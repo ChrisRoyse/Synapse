@@ -789,7 +789,7 @@ impl SynapseService {
                     self,
                     &request_context,
                     operation.as_str(),
-                    "CF_KV agent-cost/rollup/v1",
+                    "native TimeSeries CF cost generation + CF_KV projection publication metadata",
                 )?;
                 let rollup_backfill = params
                     .0
@@ -803,7 +803,7 @@ impl SynapseService {
                             operation.as_str(),
                             "agent_cost_rollup_backfill",
                             error,
-                            "inspect the transcript corpus and CF_KV agent-cost/rollup/v1 rows; repair corrupt transcript rows before retrying rollup materialization",
+                            "inspect the transcript corpus, native TimeSeries rows, and agent-cost/rollup/v2 publication metadata; repair the named corrupt row before retrying",
                         )
                     })?;
                 Ok(Json(CostResponse {
@@ -1117,7 +1117,7 @@ impl SynapseService {
             built_at_ns: report.built_at_ns,
             sealed_horizon_ns: report.sealed_horizon_ns,
             readback_source_of_truth: format!(
-                "CF_KV {ROLLUP_META_KEY} + {ROLLUP_KEY_PREFIX}cell/ hour rollup cells + {ROLLUP_KEY_PREFIX}mark/ per-spawn contribution markers"
+                "native TimeSeries CF point + minute/hour/day rollup rows named by CF_KV {ROLLUP_META_KEY}; {ROLLUP_KEY_PREFIX}mark/ and owner/ rows bind each point to its source spawn"
             ),
         })
     }
@@ -2775,13 +2775,10 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 //
 // Substrate & doctrine
 // --------------------
-// The rollups live in the vault (the single source of truth) as ordered KV rows
-// under `agent-cost/rollup/v1/` in the GC-protected `CF_KV` family — the same
-// place the cost price table and the transcript timestamp index already live.
-// This mirrors how aster itself encodes native TimeSeries rows: ordered KV under
-// a discriminant with per-window rollup tuples. There is no side store; every
-// rollup cell is a pure, rebuildable function of the transcript rows it sums, so
-// it reconciles exactly with a brute-force recomputation over the same window.
+// Metric points and continuous minute/hour/day accumulators live in Aster's
+// native TimeSeries CF. CF_KV holds only the projection's active-generation
+// marker, deterministic series roster, and source-spawn ownership bindings.
+// There is no side store and no JSON aggregate cell.
 //
 // Exactness
 // ---------
@@ -2796,27 +2793,22 @@ fn key_after(key: &[u8]) -> Vec<u8> {
 //
 // Idempotent + resumable materialization
 // --------------------------------------
-// Each spawn carries a `mark/<spawn_id>` marker recording the exact set of cell
-// contributions it currently accounts for. A materialization pass recomputes a
-// spawn's contribution; if it is unchanged the spawn is skipped, otherwise the
-// old contribution is subtracted and the new one added (read-modify-write on the
-// affected cells) and the marker is rewritten. This makes re-runs, crashes, and
-// still-growing spawns all correct: a spawn is folded exactly once, and folding
-// it again is a no-op. A `__progress` cursor lets a long pass resume its scan
-// without redoing prior spawns; because the marker fold is idempotent, resuming
-// is always safe even if the cursor is stale.
+// Each finalized or sealed-incomplete spawn carries a `mark/<spawn_id>` marker
+// recording its immutable point contributions. Replays are no-ops; a changed
+// finalized contribution fails closed and requires a new generation. A
+// `__progress` cursor resumes a long pass, and only a complete meta marker makes
+// a generation queryable.
 
-/// `CF_KV` namespace for the cost rollup family. Cells live under `…/cell/`,
-/// per-spawn contribution markers under `…/mark/`, and the two control rows are
-/// `__meta` / `__progress`.
-const ROLLUP_KEY_PREFIX: &str = "agent-cost/rollup/v1/";
-const ROLLUP_META_KEY: &str = "agent-cost/rollup/v1/__meta";
-const ROLLUP_PROGRESS_KEY: &str = "agent-cost/rollup/v1/__progress";
-const ROLLUP_CELL_INFIX: &[u8] = b"cell/";
+/// `CF_KV` namespace for projection ownership, per-spawn markers, and the
+/// active native TimeSeries generation descriptor.
+const ROLLUP_KEY_PREFIX: &str = "agent-cost/rollup/v2/";
+const ROLLUP_META_KEY: &str = "agent-cost/rollup/v2/__meta";
+const ROLLUP_PROGRESS_KEY: &str = "agent-cost/rollup/v2/__progress";
+const LEGACY_ROLLUP_KEY_PREFIX: &str = "agent-cost/rollup/v1/";
 const ROLLUP_MARK_INFIX: &[u8] = b"mark/";
-const ROLLUP_SCHEMA_VERSION: u32 = 1;
-/// Only the hour tier is materialized today; the tier byte in the cell key
-/// reserves room for a coarser day tier without a format change.
+const ROLLUP_SCHEMA_VERSION: u32 = 2;
+const ROLLUP_COLLECTION_PREFIX: &str = "syn-agent-cost-v2-";
+/// Cost queries consume the continuously maintained native hour tier.
 const ROLLUP_TIER_HOUR: u8 = 0;
 const ROLLUP_NANOS_PER_HOUR: u64 = 60 * 60 * 1_000_000_000;
 /// A window is sealed (stable, complete) once it is older than this grace period
@@ -2904,43 +2896,6 @@ struct RollupCounters {
     source_reported_micro_usd: u64,
 }
 
-impl RollupCounters {
-    fn add_assign(&mut self, other: &Self) {
-        self.spawns_total = self.spawns_total.saturating_add(other.spawns_total);
-        self.spawns_complete = self.spawns_complete.saturating_add(other.spawns_complete);
-        self.spawns_incomplete = self
-            .spawns_incomplete
-            .saturating_add(other.spawns_incomplete);
-        self.model_spawns = self.model_spawns.saturating_add(other.model_spawns);
-        add_usage(&mut self.usage, &other.usage);
-        self.source_reported_micro_usd = self
-            .source_reported_micro_usd
-            .saturating_add(other.source_reported_micro_usd);
-    }
-
-    fn sub_assign(&mut self, other: &Self) {
-        self.spawns_total = self.spawns_total.saturating_sub(other.spawns_total);
-        self.spawns_complete = self.spawns_complete.saturating_sub(other.spawns_complete);
-        self.spawns_incomplete = self
-            .spawns_incomplete
-            .saturating_sub(other.spawns_incomplete);
-        self.model_spawns = self.model_spawns.saturating_sub(other.model_spawns);
-        sub_usage(&mut self.usage, &other.usage);
-        self.source_reported_micro_usd = self
-            .source_reported_micro_usd
-            .saturating_sub(other.source_reported_micro_usd);
-    }
-
-    fn is_zero(&self) -> bool {
-        self.spawns_total == 0
-            && self.spawns_complete == 0
-            && self.spawns_incomplete == 0
-            && self.model_spawns == 0
-            && self.usage.is_zero()
-            && self.source_reported_micro_usd == 0
-    }
-}
-
 /// One cell contribution: the addressed cell (`tier`, `window_start`, `model`)
 /// plus the counters to fold in. A spawn's marker is the ordered list of these.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2948,19 +2903,7 @@ impl RollupCounters {
 struct RollupContribCell {
     tier: u8,
     window_start_ns: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    model: Option<String>,
-    counters: RollupCounters,
-}
-
-/// Stored cell value. `tier`/`window_start`/`model` echo the key for physical
-/// readback during manual FSV.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RollupCell {
-    schema_version: u32,
-    tier: u8,
-    window_start_ns: u64,
+    point_ts_ns: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     model: Option<String>,
     counters: RollupCounters,
@@ -2978,9 +2921,21 @@ struct SpawnRollupMark {
 #[serde(deny_unknown_fields)]
 struct CostRollupMeta {
     schema_version: u32,
+    collection_name: String,
+    complete: bool,
     built_at_ns: u64,
     sealed_horizon_ns: u64,
     spawns_marked: u64,
+    series: Vec<CostSeriesDescriptor>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CostSeriesDescriptor {
+    id: u64,
+    metric: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2989,21 +2944,6 @@ struct CostRollupProgress {
     schema_version: u32,
     resume_after_key_hex: String,
     spawns_examined: u64,
-}
-
-fn sub_usage(acc: &mut BillableUsage, sub: &BillableUsage) {
-    acc.input_tokens = acc.input_tokens.saturating_sub(sub.input_tokens);
-    acc.output_tokens = acc.output_tokens.saturating_sub(sub.output_tokens);
-    acc.cache_read_tokens = acc.cache_read_tokens.saturating_sub(sub.cache_read_tokens);
-    acc.cache_creation_tokens = acc
-        .cache_creation_tokens
-        .saturating_sub(sub.cache_creation_tokens);
-    acc.cache_creation_5m_tokens = acc
-        .cache_creation_5m_tokens
-        .saturating_sub(sub.cache_creation_5m_tokens);
-    acc.cache_creation_1h_tokens = acc
-        .cache_creation_1h_tokens
-        .saturating_sub(sub.cache_creation_1h_tokens);
 }
 
 fn rollup_floor_hour(ts_ns: u64) -> u64 {
@@ -3019,47 +2959,6 @@ fn rollup_ceil_hour(ts_ns: u64) -> u64 {
             .saturating_sub(remainder)
             .saturating_add(ROLLUP_NANOS_PER_HOUR)
     }
-}
-
-fn rollup_cell_scan_prefix() -> Vec<u8> {
-    let mut key = ROLLUP_KEY_PREFIX.as_bytes().to_vec();
-    key.extend_from_slice(ROLLUP_CELL_INFIX);
-    key
-}
-
-/// `…/cell/ || tier(1) || window_start_be(8) || model_utf8`. A meta (fleet) cell
-/// has no model bytes, so it sorts before that window's per-model cells.
-fn rollup_cell_key(tier: u8, window_start_ns: u64, model: Option<&str>) -> Vec<u8> {
-    let mut key = rollup_cell_scan_prefix();
-    key.push(tier);
-    key.extend_from_slice(&window_start_ns.to_be_bytes());
-    if let Some(model) = model {
-        key.extend_from_slice(model.as_bytes());
-    }
-    key
-}
-
-/// Inclusive lower-bound seek key for a hour-tier window range scan.
-fn rollup_cell_seek(tier: u8, window_start_ns: u64) -> Vec<u8> {
-    let mut key = rollup_cell_scan_prefix();
-    key.push(tier);
-    key.extend_from_slice(&window_start_ns.to_be_bytes());
-    key
-}
-
-fn decode_rollup_cell_key(key: &[u8]) -> Option<(u8, u64, Option<String>)> {
-    let prefix = rollup_cell_scan_prefix();
-    let rest = key.strip_prefix(prefix.as_slice())?;
-    let tier = *rest.first()?;
-    let window_bytes = rest.get(1..9)?;
-    let window_start_ns = u64::from_be_bytes(window_bytes.try_into().ok()?);
-    let model_bytes = &rest[9..];
-    let model = if model_bytes.is_empty() {
-        None
-    } else {
-        Some(String::from_utf8(model_bytes.to_vec()).ok()?)
-    };
-    Some((tier, window_start_ns, model))
 }
 
 fn rollup_mark_key(spawn_id: &str) -> Vec<u8> {
@@ -3091,32 +2990,38 @@ fn read_rollup_meta(db: &Db) -> Result<Option<CostRollupMeta>, ErrorData> {
             ),
         ));
     }
-    Ok(Some(meta))
-}
-
-fn read_rollup_cell(db: &Db, key: &[u8]) -> Result<Option<RollupCell>, ErrorData> {
-    let Some(value) = db
-        .get_cf(cf::CF_KV, key)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?
-    else {
-        return Ok(None);
-    };
-    let cell: RollupCell = serde_json::from_slice(&value).map_err(|error| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("AGENT_COST_ROLLUP_CELL_CORRUPT: cost rollup cell failed to decode: {error}"),
-        )
-    })?;
-    if cell.schema_version != ROLLUP_SCHEMA_VERSION {
+    if !meta.collection_name.starts_with(ROLLUP_COLLECTION_PREFIX) {
         return Err(mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
-                "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: rollup cell version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
-                cell.schema_version
+                "AGENT_COST_ROLLUP_COLLECTION_INVALID: {:?} is outside {ROLLUP_COLLECTION_PREFIX:?}",
+                meta.collection_name
             ),
         ));
     }
-    Ok(Some(cell))
+    let mut roster = BTreeMap::new();
+    for descriptor in &meta.series {
+        if cost_series_descriptor(descriptor.model.as_deref(), &descriptor.metric) != *descriptor {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_SERIES_CORRUPT: descriptor does not match its deterministic identity: {descriptor:?}"
+                ),
+            ));
+        }
+        if let Some(existing) = roster.insert(descriptor.id, descriptor)
+            && existing != descriptor
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_SERIES_COLLISION: {existing:?} and {descriptor:?} share id {}",
+                    descriptor.id
+                ),
+            ));
+        }
+    }
+    Ok(Some(meta))
 }
 
 fn read_spawn_mark(db: &Db, spawn_id: &str) -> Result<Option<Vec<RollupContribCell>>, ErrorData> {
@@ -3160,49 +3065,6 @@ fn encode_json_row<T: Serialize>(value: &T) -> Result<Vec<u8>, ErrorData> {
     })
 }
 
-/// Folds one contribution cell into (or out of) its stored rollup cell. A cell
-/// that reaches all-zero is deleted so an empty window leaves no residue.
-fn apply_rollup_contrib(
-    db: &Db,
-    contrib: &RollupContribCell,
-    add: bool,
-    cells_written: &mut u64,
-    cells_deleted: &mut u64,
-) -> Result<(), ErrorData> {
-    if contrib.counters.is_zero() {
-        return Ok(());
-    }
-    let key = rollup_cell_key(
-        contrib.tier,
-        contrib.window_start_ns,
-        contrib.model.as_deref(),
-    );
-    let mut counters = read_rollup_cell(db, &key)?
-        .map(|cell| cell.counters)
-        .unwrap_or_default();
-    if add {
-        counters.add_assign(&contrib.counters);
-    } else {
-        counters.sub_assign(&contrib.counters);
-    }
-    if counters.is_zero() {
-        db.delete_batch(cf::CF_KV, [key])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        *cells_deleted = cells_deleted.saturating_add(1);
-    } else {
-        let stored = RollupCell {
-            schema_version: ROLLUP_SCHEMA_VERSION,
-            tier: contrib.tier,
-            window_start_ns: contrib.window_start_ns,
-            model: contrib.model.clone(),
-            counters,
-        };
-        write_kv_row(db, key, encode_json_row(&stored)?)?;
-        *cells_written = cells_written.saturating_add(1);
-    }
-    Ok(())
-}
-
 /// Resolves one spawn globally (all its transcript rows) and returns its rollup
 /// contribution cells: one meta cell plus one per resolved model for a complete
 /// spawn, or a single incomplete meta cell otherwise. Identical resolution logic
@@ -3210,6 +3072,7 @@ fn apply_rollup_contrib(
 fn spawn_rollup_contribution(
     spawn_id: &str,
     rows: &[(Vec<u8>, Vec<u8>)],
+    sealed_horizon_ns: u64,
 ) -> Result<Vec<RollupContribCell>, ErrorData> {
     if rows.is_empty() {
         return Ok(Vec::new());
@@ -3230,12 +3093,17 @@ fn spawn_rollup_contribution(
     }
 
     let Some(resolved) = acc.resolve()? else {
-        // Still-running / no authoritative usage: count one active, incomplete
-        // spawn in the window of its most recent row. Zero tokens, zero cost.
+        // A recent unresolved spawn can still grow, so it has no immutable
+        // TimeSeries contribution yet. Once its latest evidence is behind the
+        // sealed horizon it is stable enough to count as incomplete.
+        if latest_ts >= sealed_horizon_ns {
+            return Ok(Vec::new());
+        }
         let window_start_ns = rollup_floor_hour(latest_ts);
         return Ok(vec![RollupContribCell {
             tier: ROLLUP_TIER_HOUR,
             window_start_ns,
+            point_ts_ns: latest_ts,
             model: None,
             counters: RollupCounters {
                 spawns_total: 1,
@@ -3260,6 +3128,7 @@ fn spawn_rollup_contribution(
     cells.push(RollupContribCell {
         tier: ROLLUP_TIER_HOUR,
         window_start_ns,
+        point_ts_ns: authoritative_ts,
         model: None,
         counters: RollupCounters {
             spawns_total: 1,
@@ -3286,6 +3155,7 @@ fn spawn_rollup_contribution(
         cells.push(RollupContribCell {
             tier: ROLLUP_TIER_HOUR,
             window_start_ns,
+            point_ts_ns: authoritative_ts,
             model: Some(label),
             counters,
         });
@@ -3298,23 +3168,36 @@ fn spawn_rollup_contribution(
 /// marker. Returns whether the spawn changed the rollups.
 fn process_spawn_rollup(
     db: &Db,
+    collection_name: &str,
     spawn_id: &str,
     rows: &[(Vec<u8>, Vec<u8>)],
+    sealed_horizon_ns: u64,
+    series_roster: &mut BTreeMap<u64, CostSeriesDescriptor>,
     cells_written: &mut u64,
-    cells_deleted: &mut u64,
 ) -> Result<bool, ErrorData> {
-    let new_cells = spawn_rollup_contribution(spawn_id, rows)?;
+    let new_cells = spawn_rollup_contribution(spawn_id, rows, sealed_horizon_ns)?;
+    register_cost_series(&new_cells, series_roster)?;
     let old_cells = read_spawn_mark(db, spawn_id)?;
     if old_cells.as_deref() == Some(new_cells.as_slice()) {
         return Ok(false);
     }
-    if let Some(old_cells) = &old_cells {
-        for contrib in old_cells {
-            apply_rollup_contrib(db, contrib, false, cells_written, cells_deleted)?;
-        }
+    if old_cells.is_some() {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT: finalized contribution for {spawn_id} changed after publication; run rollup_backfill reset=true to publish a new TimeSeries generation"
+            ),
+        ));
     }
     for contrib in &new_cells {
-        apply_rollup_contrib(db, contrib, true, cells_written, cells_deleted)?;
+        write_native_cost_contribution(
+            db,
+            collection_name,
+            spawn_id,
+            contrib,
+            series_roster,
+            cells_written,
+        )?;
     }
     let mark_key = rollup_mark_key(spawn_id);
     if new_cells.is_empty() {
@@ -3330,16 +3213,172 @@ fn process_spawn_rollup(
     Ok(true)
 }
 
+fn register_cost_series(
+    cells: &[RollupContribCell],
+    roster: &mut BTreeMap<u64, CostSeriesDescriptor>,
+) -> Result<(), ErrorData> {
+    for cell in cells {
+        for (metric, _value) in cost_counter_values(&cell.counters) {
+            let descriptor = cost_series_descriptor(cell.model.as_deref(), metric);
+            if let Some(existing) = roster.get(&descriptor.id)
+                && existing != &descriptor
+            {
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "AGENT_COST_TIMESERIES_SERIES_COLLISION: series {} maps to both {:?} and {:?}; change the series hash domain before publishing",
+                        descriptor.id, existing, descriptor
+                    ),
+                ));
+            }
+            roster.insert(descriptor.id, descriptor);
+        }
+    }
+    Ok(())
+}
+
+fn cost_series_descriptor(model: Option<&str>, metric: &str) -> CostSeriesDescriptor {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-agent-cost-timeseries-v2");
+    hasher.update([0]);
+    if let Some(model) = model {
+        hasher.update(model.as_bytes());
+    }
+    hasher.update([0]);
+    hasher.update(metric.as_bytes());
+    let digest = hasher.finalize();
+    let mut id = [0_u8; 8];
+    id.copy_from_slice(&digest[..8]);
+    CostSeriesDescriptor {
+        id: u64::from_be_bytes(id),
+        metric: metric.to_owned(),
+        model: model.map(str::to_owned),
+    }
+}
+
+fn cost_counter_values(counters: &RollupCounters) -> [(&'static str, u64); 11] {
+    [
+        ("spawns_total", counters.spawns_total),
+        ("spawns_complete", counters.spawns_complete),
+        ("spawns_incomplete", counters.spawns_incomplete),
+        ("model_spawns", counters.model_spawns),
+        ("input_tokens", counters.usage.input_tokens),
+        ("output_tokens", counters.usage.output_tokens),
+        ("cache_read_tokens", counters.usage.cache_read_tokens),
+        (
+            "cache_creation_tokens",
+            counters.usage.cache_creation_tokens,
+        ),
+        (
+            "cache_creation_5m_tokens",
+            counters.usage.cache_creation_5m_tokens,
+        ),
+        (
+            "cache_creation_1h_tokens",
+            counters.usage.cache_creation_1h_tokens,
+        ),
+        (
+            "source_reported_micro_usd",
+            counters.source_reported_micro_usd,
+        ),
+    ]
+}
+
+fn write_native_cost_contribution(
+    db: &Db,
+    collection_name: &str,
+    spawn_id: &str,
+    contribution: &RollupContribCell,
+    roster: &BTreeMap<u64, CostSeriesDescriptor>,
+    points_written: &mut u64,
+) -> Result<(), ErrorData> {
+    for (metric, value) in cost_counter_values(&contribution.counters) {
+        if value == 0 {
+            continue;
+        }
+        if value > (1_u64 << 53) {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_TIMESERIES_VALUE_NOT_EXACT: spawn={spawn_id} metric={metric} value={value} exceeds the exact integer range of f64"
+                ),
+            ));
+        }
+        let descriptor = cost_series_descriptor(contribution.model.as_deref(), metric);
+        if roster.get(&descriptor.id) != Some(&descriptor) {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "AGENT_COST_TIMESERIES_SERIES_UNREGISTERED: contribution series is absent from the collision-checked roster",
+            ));
+        }
+        persist_cost_point_owner(
+            db,
+            collection_name,
+            descriptor.id,
+            contribution.point_ts_ns,
+            spawn_id,
+        )?;
+        db.timeseries_write(
+            collection_name,
+            descriptor.id,
+            contribution.point_ts_ns,
+            value as f64,
+        )
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        *points_written = points_written.saturating_add(1);
+    }
+    Ok(())
+}
+
+fn persist_cost_point_owner(
+    db: &Db,
+    collection_name: &str,
+    series: u64,
+    timestamp_ns: u64,
+    spawn_id: &str,
+) -> Result<(), ErrorData> {
+    let key =
+        format!("{ROLLUP_KEY_PREFIX}owner/{collection_name}/{series:016x}/{timestamp_ns:016x}");
+    if let Some(existing) = get_exact_kv_row(db, &key)? {
+        if existing == spawn_id.as_bytes() {
+            return Ok(());
+        }
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_TIMESERIES_POINT_IDENTITY_COLLISION: collection={collection_name} series={series} timestamp_ns={timestamp_ns} is owned by {:?}, requested spawn={spawn_id}",
+                String::from_utf8_lossy(&existing)
+            ),
+        ));
+    }
+    write_kv_row(db, key.as_bytes().to_vec(), spawn_id.as_bytes().to_vec())?;
+    let stored = get_exact_kv_row(db, &key)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("AGENT_COST_TIMESERIES_POINT_OWNER_READBACK_MISSING: {key}"),
+        )
+    })?;
+    if stored != spawn_id.as_bytes() {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("AGENT_COST_TIMESERIES_POINT_OWNER_READBACK_MISMATCH: {key}"),
+        ));
+    }
+    Ok(())
+}
+
 /// Deletes every `agent-cost/rollup/v1/` row (cells, markers, control rows) for
 /// a `reset=true` rebuild.
 fn purge_all_rollup_rows(db: &Db) -> Result<(), ErrorData> {
-    let rows = db
-        .scan_cf_prefix(cf::CF_KV, ROLLUP_KEY_PREFIX.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    for chunk in rows.chunks(SCAN_CHUNK_ROWS) {
-        let keys: Vec<Vec<u8>> = chunk.iter().map(|(key, _value)| key.clone()).collect();
-        db.delete_batch(cf::CF_KV, keys)
+    for prefix in [ROLLUP_KEY_PREFIX, LEGACY_ROLLUP_KEY_PREFIX] {
+        let rows = db
+            .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        for chunk in rows.chunks(SCAN_CHUNK_ROWS) {
+            let keys: Vec<Vec<u8>> = chunk.iter().map(|(key, _value)| key.clone()).collect();
+            db.delete_batch(cf::CF_KV, keys)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        }
     }
     Ok(())
 }
@@ -3360,7 +3399,21 @@ pub(crate) fn materialize_cost_rollups(
     if reset {
         purge_all_rollup_rows(db)?;
     }
-
+    let prior_meta = if reset { None } else { read_rollup_meta(db)? };
+    let collection_name = prior_meta.as_ref().map_or_else(
+        || format!("{ROLLUP_COLLECTION_PREFIX}{built_at_ns:016x}"),
+        |meta| meta.collection_name.clone(),
+    );
+    let mut series_roster = prior_meta
+        .as_ref()
+        .map(|meta| {
+            meta.series
+                .iter()
+                .cloned()
+                .map(|descriptor| (descriptor.id, descriptor))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     // Resume from the checkpointed cursor when present (and not resetting).
     let mut start: Vec<u8> = Vec::new();
     let mut spawns_examined: u64 = 0;
@@ -3369,23 +3422,56 @@ pub(crate) fn materialize_cost_rollups(
             .get_cf(cf::CF_KV, ROLLUP_PROGRESS_KEY.as_bytes())
             .map_err(|error| mcp_error(error.code(), error.to_string()))?
     {
-        match serde_json::from_slice::<CostRollupProgress>(&value) {
-            Ok(progress) if progress.schema_version == ROLLUP_SCHEMA_VERSION => {
-                if let Some(resume_after) = hex_decode(&progress.resume_after_key_hex) {
-                    start = key_after(&resume_after);
-                    spawns_examined = progress.spawns_examined;
-                }
-            }
-            // A corrupt/foreign progress row is a resumption hint only; ignore it
-            // and restart the scan. Marker idempotency keeps this correct.
-            _ => {}
+        let progress: CostRollupProgress = serde_json::from_slice(&value).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_PROGRESS_CORRUPT: {ROLLUP_PROGRESS_KEY} cannot decode: {error}; run rollup_backfill reset=true only after inspecting the physical row"
+                ),
+            )
+        })?;
+        if progress.schema_version != ROLLUP_SCHEMA_VERSION {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_PROGRESS_SCHEMA_UNSUPPORTED: {} != {ROLLUP_SCHEMA_VERSION}; run rollup_backfill reset=true",
+                    progress.schema_version
+                ),
+            ));
         }
+        let resume_after = hex_decode(&progress.resume_after_key_hex).ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_PROGRESS_CURSOR_INVALID: {:?} is not even-length hex",
+                    progress.resume_after_key_hex
+                ),
+            )
+        })?;
+        start = key_after(&resume_after);
+        spawns_examined = progress.spawns_examined;
+    }
+    let building_meta = CostRollupMeta {
+        schema_version: ROLLUP_SCHEMA_VERSION,
+        collection_name: collection_name.clone(),
+        complete: false,
+        built_at_ns,
+        sealed_horizon_ns,
+        spawns_marked: 0,
+        series: series_roster.values().cloned().collect(),
+    };
+    if prior_meta.as_ref().is_none_or(|meta| !meta.complete) {
+        write_kv_row(
+            db,
+            ROLLUP_META_KEY.as_bytes().to_vec(),
+            encode_json_row(&building_meta)?,
+        )?;
     }
 
     let mut spawns_changed: u64 = 0;
     let mut transcript_rows_scanned: u64 = 0;
     let mut cells_written: u64 = 0;
-    let mut cells_deleted: u64 = 0;
+    let cells_deleted: u64 = 0;
     let mut current_spawn: Option<String> = None;
     let mut current_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut last_flushed_key: Option<Vec<u8>> = None;
@@ -3408,10 +3494,12 @@ pub(crate) fn materialize_cost_rollups(
                     if let Some(previous) = current_spawn.take() {
                         let changed = process_spawn_rollup(
                             db,
+                            &collection_name,
                             &previous,
                             &current_rows,
+                            sealed_horizon_ns,
+                            &mut series_roster,
                             &mut cells_written,
-                            &mut cells_deleted,
                         )?;
                         spawns_examined = spawns_examined.saturating_add(1);
                         if changed {
@@ -3447,10 +3535,12 @@ pub(crate) fn materialize_cost_rollups(
     if let Some(previous) = current_spawn.take() {
         let changed = process_spawn_rollup(
             db,
+            &collection_name,
             &previous,
             &current_rows,
+            sealed_horizon_ns,
+            &mut series_roster,
             &mut cells_written,
-            &mut cells_deleted,
         )?;
         spawns_examined = spawns_examined.saturating_add(1);
         if changed {
@@ -3461,9 +3551,12 @@ pub(crate) fn materialize_cost_rollups(
     // Publish meta and clear the resume cursor: the pass is complete.
     let meta = CostRollupMeta {
         schema_version: ROLLUP_SCHEMA_VERSION,
+        collection_name,
+        complete: true,
         built_at_ns,
         sealed_horizon_ns,
         spawns_marked: spawns_examined,
+        series: series_roster.into_values().collect(),
     };
     write_kv_row(
         db,
@@ -3544,6 +3637,15 @@ fn summarize_fleet_from_rollups(
              retry; or pass a spawn_id for a bounded exact spawn-prefix cost read.",
         ));
     };
+    if !meta.complete {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_ROLLUP_BUILD_INCOMPLETE: native TimeSeries generation {:?} has no complete publication marker; rerun rollup_backfill to resume and publish it",
+                meta.collection_name
+            ),
+        ));
+    }
     let prices = load_price_table(db)?;
 
     let effective_since_ns = rollup_floor_hour(since_ns);
@@ -3582,74 +3684,32 @@ fn summarize_fleet_from_rollups(
     let mut per_model_usage: BTreeMap<String, RollupCounters> = BTreeMap::new();
     let mut windows_read: u64 = 0;
 
-    let mut start = rollup_cell_seek(ROLLUP_TIER_HOUR, effective_since_ns);
-    'scan: loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        for (key, value) in &rows {
-            let Some((tier, window_start_ns, model)) = decode_rollup_cell_key(key) else {
-                break 'scan;
-            };
-            if tier != ROLLUP_TIER_HOUR || window_start_ns >= effective_until_ns {
-                break 'scan;
-            }
-            if window_start_ns < effective_since_ns {
-                continue;
-            }
-            let cell: RollupCell = serde_json::from_slice(value).map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "AGENT_COST_ROLLUP_CELL_CORRUPT: cost rollup cell failed to decode: {error}"
-                    ),
+    let mut window_start = effective_since_ns;
+    while window_start < effective_until_ns {
+        for descriptor in &meta.series {
+            let rollup = db
+                .timeseries_rollup(
+                    &meta.collection_name,
+                    descriptor.id,
+                    synapse_calyx::timeseries::SynapseCalyxRollupWindow::Hour,
+                    window_start,
                 )
-            })?;
-            if cell.schema_version != ROLLUP_SCHEMA_VERSION {
-                return Err(mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    format!(
-                        "AGENT_COST_ROLLUP_SCHEMA_UNSUPPORTED: rollup cell version {} != expected {ROLLUP_SCHEMA_VERSION}; run cost rollup_backfill with reset=true",
-                        cell.schema_version
-                    ),
-                ));
-            }
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
             windows_read = windows_read.saturating_add(1);
-            match model {
-                None => {
-                    fleet.spawns_total = fleet.spawns_total.saturating_add(
-                        usize::try_from(cell.counters.spawns_total).unwrap_or(usize::MAX),
-                    );
-                    fleet.spawns_complete = fleet.spawns_complete.saturating_add(
-                        usize::try_from(cell.counters.spawns_complete).unwrap_or(usize::MAX),
-                    );
-                    fleet.spawns_incomplete = fleet.spawns_incomplete.saturating_add(
-                        usize::try_from(cell.counters.spawns_incomplete).unwrap_or(usize::MAX),
-                    );
-                    add_usage(&mut fleet.usage, &cell.counters.usage);
-                    fleet.total_tokens = fleet
-                        .total_tokens
-                        .saturating_add(cell.counters.usage.total_tokens());
-                    fleet.source_reported_micro_usd = fleet
-                        .source_reported_micro_usd
-                        .saturating_add(cell.counters.source_reported_micro_usd);
-                }
-                Some(label) => {
-                    let entry = per_model_usage.entry(label).or_default();
-                    entry.add_assign(&cell.counters);
-                }
+            let Some(rollup) = rollup else {
+                continue;
+            };
+            let value = exact_rollup_u64(&rollup, descriptor)?;
+            match descriptor.model.as_deref() {
+                None => apply_fleet_rollup_metric(&mut fleet, &descriptor.metric, value)?,
+                Some(model) => apply_counter_metric(
+                    per_model_usage.entry(model.to_owned()).or_default(),
+                    &descriptor.metric,
+                    value,
+                )?,
             }
         }
-        let Some((last_key, _value)) = rows.last() else {
-            break;
-        };
-        start = key_after(last_key);
-        if !more {
-            break;
-        }
+        window_start = window_start.saturating_add(ROLLUP_NANOS_PER_HOUR);
     }
 
     // Price each model's summed tokens with the CURRENT price table. Pricing is
@@ -3696,7 +3756,7 @@ fn summarize_fleet_from_rollups(
     Ok(AgentCostResponse {
         ok: true,
         now_ns,
-        query_strategy: "timeseries_rollup_window_read".to_owned(),
+        query_strategy: "native_timeseries_rollup_point_reads".to_owned(),
         default_window_applied,
         completeness: "exact".to_owned(),
         transcript_index_version: None,
@@ -3716,6 +3776,126 @@ fn summarize_fleet_from_rollups(
         per_template: None,
         per_task: None,
     })
+}
+
+fn exact_rollup_u64(
+    rollup: &synapse_calyx::timeseries::SynapseCalyxRollupValue,
+    descriptor: &CostSeriesDescriptor,
+) -> Result<u64, ErrorData> {
+    if !rollup.sum.is_finite()
+        || rollup.sum < 0.0
+        || rollup.sum.fract() != 0.0
+        || rollup.sum > (1_u64 << 53) as f64
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "AGENT_COST_TIMESERIES_ROLLUP_NOT_EXACT: series={} metric={} model={:?} sum={} cannot be represented as an exact u64",
+                descriptor.id, descriptor.metric, descriptor.model, rollup.sum
+            ),
+        ));
+    }
+    Ok(rollup.sum as u64)
+}
+
+fn apply_fleet_rollup_metric(
+    fleet: &mut AgentFleetCost,
+    metric: &str,
+    value: u64,
+) -> Result<(), ErrorData> {
+    match metric {
+        "spawns_total" => {
+            fleet.spawns_total = fleet
+                .spawns_total
+                .saturating_add(usize::try_from(value).unwrap_or(usize::MAX));
+        }
+        "spawns_complete" => {
+            fleet.spawns_complete = fleet
+                .spawns_complete
+                .saturating_add(usize::try_from(value).unwrap_or(usize::MAX));
+        }
+        "spawns_incomplete" => {
+            fleet.spawns_incomplete = fleet
+                .spawns_incomplete
+                .saturating_add(usize::try_from(value).unwrap_or(usize::MAX));
+        }
+        "input_tokens" => fleet.usage.input_tokens = fleet.usage.input_tokens.saturating_add(value),
+        "output_tokens" => {
+            fleet.usage.output_tokens = fleet.usage.output_tokens.saturating_add(value);
+        }
+        "cache_read_tokens" => {
+            fleet.usage.cache_read_tokens = fleet.usage.cache_read_tokens.saturating_add(value);
+        }
+        "cache_creation_tokens" => {
+            fleet.usage.cache_creation_tokens =
+                fleet.usage.cache_creation_tokens.saturating_add(value);
+        }
+        "cache_creation_5m_tokens" => {
+            fleet.usage.cache_creation_5m_tokens =
+                fleet.usage.cache_creation_5m_tokens.saturating_add(value);
+        }
+        "cache_creation_1h_tokens" => {
+            fleet.usage.cache_creation_1h_tokens =
+                fleet.usage.cache_creation_1h_tokens.saturating_add(value);
+        }
+        "source_reported_micro_usd" => {
+            fleet.source_reported_micro_usd = fleet.source_reported_micro_usd.saturating_add(value);
+        }
+        "model_spawns" => {}
+        other => return Err(unknown_cost_series_metric(other)),
+    }
+    fleet.total_tokens = fleet.usage.total_tokens();
+    Ok(())
+}
+
+fn apply_counter_metric(
+    counters: &mut RollupCounters,
+    metric: &str,
+    value: u64,
+) -> Result<(), ErrorData> {
+    match metric {
+        "model_spawns" => counters.model_spawns = counters.model_spawns.saturating_add(value),
+        "input_tokens" => {
+            counters.usage.input_tokens = counters.usage.input_tokens.saturating_add(value);
+        }
+        "output_tokens" => {
+            counters.usage.output_tokens = counters.usage.output_tokens.saturating_add(value);
+        }
+        "cache_read_tokens" => {
+            counters.usage.cache_read_tokens =
+                counters.usage.cache_read_tokens.saturating_add(value);
+        }
+        "cache_creation_tokens" => {
+            counters.usage.cache_creation_tokens =
+                counters.usage.cache_creation_tokens.saturating_add(value);
+        }
+        "cache_creation_5m_tokens" => {
+            counters.usage.cache_creation_5m_tokens = counters
+                .usage
+                .cache_creation_5m_tokens
+                .saturating_add(value);
+        }
+        "cache_creation_1h_tokens" => {
+            counters.usage.cache_creation_1h_tokens = counters
+                .usage
+                .cache_creation_1h_tokens
+                .saturating_add(value);
+        }
+        "source_reported_micro_usd" => {
+            counters.source_reported_micro_usd =
+                counters.source_reported_micro_usd.saturating_add(value);
+        }
+        "spawns_total" | "spawns_complete" | "spawns_incomplete" => {}
+        other => return Err(unknown_cost_series_metric(other)),
+    }
+    Ok(())
+}
+
+fn unknown_cost_series_metric(metric: &str) -> ErrorData {
+    mcp_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!("AGENT_COST_TIMESERIES_METRIC_UNKNOWN: {metric:?}"),
+    )
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

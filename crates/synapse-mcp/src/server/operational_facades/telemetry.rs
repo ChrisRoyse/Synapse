@@ -76,10 +76,7 @@ pub(super) async fn handle(
         agent_event_ingress: ingress,
         cf_row_counts,
     };
-    // #1688 (telemetry half): capture the live tool-surface gauges as telemetry
-    // series points at ingest (best-effort). The forward materializer turns
-    // these into bounded hour/day sum/count/mean trend rollups.
-    capture_status_telemetry_samples(service, &status);
+    capture_status_telemetry_samples(service, &status)?;
     Ok(Json(TelemetryResponse {
         operation,
         source_of_truth: TELEMETRY_SOT.to_owned(),
@@ -89,12 +86,22 @@ pub(super) async fn handle(
     }))
 }
 
-/// Records the live tool-surface gauges as #1688 telemetry samples. Best-effort:
-/// storage being unavailable or a capture error never fails a telemetry read.
-fn capture_status_telemetry_samples(service: &SynapseService, status: &TelemetryStatusResponse) {
-    let Ok(db) = service.m3_storage() else {
-        return;
-    };
+/// Records the live tool-surface gauges as native telemetry samples. The status
+/// call fails closed if its advertised measurement cannot be made durable.
+fn capture_status_telemetry_samples(
+    service: &SynapseService,
+    status: &TelemetryStatusResponse,
+) -> Result<(), ErrorData> {
+    let db = service.m3_storage().map_err(|error| {
+        facade_delegate_error(
+            TELEMETRY_TOOL,
+            "status",
+            "telemetry_timeseries",
+            TELEMETRY_SOT,
+            error,
+            "repair storage initialization before recording telemetry gauges",
+        )
+    })?;
     let now_ns = crate::server::agent_events::unix_time_ns_now();
     let samples = [
         (
@@ -107,17 +114,9 @@ fn capture_status_telemetry_samples(service: &SynapseService, status: &Telemetry
         ),
     ];
     for (metric, value) in samples {
-        if let Err(error) =
-            super::telemetry_rollup::record_telemetry_sample(&db, metric, value, now_ns)
-        {
-            tracing::warn!(
-                code = "TELEMETRY_SAMPLE_CAPTURE_FAILED",
-                metric,
-                error = %error.message,
-                "telemetry gauge sample capture failed"
-            );
-        }
+        super::telemetry_rollup::record_telemetry_sample(&db, metric, value, now_ns)?;
     }
+    Ok(())
 }
 
 fn agent_ingress_stats() -> AgentEventIngressStats {

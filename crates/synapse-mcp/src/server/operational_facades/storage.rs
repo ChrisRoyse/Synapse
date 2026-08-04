@@ -1098,6 +1098,7 @@ pub(super) async fn handle(
                     kernel_answer: None,
                     oracle: None,
                     ensemble_card: None,
+                    olap_aggregate: None,
                 };
                 match sub_operation {
                     StorageIntelligenceOperation::Weave => {
@@ -1235,6 +1236,35 @@ pub(super) async fn handle(
                                 ..base
                             },
                         )
+                    }
+                    StorageIntelligenceOperation::OlapAggregate => {
+                        let slot = spec.content_slot.ok_or_else(|| crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                            "intelligence olap_aggregate requires content_slot",
+                        ))?;
+                        let value_column = spec.value_column.ok_or_else(|| crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                            "intelligence olap_aggregate requires value_column",
+                        ))?;
+                        db.olap_aggregate_slot(
+                            spec.panel_version,
+                            slot,
+                            value_column as usize,
+                            spec.group_by_column.map(|value| value as usize),
+                            spec.olap_max_rows.unwrap_or(1_000_000) as usize,
+                            spec.olap_max_groups.unwrap_or(4_096) as usize,
+                        )
+                        .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))
+                        .and_then(|report| serde_json::to_value(report).map_err(|error| {
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                format!("serialize native OLAP aggregate: {error}"),
+                            )
+                        }))
+                        .map(|olap_aggregate| StorageIntelligenceResponse {
+                            olap_aggregate: Some(olap_aggregate),
+                            ..base
+                        })
                     }
                 }
             })

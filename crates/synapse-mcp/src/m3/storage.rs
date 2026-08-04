@@ -1439,6 +1439,7 @@ pub enum StorageIntelligenceOperation {
     OracleReverse,
     OracleComplete,
     OracleReadiness,
+    OlapAggregate,
     /// The ensemble capability card: per-lens marginal value, the PID triple,
     /// the A37 associational-diversity gate, and a keep/park/retire verdict
     /// (#1668's admission gate; wired for #1944 ask 1).
@@ -1465,6 +1466,7 @@ impl StorageIntelligenceOperation {
             Self::OracleReverse => "oracle_reverse",
             Self::OracleComplete => "oracle_complete",
             Self::OracleReadiness => "oracle_readiness",
+            Self::OlapAggregate => "olap_aggregate",
             Self::EnsembleCard => "ensemble_card",
         }
     }
@@ -1475,7 +1477,10 @@ impl StorageIntelligenceOperation {
         // persists derived rows (weave: XTerm/Graph; assay: Assay, including
         // synergy's PairGain rows; temporal: Graph/TemporalXTerm; kernel:
         // Kernel CF).
-        !matches!(self, Self::Abundance | Self::KernelAnswer)
+        !matches!(
+            self,
+            Self::Abundance | Self::KernelAnswer | Self::OlapAggregate
+        )
     }
 }
 
@@ -1592,6 +1597,21 @@ pub struct StorageIntelligenceParams {
     /// These panel slot ids are inferred; every other declared slot is clamped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub free_slots: Vec<u16>,
+    /// Coordinate to aggregate from the materialized dense slot column
+    /// (`olap_aggregate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_column: Option<u32>,
+    /// Optional coordinate whose exact f32 values define aggregate groups.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by_column: Option<u32>,
+    /// Hard row cap for `olap_aggregate` (default and maximum 1,000,000).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 1000000))]
+    pub olap_max_rows: Option<u32>,
+    /// Hard cardinality cap for grouped OLAP output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 4096))]
+    pub olap_max_groups: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -2338,6 +2358,9 @@ pub struct StorageIntelligenceResponse {
     /// Populated by `operation=ensemble_card`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ensemble_card: Option<StorageIntelligenceEnsembleCardReport>,
+    /// Native Aster memory-mapped slot-column aggregate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub olap_aggregate: Option<serde_json::Value>,
 }
 
 #[must_use]
@@ -3594,6 +3617,12 @@ pub fn validate_intelligence_numeric_ranges(
     }
     if let Some(value) = params.max_hops {
         validate_u32_range("intelligence", "max_hops", value, 1, 64)?;
+    }
+    if let Some(value) = params.olap_max_rows {
+        validate_u32_range("intelligence", "olap_max_rows", value, 1, 1_000_000)?;
+    }
+    if let Some(value) = params.olap_max_groups {
+        validate_u32_range("intelligence", "olap_max_groups", value, 1, 4_096)?;
     }
     Ok(())
 }

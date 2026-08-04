@@ -562,6 +562,37 @@ pub trait StorageBackend: Send + Sync {
     ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus>;
     /// Per-panel coverage and grounding census (#1927 ask 1, #1920 ask 1).
     fn measure_panel_coverage(&self) -> StorageResult<crate::panel_coverage::PanelCoverageReport>;
+    fn olap_aggregate_slot(
+        &self,
+        panel_version: u32,
+        slot_id: u32,
+        value_column: usize,
+        group_by_column: Option<usize>,
+        max_rows: usize,
+        max_groups: usize,
+    ) -> StorageResult<synapse_calyx::olap::OlapScanResult>;
+    fn ensure_timeseries_collection(&self, collection_name: &str) -> StorageResult<()>;
+    fn timeseries_write(
+        &self,
+        collection_name: &str,
+        series: u64,
+        timestamp_ns: u64,
+        value: f64,
+    ) -> StorageResult<u64>;
+    fn timeseries_rollup(
+        &self,
+        collection_name: &str,
+        series: u64,
+        window: synapse_calyx::timeseries::SynapseCalyxRollupWindow,
+        timestamp_ns: u64,
+    ) -> StorageResult<Option<synapse_calyx::timeseries::SynapseCalyxRollupValue>>;
+    fn timeseries_range(
+        &self,
+        collection_name: &str,
+        series: u64,
+        start_timestamp_ns: u64,
+        end_timestamp_ns: u64,
+    ) -> StorageResult<Vec<(u64, f64)>>;
     fn pressure_level(&self) -> pressure::DiskPressureLevel;
     fn pressure_permits_write(&self, cf_name: &str) -> bool;
     fn pressure_transition_codes(&self) -> StorageResult<Vec<&'static str>>;
@@ -3454,6 +3485,139 @@ impl StorageBackend for CalyxBackend {
             });
         }
         Ok(report)
+    }
+
+    fn timeseries_write(
+        &self,
+        collection_name: &str,
+        series: u64,
+        timestamp_ns: u64,
+        value: f64,
+    ) -> StorageResult<u64> {
+        self.with_vault(
+            "calyx_timeseries",
+            "write native TimeSeries point",
+            true,
+            |vault| {
+                vault
+                    .timeseries_write(collection_name, series, timestamp_ns, value)
+                    .map_err(|error| {
+                        calyx_write_failed(
+                            "calyx_timeseries",
+                            "write native TimeSeries point and continuous rollups",
+                            &error,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn olap_aggregate_slot(
+        &self,
+        panel_version: u32,
+        slot_id: u32,
+        value_column: usize,
+        group_by_column: Option<usize>,
+        max_rows: usize,
+        max_groups: usize,
+    ) -> StorageResult<synapse_calyx::olap::OlapScanResult> {
+        self.with_vault(
+            "calyx_olap",
+            "scan native OLAP slot column",
+            false,
+            |vault| {
+                vault
+                    .olap_aggregate_slot(
+                        panel_version,
+                        slot_id,
+                        value_column,
+                        group_by_column,
+                        max_rows,
+                        max_groups,
+                    )
+                    .map_err(|error| {
+                        calyx_read_failed(
+                            "calyx_olap",
+                            "materialize and scan native OLAP slot column",
+                            &error,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn ensure_timeseries_collection(&self, collection_name: &str) -> StorageResult<()> {
+        self.with_vault(
+            "calyx_timeseries",
+            "ensure native TimeSeries collection",
+            true,
+            |vault| {
+                vault
+                    .ensure_timeseries_collection(collection_name)
+                    .map_err(|error| {
+                        calyx_write_failed(
+                            "calyx_timeseries",
+                            "create and read back native TimeSeries collection descriptor",
+                            &error,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn timeseries_rollup(
+        &self,
+        collection_name: &str,
+        series: u64,
+        window: synapse_calyx::timeseries::SynapseCalyxRollupWindow,
+        timestamp_ns: u64,
+    ) -> StorageResult<Option<synapse_calyx::timeseries::SynapseCalyxRollupValue>> {
+        self.with_vault(
+            "calyx_timeseries",
+            "read native TimeSeries rollup",
+            false,
+            |vault| {
+                vault
+                    .timeseries_rollup(collection_name, series, window, timestamp_ns)
+                    .map_err(|error| {
+                        calyx_read_failed(
+                            "calyx_timeseries",
+                            "read native TimeSeries rollup",
+                            &error,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn timeseries_range(
+        &self,
+        collection_name: &str,
+        series: u64,
+        start_timestamp_ns: u64,
+        end_timestamp_ns: u64,
+    ) -> StorageResult<Vec<(u64, f64)>> {
+        self.with_vault(
+            "calyx_timeseries",
+            "read native TimeSeries range",
+            false,
+            |vault| {
+                vault
+                    .timeseries_range(
+                        collection_name,
+                        series,
+                        start_timestamp_ns,
+                        end_timestamp_ns,
+                    )
+                    .map_err(|error| {
+                        calyx_read_failed(
+                            "calyx_timeseries",
+                            "read native TimeSeries point range",
+                            &error,
+                        )
+                    })
+            },
+        )
     }
 
     fn pressure_level(&self) -> pressure::DiskPressureLevel {

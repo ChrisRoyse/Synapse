@@ -47,6 +47,7 @@ pub use error::{
 };
 pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
+pub use synapse_calyx::timeseries::{SynapseCalyxRollupValue, SynapseCalyxRollupWindow};
 
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
@@ -1188,6 +1189,66 @@ impl Db {
     /// up (`base_cf_rows != records_total + decode_failures`).
     pub fn measure_panel_coverage(&self) -> StorageResult<panel_coverage::PanelCoverageReport> {
         self.backend.measure_panel_coverage()
+    }
+
+    pub fn timeseries_write(
+        &self,
+        collection_name: &str,
+        series: u64,
+        timestamp_ns: u64,
+        value: f64,
+    ) -> StorageResult<u64> {
+        self.backend
+            .timeseries_write(collection_name, series, timestamp_ns, value)
+    }
+
+    pub fn ensure_timeseries_collection(&self, collection_name: &str) -> StorageResult<()> {
+        self.backend.ensure_timeseries_collection(collection_name)
+    }
+
+    pub fn olap_aggregate_slot(
+        &self,
+        panel_version: u32,
+        slot_id: u32,
+        value_column: usize,
+        group_by_column: Option<usize>,
+        max_rows: usize,
+        max_groups: usize,
+    ) -> StorageResult<synapse_calyx::olap::OlapScanResult> {
+        self.backend.olap_aggregate_slot(
+            panel_version,
+            slot_id,
+            value_column,
+            group_by_column,
+            max_rows,
+            max_groups,
+        )
+    }
+
+    pub fn timeseries_rollup(
+        &self,
+        collection_name: &str,
+        series: u64,
+        window: synapse_calyx::timeseries::SynapseCalyxRollupWindow,
+        timestamp_ns: u64,
+    ) -> StorageResult<Option<synapse_calyx::timeseries::SynapseCalyxRollupValue>> {
+        self.backend
+            .timeseries_rollup(collection_name, series, window, timestamp_ns)
+    }
+
+    pub fn timeseries_range(
+        &self,
+        collection_name: &str,
+        series: u64,
+        start_timestamp_ns: u64,
+        end_timestamp_ns: u64,
+    ) -> StorageResult<Vec<(u64, f64)>> {
+        self.backend.timeseries_range(
+            collection_name,
+            series,
+            start_timestamp_ns,
+            end_timestamp_ns,
+        )
     }
 
     /// Reconstructs temporal metadata from authoritative timeline or episode
