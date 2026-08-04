@@ -4891,6 +4891,19 @@ async function handlePageScreenshot(params) {
   const tiles = [];
   const captureAttempts = [];
   try {
+    if (before.discarded || before.ready_state === "unloaded") {
+      await chrome.tabs.update(selected.tabId, { active: true });
+      await waitForTabActiveState(
+        selected.tabId,
+        true,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "restore_discarded_tab_activation")
+      );
+      activeForCapture = true;
+      await waitForDiscardedTabDocument(
+        selected.tabId,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "restore_discarded_tab_document")
+      );
+    }
     setup = await runPageScreenshotSetup(selected.tabId, {
       ...request,
       token
@@ -4901,7 +4914,7 @@ async function handlePageScreenshot(params) {
         `pageScreenshot setup failed: ${String(setup.error_detail || "")}`
       );
     }
-    if (!before.active) {
+    if (!activeForCapture) {
       await chrome.tabs.update(selected.tabId, { active: true });
       await waitForTabActiveState(
         selected.tabId,
@@ -5171,6 +5184,24 @@ async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, tim
   }
 }
 
+async function waitForDiscardedTabDocument(tabId, waitTimeoutMs) {
+  const started = Date.now();
+  let last = null;
+  while (Date.now() - started <= waitTimeoutMs) {
+    last = await tabPageState(tabId, null);
+    if (!last.discarded && !last.frozen && last.ready_state === "complete") {
+      return last;
+    }
+    await sleep(50);
+  }
+  throw bridgeError(
+    ERROR_EXTENSION_TIMEOUT,
+    `pageScreenshot could not restore discarded/unloaded tab ${tabId} within ${waitTimeoutMs}ms; ` +
+    `last_discarded=${Boolean(last?.discarded)} last_frozen=${Boolean(last?.frozen)} ` +
+    `last_ready_state=${JSON.stringify(last?.ready_state || "")} remediation=activate or reload the exact tab and verify its main document reaches complete before retrying`
+  );
+}
+
 function normalizePageScreenshotRequest(params, selectedTabId) {
   const scope = normalizePageScreenshotScope(params.scope);
   const clip = normalizePageScreenshotClip(params.clip);
@@ -5344,6 +5375,18 @@ async function runPageScreenshotSetup(tabId, request) {
       args: [request]
     });
   } catch (error) {
+    let lifecycle = null;
+    try {
+      lifecycle = await chrome.tabs.get(tabId);
+    } catch (_) {
+      lifecycle = null;
+    }
+    if (lifecycle?.discarded || lifecycle?.frozen || lifecycle?.status === "unloaded") {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        `pageScreenshot setup lost its live document for tab ${tabId}: discarded=${Boolean(lifecycle?.discarded)} frozen=${Boolean(lifecycle?.frozen)} status=${JSON.stringify(lifecycle?.status || "")}; activate or reload the exact tab and verify its main document reaches complete before retrying; injection_error=${errorMessage(error)}`
+      );
+    }
     throw bridgeError(
       ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
       `chrome.scripting.executeScript pageScreenshot setup(${tabId}) failed: ${errorMessage(error)}`
@@ -15030,6 +15073,8 @@ async function tabPageState(tabId, fallbackTarget = null) {
     url: String(tab.pendingUrl || tab.url || target?.url || fallbackTarget?.url || ""),
     title: String(tab.title || target?.title || fallbackTarget?.title || ""),
     ready_state: String(tab.status || ""),
+    discarded: Boolean(tab.discarded),
+    frozen: Boolean(tab.frozen),
     active: Boolean(tab.active),
     highlighted: Boolean(tab.highlighted),
     pinned: Boolean(tab.pinned),
