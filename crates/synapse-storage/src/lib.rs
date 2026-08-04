@@ -19,14 +19,14 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use backend::{
-    CalyxAnchorBatchWriteReport, CalyxAnchorRow, CalyxAnchorScanReport, CalyxAnchorValueReadback,
-    CalyxAnchorWriteReport, CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect,
-    CalyxVaultInspect, GroundingAnchor, GroundingAnchorSource, GroundingAnchorValue,
-    McpUsageGroundedPublicationReport, PanelLifecycleBackfillReport,
-    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
-    SynapseAnchorSourceCarrier, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
-    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
-    scan_cf_read_only_with_expired,
+    ActionOraclePublicationReport, CalyxAnchorBatchWriteReport, CalyxAnchorRow,
+    CalyxAnchorScanReport, CalyxAnchorValueReadback, CalyxAnchorWriteReport,
+    CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
+    GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
+    PanelLifecycleBackfillReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
+    StorageCfDump, StorageDumpRow, SynapseAnchorSourceCarrier, SynapseSynergyPair,
+    SynapseSynergyReport, dump_cf_read_only, dump_cf_read_only_with_expired,
+    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
@@ -935,6 +935,33 @@ impl Db {
         self.backend.put_recurrence_subject_occurrence(
             kind,
             subject_id,
+            event_time_ns,
+            occurrence_identity,
+            context,
+        )
+    }
+
+    /// Atomically publishes a terminal action audit source row, its measured
+    /// action constellation, and its typed Oracle recurrence occurrence.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed before terminal-row visibility when any source identity,
+    /// measurement, recurrence, ledger, WAL, or physical-row invariant fails.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn put_action_oracle_publication(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &serde_json::Value,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<ActionOraclePublicationReport> {
+        self.backend.put_action_oracle_publication(
+            source_key,
+            raw_bytes,
+            record,
             event_time_ns,
             occurrence_identity,
             context,

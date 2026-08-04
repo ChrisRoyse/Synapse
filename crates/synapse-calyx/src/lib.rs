@@ -34,9 +34,10 @@ use calyx_aster::dedup::EpochSecs;
 use calyx_aster::erase::{EraseRegistry, EraseScope, subject_metadata_value};
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{
-    OccurrenceContext, RecurrenceAppendDisposition, RecurrenceAppendOnceRequest,
-    RecurrenceSeriesReadback, RetentionPolicy, append_occurrence_once,
-    append_occurrence_once_with_rows, read_series_readback,
+    ConstellationRecurrenceAppendRequest, OccurrenceContext, RecurrenceAppendDisposition,
+    RecurrenceAppendOnceRequest, RecurrenceSeriesReadback, RetentionPolicy, append_occurrence_once,
+    append_occurrence_once_with_rows, append_occurrence_with_constellation_and_rows,
+    read_series_readback,
 };
 pub use calyx_aster::vault::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
@@ -1373,6 +1374,16 @@ pub struct SynapseCalyxRecurrenceAppendReadback {
     pub frequency: u64,
     pub active_occurrences: usize,
     pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxAtomicConstellationRecurrenceReadback {
+    pub constellation_cx_id: String,
+    pub recurrence_cx_id: String,
+    pub occurrence_id: u64,
+    pub committed_seq: Seq,
+    pub latest_seq: Seq,
+    pub source_row_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4492,6 +4503,61 @@ impl SynapseCalyxVault {
             frequency: readback.series.frequency,
             active_occurrences: readback.series.occurrences.len(),
             latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Atomically publishes one new measured constellation, its physical KV
+    /// source rows, and one outcome occurrence below an existing recurrence
+    /// subject.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_recurrence_occurrence_with_constellation_rows(
+        &self,
+        recurrence_cx_id: CxId,
+        event_time_secs: i64,
+        observed_at_secs: i64,
+        context: Vec<u8>,
+        occurrence_identity_sha256: [u8; 32],
+        constellation: Constellation,
+        source_rows: Vec<SynapseCalyxCfWrite>,
+        ledger_payload: Vec<u8>,
+    ) -> Result<SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxError> {
+        let context = OccurrenceContext::new(context).map_err(|error| {
+            SynapseCalyxError::from_calyx("validate atomic recurrence context", &error)
+        })?;
+        let constellation_cx_id = constellation.cx_id;
+        let source_row_count = source_rows.len();
+        let outcome = append_occurrence_with_constellation_and_rows(
+            &self.vault,
+            ConstellationRecurrenceAppendRequest {
+                recurrence: RecurrenceAppendOnceRequest {
+                    cx_id: recurrence_cx_id,
+                    t_k: EpochSecs(event_time_secs),
+                    context,
+                    observed_at: EpochSecs(observed_at_secs),
+                    retention: RetentionPolicy::default(),
+                    dedup_key_sha256: occurrence_identity_sha256,
+                },
+                constellation,
+                source_rows: source_rows
+                    .into_iter()
+                    .map(|row| (row.cf, row.key, row.value))
+                    .collect(),
+                ledger_payload,
+            },
+        )
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "atomically append recurrence occurrence with source constellation",
+                &error,
+            )
+        })?;
+        Ok(SynapseCalyxAtomicConstellationRecurrenceReadback {
+            constellation_cx_id: constellation_cx_id.to_string(),
+            recurrence_cx_id: recurrence_cx_id.to_string(),
+            occurrence_id: outcome.occurrence_id.0,
+            committed_seq: outcome.committed_seq,
+            latest_seq: self.vault.latest_seq(),
+            source_row_count,
         })
     }
 

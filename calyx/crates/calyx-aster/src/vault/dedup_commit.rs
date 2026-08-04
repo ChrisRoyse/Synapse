@@ -130,6 +130,74 @@ where
         Ok(seq)
     }
 
+    pub(crate) fn commit_constellation_recurrence_rows_locked(
+        &self,
+        mut constellation: Constellation,
+        updated_base: BaseRowRewrite,
+        recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
+        additional_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        ledger_payload: Vec<u8>,
+    ) -> Result<Seq> {
+        if constellation.vault_id != self.vault_id {
+            return Err(CalyxError::vault_access_denied(
+                "atomic recurrence constellation belongs to another vault",
+            ));
+        }
+        constellation.validate_schema()?;
+        let mut rows = additional_rows
+            .into_iter()
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        let mut hook_guard = match &self.ledger_hook {
+            Some(hook) => Some(ledger_hook::lock_hook(hook)?),
+            None => None,
+        };
+        let staged_ledger = if let Some(hook) = hook_guard.as_deref() {
+            let staged = ledger_hook::stage_ingest_payload(
+                hook,
+                &mut rows,
+                constellation.cx_id,
+                ledger_payload,
+            )?;
+            constellation.provenance = staged
+                .first()
+                .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ingest rows"))?
+                .ledger_ref();
+            Some(staged)
+        } else {
+            constellation.provenance = self.stage_raw_ingest_ledger_locked(
+                &mut rows,
+                constellation.cx_id,
+                ledger_payload,
+            )?;
+            None
+        };
+        self.stage_constellation_rows(&mut rows, &constellation)?;
+        rows.push(encode::WriteRow {
+            cf: ColumnFamily::Base,
+            key: base_key(updated_base.constellation().cx_id),
+            value: updated_base.encode()?,
+        });
+        rows.extend(
+            recurrence_rows
+                .into_iter()
+                .map(|(key, value)| encode::WriteRow {
+                    cf: ColumnFamily::Recurrence,
+                    key,
+                    value,
+                }),
+        );
+        let seq = self.commit_rows_locked(&rows)?;
+        if let (Some(hook), Some(staged)) = (hook_guard.take(), staged_ledger.as_ref()) {
+            self.commit_persistent_ledger_staged_locked(
+                hook,
+                staged,
+                "commit_constellation_recurrence_rows",
+            )?;
+        }
+        Ok(seq)
+    }
+
     pub(crate) fn commit_dedup_undo_locked(
         &self,
         restored: Vec<Constellation>,

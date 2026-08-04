@@ -387,9 +387,6 @@ impl SynapseService {
             )
         })?;
         let audit_key = action_audit_key(ts_ns, seq);
-        runtime
-            .storage_put_action_log_rows(vec![(audit_key.clone(), encoded)])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         if matches!(status, "ok" | "error" | "denied") {
             let outcome = matches!(status, "ok");
             let oracle_context = serde_json::to_vec(&json!({
@@ -405,9 +402,10 @@ impl SynapseService {
                     format!("Oracle action outcome context encode failed: {error}"),
                 )
             })?;
-            runtime
-                .storage_put_action_outcome_occurrence(
-                    tool,
+            let publication = runtime
+                .storage_put_action_oracle_publication(
+                    &audit_key,
+                    &encoded,
                     ts_ns,
                     &audit_key,
                     &oracle_context,
@@ -416,11 +414,28 @@ impl SynapseService {
                     mcp_error(
                         error.code(),
                         format!(
-                            "CALYX_ORACLE_ACTION_EVIDENCE_WRITE_FAILED: terminal action audit row was committed but its Oracle recurrence evidence failed: tool={tool} status={status} source_key_hex={} detail={error}; remediation: inspect CF_ACTION_LOG and the Calyx Base/Recurrence rows, repair the failed projection, and do not treat the action corpus as complete until physical readback agrees",
+                            "CALYX_ORACLE_ACTION_PUBLICATION_FAILED: terminal action source/constellation/recurrence commit failed before source visibility: tool={tool} status={status} source_key_hex={} detail={error}; remediation: inspect the named Calyx commit failure, repair the invariant, and retry the action only after confirming its external side effect state",
                             synapse_storage::constellations::hex_encode(&audit_key)
                         ),
                     )
                 })?;
+            tracing::info!(
+                code = "ACTION_AUDIT_ORACLE_ATOMIC_COMMITTED",
+                tool,
+                status,
+                source_key_hex = %synapse_storage::constellations::hex_encode(&audit_key),
+                subject_cx_id = %publication.subject_cx_id,
+                constellation_cx_id = %publication.constellation_cx_id,
+                occurrence_id = publication.occurrence_id,
+                committed_seq = publication.committed_seq,
+                latest_seq = publication.latest_seq,
+                source_row_count = publication.source_row_count,
+                "terminal action source, constellation, and Oracle occurrence committed atomically"
+            );
+        } else {
+            runtime
+                .storage_put_action_log_rows(vec![(audit_key.clone(), encoded)])
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         }
         drop(runtime);
         tracing::info!(

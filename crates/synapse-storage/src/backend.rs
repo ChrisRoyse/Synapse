@@ -21,17 +21,17 @@ use sha2::{Digest, Sha256};
 use synapse_calyx::{
     AsterOrphanSlotGcReport, SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback,
     SynapseCalyxAnchorReadback, SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
-    SynapseCalyxBackupReport, SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams,
-    SynapseCalyxBlindSpotReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
-    SynapseCalyxCfRows, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
-    SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport,
-    SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
-    SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
-    SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
-    SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, SynapseCalyxHazardReport,
-    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport, SynapseCalyxKernelParams,
-    SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport, SynapseCalyxKernelReport,
-    SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxBackupReport,
+    SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
+    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
+    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxDriftReport,
+    SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport, SynapseCalyxError,
+    SynapseCalyxFindParams, SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
+    SynapseCalyxGroundingGapReport, SynapseCalyxGuardCalibrateParams,
+    SynapseCalyxGuardCalibrateReport, SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport,
+    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport,
+    SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
+    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
     SynapseCalyxPeriodicityReport, SynapseCalyxPersistedNoveltyFinding,
@@ -268,6 +268,16 @@ pub struct CalyxRecurrenceSubjectReport {
     pub subject_panel_version: u32,
     pub subject_disposition: synapse_calyx::SynapseCalyxPutDisposition,
     pub occurrence: SynapseCalyxRecurrenceAppendReadback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActionOraclePublicationReport {
+    pub subject_cx_id: String,
+    pub constellation_cx_id: String,
+    pub occurrence_id: u64,
+    pub committed_seq: u64,
+    pub latest_seq: u64,
+    pub source_row_count: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -656,6 +666,15 @@ pub trait StorageBackend: Send + Sync {
         occurrence_identity: &[u8],
         context: &[u8],
     ) -> StorageResult<CalyxRecurrenceSubjectReport>;
+    fn put_action_oracle_publication(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<ActionOraclePublicationReport>;
     fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -1051,6 +1070,142 @@ impl CalyxVaultRuntime {
             "read live Calyx vault status",
             false,
             |vault| Ok(vault.status()),
+        )
+    }
+
+    fn put_action_oracle_publication_inner(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<ActionOraclePublicationReport> {
+        if context.len() > calyx_aster::recurrence::MAX_CONTEXT_BYTES {
+            return Err(calyx_write_failed_detail(
+                "calyx_action_oracle_publication",
+                format!(
+                    "Oracle context is {} bytes; maximum is {}",
+                    context.len(),
+                    calyx_aster::recurrence::MAX_CONTEXT_BYTES
+                ),
+            ));
+        }
+        self.with_vault(
+            "calyx_action_oracle_publication",
+            "atomically publish terminal action and Oracle occurrence",
+            true,
+            |vault| {
+                let action = record
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        calyx_write_failed_detail(
+                            "calyx_action_oracle_publication",
+                            "terminal action row requires a non-empty tool identity",
+                        )
+                    })?;
+                let subject_id = validate_recurrence_subject_id(action)?;
+                let subject_input = constellations::recurrence_subject_input_bytes(
+                    RecurrenceSubjectKind::Action,
+                    &subject_id,
+                );
+                let subject_cx_id =
+                    vault.cx_id_for_input(&subject_input, SYN_RECURRENCE_SUBJECT_PANEL_VERSION);
+                let created_at_ms = calyx_clock_now_for_write(vault, cf::CF_ACTION_LOG)?;
+                let subject = constellations::build_recurrence_subject_constellation(
+                    NativeConstellationContext {
+                        vault_id: vault.vault_id_value(),
+                        cx_id: subject_cx_id,
+                        created_at_ms,
+                        next_ledger_seq: vault.latest_seq().saturating_add(1),
+                    },
+                    RecurrenceSubjectKind::Action,
+                    &subject_id,
+                    &subject_input,
+                )?;
+                vault
+                    .put_observation_constellation(subject)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_action_oracle_publication",
+                            "ensure stable action recurrence subject",
+                            &source,
+                        )
+                    })?;
+
+                let action_cx_id = vault.cx_id_for_input(raw_bytes, SYN_ACTION_PANEL_VERSION);
+                let action_constellation = constellations::build_action_constellation(
+                    NativeConstellationContext {
+                        vault_id: vault.vault_id_value(),
+                        cx_id: action_cx_id,
+                        created_at_ms,
+                        next_ledger_seq: vault.latest_seq().saturating_add(1),
+                    },
+                    source_key,
+                    raw_bytes,
+                    record,
+                )?;
+                let event_time_secs =
+                    i64::try_from(event_time_ns / 1_000_000_000).map_err(|error| {
+                        calyx_write_failed_detail(
+                            "calyx_action_oracle_publication",
+                            format!("event time does not fit EpochSecs: {error}"),
+                        )
+                    })?;
+                let observed_at_secs = i64::try_from(created_at_ms / 1_000).map_err(|error| {
+                    calyx_write_failed_detail(
+                        "calyx_action_oracle_publication",
+                        format!("Calyx clock does not fit EpochSecs: {error}"),
+                    )
+                })?;
+                let mut identity_hasher = Sha256::new();
+                identity_hasher.update(b"synapse-recurrence-occurrence-v1");
+                identity_hasher.update([0]);
+                identity_hasher.update(RecurrenceSubjectKind::Action.as_str().as_bytes());
+                identity_hasher.update([0]);
+                identity_hasher.update(subject_id.as_bytes());
+                identity_hasher.update([0]);
+                identity_hasher.update(occurrence_identity);
+                let occurrence_identity_sha256: [u8; 32] = identity_hasher.finalize().into();
+                let collection_id = calyx_collection_id_for_cf_write(cf::CF_ACTION_LOG)?;
+                let source_row = calyx_put_row(
+                    cf::CF_ACTION_LOG,
+                    collection_id,
+                    source_key,
+                    raw_bytes,
+                    created_at_ms,
+                )?;
+                let readback: SynapseCalyxAtomicConstellationRecurrenceReadback = vault
+                    .append_recurrence_occurrence_with_constellation_rows(
+                        subject_cx_id,
+                        event_time_secs,
+                        observed_at_secs,
+                        context.to_vec(),
+                        occurrence_identity_sha256,
+                        action_constellation,
+                        vec![source_row],
+                        context.to_vec(),
+                    )
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_action_oracle_publication",
+                            "commit terminal action source/constellation/recurrence rows",
+                            &source,
+                        )
+                    })?;
+                Ok(ActionOraclePublicationReport {
+                    subject_cx_id: readback.recurrence_cx_id,
+                    constellation_cx_id: readback.constellation_cx_id,
+                    occurrence_id: readback.occurrence_id,
+                    committed_seq: readback.committed_seq,
+                    latest_seq: readback.latest_seq,
+                    source_row_count: readback.source_row_count,
+                })
+            },
         )
     }
 
@@ -3482,6 +3637,25 @@ impl StorageBackend for CalyxBackend {
                     None,
                 )
             },
+        )
+    }
+
+    fn put_action_oracle_publication(
+        &self,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &Value,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<ActionOraclePublicationReport> {
+        self.vault.put_action_oracle_publication_inner(
+            source_key,
+            raw_bytes,
+            record,
+            event_time_ns,
+            occurrence_identity,
+            context,
         )
     }
 

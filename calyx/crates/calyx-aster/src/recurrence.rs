@@ -7,6 +7,7 @@ use crate::vault::base_rewrite::BaseRowRewrite;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, VaultStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 
 pub const CALYX_RECURRENCE_CONTEXT_TOO_LARGE: &str = "CALYX_RECURRENCE_CONTEXT_TOO_LARGE";
 pub const CALYX_RECURRENCE_INVALID_RETENTION: &str = "CALYX_RECURRENCE_INVALID_RETENTION";
@@ -230,6 +231,119 @@ pub struct RecurrenceAppendOnceRequest {
     pub observed_at: EpochSecs,
     pub retention: RetentionPolicy,
     pub dedup_key_sha256: [u8; 32],
+}
+
+pub struct ConstellationRecurrenceAppendRequest {
+    pub recurrence: RecurrenceAppendOnceRequest,
+    pub constellation: Constellation,
+    pub source_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    pub ledger_payload: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstellationRecurrenceAppendOutcome {
+    pub occurrence_id: OccurrenceId,
+    pub committed_seq: Seq,
+}
+
+/// Atomically inserts one new constellation, caller-owned source rows, and an
+/// occurrence below an existing recurrence subject.
+pub fn append_occurrence_with_constellation_and_rows<C>(
+    vault: &AsterVault<C>,
+    request: ConstellationRecurrenceAppendRequest,
+) -> Result<ConstellationRecurrenceAppendOutcome>
+where
+    C: Clock,
+{
+    let ConstellationRecurrenceAppendRequest {
+        recurrence,
+        constellation,
+        source_rows,
+        ledger_payload,
+    } = request;
+    if constellation.vault_id != vault.vault_id() {
+        return Err(CalyxError::vault_access_denied(
+            "atomic recurrence constellation belongs to another vault",
+        ));
+    }
+    constellation.validate_schema()?;
+    if source_rows.is_empty() {
+        return Err(CalyxError::aster_corrupt_shard(
+            "atomic recurrence publication requires at least one source row",
+        ));
+    }
+    let mut source_keys = BTreeSet::new();
+    for (cf, key, _value) in &source_rows {
+        if *cf != ColumnFamily::Kv || key.is_empty() || !source_keys.insert(key.clone()) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "atomic recurrence source rows must be non-empty unique KV keys",
+            ));
+        }
+    }
+    let RecurrenceAppendOnceRequest {
+        cx_id,
+        t_k,
+        context,
+        observed_at,
+        retention,
+        dedup_key_sha256,
+    } = recurrence;
+    vault.with_recurrence_write_lock(|| {
+        let latest = vault.snapshot();
+        if vault
+            .read_cf_at(latest, ColumnFamily::Base, &base_key(constellation.cx_id))?
+            .is_some()
+        {
+            return Err(CalyxError::ledger_append_only_violation(format!(
+                "atomic recurrence constellation already exists: {}",
+                constellation.cx_id
+            )));
+        }
+        for (_cf, key, _value) in &source_rows {
+            if vault.read_cf_at(latest, ColumnFamily::Kv, key)?.is_some() {
+                return Err(CalyxError::ledger_append_only_violation(format!(
+                    "atomic recurrence source row already exists: key_len={}",
+                    key.len()
+                )));
+            }
+        }
+        let base = read_base(vault, cx_id)?.ok_or_else(|| {
+            CalyxError::stale_derived(
+                "recurrence append requires an existing subject constellation",
+            )
+        })?;
+        let existing = read_rows(vault, cx_id)?;
+        if existing.dedup_evidence(dedup_key_sha256).is_some() {
+            return Err(recurrence_error(
+                CALYX_RECURRENCE_OCCURRENCE_CONFLICT,
+                format!(
+                    "atomic recurrence occurrence identity {} for {cx_id} already exists",
+                    hex32(dedup_key_sha256)
+                ),
+            ));
+        }
+        let append = build_append(
+            vault,
+            base,
+            t_k,
+            context,
+            observed_at,
+            retention,
+            Some(dedup_key_sha256),
+        )?;
+        let occurrence_id = append.occurrence_id;
+        let committed_seq = vault.commit_constellation_recurrence_rows_locked(
+            constellation,
+            append.updated_base,
+            append.recurrence_rows,
+            source_rows,
+            ledger_payload,
+        )?;
+        Ok(ConstellationRecurrenceAppendOutcome {
+            occurrence_id,
+            committed_seq,
+        })
+    })
 }
 
 /// Appends one idempotent occurrence and caller-owned rows in the same commit.
