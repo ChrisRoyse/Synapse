@@ -15,6 +15,8 @@ pub mod lens_provenance;
 pub mod lineage;
 pub mod lowering;
 mod math;
+mod readiness;
+pub use readiness::SynapseCalyxReadinessSnapshot;
 pub mod panel_lifecycle;
 pub mod vault_runtime;
 pub mod ward;

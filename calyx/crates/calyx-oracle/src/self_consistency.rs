@@ -31,6 +31,25 @@ where
     oracle_self_consistency_from_evidence(vault, &domain, &evidence, clock)
 }
 
+/// Measures grounded Oracle self-consistency without appending an audit row.
+/// Read-only health observation must never advance the vault.
+pub fn oracle_self_consistency_read_only<C>(
+    vault: &AsterVault<C>,
+    domain: DomainId,
+) -> Result<OracleSelfConsistency, OracleError>
+where
+    C: Clock,
+{
+    let evidence = OracleEvidence::load(vault, &domain)?;
+    let stats = consistency_stats(&domain, &evidence)?;
+    Ok(OracleSelfConsistency::with_provenance(
+        stats.flakiness,
+        stats.validity,
+        stats.provisional,
+        None,
+    ))
+}
+
 pub(crate) fn oracle_self_consistency_from_evidence<C>(
     vault: &AsterVault<C>,
     domain: &DomainId,

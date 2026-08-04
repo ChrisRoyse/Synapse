@@ -989,6 +989,14 @@ impl Db {
         self.backend.oracle_complete_action(cx_id, free_slots)
     }
 
+    pub fn oracle_measure_readiness(&self) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_measure_readiness()
+    }
+
+    pub fn oracle_readiness(&self) -> StorageResult<Option<serde_json::Value>> {
+        self.backend.oracle_readiness()
+    }
+
     /// Commits one validated recurrence notification intent to Calyx
     /// `Reactive` and independently reads the exact bytes back.
     ///

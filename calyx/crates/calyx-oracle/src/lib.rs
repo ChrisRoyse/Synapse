@@ -54,6 +54,7 @@ pub use reverse_query::{
 pub use self_consistency::{
     MIN_FLAKINESS_PAIRS, MIN_VALIDITY_SAMPLES, ORACLE_DOMAIN_METADATA_KEY,
     ORACLE_FALLBACK_DOMAIN_METADATA_KEY, oracle_self_consistency,
+    oracle_self_consistency_read_only,
 };
 pub use super_intel::{
     HeldOutSplit, KERNEL_RECALL_RATIO, KernelRecallGate, KernelRecallSource,

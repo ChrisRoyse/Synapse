@@ -19,6 +19,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let db = Db::open(&root, SCHEMA_VERSION)?;
 
     println!("BEFORE seq={} action_rows={}", seq(&db)?, action_rows(&db)?);
+    let readiness_absent_before = seq(&db)?;
+    println!(
+        "READINESS_ABSENT before_seq={readiness_absent_before} after_seq={} present={}",
+        seq(&db)?,
+        db.oracle_readiness()?.is_some()
+    );
 
     let empty_before = seq(&db)?;
     let empty = db.oracle_predict_action("");
@@ -81,6 +87,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         seq(&db)?
     );
 
+    let readiness_before = seq(&db)?;
+    let readiness = db.oracle_measure_readiness()?;
+    println!(
+        "HAPPY_READINESS before_seq={readiness_before} after_seq={} result={readiness}",
+        seq(&db)?
+    );
+    let readiness_read_before = seq(&db)?;
+    let readiness_read = db.oracle_readiness()?.ok_or("readiness snapshot missing")?;
+    println!(
+        "READINESS_READBACK before_seq={readiness_read_before} after_seq={} result={readiness_read}",
+        seq(&db)?
+    );
+
     let empty_free_before = seq(&db)?;
     let empty_free = db.oracle_complete_action(&completion_cx, &[]);
     println!(
@@ -131,6 +150,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let recurrence = readback.scan_cf_at(final_seq, ColumnFamily::Recurrence)?;
     let assay = readback.scan_cf_at(final_seq, ColumnFamily::Assay)?;
     let ledger = readback.scan_cf_at(final_seq, ColumnFamily::Ledger)?;
+    let anneal_report = readback.scan_cf_at(final_seq, ColumnFamily::AnnealReport)?;
     let completion_ledger_rows = ledger
         .iter()
         .filter(|(_, value)| {
@@ -140,17 +160,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .count();
     println!(
-        "PHYSICAL_SOT snapshot={final_seq} Base={} Anchors={} Recurrence={} Assay={} Ledger={} completion_ledger_rows={completion_ledger_rows} panel={SYN_ACTION_PANEL_VERSION}",
+        "PHYSICAL_SOT snapshot={final_seq} Base={} Anchors={} Recurrence={} Assay={} Ledger={} AnnealReport={} completion_ledger_rows={completion_ledger_rows} panel={SYN_ACTION_PANEL_VERSION}",
         base.len(),
         anchors.len(),
         recurrence.len(),
         assay.len(),
-        ledger.len()
+        ledger.len(),
+        anneal_report.len()
     );
     if anchors.len() != (ROWS_PER_CLASS * 2) as usize
         || assay.is_empty()
         || ledger.is_empty()
         || completion_ledger_rows != 1
+        || anneal_report.len() != 1
     {
         return Err(
             "physical Oracle source-of-truth rows do not match the triggered corpus".into(),

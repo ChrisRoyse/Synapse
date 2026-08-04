@@ -121,6 +121,10 @@ pub struct CalyxRowGuardSiteStatus {
 pub struct SubsystemHealth {
     pub status: String,
     pub detail: Option<String>,
+    /// Last persisted six-tier Oracle readiness snapshot. Health reads this
+    /// artifact without recomputation or mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oracle_readiness: Option<serde_json::Value>,
     /// Full 40-hex commit the running binary was compiled from (#1971).
     ///
     /// `None` means the binary was built with

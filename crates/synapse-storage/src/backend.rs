@@ -678,6 +678,8 @@ pub trait StorageBackend: Send + Sync {
     fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value>;
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value>;
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value>;
+    fn oracle_measure_readiness(&self) -> StorageResult<Value>;
+    fn oracle_readiness(&self) -> StorageResult<Option<Value>>;
     fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -1211,6 +1213,62 @@ impl CalyxVaultRuntime {
             vault
                 .oracle_complete(cx_id, &panel, "synapse.action", &free_slots)
                 .map_err(|source| calyx_write_failed("calyx_oracle", "complete action constellation", &source))
+        })
+    }
+
+    fn oracle_measure_readiness(&self) -> StorageResult<Value> {
+        self.with_vault("calyx_oracle", "measure action readiness", true, |vault| {
+            let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
+            let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+                .ok_or_else(|| calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent"))?
+                .panel;
+            let assay = synapse_calyx::SynapseCalyxAssayParams::new(
+                SYN_ACTION_PANEL_VERSION,
+                "reward".to_owned(),
+            )
+            .with_corpus_shard("synapse.action".to_owned())
+            .with_lens_names(crate::constellations::syn_slot_lens_names());
+            let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
+                calyx_write_failed(
+                    "calyx_oracle",
+                    "measure calibrated action-panel capability before readiness",
+                    &source,
+                )
+            })?;
+            panel
+                .slots
+                .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
+            if panel.slots.is_empty() {
+                return Err(calyx_write_failed_detail(
+                    "calyx_oracle",
+                    "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before readiness",
+                ));
+            }
+            let snapshot = vault.measure_action_readiness(&panel).map_err(|source| {
+                calyx_write_failed("calyx_oracle", "measure action readiness", &source)
+            })?;
+            serde_json::to_value(snapshot).map_err(|error| {
+                calyx_write_failed_detail("calyx_oracle", format!("encode readiness snapshot: {error}"))
+            })
+        })
+    }
+
+    fn oracle_readiness(&self) -> StorageResult<Option<Value>> {
+        self.with_vault("calyx_oracle", "read action readiness", false, |vault| {
+            vault
+                .read_action_readiness()
+                .map_err(|source| {
+                    calyx_operation_failed("calyx_oracle", false, source.to_string())
+                })?
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| {
+                    calyx_operation_failed(
+                        "calyx_oracle",
+                        false,
+                        format!("encode readiness snapshot: {error}"),
+                    )
+                })
         })
     }
 
@@ -3836,6 +3894,14 @@ impl StorageBackend for CalyxBackend {
 
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value> {
         self.vault.oracle_complete_action(cx_id, free_slots)
+    }
+
+    fn oracle_measure_readiness(&self) -> StorageResult<Value> {
+        self.vault.oracle_measure_readiness()
+    }
+
+    fn oracle_readiness(&self) -> StorageResult<Option<Value>> {
+        self.vault.oracle_readiness()
     }
 
     fn persist_recurrence_finding(

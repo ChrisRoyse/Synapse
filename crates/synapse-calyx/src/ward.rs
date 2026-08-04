@@ -416,6 +416,47 @@ struct AdjudicatedCorpus {
 }
 
 impl SynapseCalyxVault {
+    /// Reads the worst per-slot false-accept rate from the persisted calibrated
+    /// guard for a panel. This is a read-only readiness input.
+    pub fn guard_calibration_far(&self, panel_version: u32) -> Result<f32, SynapseCalyxError> {
+        let panel_key = Self::guard_profile_key(panel_version);
+        let row = self
+            .read_cf_latest(ColumnFamily::Guard, &panel_key)?
+            .ok_or_else(|| {
+                guard_error(
+                    calyx_ward::CALYX_GUARD_PROVISIONAL,
+                    format!("no calibrated Ward profile is persisted for panel {panel_version}"),
+                    "run hygiene operation=guard_calibrate for this panel",
+                )
+            })?;
+        let profile: GuardProfile = serde_json::from_slice(&row).map_err(|error| {
+            guard_error(
+                calyx_ward::CALYX_GUARD_PROVISIONAL,
+                format!("decode persisted guard profile for readiness: {error}"),
+                "repair or recalibrate the corrupt guard profile",
+            )
+        })?;
+        if profile.panel_version != panel_version || !profile.is_calibrated() {
+            return Err(guard_error(
+                calyx_ward::CALYX_GUARD_PROVISIONAL,
+                format!("guard profile is not calibrated for panel {panel_version}"),
+                "run hygiene operation=guard_calibrate for this panel",
+            ));
+        }
+        let calibration = profile.calibration.as_ref().ok_or_else(|| {
+            guard_error(
+                calyx_ward::CALYX_GUARD_PROVISIONAL,
+                "calibrated guard profile has no calibration measurement".to_owned(),
+                "recalibrate the guard from held-out good and bad cases",
+            )
+        })?;
+        Ok(calibration
+            .per_slot
+            .values()
+            .map(|slot| slot.far)
+            .fold(calibration.far, f32::max))
+    }
+
     /// Calibrates a Ward [`GuardProfile`] from the vault's adjudicated corpus and
     /// persists it to the native `Guard` CF under the key the guarded-search
     /// consumer reads, then reads that row back and re-decodes it.

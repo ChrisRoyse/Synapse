@@ -1130,6 +1130,11 @@ impl M3State {
             .unwrap_or_else(|| self.calyx_vault_status.clone())
     }
 
+    pub fn oracle_readiness(&self) -> Option<Result<Option<serde_json::Value>, String>> {
+        let db = self.db.as_ref()?;
+        Some(db.oracle_readiness().map_err(|error| error.to_string()))
+    }
+
     /// Read-only persisted-search-generation state, or the storage error that
     /// prevented reading it (issue #1891).
     ///

@@ -1220,6 +1220,14 @@ pub(super) async fn handle(
                             },
                         )
                     }
+                    StorageIntelligenceOperation::OracleReadiness => {
+                        crate::m3::storage::run_intelligence_oracle_readiness(&db, &spec).map(
+                            |oracle| StorageIntelligenceResponse {
+                                oracle: Some(oracle),
+                                ..base
+                            },
+                        )
+                    }
                     StorageIntelligenceOperation::EnsembleCard => {
                         crate::m3::storage::run_intelligence_ensemble_card(&db, &spec).map(
                             |ensemble_card| StorageIntelligenceResponse {

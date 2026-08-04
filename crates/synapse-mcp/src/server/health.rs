@@ -517,6 +517,10 @@ impl SynapseService {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("calyx_vault".to_owned(), self.calyx_vault_health());
+        subsystems.insert(
+            "oracle_readiness".to_owned(),
+            self.oracle_readiness_health(),
+        );
         subsystems.insert("calyx_hot_path".to_owned(), self.calyx_hot_path_health());
         subsystems.insert(
             "calyx_search_generation".to_owned(),
@@ -1180,6 +1184,42 @@ impl SynapseService {
             calyx_lens_degenerate_lane_keys: (!degenerate_lane_keys.is_empty())
                 .then_some(degenerate_lane_keys),
             ..SubsystemHealth::default()
+        }
+    }
+
+    fn oracle_readiness_health(&self) -> SubsystemHealth {
+        let readback = match self.m3_state.try_lock() {
+            Ok(state) => state.oracle_readiness(),
+            Err(error) => return state_lock_unavailable_health("M3", error),
+        };
+        match readback {
+            None => SubsystemHealth {
+                status: "disabled".to_owned(),
+                detail: Some("the Calyx vault is not open, so Oracle readiness has no source of truth".to_owned()),
+                ..SubsystemHealth::default()
+            },
+            Some(Ok(None)) => SubsystemHealth {
+                status: "unmeasured".to_owned(),
+                detail: Some("no persisted action readiness snapshot exists; run storage intelligence oracle_readiness".to_owned()),
+                ..SubsystemHealth::default()
+            },
+            Some(Ok(Some(snapshot))) => {
+                let ready = snapshot
+                    .pointer("/report/overall")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                SubsystemHealth {
+                    status: if ready { "ok" } else { "not_ready" }.to_owned(),
+                    detail: Some("persisted six-tier action-domain Oracle readiness predicate".to_owned()),
+                    oracle_readiness: Some(snapshot),
+                    ..SubsystemHealth::default()
+                }
+            }
+            Some(Err(error)) => SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!("read persisted Oracle readiness snapshot: {error}")),
+                ..SubsystemHealth::default()
+            },
         }
     }
 
