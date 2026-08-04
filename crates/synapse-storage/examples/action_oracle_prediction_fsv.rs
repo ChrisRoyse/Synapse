@@ -36,6 +36,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         unknown.as_ref().err().map_or("none", |error| error.code())
     );
 
+    let mut completion_cx = None;
     for index in 0..ROWS_PER_CLASS * 2 {
         let outcome = index >= ROWS_PER_CLASS;
         let tool = if outcome { "fsv_succeeds" } else { "fsv_fails" };
@@ -51,7 +52,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 3 * 3_600_000_000_000
             }
             + class_index * 1_000_000_000;
-        publish(&db, index, ts_ns, tool, outcome)?;
+        let cx_id = publish(&db, index, ts_ns, tool, outcome)?;
+        if outcome && completion_cx.is_none() {
+            completion_cx = Some(cx_id);
+        }
     }
     println!(
         "INGEST_READBACK seq={} action_rows={} expected={}",
@@ -68,6 +72,45 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     let reverse = db.oracle_reverse_action(false)?;
     println!("HAPPY_REVERSE after_seq={} result={reverse}", seq(&db)?);
+
+    let completion_cx = completion_cx.ok_or("completion fixture cx missing")?;
+    let complete_before = seq(&db)?;
+    let completion = db.oracle_complete_action(&completion_cx, &[50])?;
+    println!(
+        "HAPPY_COMPLETE before_seq={complete_before} after_seq={} cx_id={completion_cx} result={completion}",
+        seq(&db)?
+    );
+
+    let empty_free_before = seq(&db)?;
+    let empty_free = db.oracle_complete_action(&completion_cx, &[]);
+    println!(
+        "EDGE_COMPLETE_EMPTY_FREE before_seq={empty_free_before} after_seq={} code={}",
+        seq(&db)?,
+        empty_free
+            .as_ref()
+            .err()
+            .map_or("none", |error| error.code())
+    );
+    let unknown_slot_before = seq(&db)?;
+    let unknown_slot = db.oracle_complete_action(&completion_cx, &[999]);
+    println!(
+        "EDGE_COMPLETE_UNKNOWN_SLOT before_seq={unknown_slot_before} after_seq={} code={}",
+        seq(&db)?,
+        unknown_slot
+            .as_ref()
+            .err()
+            .map_or("none", |error| error.code())
+    );
+    let invalid_cx_before = seq(&db)?;
+    let invalid_cx = db.oracle_complete_action("not-a-cx", &[50]);
+    println!(
+        "EDGE_COMPLETE_INVALID_CX before_seq={invalid_cx_before} after_seq={} code={}",
+        seq(&db)?,
+        invalid_cx
+            .as_ref()
+            .err()
+            .map_or("none", |error| error.code())
+    );
 
     let absent_before = seq(&db)?;
     let absent = db.oracle_predict_action("never_observed");
@@ -88,15 +131,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let recurrence = readback.scan_cf_at(final_seq, ColumnFamily::Recurrence)?;
     let assay = readback.scan_cf_at(final_seq, ColumnFamily::Assay)?;
     let ledger = readback.scan_cf_at(final_seq, ColumnFamily::Ledger)?;
+    let completion_ledger_rows = ledger
+        .iter()
+        .filter(|(_, value)| {
+            value
+                .windows(b"oracle_completion_v1".len())
+                .any(|window| window == b"oracle_completion_v1")
+        })
+        .count();
     println!(
-        "PHYSICAL_SOT snapshot={final_seq} Base={} Anchors={} Recurrence={} Assay={} Ledger={} panel={SYN_ACTION_PANEL_VERSION}",
+        "PHYSICAL_SOT snapshot={final_seq} Base={} Anchors={} Recurrence={} Assay={} Ledger={} completion_ledger_rows={completion_ledger_rows} panel={SYN_ACTION_PANEL_VERSION}",
         base.len(),
         anchors.len(),
         recurrence.len(),
         assay.len(),
         ledger.len()
     );
-    if anchors.len() != (ROWS_PER_CLASS * 2) as usize || assay.is_empty() || ledger.is_empty() {
+    if anchors.len() != (ROWS_PER_CLASS * 2) as usize
+        || assay.is_empty()
+        || ledger.is_empty()
+        || completion_ledger_rows != 1
+    {
         return Err(
             "physical Oracle source-of-truth rows do not match the triggered corpus".into(),
         );
@@ -110,7 +165,7 @@ fn publish(
     ts_ns: u64,
     tool: &str,
     outcome: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<String, Box<dyn Error>> {
     let key = ts_ns.to_be_bytes();
     let status = if outcome { "ok" } else { "error" };
     let record = json!({
@@ -137,8 +192,8 @@ fn publish(
         },
         "source_action_audit_key_hex": synapse_storage::constellations::hex_encode(&key),
     }))?;
-    db.put_action_oracle_publication(&key, &raw, &record, ts_ns, &key, &context)?;
-    Ok(())
+    let report = db.put_action_oracle_publication(&key, &raw, &record, ts_ns, &key, &context)?;
+    Ok(report.constellation_cx_id)
 }
 
 fn seq(db: &Db) -> Result<u64, Box<dyn Error>> {

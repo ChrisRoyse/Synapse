@@ -1437,6 +1437,7 @@ pub enum StorageIntelligenceOperation {
     KernelAnswer,
     OraclePredict,
     OracleReverse,
+    OracleComplete,
     /// The ensemble capability card: per-lens marginal value, the PID triple,
     /// the A37 associational-diversity gate, and a keep/park/retire verdict
     /// (#1668's admission gate; wired for #1944 ask 1).
@@ -1461,6 +1462,7 @@ impl StorageIntelligenceOperation {
             Self::KernelAnswer => "kernel_answer",
             Self::OraclePredict => "oracle_predict",
             Self::OracleReverse => "oracle_reverse",
+            Self::OracleComplete => "oracle_complete",
             Self::EnsembleCard => "ensemble_card",
         }
     }
@@ -1584,6 +1586,10 @@ pub struct StorageIntelligenceParams {
     /// (`oracle_reverse`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<bool>,
+    /// Action constellation to complete (`oracle_complete` uses `query_cx_id`).
+    /// These panel slot ids are inferred; every other declared slot is clamped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free_slots: Vec<u16>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
@@ -2324,7 +2330,7 @@ pub struct StorageIntelligenceResponse {
     pub kernel: Option<StorageIntelligenceKernelReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kernel_answer: Option<StorageIntelligenceKernelAnswerReport>,
-    /// Native Calyx Oracle result for `oracle_predict`/`oracle_reverse`.
+    /// Native Calyx Oracle result for prediction, reverse walk, or completion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oracle: Option<serde_json::Value>,
     /// Populated by `operation=ensemble_card`.
@@ -4409,6 +4415,34 @@ pub fn run_intelligence_oracle_reverse(
         )
     })?;
     db.oracle_reverse_action(outcome)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+/// Completes explicitly free action slots from persisted grounded peers.
+pub fn run_intelligence_oracle_complete(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<serde_json::Value, ErrorData> {
+    require_action_panel(params, "oracle_complete")?;
+    let cx_id = params
+        .query_cx_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "storage operation=intelligence sub_operation=oracle_complete requires query_cx_id"
+                    .to_owned(),
+            )
+        })?;
+    if params.free_slots.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=intelligence sub_operation=oracle_complete requires at least one free_slots entry".to_owned(),
+        ));
+    }
+    db.oracle_complete_action(cx_id, &params.free_slots)
         .map_err(|error| mcp_error(error.code(), error.to_string()))
 }
 

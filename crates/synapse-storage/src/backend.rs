@@ -677,6 +677,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> StorageResult<ActionOraclePublicationReport>;
     fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value>;
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value>;
+    fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value>;
     fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -1135,6 +1136,82 @@ impl CalyxVaultRuntime {
                     })
             },
         )
+    }
+
+    fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value> {
+        let cx_id = cx_id.parse::<calyx_core::CxId>().map_err(|error| {
+            let source = SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CX_ID_INVALID",
+                format!("invalid completion cx_id: {error}"),
+                "supply the exact 32-hex-character constellation id read from the action panel",
+            );
+            calyx_write_failed("calyx_oracle", "parse completion constellation id", &source)
+        })?;
+        self.with_vault("calyx_oracle", "complete action constellation", true, |vault| {
+            let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
+            let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+                .ok_or_else(|| calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent"))?
+                .panel;
+            if free_slots.is_empty() {
+                let source = SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ORACLE_COMPLETION_FREE_EMPTY",
+                    "Oracle completion requires at least one explicitly free slot",
+                    "supply one or more slot ids from the declared action panel contract",
+                );
+                return Err(calyx_write_failed("calyx_oracle", "validate completion slots", &source));
+            }
+            if let Some(slot_id) = free_slots.iter().find(|slot_id| {
+                !panel.slots.iter().any(|slot| slot.slot_id.get() == **slot_id)
+            }) {
+                let source = SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ORACLE_COMPLETION_SLOT_UNKNOWN",
+                    format!("slot {slot_id} is not declared by action panel {SYN_ACTION_PANEL_VERSION}"),
+                    "read the active action panel contract and supply only one of its slot ids",
+                );
+                return Err(calyx_write_failed("calyx_oracle", "validate completion slots", &source));
+            }
+            let target = vault.hydrate_constellation_latest(cx_id).map_err(|source| {
+                calyx_write_failed("calyx_oracle", "read completion target", &source)
+            })?;
+            if target.panel_version != SYN_ACTION_PANEL_VERSION {
+                let source = SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ORACLE_COMPLETION_PANEL_MISMATCH",
+                    format!("constellation {cx_id} belongs to panel {}, not {SYN_ACTION_PANEL_VERSION}", target.panel_version),
+                    "supply a constellation id read from the active action panel",
+                );
+                return Err(calyx_write_failed("calyx_oracle", "validate completion target", &source));
+            }
+            let assay = synapse_calyx::SynapseCalyxAssayParams::new(
+                SYN_ACTION_PANEL_VERSION,
+                "reward".to_owned(),
+            )
+            .with_corpus_shard("synapse.action".to_owned())
+            .with_lens_names(crate::constellations::syn_slot_lens_names());
+            let capability = vault.assay_ensemble_card(&assay, 2).map_err(|source| {
+                calyx_write_failed(
+                    "calyx_oracle",
+                    "measure calibrated action-panel capability before completion",
+                    &source,
+                )
+            })?;
+            panel
+                .slots
+                .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
+            if panel.slots.is_empty() {
+                return Err(calyx_write_failed_detail(
+                    "calyx_oracle",
+                    "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before completion",
+                ));
+            }
+            let free_slots = free_slots
+                .iter()
+                .copied()
+                .map(calyx_core::SlotId::new)
+                .collect::<std::collections::BTreeSet<_>>();
+            vault
+                .oracle_complete(cx_id, &panel, "synapse.action", &free_slots)
+                .map_err(|source| calyx_write_failed("calyx_oracle", "complete action constellation", &source))
+        })
     }
 
     fn put_action_oracle_publication_inner(
@@ -3755,6 +3832,10 @@ impl StorageBackend for CalyxBackend {
 
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value> {
         self.vault.oracle_reverse_action(outcome)
+    }
+
+    fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value> {
+        self.vault.oracle_complete_action(cx_id, free_slots)
     }
 
     fn persist_recurrence_finding(

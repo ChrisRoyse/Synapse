@@ -28,8 +28,8 @@ use calyx_assay::{
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
-    Anchor, AnchorKind, AnchorValue, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
-    PanelSlotId, SlotId, SlotVector, SparseEntry, SystemClock, Ts,
+    AbsentReason, Anchor, AnchorKind, AnchorValue, Constellation, CxId,
+    METADATA_SOURCE_EVENT_TIME_RAW, PanelSlotId, SlotId, SlotVector, SparseEntry, SystemClock, Ts,
 };
 use calyx_forge::{Backend, KnnMetric};
 use calyx_lodestar::{
@@ -43,7 +43,9 @@ use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
     StaticPairGainGate, cross_term_upper_bound, dda_signal_yield, plan_cross_terms,
 };
+use calyx_oracle::{AnnealConfig, DomainId, SlotSet, WardCompletionRegion};
 use calyx_paths::AssocGraph;
+use calyx_ward::TrustedRegion;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1088,6 +1090,139 @@ struct DenseCorpus {
     densified_sparse_slots: BTreeMap<SlotId, usize>,
     /// Slots the loader could not carry, mapped to the named reason (#1939).
     unusable_slots: BTreeMap<SlotId, String>,
+}
+
+struct PersistedAnnealDefaults;
+
+impl AnnealConfig for PersistedAnnealDefaults {
+    fn energy_beta(&self, _domain: &DomainId) -> Option<f32> {
+        Some(calyx_oracle::DEFAULT_BETA)
+    }
+}
+
+impl SynapseCalyxVault {
+    /// Completes selected action-panel slots from the bounded persisted trusted
+    /// region and records both the measured self-consistency and completion in
+    /// the append-only ledger.
+    pub fn oracle_complete(
+        &self,
+        cx_id: CxId,
+        panel: &calyx_core::Panel,
+        domain: &str,
+        free_slot_ids: &BTreeSet<SlotId>,
+    ) -> Result<serde_json::Value, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("oracle_complete");
+        if free_slot_ids.is_empty() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_COMPLETION_FREE_EMPTY",
+                "Oracle completion requires at least one explicitly free slot",
+                "supply one or more slot ids from the declared panel contract",
+            ));
+        }
+        let by_slot = panel
+            .slots
+            .iter()
+            .map(|slot| (slot.slot_id, slot.lens_id))
+            .collect::<BTreeMap<_, _>>();
+        for slot_id in free_slot_ids {
+            if !by_slot.contains_key(slot_id) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ORACLE_COMPLETION_SLOT_UNKNOWN",
+                    format!(
+                        "slot {} is not declared by panel {}",
+                        slot_id.get(),
+                        panel.version
+                    ),
+                    "read the active panel contract and supply only one of its slot ids",
+                ));
+            }
+        }
+        let mut cx = self.hydrate_constellation_latest(cx_id)?;
+        if cx.panel_version != panel.version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_COMPLETION_PANEL_MISMATCH",
+                format!(
+                    "constellation {cx_id} belongs to panel {}, not {}",
+                    cx.panel_version, panel.version
+                ),
+                "supply a constellation id read from the requested panel",
+            ));
+        }
+        for slot_id in free_slot_ids {
+            cx.slots.insert(
+                *slot_id,
+                SlotVector::Absent {
+                    reason: AbsentReason::Deferred,
+                },
+            );
+        }
+        let corpus =
+            self.load_panel_dense_corpus(panel.version, SYNAPSE_INTELLIGENCE_MAX_RECORDS)?;
+        let regions = corpus
+            .records
+            .into_iter()
+            .filter(|record| record.cx_id != cx_id && !record.anchors.is_empty())
+            .map(|record| TrustedRegion {
+                cx_id: record.cx_id,
+                slots: record.slots,
+            })
+            .collect::<Vec<_>>();
+        if regions.is_empty() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_COMPLETION_REGION_EMPTY",
+                format!(
+                    "panel {} has no other anchored trusted-region members",
+                    panel.version
+                ),
+                "ingest and ground other panel records before requesting completion",
+            ));
+        }
+        let free = free_slot_ids
+            .iter()
+            .filter_map(|slot_id| by_slot.get(slot_id).copied())
+            .collect::<SlotSet>();
+        let clamp = by_slot
+            .iter()
+            .filter(|(slot_id, _)| !free_slot_ids.contains(slot_id))
+            .map(|(_, lens_id)| *lens_id)
+            .collect::<SlotSet>();
+        let domain = DomainId::new(domain);
+        let clock = SystemClock;
+        let consistency =
+            calyx_oracle::oracle_self_consistency(&self.vault, domain.clone(), &clock).map_err(
+                |error| {
+                    let error: calyx_core::CalyxError = error.into();
+                    SynapseCalyxError::from_calyx(
+                        "measure Oracle self-consistency before completion",
+                        &error,
+                    )
+                },
+            )?;
+        let region = WardCompletionRegion::new(panel, &regions);
+        let result = calyx_oracle::complete(
+            &self.vault,
+            &cx,
+            panel,
+            domain,
+            clamp,
+            free,
+            &region,
+            consistency,
+            &PersistedAnnealDefaults,
+            &clock,
+        )
+        .map_err(|error| {
+            let error: calyx_core::CalyxError = error.into();
+            SynapseCalyxError::from_calyx("complete Oracle constellation", &error)
+        })?;
+        serde_json::to_value(result).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_ORACLE_RESPONSE_ENCODE_FAILED",
+                format!("encode Oracle completion response: {error}"),
+                "preserve the vault and inspect the Oracle completion result schema",
+            )
+        })
+    }
 }
 
 impl DenseCorpus {

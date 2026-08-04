@@ -980,6 +980,15 @@ impl Db {
         self.backend.oracle_reverse_action(outcome)
     }
 
+    /// Completes explicitly selected action slots from grounded persisted peers.
+    pub fn oracle_complete_action(
+        &self,
+        cx_id: &str,
+        free_slots: &[u16],
+    ) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_complete_action(cx_id, free_slots)
+    }
+
     /// Commits one validated recurrence notification intent to Calyx
     /// `Reactive` and independently reads the exact bytes back.
     ///
