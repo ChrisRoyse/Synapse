@@ -838,6 +838,16 @@ impl SynapseCalyxVault {
         let mut densified_sparse_slots: BTreeMap<SlotId, usize> = BTreeMap::new();
         let mut unusable_slots: BTreeMap<SlotId, String> = BTreeMap::new();
         for (slot, support) in &sparse_support {
+            if support.is_empty() {
+                unusable_slots.insert(
+                    *slot,
+                    format!(
+                        "sparse lens has empty observed support across the {} loaded record(s). The stored all-zero sparse value remains exact, but an observed-support densifier cannot manufacture a zero-dimensional vector for Loom/KSG/kNN",
+                        records.len()
+                    ),
+                );
+                continue;
+            }
             if support.len() > SYNAPSE_SPARSE_SLOT_MAX_SUPPORT {
                 unusable_slots.insert(
                     *slot,
