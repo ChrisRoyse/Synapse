@@ -56,5 +56,28 @@ EDGE_COMPLETE_UNKNOWN_SLOT before_seq=424 after_seq=424 code=SYNAPSE_CALYX_ORACL
 EDGE_COMPLETE_INVALID_CX before_seq=424 after_seq=424 code=SYNAPSE_CALYX_CX_ID_INVALID
 ```
 
-The installed-daemon MCP/health evidence is appended after deployment of the
-repo-built release binary.
+## Installed-daemon verification
+
+`scripts/synapse-setup.ps1` built and installed commit `3333deeab1ea` through
+the supported scheduled-task path. An independent public `health` call read
+PID 20324, `build_matches_checkout=true`, `build_tree_state=clean`, AVX2 CPU
+math, and the fixed-vector bit-parity probe. Before measurement the production
+source state was `oracle_readiness.status=unmeasured` at vault sequence 504800.
+
+The normal-agent call was first refused by `TOOL_PROFILE_POLICY_DENIED` with
+the exact lease/profile remediation. After an audited lease and temporary
+break-glass profile, the real storage facade reached the new operation and
+failed closed at its actual data prerequisite:
+
+```text
+SYNAPSE_CALYX_ENSEMBLE_NO_ANCHORED_RECORDS
+panel_version=2006001 carries no discrete reward anchor
+remediation=write grounded outcome anchors, then re-run the ensemble card
+```
+
+No readiness row was fabricated: two subsequent health reads continued to
+report `oracle_readiness.status=unmeasured`. The production absence is the
+current-generation anchor-lineage defect tracked by #1685; the isolated vault
+above proves the successful physical write/read path with a deliberately
+minimal sufficient corpus. The session was restored to `normal_agent` and the
+foreground lease read back `held=false` after the probe.
