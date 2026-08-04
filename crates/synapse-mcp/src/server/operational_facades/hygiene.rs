@@ -138,18 +138,21 @@ pub(super) async fn handle(
         operation = operation.as_str(),
         "tool.invocation kind=hygiene"
     );
-    let runtime = service.reflex_runtime().map_err(|error| {
-        facade_delegate_error(
-            HYGIENE_TOOL,
-            operation.as_str(),
-            "reflex_runtime",
-            HYGIENE_SOT,
-            error,
-            "repair storage/reflex initialization and retry the hygiene operation",
-        )
-    })?;
+    let reflex_runtime = || {
+        service.reflex_runtime().map_err(|error| {
+            facade_delegate_error(
+                HYGIENE_TOOL,
+                operation.as_str(),
+                "reflex_runtime",
+                HYGIENE_SOT,
+                error,
+                "repair storage/reflex initialization and retry the hygiene operation",
+            )
+        })
+    };
     match operation {
         HygieneOperation::ScanText => {
+            let runtime = reflex_runtime()?;
             let spec = params
                 .0
                 .scan_text
@@ -190,6 +193,7 @@ pub(super) async fn handle(
             )))
         }
         HygieneOperation::ScanStorage => {
+            let runtime = reflex_runtime()?;
             let spec = params
                 .0
                 .scan_storage
@@ -226,6 +230,7 @@ pub(super) async fn handle(
             )))
         }
         HygieneOperation::Flags => {
+            let runtime = reflex_runtime()?;
             let spec = params.0.flags.unwrap_or_default();
             service.require_m3_permissions(
                 HYGIENE_TOOL,
@@ -252,6 +257,7 @@ pub(super) async fn handle(
             )))
         }
         HygieneOperation::Report => {
+            let runtime = reflex_runtime()?;
             let spec = params.0.report.unwrap_or_default();
             service.require_m3_permissions(
                 HYGIENE_TOOL,
@@ -402,7 +408,7 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response =
+            let mut response =
                 tokio::task::spawn_blocking(move || crate::m3::hygiene::run_drift(&db, &spec))
                     .await
                     .map_err(|error| {
@@ -418,13 +424,64 @@ pub(super) async fn handle(
                             "inspect daemon logs; the MMD drift task terminated abnormally",
                         )
                     })??;
+            let event_bus = service.sse_state()?.event_bus();
+            for finding in &response.persisted_findings {
+                let event_seq = finding
+                    .observed_seq
+                    .checked_mul(u64::from(u16::MAX) + 1)
+                    .and_then(|base| base.checked_add(u64::from(finding.slot)))
+                    .ok_or_else(|| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "reactive drift event sequence overflow for observed_seq={} slot={}; remediation=preserve the Reactive CF row and inspect vault sequence exhaustion",
+                                finding.observed_seq, finding.slot
+                            ),
+                        )
+                    })?;
+                let report = event_bus.publish(synapse_core::types::Event {
+                    seq: event_seq,
+                    at: chrono::Utc::now(),
+                    source: synapse_core::types::EventSource::System,
+                    kind: "calyx.reactive.drift".to_owned(),
+                    data: serde_json::to_value(finding).map_err(|error| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "serialize committed Reactive CF drift finding for delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
+                            ),
+                        )
+                    })?,
+                    correlations: Vec::new(),
+                });
+                response.notifications_matched = response
+                    .notifications_matched
+                    .saturating_add(report.matched as u64);
+                response.notifications_queued = response
+                    .notifications_queued
+                    .saturating_add(report.queued as u64);
+                response.notifications_dropped = response
+                    .notifications_dropped
+                    .saturating_add(report.dropped);
+            }
+            if response.notifications_dropped > 0 {
+                return Err(crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "reactive drift delivery dropped {} subscription notification(s) after persisting {} Reactive CF trigger row(s); remediation=consume or recreate the saturated subscription, then read the durable Reactive CF findings before retrying delivery",
+                        response.notifications_dropped, response.drift_rows_persisted
+                    ),
+                ));
+            }
             Ok(Json(hygiene_response(
                 operation,
                 format!(
-                    "drifted_lenses={} drift_rows_persisted={} reactive_cf_rows_after={}",
+                    "drifted_lenses={} drift_rows_persisted={} reactive_cf_rows_after={} notifications_matched={} notifications_queued={}",
                     response.drifted_lenses,
                     response.drift_rows_persisted,
-                    response.reactive_cf_rows_after
+                    response.reactive_cf_rows_after,
+                    response.notifications_matched,
+                    response.notifications_queued,
                 ),
                 |out| out.drift = Some(response),
             )))

@@ -675,6 +675,22 @@ pub struct HygieneLensDrift {
     pub persisted: bool,
 }
 
+/// One fired drift trigger, decoded from its committed Reactive CF row.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygienePersistedDriftFinding {
+    pub panel_version: u32,
+    pub slot: u32,
+    pub dimension: u64,
+    pub reference_n: u64,
+    pub recent_n: u64,
+    pub mmd2: f64,
+    pub p_value: f64,
+    pub bandwidth: f64,
+    pub significant: bool,
+    pub observed_seq: u64,
+}
+
 /// MMD lens-drift scan report over one panel with the `Reactive` CF readback.
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -691,6 +707,10 @@ pub struct HygieneDriftResponse {
     pub lens_drift: Vec<HygieneLensDrift>,
     pub reactive_cf_rows_after: u64,
     pub drift_rows_persisted: u64,
+    pub persisted_findings: Vec<HygienePersistedDriftFinding>,
+    pub notifications_matched: u64,
+    pub notifications_queued: u64,
+    pub notifications_dropped: u64,
 }
 
 /// Kernel-health request for one persisted domain kernel (#1675).
@@ -1308,6 +1328,25 @@ pub fn run_drift(db: &Db, params: &HygieneDriftParams) -> Result<HygieneDriftRes
             .collect(),
         reactive_cf_rows_after: report.reactive_cf_rows_after as u64,
         drift_rows_persisted: report.drift_rows_persisted as u64,
+        persisted_findings: report
+            .persisted_findings
+            .into_iter()
+            .map(|finding| HygienePersistedDriftFinding {
+                panel_version: finding.panel_version,
+                slot: u32::from(finding.slot),
+                dimension: finding.dimension as u64,
+                reference_n: finding.reference_n as u64,
+                recent_n: finding.recent_n as u64,
+                mmd2: finding.mmd2,
+                p_value: finding.p_value,
+                bandwidth: finding.bandwidth,
+                significant: finding.significant,
+                observed_seq: finding.observed_seq,
+            })
+            .collect(),
+        notifications_matched: 0,
+        notifications_queued: 0,
+        notifications_dropped: 0,
     })
 }
 

@@ -238,21 +238,23 @@ pub struct SynapseCalyxPanelDriftReport {
     pub lens_drift: Vec<SynapseCalyxLensDrift>,
     pub reactive_cf_rows_after: usize,
     pub drift_rows_persisted: usize,
+    /// Exact typed rows independently read from the Reactive CF after commit.
+    pub persisted_findings: Vec<SynapseCalyxPersistedDriftFinding>,
 }
 
 /// Persisted drift finding row shape written to the native `Reactive` CF.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct PersistedDriftFinding {
-    panel_version: u32,
-    slot: u16,
-    dimension: usize,
-    reference_n: usize,
-    recent_n: usize,
-    mmd2: f64,
-    p_value: f64,
-    bandwidth: f64,
-    significant: bool,
-    observed_seq: u64,
+pub struct SynapseCalyxPersistedDriftFinding {
+    pub panel_version: u32,
+    pub slot: u16,
+    pub dimension: usize,
+    pub reference_n: usize,
+    pub recent_n: usize,
+    pub mmd2: f64,
+    pub p_value: f64,
+    pub bandwidth: f64,
+    pub significant: bool,
+    pub observed_seq: u64,
 }
 
 /// One record reduced to its dense slot vectors, in `Base` CF scan order.
@@ -604,7 +606,7 @@ impl SynapseCalyxVault {
             if report.significant {
                 drifted_lenses += 1;
             }
-            let finding = PersistedDriftFinding {
+            let finding = SynapseCalyxPersistedDriftFinding {
                 panel_version: params.panel_version,
                 slot: slot.get(),
                 dimension,
@@ -616,11 +618,13 @@ impl SynapseCalyxVault {
                 significant: report.significant,
                 observed_seq,
             };
-            writes.push(SynapseCalyxCfWrite {
-                cf: ColumnFamily::Reactive,
-                key: reactive_drift_key(params.panel_version, slot.get()),
-                value: encode_json(&finding)?,
-            });
+            if report.significant {
+                writes.push(SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Reactive,
+                    key: reactive_drift_key(observed_seq, params.panel_version, slot.get()),
+                    value: encode_json(&finding)?,
+                });
+            }
             lens_drift.push(SynapseCalyxLensDrift {
                 slot: slot.get(),
                 dimension,
@@ -630,7 +634,7 @@ impl SynapseCalyxVault {
                 p_value: report.p_value,
                 bandwidth: report.bandwidth,
                 significant: report.significant,
-                persisted: true,
+                persisted: report.significant,
             });
         }
 
@@ -638,6 +642,34 @@ impl SynapseCalyxVault {
         if !writes.is_empty() {
             self.write_cf_batch(writes)?;
             self.flush()?;
+        }
+        let mut persisted_findings = Vec::with_capacity(drift_rows_persisted);
+        for finding in lens_drift.iter().filter(|finding| finding.persisted) {
+            let key = reactive_drift_key(observed_seq, params.panel_version, finding.slot);
+            let bytes = self
+                .read_cf_latest(ColumnFamily::Reactive, &key)?
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_READBACK_MISSING",
+                        format!(
+                            "Reactive CF drift row disappeared after commit: panel={} slot={}",
+                            params.panel_version, finding.slot
+                        ),
+                        "stop writers, preserve the vault, and inspect the Reactive CF commit before retrying drift",
+                    )
+                })?;
+            let decoded = serde_json::from_slice::<SynapseCalyxPersistedDriftFinding>(&bytes)
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                        format!(
+                            "decode committed Reactive CF drift row for panel={} slot={}: {error}",
+                            params.panel_version, finding.slot
+                        ),
+                        "stop writers, preserve the vault, and inspect the named Reactive CF row",
+                    )
+                })?;
+            persisted_findings.push(decoded);
         }
         let reactive_cf_rows_after = self
             .count_cf_latest_bounded(ColumnFamily::Reactive)?
@@ -656,6 +688,7 @@ impl SynapseCalyxVault {
             lens_drift,
             reactive_cf_rows_after,
             drift_rows_persisted,
+            persisted_findings,
         })
     }
 
@@ -959,9 +992,10 @@ fn is_unmeasurable(error: &calyx_core::CalyxError) -> bool {
     )
 }
 
-fn reactive_drift_key(panel_version: u32, slot: u16) -> Vec<u8> {
-    let mut key = Vec::with_capacity(REACTIVE_DRIFT_PREFIX.len() + 6);
+fn reactive_drift_key(observed_seq: u64, panel_version: u32, slot: u16) -> Vec<u8> {
+    let mut key = Vec::with_capacity(REACTIVE_DRIFT_PREFIX.len() + 14);
     key.extend_from_slice(REACTIVE_DRIFT_PREFIX);
+    key.extend_from_slice(&observed_seq.to_be_bytes());
     key.extend_from_slice(&panel_version.to_be_bytes());
     key.extend_from_slice(&slot.to_be_bytes());
     key
