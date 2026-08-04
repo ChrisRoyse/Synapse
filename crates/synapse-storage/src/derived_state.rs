@@ -29,6 +29,7 @@
 //! it executes on the dedicated blocking pool under an admission permit and can
 //! never park a runtime worker that is serving MCP requests.
 
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
@@ -80,6 +81,20 @@ pub const PANEL_BACKFILL_PAGE_ROWS: usize = 1_000;
 /// requests.
 pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Maximum records admitted to one unattended Loom pass.
+///
+/// The association and kNN work is quadratic in the records that share a slot.
+/// A five-minute ingest interval is normally far smaller than this; when it is
+/// not, [`drive_incremental_weave`] bisects the time range instead of silently
+/// dropping everything beyond the cap.
+pub const WEAVE_INTERVAL_MAX_RECORDS: usize = 2_000;
+
+/// Wall-clock budget for one panel's incremental weave in one maintenance tick.
+pub const WEAVE_PANEL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Maximum bisection work items accepted for one panel interval.
+const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
+
 static DERIVED_STATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_FAILURE: AtomicU64 = AtomicU64::new(0);
@@ -93,6 +108,15 @@ static DERIVED_STATE_SOURCE: LazyLock<Mutex<Option<Weak<Db>>>> = LazyLock::new(|
 
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
     LazyLock::new(|| Mutex::new(DerivedStateReadback::default()));
+
+/// Exclusive end of the last completely woven ingest interval per panel.
+///
+/// Registration initializes these watermarks before the daemon accepts live
+/// writes. A restart therefore cannot create an unwoven live-ingest gap: the
+/// replacement process starts a fresh interval at registration, while all
+/// historical rows remain available to the explicit full-corpus weave.
+static WEAVE_WATERMARK_NS: LazyLock<Mutex<BTreeMap<u32, i64>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// Externally readable outcome of the derived-state maintainer, as published for
 /// `health` to read without touching the vault.
@@ -137,6 +161,12 @@ pub struct DerivedStateReadback {
     /// True when the sweep reached the end of its source CF this tick, so the
     /// cursor reset to the start of the CF for the next generation bump.
     pub last_backfill_sweep_complete: Option<bool>,
+    /// Last incremental Loom action and physical readback (#1671).
+    pub last_weave_actions: BTreeMap<u32, String>,
+    pub last_weave_until_ns: BTreeMap<u32, i64>,
+    pub last_weave_records: BTreeMap<u32, u64>,
+    pub last_weave_xterm_rows: BTreeMap<u32, usize>,
+    pub last_weave_graph_rows: BTreeMap<u32, usize>,
     /// The last failure, retained across later successes so a lifetime failure
     /// counter can never outlive its own evidence (the #1889 lesson).
     pub last_failure_code: Option<String>,
@@ -157,6 +187,27 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
     match DERIVED_STATE_SOURCE.lock() {
         Ok(mut guard) => *guard = Some(weak),
         Err(poisoned) => *poisoned.into_inner() = Some(weak),
+    }
+    let registered_at_ns = now_unix_ms()
+        .and_then(|value| value.checked_mul(1_000_000))
+        .and_then(|value| i64::try_from(value).ok());
+    if let Some(registered_at_ns) = registered_at_ns {
+        let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for panel_version in [
+            crate::constellations::SYN_TIMELINE_PANEL_VERSION,
+            crate::constellations::SYN_EPISODE_PANEL_VERSION,
+            crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
+        ] {
+            watermarks.entry(panel_version).or_insert(registered_at_ns);
+        }
+    } else {
+        record_failure(
+            "STORAGE_DERIVED_STATE_WEAVE_CLOCK_INVALID",
+            "system time could not be represented as signed Unix nanoseconds while initializing incremental Loom watermarks; unattended weave remains disabled until a valid clock is observed".to_owned(),
+        );
     }
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_SOURCE_REGISTERED",
@@ -443,6 +494,26 @@ pub(crate) fn run_derived_state_maintenance() {
         }
     }
 
+    // --- Incremental Loom weave (#1671) ---
+    //
+    // This runs after the coverage census so it never delays the cheaper
+    // structural health signals above. Each target owns an independent
+    // watermark; one failed panel cannot advance itself or suppress the other
+    // two panels' work.
+    for panel_version in [
+        crate::constellations::SYN_TIMELINE_PANEL_VERSION,
+        crate::constellations::SYN_EPISODE_PANEL_VERSION,
+        crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
+    ] {
+        if let Err(error) = drive_incremental_weave(&db, panel_version) {
+            any_failed = true;
+            record_failure(
+                "STORAGE_DERIVED_STATE_WEAVE_FAILED",
+                format!("incrementally weave panel {panel_version}: {error}"),
+            );
+        }
+    }
+
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -454,6 +525,145 @@ pub(crate) fn run_derived_state_maintenance() {
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+}
+
+fn calyx_time_boundary_ns_now() -> Result<i64, String> {
+    let duration = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?;
+    let millis = i64::try_from(duration.as_millis())
+        .map_err(|_| "system time exceeds signed millisecond range".to_owned())?;
+    millis
+        .checked_mul(1_000_000)
+        .ok_or_else(|| "system time exceeds signed nanosecond range".to_owned())
+}
+
+/// Weaves every record in one panel's new ingest interval without permitting a
+/// record cap to become data loss.
+fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
+    // Constellation `created_at` is millisecond-granular. Both ends must be
+    // aligned to that same grid: a fractional watermark would exclude records
+    // created later in the same millisecond but carrying the same stored stamp.
+    // The current millisecond stays open and is picked up on the next tick.
+    let until_ns = calyx_time_boundary_ns_now()?;
+    let since_ns = {
+        let watermarks = match WEAVE_WATERMARK_NS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *watermarks.get(&panel_version).ok_or_else(|| {
+            format!(
+                "panel {panel_version} has no incremental weave watermark; re-register the live storage source before running maintenance"
+            )
+        })?
+    };
+    if until_ns == since_ns {
+        return Ok(());
+    }
+    if until_ns < since_ns {
+        return Err(format!(
+            "regressed system clock at weave boundary: since_ns={since_ns} until_ns={until_ns}"
+        ));
+    }
+
+    let started = std::time::Instant::now();
+    let mut intervals = VecDeque::from([(since_ns, until_ns)]);
+    let mut completed_parts = 0usize;
+    let mut records_woven = 0u64;
+    let mut last_xterm_rows = 0usize;
+    let mut last_graph_rows = 0usize;
+
+    while let Some((part_since, part_until)) = intervals.pop_front() {
+        if started.elapsed() >= WEAVE_PANEL_TICK_BUDGET {
+            return Err(format!(
+                "weave budget exhausted after {completed_parts} completed interval part(s); watermark remains at {since_ns} so the entire interval is retried; budget_ms={} pending_parts={}",
+                WEAVE_PANEL_TICK_BUDGET.as_millis(),
+                intervals.len() + 1
+            ));
+        }
+        if completed_parts + intervals.len() >= WEAVE_MAX_INTERVAL_PARTS {
+            return Err(format!(
+                "weave interval required more than {WEAVE_MAX_INTERVAL_PARTS} bounded parts; watermark remains at {since_ns}; narrow the maintenance interval or raise the record cap only after measuring association cost"
+            ));
+        }
+
+        let mut params = synapse_calyx::SynapseCalyxWeaveParams::new(panel_version);
+        params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
+        params.since_ts_ns = Some(part_since);
+        params.until_ts_ns = Some(part_until);
+        let report = db
+            .weave_panel_intelligence(params)
+            .map_err(|error| error.to_string())?;
+
+        if report.records_scanned > WEAVE_INTERVAL_MAX_RECORDS {
+            // Calyx timestamps are millisecond-granular. Once the interval is a
+            // single millisecond, another split cannot separate its records;
+            // refuse instead of advancing past an unprocessed suffix.
+            if part_until - part_since <= 1_000_000 {
+                return Err(format!(
+                    "panel {panel_version} contains {} records in the indivisible interval [{part_since},{part_until}), above cap {WEAVE_INTERVAL_MAX_RECORDS}; watermark remains at {since_ns}; increase the cap only with a measured memory/latency budget or add a Base-key cursor",
+                    report.records_scanned
+                ));
+            }
+            let midpoint = part_since + (part_until - part_since) / 2;
+            intervals.push_front((midpoint, part_until));
+            intervals.push_front((part_since, midpoint));
+            continue;
+        }
+
+        completed_parts += 1;
+        records_woven = records_woven.saturating_add(report.records_woven as u64);
+        last_xterm_rows = report.xterm_cf_rows_after;
+        last_graph_rows = report.graph_cf_rows_after;
+    }
+
+    {
+        let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let watermark = watermarks
+            .get_mut(&panel_version)
+            .ok_or_else(|| format!("panel {panel_version} watermark disappeared before commit"))?;
+        if *watermark != since_ns {
+            return Err(format!(
+                "panel {panel_version} watermark changed concurrently: expected={since_ns} actual={watermark}; refusing to overwrite a newer owner"
+            ));
+        }
+        *watermark = until_ns;
+    }
+    {
+        let mut readback = match DERIVED_STATE_LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        readback
+            .last_weave_actions
+            .insert(panel_version, "interval_complete".to_owned());
+        readback.last_weave_until_ns.insert(panel_version, until_ns);
+        readback
+            .last_weave_records
+            .insert(panel_version, records_woven);
+        readback
+            .last_weave_xterm_rows
+            .insert(panel_version, last_xterm_rows);
+        readback
+            .last_weave_graph_rows
+            .insert(panel_version, last_graph_rows);
+    }
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_WEAVE_PASS",
+        panel_version,
+        since_ns,
+        until_ns,
+        completed_parts,
+        records_woven,
+        xterm_cf_rows = last_xterm_rows,
+        graph_cf_rows = last_graph_rows,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        "readback=physical XTerm/Graph CF counts after every new record in the bounded ingest interval was woven"
+    );
+    Ok(())
 }
 
 /// Where the last backfill page stopped, so the next tick resumes instead of
