@@ -59,14 +59,17 @@
 //! every reported float by exact equality.
 //!
 //! Usage:
-//! `cargo run --release -p synapse-storage --example assay_known_mi_fsv -- <empty-scratch-dir>`
+//! `cargo run --release -p synapse-storage --example assay_known_mi_fsv -- <new-scratch-dir>`
 
 use std::error::Error;
 use std::path::PathBuf;
 
+use calyx_aster::cf::ColumnFamily;
 use calyx_core::{Anchor, AnchorKind, AnchorValue, CxId, VaultId};
 use serde_json::json;
-use synapse_calyx::{SynapseCalyxAssayParams, SynapseCalyxConfig, SynapseCalyxVault};
+use synapse_calyx::{
+    SynapseCalyxAssayParams, SynapseCalyxConfig, SynapseCalyxReadOnlyVault, SynapseCalyxVault,
+};
 use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_storage::constellations::{
     NativeConstellationContext, SYN_TIMELINE_PANEL_VERSION, build_timeline_constellation,
@@ -218,8 +221,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dir = std::env::args()
         .nth(1)
         .map(PathBuf::from)
-        .ok_or("usage: assay_known_mi_fsv <empty-scratch-dir>")?;
-    std::fs::create_dir_all(&dir)?;
+        .ok_or("usage: assay_known_mi_fsv <new-scratch-dir>")?;
+    std::fs::create_dir(&dir).map_err(|error| {
+        format!(
+            "SYNAPSE_FSV_SCRATCH_CREATE_FAILED: cannot atomically create a fresh fixture vault at {}: {error}; remediation=pass a new child path whose parent already exists; never reuse or pre-create a known-answer fixture vault",
+            dir.display()
+        )
+    })?;
 
     println!("assay_known_mi_fsv: vault_dir={}", dir.display());
 
@@ -337,7 +345,29 @@ fn main() -> Result<(), Box<dyn Error>> {
         verdict(deterministic)
     );
 
-    let pass = entropy_ok && recovery_ok && monotone_ok && deterministic;
+    // A computing call's return value is not persistence evidence. Reopen the
+    // vault through a handle that never held the writer lock and count the
+    // physical native CF rows independently.
+    let readback = SynapseCalyxReadOnlyVault::open_existing_with_cfs(
+        SynapseCalyxConfig::from_vault_dir(dir),
+        None,
+    )?;
+    let snapshot = readback.latest_seq();
+    let base_rows = readback.scan_cf_at(snapshot, ColumnFamily::Base)?.len();
+    let anchor_rows = readback.scan_cf_at(snapshot, ColumnFamily::Anchors)?.len();
+    let assay_rows = readback.scan_cf_at(snapshot, ColumnFamily::Assay)?.len();
+    let ledger_rows = readback.scan_cf_at(snapshot, ColumnFamily::Ledger)?.len();
+    let persistence_ok = base_rows == ROWS as usize
+        && anchor_rows == ROWS as usize
+        && assay_rows == suff2.assay_cf_rows_after
+        && ledger_rows > 0;
+    println!(
+        "  5 independent CF readback snapshot={snapshot} Base={base_rows} Anchors={anchor_rows} Assay={assay_rows} Ledger={ledger_rows} reported_assay={}  {}",
+        suff2.assay_cf_rows_after,
+        verdict(persistence_ok)
+    );
+
+    let pass = entropy_ok && recovery_ok && monotone_ok && deterministic && persistence_ok;
     println!(
         "\n{}",
         if pass {
