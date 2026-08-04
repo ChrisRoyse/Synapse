@@ -61,10 +61,10 @@ pub(super) fn resolve_guard<C: Clock>(
     }
 }
 
-/// Load the calibrated default Ward guard profile from the Guard CF, failing
-/// closed with `CALYX_GUARD_PROVISIONAL` when it is missing, undecodable,
-/// uncalibrated, or calibrated for a different panel version - the same gate
-/// the MCP search path enforces (`calyx-mcp/src/tools/search/engine.rs`).
+/// Load the calibrated Ward profile for the requested panel from the Guard CF.
+/// The default active-panel key is only a compatibility mirror. Missing,
+/// undecodable, uncalibrated, or panel-mismatched state fails closed with
+/// `CALYX_GUARD_PROVISIONAL`.
 ///
 /// The caller must have opened the vault with [`ColumnFamily::Guard`]
 /// selected: reading an unselected CF silently returns `None`, which would
@@ -73,32 +73,41 @@ fn load_default_guard_profile<C: Clock>(
     vault: &AsterVault<C>,
     guard_panel_version: Option<u32>,
 ) -> CliResult<GuardProfile> {
-    let Some(bytes) = vault.read_cf_at(
-        vault.snapshot(),
-        ColumnFamily::Guard,
-        DEFAULT_GUARD_PROFILE_KEY,
-    )?
-    else {
+    let panel_key = guard_panel_version.map(|panel_version| {
+        let mut key = Vec::with_capacity(19);
+        key.extend_from_slice(b"profile\0panel\0");
+        key.extend_from_slice(&panel_version.to_be_bytes());
+        key
+    });
+    let snapshot = vault.snapshot();
+    let panel_profile = match panel_key.as_deref() {
+        Some(key) => vault.read_cf_at(snapshot, ColumnFamily::Guard, key)?,
+        None => None,
+    };
+    let default_profile = match panel_profile {
+        Some(bytes) => Some(bytes),
+        None => vault.read_cf_at(snapshot, ColumnFamily::Guard, DEFAULT_GUARD_PROFILE_KEY)?,
+    };
+    let Some(bytes) = default_profile else {
         return Err(CalyxError::guard_provisional(
-            "in-region search requires a calibrated default guard profile (Guard CF key `profile\\0default`); run `calyx guard <vault> calibrate` or supply an explicit operator tau",
+            "in-region search requires a calibrated guard profile for the requested panel (Guard CF key `profile\\0panel\\0<version>`, with `profile\\0default` only as the active-panel compatibility mirror); calibrate that panel or supply an explicit operator tau",
         )
         .into());
     };
-    let profile: GuardProfile = serde_json::from_slice(&bytes).map_err(|error| {
-        CalyxError::guard_provisional(format!("decode default guard profile: {error}"))
-    })?;
+    let profile: GuardProfile = serde_json::from_slice(&bytes)
+        .map_err(|error| CalyxError::guard_provisional(format!("decode guard profile: {error}")))?;
     if let Some(panel_version) = guard_panel_version
         && profile.panel_version != panel_version
     {
         return Err(CalyxError::guard_provisional(format!(
-            "guard profile panel_version {} does not match active panel {panel_version}; recalibrate the guard for the current panel",
+            "guard profile panel_version {} does not match requested panel {panel_version}; recalibrate the guard for that panel",
             profile.panel_version
         ))
         .into());
     }
     if !profile.is_calibrated() {
         return Err(CalyxError::guard_provisional(
-            "default guard profile is not calibrated; run `calyx guard <vault> calibrate`",
+            "guard profile is not calibrated; run `calyx guard <vault> calibrate` for the requested panel",
         )
         .into());
     }

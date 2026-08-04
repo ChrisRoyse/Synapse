@@ -206,6 +206,14 @@ pub struct StorageFindSimilarParams {
     /// through a neighbouring panel's slot map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_version: Option<u32>,
+    /// `off` (default) or `in_region`. In-region without `guard_tau` loads the
+    /// panel's calibrated Ward profile; missing/provisional profiles refuse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_mode: Option<String>,
+    /// Optional explicit flat cosine threshold for `guard_mode=in_region`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0.0, max = 1.0))]
+    pub guard_tau: Option<f32>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -250,6 +258,33 @@ pub struct StorageFindHit {
     pub freshness_built_at_seq: u64,
     pub freshness_base_seq: u64,
     pub freshness_policy: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_verdict: Option<StorageGuardVerdict>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageGuardSlotVerdict {
+    pub slot: u32,
+    pub cosine: f32,
+    pub tau: f32,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageGuardVerdict {
+    pub guard_id: String,
+    pub overall_pass: bool,
+    pub provisional: bool,
+    pub action: Option<String>,
+    pub per_slot: Vec<StorageGuardSlotVerdict>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StorageDroppedGuardHit {
+    pub cx_id: String,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<StorageGuardVerdict>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -276,7 +311,8 @@ pub struct StorageFindGuard {
     pub operator_tau: Option<f32>,
     pub dropped_candidates: u64,
     pub hits_with_guard_verdict: u64,
-    pub disabled_reason: String,
+    pub dropped: Vec<StorageDroppedGuardHit>,
+    pub disabled_reason: Option<String>,
     pub enable_requirements: Vec<String>,
 }
 
@@ -2228,6 +2264,29 @@ pub fn run_find_similar(
                 query_time_secs: temporal.query_time_secs,
                 tz_offset_secs: temporal.tz_offset_secs,
             });
+    let guard = match params.guard_mode.as_deref().unwrap_or("off").trim() {
+        "off" => {
+            if params.guard_tau.is_some() {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "storage operation=find_similar guard_tau requires guard_mode=in_region"
+                        .to_owned(),
+                ));
+            }
+            synapse_calyx::SynapseCalyxFindGuardMode::Off
+        }
+        "in_region" => synapse_calyx::SynapseCalyxFindGuardMode::InRegion {
+            operator_tau: params.guard_tau,
+        },
+        other => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage operation=find_similar guard_mode {other:?} must be off or in_region"
+                ),
+            ));
+        }
+    };
     let find_params = synapse_calyx::SynapseCalyxFindParams {
         query,
         k: params.k as usize,
@@ -2236,6 +2295,7 @@ pub fn run_find_similar(
         explain: params.explain,
         temporal,
         panel_version: params.panel_version,
+        guard,
     };
     let report = db
         .find_similar(&find_params)
@@ -2381,6 +2441,7 @@ fn storage_find_similar_response(
             freshness_built_at_seq: hit.freshness_built_at_seq,
             freshness_base_seq: hit.freshness_base_seq,
             freshness_policy: hit.freshness_policy,
+            guard_verdict: hit.guard_verdict.map(storage_guard_verdict),
         })
         .collect();
     StorageFindSimilarResponse {
@@ -2400,6 +2461,16 @@ fn storage_find_similar_response(
             operator_tau: report.guard.operator_tau,
             dropped_candidates: report.guard.dropped_candidates as u64,
             hits_with_guard_verdict: report.guard.hits_with_guard_verdict as u64,
+            dropped: report
+                .guard
+                .dropped
+                .into_iter()
+                .map(|hit| StorageDroppedGuardHit {
+                    cx_id: hit.cx_id,
+                    reason: hit.reason,
+                    verdict: hit.verdict.map(storage_guard_verdict),
+                })
+                .collect(),
             disabled_reason: report.guard.disabled_reason,
             enable_requirements: report.guard.enable_requirements,
         },
@@ -2408,6 +2479,25 @@ fn storage_find_similar_response(
         generation,
         exact: None,
         hits,
+    }
+}
+
+fn storage_guard_verdict(verdict: synapse_calyx::SynapseCalyxGuardVerdict) -> StorageGuardVerdict {
+    StorageGuardVerdict {
+        guard_id: verdict.guard_id.to_string(),
+        overall_pass: verdict.overall_pass,
+        provisional: verdict.provisional,
+        action: verdict.action,
+        per_slot: verdict
+            .per_slot
+            .into_iter()
+            .map(|slot| StorageGuardSlotVerdict {
+                slot: u32::from(slot.slot),
+                cosine: slot.cosine,
+                tau: slot.tau,
+                pass: slot.pass,
+            })
+            .collect(),
     }
 }
 

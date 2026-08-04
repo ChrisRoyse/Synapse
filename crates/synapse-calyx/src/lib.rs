@@ -109,9 +109,11 @@ pub use drift::{
 };
 pub use find::{
     SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K,
-    SynapseCalyxFindFusion, SynapseCalyxFindGuard, SynapseCalyxFindHit,
+    SynapseCalyxDroppedGuardHit, SynapseCalyxFindFusion, SynapseCalyxFindGuard,
+    SynapseCalyxFindGuardMode, SynapseCalyxFindGuardSlotVerdict, SynapseCalyxFindHit,
     SynapseCalyxFindLensContribution, SynapseCalyxFindParams, SynapseCalyxFindQuery,
-    SynapseCalyxFindReport, SynapseCalyxFindTemporal, synapse_find_rrf_formula,
+    SynapseCalyxFindReport, SynapseCalyxFindTemporal, SynapseCalyxGuardVerdict,
+    synapse_find_rrf_formula,
 };
 pub use grounding::{
     METADATA_SOURCE_CF, METADATA_SOURCE_KEY_HEX, SYNAPSE_GROUNDING_COVERAGE_FLOOR,

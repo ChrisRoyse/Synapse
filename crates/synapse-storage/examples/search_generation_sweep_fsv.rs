@@ -430,6 +430,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             filter: None,
             explain: false,
             temporal: None,
+            guard: synapse_calyx::SynapseCalyxFindGuardMode::Off,
         };
         match db.find_similar(&params) {
             Ok(report) => {

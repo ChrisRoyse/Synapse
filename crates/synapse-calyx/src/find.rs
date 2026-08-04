@@ -49,15 +49,12 @@
 //! both "the sparse lane" and rank by entirely different laws (#1900).
 //!
 //! ## Seams
-//! * **Ward guarded search (#1677)** — always `GuardChoice::Off` here. The
-//!   disabled state is not left implicit: every report carries a
-//!   [`SynapseCalyxFindGuard`] block whose `applied=false` is *read back from
-//!   the substrate outcome* (no operator tau, no dropped candidates, no per-hit
-//!   guard verdict), together with the exact prerequisites for turning the
-//!   calibrated in-region guard on. A caller can therefore tell that hits are
-//!   unguarded instead of assuming they were guarded. If the substrate ever
-//!   returns guard evidence for a pass that asked for `Off`, the pass fails
-//!   closed rather than reporting a state it cannot prove.
+//! * **Ward guarded search (#1677)** — callers explicitly choose raw recall or
+//!   calibrated in-region enforcement. Profile-backed guarding loads the exact
+//!   requested panel's Ward profile, and the report carries every retained
+//!   candidate's per-slot verdict plus every rejection's verdict or precise
+//!   unscorable reason. An unguarded pass still proves that
+//!   no guard evidence was applied; contradictory substrate state fails closed.
 //! * **`MaxSim` late interaction** — the substrate already fuses any
 //!   `multi_maxsim` slot; the report reads back whether the live generation
 //!   carries one. The `Syn*` encoder catalog ships no multi-vector token slot
@@ -77,7 +74,7 @@ use calyx_search::{
     FusionChoice, FusionTuning, GuardChoice, PersistedSearchGeneration, PersistedSearchIndexes,
     QueryMeasurement, REBUILD_REQUIRED_REMEDIATION, SearchBudget, SearchError, SearchFreshness,
     SearchOutcome, measure_query, read_rebuild_required_marker,
-    search_outcome_with_query_vectors_freshness,
+    search_outcome_with_query_vectors_freshness_cached,
 };
 use calyx_sextant::TemporalScores;
 use serde::{Deserialize, Serialize};
@@ -121,9 +118,6 @@ pub fn synapse_find_rrf_formula(rrf_k: u32) -> String {
 /// off, so a caller can branch on the guard state without parsing prose.
 pub const SYNAPSE_FIND_GUARD_DISABLED_CODE: &str = "SYNAPSE_CALYX_FIND_GUARD_DISABLED";
 
-/// Guard mode this build asks the substrate for. Always `off` (#1677 is unwired).
-const SYNAPSE_FIND_GUARD_REQUESTED_MODE: &str = "off";
-
 /// Why the guard is off, stated as fact rather than as a promise.
 ///
 /// This text asserted three things, and two of them stopped being true. It
@@ -137,16 +131,13 @@ const SYNAPSE_FIND_GUARD_REQUESTED_MODE: &str = "off";
 /// operator following a stale remediation goes and builds a path that already
 /// exists, and never looks at the thing actually blocking them. The blocker is
 /// the panel binding, not the wiring.
-const SYNAPSE_FIND_GUARD_DISABLED_REASON: &str = "the Ward in-region guard seam is not wired into fused find: this pass requests guard=off, so these hits are the raw unguarded fused recall and were NOT filtered for in-region membership. Ward itself IS wired — calyx-ward is a direct dependency of synapse-calyx and `hygiene guard_calibrate` writes the Guard CF — but that CF is empty on the live vault because calibration is pinned to the single durable active panel, which carries no adjudicated outcome, so every calibration attempt correctly refuses with SYNAPSE_CALYX_GUARD_BAD_CORPUS_ABSENT (#1919). The gap is the panel binding and the find-side seam, NOT the absence of a calibration path";
+const SYNAPSE_FIND_GUARD_DISABLED_REASON: &str = "this request explicitly selected guard=off, so these hits are raw fused recall and were NOT filtered for Ward in-region membership";
 
 /// Exact, ordered prerequisites for enabling the calibrated in-region guard.
 /// Each line names a physical artifact or code seam that must exist first.
 const SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS: &[&str] = &[
-    "1. open the vault with ColumnFamily::Guard selected: calyx-search reads the profile via read_cf_at(Guard, b\"profile\\0default\") and an unselected CF returns None, which is indistinguishable from a missing profile",
-    "2. persist a calibrated calyx_ward::GuardProfile at Guard CF key profile\\0default whose panel_version equals the active panel; a missing/uncalibrated/panel-mismatched profile fails closed with CALYX_GUARD_PROVISIONAL",
-    "3. DONE — calyx-ward is a direct dependency of synapse-calyx and crate::ward::guard_calibrate produces a profile from real adjudicated evidence, verified end to end by crates/synapse-storage/examples/ward_declared_enum_adjudication_fsv.rs. What remains is upstream of it: calibration is pinned to the single durable active panel, and on this vault that panel carries no adjudicated outcome while the panels that do (syn-mcp-usage-v1 @ 1776006, ~1000 records at 1.0 coverage) can never be active under the single-active-panel model (#1919 step 2, #1668)",
-    "4. thread an explicit guard mode (and optional operator cosine tau in (0.0, 1.0]) through SynapseCalyxFindParams to the GuardChoice argument, so guarding is a caller decision, never a silent default",
-    "5. surface SearchOutcome::dropped_guard_hits and each hit's guard verdict in the report, so a guarded result stays auditable instead of silently returning a smaller set",
+    "1. persist a calibrated Ward profile for the exact requested panel at Guard CF key profile\\0panel\\0<version>; calibration requires real adjudicated good and bad outcomes",
+    "2. retry with guard_mode=in_region; omit guard_tau to use the conformal per-slot profile, or state a finite operator cosine tau in (0.0, 1.0]",
 ];
 
 /// Which record set the query is drawn from.
@@ -211,7 +202,7 @@ pub struct SynapseCalyxFindTemporal {
 }
 
 /// Bounded request for one fused find-similar pass.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxFindParams {
     pub query: SynapseCalyxFindQuery,
     pub k: usize,
@@ -239,6 +230,46 @@ pub struct SynapseCalyxFindParams {
     /// cross-panel ambiguity #1776 closed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_version: Option<u32>,
+    /// Explicit Ward enforcement. Defaults to off for compatibility; callers
+    /// must opt into a calibrated profile or state an operator tau.
+    #[serde(default)]
+    pub guard: SynapseCalyxFindGuardMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxFindGuardMode {
+    #[default]
+    Off,
+    InRegion {
+        operator_tau: Option<f32>,
+    },
+}
+
+impl SynapseCalyxFindGuardMode {
+    const fn choice(self) -> GuardChoice {
+        match self {
+            Self::Off => GuardChoice::Off,
+            Self::InRegion { .. } => GuardChoice::InRegion,
+        }
+    }
+
+    const fn operator_tau(self) -> Option<f32> {
+        match self {
+            Self::Off => None,
+            Self::InRegion { operator_tau } => operator_tau,
+        }
+    }
+
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::InRegion { operator_tau: None } => "in_region_profile",
+            Self::InRegion {
+                operator_tau: Some(_),
+            } => "in_region_operator_tau",
+        }
+    }
 }
 
 /// Resolves which panel generation one fused find runs against (#1668).
@@ -335,6 +366,33 @@ pub struct SynapseCalyxFindHit {
     pub freshness_built_at_seq: u64,
     pub freshness_base_seq: u64,
     pub freshness_policy: String,
+    /// Full Ward decomposition for a retained guarded hit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard_verdict: Option<SynapseCalyxGuardVerdict>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxFindGuardSlotVerdict {
+    pub slot: u16,
+    pub cosine: f32,
+    pub tau: f32,
+    pub pass: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxGuardVerdict {
+    pub guard_id: String,
+    pub overall_pass: bool,
+    pub provisional: bool,
+    pub action: Option<String>,
+    pub per_slot: Vec<SynapseCalyxFindGuardSlotVerdict>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SynapseCalyxDroppedGuardHit {
+    pub cx_id: String,
+    pub reason: String,
+    pub verdict: Option<SynapseCalyxGuardVerdict>,
 }
 
 /// Explicit, observable state of the Ward guarded-search seam (#1677) for one
@@ -361,8 +419,9 @@ pub struct SynapseCalyxFindGuard {
     pub dropped_candidates: usize,
     /// Returned hits that carry a per-hit guard verdict, counted from the hits.
     pub hits_with_guard_verdict: usize,
+    pub dropped: Vec<SynapseCalyxDroppedGuardHit>,
     /// Why the guard is off, in operator terms.
-    pub disabled_reason: String,
+    pub disabled_reason: Option<String>,
     /// Exact prerequisites for enabling the calibrated in-region guard.
     pub enable_requirements: Vec<String>,
 }
@@ -637,8 +696,9 @@ impl SynapseCalyxVault {
         // fusion. Ask for one additional bounded candidate so that removal
         // cannot underfill the caller's requested result count (#1844).
         let substrate_k = if self_cx.is_some() { k + 1 } else { k };
-        // Ward guarded search is a documented seam (#1677); keep it off so the
-        // result is the honest fused recall, never a silently guarded subset.
+        // Guarding is an explicit caller decision. Profile-backed mode resolves
+        // the exact panel profile and preserves every per-slot verdict; off
+        // mode is validated below to have produced no hidden guard evidence.
         // The configured knob, not a constant: `calyx_fusion_k` reaches the
         // scoring law it names (#1883). Validated at config load, re-validated
         // here so an out-of-domain value fails the query loudly rather than
@@ -651,18 +711,20 @@ impl SynapseCalyxVault {
                 "set calyx_fusion_k to a positive integer; the Cormack et al. default is 60",
             )
         })?;
-        let outcome: SearchOutcome = search_outcome_with_query_vectors_freshness(
+        let outcome: SearchOutcome = search_outcome_with_query_vectors_freshness_cached(
             &self.vault,
             vault_dir,
             &state.panel,
             &query_vectors,
             substrate_k,
             params.fusion.to_choice(),
-            GuardChoice::Off,
+            params.guard.choice(),
+            params.guard.operator_tau(),
             params.filter.as_deref(),
             params.explain,
             SearchFreshness::Fresh,
             SearchBudget::disabled(),
+            None,
             fusion_tuning,
             None,
         )
@@ -672,10 +734,17 @@ impl SynapseCalyxVault {
         // not against the mode this code passed. Guard evidence on a pass that
         // requested `Off` means the substrate contract changed underneath us, so
         // fail closed instead of reporting an unguarded result we cannot prove.
-        let guard = find_guard_readback(&outcome)?;
+        let mut guard = find_guard_readback(&outcome, params.guard)?;
 
         let mut hits = build_find_hits(&outcome, &consulted_slots, self_cx);
         hits.truncate(k);
+        // The substrate guards before this facade removes the by-example
+        // self-match and applies the caller's final k. Report verdict coverage
+        // over the records actually returned, not that larger internal set.
+        guard.hits_with_guard_verdict = hits
+            .iter()
+            .filter(|hit| hit.guard_verdict.is_some())
+            .count();
 
         // Bounded temporal post-boost (#1667): reuse the fully-validated
         // registered-policy rerank over the fused candidates, then merge the
@@ -836,6 +905,10 @@ fn build_find_hits(
             freshness_built_at_seq: hit.freshness.built_at_seq,
             freshness_base_seq: hit.freshness.base_seq,
             freshness_policy: hit.freshness.policy.clone(),
+            guard_verdict: hit
+                .guard
+                .as_ref()
+                .map(|guard| guard_verdict(&guard.verdict)),
         });
     }
     // The self-match drop can leave a stale gap at rank 1; renumber so the
@@ -848,9 +921,10 @@ fn build_find_hits(
 
 /// Builds the explicit guard-state readback for one fused pass (#1677).
 ///
-/// This never reports "off" on the strength of the requested mode alone: it
-/// counts the guard artifacts the substrate actually produced. Because the pass
-/// requests [`GuardChoice::Off`], every one of those counts must be zero.
+/// This never reports "off" or "applied" on the requested mode alone: it
+/// validates the guard artifacts the substrate actually produced. An off pass
+/// must have none. A profile-backed pass must attach a verdict to every retained
+/// candidate; an empty candidate set is valid and therefore needs no verdict.
 ///
 /// # Errors
 ///
@@ -859,6 +933,7 @@ fn build_find_hits(
 /// mean the caller is being handed a filtered subset while told it is raw recall.
 fn find_guard_readback(
     outcome: &SearchOutcome,
+    requested: SynapseCalyxFindGuardMode,
 ) -> Result<SynapseCalyxFindGuard, SynapseCalyxError> {
     let hits_with_guard_verdict = outcome
         .hits
@@ -867,28 +942,93 @@ fn find_guard_readback(
         .count();
     let dropped_candidates = outcome.dropped_guard_hits.len();
     let operator_tau = outcome.guard_tau;
-    if operator_tau.is_some() || dropped_candidates > 0 || hits_with_guard_verdict > 0 {
+    if matches!(requested, SynapseCalyxFindGuardMode::Off)
+        && (operator_tau.is_some() || dropped_candidates > 0 || hits_with_guard_verdict > 0)
+    {
         return Err(SynapseCalyxError::new(
             "SYNAPSE_CALYX_FIND_GUARD_STATE_INCONSISTENT",
             format!(
-                "fused find requested guard={SYNAPSE_FIND_GUARD_REQUESTED_MODE} but the substrate returned guard evidence: operator_tau={operator_tau:?} dropped_candidates={dropped_candidates} hits_with_guard_verdict={hits_with_guard_verdict}"
+                "fused find requested guard=off but the substrate returned guard evidence: operator_tau={operator_tau:?} dropped_candidates={dropped_candidates} hits_with_guard_verdict={hits_with_guard_verdict}"
             ),
             "the search substrate applied a guard to a pass that did not request one; inspect calyx-search's guard resolution before trusting any fused-find result set",
         ));
     }
+    let applied = !matches!(requested, SynapseCalyxFindGuardMode::Off);
+    if applied && operator_tau.is_none() && hits_with_guard_verdict != outcome.hits.len() {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_FIND_GUARD_STATE_INCONSISTENT",
+            format!(
+                "profile-backed guarded find returned {} retained candidates but only {hits_with_guard_verdict} carried Ward verdicts",
+                outcome.hits.len()
+            ),
+            "inspect the calibrated profile required slots and the search guard projection; guarded recall must expose a verdict for every evaluated candidate",
+        ));
+    }
+    if applied
+        && outcome
+            .dropped_guard_hits
+            .iter()
+            .any(|candidate| candidate.reason.trim().is_empty())
+    {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_FIND_GUARD_STATE_INCONSISTENT",
+            "guarded find dropped a candidate without an auditable reason".to_owned(),
+            "inspect calyx-search's guard projection; every rejection must retain either its Ward verdict or the precise reason it could not be scored",
+        ));
+    }
     Ok(SynapseCalyxFindGuard {
-        requested_mode: SYNAPSE_FIND_GUARD_REQUESTED_MODE.to_owned(),
-        applied: false,
-        state_code: SYNAPSE_FIND_GUARD_DISABLED_CODE.to_owned(),
+        requested_mode: requested.name().to_owned(),
+        applied,
+        state_code: if applied {
+            "SYNAPSE_CALYX_FIND_GUARD_APPLIED".to_owned()
+        } else {
+            SYNAPSE_FIND_GUARD_DISABLED_CODE.to_owned()
+        },
         operator_tau,
         dropped_candidates,
         hits_with_guard_verdict,
-        disabled_reason: SYNAPSE_FIND_GUARD_DISABLED_REASON.to_owned(),
-        enable_requirements: SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS
+        dropped: outcome
+            .dropped_guard_hits
             .iter()
-            .map(|line| (*line).to_owned())
+            .map(|hit| SynapseCalyxDroppedGuardHit {
+                cx_id: hit.cx_id.to_string(),
+                reason: hit.reason.clone(),
+                verdict: hit.verdict.as_ref().map(guard_verdict),
+            })
             .collect(),
+        disabled_reason: (!applied).then(|| SYNAPSE_FIND_GUARD_DISABLED_REASON.to_owned()),
+        enable_requirements: if applied {
+            Vec::new()
+        } else {
+            SYNAPSE_FIND_GUARD_ENABLE_REQUIREMENTS
+                .iter()
+                .map(|line| (*line).to_owned())
+                .collect()
+        },
     })
+}
+
+fn guard_verdict(verdict: &calyx_ward::GuardVerdict) -> SynapseCalyxGuardVerdict {
+    SynapseCalyxGuardVerdict {
+        guard_id: verdict.guard_id.to_string(),
+        overall_pass: verdict.overall_pass,
+        provisional: verdict.provisional,
+        action: verdict.action.as_ref().map(|action| match action {
+            calyx_ward::NoveltyAction::NewRegion => "new_region".to_owned(),
+            calyx_ward::NoveltyAction::Quarantine => "quarantine".to_owned(),
+            calyx_ward::NoveltyAction::RejectClosed => "refuse".to_owned(),
+        }),
+        per_slot: verdict
+            .per_slot
+            .iter()
+            .map(|slot| SynapseCalyxFindGuardSlotVerdict {
+                slot: slot.slot.get(),
+                cosine: slot.cos,
+                tau: slot.tau,
+                pass: slot.pass,
+            })
+            .collect(),
+    }
 }
 
 /// Builds the empty-query failure so it names **why** no slot qualified.

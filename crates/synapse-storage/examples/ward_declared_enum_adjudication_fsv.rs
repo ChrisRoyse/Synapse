@@ -59,8 +59,9 @@ use std::path::{Path, PathBuf};
 use calyx_core::{Anchor, AnchorKind, AnchorValue, CxId, VaultId};
 use serde_json::json;
 use synapse_calyx::{
-    SynapseCalyxConfig, SynapseCalyxGuardAspect, SynapseCalyxGuardCalibrateParams,
-    SynapseCalyxGuardSlotSpec, SynapseCalyxVault,
+    SynapseCalyxConfig, SynapseCalyxFindFusion, SynapseCalyxFindGuardMode, SynapseCalyxFindParams,
+    SynapseCalyxFindQuery, SynapseCalyxGuardAspect, SynapseCalyxGuardCalibrateParams,
+    SynapseCalyxGuardSlotSpec, SynapseCalyxGuardVerifyParams, SynapseCalyxVault,
 };
 use synapse_core::types::{TimelineActor, TimelineKind, TimelineRecord};
 use synapse_storage::constellations::{
@@ -150,10 +151,8 @@ fn row(
     } else {
         20 + u64::from(index % 4)
     };
-    let ts_ns = DAY0_NS
-        + u64::from(index) * DAY_NS / u64::from(TOTAL_ROWS)
-        + hour * HOUR_NS
-        + u64::from(index % 47) * MINUTE_NS;
+    let ts_ns =
+        DAY0_NS + u64::from(index) * DAY_NS + hour * HOUR_NS + u64::from(index % 47) * MINUTE_NS;
 
     let record = TimelineRecord {
         record_version: 1,
@@ -276,6 +275,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ward_declared_enum_adjudication_fsv: root={}",
         root.display()
     );
+
     println!(
         "CONSTRUCTED CORPUS: {TOTAL_ROWS} rows = {GOOD_ROWS} good + {BAD_ROWS} bad, \
          guard slot {GUARD_SLOT} (syn.timeline.hour_cyclic.v1)"
@@ -358,6 +358,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 "  tau is a real certified threshold (finite, > -1)   {}",
                 if tau_real { "OK" } else { "FAIL" }
             );
+            ok &= verify_and_readback_verdicts(&root.join("declared"))?;
         }
         Err(message) => {
             ok = false;
@@ -458,6 +459,136 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn first_line(message: &str) -> String {
     message.lines().next().unwrap_or(message).to_owned()
+}
+
+fn fixture_cx(index: u32) -> CxId {
+    let mut bytes = [0_u8; 16];
+    bytes[0] = 0x19;
+    bytes[1] = 0x19;
+    bytes[2] = u8::try_from((index >> 8) & 0xFF).unwrap_or(0);
+    bytes[3] = u8::try_from(index & 0xFF).unwrap_or(0);
+    CxId::from_bytes(bytes)
+}
+
+/// Executes real verification and then reads its physical Ledger rows through
+/// a separate API. The three refusal probes compare the Ledger row count before
+/// and after, proving invalid requests released no security verdict.
+fn verify_and_readback_verdicts(dir: &Path) -> Result<bool, Box<dyn Error>> {
+    println!();
+    println!("CLAIM 3B - accepted and OOD verdicts are physically ledgered");
+    let vault = SynapseCalyxVault::open(SynapseCalyxConfig::from_vault_dir(dir.to_path_buf()))?;
+    let verify = |cx_id: CxId, panel_version, max_records| SynapseCalyxGuardVerifyParams {
+        panel_version,
+        query_cx_id: cx_id.to_string(),
+        high_stakes: true,
+        max_records,
+    };
+    let good = vault.guard_verify(&verify(fixture_cx(0), SYN_TIMELINE_PANEL_VERSION, 1_000))?;
+    let bad = vault.guard_verify(&verify(
+        fixture_cx(GOOD_ROWS),
+        SYN_TIMELINE_PANEL_VERSION,
+        1_000,
+    ))?;
+    let good_row = vault.read_ledger_entry(good.ledger_seq)?;
+    let bad_row = vault.read_ledger_entry(bad.ledger_seq)?;
+    let happy = good.overall_pass
+        && !bad.overall_pass
+        && good_row.present
+        && bad_row.present
+        && good_row.kind.as_deref() == Some("guard")
+        && bad_row.kind.as_deref() == Some("guard")
+        && good_row.entry_hash.as_deref() == Some(good.ledger_hash.as_str())
+        && bad_row.entry_hash.as_deref() == Some(bad.ledger_hash.as_str())
+        && good_row.self_verifies == Some(true)
+        && bad_row.self_verifies == Some(true);
+    println!(
+        "  good_pass={} bad_refused={} good_ledger_seq={} bad_ledger_seq={} physical_hashes_match={} self_verify={} {}",
+        good.overall_pass,
+        !bad.overall_pass,
+        good.ledger_seq,
+        bad.ledger_seq,
+        good_row.entry_hash.as_deref() == Some(good.ledger_hash.as_str())
+            && bad_row.entry_hash.as_deref() == Some(bad.ledger_hash.as_str()),
+        good_row.self_verifies == Some(true) && bad_row.self_verifies == Some(true),
+        if happy { "OK" } else { "FAIL" }
+    );
+
+    let rebuilt = vault.rebuild_search_indexes(SYN_TIMELINE_PANEL_VERSION)?;
+    let guarded = vault.find_similar(&SynapseCalyxFindParams {
+        panel_version: Some(SYN_TIMELINE_PANEL_VERSION),
+        query: SynapseCalyxFindQuery::ByExample {
+            cx_id: fixture_cx(0).to_string(),
+        },
+        k: 20,
+        fusion: SynapseCalyxFindFusion::Rrf,
+        filter: None,
+        explain: true,
+        temporal: None,
+        guard: SynapseCalyxFindGuardMode::InRegion { operator_tau: None },
+    })?;
+    let guarded_find_ok = guarded.guard.applied
+        && guarded.guard.operator_tau.is_none()
+        && guarded.guard.hits_with_guard_verdict == guarded.hits.len()
+        && guarded.hits.iter().all(|hit| {
+            hit.guard_verdict
+                .as_ref()
+                .is_some_and(|verdict| verdict.overall_pass)
+        })
+        && rebuilt.generation.manifest_sha256 == guarded.generation.manifest_sha256;
+    println!(
+        "  GUARDED FIND: hits={} verdicts={} dropped={} panel_profile=true manifest_sha256={} {}",
+        guarded.hits.len(),
+        guarded.guard.hits_with_guard_verdict,
+        guarded.guard.dropped_candidates,
+        guarded.generation.manifest_sha256,
+        if guarded_find_ok { "OK" } else { "FAIL" }
+    );
+
+    let mut edges_ok = true;
+    let probes = [
+        (
+            "missing_record",
+            verify(
+                CxId::from_bytes([0xEE; 16]),
+                SYN_TIMELINE_PANEL_VERSION,
+                1_000,
+            ),
+        ),
+        (
+            "wrong_panel",
+            verify(fixture_cx(0), SYN_TIMELINE_PANEL_VERSION + 1, 1_000),
+        ),
+        (
+            "invalid_cx_format",
+            SynapseCalyxGuardVerifyParams {
+                panel_version: SYN_TIMELINE_PANEL_VERSION,
+                query_cx_id: "not-a-content-address".to_owned(),
+                high_stakes: true,
+                max_records: 1_000,
+            },
+        ),
+    ];
+    for (name, params) in probes {
+        let before = vault.count_cf_latest(calyx_aster::cf::ColumnFamily::Ledger)?;
+        let result = vault.guard_verify(&params);
+        let after = vault.count_cf_latest(calyx_aster::cf::ColumnFamily::Ledger)?;
+        let refused_without_mutation = result.is_err() && before == after;
+        edges_ok &= refused_without_mutation;
+        println!(
+            "  EDGE {name}: ledger_before={before} refused={} ledger_after={after} unchanged={} {}",
+            result.is_err(),
+            before == after,
+            if refused_without_mutation {
+                "OK"
+            } else {
+                "FAIL"
+            }
+        );
+        if let Err(error) = result {
+            println!("    {}", first_line(&error.to_string()));
+        }
+    }
+    Ok(happy && guarded_find_ok && edges_ok)
 }
 
 /// The raw quotient `dense_cosine` used to return, reproduced so the defect is

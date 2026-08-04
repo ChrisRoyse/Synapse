@@ -124,6 +124,7 @@ use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
     AnchorKind, AnchorValue, Clock, CxId, Panel, SlotId, SlotVector, Ts, dense_cosine,
 };
+use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::load_vault_panel_state;
 use calyx_ward::{
     CalibrationInput, GuardId, GuardPolicy, GuardProfile, MIN_BAD_SCORES, NoveltyAction, SlotKind,
@@ -323,6 +324,9 @@ pub struct SynapseCalyxGuardVerifyReport {
     pub calibration_frr: Option<f32>,
     pub calibration_confidence: Option<f32>,
     pub trusted_exemplars: usize,
+    /// Physical append-only Ledger row sealing this exact verdict.
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
 }
 
 /// One enum anchor kind whose value set carries a **declared** good/bad
@@ -811,6 +815,42 @@ impl SynapseCalyxVault {
                 )
             })?;
 
+        // A Ward verdict is a security decision, not an observational return
+        // value. Commit its complete decomposition before exposing it so every
+        // accepted/refused decision has a physical, hash-chained source of
+        // truth. Failure to append fails the verification itself closed.
+        let verdict_payload = serde_json::to_vec(&serde_json::json!({
+            "ward_provenance": "ward_guard_verdict_v1",
+            "cx_id": query_cx.to_string(),
+            "guard_id": verdict.guard_id.to_string(),
+            "overall_pass": verdict.overall_pass,
+            "provisional": verdict.provisional,
+            "action": verdict.action,
+            "per_slot": verdict.per_slot,
+        }))
+        .map_err(|error| {
+            guard_error(
+                "SYNAPSE_CALYX_GUARD_VERDICT_ENCODE_FAILED",
+                format!("encode Ward verdict ledger payload: {error}"),
+                "inspect the GuardVerdict serialization contract; no verdict is returned without durable provenance",
+            )
+        })?;
+        let ledger_ref = self
+            .vault
+            .append_ledger_entry(
+                EntryKind::Guard,
+                SubjectId::Cx(query_cx),
+                verdict_payload,
+                ActorId::Service("calyx-ward".to_owned()),
+            )
+            .map_err(|error| {
+                guard_error(
+                    "SYNAPSE_CALYX_GUARD_VERDICT_LEDGER_FAILED",
+                    format!("append Ward verdict to the physical Ledger CF: {error}"),
+                    "repair the vault Ledger append path and verify its hash chain before retrying; the verdict was not released",
+                )
+            })?;
+
         let per_slot: Vec<SynapseCalyxGuardSlotVerdict> = verdict
             .per_slot
             .iter()
@@ -859,6 +899,8 @@ impl SynapseCalyxVault {
             calibration_frr: profile.calibration.as_ref().map(|meta| meta.frr),
             calibration_confidence: profile.calibration.as_ref().map(|meta| meta.confidence),
             trusted_exemplars: corpus.good.len(),
+            ledger_seq: ledger_ref.seq,
+            ledger_hash: crate::hex_bytes(&ledger_ref.hash),
         })
     }
 
