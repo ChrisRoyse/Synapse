@@ -106,7 +106,17 @@ def main():
         send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         time.sleep(0.3)
 
-        # 3. tool calls
+        # 3. list tools and retain the advertised schemas for called tools.
+        send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
+        listed = read_response(2)
+        results["tools/list"] = listed
+        advertised_tools = {
+            tool.get("name"): tool
+            for tool in (listed or {}).get("result", {}).get("tools", [])
+        }
+        print(f"[tools/list OK] advertised={len(advertised_tools)}")
+
+        # 4. tool calls
         settle_ms = int(os.environ.get("SYNAPSE_PROBE_SETTLE_MS", "0"))
         next_id = 10
         for spec in tool_specs:
@@ -117,6 +127,12 @@ def main():
                 args = json.loads(raw)
             else:
                 name, args = spec, {}
+            advertised = advertised_tools.get(name)
+            print(f"\n========== ADVERTISED TOOL: {name} ==========")
+            if advertised is None:
+                print("  MISSING FROM tools/list")
+            else:
+                print(json.dumps(advertised.get("inputSchema", {}), sort_keys=True))
             send({
                 "jsonrpc": "2.0", "id": next_id, "method": "tools/call",
                 "params": {"name": name, "arguments": args},

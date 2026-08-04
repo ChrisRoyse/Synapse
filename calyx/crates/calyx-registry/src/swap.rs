@@ -69,6 +69,12 @@ pub struct BackfillQueue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct BackfillTaskId(u64);
 
+impl BackfillTaskId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackfillTask {
     pub id: BackfillTaskId,

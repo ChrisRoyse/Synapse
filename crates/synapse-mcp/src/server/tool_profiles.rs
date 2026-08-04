@@ -2159,6 +2159,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "hold an explicit maintenance profile, wait for any in-flight rebuild to publish its generation, then retry with the exact expected_panel_version",
             ),
             op(
+                "panel_lifecycle",
+                true,
+                false,
+                "one revision-guarded per-panel lifecycle row in the physical Calyx Registry CF plus the vault-global generation allocator",
+                Some(
+                    "exact Registry CF lifecycle state, committed sequence, value SHA-256, allocated slot/lens identity, and queued historical-record count",
+                ),
+                error_codes::STORAGE_PANEL_LIFECYCLE_IN_PROGRESS,
+                "use read without a maintenance profile; for add/park/unpark/retire hold an explicit maintenance profile, wait for any in-flight lifecycle mutation, then retry with a 64-character lowercase hexadecimal idempotency id",
+            ),
+            op(
                 "find_similar",
                 false,
                 false,
@@ -6210,7 +6221,7 @@ mod facade_schema_parity_tests {
         // catch an *unlisted* operation had itself been failing, and every new
         // operation since then went unverified. A count that restates the
         // length of the list above it cannot drift from it.
-        const EXPECTED_OPERATIONS: [&str; 17] = [
+        const EXPECTED_OPERATIONS: [&str; 18] = [
             "inspect",
             "summary",
             "gc_once",
@@ -6221,6 +6232,7 @@ mod facade_schema_parity_tests {
             "temporal_rerank",
             "temporal_backfill",
             "search_rebuild",
+            "panel_lifecycle",
             "find_similar",
             "retire_orphan_slot_cfs",
             "retire_search_generation",

@@ -3011,6 +3011,16 @@ impl SynapseCalyxVault {
             )
         })
     }
+
+    /// Reads one latest physical Base row and hydrates every declared Slot CF
+    /// vector. Lifecycle workers use this as the independent post-write source
+    /// of truth before completing a durable backfill task.
+    pub fn hydrate_constellation_latest(
+        &self,
+        cx_id: CxId,
+    ) -> Result<Constellation, SynapseCalyxError> {
+        self.hydrated_constellation(cx_id, self.read_snapshot())
+    }
     /// Atomically replaces only the temporal metadata fields on one legacy
     /// Base row after exact panel and source-identity verification.
     ///

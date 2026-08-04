@@ -7,16 +7,19 @@
 use std::collections::BTreeMap;
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_core::{CxId, LensId, Panel, SlotId, SlotState, Ts};
+use calyx_core::{
+    AbsentReason, Constellation, CxId, Input, LensId, Panel, SlotId, SlotState, SlotVector, Ts,
+};
 use calyx_registry::{
-    AlgorithmicLens, FrozenLensContract, LensRuntime, LensSpec, Registry, SlotSpec, SwapController,
-    algorithmic_encoder, derive_runtime_contract_from_spec,
+    AlgorithmicLens, BackfillState, BackfillTask, BackfillTaskId, FrozenLensContract, LensRuntime,
+    LensSpec, Registry, SlotSpec, SwapController, algorithmic_encoder, canonical_json_bytes,
+    derive_runtime_contract_from_spec,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
 
-const SCHEMA_VERSION: u16 = 1;
+const SCHEMA_VERSION: u16 = 2;
 const KEY_PREFIX: &[u8] = b"panel-lifecycle\0v1\0";
 const MAX_CAS_ATTEMPTS: usize = 64;
 const MAX_PANEL_NAME_BYTES: usize = 128;
@@ -33,6 +36,32 @@ pub const SYNAPSE_CALYX_PANEL_LIFECYCLE_RUNTIME_UNSUPPORTED: &str =
 pub struct SynapseCalyxAddedLens {
     pub operation_id: String,
     pub lens_spec: LensSpec,
+    pub source_projection: SynapseCalyxSourceProjection,
+}
+
+/// Frozen mapping from an authoritative source row to the bytes a lens sees.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", deny_unknown_fields)]
+pub enum SynapseCalyxSourceProjection {
+    /// Measure the exact bytes stored by the authoritative source CF.
+    RawSourceBytes,
+    /// Decode the source JSON and re-encode the complete value canonically.
+    WholeRecordCanonicalJson,
+    /// Select one RFC 6901 JSON pointer from the decoded source record.
+    JsonPointer {
+        pointer: String,
+        encoding: SynapseCalyxProjectedValueEncoding,
+    },
+}
+
+/// Stable byte encoding for a JSON-pointer projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxProjectedValueEncoding {
+    /// String bytes, or the exact JSON lexical form of a number/bool/null.
+    ScalarText,
+    /// Canonical JSON bytes, including arrays and objects.
+    CanonicalJson,
 }
 
 /// Authoritative lifecycle row for one logical panel.
@@ -52,6 +81,7 @@ pub struct SynapseCalyxAddLensRequest<'a> {
     pub operation_id: &'a str,
     pub slot_key: &'a str,
     pub lens_spec: LensSpec,
+    pub source_projection: SynapseCalyxSourceProjection,
     pub candidates: &'a [CxId],
     pub now: Ts,
 }
@@ -89,7 +119,75 @@ pub struct SynapseCalyxSetLensStateReadback {
     pub existing_identical: bool,
 }
 
+/// Reproducible measurement of one authoritative row through one added lens.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxAddedLensMeasurement {
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub lens_id: LensId,
+    pub input_sha256: String,
+    pub vector: SlotVector,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxBackfillClaimReadback {
+    pub state: SynapseCalyxPanelLifecycleState,
+    pub tasks: Vec<BackfillTask>,
+    pub recovered_in_flight: u64,
+    pub committed_seq: u64,
+    pub value_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxBackfillCompleteReadback {
+    pub state: SynapseCalyxPanelLifecycleState,
+    pub task_id: u64,
+    pub committed_seq: u64,
+    pub value_sha256: String,
+}
+
 impl SynapseCalyxVault {
+    /// Lists every physical Base id in one panel, bounded before allocation.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `max_records` is zero, a Base row cannot decode, or the panel
+    /// contains more records than the caller's declared durable-queue budget.
+    pub fn panel_constellation_ids(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+    ) -> Result<Vec<CxId>, SynapseCalyxError> {
+        if max_records == 0 {
+            return Err(invalid("panel constellation id limit must be positive"));
+        }
+        let mut ids = Vec::new();
+        self.walk_cf_latest(
+            ColumnFamily::Base,
+            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            |_key, value| {
+                let base = calyx_aster::vault::encode::decode_constellation_base(value).map_err(
+                    |error| {
+                        SynapseCalyxError::from_calyx(
+                            "decode Base row for lifecycle candidate census",
+                            &error,
+                        )
+                    },
+                )?;
+                if base.panel_version == panel_version {
+                    if ids.len() >= max_records {
+                        return Err(invalid(format!(
+                            "panel {panel_version} exceeds lifecycle candidate limit {max_records}"
+                        )));
+                    }
+                    ids.push(base.cx_id);
+                }
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
+        Ok(ids)
+    }
+
     /// Reads one panel's lifecycle row from the physical Registry CF.
     pub fn read_panel_lifecycle(
         &self,
@@ -99,6 +197,39 @@ impl SynapseCalyxVault {
         self.read_cf_latest(ColumnFamily::Registry, &key)?
             .map(|bytes| decode_state(&bytes, panel_name))
             .transpose()
+    }
+
+    /// Reconstructs every dynamically added frozen lens into a supplied base
+    /// registry and returns the durable lifecycle panel definition.
+    pub fn reconstruct_panel_lifecycle_contract(
+        &self,
+        panel_name: &str,
+        mut registry: Registry,
+    ) -> Result<Option<calyx_registry::VaultPanelState>, SynapseCalyxError> {
+        let Some(state) = self.read_panel_lifecycle(panel_name)? else {
+            return Ok(None);
+        };
+        for (expected_id, added) in &state.added_lenses {
+            let (lens, contract) = runtime_lens(&added.lens_spec)?;
+            let observed = registry
+                .register_frozen_with_spec(lens, contract, added.lens_spec.clone())
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        "reconstruct durable panel lifecycle registry",
+                        &error,
+                    )
+                })?;
+            if observed != *expected_id {
+                return Err(invalid(format!(
+                    "reconstructed lifecycle lens {observed} differs from stored id {expected_id}"
+                )));
+            }
+        }
+        Ok(Some(calyx_registry::VaultPanelState {
+            panel: state.controller.panel().clone(),
+            registry,
+            registry_snapshot: None,
+        }))
     }
 
     /// Adds one deterministic lens and durably enqueues historical records.
@@ -174,6 +305,7 @@ impl SynapseCalyxVault {
                 SynapseCalyxAddedLens {
                     operation_id: request.operation_id.to_owned(),
                     lens_spec: request.lens_spec.clone(),
+                    source_projection: request.source_projection.clone(),
                 },
             );
             validate_state(&state)?;
@@ -365,6 +497,344 @@ impl SynapseCalyxVault {
             request.panel_name
         )))
     }
+
+    /// Reconstructs one added frozen lens and measures authoritative source bytes.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the lifecycle row or lens is absent/retired, its frozen
+    /// runtime no longer reproduces, source JSON/projection is invalid, or the
+    /// measured vector violates the declared shape/numerical contract.
+    pub fn measure_added_panel_lens(
+        &self,
+        panel_name: &str,
+        lens_id: LensId,
+        source_bytes: &[u8],
+    ) -> Result<SynapseCalyxAddedLensMeasurement, SynapseCalyxError> {
+        let state = self.read_panel_lifecycle(panel_name)?.ok_or_else(|| {
+            conflict(format!("panel {panel_name:?} has no durable lifecycle row"))
+        })?;
+        let added = state.added_lenses.get(&lens_id).ok_or_else(|| {
+            invalid(format!(
+                "lens {lens_id} is not an added lens on panel {panel_name:?}"
+            ))
+        })?;
+        let slot = state
+            .controller
+            .panel()
+            .slots
+            .iter()
+            .find(|slot| slot.lens_id == lens_id)
+            .ok_or_else(|| invalid(format!("lens {lens_id} has no durable panel slot")))?;
+        if slot.state == SlotState::Retired {
+            return Err(SynapseCalyxError::from_calyx(
+                "measure added panel lens",
+                &calyx_core::CalyxError::lens_frozen_violation(format!(
+                    "lens {lens_id} is retired and cannot measure new source rows"
+                )),
+            ));
+        }
+        let (lens, contract) = runtime_lens(&added.lens_spec)?;
+        let mut registry = Registry::new();
+        let registered_id = registry
+            .register_frozen_with_spec(lens, contract, added.lens_spec.clone())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("reconstruct added panel lens", &error)
+            })?;
+        if registered_id != lens_id {
+            return Err(invalid(format!(
+                "reconstructed lens id {registered_id} differs from lifecycle id {lens_id}"
+            )));
+        }
+        let projected = project_source_bytes(&added.source_projection, source_bytes)?;
+        let vector = registry
+            .measure(
+                lens_id,
+                &Input::new(added.lens_spec.modality, projected.clone()),
+            )
+            .map_err(|error| SynapseCalyxError::from_calyx("measure added panel lens", &error))?;
+        Ok(SynapseCalyxAddedLensMeasurement {
+            panel_name: panel_name.to_owned(),
+            panel_version: state.controller.panel().version,
+            lens_id,
+            input_sha256: hex_sha256(&projected),
+            vector,
+        })
+    }
+
+    /// Re-measures one authoritative input into the latest durable lifecycle
+    /// generation while preserving the supplied base generation as history.
+    ///
+    /// Returns `None` when the panel has never been mutated. Active added
+    /// lenses are measured immediately; parked and retired slots are carried as
+    /// explicit inactive absences so a zero vector can never be inferred.
+    pub fn materialize_panel_lifecycle_generation(
+        &self,
+        panel_name: &str,
+        identity_input: &[u8],
+        source_bytes: &[u8],
+        base: &Constellation,
+    ) -> Result<Option<Constellation>, SynapseCalyxError> {
+        let Some(state) = self.read_panel_lifecycle(panel_name)? else {
+            return Ok(None);
+        };
+        let panel = state.controller.panel();
+        if base.panel_version > panel.version {
+            return Err(conflict(format!(
+                "base constellation generation {} is newer than lifecycle generation {} for {panel_name:?}",
+                base.panel_version, panel.version
+            )));
+        }
+        if base.panel_version == panel.version {
+            return Ok(Some(base.clone()));
+        }
+        let mut materialized = base.clone();
+        materialized.cx_id = self.cx_id_for_input(identity_input, panel.version);
+        materialized.panel_version = panel.version;
+        for slot in &panel.slots {
+            if materialized.slots.contains_key(&slot.slot_id) {
+                continue;
+            }
+            let vector = match slot.state {
+                SlotState::Active => {
+                    self.measure_added_panel_lens(panel_name, slot.lens_id, source_bytes)?
+                        .vector
+                }
+                SlotState::Parked | SlotState::Retired => SlotVector::Absent {
+                    reason: AbsentReason::LensInactive,
+                },
+            };
+            materialized.slots.insert(slot.slot_id, vector);
+        }
+        materialized.validate_schema().map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "validate materialized panel lifecycle generation",
+                &error,
+            )
+        })?;
+        Ok(Some(materialized))
+    }
+
+    /// Atomically recovers abandoned claims and claims a bounded next batch.
+    pub fn claim_panel_backfill(
+        &self,
+        panel_name: &str,
+        limit: usize,
+        recover_in_flight: bool,
+    ) -> Result<SynapseCalyxBackfillClaimReadback, SynapseCalyxError> {
+        if !(1..=256).contains(&limit) {
+            return Err(invalid("backfill claim limit must be within 1..=256"));
+        }
+        let key = lifecycle_key(panel_name)?;
+        for _attempt in 0..MAX_CAS_ATTEMPTS {
+            let row = self
+                .read_cf_latest_revisioned(ColumnFamily::Registry, &key)?
+                .ok_or_else(|| {
+                    conflict(format!("panel {panel_name:?} has no durable lifecycle row"))
+                })?;
+            let mut state = decode_state(&row.value, panel_name)?;
+            let abandoned = state
+                .controller
+                .queue()
+                .tasks()
+                .filter(|task| task.state == BackfillState::InFlight)
+                .map(|task| task.id)
+                .collect::<Vec<_>>();
+            if !abandoned.is_empty() && !recover_in_flight {
+                return Err(conflict(format!(
+                    "panel {panel_name:?} has {} in-flight backfill tasks; restart recovery must be explicitly requested",
+                    abandoned.len()
+                )));
+            }
+            for id in &abandoned {
+                state.controller.queue_mut().retry(*id).map_err(|error| {
+                    SynapseCalyxError::from_calyx("recover abandoned panel backfill task", &error)
+                })?;
+            }
+            let tasks = state.controller.queue_mut().claim_batch(limit);
+            if tasks.is_empty() && abandoned.is_empty() {
+                return Ok(SynapseCalyxBackfillClaimReadback {
+                    state,
+                    tasks,
+                    recovered_in_flight: 0,
+                    committed_seq: self.latest_seq(),
+                    value_sha256: hex_sha256(&row.value),
+                });
+            }
+            let encoded = serde_json::to_vec(&state).map_err(|error| {
+                invalid(format!(
+                    "encode backfill claim state for {panel_name}: {error}"
+                ))
+            })?;
+            let write = self.write_cf_batch_if_revision(
+                ColumnFamily::Registry,
+                &key,
+                Some(row.revision_sha256),
+                vec![SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Registry,
+                    key: key.clone(),
+                    value: encoded,
+                }],
+            )?;
+            if !write.applied {
+                continue;
+            }
+            let stored = self
+                .read_cf_latest(ColumnFamily::Registry, &key)?
+                .ok_or_else(|| conflict("committed backfill claim row is absent"))?;
+            let readback = decode_state(&stored, panel_name)?;
+            if readback != state {
+                return Err(conflict(
+                    "backfill claim physical readback differs from committed state",
+                ));
+            }
+            return Ok(SynapseCalyxBackfillClaimReadback {
+                state: readback,
+                tasks,
+                recovered_in_flight: abandoned.len() as u64,
+                committed_seq: write.committed_seq,
+                value_sha256: hex_sha256(&stored),
+            });
+        }
+        Err(conflict(format!(
+            "panel {panel_name:?} backfill claim exceeded {MAX_CAS_ATTEMPTS} atomic retries"
+        )))
+    }
+
+    /// Marks one physically verified task complete in the durable queue.
+    pub fn complete_panel_backfill_task(
+        &self,
+        panel_name: &str,
+        task_id: BackfillTaskId,
+    ) -> Result<SynapseCalyxBackfillCompleteReadback, SynapseCalyxError> {
+        let key = lifecycle_key(panel_name)?;
+        for _attempt in 0..MAX_CAS_ATTEMPTS {
+            let row = self
+                .read_cf_latest_revisioned(ColumnFamily::Registry, &key)?
+                .ok_or_else(|| {
+                    conflict(format!("panel {panel_name:?} has no durable lifecycle row"))
+                })?;
+            let mut state = decode_state(&row.value, panel_name)?;
+            let task = state
+                .controller
+                .queue()
+                .tasks()
+                .find(|task| task.id == task_id)
+                .cloned()
+                .ok_or_else(|| invalid(format!("backfill task {} is absent", task_id.get())))?;
+            if task.state == BackfillState::Complete {
+                return Ok(SynapseCalyxBackfillCompleteReadback {
+                    state,
+                    task_id: task_id.get(),
+                    committed_seq: self.latest_seq(),
+                    value_sha256: hex_sha256(&row.value),
+                });
+            }
+            if task.state != BackfillState::InFlight {
+                return Err(conflict(format!(
+                    "backfill task {} is {:?}, not in_flight",
+                    task_id.get(),
+                    task.state
+                )));
+            }
+            state
+                .controller
+                .queue_mut()
+                .complete(task_id)
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx("complete durable panel backfill task", &error)
+                })?;
+            let encoded = serde_json::to_vec(&state).map_err(|error| {
+                invalid(format!(
+                    "encode backfill completion for {panel_name}: {error}"
+                ))
+            })?;
+            let write = self.write_cf_batch_if_revision(
+                ColumnFamily::Registry,
+                &key,
+                Some(row.revision_sha256),
+                vec![SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Registry,
+                    key: key.clone(),
+                    value: encoded,
+                }],
+            )?;
+            if !write.applied {
+                continue;
+            }
+            let stored = self
+                .read_cf_latest(ColumnFamily::Registry, &key)?
+                .ok_or_else(|| conflict("committed backfill completion row is absent"))?;
+            let readback = decode_state(&stored, panel_name)?;
+            if readback != state {
+                return Err(conflict(
+                    "backfill completion physical readback differs from committed state",
+                ));
+            }
+            return Ok(SynapseCalyxBackfillCompleteReadback {
+                state: readback,
+                task_id: task_id.get(),
+                committed_seq: write.committed_seq,
+                value_sha256: hex_sha256(&stored),
+            });
+        }
+        Err(conflict(format!(
+            "panel {panel_name:?} backfill completion exceeded {MAX_CAS_ATTEMPTS} atomic retries"
+        )))
+    }
+}
+
+fn project_source_bytes(
+    projection: &SynapseCalyxSourceProjection,
+    source_bytes: &[u8],
+) -> Result<Vec<u8>, SynapseCalyxError> {
+    match projection {
+        SynapseCalyxSourceProjection::RawSourceBytes => Ok(source_bytes.to_vec()),
+        SynapseCalyxSourceProjection::WholeRecordCanonicalJson => {
+            canonical_json_bytes(&decode_source_json(source_bytes)?).map_err(|error| {
+                SynapseCalyxError::from_calyx("canonicalize whole source record", &error)
+            })
+        }
+        SynapseCalyxSourceProjection::JsonPointer { pointer, encoding } => {
+            let value = decode_source_json(source_bytes)?;
+            let selected = value.pointer(pointer).ok_or_else(|| {
+                invalid(format!("source JSON has no value at pointer {pointer:?}"))
+            })?;
+            match encoding {
+                SynapseCalyxProjectedValueEncoding::CanonicalJson => canonical_json_bytes(selected)
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx(
+                            "canonicalize JSON-pointer source value",
+                            &error,
+                        )
+                    }),
+                SynapseCalyxProjectedValueEncoding::ScalarText => match selected {
+                    serde_json::Value::String(value) => Ok(value.as_bytes().to_vec()),
+                    serde_json::Value::Number(_)
+                    | serde_json::Value::Bool(_)
+                    | serde_json::Value::Null => canonical_json_bytes(selected).map_err(|error| {
+                        SynapseCalyxError::from_calyx(
+                            "encode JSON-pointer scalar source value",
+                            &error,
+                        )
+                    }),
+                    serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                        Err(invalid(format!(
+                            "source JSON pointer {pointer:?} selected a composite value for scalar_text encoding"
+                        )))
+                    }
+                },
+            }
+        }
+    }
+}
+
+fn decode_source_json(source_bytes: &[u8]) -> Result<serde_json::Value, SynapseCalyxError> {
+    serde_json::from_slice(source_bytes).map_err(|error| {
+        invalid(format!(
+            "authoritative source row is not valid JSON: {error}"
+        ))
+    })
 }
 
 fn runtime_lens(
@@ -406,6 +876,20 @@ fn validate_request(request: &SynapseCalyxAddLensRequest<'_>) -> Result<(), Syna
     }
     if request.lens_spec.name.trim().is_empty() {
         return Err(invalid("lens spec name must be non-blank"));
+    }
+    validate_source_projection(&request.source_projection)?;
+    Ok(())
+}
+
+fn validate_source_projection(
+    projection: &SynapseCalyxSourceProjection,
+) -> Result<(), SynapseCalyxError> {
+    if let SynapseCalyxSourceProjection::JsonPointer { pointer, .. } = projection
+        && (pointer.is_empty() || !pointer.starts_with('/') || pointer.as_bytes().contains(&0))
+    {
+        return Err(invalid(
+            "JSON-pointer source projection must start with '/' and contain no NUL byte",
+        ));
     }
     Ok(())
 }

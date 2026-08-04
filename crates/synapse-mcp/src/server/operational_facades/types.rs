@@ -28,13 +28,13 @@ use crate::m3::{
         StorageCorpusHistogramResponse, StorageFindSimilarParams, StorageFindSimilarResponse,
         StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
         StorageIntelligenceParams, StorageIntelligenceResponse, StoragePanelCoverageParams,
-        StoragePanelCoverageResponse, StorageRestoreVerifyParams, StorageRestoreVerifyResponse,
-        StorageRetireOrphanSlotCfsParams, StorageRetireOrphanSlotCfsResponse,
-        StorageRetireSearchGenerationParams, StorageRetireSearchGenerationResponse,
-        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
-        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
-        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
-        StorageTemporalRerankResponse,
+        StoragePanelCoverageResponse, StoragePanelLifecycleParams, StoragePanelLifecycleResponse,
+        StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
+        StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
+        StorageRetireSearchGenerationResponse, StorageSearchRebuildParams,
+        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
+        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
+        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -50,6 +50,7 @@ pub enum StorageOperation {
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
+    PanelLifecycle,
     FindSimilar,
     RetireOrphanSlotCfs,
     RetireSearchGeneration,
@@ -72,6 +73,7 @@ impl StorageOperation {
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
+            Self::PanelLifecycle => "panel_lifecycle",
             Self::FindSimilar => "find_similar",
             Self::RetireOrphanSlotCfs => "retire_orphan_slot_cfs",
             Self::RetireSearchGeneration => "retire_search_generation",
@@ -107,6 +109,8 @@ pub struct StorageParams {
     pub temporal_backfill: Option<StorageTemporalBackfillParams>,
     #[serde(default)]
     pub search_rebuild: Option<StorageSearchRebuildParams>,
+    #[serde(default)]
+    pub panel_lifecycle: Option<StoragePanelLifecycleParams>,
     #[serde(default)]
     pub find_similar: Option<StorageFindSimilarParams>,
     #[serde(default)]
@@ -149,6 +153,8 @@ pub struct StorageResponse {
     pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_rebuild: Option<StorageSearchRebuildResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub panel_lifecycle: Option<StoragePanelLifecycleResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub find_similar: Option<StorageFindSimilarResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

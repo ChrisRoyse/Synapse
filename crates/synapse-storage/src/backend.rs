@@ -268,6 +268,22 @@ pub struct CalyxRecurrenceSubjectReport {
     pub occurrence: SynapseCalyxRecurrenceAppendReadback,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct PanelLifecycleBackfillReport {
+    pub panel_name: String,
+    pub source_panel_version: u32,
+    pub target_panel_version: u32,
+    pub claimed: u64,
+    pub recovered_in_flight: u64,
+    pub completed: u64,
+    pub pending: u64,
+    pub in_flight: u64,
+    pub completed_total: u64,
+    pub registry_committed_seq: u64,
+    pub registry_value_sha256: String,
+    pub verified_cx_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroundingAnchorSource {
     pub source_cf: &'static str,
@@ -644,6 +660,31 @@ pub trait StorageBackend: Send + Sync {
         subject_id: &str,
     ) -> StorageResult<SynapseCalyxRecurrenceSeriesReadback>;
     fn list_temporal_panels(&self) -> StorageResult<Vec<VaultTemporalPanelRegistration>>;
+    fn add_panel_lens(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_key: &str,
+        lens_spec: calyx_registry::LensSpec,
+        source_projection: synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxAddLensReadback>;
+    fn set_panel_lens_state(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_id: calyx_core::SlotId,
+        state: calyx_core::SlotState,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateReadback>;
+    fn read_panel_lifecycle(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<Option<synapse_calyx::panel_lifecycle::SynapseCalyxPanelLifecycleState>>;
+    fn run_panel_backfill(
+        &self,
+        panel_version: u32,
+        limit: usize,
+        recover_in_flight: bool,
+    ) -> StorageResult<PanelLifecycleBackfillReport>;
     fn temporal_rerank(
         &self,
         candidates: &[SynapseCalyxTemporalCandidate],
@@ -1913,6 +1954,226 @@ impl gc::GcRunner for CalyxGcRunner {
     }
 }
 
+fn put_observation_with_lifecycle(
+    vault: &SynapseCalyxVault,
+    panel_name: &str,
+    identity_input: &[u8],
+    source_bytes: &[u8],
+    constellation: Constellation,
+) -> StorageResult<SynapseCalyxObservationPutReadback> {
+    let lifecycle = vault
+        .materialize_panel_lifecycle_generation(
+            panel_name,
+            identity_input,
+            source_bytes,
+            &constellation,
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_constellation",
+                "materialize latest panel lifecycle generation",
+                &source,
+            )
+        })?;
+    let Some(lifecycle) = lifecycle else {
+        return vault
+            .put_observation_constellation(constellation)
+            .map_err(|source| {
+                calyx_write_failed(
+                    "calyx_constellation",
+                    "put native Calyx observation constellation",
+                    &source,
+                )
+            });
+    };
+    if lifecycle.cx_id == constellation.cx_id {
+        return vault
+            .put_observation_constellation(constellation)
+            .map_err(|source| {
+                calyx_write_failed(
+                    "calyx_constellation",
+                    "put current panel lifecycle constellation",
+                    &source,
+                )
+            });
+    }
+    let mut readbacks = vault
+        .put_observation_constellation_batch([constellation, lifecycle])
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_constellation",
+                "atomically put base and latest panel lifecycle constellations",
+                &source,
+            )
+        })?;
+    if readbacks.len() != 2 {
+        return Err(calyx_write_failed_detail(
+            "calyx_constellation",
+            format!(
+                "atomic lifecycle dual measurement returned {} readbacks instead of 2",
+                readbacks.len()
+            ),
+        ));
+    }
+    Ok(readbacks.remove(0))
+}
+
+fn lifecycle_constellation_from_source(
+    vault: &SynapseCalyxVault,
+    panel_name: &str,
+    source_panel_version: u32,
+    source_cf: &str,
+    source_key: &[u8],
+    raw: &[u8],
+) -> StorageResult<Constellation> {
+    let expected_source_cf = match source_panel_version {
+        SYN_TIMELINE_PANEL_VERSION => cf::CF_TIMELINE,
+        SYN_EPISODE_PANEL_VERSION => cf::CF_EPISODES,
+        SYN_AGENT_TRANSCRIPT_PANEL_VERSION => cf::CF_AGENT_TRANSCRIPTS,
+        SYN_MCP_USAGE_PANEL_VERSION => cf::CF_KV,
+        _ => {
+            return Err(StorageError::BackendInvalidConfig {
+                value: source_panel_version.to_string(),
+                detail: "the lifecycle worker has no authoritative typed source builder for this active panel generation".to_owned(),
+            });
+        }
+    };
+    if source_cf != expected_source_cf {
+        return Err(StorageError::ReadFailed {
+            cf_name: source_cf.to_owned(),
+            detail: format!(
+                "lifecycle Base pointer names {source_cf}, but panel {source_panel_version} requires {expected_source_cf}"
+            ),
+        });
+    }
+    let panel = constellations::anchor_panel_for_source_row(expected_source_cf, source_key)?;
+    if panel.panel_name != panel_name || panel.panel_version != source_panel_version {
+        return Err(calyx_write_failed_detail(
+            "calyx_constellation",
+            format!(
+                "lifecycle source {source_cf}/{} maps to {} generation {}, expected {panel_name} generation {source_panel_version}",
+                constellations::hex_encode(source_key),
+                panel.panel_name,
+                panel.panel_version
+            ),
+        ));
+    }
+    let identity = constellations::source_constellation_input_bytes(
+        panel.input_mode,
+        source_cf,
+        source_key,
+        raw,
+    );
+    let context = NativeConstellationContext {
+        vault_id: vault.vault_id_value(),
+        cx_id: vault.cx_id_for_input(&identity, source_panel_version),
+        created_at_ms: calyx_clock_now_for_write(vault, source_cf)?,
+        next_ledger_seq: vault.latest_seq().saturating_add(1),
+    };
+    let base = match source_panel_version {
+        SYN_TIMELINE_PANEL_VERSION => {
+            let record: TimelineRecord =
+                serde_json::from_slice(raw).map_err(|source| StorageError::DecodeJson {
+                    type_name: "panel_lifecycle_timeline",
+                    source,
+                })?;
+            constellations::build_timeline_constellation(context, source_key, raw, &record)?
+        }
+        SYN_EPISODE_PANEL_VERSION => {
+            let record: EpisodeRecord =
+                serde_json::from_slice(raw).map_err(|source| StorageError::DecodeJson {
+                    type_name: "panel_lifecycle_episode",
+                    source,
+                })?;
+            constellations::build_episode_constellation(context, source_key, raw, &record)?
+        }
+        SYN_AGENT_TRANSCRIPT_PANEL_VERSION => {
+            let record: AgentTranscriptRecord =
+                serde_json::from_slice(raw).map_err(|source| StorageError::DecodeJson {
+                    type_name: "panel_lifecycle_agent_transcript",
+                    source,
+                })?;
+            constellations::build_agent_transcript_constellation(context, source_key, raw, &record)?
+        }
+        SYN_MCP_USAGE_PANEL_VERSION => {
+            let record: Value =
+                serde_json::from_slice(raw).map_err(|source| StorageError::DecodeJson {
+                    type_name: "panel_lifecycle_mcp_usage",
+                    source,
+                })?;
+            constellations::build_mcp_usage_constellation(
+                context, source_key, raw, &identity, &record,
+            )?
+        }
+        _ => {
+            return Err(StorageError::BackendInvalidConfig {
+                value: source_panel_version.to_string(),
+                detail: "the lifecycle worker has no authoritative typed source builder for this active panel generation".to_owned(),
+            });
+        }
+    };
+    vault
+        .materialize_panel_lifecycle_generation(panel_name, &identity, raw, &base)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_constellation",
+                "materialize lifecycle backfill generation from authoritative source",
+                &source,
+            )
+        })?
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                "calyx_registry",
+                format!("panel {panel_name} lifecycle row disappeared after its task was claimed"),
+            )
+        })
+}
+
+fn resolve_panel_contract(
+    vault: &SynapseCalyxVault,
+    panel_version: u32,
+    created_at_ms: u64,
+) -> StorageResult<Option<SynapseCalyxPanelState>> {
+    if let Some(contract) = syn_active_panel_contract(panel_version, created_at_ms)? {
+        return Ok(Some(SynapseCalyxPanelState {
+            panel: contract.panel,
+            registry: contract.registry,
+            registry_snapshot: None,
+        }));
+    }
+    let mut matched = None;
+    for entry in constellations::builtin_panel_catalog() {
+        let Some(base) = syn_active_panel_contract(entry.panel_version, created_at_ms)? else {
+            continue;
+        };
+        let Some(candidate) = vault
+            .reconstruct_panel_lifecycle_contract(entry.panel_name, base.registry)
+            .map_err(|source| {
+                calyx_write_failed(
+                    "calyx_registry",
+                    "reconstruct durable panel lifecycle contract",
+                    &source,
+                )
+            })?
+        else {
+            continue;
+        };
+        if candidate.panel.version != panel_version {
+            continue;
+        }
+        if matched.is_some() {
+            return Err(calyx_write_failed_detail(
+                "calyx_registry",
+                format!(
+                    "multiple durable lifecycle panels claim generation {panel_version}; generation identity is ambiguous"
+                ),
+            ));
+        }
+        matched = Some(candidate);
+    }
+    Ok(matched)
+}
+
 impl StorageBackend for CalyxBackend {
     fn kind(&self) -> StorageBackendKind {
         StorageBackendKind::Calyx
@@ -2245,6 +2506,205 @@ impl StorageBackend for CalyxBackend {
             crate::derived_state::DERIVED_STATE_INTERVAL,
             gc::MaintenanceTaskKind::DerivedState,
         )
+    }
+
+    fn run_panel_backfill(
+        &self,
+        panel_version: u32,
+        limit: usize,
+        recover_in_flight: bool,
+    ) -> StorageResult<PanelLifecycleBackfillReport> {
+        if !self.pressure.permits_write("calyx_constellation") {
+            return Err(StorageError::WriteShed {
+                cf_name: "calyx_constellation".to_owned(),
+                pressure_level: format!("{:?}", self.pressure.level()),
+                rows: limit,
+            });
+        }
+        let entry = constellations::panel_catalog_entry_for_version(panel_version)
+            .filter(|entry| entry.panel_version == panel_version)
+            .ok_or_else(|| StorageError::BackendInvalidConfig {
+                value: panel_version.to_string(),
+                detail:
+                    "panel lifecycle backfill requires an exact active built-in panel generation"
+                        .to_owned(),
+            })?;
+        let claim = self.with_vault(
+            "calyx_registry",
+            "claim durable Calyx panel backfill batch",
+            true,
+            |vault| {
+                vault
+                    .claim_panel_backfill(entry.panel_name, limit, recover_in_flight)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "claim durable Calyx panel backfill batch",
+                            &source,
+                        )
+                    })
+            },
+        )?;
+        let claimed = claim.tasks.len() as u64;
+        let mut verified_cx_ids = Vec::with_capacity(claim.tasks.len());
+        let mut last_seq = claim.committed_seq;
+        let mut last_hash = claim.value_sha256;
+        let mut final_state = claim.state;
+        for task in claim.tasks {
+            if !self.pressure.permits_write("calyx_constellation") {
+                return Err(StorageError::WriteShed {
+                    cf_name: "calyx_constellation".to_owned(),
+                    pressure_level: format!("{:?}", self.pressure.level()),
+                    rows: 1,
+                });
+            }
+            let pointer = self
+                .with_vault(
+                    "calyx_base",
+                    "read lifecycle backfill source pointer",
+                    false,
+                    |vault| {
+                        vault
+                            .read_base_source_pointer(task.cx_id)
+                            .map_err(|source| {
+                                calyx_write_failed(
+                                    "calyx_base",
+                                    "read lifecycle backfill source pointer",
+                                    &source,
+                                )
+                            })
+                    },
+                )?
+                .ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: "calyx_base".to_owned(),
+                    detail: format!(
+                        "lifecycle backfill source constellation {} is absent",
+                        task.cx_id
+                    ),
+                })?;
+            let source_cf = pointer.source_cf.ok_or_else(|| StorageError::ReadFailed {
+                cf_name: "calyx_base".to_owned(),
+                detail: format!(
+                    "lifecycle backfill source {} has no source CF metadata",
+                    task.cx_id
+                ),
+            })?;
+            let source_key_hex =
+                pointer
+                    .source_key_hex
+                    .ok_or_else(|| StorageError::ReadFailed {
+                        cf_name: "calyx_base".to_owned(),
+                        detail: format!(
+                            "lifecycle backfill source {} has no source key metadata",
+                            task.cx_id
+                        ),
+                    })?;
+            let source_key = decode_source_key_hex(&source_key_hex).map_err(|detail| {
+                StorageError::ReadFailed {
+                    cf_name: source_cf.clone(),
+                    detail: format!("decode lifecycle source key {source_key_hex:?}: {detail}"),
+                }
+            })?;
+            let raw =
+                self.get_cf(&source_cf, &source_key)?
+                    .ok_or_else(|| StorageError::ReadFailed {
+                        cf_name: source_cf.clone(),
+                        detail: format!(
+                            "authoritative lifecycle source row key_hex={source_key_hex} is absent"
+                        ),
+                    })?;
+            let materialized = self.with_vault(
+                "calyx_constellation",
+                "remeasure lifecycle backfill source row",
+                true,
+                |vault| {
+                    let expected = lifecycle_constellation_from_source(
+                        vault,
+                        entry.panel_name,
+                        panel_version,
+                        &source_cf,
+                        &source_key,
+                        &raw,
+                    )?;
+                    vault
+                        .put_observation_constellation(expected.clone())
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "put lifecycle backfill constellation",
+                                &source,
+                            )
+                        })?;
+                    let observed = vault
+                        .hydrate_constellation_latest(expected.cx_id)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_constellation",
+                                "independently hydrate lifecycle backfill constellation",
+                                &source,
+                            )
+                        })?;
+                    if observed.cx_id != expected.cx_id
+                        || observed.panel_version != expected.panel_version
+                        || observed.slots != expected.slots
+                        || observed.input_ref != expected.input_ref
+                    {
+                        return Err(calyx_write_failed_detail(
+                            "calyx_constellation",
+                            format!(
+                                "physical lifecycle readback differs for expected cx_id {} panel {}",
+                                expected.cx_id, expected.panel_version
+                            ),
+                        ));
+                    }
+                    Ok(expected.cx_id)
+                },
+            )?;
+            let completion = self.with_vault(
+                "calyx_registry",
+                "complete verified Calyx panel backfill task",
+                true,
+                |vault| {
+                    vault
+                        .complete_panel_backfill_task(entry.panel_name, task.id)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_registry",
+                                "complete verified Calyx panel backfill task",
+                                &source,
+                            )
+                        })
+                },
+            )?;
+            verified_cx_ids.push(materialized.to_string());
+            last_seq = completion.committed_seq;
+            last_hash = completion.value_sha256;
+            final_state = completion.state;
+        }
+        let queue = final_state.controller.queue();
+        let pending = queue
+            .tasks()
+            .filter(|task| task.state == calyx_registry::BackfillState::Pending)
+            .count() as u64;
+        let in_flight = queue
+            .tasks()
+            .filter(|task| task.state == calyx_registry::BackfillState::InFlight)
+            .count() as u64;
+        let completed_total = queue.completed_len() as u64;
+        Ok(PanelLifecycleBackfillReport {
+            panel_name: entry.panel_name.to_owned(),
+            source_panel_version: panel_version,
+            target_panel_version: final_state.controller.panel().version,
+            claimed,
+            recovered_in_flight: claim.recovered_in_flight,
+            completed: verified_cx_ids.len() as u64,
+            pending,
+            in_flight,
+            completed_total,
+            registry_committed_seq: last_seq,
+            registry_value_sha256: last_hash,
+            verified_cx_ids,
+        })
     }
 
     #[allow(
@@ -2793,15 +3253,8 @@ impl StorageBackend for CalyxBackend {
                 // SEARCH_PANEL_MISMATCH) rather than silently rebuilding a
                 // different panel — the same refusal as before.
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-                let supplied = syn_active_panel_contract(expected_panel_version, created_at_ms)?
-                    .map(|contract| SynapseCalyxPanelState {
-                        panel: contract.panel,
-                        registry: contract.registry,
-                        // Read paths never consult the snapshot; it is only
-                        // compared on the publish path, which this no longer
-                        // takes.
-                        registry_snapshot: None,
-                    });
+                let supplied =
+                    resolve_panel_contract(vault, expected_panel_version, created_at_ms)?;
                 vault
                     .rebuild_search_indexes_for_panel(expected_panel_version, supplied.as_ref())
                     .map_err(|source| {
@@ -2837,13 +3290,7 @@ impl StorageBackend for CalyxBackend {
                 let supplied = match params.panel_version {
                     Some(version) => {
                         let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-                        syn_active_panel_contract(version, created_at_ms)?.map(|contract| {
-                            SynapseCalyxPanelState {
-                                panel: contract.panel,
-                                registry: contract.registry,
-                                registry_snapshot: None,
-                            }
-                        })
+                        resolve_panel_contract(vault, version, created_at_ms)?
                     }
                     None => None,
                 };
@@ -3047,6 +3494,131 @@ impl StorageBackend for CalyxBackend {
                     calyx_write_failed(
                         "calyx_registry",
                         "list native Calyx temporal panels",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn add_panel_lens(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_key: &str,
+        lens_spec: calyx_registry::LensSpec,
+        source_projection: synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxAddLensReadback> {
+        const MAX_BACKFILL_CANDIDATES: usize = 100_000;
+        self.with_vault(
+            "calyx_registry",
+            "add durable Calyx panel lens",
+            true,
+            |vault| {
+                let entry = constellations::panel_catalog_entry_for_version(panel_version)
+                    .filter(|entry| entry.panel_version == panel_version)
+                    .ok_or_else(|| StorageError::BackendInvalidConfig {
+                        value: panel_version.to_string(),
+                        detail: "panel lifecycle mutations require an exact active built-in panel generation; superseded and unknown generations are immutable".to_owned(),
+                    })?;
+                let now = calyx_clock_now_for_write(vault, "calyx_registry")?;
+                let contract = syn_active_panel_contract(panel_version, now)?.ok_or_else(|| {
+                    StorageError::BackendInvalidConfig {
+                        value: panel_version.to_string(),
+                        detail: "the active panel has no reconstructable built-in contract; declare every slot runtime in syn_active_panel_contract before mutating it".to_owned(),
+                    }
+                })?;
+                let candidates = vault
+                    .panel_constellation_ids(panel_version, MAX_BACKFILL_CANDIDATES)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_base",
+                            "enumerate bounded panel lifecycle backfill candidates",
+                            &source,
+                        )
+                    })?;
+                vault
+                    .add_panel_lens(synapse_calyx::panel_lifecycle::SynapseCalyxAddLensRequest {
+                        panel_name: entry.panel_name,
+                        base_panel: contract.panel,
+                        operation_id,
+                        slot_key,
+                        lens_spec,
+                        source_projection,
+                        candidates: &candidates,
+                        now,
+                    })
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "add durable Calyx panel lens",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn set_panel_lens_state(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_id: calyx_core::SlotId,
+        state: calyx_core::SlotState,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateReadback> {
+        self.with_vault(
+            "calyx_registry",
+            "change durable Calyx panel lens state",
+            true,
+            |vault| {
+                let entry = constellations::panel_catalog_entry_for_version(panel_version)
+                    .filter(|entry| entry.panel_version == panel_version)
+                    .ok_or_else(|| StorageError::BackendInvalidConfig {
+                        value: panel_version.to_string(),
+                        detail: "panel lifecycle mutations require an exact active built-in panel generation; superseded and unknown generations are immutable".to_owned(),
+                    })?;
+                let now = calyx_clock_now_for_write(vault, "calyx_registry")?;
+                vault
+                    .set_panel_lens_state(
+                        synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateRequest {
+                            panel_name: entry.panel_name,
+                            operation_id,
+                            slot_id,
+                            state,
+                            now,
+                        },
+                    )
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "change durable Calyx panel lens state",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn read_panel_lifecycle(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<Option<synapse_calyx::panel_lifecycle::SynapseCalyxPanelLifecycleState>>
+    {
+        self.with_vault(
+            "calyx_registry",
+            "read durable Calyx panel lifecycle",
+            false,
+            |vault| {
+                let entry = constellations::panel_catalog_entry_for_version(panel_version)
+                    .filter(|entry| entry.panel_version == panel_version)
+                    .ok_or_else(|| StorageError::BackendInvalidConfig {
+                        value: panel_version.to_string(),
+                        detail: "panel lifecycle reads require an exact active built-in panel generation; inspect the catalog for the current generation".to_owned(),
+                    })?;
+                vault.read_panel_lifecycle(entry.panel_name).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_registry",
+                        "read durable Calyx panel lifecycle",
                         &source,
                     )
                 })
@@ -4105,16 +4677,13 @@ impl StorageBackend for CalyxBackend {
                 )?;
                 let slot_count = constellation.slots.len() as u64;
                 let scalar_count = constellation.scalars.len() as u64;
-                let readback =
-                    vault
-                        .put_observation_constellation(constellation)
-                        .map_err(|source| {
-                            calyx_write_failed(
-                                "calyx_constellation",
-                                "put timeline observation constellation",
-                                &source,
-                            )
-                        })?;
+                let readback = put_observation_with_lifecycle(
+                    vault,
+                    SYN_TIMELINE_PANEL_NAME,
+                    raw_bytes,
+                    raw_bytes,
+                    constellation,
+                )?;
                 if let Some(app) = record
                     .app
                     .as_deref()
@@ -4217,16 +4786,13 @@ impl StorageBackend for CalyxBackend {
                 )?;
                 let slot_count = constellation.slots.len() as u64;
                 let scalar_count = constellation.scalars.len() as u64;
-                let readback =
-                    vault
-                        .put_observation_constellation(constellation)
-                        .map_err(|source| {
-                            calyx_write_failed(
-                                "calyx_constellation",
-                                "put episode observation constellation",
-                                &source,
-                            )
-                        })?;
+                let readback = put_observation_with_lifecycle(
+                    vault,
+                    SYN_EPISODE_PANEL_NAME,
+                    raw_bytes,
+                    raw_bytes,
+                    constellation,
+                )?;
                 Ok(constellation_report(ConstellationReportInput {
                     panel_name: SYN_EPISODE_PANEL_NAME,
                     panel_version: SYN_EPISODE_PANEL_VERSION,

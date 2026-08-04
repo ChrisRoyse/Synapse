@@ -3,6 +3,11 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use calyx_core::{Asymmetry, Modality, QuantPolicy, SlotId, SlotShape, SlotState};
+use calyx_registry::{
+    LensRuntime, LensSpec, NormPolicy, derive_runtime_contract_from_spec,
+    lens_spec_with_frozen_contract,
+};
 use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -108,6 +113,242 @@ pub struct StorageGcOnceParams {
 #[serde(deny_unknown_fields)]
 pub struct StorageSearchRebuildParams {
     pub expected_panel_version: u32,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoragePanelLifecycleAction {
+    Read,
+    Add,
+    Backfill,
+    Park,
+    Unpark,
+    Retire,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StoragePanelLifecycleParams {
+    pub action: StoragePanelLifecycleAction,
+    pub panel_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_id: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slot_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lens_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub algorithmic_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_dim: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modality: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_pointer: Option<String>,
+    #[serde(default)]
+    pub canonical_json: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 1, max = 256))]
+    pub limit: Option<u16>,
+    #[serde(default)]
+    pub recover_in_flight: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct StoragePanelLifecycleResponse {
+    pub action: StoragePanelLifecycleAction,
+    pub panel_version: u32,
+    pub registry_readback: Value,
+}
+
+pub fn panel_lifecycle(
+    db: &synapse_storage::Db,
+    params: &StoragePanelLifecycleParams,
+) -> Result<StoragePanelLifecycleResponse, ErrorData> {
+    let mutation_fields_present = params.operation_id.is_some()
+        || params.slot_id.is_some()
+        || params.slot_key.is_some()
+        || params.lens_name.is_some()
+        || params.algorithmic_kind.is_some()
+        || params.output_kind.is_some()
+        || params.output_dim.is_some()
+        || params.modality.is_some()
+        || params.json_pointer.is_some()
+        || params.canonical_json
+        || params.limit.is_some()
+        || params.recover_in_flight;
+    let value = match params.action {
+        StoragePanelLifecycleAction::Read => {
+            if mutation_fields_present {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "panel lifecycle action=read accepts only panel_version".to_owned(),
+                ));
+            }
+            serde_json::to_value(db.read_panel_lifecycle(params.panel_version).map_err(
+                |error| storage_mcp_error(&error),
+            )?)
+        }
+        StoragePanelLifecycleAction::Add => {
+            if params.slot_id.is_some() || params.limit.is_some() || params.recover_in_flight {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "panel lifecycle action=add does not accept slot_id".to_owned(),
+                ));
+            }
+            let operation_id = required_panel_field(&params.operation_id, "operation_id")?;
+            let slot_key = required_panel_field(&params.slot_key, "slot_key")?;
+            let lens_name = required_panel_field(&params.lens_name, "lens_name")?;
+            let kind = required_panel_field(&params.algorithmic_kind, "algorithmic_kind")?;
+            let output_kind = required_panel_field(&params.output_kind, "output_kind")?;
+            let output_dim = params.output_dim.ok_or_else(|| {
+                mcp_error(error_codes::TOOL_PARAMS_INVALID, "panel lifecycle action=add requires output_dim".to_owned())
+            })?;
+            if output_dim == 0 {
+                return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, "output_dim must be positive".to_owned()));
+            }
+            let output = match output_kind.as_str() {
+                "dense" => SlotShape::Dense(output_dim),
+                "sparse" => SlotShape::Sparse(output_dim),
+                "multi" => SlotShape::Multi { token_dim: output_dim },
+                _ => return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, format!("unsupported output_kind {output_kind:?}; expected dense, sparse, or multi"))),
+            };
+            let modality = match required_panel_field(&params.modality, "modality")?.as_str() {
+                "text" => Modality::Text,
+                "code" => Modality::Code,
+                "image" => Modality::Image,
+                "audio" => Modality::Audio,
+                "video" => Modality::Video,
+                "protein" => Modality::Protein,
+                "dna" => Modality::Dna,
+                "molecule" => Modality::Molecule,
+                "structured" => Modality::Structured,
+                "mixed" => Modality::Mixed,
+                other => return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, format!("unsupported modality {other:?}"))),
+            };
+            let provisional = LensSpec {
+                name: lens_name.clone(),
+                runtime: LensRuntime::Algorithmic { kind: kind.clone() },
+                output,
+                modality,
+                weights_sha256: [0; 32],
+                corpus_hash: [0; 32],
+                norm_policy: NormPolicy::finite_only(),
+                max_batch: None,
+                axis: None,
+                asymmetry: Asymmetry::None,
+                quant_default: QuantPolicy::None,
+                truncate_dim: None,
+                recall_delta: 0.0,
+                retrieval_only: false,
+                excluded_from_dedup: false,
+            };
+            let contract = derive_runtime_contract_from_spec(&provisional).map_err(|error| {
+                mcp_error(error_codes::TOOL_PARAMS_INVALID, format!("algorithmic lens contract is invalid: {error}"))
+            })?;
+            let spec = lens_spec_with_frozen_contract(provisional, &contract);
+            let projection = match (&params.json_pointer, params.canonical_json) {
+                (Some(pointer), canonical) => synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection::JsonPointer {
+                    pointer: pointer.clone(),
+                    encoding: if canonical {
+                        synapse_calyx::panel_lifecycle::SynapseCalyxProjectedValueEncoding::CanonicalJson
+                    } else {
+                        synapse_calyx::panel_lifecycle::SynapseCalyxProjectedValueEncoding::ScalarText
+                    },
+                },
+                (None, true) => synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection::WholeRecordCanonicalJson,
+                (None, false) => synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection::RawSourceBytes,
+            };
+            serde_json::to_value(db.add_panel_lens(
+                params.panel_version,
+                operation_id,
+                slot_key,
+                spec,
+                projection,
+            ).map_err(|error| storage_mcp_error(&error))?)
+        }
+        StoragePanelLifecycleAction::Backfill => {
+            if params.operation_id.is_some()
+                || params.slot_id.is_some()
+                || params.slot_key.is_some()
+                || params.lens_name.is_some()
+                || params.algorithmic_kind.is_some()
+                || params.output_kind.is_some()
+                || params.output_dim.is_some()
+                || params.modality.is_some()
+                || params.json_pointer.is_some()
+                || params.canonical_json
+            {
+                return Err(mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "panel lifecycle action=backfill accepts only panel_version, limit, and recover_in_flight".to_owned(),
+                ));
+            }
+            serde_json::to_value(
+                db.run_panel_backfill(
+                    params.panel_version,
+                    usize::from(params.limit.unwrap_or(64)),
+                    params.recover_in_flight,
+                )
+                .map_err(|error| storage_mcp_error(&error))?,
+            )
+        }
+        action @ (StoragePanelLifecycleAction::Park
+        | StoragePanelLifecycleAction::Unpark
+        | StoragePanelLifecycleAction::Retire) => {
+            if params.slot_key.is_some()
+                || params.lens_name.is_some()
+                || params.algorithmic_kind.is_some()
+                || params.output_kind.is_some()
+                || params.output_dim.is_some()
+                || params.modality.is_some()
+                || params.json_pointer.is_some()
+                || params.canonical_json
+                || params.limit.is_some()
+                || params.recover_in_flight
+            {
+                return Err(mcp_error(error_codes::TOOL_PARAMS_INVALID, "panel lifecycle state transitions accept only panel_version, operation_id, and slot_id".to_owned()));
+            }
+            let operation_id = required_panel_field(&params.operation_id, "operation_id")?;
+            let slot_id = params.slot_id.ok_or_else(|| mcp_error(error_codes::TOOL_PARAMS_INVALID, "panel lifecycle state transition requires slot_id".to_owned()))?;
+            let state = match action {
+                StoragePanelLifecycleAction::Park => SlotState::Parked,
+                StoragePanelLifecycleAction::Unpark => SlotState::Active,
+                StoragePanelLifecycleAction::Retire => SlotState::Retired,
+                _ => unreachable!(),
+            };
+            serde_json::to_value(db.set_panel_lens_state(
+                params.panel_version,
+                operation_id,
+                SlotId::new(slot_id),
+                state,
+            ).map_err(|error| storage_mcp_error(&error))?)
+        }
+    }.map_err(|error| mcp_error(error_codes::TOOL_INTERNAL_ERROR, format!("serialize panel lifecycle Registry readback: {error}")))?;
+    Ok(StoragePanelLifecycleResponse {
+        action: params.action,
+        panel_version: params.panel_version,
+        registry_readback: value,
+    })
+}
+
+fn required_panel_field<'a>(
+    value: &'a Option<String>,
+    field: &str,
+) -> Result<&'a String, ErrorData> {
+    value
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("panel lifecycle request requires non-empty {field}"),
+            )
+        })
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2120,6 +2361,17 @@ pub fn required_permissions_search_rebuild(
     _params: &StorageSearchRebuildParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_panel_lifecycle(
+    params: &StoragePanelLifecycleParams,
+) -> RequiredPermissions {
+    if params.action == StoragePanelLifecycleAction::Read {
+        required([Permission::ReadStorage])
+    } else {
+        required([Permission::ReadStorage, Permission::WriteStorage])
+    }
 }
 
 #[must_use]

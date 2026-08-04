@@ -22,10 +22,11 @@ pub use backend::{
     CalyxAnchorBatchWriteReport, CalyxAnchorRow, CalyxAnchorScanReport, CalyxAnchorValueReadback,
     CalyxAnchorWriteReport, CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect,
     CalyxVaultInspect, GroundingAnchor, GroundingAnchorSource, GroundingAnchorValue,
-    McpUsageGroundedPublicationReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
-    StorageCfDump, StorageDumpRow, SynapseAnchorSourceCarrier, SynapseSynergyPair,
-    SynapseSynergyReport, dump_cf_read_only, dump_cf_read_only_with_expired,
-    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
+    McpUsageGroundedPublicationReport, PanelLifecycleBackfillReport,
+    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
+    SynapseAnchorSourceCarrier, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
+    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
+    scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
@@ -964,6 +965,58 @@ impl Db {
         &self,
     ) -> StorageResult<Vec<synapse_calyx::VaultTemporalPanelRegistration>> {
         self.backend.list_temporal_panels()
+    }
+
+    /// Adds one frozen deterministic lens to an active built-in panel and
+    /// durably enqueues its existing constellation ids for backfill.
+    pub fn add_panel_lens(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_key: &str,
+        lens_spec: calyx_registry::LensSpec,
+        source_projection: synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxAddLensReadback> {
+        self.backend.add_panel_lens(
+            panel_version,
+            operation_id,
+            slot_key,
+            lens_spec,
+            source_projection,
+        )
+    }
+
+    /// Parks, unparks, or irreversibly retires one dynamically added panel slot.
+    pub fn set_panel_lens_state(
+        &self,
+        panel_version: u32,
+        operation_id: &str,
+        slot_id: calyx_core::SlotId,
+        state: calyx_core::SlotState,
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateReadback> {
+        self.backend
+            .set_panel_lens_state(panel_version, operation_id, slot_id, state)
+    }
+
+    /// Reads the physical Registry CF lifecycle row for one active panel.
+    pub fn read_panel_lifecycle(
+        &self,
+        panel_version: u32,
+    ) -> StorageResult<Option<synapse_calyx::panel_lifecycle::SynapseCalyxPanelLifecycleState>>
+    {
+        self.backend.read_panel_lifecycle(panel_version)
+    }
+
+    /// Claims, re-measures, physically verifies, and completes one bounded
+    /// pressure-aware lifecycle backfill batch.
+    pub fn run_panel_backfill(
+        &self,
+        panel_version: u32,
+        limit: usize,
+        recover_in_flight: bool,
+    ) -> StorageResult<PanelLifecycleBackfillReport> {
+        self.backend
+            .run_panel_backfill(panel_version, limit, recover_in_flight)
     }
 
     /// Applies the exact registered Calyx temporal policy to a bounded

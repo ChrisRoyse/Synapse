@@ -68,6 +68,11 @@ pub const LENS_COVERAGE_SAMPLE_RECORDS: usize = 256;
 /// per-call overhead to the same total work.
 pub const PANEL_BACKFILL_PAGE_ROWS: usize = 1_000;
 
+/// Lifecycle tasks claimed per five-minute maintenance tick. Each task fully
+/// decodes and re-measures an authoritative row, so the bound controls both IO
+/// and CPU independently of the older temporal-metadata page size.
+pub const LIFECYCLE_BACKFILL_BATCH_ROWS: usize = 64;
+
 /// Wall-clock the maintainer will spend driving backfill pages in one tick.
 ///
 /// Chosen from the measured rate, not picked: driving this by hand on #1927 took
@@ -309,6 +314,56 @@ pub(crate) fn run_derived_state_maintenance() {
     };
 
     let mut any_failed = false;
+
+    // --- Durable hot-added lens backfill (#1668) ---
+    // Run before search maintenance so a generation rebuilt on this same tick
+    // can include the newly materialized Slot CF rows.
+    for entry in crate::constellations::builtin_panel_catalog() {
+        let lifecycle = match db.read_panel_lifecycle(entry.panel_version) {
+            Ok(state) => state,
+            Err(error) => {
+                any_failed = true;
+                record_failure(
+                    "STORAGE_DERIVED_STATE_LIFECYCLE_READ_FAILED",
+                    format!("read lifecycle state for {}: {error}", entry.panel_name),
+                );
+                continue;
+            }
+        };
+        let Some(state) = lifecycle else {
+            continue;
+        };
+        let pending = state
+            .controller
+            .queue()
+            .tasks()
+            .filter(|task| task.state == calyx_registry::BackfillState::Pending)
+            .count();
+        if pending == 0 {
+            continue;
+        }
+        match db.run_panel_backfill(entry.panel_version, LIFECYCLE_BACKFILL_BATCH_ROWS, false) {
+            Ok(report) => tracing::info!(
+                code = "STORAGE_DERIVED_STATE_LIFECYCLE_BACKFILL",
+                panel_name = report.panel_name,
+                source_panel_version = report.source_panel_version,
+                target_panel_version = report.target_panel_version,
+                claimed = report.claimed,
+                completed = report.completed,
+                pending = report.pending,
+                registry_committed_seq = report.registry_committed_seq,
+                registry_value_sha256 = report.registry_value_sha256,
+                "completed a bounded durable panel lifecycle backfill batch"
+            ),
+            Err(error) => {
+                any_failed = true;
+                record_failure(
+                    "STORAGE_DERIVED_STATE_LIFECYCLE_BACKFILL_FAILED",
+                    format!("drive lifecycle backfill for {}: {error}", entry.panel_name),
+                );
+            }
+        }
+    }
 
     // --- Search generations (#1891 ask 2, extended to every published
     // generation by #1938) ---

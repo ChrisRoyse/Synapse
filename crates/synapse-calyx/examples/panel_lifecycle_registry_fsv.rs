@@ -11,7 +11,7 @@ use calyx_registry::{
 };
 use synapse_calyx::panel_lifecycle::{
     SYNAPSE_CALYX_PANEL_LIFECYCLE_INVALID, SYNAPSE_CALYX_PANEL_LIFECYCLE_RUNTIME_UNSUPPORTED,
-    SynapseCalyxAddLensRequest, SynapseCalyxSetLensStateRequest,
+    SynapseCalyxAddLensRequest, SynapseCalyxSetLensStateRequest, SynapseCalyxSourceProjection,
 };
 use synapse_calyx::{SynapseCalyxConfig, SynapseCalyxVault};
 
@@ -66,6 +66,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         operation_id: ADD_OPERATION,
         slot_key: "fsv.byte_features",
         lens_spec: byte_spec(),
+        source_projection: SynapseCalyxSourceProjection::RawSourceBytes,
         candidates: &candidates,
         now: 2,
     })?;
@@ -97,6 +98,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         physical_hash,
         physical.1.len()
     );
+    let measured = vault.measure_added_panel_lens("syn-fsv-panel-v1", created.lens_id, b"Aa 1")?;
+    let calyx_core::SlotVector::Dense { dim, data } = measured.vector else {
+        return Err("byte-feature lifecycle lens did not return a dense vector".into());
+    };
+    ensure(
+        dim == 16 && data.len() == 16,
+        "byte-feature vector shape drifted",
+    )?;
+    ensure(
+        data[..8] == [0.0625, 1.0, 0.25, 0.5, 0.25, 0.0, 0.25, 0.25],
+        format!("known byte-feature prefix differs: {:?}", &data[..8]),
+    )?;
+    ensure(
+        measured.input_sha256 == sha256_hex(b"Aa 1"),
+        "measured input hash differs from authoritative bytes",
+    )?;
+    println!(
+        "MEASURE known input: input='Aa 1' dim=16 prefix={:?} input_sha256={}",
+        &data[..8],
+        measured.input_sha256
+    );
 
     let replay_before = vault.scan_cf_latest(ColumnFamily::Registry)?;
     let replay = vault.add_panel_lens(SynapseCalyxAddLensRequest {
@@ -105,6 +127,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         operation_id: ADD_OPERATION,
         slot_key: "fsv.byte_features",
         lens_spec: byte_spec(),
+        source_projection: SynapseCalyxSourceProjection::RawSourceBytes,
         candidates: &candidates,
         now: 3,
     })?;
@@ -178,6 +201,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             operation_id: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
             slot_key: "fsv.invalid",
             lens_spec: byte_spec(),
+            source_projection: SynapseCalyxSourceProjection::RawSourceBytes,
             candidates: &[],
             now: 6,
         },
@@ -192,6 +216,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             operation_id: EXTERNAL_OPERATION,
             slot_key: "fsv.external",
             lens_spec: external_spec(),
+            source_projection: SynapseCalyxSourceProjection::RawSourceBytes,
             candidates: &[],
             now: 7,
         },

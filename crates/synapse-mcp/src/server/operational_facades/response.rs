@@ -24,6 +24,7 @@ pub(super) fn storage_response(
         temporal_rerank: None,
         temporal_backfill: None,
         search_rebuild: None,
+        panel_lifecycle: None,
         find_similar: None,
         retire_orphan_slot_cfs: None,
         retire_search_generation: None,

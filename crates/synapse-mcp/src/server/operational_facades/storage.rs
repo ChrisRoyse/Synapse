@@ -24,6 +24,11 @@ use super::{
 static SEARCH_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
+/// Panel generation allocation and Registry publication are one ordered
+/// mutation stream. Reject concurrent callers before either can reserve an id.
+static PANEL_LIFECYCLE_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 /// At most one durable vault backup may execute at a time. A backup holds the
 /// native-compaction guard and copies the whole sacred vault tree; a second
 /// concurrent backup would contend on that guard and could interleave two copies
@@ -524,6 +529,87 @@ pub(super) async fn handle(
                     response.raw_sidecars.len()
                 ),
                 |out| out.search_rebuild = Some(response),
+            )))
+        }
+        StorageOperation::PanelLifecycle => {
+            let spec = params
+                .0
+                .panel_lifecycle
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "panel_lifecycle"))?;
+            let source_id = format!("panel_{}", spec.panel_version);
+            let mutating = spec.action != crate::m3::storage::StoragePanelLifecycleAction::Read;
+            if mutating {
+                require_maintenance_profile(
+                    service,
+                    &request_context,
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                )?;
+            }
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_panel_lifecycle(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            let permit = if mutating {
+                Some(
+                    Arc::clone(&PANEL_LIFECYCLE_PERMITS)
+                        .try_acquire_owned()
+                        .map_err(|error| match error {
+                            TryAcquireError::NoPermits => facade_conflict_error(
+                                STORAGE_TOOL,
+                                operation.as_str(),
+                                &source_id,
+                                STORAGE_SOT,
+                                error_codes::STORAGE_PANEL_LIFECYCLE_IN_PROGRESS,
+                                "a panel lifecycle mutation is already in progress for this vault"
+                                    .to_owned(),
+                                "wait for the in-flight panel_lifecycle mutation to publish its Registry CF row, read that row, then retry with an appropriate idempotent operation id",
+                            ),
+                            TryAcquireError::Closed => facade_delegate_error(
+                                STORAGE_TOOL,
+                                operation.as_str(),
+                                &source_id,
+                                STORAGE_SOT,
+                                crate::m1::mcp_error(
+                                    error_codes::TOOL_INTERNAL_ERROR,
+                                    "panel-lifecycle admission semaphore was unexpectedly closed"
+                                        .to_owned(),
+                                ),
+                                "restart the daemon; the panel-lifecycle admission gate is no longer available",
+                            ),
+                        })?,
+                )
+            } else {
+                None
+            };
+            let response = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::m3::storage::panel_lifecycle(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("panel-lifecycle blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs for the panel_lifecycle phase record; the task terminated abnormally",
+                )
+            })??;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Calyx Registry CF panel={} action={:?}",
+                    response.panel_version, response.action
+                ),
+                |out| out.panel_lifecycle = Some(response),
             )))
         }
         StorageOperation::FindSimilar => {
