@@ -2,6 +2,11 @@ use rmcp::{RoleServer, service::RequestContext};
 
 use crate::server::{ErrorData, Json, Parameters, SynapseService};
 
+const VAULT_VERIFY_INTERVAL_ENV: &str = "SYNAPSE_VAULT_VERIFY_INTERVAL_SECS";
+const VAULT_VERIFY_STARTUP_DELAY_ENV: &str = "SYNAPSE_VAULT_VERIFY_STARTUP_DELAY_SECS";
+const DEFAULT_VAULT_VERIFY_INTERVAL_SECS: u64 = 24 * 60 * 60;
+const DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS: u64 = 5 * 60;
+
 use super::{
     HYGIENE_SOT, HYGIENE_TOOL,
     errors::{facade_delegate_error, missing_spec},
@@ -10,6 +15,116 @@ use super::{
     types::{HygieneOperation, HygieneParams, HygieneResponse},
     validation::validate_hygiene_params,
 };
+
+pub(crate) fn spawn_periodic_vault_verifier(
+    service: SynapseService,
+    cancel: tokio_util::sync::CancellationToken,
+) -> anyhow::Result<Option<tokio::task::JoinHandle<()>>> {
+    let interval_secs = strict_seconds_env(
+        VAULT_VERIFY_INTERVAL_ENV,
+        DEFAULT_VAULT_VERIFY_INTERVAL_SECS,
+    )?;
+    let startup_delay_secs = strict_seconds_env(
+        VAULT_VERIFY_STARTUP_DELAY_ENV,
+        DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS,
+    )?;
+    if interval_secs == 0 {
+        tracing::warn!(
+            code = "VAULT_VERIFY_PERIODIC_DISABLED",
+            env = VAULT_VERIFY_INTERVAL_ENV,
+            "periodic physical vault verification explicitly disabled"
+        );
+        return Ok(None);
+    }
+    tracing::info!(
+        code = "VAULT_VERIFY_PERIODIC_SCHEDULED",
+        interval_secs,
+        startup_delay_secs,
+        "periodic physical vault verification scheduled"
+    );
+    Ok(Some(tokio::spawn(async move {
+        let mut delay = std::time::Duration::from_secs(startup_delay_secs);
+        loop {
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!(
+                        code = "VAULT_VERIFY_PERIODIC_STOPPED",
+                        "periodic physical vault verification stopped by daemon shutdown"
+                    );
+                    return;
+                }
+                () = tokio::time::sleep(delay) => {}
+            }
+            run_periodic_vault_verify_once(&service).await;
+            delay = std::time::Duration::from_secs(interval_secs);
+        }
+    })))
+}
+
+fn strict_seconds_env(name: &'static str, default: u64) -> anyhow::Result<u64> {
+    let Some(raw) = std::env::var_os(name) else {
+        return Ok(default);
+    };
+    let raw = raw.into_string().map_err(|_| {
+        anyhow::anyhow!(
+            "{name} must be valid Unicode containing an unsigned integer number of seconds"
+        )
+    })?;
+    raw.parse::<u64>().map_err(|error| {
+        anyhow::anyhow!(
+            "{name}={raw:?} is invalid: expected an unsigned integer number of seconds: {error}"
+        )
+    })
+}
+
+async fn run_periodic_vault_verify_once(service: &SynapseService) {
+    let db = match service.m3_storage() {
+        Ok(db) => db,
+        Err(error) => {
+            tracing::error!(
+                code = "VAULT_VERIFY_PERIODIC_STORAGE_UNAVAILABLE",
+                error_code = ?error.code,
+                error = %error.message,
+                remediation = "repair storage/Calyx initialization; scheduled verification cannot inspect the vault",
+                "scheduled physical vault verification could not open its Source of Truth"
+            );
+            return;
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::m3::hygiene::run_vault_verify(
+            &db,
+            &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(report)) => tracing::info!(
+            code = "VAULT_VERIFY_PERIODIC_OK",
+            vault_id = %report.vault_id,
+            verified_from_seq = report.verified_from_seq,
+            verified_to_seq = report.verified_to_seq,
+            ledger_head_height = report.ledger_head_height,
+            ledger_tip_hash = %report.ledger_tip_hash,
+            raw_commitments_intact = report.raw_commitments_intact,
+            "scheduled physical vault verification completed"
+        ),
+        Ok(Err(error)) => tracing::error!(
+            code = "VAULT_VERIFY_PERIODIC_FAILED",
+            error_code = ?error.code,
+            error = %error.message,
+            remediation = "stop writers, preserve the vault and lineage journal, and restore from a verified backup before trusting vault reads",
+            "scheduled physical vault verification raised an integrity alarm"
+        ),
+        Err(error) => tracing::error!(
+            code = "VAULT_VERIFY_PERIODIC_TASK_FAILED",
+            error = %error,
+            remediation = "inspect daemon logs and process health; the blocking verification task terminated abnormally",
+            "scheduled physical vault verification task failed"
+        ),
+    }
+}
+
 pub(super) async fn handle(
     service: &SynapseService,
     params: Parameters<HygieneParams>,

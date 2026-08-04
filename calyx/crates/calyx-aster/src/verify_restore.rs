@@ -59,13 +59,14 @@ impl VerifyRestoreReport {
         }
     }
 
-    /// Strict DR-drill predicate: intact chain and real data bytes present.
+    /// Restore-integrity predicate: intact chain and durable state bytes present.
+    ///
+    /// A newly created vault legitimately has no Base or Anchor rows. Corpus
+    /// population is reported by the counts, but is not a storage-integrity
+    /// invariant and must not turn scheduled verification into a permanent
+    /// false alarm on fresh installations.
     pub fn success(&self) -> bool {
-        self.error.is_none()
-            && self.chain_intact
-            && self.constellation_count > 0
-            && self.anchor_count > 0
-            && self.wal_bytes_present > 0
+        self.error.is_none() && self.chain_intact && self.wal_bytes_present > 0
     }
 
     /// Names every unmet pass criterion.
@@ -76,14 +77,6 @@ impl VerifyRestoreReport {
         let mut reasons = Vec::new();
         if !self.chain_intact {
             reasons.push("ledger chain not verified intact".to_string());
-        }
-        if self.constellation_count == 0 {
-            reasons.push(
-                "constellation_count=0: no constellation readable from the base CF".to_string(),
-            );
-        }
-        if self.anchor_count == 0 {
-            reasons.push("anchor_count=0: no anchor readable from the anchors CF".to_string());
         }
         if self.wal_bytes_present == 0 {
             reasons

@@ -1314,6 +1314,27 @@ fn start_http_runtime(
         background_tasks.push(own_http_background_task("armed_routine_runner", task));
     }
 
+    let vault_verifier =
+        match crate::server::operational_facades::hygiene::spawn_periodic_vault_verifier(
+            service.clone(),
+            shutdown_cancel.clone(),
+        )
+        .context("spawn periodic physical vault verifier")
+        {
+            Ok(task) => task,
+            Err(error) => {
+                return Err(HttpRuntimeStartupFailure::new(
+                    "vault_verifier",
+                    error,
+                    background_tasks,
+                    None,
+                ));
+            }
+        };
+    if let Some(task) = vault_verifier {
+        background_tasks.push(own_http_background_task("vault_verifier", task));
+    }
+
     let transcript_ingest =
         match crate::server::agent_transcripts::spawn_periodic_transcript_ingest(
             service.m3_state_handle(),

@@ -1,7 +1,7 @@
 mod errors;
 pub(crate) mod find;
 pub(crate) mod host_transition;
-mod hygiene;
+pub(crate) mod hygiene;
 mod model;
 mod policy;
 mod response;
