@@ -58,9 +58,7 @@ use synapse_core::{
     TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
-    CfRevisionGuard, Db,
-    agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
-    cf, decode_json, encode_json,
+    CfRevisionGuard, Db, agent_transcripts::agent_transcript_key, cf, decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -99,7 +97,7 @@ pub(crate) const MAX_AGENT_TRANSCRIPT_VALUE_BYTES: usize = 32 * 1024;
 /// the much smaller durable row above.
 pub(crate) const MAX_AGENT_TRANSCRIPT_SOURCE_LINE_BYTES: usize = 10 * 1024 * 1024;
 
-/// The source/index mutation for one chunk is at most 64 * 32 KiB of durable
+/// The source mutation for one chunk is at most 64 * 32 KiB of durable
 /// values plus small deterministic keys and retention envelopes. This remains
 /// a small fraction of Calyx's 64 MiB WAL-record ceiling; the storage layer
 /// independently rejects the mutation if that physical invariant ever drifts.
@@ -114,7 +112,6 @@ const AGENT_TRANSCRIPT_SOURCE_BOUNDARY_BYTES: u64 = 64 * 1024;
 pub(super) struct PreparedTranscriptRow {
     pub source_key: Vec<u8>,
     pub encoded: Vec<u8>,
-    pub ts_index_key: Vec<u8>,
     pub record: AgentTranscriptRecord,
     pub source_offset_bytes: u64,
     pub consumed_bytes: u64,
@@ -933,7 +930,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 /// Publishes one bounded transcript chunk, then performs independent point
-/// reads of every source and timestamp-index row before any cursor may cover
+/// reads of every source row before any cursor may cover
 /// the corresponding source bytes. Constellation publication performs its own
 /// native Calyx readback and remains before the cursor commit marker.
 pub(super) fn commit_transcript_chunk(
@@ -971,7 +968,7 @@ pub(super) fn commit_transcript_chunk(
         ));
     }
 
-    let mut guards = Vec::with_capacity(rows.len().saturating_mul(2));
+    let mut guards = Vec::with_capacity(rows.len());
     for row in rows {
         let source_revision = db
             .get_cf_revisioned(cf::CF_AGENT_TRANSCRIPTS, &row.source_key)
@@ -1009,60 +1006,16 @@ pub(super) fn commit_transcript_chunk(
             row.source_key.clone(),
             expected_source_revision,
         ));
-
-        let index_revision = db
-            .get_cf_revisioned(cf::CF_KV, &row.ts_index_key)
-            .map_err(|error| {
-                format!(
-                    "{code_prefix}_INDEX_PRECONDITION_READ_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={}: {error}; remediation=repair the Calyx revisioned point-read before retrying",
-                    source_path.display(),
-                    row.record.line_no,
-                    row.source_offset_bytes,
-                    synapse_storage::constellations::hex_encode(&row.ts_index_key)
-                )
-            })?;
-        let expected_index_revision = match index_revision {
-            Some(revisioned) => {
-                if revisioned.value.as_deref() != Some(row.source_key.as_slice()) {
-                    return Err(format!(
-                        "{code_prefix}_INDEX_IDENTITY_CONFLICT: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={} expected_source_key_hex={} actual_sha256={}; remediation=reconcile the conflicting deterministic timestamp index without overwriting it",
-                        source_path.display(),
-                        row.record.line_no,
-                        row.source_offset_bytes,
-                        synapse_storage::constellations::hex_encode(&row.ts_index_key),
-                        synapse_storage::constellations::hex_encode(&row.source_key),
-                        revisioned
-                            .value
-                            .as_deref()
-                            .map_or_else(|| "expired".to_owned(), sha256_hex)
-                    ));
-                }
-                Some(revisioned.revision_sha256)
-            }
-            None => None,
-        };
-        guards.push(CfRevisionGuard::new(
-            cf::CF_KV,
-            row.ts_index_key.clone(),
-            expected_index_revision,
-        ));
     }
 
     let transcript_rows = rows
         .iter()
         .map(|row| (row.source_key.clone(), row.encoded.clone()))
         .collect();
-    let timestamp_rows = rows
-        .iter()
-        .map(|row| (row.ts_index_key.clone(), row.source_key.clone()))
-        .collect();
     let outcome = db
         .put_cf_batches_if_revisions_pressure_bypass(
             guards,
-            vec![
-                (cf::CF_AGENT_TRANSCRIPTS, transcript_rows),
-                (cf::CF_KV, timestamp_rows),
-            ],
+            vec![(cf::CF_AGENT_TRANSCRIPTS, transcript_rows)],
         )
         .map_err(|error| {
             format!(
@@ -1120,29 +1073,6 @@ pub(super) fn commit_transcript_chunk(
                 synapse_storage::constellations::hex_encode(&row.source_key),
                 sha256_hex(&row.encoded),
                 actual
-                    .as_deref()
-                    .map_or_else(|| "absent".to_owned(), sha256_hex)
-            ));
-        }
-
-        let actual_index = db.get_cf(cf::CF_KV, &row.ts_index_key).map_err(|error| {
-            format!(
-                "{code_prefix}_INDEX_READBACK_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={}: {error}; remediation=repair the Calyx point-read path and retry from the unchanged cursor",
-                source_path.display(),
-                row.record.line_no,
-                row.source_offset_bytes,
-                synapse_storage::constellations::hex_encode(&row.ts_index_key)
-            )
-        })?;
-        if actual_index.as_deref() != Some(row.source_key.as_slice()) {
-            return Err(format!(
-                "{code_prefix}_INDEX_READBACK_MISMATCH: source_id={source_id} path={} line_no={} source_offset_bytes={} index_key_hex={} expected_source_key_hex={} actual_sha256={}; remediation=quarantine and repair the divergent timestamp index before clearing the cursor",
-                source_path.display(),
-                row.record.line_no,
-                row.source_offset_bytes,
-                synapse_storage::constellations::hex_encode(&row.ts_index_key),
-                synapse_storage::constellations::hex_encode(&row.source_key),
-                actual_index
                     .as_deref()
                     .map_or_else(|| "absent".to_owned(), sha256_hex)
             ));
@@ -2074,11 +2004,9 @@ fn ingest_spawn_dir_once_with_cancel(
                         }
                     }
                     let source_key = agent_transcript_key(spawn_id, line_no);
-                    let ts_index_key = agent_transcript_ts_index_key(record.ts_ns, &source_key);
                     chunk.push(PreparedTranscriptRow {
                         source_key,
                         encoded,
-                        ts_index_key,
                         record,
                         source_offset_bytes,
                         consumed_bytes,
@@ -2911,8 +2839,10 @@ fn run_telemetry_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
         0,
     );
     if let (Ok(total), Ok(errors)) = (total, errors) {
-        let total_events = total.windows.iter().map(|window| window.sum).sum::<f64>();
-        let error_events = errors.windows.iter().map(|window| window.sum).sum::<f64>();
+        let total_events =
+            canonical_count_zero(total.windows.iter().map(|window| window.sum).sum::<f64>());
+        let error_events =
+            canonical_count_zero(errors.windows.iter().map(|window| window.sum).sum::<f64>());
         tracing::info!(
             code = "TELEMETRY_HEALTH_TREND",
             window_start_ns = last_hour_start,
@@ -2922,6 +2852,10 @@ fn run_telemetry_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
             "sealed-hour agent-event health trend served from telemetry rollups"
         );
     }
+}
+
+fn canonical_count_zero(value: f64) -> f64 {
+    if value == 0.0 { 0.0 } else { value }
 }
 
 fn configured_db_path(m3_state: &Arc<Mutex<M3State>>) -> anyhow::Result<PathBuf> {

@@ -86,7 +86,7 @@ type AmbientOutboxScanReadback = (Vec<(Vec<u8>, Vec<u8>)>, usize, u64, u64);
 use synapse_storage::{
     Db,
     agent_events::agent_event_key,
-    agent_transcripts::{agent_transcript_key, agent_transcript_ts_index_key},
+    agent_transcripts::agent_transcript_key,
     cf,
     constellations::{TRANSCRIPT_TOOL_STATUS_ERROR, TRANSCRIPT_TOOL_STATUS_OK},
     decode_json, encode_json,
@@ -2174,11 +2174,9 @@ fn ingest_session_file_with_cancel(
                         }
                     }
                     let source_key = agent_transcript_key(&spawn_id, line_no);
-                    let ts_index_key = agent_transcript_ts_index_key(record.ts_ns, &source_key);
                     chunk.push(PreparedTranscriptRow {
                         source_key,
                         encoded,
-                        ts_index_key,
                         record,
                         source_offset_bytes,
                         consumed_bytes,

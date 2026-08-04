@@ -68,11 +68,7 @@ use synapse_core::{
 };
 use synapse_storage::{
     Db,
-    agent_transcripts::{
-        AGENT_TRANSCRIPT_TS_INDEX_PREFIX, agent_transcript_spawn_prefix,
-        agent_transcript_ts_index_lower_bound, decode_agent_transcript_key,
-        decode_agent_transcript_ts_index_key_ts,
-    },
+    agent_transcripts::{agent_transcript_spawn_prefix, decode_agent_transcript_key},
     cf,
 };
 
@@ -108,9 +104,8 @@ const MAX_EVENT_SCAN_ROWS_PER_CALL: usize = 1_000_000;
 /// rule.
 const UNATTRIBUTED_KEY: &str = "(unattributed)";
 const COST_TOOL: &str = "cost";
-const COST_SOURCE_OF_TRUTH: &str = "CF_AGENT_TRANSCRIPTS transcript rows + CF_KV cost/price/v1 rows + CF_KV agent-cost/transcript-ts-index/v1 rows";
-const COST_TS_INDEX_META_KEY: &str = "agent-cost/transcript-ts-index/v1/__meta";
-const COST_TS_INDEX_VERSION: u32 = 1;
+const COST_SOURCE_OF_TRUTH: &str = "CF_AGENT_TRANSCRIPTS source rows + native Aster TimeSeries cost generation named by CF_KV agent-cost/rollup/v2/__meta + CF_KV cost/price/v1 rows";
+const LEGACY_TRANSCRIPT_TS_INDEX_PREFIX: &str = "agent-cost/transcript-ts-index/v1/";
 const DEFAULT_FLEET_WINDOW_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -828,7 +823,6 @@ struct AgentCostQueryPlan {
     query_strategy: String,
     default_window_applied: bool,
     explicit_all_history: bool,
-    use_timestamp_index: bool,
 }
 
 impl AgentCostQueryPlan {
@@ -844,7 +838,6 @@ impl AgentCostQueryPlan {
 
         let explicit_all_history = params.all_history;
         let mut default_window_applied = false;
-        let mut use_timestamp_index = false;
         let query_strategy;
         if params.spawn_id.is_some() {
             query_strategy = "spawn_prefix_scan".to_owned();
@@ -859,8 +852,7 @@ impl AgentCostQueryPlan {
                 params.since_ns = Some(window_end.saturating_sub(DEFAULT_FLEET_WINDOW_NS));
                 default_window_applied = true;
             }
-            query_strategy = "timestamp_index_window_scan".to_owned();
-            use_timestamp_index = true;
+            query_strategy = "native_timeseries_rollup_point_reads".to_owned();
         }
 
         if let (Some(since), Some(until)) = (params.since_ns, params.until_ns)
@@ -877,7 +869,6 @@ impl AgentCostQueryPlan {
             query_strategy,
             default_window_applied,
             explicit_all_history,
-            use_timestamp_index,
         })
     }
 }
@@ -1147,7 +1138,7 @@ impl SynapseService {
         // Accumulate per-spawn state from the transcript rows.
         let mut spawns: BTreeMap<String, SpawnAccumulator> = BTreeMap::new();
         let mut scanned_rows: u64 = 0;
-        let mut scanned_index_rows: u64 = 0;
+        let scanned_index_rows: u64 = 0;
         if let Some(spawn_id) = params.spawn_id.as_deref() {
             validate_spawn_id(spawn_id)?;
             let rows = db
@@ -1185,19 +1176,6 @@ impl SynapseService {
                     scanned_rows += 1;
                     ingest_row(&mut spawns, &key, &value, params.since_ns, params.until_ns)?;
                 }
-            }
-        } else if plan.use_timestamp_index {
-            let Some(since_ns) = params.since_ns else {
-                return Err(mcp_error(
-                    error_codes::TOOL_INTERNAL_ERROR,
-                    "AGENT_COST_QUERY_PLAN_INVALID: timestamp-index plan missing since_ns",
-                ));
-            };
-            let read = scan_transcripts_by_timestamp_index(&db, since_ns, params.until_ns)?;
-            scanned_rows = read.scanned_rows;
-            scanned_index_rows = read.scanned_index_rows;
-            for (key, value) in read.transcript_rows {
-                ingest_row(&mut spawns, &key, &value, params.since_ns, params.until_ns)?;
             }
         } else {
             let mut start: Vec<u8> = Vec::new();
@@ -1505,7 +1483,7 @@ impl SynapseService {
             query_strategy: plan.query_strategy,
             default_window_applied: plan.default_window_applied,
             completeness: "exact".to_owned(),
-            transcript_index_version: plan.use_timestamp_index.then_some(COST_TS_INDEX_VERSION),
+            transcript_index_version: None,
             scanned_index_rows,
             since_ns: params.since_ns,
             until_ns: params.until_ns,
@@ -2204,121 +2182,6 @@ fn source_label(source: TranscriptSource) -> String {
         TranscriptSource::CodexAppServerJsonRpc => "codex_app_server_json_rpc".to_owned(),
         TranscriptSource::LocalModelJson => "local_model_json".to_owned(),
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CostTranscriptIndexMeta {
-    schema_version: u32,
-    indexed_rows: u64,
-    built_at_ns: u64,
-    source_cf: String,
-    index_prefix: String,
-}
-
-struct IndexedTranscriptRead {
-    scanned_index_rows: u64,
-    scanned_rows: u64,
-    transcript_rows: Vec<(Vec<u8>, Vec<u8>)>,
-}
-
-fn load_transcript_ts_index_meta(db: &Db) -> Result<CostTranscriptIndexMeta, ErrorData> {
-    if let Some(value) = db
-        .get_cf(cf::CF_KV, COST_TS_INDEX_META_KEY.as_bytes())
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?
-    {
-        let meta: CostTranscriptIndexMeta = serde_json::from_slice(&value).map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!("AGENT_COST_INDEX_META_CORRUPT: {COST_TS_INDEX_META_KEY}: {error}"),
-            )
-        })?;
-        if meta.schema_version != COST_TS_INDEX_VERSION {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "AGENT_COST_INDEX_VERSION_UNSUPPORTED: meta version {} != expected {}",
-                    meta.schema_version, COST_TS_INDEX_VERSION
-                ),
-            ));
-        }
-        return Ok(meta);
-    }
-
-    Err(mcp_error(
-        error_codes::TOOL_INTERNAL_ERROR,
-        format!(
-            "AGENT_COST_INDEX_MISSING: {COST_TS_INDEX_META_KEY} is absent from CF_KV; \
-             default fleet cost summarize cannot prove a bounded timestamp-index read. \
-             Use spawn_id for an exact spawn-prefix cost read, or complete #1688 \
-             TimeSeries/OLAP rollups before fleet cost analytics. The read path \
-             refuses to rebuild the index inline because that hides setup work \
-             behind a long-running tools/call."
-        ),
-    ))
-}
-
-fn scan_transcripts_by_timestamp_index(
-    db: &Db,
-    since_ns: u64,
-    until_ns: Option<u64>,
-) -> Result<IndexedTranscriptRead, ErrorData> {
-    let _meta = load_transcript_ts_index_meta(db)?;
-    let upper = until_ns.map(agent_transcript_ts_index_lower_bound);
-    let mut start = agent_transcript_ts_index_lower_bound(since_ns);
-    let mut scanned_index_rows = 0_u64;
-    let mut transcript_rows = Vec::new();
-    'scan: loop {
-        let (rows, more) = db
-            .scan_cf_from(cf::CF_KV, &start, SCAN_CHUNK_ROWS)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        if rows.is_empty() {
-            break;
-        }
-        for (key, transcript_key) in &rows {
-            if !key.starts_with(AGENT_TRANSCRIPT_TS_INDEX_PREFIX) {
-                break 'scan;
-            }
-            if let Some(upper) = &upper
-                && key.as_slice() >= upper.as_slice()
-            {
-                break 'scan;
-            }
-            let ts_ns = decode_agent_transcript_ts_index_key_ts(key)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            if ts_ns < since_ns {
-                continue;
-            }
-            if let Some(until) = until_ns
-                && ts_ns >= until
-            {
-                break 'scan;
-            }
-            scanned_index_rows = scanned_index_rows.saturating_add(1);
-            let transcript_value = db
-                .get_cf(cf::CF_AGENT_TRANSCRIPTS, transcript_key)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?
-                .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        "AGENT_COST_INDEX_STALE: timestamp index row points at a missing CF_AGENT_TRANSCRIPTS row; rebuild or repair the transcript timestamp index",
-                    )
-                })?;
-            transcript_rows.push((transcript_key.clone(), transcript_value));
-        }
-        if !more {
-            break;
-        }
-        let Some((last, _value)) = rows.last() else {
-            break;
-        };
-        start = key_after(last);
-    }
-    Ok(IndexedTranscriptRead {
-        scanned_index_rows,
-        scanned_rows: transcript_rows.len() as u64,
-        transcript_rows,
-    })
 }
 
 /// Decodes one transcript row and folds it into the per-spawn accumulator,
@@ -3370,7 +3233,11 @@ fn persist_cost_point_owner(
 /// Deletes every `agent-cost/rollup/v1/` row (cells, markers, control rows) for
 /// a `reset=true` rebuild.
 fn purge_all_rollup_rows(db: &Db) -> Result<(), ErrorData> {
-    for prefix in [ROLLUP_KEY_PREFIX, LEGACY_ROLLUP_KEY_PREFIX] {
+    for prefix in [
+        ROLLUP_KEY_PREFIX,
+        LEGACY_ROLLUP_KEY_PREFIX,
+        LEGACY_TRANSCRIPT_TS_INDEX_PREFIX,
+    ] {
         let rows = db
             .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
