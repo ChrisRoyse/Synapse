@@ -1365,6 +1365,16 @@ pub struct StorageIntelligenceAgreementEdge {
     pub n: u64,
 }
 
+/// Exact structured measurements excluded only from cosine kNN because a zero
+/// vector has no direction to normalize (#1996).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceKnnZeroNormExclusion {
+    pub slot: u32,
+    pub records: u64,
+    pub sample_cx_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceWeaveResponse {
@@ -1381,6 +1391,7 @@ pub struct StorageIntelligenceWeaveResponse {
     pub cross_terms_materialized: u64,
     pub agreement_edges_persisted: u64,
     pub between_record_edges_persisted: u64,
+    pub knn_zero_norm_exclusions: Vec<StorageIntelligenceKnnZeroNormExclusion>,
     pub xterm_cf_rows_after: u64,
     pub graph_cf_rows_after: u64,
     /// Effective half-open `created_at` window, echoed back.
@@ -3118,6 +3129,15 @@ pub fn run_intelligence_weave(
         cross_terms_materialized: report.cross_terms_materialized as u64,
         agreement_edges_persisted: report.agreement_edges_persisted as u64,
         between_record_edges_persisted: report.between_record_edges_persisted as u64,
+        knn_zero_norm_exclusions: report
+            .knn_zero_norm_exclusions
+            .into_iter()
+            .map(|exclusion| StorageIntelligenceKnnZeroNormExclusion {
+                slot: u32::from(exclusion.slot),
+                records: exclusion.records as u64,
+                sample_cx_ids: exclusion.sample_cx_ids,
+            })
+            .collect(),
         xterm_cf_rows_after: report.xterm_cf_rows_after as u64,
         graph_cf_rows_after: report.graph_cf_rows_after as u64,
         since_ts_ns: report.since_ts_ns,
