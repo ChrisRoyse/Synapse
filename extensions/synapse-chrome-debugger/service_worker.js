@@ -4886,6 +4886,7 @@ async function handlePageScreenshot(params) {
   let requiredForeground = !focusedWindowForCapture;
   let restoredPreviousActive = false;
   let setup = null;
+  let captureBackend = "chrome_tabs_extension";
   const token = `synapse-page-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const tiles = [];
   const captureAttempts = [];
@@ -4919,6 +4920,40 @@ async function handlePageScreenshot(params) {
       focusedWindowForCapture = true;
       restoredPreviousWindowFocus = false;
     }
+    const emulatedPageSurface =
+      VIEWPORT_BASELINE_BY_TAB.has(selected.tabId) ||
+      DEVICE_BASELINE_BY_TAB.has(selected.tabId);
+    if (emulatedPageSurface) {
+      const imageDataUrl = await captureEmulatedPageSurface(
+        selected.tabId,
+        setup.clip_css,
+        request,
+        setup.metrics.device_pixel_ratio,
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, "capture_emulated_page_surface")
+      );
+      tiles.push({
+        scroll_x_css: setup.clip_css.x,
+        scroll_y_css: setup.clip_css.y,
+        viewport_width_css: setup.clip_css.w,
+        viewport_height_css: setup.clip_css.h,
+        image_data_url: imageDataUrl,
+        image_data_url_len: imageDataUrl.length
+      });
+      captureAttempts.push({
+        attempt: 1,
+        scroll_x_css: setup.clip_css.x,
+        scroll_y_css: setup.clip_css.y,
+        requested_scroll_x_css: setup.clip_css.x,
+        requested_scroll_y_css: setup.clip_css.y,
+        ok: true,
+        elapsed_ms: 0,
+        timeout_ms: remainingPageScreenshotBudgetMs(commandDeadlineMs, "capture_emulated_page_surface_readback"),
+        retryable: false,
+        image_data_url_len: imageDataUrl.length,
+        error_detail: ""
+      });
+      captureBackend = "chrome_debugger_page_surface";
+    } else {
     const positions = pageScreenshotTilePositions(setup.clip_css, setup.metrics);
     for (const [index, position] of positions.entries()) {
       remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
@@ -4985,6 +5020,7 @@ async function handlePageScreenshot(params) {
         image_data_url: imageDataUrl,
         image_data_url_len: imageDataUrl.length
       });
+    }
     }
   } finally {
     if (setup?.ok) {
@@ -5068,12 +5104,71 @@ async function handlePageScreenshot(params) {
     capture_attempts: captureAttempts,
     mask_count: setup.mask_count,
     masks: setup.masks,
-    readback_backend: "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
-    backend_tier_used: "chrome_tabs_extension",
+    readback_backend: captureBackend === "chrome_debugger_page_surface"
+      ? "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot"
+      : "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
+    backend_tier_used: captureBackend,
     required_foreground: requiredForeground,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
+}
+
+async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, timeoutMs) {
+  const viewportBaseline = VIEWPORT_BASELINE_BY_TAB.get(tabId);
+  const deviceBaseline = DEVICE_BASELINE_BY_TAB.get(tabId);
+  const nativeDpr = Number(
+    viewportBaseline?.device_pixel_ratio ??
+    deviceBaseline?.viewport?.device_pixel_ratio ??
+    deviceBaseline?.device_pixel_ratio
+  );
+  const requestedDpr = Number(emulatedDpr);
+  if (!Number.isFinite(nativeDpr) || nativeDpr <= 0 ||
+      !Number.isFinite(requestedDpr) || requestedDpr <= 0) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `pageScreenshot cannot bind emulated pixels to CSS geometry: tab=${tabId} native_dpr=${String(nativeDpr)} requested_dpr=${String(requestedDpr)}; reset and reapply the viewport/device override so its baseline is physically readable`
+    );
+  }
+  const attachment = await attachDebuggerForCommand(tabId);
+  try {
+    const result = await sendDebuggerCommand(
+      attachment.debuggee,
+      "Page.captureScreenshot",
+      {
+        format: request.format,
+        quality: request.format === "jpeg" ? request.quality : undefined,
+        fromSurface: true,
+        captureBeyondViewport: true,
+        clip: {
+          x: Number(clip.x),
+          y: Number(clip.y),
+          width: Number(clip.w),
+          height: Number(clip.h),
+          scale: requestedDpr / nativeDpr
+        }
+      },
+      timeoutMs
+    );
+    const data = String(result?.data || "");
+    if (!data) {
+      throw new Error("Page.captureScreenshot returned empty image data");
+    }
+    return `data:image/${request.format};base64,${data}`;
+  } catch (error) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `pageScreenshot emulated page-surface capture failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  } finally {
+    if (attachment.shouldDetach) {
+      try {
+        await chrome.debugger.detach(attachment.debuggee);
+      } catch (error) {
+        console.warn(`Synapse pageScreenshot emulated surface detach failed for tab ${tabId}: ${errorMessage(error)}`);
+      }
+    }
+  }
 }
 
 function normalizePageScreenshotRequest(params, selectedTabId) {
@@ -5244,6 +5339,7 @@ async function runPageScreenshotSetup(tabId, request) {
   try {
     injected = await chrome.scripting.executeScript({
       target: { tabId },
+      world: "MAIN",
       func: pageScreenshotSetupInPage,
       args: [request]
     });
@@ -5265,6 +5361,7 @@ async function runPageScreenshotScroll(tabId, position) {
   try {
     injected = await chrome.scripting.executeScript({
       target: { tabId },
+      world: "MAIN",
       func: pageScreenshotScrollInPage,
       args: [position]
     });
@@ -5293,6 +5390,7 @@ async function runPageScreenshotCleanup(tabId, request) {
   }
   const injected = await chrome.scripting.executeScript({
     target: { tabId },
+    world: "MAIN",
     func: pageScreenshotCleanupInPage,
     args: [request]
   });

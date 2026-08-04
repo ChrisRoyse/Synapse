@@ -2365,12 +2365,19 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_screenshot_before_output_write",
         )?;
+        let used_emulated_page_surface =
+            captured.backend_tier_used == "chrome_debugger_page_surface";
+        let capture_backend = if used_emulated_page_surface {
+            "chrome_debugger_page_capture_screenshot_bgra"
+        } else {
+            "chrome_tabs_capture_visible_tab_stitched_bgra"
+        };
         let screenshot = write_screenshot_bitmap_with_quality(
             &write_params,
             validation.output_path.clone(),
             validation.format,
             bitmap,
-            "chrome_tabs_capture_visible_tab_stitched_bgra",
+            capture_backend,
             bitmap_sha256,
             None,
             params.quality,
@@ -2406,15 +2413,20 @@ impl SynapseService {
             tile_count: captured.tile_count,
             mask_count: captured.mask_count,
             omit_background: captured.omit_background,
-            required_foreground: foreground_readback.required_foreground || captured.required_foreground,
+            required_foreground: foreground_readback.required_foreground
+                || captured.required_foreground,
             human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
             human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
             human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
             restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
             backend_tier_used: captured.backend_tier_used,
-            source_of_truth:
-                "human OS foreground readback plus normal Chrome bridge chrome.scripting page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched by synapse-mcp"
-                    .to_owned(),
+            source_of_truth: if used_emulated_page_surface {
+                "normal Chrome bridge MAIN-world page metrics plus chrome.debugger Page.captureScreenshot page-surface pixels, independently geometry-checked before write"
+                    .to_owned()
+            } else {
+                "human OS foreground readback plus normal Chrome bridge MAIN-world page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched and independently geometry-checked by synapse-mcp"
+                    .to_owned()
+            },
             degradation_code: None,
             fallback_metadata_source: None,
             fallback_reason: None,
@@ -17588,6 +17600,7 @@ fn stitch_browser_screenshot_tiles(
         first.viewport_height_css,
         "viewport_height_css",
     )?;
+    validate_browser_screenshot_geometry(captured, scale_x, scale_y)?;
     let output_width = f64_to_u32_ceil(captured.clip_css.w * scale_x, "output width")?;
     let output_height = f64_to_u32_ceil(captured.clip_css.h * scale_y, "output height")?;
     let mut output = RgbaImage::new(output_width, output_height);
@@ -17654,6 +17667,39 @@ fn browser_screenshot_tile_scale(
         ));
     }
     Ok(f64::from(image_extent) / viewport_extent_css)
+}
+
+fn validate_browser_screenshot_geometry(
+    captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
+    scale_x: f64,
+    scale_y: f64,
+) -> Result<(), ErrorData> {
+    let dpr = captured.device_pixel_ratio;
+    let tolerance = 0.02_f64.max(dpr.abs() * 0.01);
+    if !dpr.is_finite()
+        || dpr <= 0.0
+        || (scale_x - scale_y).abs() > tolerance
+        || (scale_x - dpr).abs() > tolerance
+        || (scale_y - dpr).abs() > tolerance
+    {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot refused bitmap/CSS geometry mismatch before writing an artifact: backend={:?}, requested_clip_css={}x{}, declared_viewport_css={}x{}, declared_device_pixel_ratio={}, actual_first_tile_bitmap={}x{}, observed_scale_x={}, observed_scale_y={}. The capture backend returned pixels from a different surface than the page metrics; reset the active viewport/device emulation or use a build whose emulated-page capture uses CDP Page.captureScreenshot.",
+                captured.backend_tier_used,
+                captured.clip_css.w,
+                captured.clip_css.h,
+                captured.viewport_width_css,
+                captured.viewport_height_css,
+                dpr,
+                captured.tiles[0].viewport_width_css * scale_x,
+                captured.tiles[0].viewport_height_css * scale_y,
+                scale_x,
+                scale_y,
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn f64_to_u32_ceil(value: f64, label: &str) -> Result<u32, ErrorData> {
