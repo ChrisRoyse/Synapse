@@ -3716,10 +3716,11 @@ impl StorageBackend for CalyxBackend {
                 | cf::CF_ACTION_LOG
                 | cf::CF_REFLEX_AUDIT
                 | cf::CF_PROCESS_HISTORY
+                | cf::CF_OBSERVATIONS
         ) {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
-                detail: "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES,                          CF_AGENT_TRANSCRIPTS, CF_AGENT_EVENTS, CF_ACTION_LOG, CF_REFLEX_AUDIT                          or CF_PROCESS_HISTORY"
+                detail: "temporal metadata backfill accepts only CF_TIMELINE, CF_EPISODES,                          CF_AGENT_TRANSCRIPTS, CF_AGENT_EVENTS, CF_ACTION_LOG, CF_REFLEX_AUDIT,                          CF_PROCESS_HISTORY or sampled CF_OBSERVATIONS rows"
                     .to_owned(),
             });
         }
@@ -3751,6 +3752,23 @@ impl StorageBackend for CalyxBackend {
                     page.expired_rows_skipped,
                 )
             };
+        let rows = if source_cf == cf::CF_OBSERVATIONS {
+            let mut sampled = Vec::with_capacity(rows.len());
+            for row in rows {
+                if constellations::observation_constellation_sample_permits(&row.0)? {
+                    sampled.push(row);
+                } else if source_key.is_some() {
+                    return Err(StorageError::BackendInvalidConfig {
+                        value: constellations::hex_encode(&row.0),
+                        detail: "exact CF_OBSERVATIONS row is outside the deterministic sampled panel population"
+                            .to_owned(),
+                    });
+                }
+            }
+            sampled
+        } else {
+            rows
+        };
         let examined_rows = rows.len() as u64;
         let mut inserted_rows = 0_u64;
         let mut backfilled_rows = 0_u64;
@@ -3838,6 +3856,13 @@ impl StorageBackend for CalyxBackend {
                             let record: StoredReflexAudit = serde_json::from_slice(&raw)
                                 .map_err(|error| decode_failed(&error, "reflex audit"))?;
                             constellations::build_reflex_audit_constellation(
+                                context, &key, &raw, &record,
+                            )?
+                        }
+                        cf::CF_OBSERVATIONS => {
+                            let record: StoredObservation = serde_json::from_slice(&raw)
+                                .map_err(|error| decode_failed(&error, "observation"))?;
+                            constellations::build_observation_constellation(
                                 context, &key, &raw, &record,
                             )?
                         }
@@ -10319,6 +10344,7 @@ fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {
         cf::CF_ACTION_LOG => Ok(SYN_ACTION_PANEL_VERSION),
         cf::CF_REFLEX_AUDIT => Ok(SYN_REFLEX_PANEL_VERSION),
         cf::CF_PROCESS_HISTORY => Ok(SYN_PROCESS_PANEL_VERSION),
+        cf::CF_OBSERVATIONS => Ok(SYN_OBSERVATION_PANEL_VERSION),
         other => Err(StorageError::BackendInvalidConfig {
             value: other.to_owned(),
             detail: "no active panel generation is declared for this backfill source CF".to_owned(),

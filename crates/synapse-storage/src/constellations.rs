@@ -120,7 +120,8 @@ pub const SYN_PROCESS_PANEL_NAME: &str = "syn-process-v1";
 pub const SYN_PROCESS_PANEL_VERSION: u32 = 1_965_005;
 pub const SYN_PROCESS_PANEL_VERSION_PRE_1965: u32 = 1_776_003;
 pub const SYN_OBSERVATION_PANEL_NAME: &str = "syn-observation-v1";
-pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_776_004;
+pub const SYN_OBSERVATION_PANEL_VERSION: u32 = 1_965_006;
+pub const SYN_OBSERVATION_PANEL_VERSION_PRE_1965: u32 = 1_776_004;
 pub const SYN_OUTCOME_PANEL_NAME: &str = "syn-outcome-v1";
 pub const SYN_OUTCOME_PANEL_VERSION: u32 = 1_776_005;
 pub const SYN_MCP_USAGE_PANEL_NAME: &str = "syn-mcp-usage-v1";
@@ -467,11 +468,12 @@ const PR_SLOT_RECENCY_RANK: SlotId = SlotId::new(65);
 const OB_SLOT_APP_HASH: SlotId = SlotId::new(67);
 const OB_SLOT_ROLE_HISTOGRAM: SlotId = SlotId::new(68);
 const OB_SLOT_ENTITY_MULTI_HOT: SlotId = SlotId::new(69);
-const OB_SLOT_HUD_RECORD_VECTOR: SlotId = SlotId::new(70);
+// Slot 70 is reserved for the uncalibrated magnitude-weighted HUD vector
+// retired by #1965.
 const OB_SLOT_FLAGS_MULTI_HOT: SlotId = SlotId::new(71);
 const OB_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(72);
 const OB_SLOT_DOW_CYCLIC: SlotId = SlotId::new(73);
-const OB_SLOT_RECORD_VECTOR: SlotId = SlotId::new(74);
+// Slot 74 is reserved for the magnitude-weighted vector retired by #1965.
 
 const OUT_SLOT_SOURCE_CF_ONEHOT: SlotId = SlotId::new(75);
 const OUT_SLOT_EVENT_ONEHOT: SlotId = SlotId::new(76);
@@ -2001,14 +2003,12 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         OB_SLOT_ENTITY_MULTI_HOT,
         "syn.observation.entity_multi_hot.v1",
     ),
-    (OB_SLOT_HUD_RECORD_VECTOR, "syn.observation.hud_scalars.v1"),
     (
         OB_SLOT_FLAGS_MULTI_HOT,
         "syn.observation.flags_multi_hot.v1",
     ),
     (OB_SLOT_HOUR_CYCLIC, "syn.observation.hour_cyclic.v1"),
     (OB_SLOT_DOW_CYCLIC, "syn.observation.dow_cyclic.v1"),
-    (OB_SLOT_RECORD_VECTOR, "syn.observation.record_vector.v1"),
     (OUT_SLOT_SOURCE_CF_ONEHOT, "syn.outcome.source_cf_onehot.v1"),
     (OUT_SLOT_EVENT_ONEHOT, "syn.outcome.event_onehot.v1"),
     (OUT_SLOT_STATUS_ONEHOT, "syn.outcome.status_onehot.v1"),
@@ -2420,8 +2420,8 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_OBSERVATIONS),
             outcome_bearing: false,
             source_ttl_managed: true,
-            superseded_versions: &[1_666_004],
-            backfill_source_cf: None,
+            superseded_versions: &[1_666_004, SYN_OBSERVATION_PANEL_VERSION_PRE_1965],
+            backfill_source_cf: Some(cf::CF_OBSERVATIONS),
         },
         PanelCatalogEntry {
             panel_name: SYN_RECURRENCE_SUBJECT_PANEL_NAME,
@@ -3225,7 +3225,6 @@ pub fn syn_content_slot(
 const RECORD_VECTOR_MAGNITUDE_GRANDFATHERED: &[(u32, &str, u64)] = &[
     (1_983_001, "syn-agent-event-v1", 9_091),
     (1_983_002, "syn-agent-transcript-v1", 50_973),
-    (1_776_004, "syn-observation-v1", 2),
     (1_776_005, "syn-outcome-v1", 18),
     (1_776_006, "syn-mcp-usage-v1", 9_842),
 ];
@@ -4701,19 +4700,6 @@ pub fn build_observation_constellation(
             &entity_labels,
         )?,
     );
-    let hud_numeric_record = observation_hud_numeric_record(record);
-    slots.insert(
-        OB_SLOT_HUD_RECORD_VECTOR,
-        optional_json_slot(
-            SYN_OBSERVATION_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.observation.hud_scalars.v1",
-                Modality::Structured,
-                128,
-            ),
-            hud_numeric_record.as_ref(),
-        )?,
-    );
     slots.insert(
         OB_SLOT_FLAGS_MULTI_HOT,
         optional_json_slice_slot(
@@ -4735,19 +4721,6 @@ pub fn build_observation_constellation(
         "syn.observation.dow_cyclic.v1",
         Some(record.ts_ns),
     )?;
-    slots.insert(
-        OB_SLOT_RECORD_VECTOR,
-        measure_json(
-            SYN_OBSERVATION_PANEL_NAME,
-            AlgorithmicLens::syn_record_vector(
-                "syn.observation.record_vector.v1",
-                Modality::Structured,
-                128,
-            ),
-            &observation_numeric_record(record),
-        )?,
-    );
-
     let scalars = observation_scalars(record, raw_bytes)?;
     let metadata = observation_metadata(source_key, raw_bytes, record)?;
     constellation(
@@ -7522,37 +7495,6 @@ fn observation_entity_labels(record: &StoredObservation) -> Vec<String> {
         .collect()
 }
 
-fn observation_hud_numeric_record(record: &StoredObservation) -> Option<Value> {
-    if record.hud.by_name.is_empty() && record.hud.errors.is_empty() {
-        return None;
-    }
-    let mut fields = BTreeMap::<String, f64>::new();
-    fields.insert(
-        "hud_field_count".to_owned(),
-        metric_u64_as_f64(u64::try_from(record.hud.by_name.len()).unwrap_or(u64::MAX)),
-    );
-    fields.insert(
-        "hud_error_count".to_owned(),
-        metric_u64_as_f64(u64::try_from(record.hud.errors.len()).unwrap_or(u64::MAX)),
-    );
-    for (name, reading) in &record.hud.by_name {
-        if let synapse_core::HudValue::Number(value) = reading.parsed
-            && value.is_finite()
-        {
-            fields.insert(format!("field/{name}/value"), value);
-        }
-        fields.insert(
-            format!("field/{name}/confidence"),
-            f64::from(reading.confidence),
-        );
-        fields.insert(
-            format!("field/{name}/stale_ms"),
-            f64::from(reading.stale_ms),
-        );
-    }
-    Some(json!(fields))
-}
-
 fn observation_flags(record: &StoredObservation) -> StorageResult<Vec<String>> {
     let mut flags = Vec::new();
     flags.push(format!(
@@ -7596,31 +7538,6 @@ fn observation_flags(record: &StoredObservation) -> StorageResult<Vec<String>> {
     flags.sort();
     flags.dedup();
     Ok(flags)
-}
-
-fn observation_numeric_record(record: &StoredObservation) -> Value {
-    json!({
-        "record_present": 1,
-        "schema_version": record.schema_version,
-        "ts_unix_ms": record.ts_ns / NS_PER_MS,
-        "element_count": record.elements.len(),
-        "entity_count": record.entities.len(),
-        "hud_field_count": record.hud.by_name.len(),
-        "hud_error_count": record.hud.errors.len(),
-        "recent_event_count": record.recent_events.len(),
-        "fs_recent_count": record.fs_recent.len(),
-        "audio_recent_event_count": record.audio.recent_events.len(),
-        "foreground_dpi_scale": record.foreground.dpi_scale,
-        "foreground_monitor_index": record.foreground.monitor_index,
-        "foreground_fullscreen": bool_u64(record.foreground.is_fullscreen),
-        "foreground_dwm_composed": bool_u64(record.foreground.is_dwm_composed),
-        "assembled_in_ms": record.diagnostics.assembled_in_ms,
-        "size_bytes": record.diagnostics.size_bytes,
-        "size_estimate_tokens": record.diagnostics.size_estimate_tokens,
-        "elements_truncated": bool_u64(record.diagnostics.elements_truncated),
-        "entities_truncated": bool_u64(record.diagnostics.entities_truncated),
-        "redacted": bool_u64(record.redacted),
-    })
 }
 
 const fn sensor_status_code(status: &SensorStatus) -> &'static str {
