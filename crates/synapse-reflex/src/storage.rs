@@ -481,6 +481,31 @@ impl ReflexRuntime {
         self.db.flush()
     }
 
+    /// Appends one terminal action outcome to its stable Calyx recurrence
+    /// subject. The caller supplies the exact audit-row key as the idempotency
+    /// identity and a typed Oracle evidence context.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the subject, timestamp, evidence context,
+    /// or durable Base/Recurrence publication is invalid.
+    #[tracing::instrument(skip_all, fields(component = "reflex_runtime", action))]
+    pub fn storage_put_action_outcome_occurrence(
+        &self,
+        action: &str,
+        event_time_ns: u64,
+        occurrence_identity: &[u8],
+        context: &[u8],
+    ) -> StorageResult<synapse_storage::CalyxRecurrenceSubjectReport> {
+        self.db.put_recurrence_subject_occurrence(
+            synapse_storage::RecurrenceSubjectKind::Action,
+            action,
+            event_time_ns,
+            occurrence_identity,
+            context,
+        )
+    }
+
     /// Writes process start/exit history rows and flushes them immediately.
     ///
     /// # Errors

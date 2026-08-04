@@ -386,9 +386,42 @@ impl SynapseService {
                 "reflex runtime lock poisoned while writing action audit",
             )
         })?;
+        let audit_key = action_audit_key(ts_ns, seq);
         runtime
-            .storage_put_action_log_rows(vec![(action_audit_key(ts_ns, seq), encoded)])
+            .storage_put_action_log_rows(vec![(audit_key.clone(), encoded)])
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if matches!(status, "ok" | "error" | "denied") {
+            let outcome = matches!(status, "ok");
+            let oracle_context = serde_json::to_vec(&json!({
+                "action_id": tool,
+                "outcome_anchor": {
+                    "value": { "bool": outcome }
+                },
+                "source_action_audit_key_hex": synapse_storage::constellations::hex_encode(&audit_key),
+            }))
+            .map_err(|error| {
+                mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!("Oracle action outcome context encode failed: {error}"),
+                )
+            })?;
+            runtime
+                .storage_put_action_outcome_occurrence(
+                    tool,
+                    ts_ns,
+                    &audit_key,
+                    &oracle_context,
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "CALYX_ORACLE_ACTION_EVIDENCE_WRITE_FAILED: terminal action audit row was committed but its Oracle recurrence evidence failed: tool={tool} status={status} source_key_hex={} detail={error}; remediation: inspect CF_ACTION_LOG and the Calyx Base/Recurrence rows, repair the failed projection, and do not treat the action corpus as complete until physical readback agrees",
+                            synapse_storage::constellations::hex_encode(&audit_key)
+                        ),
+                    )
+                })?;
+        }
         drop(runtime);
         tracing::info!(
             code = "ACTION_AUDIT_RECORDED",

@@ -718,6 +718,7 @@ const PH_PATH_HASH_DIM: u32 = 4096;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RecurrenceSubjectKind {
+    Action,
     AppUsage,
     Routine,
 }
@@ -726,6 +727,7 @@ impl RecurrenceSubjectKind {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
+            Self::Action => "action",
             Self::AppUsage => "app_usage",
             Self::Routine => "routine",
         }
@@ -1249,6 +1251,10 @@ pub fn build_recurrence_subject_constellation(
         "recurrence_subject_id".to_owned(),
         truncate_metadata(subject_id),
     );
+    if kind == RecurrenceSubjectKind::Action {
+        metadata.insert("oracle.domain".to_owned(), "synapse.action".to_owned());
+        metadata.insert("oracle.action".to_owned(), truncate_metadata(subject_id));
+    }
     constellation(
         context,
         SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
