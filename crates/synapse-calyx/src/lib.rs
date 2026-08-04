@@ -15,6 +15,7 @@ pub mod lens_provenance;
 pub mod lineage;
 pub mod lowering;
 mod math;
+pub mod panel_lifecycle;
 pub mod vault_runtime;
 pub mod ward;
 
