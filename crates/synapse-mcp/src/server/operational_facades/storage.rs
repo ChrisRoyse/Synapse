@@ -920,6 +920,7 @@ pub(super) async fn handle(
                 .0
                 .intelligence
                 .ok_or_else(|| missing_spec(STORAGE_TOOL, "intelligence"))?;
+            crate::m3::storage::validate_intelligence_numeric_ranges(&spec)?;
             let sub_operation = spec.operation;
             let source_id = format!("panel_{}", spec.panel_version);
             // The weave sub-operation persists derived XTerm/Graph rows, so it is

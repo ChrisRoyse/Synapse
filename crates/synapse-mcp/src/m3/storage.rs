@@ -1201,7 +1201,7 @@ pub struct StorageIntelligenceParams {
     pub operation: StorageIntelligenceOperation,
     /// Exact `Syn*` panel version (domain) to weave/report over.
     pub panel_version: u32,
-    /// Bounded cap on records scanned; clamped to `[1, 20000]`.
+    /// Bounded cap on records scanned; must be in `[1, 20000]`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 20000))]
     pub max_records: Option<u32>,
@@ -2109,6 +2109,13 @@ pub fn run_find_similar(
     db: &synapse_storage::Db,
     params: &StorageFindSimilarParams,
 ) -> Result<StorageFindSimilarResponse, ErrorData> {
+    validate_u32_range("find_similar", "k", params.k, 1, 1000)?;
+    if let Some(value) = params.exact_slot {
+        validate_u32_range("find_similar", "exact_slot", value, 0, 65_535)?;
+    }
+    if let Some(value) = params.single_slot {
+        validate_u32_range("find_similar", "single_slot", value, 0, 65_535)?;
+    }
     let query = match params.query_mode.trim() {
         "by_example" => {
             let cx_id = params
@@ -2752,6 +2759,12 @@ pub fn inspect_corpus_histogram(
     db: &synapse_storage::Db,
     params: &StorageCorpusHistogramParams,
 ) -> Result<StorageCorpusHistogramResponse, ErrorData> {
+    if let Some(max_rows) = params.max_rows {
+        validate_u64_range("corpus_histogram", "max_rows", max_rows, 1, 200_000)?;
+    }
+    if let Some(max_buckets) = params.max_buckets {
+        validate_u32_range("corpus_histogram", "max_buckets", max_buckets, 1, 1000)?;
+    }
     let Some(declared) = declared_dimensions(params.source_cf.as_str()) else {
         return Err(mcp_error_with_remediation(
             "SYNAPSE_STORAGE_CORPUS_HISTOGRAM_CF_UNSUPPORTED",
@@ -2784,14 +2797,10 @@ pub fn inspect_corpus_histogram(
         params.dimensions.clone()
     };
 
-    let row_cap = params
-        .max_rows
-        .unwrap_or(CORPUS_HISTOGRAM_MAX_ROWS)
-        .clamp(1, CORPUS_HISTOGRAM_MAX_ROWS);
+    let row_cap = params.max_rows.unwrap_or(CORPUS_HISTOGRAM_MAX_ROWS);
     let bucket_cap = params
         .max_buckets
-        .unwrap_or(CORPUS_HISTOGRAM_DEFAULT_BUCKETS)
-        .clamp(1, 1000) as usize;
+        .unwrap_or(CORPUS_HISTOGRAM_DEFAULT_BUCKETS) as usize;
 
     let mut counts: BTreeMap<String, BTreeMap<String, u64>> = wanted
         .iter()
@@ -3082,7 +3091,7 @@ pub fn run_intelligence_weave(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<StorageIntelligenceWeaveResponse, ErrorData> {
-    let max_records = clamp_intelligence_records(params.max_records);
+    let max_records = intelligence_record_limit(params.max_records);
     let mut weave = synapse_calyx::SynapseCalyxWeaveParams::new(params.panel_version);
     weave.max_records = max_records;
     if let Some(knn_k) = params.knn_k {
@@ -3146,17 +3155,111 @@ pub fn run_intelligence_abundance(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<StorageIntelligenceAbundanceReport, ErrorData> {
-    let max_records = clamp_intelligence_records(params.max_records);
+    let max_records = intelligence_record_limit(params.max_records);
     let report = db
         .abundance_report_intelligence(params.panel_version, max_records)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(storage_intelligence_abundance(report))
 }
 
-fn clamp_intelligence_records(requested: Option<u32>) -> usize {
-    requested
-        .unwrap_or(MAX_INTELLIGENCE_RECORDS)
-        .clamp(1, MAX_INTELLIGENCE_RECORDS) as usize
+fn intelligence_record_limit(requested: Option<u32>) -> usize {
+    requested.unwrap_or(MAX_INTELLIGENCE_RECORDS) as usize
+}
+
+/// Enforces every numeric range published by [`StorageIntelligenceParams`].
+/// Schemars describes the wire contract but does not validate serde input.
+pub fn validate_intelligence_numeric_ranges(
+    params: &StorageIntelligenceParams,
+) -> Result<(), ErrorData> {
+    if let Some(value) = params.max_records {
+        validate_u32_range("intelligence", "max_records", value, 1, 20_000)?;
+    }
+    if let Some(value) = params.knn_k {
+        validate_u32_range("intelligence", "knn_k", value, 1, 64)?;
+    }
+    if let Some(value) = params.min_gate_lenses {
+        validate_u32_range("intelligence", "min_gate_lenses", value, 2, 64)?;
+    }
+    if let Some(value) = params.ksg_k {
+        validate_u32_range("intelligence", "ksg_k", value, 1, 32)?;
+    }
+    if let Some(value) = params.bin_seconds
+        && (!value.is_finite() || value < 1.0)
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "bin_seconds",
+            &value.to_string(),
+            "a finite number >= 1",
+        ));
+    }
+    if let Some(value) = params.max_lag {
+        validate_u32_range("intelligence", "max_lag", value, 1, 64)?;
+    }
+    if let Some(value) = params.min_recall_ratio
+        && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "min_recall_ratio",
+            &value.to_string(),
+            "a finite number in 0..=1",
+        ));
+    }
+    if let Some(value) = params.max_hops {
+        validate_u32_range("intelligence", "max_hops", value, 1, 64)?;
+    }
+    Ok(())
+}
+
+fn validate_u32_range(
+    operation: &str,
+    field: &str,
+    value: u32,
+    min: u32,
+    max: u32,
+) -> Result<(), ErrorData> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(numeric_range_error(
+            operation,
+            field,
+            &value.to_string(),
+            &format!("an integer in {min}..={max}"),
+        ))
+    }
+}
+
+fn validate_u64_range(
+    operation: &str,
+    field: &str,
+    value: u64,
+    min: u64,
+    max: u64,
+) -> Result<(), ErrorData> {
+    if (min..=max).contains(&value) {
+        Ok(())
+    } else {
+        Err(numeric_range_error(
+            operation,
+            field,
+            &value.to_string(),
+            &format!("an integer in {min}..={max}"),
+        ))
+    }
+}
+
+fn numeric_range_error(operation: &str, field: &str, value: &str, accepted: &str) -> ErrorData {
+    mcp_error_with_remediation(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "storage operation={operation} field {field}={value} is outside the accepted range ({accepted})"
+        ),
+        &format!(
+            "set {field} to {accepted}; validation stopped before any storage operation was attempted"
+        ),
+    )
 }
 
 fn assay_params(
@@ -3179,7 +3282,7 @@ fn assay_params(
     let mut assay =
         synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, anchor_kind.to_owned())
             .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
-    assay.max_records = clamp_intelligence_records(params.max_records);
+    assay.max_records = intelligence_record_limit(params.max_records);
     if let Some(ksg_k) = params.ksg_k {
         assay.ksg_k = ksg_k as usize;
     }
@@ -3464,7 +3567,7 @@ pub fn run_intelligence_redundancy(
     let mut assay =
         synapse_calyx::SynapseCalyxAssayParams::new(params.panel_version, String::new())
             .with_lens_names(synapse_storage::constellations::syn_slot_lens_names());
-    assay.max_records = clamp_intelligence_records(params.max_records);
+    assay.max_records = intelligence_record_limit(params.max_records);
     let report = db
         .assay_redundancy_intelligence(&assay)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -3599,7 +3702,7 @@ fn temporal_params(
     params: &StorageIntelligenceParams,
 ) -> synapse_calyx::SynapseCalyxTemporalParams {
     let mut temporal = synapse_calyx::SynapseCalyxTemporalParams::new(params.panel_version);
-    temporal.max_records = clamp_intelligence_records(params.max_records);
+    temporal.max_records = intelligence_record_limit(params.max_records);
     temporal.group_key = params.group_key.clone();
     temporal.group_a = params.group_a.clone();
     temporal.group_b = params.group_b.clone();
@@ -3785,7 +3888,7 @@ fn kernel_params(
     })?;
     let mut kernel =
         synapse_calyx::SynapseCalyxKernelParams::new(params.panel_version, content_slot);
-    kernel.max_records = clamp_intelligence_records(params.max_records);
+    kernel.max_records = intelligence_record_limit(params.max_records);
     if let Some(knn) = params.knn_k {
         kernel.knn = knn as usize;
     }
