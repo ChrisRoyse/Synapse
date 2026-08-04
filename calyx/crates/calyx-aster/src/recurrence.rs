@@ -4,7 +4,7 @@ use crate::cf::{ColumnFamily, base_key, recurrence_key, recurrence_prefix_range}
 use crate::dedup::{EpochSecs, OccurrenceId};
 use crate::vault::AsterVault;
 use crate::vault::base_rewrite::BaseRowRewrite;
-use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, VaultStore};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, Seq, VaultStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -182,7 +182,11 @@ where
         })?;
         let append = build_append(vault, base, t_k, context, observed_at, retention, None)?;
         let occurrence_id = append.occurrence_id;
-        vault.commit_recurrence_batch_locked(append.recurrence_rows, Some(append.updated_base))?;
+        vault.commit_recurrence_batch_locked(
+            append.recurrence_rows,
+            Some(append.updated_base),
+            Vec::new(),
+        )?;
         Ok(occurrence_id)
     })
 }
@@ -205,6 +209,49 @@ pub fn append_occurrence_once<C>(
 where
     C: Clock,
 {
+    append_occurrence_once_with_rows(
+        vault,
+        RecurrenceAppendOnceRequest {
+            cx_id,
+            t_k,
+            context,
+            observed_at,
+            retention,
+            dedup_key_sha256,
+        },
+        |_occurrence_id, _frequency, _commit_seq| Ok(Vec::new()),
+    )
+}
+
+pub struct RecurrenceAppendOnceRequest {
+    pub cx_id: CxId,
+    pub t_k: EpochSecs,
+    pub context: OccurrenceContext,
+    pub observed_at: EpochSecs,
+    pub retention: RetentionPolicy,
+    pub dedup_key_sha256: [u8; 32],
+}
+
+/// Appends one idempotent occurrence and caller-owned rows in the same commit.
+/// The row builder runs only for a genuinely new occurrence while the durable
+/// recurrence lock is held.
+pub fn append_occurrence_once_with_rows<C, F>(
+    vault: &AsterVault<C>,
+    request: RecurrenceAppendOnceRequest,
+    build_rows: F,
+) -> Result<RecurrenceAppendOutcome>
+where
+    C: Clock,
+    F: FnOnce(OccurrenceId, u64, Seq) -> Result<Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>>,
+{
+    let RecurrenceAppendOnceRequest {
+        cx_id,
+        t_k,
+        context,
+        observed_at,
+        retention,
+        dedup_key_sha256,
+    } = request;
     vault.with_recurrence_write_lock(|| {
         let base = read_base(vault, cx_id)?.ok_or_else(|| {
             CalyxError::stale_derived("recurrence append requires an existing constellation")
@@ -235,7 +282,16 @@ where
             Some(dedup_key_sha256),
         )?;
         let occurrence_id = append.occurrence_id;
-        vault.commit_recurrence_batch_locked(append.recurrence_rows, Some(append.updated_base))?;
+        let frequency = occurrence_id.0.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard("recurrence frequency overflow before atomic extension")
+        })?;
+        let commit_seq = vault.latest_seq().saturating_add(1);
+        let additional_rows = build_rows(occurrence_id, frequency, commit_seq)?;
+        vault.commit_recurrence_batch_locked(
+            append.recurrence_rows,
+            Some(append.updated_base),
+            additional_rows,
+        )?;
         Ok(RecurrenceAppendOutcome {
             occurrence_id,
             disposition: RecurrenceAppendDisposition::Inserted,

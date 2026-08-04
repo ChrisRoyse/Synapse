@@ -963,6 +963,24 @@ impl Db {
         self.backend.persist_novelty_finding(finding)
     }
 
+    /// Reads a bounded set of typed exact-identity new-region outbox rows.
+    pub fn persisted_region_findings(
+        &self,
+        after_observed_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<synapse_calyx::SynapseCalyxPersistedRegionFinding>> {
+        self.backend
+            .persisted_region_findings(after_observed_seq, max_rows)
+    }
+
+    pub fn region_delivery_cursor(&self) -> StorageResult<u64> {
+        self.backend.region_delivery_cursor()
+    }
+
+    pub fn persist_region_delivery_cursor(&self, observed_seq: u64) -> StorageResult<u64> {
+        self.backend.persist_region_delivery_cursor(observed_seq)
+    }
+
     /// Reads the physical recurrence series for one stable subject.
     ///
     /// # Errors

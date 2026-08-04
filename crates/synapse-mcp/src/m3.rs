@@ -883,6 +883,37 @@ impl M3State {
                 dropped: report.dropped,
             })
         });
+        let region_event_bus = self.sse_state.event_bus();
+        synapse_storage::derived_state::register_region_delivery_sink(move |finding| {
+            let event_seq = finding
+                .observed_seq
+                .checked_mul(u64::from(u16::MAX) + 1)
+                .and_then(|base| base.checked_add(u64::from(u16::MAX)))
+                .ok_or_else(|| {
+                    format!(
+                        "reactive new-region event sequence overflow for observed_seq={}; remediation=preserve the Reactive CF row and inspect vault sequence exhaustion",
+                        finding.observed_seq
+                    )
+                })?;
+            let data = serde_json::to_value(finding).map_err(|error| {
+                format!(
+                    "serialize committed Reactive CF region finding for scheduled delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
+                )
+            })?;
+            let report = region_event_bus.publish(synapse_core::types::Event {
+                seq: event_seq,
+                at: chrono::Utc::now(),
+                source: synapse_core::types::EventSource::System,
+                kind: "calyx.reactive.new_region".to_owned(),
+                data,
+                correlations: Vec::new(),
+            });
+            Ok(synapse_storage::derived_state::ReactiveDeliveryReadback {
+                matched: report.matched as u64,
+                queued: report.queued as u64,
+                dropped: report.dropped,
+            })
+        });
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample

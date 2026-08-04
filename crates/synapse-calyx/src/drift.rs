@@ -74,6 +74,8 @@ pub const SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION: f32 = 0.3;
 const REACTIVE_DRIFT_PREFIX: &[u8; 8] = b"RDRIFT1\0";
 const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
 const REACTIVE_NOVELTY_PREFIX: &[u8; 8] = b"RNOVEL1\0";
+const REACTIVE_REGION_PREFIX: &[u8; 8] = b"RREGION1";
+const REACTIVE_REGION_DELIVERY_CURSOR_KEY: &[u8] = b"reactive_delivery\0region_event_bus_v1";
 
 /// Durable recurrence event stored in `Reactive` before live publication.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -97,7 +99,132 @@ pub struct SynapseCalyxPersistedNoveltyFinding {
     pub ledger_hash: String,
 }
 
+/// Exact first-observation cause for a discrete region such as an application
+/// identity. This is separate from Ward cosine novelty: the acceptance fact is
+/// that an exact frozen identity has never occurred before.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPersistedRegionFinding {
+    pub region_kind: String,
+    pub region_id: String,
+    pub subject_cx_id: String,
+    pub trigger_cx_id: String,
+    pub occurrence_id: u64,
+    pub frequency: u64,
+    pub observed_seq: u64,
+}
+
 impl SynapseCalyxVault {
+    /// Reads the durable event-bus relay cursor for exact region findings.
+    pub fn region_delivery_cursor(&self) -> Result<u64, SynapseCalyxError> {
+        self.read_cf_latest(ColumnFamily::Registry, REACTIVE_REGION_DELIVERY_CURSOR_KEY)?
+            .map_or(Ok(0), |bytes| {
+                serde_json::from_slice::<u64>(&bytes).map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_CURSOR_CORRUPT",
+                        format!("decode region delivery cursor: {error}"),
+                        "preserve the vault and repair the named Registry cursor from delivered event evidence",
+                    )
+                })
+            })
+    }
+
+    /// Advances and independently reads back the durable region relay cursor.
+    pub fn persist_region_delivery_cursor(
+        &self,
+        observed_seq: u64,
+    ) -> Result<u64, SynapseCalyxError> {
+        let current = self.region_delivery_cursor()?;
+        if observed_seq < current {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_CURSOR_REGRESSION",
+                format!("region delivery cursor cannot regress from {current} to {observed_seq}"),
+                "retain the greater committed cursor and inspect relay ordering before retrying",
+            ));
+        }
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf: ColumnFamily::Registry,
+            key: REACTIVE_REGION_DELIVERY_CURSOR_KEY.to_vec(),
+            value: encode_json(&observed_seq)?,
+        }])?;
+        self.flush()?;
+        let readback = self.region_delivery_cursor()?;
+        if readback != observed_seq {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_CURSOR_READBACK_MISMATCH",
+                format!("wrote region delivery cursor {observed_seq}, read back {readback}"),
+                "stop relay, preserve the vault, and inspect the Registry commit before retrying",
+            ));
+        }
+        Ok(readback)
+    }
+
+    /// Persists one exact first-observation region event and proves its bytes by
+    /// an independent point read before returning it.
+    pub fn persist_region_finding(
+        &self,
+        finding: &SynapseCalyxPersistedRegionFinding,
+    ) -> Result<SynapseCalyxPersistedRegionFinding, SynapseCalyxError> {
+        let key = reactive_region_key(finding);
+        self.write_cf_batch(vec![SynapseCalyxCfWrite {
+            cf: ColumnFamily::Reactive,
+            key: key.clone(),
+            value: encode_json(finding)?,
+        }])?;
+        self.flush()?;
+        let bytes = self.read_cf_latest(ColumnFamily::Reactive, &key)?.ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_MISSING",
+                format!(
+                    "Reactive CF region row disappeared after commit: kind={} id={} occurrence={}",
+                    finding.region_kind, finding.region_id, finding.occurrence_id
+                ),
+                "stop writers, preserve the vault, and inspect the Reactive CF commit before retrying region delivery",
+            )
+        })?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                format!(
+                    "decode committed Reactive CF region row for kind={} id={} occurrence={}: {error}",
+                    finding.region_kind, finding.region_id, finding.occurrence_id
+                ),
+                "stop writers, preserve the vault, and inspect the named Reactive CF row",
+            )
+        })
+    }
+
+    /// Reads a bounded prefix of exact first-observation region rows from the
+    /// durable Reactive outbox. A corrupt matching row fails the whole read.
+    pub fn persisted_region_findings(
+        &self,
+        after_observed_seq: u64,
+        max_rows: usize,
+    ) -> Result<Vec<SynapseCalyxPersistedRegionFinding>, SynapseCalyxError> {
+        let mut findings = Vec::new();
+        self.walk_cf_latest(ColumnFamily::Reactive, max_rows.max(1), |key, value| {
+            if !key.starts_with(REACTIVE_REGION_PREFIX) {
+                return Ok(crate::SynapseCalyxWalkStep::Continue);
+            }
+            if findings.len() >= max_rows.max(1) {
+                return Ok(crate::SynapseCalyxWalkStep::Stop);
+            }
+            let finding: SynapseCalyxPersistedRegionFinding =
+                serde_json::from_slice(value).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                    format!("decode Reactive CF region row {}: {error}", crate::hex_bytes(key)),
+                    "preserve the vault and repair or remove only the named corrupt derived row before replay",
+                )
+                })?;
+            if finding.observed_seq <= after_observed_seq {
+                return Ok(crate::SynapseCalyxWalkStep::Continue);
+            }
+            findings.push(finding);
+            Ok(crate::SynapseCalyxWalkStep::Continue)
+        })?;
+        Ok(findings)
+    }
+
     pub fn persist_novelty_finding(
         &self,
         finding: &SynapseCalyxPersistedNoveltyFinding,
@@ -179,6 +306,20 @@ fn reactive_recurrence_key(finding: &SynapseCalyxPersistedRecurrenceFinding) -> 
     let digest = hasher.finalize();
     let mut key = Vec::with_capacity(32);
     key.extend_from_slice(REACTIVE_RECURRENCE_PREFIX);
+    key.extend_from_slice(&finding.observed_seq.to_be_bytes());
+    key.extend_from_slice(&digest[..8]);
+    key.extend_from_slice(&finding.occurrence_id.to_be_bytes());
+    key
+}
+
+pub(crate) fn reactive_region_key(finding: &SynapseCalyxPersistedRegionFinding) -> Vec<u8> {
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(finding.region_kind.as_bytes());
+    hasher.update([0]);
+    hasher.update(finding.region_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut key = Vec::with_capacity(32);
+    key.extend_from_slice(REACTIVE_REGION_PREFIX);
     key.extend_from_slice(&finding.observed_seq.to_be_bytes());
     key.extend_from_slice(&digest[..8]);
     key.extend_from_slice(&finding.occurrence_id.to_be_bytes());

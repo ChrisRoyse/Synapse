@@ -38,7 +38,7 @@ use std::sync::{
 use synapse_calyx::{
     SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_DELTA_KEYS,
     SynapseCalyxLensCoverageStatus, SynapseCalyxPersistedDriftFinding,
-    SynapseCalyxSearchGenerationStatus, hot_context,
+    SynapseCalyxPersistedRegionFinding, SynapseCalyxSearchGenerationStatus, hot_context,
 };
 
 use crate::Db;
@@ -124,6 +124,11 @@ type ReactiveDeliverySink = dyn Fn(&SynapseCalyxPersistedDriftFinding) -> Result
 
 static REACTIVE_DELIVERY_SINK: LazyLock<Mutex<Option<Arc<ReactiveDeliverySink>>>> =
     LazyLock::new(|| Mutex::new(None));
+type RegionDeliverySink = dyn Fn(&SynapseCalyxPersistedRegionFinding) -> Result<ReactiveDeliveryReadback, String>
+    + Send
+    + Sync;
+static REGION_DELIVERY_SINK: LazyLock<Mutex<Option<Arc<RegionDeliverySink>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReactiveDeliveryReadback {
@@ -198,6 +203,11 @@ pub struct DerivedStateReadback {
     pub last_reactive_notifications_matched: BTreeMap<u32, u64>,
     pub last_reactive_notifications_queued: BTreeMap<u32, u64>,
     pub last_reactive_notifications_dropped: BTreeMap<u32, u64>,
+    pub last_region_rows_read: u64,
+    pub last_region_notifications_matched: u64,
+    pub last_region_notifications_queued: u64,
+    pub last_region_notifications_dropped: u64,
+    pub last_region_delivery_watermark: u64,
     /// Last scheduled per-panel kernel outcome, including the physical Kernel
     /// CF row count returned after persistence.
     pub last_kernel_actions: BTreeMap<u32, String>,
@@ -266,6 +276,22 @@ where
 {
     let sink: Arc<ReactiveDeliverySink> = Arc::new(sink);
     match REACTIVE_DELIVERY_SINK.lock() {
+        Ok(mut guard) => *guard = Some(sink),
+        Err(poisoned) => *poisoned.into_inner() = Some(sink),
+    }
+}
+
+/// Registers the daemon-owned subscriber delivery boundary for exact persisted
+/// discrete-region findings.
+pub fn register_region_delivery_sink<F>(sink: F)
+where
+    F: Fn(&SynapseCalyxPersistedRegionFinding) -> Result<ReactiveDeliveryReadback, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let sink: Arc<RegionDeliverySink> = Arc::new(sink);
+    match REGION_DELIVERY_SINK.lock() {
         Ok(mut guard) => *guard = Some(sink),
         Err(poisoned) => *poisoned.into_inner() = Some(sink),
     }
@@ -636,6 +662,11 @@ pub(crate) fn run_derived_state_maintenance() {
         }
     }
 
+    if let Err(error) = drive_region_relay(&db) {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_REACTIVE_REGION_FAILED", error);
+    }
+
     if let Err(error) = drive_scheduled_kernels(&db) {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_KERNEL_REBUILD_FAILED", error);
@@ -926,6 +957,71 @@ fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), Strin
         notifications_queued = delivery.queued,
         notifications_dropped = delivery.dropped,
         "scheduled post-ingest drift findings were persisted, read back, and delivered"
+    );
+    Ok(())
+}
+
+fn drive_region_relay(db: &Arc<Db>) -> Result<(), String> {
+    const MAX_REGION_DELIVERIES_PER_TICK: usize = 256;
+    let after = db
+        .region_delivery_cursor()
+        .map_err(|error| format!("read durable region delivery cursor: {error}"))?;
+    let findings = db
+        .persisted_region_findings(after, MAX_REGION_DELIVERIES_PER_TICK)
+        .map_err(|error| {
+            format!("read persisted Reactive new-region rows after {after}: {error}")
+        })?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let sink = match REGION_DELIVERY_SINK.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+    .ok_or_else(|| {
+        format!(
+            "{} persisted Reactive new-region row(s) await delivery after seq {after}, but no daemon region sink is registered; remediation=repair derived-state startup registration and rerun maintenance",
+            findings.len()
+        )
+    })?;
+    let mut delivery = ReactiveDeliveryReadback::default();
+    let mut watermark = after;
+    for finding in &findings {
+        let readback = sink(finding)?;
+        delivery.matched = delivery.matched.saturating_add(readback.matched);
+        delivery.queued = delivery.queued.saturating_add(readback.queued);
+        delivery.dropped = delivery.dropped.saturating_add(readback.dropped);
+        if readback.dropped > 0 {
+            return Err(format!(
+                "new-region delivery for observed_seq={} dropped {} item(s); watermark remains at {watermark}; remediation=consume or recreate the saturated subscription and rerun maintenance",
+                finding.observed_seq, readback.dropped
+            ));
+        }
+        if readback.matched == 0 {
+            break;
+        }
+        watermark = finding.observed_seq;
+        watermark = db
+            .persist_region_delivery_cursor(watermark)
+            .map_err(|error| format!("persist durable region delivery cursor: {error}"))?;
+    }
+    let mut state = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.last_region_rows_read = findings.len() as u64;
+    state.last_region_notifications_matched = delivery.matched;
+    state.last_region_notifications_queued = delivery.queued;
+    state.last_region_notifications_dropped = delivery.dropped;
+    state.last_region_delivery_watermark = watermark;
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_REACTIVE_REGION_PASS",
+        rows_read = findings.len(),
+        notifications_matched = delivery.matched,
+        notifications_queued = delivery.queued,
+        notifications_dropped = delivery.dropped,
+        delivery_watermark = watermark,
+        "persisted exact-identity new-region findings were relayed in durable sequence order"
     );
     Ok(())
 }

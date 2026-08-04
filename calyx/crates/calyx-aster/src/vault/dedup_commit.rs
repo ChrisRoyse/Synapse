@@ -11,6 +11,7 @@ where
         &self,
         recurrence_rows: Vec<(Vec<u8>, Vec<u8>)>,
         updated_base: Option<BaseRowRewrite>,
+        additional_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
     ) -> Result<Seq> {
         let mut rows = Vec::new();
         if let Some(rewrite) = updated_base.as_ref() {
@@ -36,6 +37,11 @@ where
                     key,
                     value,
                 }),
+        );
+        rows.extend(
+            additional_rows
+                .into_iter()
+                .map(|(cf, key, value)| encode::WriteRow { cf, key, value }),
         );
         self.commit_rows_locked(&rows)
     }

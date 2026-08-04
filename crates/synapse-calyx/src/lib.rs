@@ -34,8 +34,9 @@ use calyx_aster::dedup::EpochSecs;
 use calyx_aster::erase::{EraseRegistry, EraseScope, subject_metadata_value};
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{
-    OccurrenceContext, RecurrenceAppendDisposition, RecurrenceSeriesReadback, RetentionPolicy,
-    append_occurrence_once, read_series_readback,
+    OccurrenceContext, RecurrenceAppendDisposition, RecurrenceAppendOnceRequest,
+    RecurrenceSeriesReadback, RetentionPolicy, append_occurrence_once,
+    append_occurrence_once_with_rows, read_series_readback,
 };
 pub use calyx_aster::vault::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
@@ -108,7 +109,7 @@ pub use drift::{
     SynapseCalyxBlindSpotAlert, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
     SynapseCalyxLensDrift, SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport,
     SynapseCalyxPersistedDriftFinding, SynapseCalyxPersistedNoveltyFinding,
-    SynapseCalyxPersistedRecurrenceFinding,
+    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxPersistedRegionFinding,
 };
 pub use find::{
     SYNAPSE_FIND_GUARD_DISABLED_CODE, SYNAPSE_FIND_MAX_K, SYNAPSE_FIND_RRF_K,
@@ -1374,6 +1375,12 @@ pub struct SynapseCalyxRecurrenceAppendReadback {
     pub latest_seq: Seq,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxRecurrenceRegionAppendReadback {
+    pub occurrence: SynapseCalyxRecurrenceAppendReadback,
+    pub region: Option<SynapseCalyxPersistedRegionFinding>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxRecurrenceSeriesReadback {
     pub cx_id: String,
@@ -2560,6 +2567,18 @@ pub struct SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxReadOnlyVault {
+    /// Opens an existing vault with only the native Reactive outbox selected.
+    pub fn open_existing_reactive_only(
+        config: SynapseCalyxConfig,
+    ) -> Result<Self, SynapseCalyxError> {
+        Self::open_existing_with_cfs(config, Some(vec![ColumnFamily::Reactive]))
+    }
+
+    /// Reads all visible native Reactive outbox rows from the read-only handle.
+    pub fn scan_reactive_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_latest(ColumnFamily::Reactive)
+    }
+
     /// Opens an existing Calyx vault for physical inspection of the **`Kv`
     /// column family only**.
     ///
@@ -4473,6 +4492,109 @@ impl SynapseCalyxVault {
             frequency: readback.series.frequency,
             active_occurrences: readback.series.occurrences.len(),
             latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Appends one occurrence and, only when it is the subject's first, commits
+    /// its exact region outbox row in the same durable batch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_recurrence_occurrence_once_with_region(
+        &self,
+        cx_id: CxId,
+        event_time_secs: i64,
+        observed_at_secs: i64,
+        context: Vec<u8>,
+        occurrence_identity_sha256: [u8; 32],
+        region_kind: &str,
+        region_id: &str,
+        trigger_cx_id: CxId,
+    ) -> Result<SynapseCalyxRecurrenceRegionAppendReadback, SynapseCalyxError> {
+        let context = OccurrenceContext::new(context).map_err(|error| {
+            SynapseCalyxError::from_calyx("validate native Calyx recurrence context", &error)
+        })?;
+        let mut region = None;
+        let outcome = append_occurrence_once_with_rows(
+            &self.vault,
+            RecurrenceAppendOnceRequest {
+                cx_id,
+                t_k: EpochSecs(event_time_secs),
+                context,
+                observed_at: EpochSecs(observed_at_secs),
+                retention: RetentionPolicy::default(),
+                dedup_key_sha256: occurrence_identity_sha256,
+            },
+            |occurrence_id, frequency, commit_seq| {
+                if frequency != 1 {
+                    return Ok(Vec::new());
+                }
+                let finding = SynapseCalyxPersistedRegionFinding {
+                    region_kind: region_kind.to_owned(),
+                    region_id: region_id.to_owned(),
+                    subject_cx_id: cx_id.to_string(),
+                    trigger_cx_id: trigger_cx_id.to_string(),
+                    occurrence_id: occurrence_id.0,
+                    frequency,
+                    observed_seq: commit_seq,
+                };
+                let key = drift::reactive_region_key(&finding);
+                let value = serde_json::to_vec(&finding).map_err(|error| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "encode atomic recurrence region finding: {error}"
+                    ))
+                })?;
+                region = Some(finding);
+                Ok(vec![(ColumnFamily::Reactive, key, value)])
+            },
+        )
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "append native recurrence occurrence with atomic region finding",
+                &error,
+            )
+        })?;
+        let readback = read_series_readback(&self.vault, cx_id).map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "read native Calyx recurrence series after atomic region append",
+                &error,
+            )
+        })?;
+        if let Some(expected) = &region {
+            let key = drift::reactive_region_key(expected);
+            let bytes = self
+                .read_cf_latest(ColumnFamily::Reactive, &key)?
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_READBACK_MISSING",
+                        "atomic first-region row is absent after recurrence commit",
+                        "stop writers, preserve the vault, and inspect the recurrence commit",
+                    )
+                })?;
+            let actual: SynapseCalyxPersistedRegionFinding = serde_json::from_slice(&bytes)
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_REACTIVE_READBACK_CORRUPT",
+                        format!("decode atomic first-region readback: {error}"),
+                        "preserve the vault and inspect the named Reactive row",
+                    )
+                })?;
+            if actual != *expected {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_REACTIVE_READBACK_MISMATCH",
+                    "atomic first-region row differs from its committed cause",
+                    "stop relay, preserve the vault, and inspect the Reactive row",
+                ));
+            }
+        }
+        Ok(SynapseCalyxRecurrenceRegionAppendReadback {
+            occurrence: SynapseCalyxRecurrenceAppendReadback {
+                cx_id: cx_id.to_string(),
+                occurrence_id: outcome.occurrence_id.0,
+                disposition: outcome.disposition.into(),
+                frequency: readback.series.frequency,
+                active_occurrences: readback.series.occurrences.len(),
+                latest_seq: self.vault.latest_seq(),
+            },
+            region,
         })
     }
 

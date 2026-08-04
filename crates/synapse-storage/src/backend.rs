@@ -35,14 +35,15 @@ use synapse_calyx::{
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
     SynapseCalyxPeriodicityReport, SynapseCalyxPersistedNoveltyFinding,
-    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxReadOnlyVault,
-    SynapseCalyxRecurrenceAppendReadback, SynapseCalyxRecurrenceSeriesReadback,
-    SynapseCalyxRedundancyReport, SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration,
-    SynapseCalyxRevisionGuard, SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport,
-    SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback,
-    SynapseCalyxVault, SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus,
-    SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport, SynapseCalyxWeaveParams,
-    SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
+    SynapseCalyxPersistedRecurrenceFinding, SynapseCalyxPersistedRegionFinding,
+    SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
+    SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
+    SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
+    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
+    SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback, SynapseCalyxVault,
+    SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport,
+    SynapseCalyxVerifyReport, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -663,6 +664,13 @@ pub trait StorageBackend: Send + Sync {
         &self,
         finding: &SynapseCalyxPersistedNoveltyFinding,
     ) -> StorageResult<SynapseCalyxPersistedNoveltyFinding>;
+    fn persisted_region_findings(
+        &self,
+        after_observed_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<SynapseCalyxPersistedRegionFinding>>;
+    fn region_delivery_cursor(&self) -> StorageResult<u64>;
+    fn persist_region_delivery_cursor(&self, observed_seq: u64) -> StorageResult<u64>;
     fn read_recurrence_subject_series(
         &self,
         kind: RecurrenceSubjectKind,
@@ -3464,6 +3472,7 @@ impl StorageBackend for CalyxBackend {
                     event_time_ns,
                     occurrence_identity,
                     context,
+                    None,
                 )
             },
         )
@@ -3505,6 +3514,65 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn persisted_region_findings(
+        &self,
+        after_observed_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<Vec<SynapseCalyxPersistedRegionFinding>> {
+        self.with_vault(
+            "calyx_reactive",
+            "read persisted first-observation region findings",
+            false,
+            |vault| {
+                vault
+                    .persisted_region_findings(after_observed_seq, max_rows)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_reactive",
+                            "read persisted first-observation region findings",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn region_delivery_cursor(&self) -> StorageResult<u64> {
+        self.with_vault(
+            "calyx_reactive",
+            "read durable region delivery cursor",
+            false,
+            |vault| {
+                vault.region_delivery_cursor().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_reactive",
+                        "read durable region delivery cursor",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn persist_region_delivery_cursor(&self, observed_seq: u64) -> StorageResult<u64> {
+        self.with_vault(
+            "calyx_reactive",
+            "persist durable region delivery cursor",
+            false,
+            |vault| {
+                vault
+                    .persist_region_delivery_cursor(observed_seq)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_reactive",
+                            "persist durable region delivery cursor",
+                            &source,
+                        )
+                    })
             },
         )
     }
@@ -4721,6 +4789,7 @@ impl StorageBackend for CalyxBackend {
                     created_at_ms: calyx_clock_now_for_write(vault, cf::CF_TIMELINE)?,
                     next_ledger_seq: vault.latest_seq().saturating_add(1),
                 };
+                let trigger_cx_id = context.cx_id;
                 let constellation = constellations::build_timeline_constellation(
                     context, source_key, raw_bytes, record,
                 )?;
@@ -4757,6 +4826,7 @@ impl StorageBackend for CalyxBackend {
                         record.ts_ns,
                         source_key,
                         &recurrence_context,
+                        Some(trigger_cx_id),
                     )?;
                     tracing::debug!(
                         code = "CALYX_APP_USAGE_RECURRENCE_APPENDED",
@@ -7052,6 +7122,7 @@ fn put_recurrence_subject_occurrence_on_vault(
     event_time_ns: u64,
     occurrence_identity: &[u8],
     context: &[u8],
+    region_trigger_cx_id: Option<calyx_core::CxId>,
 ) -> StorageResult<CalyxRecurrenceSubjectReport> {
     let subject_id = validate_recurrence_subject_id(subject_id)?;
     if occurrence_identity.is_empty() {
@@ -7109,21 +7180,35 @@ fn put_recurrence_subject_occurrence_on_vault(
     identity_hasher.update([0]);
     identity_hasher.update(occurrence_identity);
     let occurrence_identity_sha256: [u8; 32] = identity_hasher.finalize().into();
-    let occurrence = vault
-        .append_recurrence_occurrence_once(
+    let occurrence = if let Some(trigger_cx_id) = region_trigger_cx_id {
+        vault
+            .append_recurrence_occurrence_once_with_region(
+                cx_id,
+                event_time_secs,
+                observed_at_secs,
+                context.to_vec(),
+                occurrence_identity_sha256,
+                kind.as_str(),
+                &subject_id,
+                trigger_cx_id,
+            )
+            .map(|readback| readback.occurrence)
+    } else {
+        vault.append_recurrence_occurrence_once(
             cx_id,
             event_time_secs,
             observed_at_secs,
             context.to_vec(),
             occurrence_identity_sha256,
         )
-        .map_err(|source| {
-            calyx_write_failed(
-                "calyx_recurrence",
-                "append native Calyx recurrence subject occurrence",
-                &source,
-            )
-        })?;
+    }
+    .map_err(|source| {
+        calyx_write_failed(
+            "calyx_recurrence",
+            "append native Calyx recurrence subject occurrence",
+            &source,
+        )
+    })?;
     Ok(CalyxRecurrenceSubjectReport {
         subject_kind: kind.as_str().to_owned(),
         subject_id,
