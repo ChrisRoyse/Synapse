@@ -35,6 +35,11 @@ const NANOS_PER_HOUR: u64 = 60 * NANOS_PER_MINUTE;
 const NANOS_PER_DAY: u64 = 24 * NANOS_PER_HOUR;
 const NANOS_PER_MILLI: u64 = 1_000_000;
 
+/// A caller reused one immutable `(collection, series, timestamp)` identity
+/// for a different measurement. Replacing it cannot update min/max exactly
+/// from the compact accumulator, so the layer refuses before any write.
+pub const CALYX_TIMESERIES_POINT_CONFLICT: &str = "CALYX_TIMESERIES_POINT_CONFLICT";
+
 /// Continuous rollup window granularities, maintained on every write.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RollupWindow {
@@ -119,6 +124,21 @@ impl<'a, C: Clock> TimeSeriesLayer<'a, C> {
         }
         let snapshot = self.vault.latest_seq();
         let point_key = point_key(col, series, ts);
+        if let Some(existing_bytes) =
+            self.vault
+                .read_cf_at(snapshot, ColumnFamily::TimeSeries, &point_key)?
+        {
+            let existing = decode_point(&existing_bytes)?;
+            if existing.to_bits() == val.to_bits() {
+                return Ok(snapshot);
+            }
+            return Err(point_conflict(format!(
+                "time-series point already exists for collection={} series={series} ts={ts}: existing_bits={:016x} requested_bits={:016x}",
+                col.name,
+                existing.to_bits(),
+                val.to_bits()
+            )));
+        }
         let pk = RecordKey::from_bytes(point_key.clone())?;
         let mut rows = Vec::with_capacity(1 + RollupWindow::ALL.len());
         rows.push((
@@ -457,6 +477,14 @@ fn invalid_argument(message: impl Into<String>) -> CalyxError {
         code: CALYX_INVALID_ARGUMENT,
         message: message.into(),
         remediation: "fix the time-series input",
+    }
+}
+
+fn point_conflict(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: CALYX_TIMESERIES_POINT_CONFLICT,
+        message: message.into(),
+        remediation: "use a new timestamp for a distinct measurement or replay the byte-identical value",
     }
 }
 
