@@ -29,13 +29,14 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
     Anchor, AnchorKind, AnchorValue, Constellation, CxId, METADATA_SOURCE_EVENT_TIME_RAW,
-    PanelSlotId, SlotId, SlotVector, SystemClock, Ts,
+    PanelSlotId, SlotId, SlotVector, SparseEntry, SystemClock, Ts,
 };
 use calyx_forge::{Backend, KnnMetric};
 use calyx_lodestar::{
     AnswerDerivation, InMemoryAnnIndex, InMemoryCorpus, Kernel, KernelGraphParams, KernelIndex,
     KernelParams, LodestarError, LpRoundParams, RecallEvalParams, RecallQuery, build_kernel_index,
-    build_kernel_pipeline, derive_kernel_answer, measure_kernel_recall, write_kernel_artifact,
+    build_kernel_pipeline, derive_kernel_answer, derive_kernel_answer_from_ranked_members,
+    measure_kernel_recall, measure_ranked_kernel_recall, write_kernel_artifact,
 };
 use calyx_loom::{
     AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
@@ -1084,23 +1085,6 @@ fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
     }
 }
 
-/// The stored kind of one slot vector, for a refusal that can name what it saw.
-///
-/// [`dense_vector`] collapses `Sparse`, `Multi` and `Absent` into one `None`,
-/// and a caller that reads `None` as "this record is not a concept" cannot tell
-/// "the record has no measurement here" from "this whole lane is the wrong kind
-/// to be a kernel content slot" (#1979). Those need different answers: the first
-/// is a legitimate exclusion, the second is a caller error that must fail
-/// closed.
-const fn slot_vector_kind(vector: &SlotVector) -> &'static str {
-    match vector {
-        SlotVector::Dense { .. } => "dense",
-        SlotVector::Sparse { .. } => "sparse",
-        SlotVector::Multi { .. } => "multi",
-        SlotVector::Absent { .. } => "absent",
-    }
-}
-
 /// What the kernel corpus loader saw on the requested content slot for records
 /// it could not use.
 ///
@@ -1109,16 +1093,16 @@ const fn slot_vector_kind(vector: &SlotVector) -> &'static str {
 /// caller that reads nothing as "there is nothing here".
 #[derive(Debug, Default)]
 struct ContentSlotRejects {
-    sparse: usize,
     multi: usize,
     absent: usize,
+    empty: usize,
 }
 
 impl ContentSlotRejects {
     fn record(&mut self, kind: &str) {
         match kind {
-            "sparse" => self.sparse += 1,
             "multi" => self.multi += 1,
+            "empty" => self.empty += 1,
             _ => self.absent += 1,
         }
     }
@@ -1126,13 +1110,13 @@ impl ContentSlotRejects {
     /// Vectors of a kind that can never be a kernel content slot, as opposed to
     /// records that simply carry no measurement there.
     const fn wrong_kind(&self) -> usize {
-        self.sparse + self.multi
+        self.multi
     }
 
     fn describe(&self) -> String {
         format!(
-            "{} sparse, {} multi, {} absent",
-            self.sparse, self.multi, self.absent
+            "{} multi, {} absent, {} empty",
+            self.multi, self.absent, self.empty
         )
     }
 }
@@ -5468,7 +5452,7 @@ pub const KERNEL_ROW_PREFIX: &[u8; 5] = b"KERN1";
 #[derive(Clone, Debug)]
 pub struct SynapseCalyxKernelParams {
     pub panel_version: u32,
-    /// Dense semantic-lens slot id read per concept as the kernel embedding.
+    /// Dense or sparse content-lens slot read per kernel concept.
     pub content_slot: u16,
     pub max_records: usize,
     pub knn: usize,
@@ -5551,20 +5535,170 @@ pub struct SynapseCalyxKernelAnswerReport {
     pub min_recall_ratio: f32,
 }
 
-/// The reusable kernel inputs assembled from the vault: the embedding rows, the
-/// proximity association graph, the selected kernel, its measured recall, and the
-/// kernel index — everything a build or an answer needs.
+/// Reusable kernel inputs assembled from native dense or sparse measurements.
 pub struct DomainKernelInputs {
-    rows: Vec<RecallQuery>,
+    rows: KernelContentRows,
     pub anchors: Vec<CxId>,
     graph: AssocGraph,
     pub kernel: Kernel,
-    kernel_index: KernelIndex,
+    kernel_index: Option<KernelIndex>,
     pub recall_kernel_only: f32,
     pub recall_ratio: f32,
     pub corpus_size: usize,
     pub vault_corpus_size: usize,
     pub corpus_fingerprint: String,
+}
+
+enum KernelContentRows {
+    Dense(Vec<RecallQuery>),
+    Sparse(SparseCosineIndex),
+}
+
+impl KernelContentRows {
+    fn len(&self) -> usize {
+        match self {
+            Self::Dense(rows) => rows.len(),
+            Self::Sparse(index) => index.rows.len(),
+        }
+    }
+
+    fn ids(&self) -> Vec<CxId> {
+        match self {
+            Self::Dense(rows) => rows.iter().map(|row| row.cx_id).collect(),
+            Self::Sparse(index) => index.rows.iter().map(|row| row.cx_id).collect(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SparseKernelRow {
+    cx_id: CxId,
+    entries: Vec<SparseEntry>,
+    norm: f32,
+}
+
+struct SparseCosineIndex {
+    rows: Vec<SparseKernelRow>,
+    by_id: BTreeMap<CxId, usize>,
+    postings: BTreeMap<u32, Vec<(usize, f32)>>,
+}
+
+impl SparseCosineIndex {
+    fn new(source: Vec<(CxId, Vec<SparseEntry>)>) -> Result<Self, SynapseCalyxError> {
+        let mut rows = Vec::with_capacity(source.len());
+        let mut by_id = BTreeMap::new();
+        let mut postings = BTreeMap::<u32, Vec<(usize, f32)>>::new();
+        for (cx_id, entries) in source {
+            let ordinal = rows.len();
+            let norm_sq = entries.iter().try_fold(0.0_f32, |sum, entry| {
+                let next = sum + entry.val * entry.val;
+                next.is_finite().then_some(next).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_KERNEL_SPARSE_NORM_INVALID",
+                        format!("sparse content row {cx_id} norm overflowed"),
+                        "repair or remeasure the sparse content slot before building a kernel",
+                    )
+                })
+            })?;
+            if norm_sq == 0.0 {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_SPARSE_NORM_INVALID",
+                    format!("sparse content row {cx_id} has zero norm"),
+                    "measure at least one non-zero term for every sparse kernel concept",
+                ));
+            }
+            for entry in &entries {
+                postings
+                    .entry(entry.idx)
+                    .or_default()
+                    .push((ordinal, entry.val));
+            }
+            by_id.insert(cx_id, ordinal);
+            rows.push(SparseKernelRow {
+                cx_id,
+                entries,
+                norm: norm_sq.sqrt(),
+            });
+        }
+        Ok(Self {
+            rows,
+            by_id,
+            postings,
+        })
+    }
+
+    fn search(
+        &self,
+        query: CxId,
+        top_k: usize,
+        allowed: Option<&BTreeSet<CxId>>,
+    ) -> Result<Vec<(CxId, f32)>, SynapseCalyxError> {
+        let ordinal = self.by_id.get(&query).copied().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_QUERY_UNMEASURED",
+                format!("query record {query} is absent from the sparse kernel corpus"),
+                "supply a query record carrying the requested sparse content slot",
+            )
+        })?;
+        let query_row = &self.rows[ordinal];
+        let mut dots = BTreeMap::<usize, f32>::new();
+        for query_entry in &query_row.entries {
+            if let Some(postings) = self.postings.get(&query_entry.idx) {
+                for &(candidate, value) in postings {
+                    let candidate_id = self.rows[candidate].cx_id;
+                    if allowed.is_some_and(|set| !set.contains(&candidate_id)) {
+                        continue;
+                    }
+                    let score = dots.entry(candidate).or_default();
+                    *score += query_entry.val * value;
+                    if !score.is_finite() {
+                        return Err(SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_KERNEL_SPARSE_SCORE_INVALID",
+                            format!(
+                                "sparse cosine accumulator overflowed for query {query} and candidate {candidate_id}"
+                            ),
+                            "repair or remeasure non-finite or excessively weighted sparse vectors",
+                        ));
+                    }
+                }
+            }
+        }
+        let scored_ordinals = dots.keys().copied().collect::<BTreeSet<_>>();
+        let mut ranked = dots
+            .into_iter()
+            .map(|(candidate, dot)| {
+                let row = &self.rows[candidate];
+                (
+                    row.cx_id,
+                    (dot / (query_row.norm * row.norm)).clamp(-1.0, 1.0),
+                )
+            })
+            .collect::<Vec<_>>();
+        // An unseen row has exact cosine 0. Include enough of them to displace
+        // negative-overlap rows and to make top-k exact for rare terms, without
+        // materializing the vocabulary or every zero score.
+        for (candidate, row) in self.rows.iter().enumerate() {
+            if ranked.len() >= top_k
+                && ranked.iter().filter(|(_, score)| *score >= 0.0).count() >= top_k
+            {
+                break;
+            }
+            if scored_ordinals.contains(&candidate)
+                || allowed.is_some_and(|set| !set.contains(&row.cx_id))
+            {
+                continue;
+            }
+            ranked.push((row.cx_id, 0.0));
+        }
+        ranked.sort_by(|left, right| {
+            right
+                .1
+                .total_cmp(&left.1)
+                .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
+        });
+        ranked.truncate(top_k);
+        Ok(ranked)
+    }
 }
 
 impl SynapseCalyxVault {
@@ -5711,21 +5845,6 @@ impl SynapseCalyxVault {
         // The query embedding is the query record's own dense content-slot vector
         // (encoders only — there is no query embedder). A query record without an
         // embedding in this panel is a named refusal, never a guessed vector.
-        let query_vec = inputs
-            .rows
-            .iter()
-            .find(|row| row.cx_id == query_cx)
-            .map(|row| row.vector.clone())
-            .ok_or_else(|| {
-                SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_KERNEL_QUERY_UNEMBEDDED",
-                    format!(
-                        "query record {query_cx} has no embedding in panel {} slot {}; it is not a grounded concept in this domain",
-                        params.panel_version, params.content_slot
-                    ),
-                    "supply a query cx_id that exists in this panel and carries the content-slot embedding",
-                )
-            })?;
         let anchored_kernel_nodes: Vec<CxId> = inputs
             .kernel
             .members
@@ -5745,15 +5864,27 @@ impl SynapseCalyxVault {
         }
 
         let max_hops = max_hops.clamp(1, 64);
-        let derivation: AnswerDerivation = derive_kernel_answer(
-            &inputs.kernel_index,
-            &inputs.graph,
-            query_cx,
-            &query_vec,
-            &anchored_kernel_nodes,
-            max_hops,
-        )
-        .map_err(|error| kernel_refusal("derive grounded kernel answer", &error))?;
+        let derivation: AnswerDerivation = match (&inputs.rows, &inputs.kernel_index) {
+            (KernelContentRows::Dense(rows), Some(index)) => {
+                let query_vec = rows.iter().find(|row| row.cx_id == query_cx)
+                    .map(|row| row.vector.clone()).ok_or_else(|| SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_KERNEL_QUERY_UNMEASURED",
+                        format!("query record {query_cx} has no dense measurement in panel {} slot {}", params.panel_version, params.content_slot),
+                        "supply a query cx_id that exists in this panel and carries the requested content slot",
+                    ))?;
+                derive_kernel_answer(index, &inputs.graph, query_cx, &query_vec, &anchored_kernel_nodes, max_hops)
+            }
+            (KernelContentRows::Sparse(index), None) => {
+                let allowed = inputs.kernel.members.iter().copied().collect::<BTreeSet<_>>();
+                let ranked = index.search(query_cx, allowed.len(), Some(&allowed))?;
+                derive_kernel_answer_from_ranked_members(inputs.kernel.kernel_id, &inputs.graph, query_cx, &ranked, &anchored_kernel_nodes, max_hops)
+            }
+            _ => return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_INDEX_KIND_MISMATCH",
+                "kernel content rows and retrieval index kinds disagree",
+                "rebuild the kernel inputs from the vault; do not reuse a mismatched derived index",
+            )),
+        }.map_err(|error| kernel_refusal("derive grounded kernel answer", &error))?;
 
         let hops: Vec<SynapseCalyxKernelAnswerHop> = derivation
             .hops
@@ -5803,7 +5934,7 @@ impl SynapseCalyxVault {
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let content_slot = PanelSlotId::new(params.panel_version, SlotId::new(params.content_slot));
-        let mut rows: Vec<RecallQuery> = Vec::new();
+        let mut measured_rows: Vec<(CxId, SlotVector)> = Vec::new();
         let mut anchors: Vec<CxId> = Vec::new();
         let mut vault_corpus_size = 0usize;
         let mut rejects = ContentSlotRejects::default();
@@ -5833,14 +5964,29 @@ impl SynapseCalyxVault {
                 }
                 let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
                 let stored = constellation.slots.get(&content_slot.slot_id());
-                let Some(vector) = stored.and_then(dense_vector) else {
-                    // A record without the dense content-slot embedding is simply not
-                    // a grounded concept in this domain; it is excluded, never faked.
-                    // What kind it *was* is counted, so an empty corpus can say why
-                    // it is empty instead of only that it is (#1979).
-                    rejects.record(stored.map_or("absent", slot_vector_kind));
+                let Some(vector) = stored else {
+                    rejects.record("absent");
                     return Ok(crate::SynapseCalyxWalkStep::Continue);
                 };
+                match vector {
+                    SlotVector::Dense { data, .. } if data.iter().all(|value| *value == 0.0) => {
+                        rejects.record("empty");
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    SlotVector::Sparse { entries, .. } if entries.is_empty() => {
+                        rejects.record("empty");
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    SlotVector::Multi { .. } => {
+                        rejects.record("multi");
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    SlotVector::Absent { .. } => {
+                        rejects.record("absent");
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
+                }
                 // Domain scope: with `anchor_kind` set only that outcome axis
                 // anchors the kernel, so a per-domain sweep selects one kernel per
                 // domain instead of one blended kernel over every anchored concept.
@@ -5851,7 +5997,7 @@ impl SynapseCalyxVault {
                         })
                 });
                 let cx_id = constellation.cx_id;
-                rows.push(RecallQuery { cx_id, vector });
+                measured_rows.push((cx_id, vector.clone()));
                 if has_anchor {
                     anchors.push(cx_id);
                 }
@@ -5859,44 +6005,37 @@ impl SynapseCalyxVault {
                 // `vault_corpus_size` is truncated at exactly the same row it was
                 // before. It counts the population the loader *reached*, not the
                 // whole panel, and that has not changed.
-                if rows.len() >= max_records {
+                if measured_rows.len() >= max_records {
                     return Ok(crate::SynapseCalyxWalkStep::Stop);
                 }
                 Ok(crate::SynapseCalyxWalkStep::Continue)
             },
         )?;
-        // #1979 ask 1. The kernel is dense-only: `dense_vector` returns `None`
-        // for a `Sparse` or `Multi` slot, so naming the BM25 lexical lane (or
-        // any other sparse lane) as `content_slot` used to contribute exactly
-        // zero concepts and then surface as a recall failure or an empty
-        // kernel — a diagnosis pointing at the corpus for a fault that is in
-        // the request. Refusing here names the slot, the kind actually stored,
-        // and how many records carry it, so the answer is the request rather
-        // than the data. Checked before the "needs at least two" arm because a
-        // wrong-kind lane is a caller error at any corpus size, including one
-        // that happens to have two usable dense records from some other source.
+        // Multi vectors require MaxSim and are deliberately not interpreted as
+        // either dense or sparse cosine. Sparse vectors are native kernel
+        // content and stay sparse end-to-end (#1979).
         if rejects.wrong_kind() > 0 {
             return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_NOT_DENSE",
+                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_UNSUPPORTED",
                 format!(
-                    "panel {} slot {} stores a non-dense vector on {} of the {} record(s) that declare it ({}); a grounding kernel is built from cosine kNN over dense vectors and cannot consume a sparse or multi lane",
+                    "panel {} slot {} stores an unsupported vector on {} of {} measured or excluded record(s) ({}); dense cosine and sparse cosine are supported, but multi vectors require an explicit MaxSim kernel",
                     params.panel_version,
                     params.content_slot,
                     rejects.wrong_kind(),
-                    rejects.wrong_kind() + rejects.absent + rows.len(),
+                    rejects.wrong_kind() + rejects.absent + rejects.empty + measured_rows.len(),
                     rejects.describe()
                 ),
-                "name a dense encoder lens as the kernel content_slot; a sparse lexical lane (BM25) is queryable through find by_text but is not a kernel content slot, and densifying it is a deliberate design change, not a fallback",
+                "name a dense or sparse content slot; add an explicit MaxSim association path before using a multi-vector slot",
             ));
         }
-        if rows.len() < 2 {
+        if measured_rows.len() < 2 {
             return Err(SynapseCalyxError::new(
                 LodestarError::KernelEmptyResult.code(),
                 format!(
                     "panel {} slot {} has {} embedded concept(s) out of {} record(s) in the panel; a kernel needs at least two (excluded: {})",
                     params.panel_version,
                     params.content_slot,
-                    rows.len(),
+                    measured_rows.len(),
                     vault_corpus_size,
                     rejects.describe()
                 ),
@@ -5918,6 +6057,50 @@ impl SynapseCalyxVault {
                 "anchor at least one concept (a grounded outcome) in this domain before building a kernel",
             ));
         }
+
+        let dense_count = measured_rows
+            .iter()
+            .filter(|(_, vector)| matches!(vector, SlotVector::Dense { .. }))
+            .count();
+        let sparse_count = measured_rows.len() - dense_count;
+        if dense_count > 0 && sparse_count > 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_KIND_MIXED",
+                format!(
+                    "panel {} slot {} stores {dense_count} dense and {sparse_count} sparse vectors; one frozen slot must have one physical shape",
+                    params.panel_version, params.content_slot
+                ),
+                "repair or remeasure the slot so every record agrees with its frozen lens shape",
+            ));
+        }
+        let rows = if dense_count > 0 {
+            KernelContentRows::Dense(
+                measured_rows
+                    .into_iter()
+                    .map(|(cx_id, vector)| {
+                        let SlotVector::Dense { data, .. } = vector else {
+                            unreachable!("kind checked above")
+                        };
+                        RecallQuery {
+                            cx_id,
+                            vector: data,
+                        }
+                    })
+                    .collect(),
+            )
+        } else {
+            let mut dim = None;
+            let source = measured_rows.into_iter().map(|(cx_id, vector)| {
+                let SlotVector::Sparse { dim: row_dim, entries } = vector else { unreachable!("kind checked above") };
+                if let Some(expected) = dim { if expected != row_dim { return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_SPARSE_DIM_MISMATCH",
+                    format!("sparse content slot {} mixes dimensions {expected} and {row_dim}", params.content_slot),
+                    "repair or remeasure the slot so every row matches the frozen lens dimension",
+                )); }} else { dim = Some(row_dim); }
+                Ok((cx_id, entries))
+            }).collect::<Result<Vec<_>, _>>()?;
+            KernelContentRows::Sparse(SparseCosineIndex::new(source)?)
+        };
 
         let graph = self.build_kernel_assoc_graph(&rows, params)?;
         let corpus_fingerprint = corpus_fingerprint(&rows);
@@ -5941,22 +6124,54 @@ impl SynapseCalyxVault {
                 "inspect the association graph density (knn/edge_cos_threshold) and the anchored set",
             ));
         }
-        let embeddings: BTreeMap<CxId, Vec<f32>> = rows
-            .iter()
-            .map(|row| (row.cx_id, row.vector.clone()))
-            .collect();
-        let kernel_index = build_kernel_index(&kernel, &embeddings)
-            .map_err(|error| kernel_math_error("build kernel index", &error))?;
-        let full = InMemoryAnnIndex::new(rows.clone())
-            .map_err(|error| kernel_math_error("build full-corpus index", &error))?;
         let corpus_size = rows.len();
-        let corpus = InMemoryCorpus::new("synapse-domain-kernel", rows.clone());
         let recall_params = RecallEvalParams {
             min_recall_ratio: params.min_recall_ratio,
             ..RecallEvalParams::default()
         };
-        let recall = measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params)
-            .map_err(|error| kernel_math_error("measure kernel-only recall", &error))?;
+        let (kernel_index, recall) = match &rows {
+            KernelContentRows::Dense(dense) => {
+                let embeddings = dense
+                    .iter()
+                    .map(|row| (row.cx_id, row.vector.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                let kernel_index = build_kernel_index(&kernel, &embeddings)
+                    .map_err(|error| kernel_math_error("build dense kernel index", &error))?;
+                let full = InMemoryAnnIndex::new(dense.clone())
+                    .map_err(|error| kernel_math_error("build dense full-corpus index", &error))?;
+                let corpus = InMemoryCorpus::new("synapse-domain-kernel-dense", dense.clone());
+                let recall = measure_kernel_recall(&kernel_index, &full, &corpus, &recall_params)
+                    .map_err(|error| {
+                    kernel_math_error("measure dense kernel-only recall", &error)
+                })?;
+                (Some(kernel_index), recall)
+            }
+            KernelContentRows::Sparse(index) => {
+                let ids = rows.ids();
+                let members = kernel.members.iter().copied().collect::<BTreeSet<_>>();
+                let recall = measure_ranked_kernel_recall(
+                    "synapse-domain-kernel-sparse-cosine",
+                    &ids,
+                    &recall_params,
+                    |query, top_k| {
+                        index.search(query, top_k, None).map_err(|error| {
+                            LodestarError::KernelIndexBuild {
+                                detail: error.to_string(),
+                            }
+                        })
+                    },
+                    |query, top_k| {
+                        index.search(query, top_k, Some(&members)).map_err(|error| {
+                            LodestarError::KernelIndexBuild {
+                                detail: error.to_string(),
+                            }
+                        })
+                    },
+                )
+                .map_err(|error| kernel_math_error("measure sparse kernel-only recall", &error))?;
+                (None, recall)
+            }
+        };
 
         Ok(DomainKernelInputs {
             rows,
@@ -5977,16 +6192,38 @@ impl SynapseCalyxVault {
     /// `edge_cos_threshold` (GPU-preferred/CPU-fallback Forge kNN).
     fn build_kernel_assoc_graph(
         &self,
-        rows: &[RecallQuery],
+        rows: &KernelContentRows,
         params: &SynapseCalyxKernelParams,
     ) -> Result<AssocGraph, SynapseCalyxError> {
         let mut builder = AssocGraph::builder();
-        for row in rows {
+        for cx_id in rows.ids() {
             builder
-                .add_node(row.cx_id, 1.0)
+                .add_node(cx_id, 1.0)
                 .map_err(|error| paths_error("add kernel graph node", &error))?;
         }
         let knn = params.knn.clamp(1, 64);
+        if let KernelContentRows::Sparse(index) = rows {
+            for row in &index.rows {
+                for (candidate, score) in index
+                    .search(row.cx_id, knn + 1, None)?
+                    .into_iter()
+                    .filter(|(candidate, _)| *candidate != row.cx_id)
+                    .take(knn)
+                {
+                    let score = kernel_graph_cosine(score)?;
+                    if score < params.edge_cos_threshold {
+                        continue;
+                    }
+                    builder
+                        .add_edge(row.cx_id, candidate, score)
+                        .map_err(|error| paths_error("add sparse kernel graph edge", &error))?;
+                }
+            }
+            return Ok(builder.build());
+        }
+        let KernelContentRows::Dense(rows) = rows else {
+            unreachable!()
+        };
         // Only equal-dimension vectors can be compared by cosine; group by dim.
         let mut by_dim: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (index, row) in rows.iter().enumerate() {
@@ -6015,6 +6252,7 @@ impl SynapseCalyxVault {
                         continue;
                     }
                     let score = batch.scores[base + slot];
+                    let score = kernel_graph_cosine(score)?;
                     if score < params.edge_cos_threshold {
                         continue;
                     }
@@ -6033,9 +6271,22 @@ impl SynapseCalyxVault {
     }
 }
 
+fn kernel_graph_cosine(score: f32) -> Result<f32, SynapseCalyxError> {
+    if !score.is_finite() {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_KERNEL_COSINE_NON_FINITE",
+            format!("kernel association cosine is non-finite: {score}"),
+            "repair or remeasure the content slot; non-finite similarity cannot enter the association graph",
+        ));
+    }
+    // Cosine is mathematically within [-1, 1], but f32 accumulation may
+    // overshoot by an ulp. Graph agreement weights are defined in [0, 1].
+    Ok(score.clamp(0.0, 1.0))
+}
+
 /// Content fingerprint of the embedded corpus: sha256 over the sorted `cx_id`
 /// bytes, hex-encoded — proves which concepts the kernel was selected against.
-fn corpus_fingerprint(rows: &[RecallQuery]) -> String {
+fn corpus_fingerprint(rows: &KernelContentRows) -> String {
     let bytes = corpus_hash_bytes(rows);
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -6045,8 +6296,12 @@ fn corpus_fingerprint(rows: &[RecallQuery]) -> String {
     hex
 }
 
-fn corpus_hash_bytes(rows: &[RecallQuery]) -> [u8; 32] {
-    let mut ids: Vec<[u8; 16]> = rows.iter().map(|row| row.cx_id.to_bytes()).collect();
+fn corpus_hash_bytes(rows: &KernelContentRows) -> [u8; 32] {
+    let mut ids: Vec<[u8; 16]> = rows
+        .ids()
+        .into_iter()
+        .map(|cx_id| cx_id.to_bytes())
+        .collect();
     ids.sort_unstable();
     let mut hasher = Sha256::new();
     for id in ids {

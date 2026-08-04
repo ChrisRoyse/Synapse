@@ -110,8 +110,8 @@ pub use kernel::{
 };
 pub use kernel_answer::{
     AnswerDerivation, AnswerDerivationHop, AnswerHop, AnswerPath, AsterKernelAnswerRequest,
-    derive_kernel_answer, kernel_answer, kernel_answer_derivation_hash,
-    kernel_answer_with_aster_ledger, kernel_answer_with_ledger,
+    derive_kernel_answer, derive_kernel_answer_from_ranked_members, kernel_answer,
+    kernel_answer_derivation_hash, kernel_answer_with_aster_ledger, kernel_answer_with_ledger,
 };
 pub use kernel_graph::{
     KernelGraph, KernelGraphParams, KernelNodeScore, LpRoundParams, NodeScore,
@@ -167,7 +167,7 @@ pub use recall_eval::{
     AnnIndex, CALYX_KERNEL_RECALL_BELOW_GATE, CorpusReader, InMemoryAnnIndex, InMemoryCorpus,
     RecallEvalParams, RecallEvaluationReport, RecallQuery, RecallSupportReport,
     enforce_recall_gate, full_topk_support_set, kernel_recall_gate, kernel_recall_gate_with_clock,
-    measure_kernel_recall, measure_kernel_recall_with_clock,
+    measure_kernel_recall, measure_kernel_recall_with_clock, measure_ranked_kernel_recall,
 };
 pub use refusal_expansion::{
     REFUSAL_EXPANSION_SCHEMA_VERSION, RefusalExpansionAction, RefusalExpansionActionKind,

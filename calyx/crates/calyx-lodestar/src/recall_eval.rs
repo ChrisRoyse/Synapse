@@ -154,6 +154,65 @@ pub fn measure_kernel_recall(
     measure_kernel_recall_with_clock(kernel_index, full_index, corpus, params, &SystemClock)
 }
 
+/// Measure kernel-only recall when the corpus similarity is not a dense vector
+/// ANN (for example, exact sparse cosine over an inverted index).
+///
+/// The caller supplies the physical corpus ids and two search functions. Both
+/// functions must rank the same association law; comparing different scoring
+/// laws would make the recall ratio meaningless.
+pub fn measure_ranked_kernel_recall<F, K>(
+    corpus_name: &str,
+    corpus_ids: &[CxId],
+    params: &RecallEvalParams,
+    mut full_search: F,
+    mut kernel_search: K,
+) -> Result<RecallEvaluationReport>
+where
+    F: FnMut(CxId, usize) -> Result<Vec<(CxId, f32)>>,
+    K: FnMut(CxId, usize) -> Result<Vec<(CxId, f32)>>,
+{
+    validate_params(params)?;
+    if corpus_ids.is_empty() {
+        return Err(LodestarError::RecallEmptyCorpus);
+    }
+    let seed = if params.rng_seed == 0 {
+        SystemClock.now()
+    } else {
+        params.rng_seed
+    };
+    let selected = held_out_id_ordinals(corpus_ids, params.held_out_fraction, seed);
+    if selected.is_empty() {
+        return Err(LodestarError::RecallEmptyCorpus);
+    }
+
+    let mut held_out = Vec::with_capacity(selected.len());
+    let mut total_recall = 0.0_f32;
+    for ordinal in selected {
+        let query = corpus_ids[ordinal];
+        let full_hits = full_search(query, params.top_k)?;
+        if full_hits.is_empty() {
+            return Err(LodestarError::RecallEmptyCorpus);
+        }
+        let kernel_hits = kernel_search(query, params.top_k)?;
+        total_recall += recall_at_k(&kernel_hits, &full_hits);
+        held_out.push(query);
+    }
+    let kernel_only = total_recall / held_out.len() as f32;
+    Ok(RecallEvaluationReport {
+        kernel_only,
+        full: 1.0,
+        ratio: kernel_only,
+        approx_factor: 1.0,
+        tau_star_estimate: 0,
+        tau_star_exact: true,
+        recall_eval_params: Some(params.clone()),
+        corpus_name: Some(corpus_name.to_string()),
+        n_queries_tested: held_out.len(),
+        held_out,
+        warning: recall_warning(kernel_only, params.min_recall_ratio),
+    })
+}
+
 pub fn kernel_recall_gate(
     kernel_index: &KernelIndex,
     full_index: &dyn AnnIndex,
@@ -326,6 +385,23 @@ fn held_out_ordinals(
         .collect();
     selected.sort_unstable();
     Ok(selected)
+}
+
+fn held_out_id_ordinals(ids: &[CxId], held_out_fraction: f32, seed: u64) -> Vec<usize> {
+    let target = ((ids.len() as f32) * held_out_fraction).ceil() as usize;
+    let mut keyed = ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, cx_id)| (sample_key(seed, ordinal, *cx_id), ordinal))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut selected = keyed
+        .into_iter()
+        .take(target.min(ids.len()))
+        .map(|(_, ordinal)| ordinal)
+        .collect::<Vec<_>>();
+    selected.sort_unstable();
+    selected
 }
 
 fn sample_key(seed: u64, ordinal: usize, cx_id: CxId) -> [u8; 32] {

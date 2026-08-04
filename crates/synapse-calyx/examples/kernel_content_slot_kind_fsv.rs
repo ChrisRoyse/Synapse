@@ -1,9 +1,8 @@
-//! FSV for #1979: naming a non-dense lane as the grounding kernel's
-//! `content_slot` must fail closed naming the slot and the kind it found, not
-//! silently contribute zero concepts.
+//! FSV for #1979: dense and sparse content slots both build native association
+//! graphs and measured-recall inputs; absent and MaxSim inputs fail closed.
 //!
 //! ```powershell
-//! cargo run --release -p synapse-calyx --example kernel_content_slot_kind_fsv -- <restore-copy> [panel_version]
+//! cargo run --release -p synapse-calyx --example kernel_content_slot_kind_fsv -- <restore-copy> [panel_version] [sparse_slot] [dense_slot]
 //! ```
 //!
 //! Run against a copy of the live vault (`vault-copy-fsv-recipe`) so the arms
@@ -14,14 +13,12 @@
 //!
 //! | arm | content_slot | expected |
 //! |---|---|---|
-//! | sparse lane | the BM25 lexical lane (#1898) | `SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_NOT_DENSE`, naming counts |
-//! | absent lane | a slot id no record carries | *not* the not-dense code — nothing is the wrong kind, there is simply nothing |
-//! | dense lane | a real dense encoder lens | anything but a kind refusal; a recall/anchor refusal is a legitimate outcome |
+//! | sparse lane | the BM25 lexical lane (#1898) | reaches graph and recall math |
+//! | absent lane | a slot id no record carries | structured empty-corpus refusal |
+//! | dense lane | a real dense encoder lens | reaches graph and recall math |
 //!
 //! The middle arm is the one that makes this a test rather than an assertion:
-//! before the fix all three produced the same shrug, and a refusal that fires on
-//! *every* empty corpus would be no more informative than the silence it
-//! replaces.
+//! before the fix sparse and absent both produced an empty/refusal result.
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -34,7 +31,7 @@ use synapse_calyx::{
     SynapseCalyxKernelParams, SynapseCalyxVault, SynapseCalyxWalkStep,
 };
 
-const NOT_DENSE: &str = "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_NOT_DENSE";
+const UNSUPPORTED: &str = "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_UNSUPPORTED";
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
@@ -47,6 +44,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         .and_then(|value| value.parse().ok())
         .or_else(|| vault.active_panel_version().ok().flatten())
         .ok_or("no active panel version and none given")?;
+    let sparse_slot = args
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(107);
+    let dense_slot = args
+        .next()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(110);
     println!(
         "panel_version = {panel_version}, seq = {}",
         vault.latest_seq()
@@ -77,10 +82,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("every slot id is in use")?;
 
     let mut failures = 0;
-    for (label, slot, expect_not_dense) in [
-        ("sparse lexical lane", lexical_slot(&declared)?, true),
+    for (label, slot, expect_usable) in [
+        ("sparse lexical lane", sparse_slot, true),
         ("absent lane", unused_slot, false),
-        ("dense encoder lane", dense_slot(&declared)?, false),
+        ("dense encoder lane", dense_slot, true),
     ] {
         let params = SynapseCalyxKernelParams::new(panel_version, slot);
         let outcome = vault.build_domain_kernel_inputs(&params);
@@ -94,49 +99,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             ),
             Err(error) => (error.code.to_string(), error.message.clone()),
         };
-        let hit = code == NOT_DENSE;
-        let verdict = if hit == expect_not_dense {
+        let usable =
+            outcome.is_ok() || (code != UNSUPPORTED && code != "CALYX_KERNEL_EMPTY_RESULT");
+        let verdict = if usable == expect_usable {
             "OK "
         } else {
             "FAIL"
         };
-        if hit != expect_not_dense {
+        if usable != expect_usable {
             failures += 1;
         }
         println!(
             "\n[{verdict}] {label}: slot {slot} ({} records declare it)",
             declared.get(&slot).copied().unwrap_or(0)
         );
-        println!("       expected not-dense refusal: {expect_not_dense}, got code {code}");
+        println!("       expected measured content: {expect_usable}, got code {code}");
         println!("       {message}");
     }
 
     assert_eq!(failures, 0, "{failures} arm(s) produced the wrong verdict");
-    println!("\nPASS: the kind refusal fires on the sparse lane and on nothing else");
+    println!("\nPASS: sparse and dense lanes reach native kernel math; absence does not");
     Ok(())
-}
-
-/// The most-carried slot below 100 that is not the timeline text lane, used as
-/// the dense arm. Panel slot layout differs per panel, so it is derived.
-fn dense_slot(declared: &BTreeMap<u16, usize>) -> Result<u16, Box<dyn Error>> {
-    declared
-        .iter()
-        .filter(|(slot, _)| **slot < 100)
-        .max_by_key(|(_, count)| **count)
-        .map(|(slot, _)| *slot)
-        .ok_or_else(|| "the panel carries no slot below 100".into())
-}
-
-/// Slot 103 is the BM25 lexical lane (#1898); fall back to the most-carried
-/// slot at or above 100 if this panel numbers it differently.
-fn lexical_slot(declared: &BTreeMap<u16, usize>) -> Result<u16, Box<dyn Error>> {
-    if declared.contains_key(&103) {
-        return Ok(103);
-    }
-    declared
-        .iter()
-        .filter(|(slot, _)| **slot >= 100)
-        .max_by_key(|(_, count)| **count)
-        .map(|(slot, _)| *slot)
-        .ok_or_else(|| "the panel carries no slot at or above 100".into())
 }

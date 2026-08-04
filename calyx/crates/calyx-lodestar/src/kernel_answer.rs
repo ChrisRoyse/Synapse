@@ -125,11 +125,33 @@ pub fn derive_kernel_answer(
     anchored_kernel_nodes: &[CxId],
     max_hops: usize,
 ) -> Result<AnswerDerivation> {
-    let (anchor, path) = nearest_answerable_anchored_path(
-        kernel_index,
+    let ranked = kernel_search(kernel_index, query_vec, kernel_index.rows().len())?;
+    derive_kernel_answer_from_ranked_members(
+        kernel_index.kernel_id,
         graph,
         query_cx,
-        query_vec,
+        &ranked,
+        anchored_kernel_nodes,
+        max_hops,
+    )
+}
+
+/// Derive a grounded answer from kernel members ranked by the content slot's
+/// native similarity law. This is the modality-neutral half of
+/// [`derive_kernel_answer`]; sparse callers can rank with exact sparse cosine
+/// without fabricating a dense vector.
+pub fn derive_kernel_answer_from_ranked_members(
+    kernel_id: CxId,
+    graph: &AssocGraph,
+    query_cx: CxId,
+    ranked_kernel_members: &[(CxId, f32)],
+    anchored_kernel_nodes: &[CxId],
+    max_hops: usize,
+) -> Result<AnswerDerivation> {
+    let (anchor, path) = nearest_answerable_anchored_path_from_ranked(
+        graph,
+        query_cx,
+        ranked_kernel_members,
         anchored_kernel_nodes,
         max_hops,
     )?;
@@ -143,7 +165,7 @@ pub fn derive_kernel_answer(
     Ok(AnswerDerivation {
         query_cx,
         anchor_kernel_node: anchor,
-        kernel_id: kernel_index.kernel_id,
+        kernel_id,
         hops,
         total_score,
     })
@@ -339,23 +361,21 @@ pub fn kernel_answer_with_aster_ledger<C: Clock>(
     Ok(answer)
 }
 
-fn nearest_answerable_anchored_path(
-    index: &KernelIndex,
+fn nearest_answerable_anchored_path_from_ranked(
     graph: &AssocGraph,
     query_cx: CxId,
-    query_vec: &[f32],
+    candidates: &[(CxId, f32)],
     anchored_nodes: &[CxId],
     max_hops: usize,
 ) -> Result<(CxId, Vec<CxId>)> {
     if anchored_nodes.is_empty() {
         return Err(LodestarError::KernelNoAnchoredNode);
     }
-    let candidates = kernel_search(index, query_vec, index.rows().len())?;
     let mut saw_anchored_candidate = false;
     let mut first_path_error = None;
     for anchor in candidates
-        .into_iter()
-        .map(|(cx_id, _)| cx_id)
+        .iter()
+        .map(|(cx_id, _)| *cx_id)
         .filter(|cx_id| anchored_nodes.contains(cx_id))
     {
         saw_anchored_candidate = true;
