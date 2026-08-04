@@ -37,7 +37,8 @@ use std::sync::{
 
 use synapse_calyx::{
     SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_DELTA_KEYS,
-    SynapseCalyxLensCoverageStatus, SynapseCalyxSearchGenerationStatus, hot_context,
+    SynapseCalyxLensCoverageStatus, SynapseCalyxPersistedDriftFinding,
+    SynapseCalyxSearchGenerationStatus, hot_context,
 };
 
 use crate::Db;
@@ -117,6 +118,20 @@ static LAST_KERNEL_REBUILD_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 /// be the reason a closed vault's handle stays alive.
 static DERIVED_STATE_SOURCE: LazyLock<Mutex<Option<Weak<Db>>>> = LazyLock::new(|| Mutex::new(None));
 
+type ReactiveDeliverySink = dyn Fn(&SynapseCalyxPersistedDriftFinding) -> Result<ReactiveDeliveryReadback, String>
+    + Send
+    + Sync;
+
+static REACTIVE_DELIVERY_SINK: LazyLock<Mutex<Option<Arc<ReactiveDeliverySink>>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ReactiveDeliveryReadback {
+    pub matched: u64,
+    pub queued: u64,
+    pub dropped: u64,
+}
+
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
     LazyLock::new(|| Mutex::new(DerivedStateReadback::default()));
 
@@ -178,6 +193,11 @@ pub struct DerivedStateReadback {
     pub last_weave_records: BTreeMap<u32, u64>,
     pub last_weave_xterm_rows: BTreeMap<u32, usize>,
     pub last_weave_graph_rows: BTreeMap<u32, usize>,
+    /// Scheduled post-ingest Reactive drift production and delivery (#1680).
+    pub last_reactive_drift_rows: BTreeMap<u32, usize>,
+    pub last_reactive_notifications_matched: BTreeMap<u32, u64>,
+    pub last_reactive_notifications_queued: BTreeMap<u32, u64>,
+    pub last_reactive_notifications_dropped: BTreeMap<u32, u64>,
     /// Last scheduled per-panel kernel outcome, including the physical Kernel
     /// CF row count returned after persistence.
     pub last_kernel_actions: BTreeMap<u32, String>,
@@ -235,6 +255,22 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
     );
 }
 
+/// Registers the daemon-owned delivery boundary for exact persisted Reactive
+/// findings. Re-registration replaces the prior process-local sink.
+pub fn register_reactive_delivery_sink<F>(sink: F)
+where
+    F: Fn(&SynapseCalyxPersistedDriftFinding) -> Result<ReactiveDeliveryReadback, String>
+        + Send
+        + Sync
+        + 'static,
+{
+    let sink: Arc<ReactiveDeliverySink> = Arc::new(sink);
+    match REACTIVE_DELIVERY_SINK.lock() {
+        Ok(mut guard) => *guard = Some(sink),
+        Err(poisoned) => *poisoned.into_inner() = Some(sink),
+    }
+}
+
 /// Current derived-state counters and last outcome.
 #[must_use]
 pub fn derived_state_readback() -> DerivedStateReadback {
@@ -249,6 +285,16 @@ pub fn derived_state_readback() -> DerivedStateReadback {
     readback.refresh_delta_keys_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS;
     readback.min_rebuild_interval_ms = SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS;
     readback
+}
+
+/// Runs the same bounded pass owned by the periodic derived-state task and
+/// returns the process-published readback after it completes.
+///
+/// This is the operator/FSV seam for proving a scheduled pass without changing
+/// its production interval or constructing a second implementation.
+pub fn run_derived_state_maintenance_once() -> DerivedStateReadback {
+    run_derived_state_maintenance();
+    derived_state_readback()
 }
 
 fn now_unix_ms() -> Option<u64> {
@@ -572,12 +618,21 @@ pub(crate) fn run_derived_state_maintenance() {
         crate::constellations::SYN_EPISODE_PANEL_VERSION,
         crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
     ] {
-        if let Err(error) = drive_incremental_weave(&db, panel_version) {
-            any_failed = true;
-            record_failure(
-                "STORAGE_DERIVED_STATE_WEAVE_FAILED",
-                format!("incrementally weave panel {panel_version}: {error}"),
-            );
+        match drive_incremental_weave(&db, panel_version) {
+            Ok(0) => {}
+            Ok(_) => {
+                if let Err(error) = drive_post_ingest_drift(&db, panel_version) {
+                    any_failed = true;
+                    record_failure("STORAGE_DERIVED_STATE_REACTIVE_DRIFT_FAILED", error);
+                }
+            }
+            Err(error) => {
+                any_failed = true;
+                record_failure(
+                    "STORAGE_DERIVED_STATE_WEAVE_FAILED",
+                    format!("incrementally weave panel {panel_version}: {error}"),
+                );
+            }
         }
     }
 
@@ -688,7 +743,7 @@ fn calyx_time_boundary_ns_now() -> Result<i64, String> {
 
 /// Weaves every record in one panel's new ingest interval without permitting a
 /// record cap to become data loss.
-fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
+fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, String> {
     // Constellation `created_at` is millisecond-granular. Both ends must be
     // aligned to that same grid: a fractional watermark would exclude records
     // created later in the same millisecond but carrying the same stored stamp.
@@ -706,7 +761,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<(), Strin
         })?
     };
     if until_ns == since_ns {
-        return Ok(());
+        return Ok(0);
     }
     if until_ns < since_ns {
         return Err(format!(
@@ -810,6 +865,67 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<(), Strin
         graph_cf_rows = last_graph_rows,
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "readback=physical XTerm/Graph CF counts after every new record in the bounded ingest interval was woven"
+    );
+    Ok(records_woven)
+}
+
+fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
+    let mut params = synapse_calyx::SynapseCalyxPanelDriftParams::new(panel_version);
+    params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
+    let report = db
+        .panel_drift_intelligence(&params)
+        .map_err(|error| format!("measure panel {panel_version} post-ingest drift: {error}"))?;
+    let mut delivery = ReactiveDeliveryReadback::default();
+    if !report.persisted_findings.is_empty() {
+        let sink = match REACTIVE_DELIVERY_SINK.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+        .ok_or_else(|| {
+            format!(
+                "panel {panel_version} persisted {} Reactive drift row(s), but no daemon delivery sink is registered; remediation=repair derived-state startup registration and replay the durable Reactive rows",
+                report.drift_rows_persisted
+            )
+        })?;
+        for finding in &report.persisted_findings {
+            let readback = sink(finding)?;
+            delivery.matched = delivery.matched.saturating_add(readback.matched);
+            delivery.queued = delivery.queued.saturating_add(readback.queued);
+            delivery.dropped = delivery.dropped.saturating_add(readback.dropped);
+        }
+    }
+    if delivery.dropped > 0 {
+        return Err(format!(
+            "panel {panel_version} dropped {} subscription delivery item(s) after persisting {} Reactive drift row(s); remediation=consume or recreate the saturated subscription and replay the durable Reactive rows",
+            delivery.dropped, report.drift_rows_persisted
+        ));
+    }
+    let mut readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    readback
+        .last_reactive_drift_rows
+        .insert(panel_version, report.drift_rows_persisted);
+    readback
+        .last_reactive_notifications_matched
+        .insert(panel_version, delivery.matched);
+    readback
+        .last_reactive_notifications_queued
+        .insert(panel_version, delivery.queued);
+    readback
+        .last_reactive_notifications_dropped
+        .insert(panel_version, delivery.dropped);
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_REACTIVE_DRIFT_PASS",
+        panel_version,
+        records_scanned = report.records_scanned,
+        drifted_lenses = report.drifted_lenses,
+        drift_rows_persisted = report.drift_rows_persisted,
+        notifications_matched = delivery.matched,
+        notifications_queued = delivery.queued,
+        notifications_dropped = delivery.dropped,
+        "scheduled post-ingest drift findings were persisted, read back, and delivered"
     );
     Ok(())
 }

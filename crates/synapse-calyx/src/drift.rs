@@ -37,7 +37,7 @@
 //! Everything fails closed with structured `SynapseCalyxError` values and never
 //! invents a fallback.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
     DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
@@ -805,20 +805,20 @@ impl SynapseCalyxVault {
         })
     }
 
-    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel in
-    /// scan order (oldest first), for the drift/blind-spot analyses.
+    /// Scans the `Base` CF once and returns the newest bounded dense-slot corpus
+    /// in persisted creation order, for the drift/blind-spot analyses.
     fn load_drift_corpus(
         &self,
         panel_version: u32,
         max_records: usize,
     ) -> Result<DriftCorpus, SynapseCalyxError> {
         let snapshot = self.read_snapshot();
-        let mut records = Vec::new();
+        let mut selected = BTreeSet::new();
         let mut records_scanned = 0usize;
-        // #1968: paged rather than materialized. The corpus this builds is
-        // bounded by `max_records`, but the old form built a
-        // whole-`Base` `Vec` first — under the row-guard the constellation
-        // writers need — purely to walk it once.
+        // Base keys are content hashes, not chronology (#2003). Retain the
+        // newest bounded set by the server-stamped creation time and use cx_id
+        // as the deterministic tie-breaker. Slot hydration happens only after
+        // selection, so a large panel costs O(max_records) memory and reads.
         let walk = self.walk_cf_latest(
             ColumnFamily::Base,
             crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
@@ -830,28 +830,35 @@ impl SynapseCalyxVault {
                     return Ok(crate::SynapseCalyxWalkStep::Continue);
                 }
                 records_scanned += 1;
-                if records.len() >= max_records {
-                    // Deliberately not `Stop`: `records_scanned` is the
-                    // whole-panel denominator the drift report divides by, so
-                    // the walk must still reach the end of the CF.
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                selected.insert((base.created_at, base.cx_id));
+                if selected.len() > max_records {
+                    let oldest = selected.first().copied().ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_SELECTION_EMPTY",
+                            "bounded chronological drift selection lost its oldest candidate",
+                            "preserve the vault and inspect the Base CF selection invariant",
+                        )
+                    })?;
+                    selected.remove(&oldest);
                 }
-                // Slot vectors live in the per-slot CFs; a Base row decodes to
-                // `Absent` for every slot, so reading them from it produced an
-                // empty drift corpus that measured nothing (issue #1894).
-                let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
-                let slots = constellation
-                    .slots
-                    .iter()
-                    .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
-                    .collect();
-                records.push(DriftRecord {
-                    cx_id: constellation.cx_id,
-                    slots,
-                });
                 Ok(crate::SynapseCalyxWalkStep::Continue)
             },
         )?;
+        let mut records = Vec::with_capacity(selected.len());
+        for (_, cx_id) in selected {
+            // Slot vectors live in the per-slot CFs; Base carries their typed
+            // absence only (#1894), so hydrate exactly the selected records.
+            let constellation = self.hydrated_constellation(cx_id, snapshot)?;
+            let slots = constellation
+                .slots
+                .iter()
+                .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
+                .collect();
+            records.push(DriftRecord {
+                cx_id: constellation.cx_id,
+                slots,
+            });
+        }
         Ok(DriftCorpus {
             records,
             records_scanned,

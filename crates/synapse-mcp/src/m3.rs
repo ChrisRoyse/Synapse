@@ -852,6 +852,37 @@ impl M3State {
         // first tick is what keeps the search generation and the lens-coverage
         // readback from being skipped for want of a source.
         synapse_storage::derived_state::register_derived_state_source(&db);
+        let event_bus = self.sse_state.event_bus();
+        synapse_storage::derived_state::register_reactive_delivery_sink(move |finding| {
+            let event_seq = finding
+                .observed_seq
+                .checked_mul(u64::from(u16::MAX) + 1)
+                .and_then(|base| base.checked_add(u64::from(finding.slot)))
+                .ok_or_else(|| {
+                    format!(
+                        "reactive drift event sequence overflow for observed_seq={} slot={}; remediation=preserve the Reactive CF row and inspect vault sequence exhaustion",
+                        finding.observed_seq, finding.slot
+                    )
+                })?;
+            let data = serde_json::to_value(finding).map_err(|error| {
+                format!(
+                    "serialize committed Reactive CF drift finding for scheduled delivery: {error}; remediation=inspect the typed finding schema and preserve the Reactive CF row"
+                )
+            })?;
+            let report = event_bus.publish(synapse_core::types::Event {
+                seq: event_seq,
+                at: chrono::Utc::now(),
+                source: synapse_core::types::EventSource::System,
+                kind: "calyx.reactive.drift".to_owned(),
+                data,
+                correlations: Vec::new(),
+            });
+            Ok(synapse_storage::derived_state::ReactiveDeliveryReadback {
+                matched: report.matched as u64,
+                queued: report.queued as u64,
+                dropped: report.dropped,
+            })
+        });
         self.storage_maintenance_unsupported = None;
         if self.storage_pressure_task.is_none() {
             let pressure_result = if let Some(free_bytes) = self.storage_pressure_free_bytes_sample

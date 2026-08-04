@@ -2669,7 +2669,7 @@ pub fn build_timeline_constellation(
     );
     slots.insert(
         TL_SLOT_TITLE_SPARSE,
-        measure_text(
+        measure_text_or_absent(
             SYN_TIMELINE_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text(
                 "syn.timeline.title_sparse.v1",
@@ -2724,7 +2724,7 @@ pub fn build_timeline_constellation(
 
     slots.insert(
         TL_SLOT_TITLE_BM25,
-        measure_text(
+        measure_text_or_absent(
             SYN_TIMELINE_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text_tf(
                 "syn.timeline.title_bm25.v1",
@@ -2809,7 +2809,7 @@ pub fn build_episode_constellation(
     );
     slots.insert(
         EP_SLOT_TITLE_SPARSE,
-        measure_text(
+        measure_text_or_absent(
             SYN_EPISODE_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text(
                 "syn.episode.title_sparse.v1",
@@ -2821,7 +2821,7 @@ pub fn build_episode_constellation(
     );
     slots.insert(
         EP_SLOT_TITLE_BM25,
-        measure_text(
+        measure_text_or_absent(
             SYN_EPISODE_PANEL_NAME,
             AlgorithmicLens::syn_sparse_text_tf(
                 "syn.episode.title_bm25.v1",
@@ -6605,6 +6605,9 @@ fn measure_text_or_absent(
     lens: AlgorithmicLens,
     text: &str,
 ) -> StorageResult<SlotVector> {
+    if non_empty(text).is_none() {
+        return Ok(absent(AbsentReason::NotApplicable));
+    }
     let input = Input::new(Modality::Structured, text.as_bytes());
     match lens.measure(&input) {
         Ok(vector) => Ok(vector),
