@@ -934,9 +934,12 @@ pub(super) async fn handle(
                 )
             })?
             .map_err(|error| {
-                crate::m1::mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                crate::m1::mcp_error_with_remediation(
+                    error.code(),
                     format!("Anneal search proposal failed: {error}"),
+                    error.remediation().unwrap_or(
+                        "inspect the structured storage failure and repair the native Anneal state",
+                    ),
                 )
             })?;
             let (outcome, change_id) = match report.change.outcome {
@@ -1034,10 +1037,13 @@ pub(super) async fn handle(
                         )
                     })?
                     .map_err(|error| {
-                        crate::m1::mcp_error(
-                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                            format!("Anneal rollback failed: {error}"),
-                        )
+                        crate::m1::mcp_error_with_remediation(
+                    error.code(),
+                    format!("Anneal rollback failed: {error}"),
+                    error.remediation().unwrap_or(
+                        "inspect the structured storage failure and repair the native Anneal state",
+                    ),
+                )
                     })?;
             let response = super::types::HygieneAnnealRollbackResponse {
                 change_id: report.change_id,

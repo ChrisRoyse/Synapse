@@ -418,6 +418,7 @@ pub(crate) fn run_derived_state_maintenance() {
     };
 
     let mut any_failed = false;
+    let mut current_panel_coverage = None;
 
     // --- Durable hot-added lens backfill (#1668) ---
     // Run before search maintenance so a generation rebuilt on this same tick
@@ -649,6 +650,7 @@ pub(crate) fn run_derived_state_maintenance() {
             // last_success_unix_ms, so an operator reading the counters would see
             // a healthy cadence over a backfill that has been failing every tick.
             any_failed |= drive_panel_backfill(&db, &report);
+            current_panel_coverage = Some(report.clone());
             let mut guard = match DERIVED_STATE_LAST.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -703,7 +705,7 @@ pub(crate) fn run_derived_state_maintenance() {
         record_failure("STORAGE_DERIVED_STATE_WARD_NOVELTY_FAILED", error);
     }
 
-    if let Err(error) = drive_scheduled_kernels(&db) {
+    if let Err(error) = drive_scheduled_kernels(&db, current_panel_coverage.as_ref()) {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_KERNEL_REBUILD_FAILED", error);
     }
@@ -721,7 +723,14 @@ pub(crate) fn run_derived_state_maintenance() {
     }
 }
 
-fn drive_scheduled_kernels(db: &Arc<Db>) -> Result<(), String> {
+fn drive_scheduled_kernels(
+    db: &Arc<Db>,
+    coverage: Option<&crate::panel_coverage::PanelCoverageReport>,
+) -> Result<(), String> {
+    let coverage = coverage.ok_or_else(|| {
+        "current panel coverage census is unavailable; kernel eligibility cannot be inferred from stale state"
+            .to_owned()
+    })?;
     let now = now_unix_ms().ok_or_else(|| "system clock precedes Unix epoch".to_owned())?;
     let last = LAST_KERNEL_REBUILD_UNIX_MS.load(Ordering::Acquire);
     let interval_ms = u64::try_from(KERNEL_REBUILD_INTERVAL.as_millis())
@@ -734,7 +743,43 @@ fn drive_scheduled_kernels(db: &Arc<Db>) -> Result<(), String> {
     LAST_KERNEL_REBUILD_UNIX_MS.store(now, Ordering::Release);
 
     let mut failures = Vec::new();
+    let mut eligible_targets = 0usize;
     for &(panel_version, content_slot) in crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS {
+        let panel = coverage
+            .panels
+            .iter()
+            .find(|panel| panel.panel_version == panel_version)
+            .ok_or_else(|| {
+                format!(
+                    "panel={panel_version} slot={content_slot}: current coverage census has no declared panel row"
+                )
+            })?;
+        let ineligible_reason = if !panel.outcome_bearing {
+            Some("ineligible_observation_panel")
+        } else if panel.active_version_records == 0 {
+            Some("ineligible_empty_panel")
+        } else if panel.grounded_records == 0 || panel.anchor_kind_records.is_empty() {
+            Some("ineligible_no_grounded_domain")
+        } else {
+            None
+        };
+        if let Some(reason) = ineligible_reason {
+            let mut readback = match DERIVED_STATE_LAST.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            readback.last_kernel_actions.insert(
+                panel_version,
+                format!(
+                    "{reason} active_records={} grounded_records={} anchor_kinds={}",
+                    panel.active_version_records,
+                    panel.grounded_records,
+                    panel.anchor_kind_records.len()
+                ),
+            );
+            continue;
+        }
+        eligible_targets += 1;
         let mut params =
             synapse_calyx::SynapseCalyxKernelRebuildParams::new(panel_version, content_slot);
         params.max_records = KERNEL_REBUILD_MAX_RECORDS;
@@ -791,8 +836,9 @@ fn drive_scheduled_kernels(db: &Arc<Db>) -> Result<(), String> {
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_KERNEL_REBUILD_PASS",
         targets = crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS.len(),
+        eligible_targets,
         max_records = KERNEL_REBUILD_MAX_RECORDS,
-        "scheduled grounding kernels persisted and physically counted"
+        "eligible grounding kernels persisted and physically counted; ineligible targets were explicitly classified"
     );
     Ok(())
 }
