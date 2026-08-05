@@ -85,6 +85,7 @@ where
     replay_measurer: Option<Arc<dyn ArtifactReplayMeasurer>>,
     shadow_cpu_weight: f64,
     shadow_vram_bytes: u64,
+    shadow_metrics: Vec<crate::TripwireMetric>,
 }
 
 impl<'a, R, L, C, P> AnnealSubstrate<'a, R, L, C, P>
@@ -112,12 +113,18 @@ where
             replay_measurer: None,
             shadow_cpu_weight: DEFAULT_SHADOW_CPU_WEIGHT,
             shadow_vram_bytes: DEFAULT_SHADOW_VRAM_BYTES,
+            shadow_metrics: crate::ALL_SHADOW_METRICS.to_vec(),
         }
     }
 
     pub const fn with_budget_request(mut self, cpu_weight: f64, vram_bytes: u64) -> Self {
         self.shadow_cpu_weight = cpu_weight;
         self.shadow_vram_bytes = vram_bytes;
+        self
+    }
+
+    pub fn with_shadow_metrics(mut self, metrics: Vec<crate::TripwireMetric>) -> Self {
+        self.shadow_metrics = metrics;
         self
     }
 
@@ -382,7 +389,8 @@ where
             self.replay.clone(),
             budget,
             self.clock,
-        );
+        )
+        .with_required_metrics(self.shadow_metrics.clone());
         let verdict = executor.run_shadow(candidate, incumbent);
         self.tripwires = executor.registry;
         Ok(verdict)

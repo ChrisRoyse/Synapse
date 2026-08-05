@@ -77,6 +77,12 @@ pub fn rebuild_for_vault_with_panel_state<C: Clock>(
     )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CandidateSearchGeneration {
+    pub candidate_key: [u8; 32],
+    pub generation: PersistedSearchGeneration,
+}
+
 pub fn rebuild_for_vault_with_panel_state_and_dense_config<C: Clock>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
@@ -125,6 +131,38 @@ where
             Ok(())
         },
     )
+}
+
+/// Builds and independently reopens an immutable candidate generation without
+/// publishing or replacing the live panel manifest.
+pub fn rebuild_candidate_for_vault_with_panel_state_and_dense_config<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    state: &VaultPanelState,
+    dense_index_config: PersistedDenseIndexConfig,
+    candidate_key: [u8; 32],
+) -> CliResult<CandidateSearchGeneration> {
+    let active_slots = active_panel_slots(state);
+    let sparse_scoring = active_sparse_scoring(state)?;
+    let summary = super::rebuild_stream::rebuild_candidate_for_vault_with_active_slots(
+        vault_dir,
+        vault,
+        state.panel.version,
+        &active_slots,
+        &sparse_scoring,
+        dense_index_config.validate()?,
+        candidate_key,
+    )?;
+    let indexes = PersistedSearchIndexes::open_candidate(
+        vault_dir,
+        state.panel.version,
+        candidate_key,
+        summary.base_seq,
+    )?;
+    Ok(CandidateSearchGeneration {
+        candidate_key,
+        generation: indexes.generation()?,
+    })
 }
 
 pub fn rebuild_for_vault_with_panel_state_dense_config_progress<C: Clock, F>(

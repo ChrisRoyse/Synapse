@@ -2492,6 +2492,26 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::STORAGE_READ_FAILED,
                 "inspect the Calyx Kv artifact and AnnealRollback rows; status fails closed on a missing, malformed, or hash-mismatched live pointer",
             ),
+            op(
+                "anneal_search_propose",
+                true,
+                false,
+                "Calyx Base/slot rows at one pinned MVCC cut plus the live tuning and search manifests",
+                Some(
+                    "content-addressed candidate generation, measured native Anneal transaction, and independently reopened live tuning+manifest pair",
+                ),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before building and promoting a persisted-search candidate",
+            ),
+            op(
+                "anneal_rollback",
+                true,
+                false,
+                "Calyx AnnealRollback row plus content-addressed tuning/search bindings",
+                Some("restored live tuning pointer and exact bound persisted-search manifests"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to an explicit maintenance profile before rolling back an Anneal change",
+            ),
         ],
     ),
     facade_contract(

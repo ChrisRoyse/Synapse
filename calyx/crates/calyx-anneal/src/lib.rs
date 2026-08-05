@@ -153,7 +153,7 @@ pub use rollback::{
     RollbackStore, rollback_live_key, rollback_snapshot_key,
 };
 pub use shadow::{
-    ActionMetricSnapshot, AnnealAction, ArtifactReplayMeasurer,
+    ALL_SHADOW_METRICS, ActionMetricSnapshot, AnnealAction, ArtifactReplayMeasurer,
     CALYX_ANNEAL_SHADOW_MEASUREMENT_MISSING, HeldOutReplay, MetricComparison, MetricSide,
     MetricSnapshot, ReplayAnchor, ReplayQuery, ReplaySource, ShadowExecutor, ShadowRevertReason,
     ShadowVerdict, build_replay,

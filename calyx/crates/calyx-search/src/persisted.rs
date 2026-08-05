@@ -44,8 +44,10 @@ pub use marker::{
 };
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub use rebuild::{
-    RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
-    rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_and_dense_config,
+    CandidateSearchGeneration, RebuildProgress, load_docs,
+    rebuild_candidate_for_vault_with_panel_state_and_dense_config, rebuild_for_vault,
+    rebuild_for_vault_with_fallible_progress, rebuild_for_vault_with_panel_state,
+    rebuild_for_vault_with_panel_state_and_dense_config,
     rebuild_for_vault_with_panel_state_dense_config_progress,
     rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
@@ -56,6 +58,14 @@ const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";
 const INDEX_ROOT: &str = "idx/search";
 const MANIFEST_NAME: &str = "manifest.json";
 pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSearchManifestArtifact {
+    pub panel_version: u32,
+    pub base_seq: u64,
+    pub manifest_sha256: String,
+    pub manifest_bytes: Vec<u8>,
+}
 
 /// Load-bearing parameters for persisted dense DiskANN generations.
 ///
@@ -196,9 +206,9 @@ struct FilterIndexEntry {
 
 #[derive(Clone, Debug)]
 struct RebuildSummary {
-    slots: usize,
     total_rows: usize,
     manifest_path: PathBuf,
+    base_seq: u64,
 }
 
 #[derive(Debug)]
@@ -226,20 +236,64 @@ impl PersistedSearchIndexes {
                 marker::marker_error_context(vault_dir, panel_version)
             )));
         }
-        let manifest_bytes = fs::read(&manifest_path)?;
-        let manifest_sha256 = sha256_hex(&manifest_bytes);
-        let manifest: SearchIndexManifest = serde_json::from_slice(&manifest_bytes)?;
+        Self::open_manifest_path(vault_dir, panel_version, &manifest_path)
+    }
+
+    /// Opens one immutable candidate generation built for an Anneal shadow.
+    ///
+    /// Candidate paths are derived here rather than accepted from callers, so
+    /// a persisted tuning artifact can identify a generation without turning
+    /// an arbitrary filesystem path into trusted search input.
+    pub fn open_candidate(
+        vault_dir: &Path,
+        panel_version: u32,
+        candidate_key: [u8; 32],
+        base_seq: u64,
+    ) -> CliResult<Self> {
+        let manifest_path =
+            candidate_manifest_path(vault_dir, panel_version, candidate_key, base_seq);
+        if !manifest_path.is_file() {
+            return Err(stale(format!(
+                "candidate search index manifest missing at {}; rebuild the exact content-addressed shadow generation before evaluation",
+                manifest_path.display()
+            )));
+        }
+        let opened = Self::open_manifest_path(vault_dir, panel_version, &manifest_path)?;
+        if opened.manifest.base_seq != base_seq {
+            return Err(stale(format!(
+                "candidate search manifest {} declares Base seq {}, expected pinned seq {base_seq}",
+                manifest_path.display(),
+                opened.manifest.base_seq
+            )));
+        }
+        Ok(opened)
+    }
+
+    fn open_manifest_path(
+        vault_dir: &Path,
+        panel_version: u32,
+        manifest_path: &Path,
+    ) -> CliResult<Self> {
+        let manifest_bytes = fs::read(manifest_path)?;
+        Self::from_manifest_bytes(vault_dir, panel_version, &manifest_bytes)
+    }
+
+    fn from_manifest_bytes(
+        vault_dir: &Path,
+        panel_version: u32,
+        manifest_bytes: &[u8],
+    ) -> CliResult<Self> {
+        let manifest_sha256 = sha256_hex(manifest_bytes);
+        let manifest: SearchIndexManifest = serde_json::from_slice(manifest_bytes)?;
         if manifest.format != MANIFEST_FORMAT {
             return Err(stale(format!(
-                "persistent search index manifest {} has format {}; expected {MANIFEST_FORMAT}",
-                manifest_path.display(),
-                manifest.format
+                "persistent search index manifest bytes have format {}; expected {MANIFEST_FORMAT}",
+                manifest.format,
             )));
         }
         if manifest.panel_version != panel_version {
             return Err(stale(format!(
-                "persistent search index manifest {} declares panel {} but panel {panel_version} was requested; rebuild the exact panel generation",
-                manifest_path.display(),
+                "persistent search index manifest bytes declare panel {} but panel {panel_version} was requested; rebuild the exact panel generation",
                 manifest.panel_version
             )));
         }
@@ -247,6 +301,23 @@ impl PersistedSearchIndexes {
             vault_dir: vault_dir.to_path_buf(),
             manifest,
             manifest_sha256,
+        })
+    }
+
+    fn manifest_artifact(&self) -> CliResult<PersistedSearchManifestArtifact> {
+        let manifest_bytes = serde_json::to_vec_pretty(&self.manifest)?;
+        let manifest_sha256 = sha256_hex(&manifest_bytes);
+        if manifest_sha256 != self.manifest_sha256 {
+            return Err(stale(format!(
+                "parsed search manifest canonical bytes hash {manifest_sha256}, but the opened physical bytes hash {}; manifest serialization is not byte-stable",
+                self.manifest_sha256
+            )));
+        }
+        Ok(PersistedSearchManifestArtifact {
+            panel_version: self.manifest.panel_version,
+            base_seq: self.manifest.base_seq,
+            manifest_sha256,
+            manifest_bytes,
         })
     }
 
@@ -293,6 +364,35 @@ impl PersistedSearchIndexes {
                 "persistent search slot {slot} received an absent query vector; remeasure the active panel"
             ))),
         }
+    }
+
+    /// Exhaustive exact-cosine reference search over one dense lane.
+    ///
+    /// This is intentionally separate from production ANN recall. Anneal uses
+    /// it to derive held-out expected ranks from the immutable raw sidecar
+    /// instead of accepting caller-asserted relevance labels.
+    pub fn exact_dense_search(
+        &self,
+        slot: SlotId,
+        query: &SlotVector,
+        k: usize,
+    ) -> CliResult<Vec<IndexSearchHit>> {
+        let entry = self.require_entry(slot)?;
+        dense::exact_search(
+            &self.vault_dir,
+            entry,
+            self.manifest.panel_version,
+            slot,
+            query,
+            k,
+            self.manifest.dense_index_config.validate()?,
+        )
+    }
+
+    /// Exact indexed identities for one dense lane, in durable id-map order.
+    pub fn dense_ids(&self, slot: SlotId) -> CliResult<Vec<CxId>> {
+        let entry = self.require_entry(slot)?;
+        dense::ids(&self.vault_dir, entry, self.manifest.panel_version, slot)
     }
 
     pub fn search_filtered(
@@ -500,6 +600,65 @@ impl PersistedSearchIndexes {
     }
 }
 
+pub fn read_live_manifest_artifact(
+    vault_dir: &Path,
+    panel_version: u32,
+) -> CliResult<PersistedSearchManifestArtifact> {
+    PersistedSearchIndexes::open(vault_dir, panel_version)?.manifest_artifact()
+}
+
+pub fn read_candidate_manifest_artifact(
+    vault_dir: &Path,
+    panel_version: u32,
+    candidate_key: [u8; 32],
+    base_seq: u64,
+) -> CliResult<PersistedSearchManifestArtifact> {
+    PersistedSearchIndexes::open_candidate(vault_dir, panel_version, candidate_key, base_seq)?
+        .manifest_artifact()
+}
+
+/// Validates every artifact referenced by `artifact`, durably publishes its
+/// manifest as live, then independently reopens the physical manifest.
+pub fn publish_live_manifest_artifact(
+    vault_dir: &Path,
+    panel_version: u32,
+    artifact: &PersistedSearchManifestArtifact,
+) -> CliResult<PersistedSearchGeneration> {
+    if artifact.panel_version != panel_version {
+        return Err(stale(format!(
+            "cannot publish manifest artifact for panel {} as panel {panel_version}",
+            artifact.panel_version
+        )));
+    }
+    if sha256_hex(&artifact.manifest_bytes) != artifact.manifest_sha256 {
+        return Err(stale(format!(
+            "manifest artifact bytes do not match declared SHA-256 {}",
+            artifact.manifest_sha256
+        )));
+    }
+    let indexes = PersistedSearchIndexes::from_manifest_bytes(
+        vault_dir,
+        panel_version,
+        &artifact.manifest_bytes,
+    )?;
+    if indexes.manifest.base_seq != artifact.base_seq {
+        return Err(stale(format!(
+            "manifest artifact declares Base seq {}, expected {}",
+            indexes.manifest.base_seq, artifact.base_seq
+        )));
+    }
+    rebuild_stream::validate_staged_manifest_artifacts(vault_dir, &indexes.manifest)?;
+    write_json_atomic_durable(&manifest_path(vault_dir, panel_version), &indexes.manifest)?;
+    let reopened = PersistedSearchIndexes::open(vault_dir, panel_version)?;
+    if reopened.manifest_sha256 != artifact.manifest_sha256 {
+        return Err(stale(format!(
+            "published live manifest readback hash {} differs from expected {}",
+            reopened.manifest_sha256, artifact.manifest_sha256
+        )));
+    }
+    reopened.generation()
+}
+
 pub fn validate_rebuild_config() -> CliResult {
     rebuild_plan::validate_parallel_rebuild_config()
 }
@@ -667,6 +826,31 @@ fn panel_index_root(vault_dir: &Path, panel_version: u32) -> PathBuf {
     vault_dir
         .join(INDEX_ROOT)
         .join(format!("panel_{panel_version:010}"))
+}
+
+fn candidate_index_root(
+    vault_dir: &Path,
+    panel_version: u32,
+    candidate_key: [u8; 32],
+    base_seq: u64,
+) -> PathBuf {
+    panel_index_root(vault_dir, panel_version)
+        .join("candidates")
+        .join(hex32(candidate_key))
+        .join(format!("base_{base_seq:020}"))
+}
+
+fn candidate_manifest_path(
+    vault_dir: &Path,
+    panel_version: u32,
+    candidate_key: [u8; 32],
+    base_seq: u64,
+) -> PathBuf {
+    candidate_index_root(vault_dir, panel_version, candidate_key, base_seq).join(MANIFEST_NAME)
+}
+
+fn hex32(hash: [u8; 32]) -> String {
+    hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 fn legacy_manifest_path(vault_dir: &Path) -> PathBuf {

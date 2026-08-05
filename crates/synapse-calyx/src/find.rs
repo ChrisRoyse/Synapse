@@ -574,6 +574,17 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 find_index_error("open persisted search generation for fused find", &error)
             })?;
+        let expected_dense_config = tuning.dense_index_config();
+        if generation.dense_index_config != expected_dense_config {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_FIND_ANNEAL_GENERATION_MISMATCH",
+                format!(
+                    "panel {panel_version} live search manifest dense config {:?} differs from live Anneal tuning {:?}",
+                    generation.dense_index_config, expected_dense_config
+                ),
+                "reconcile the exact manifest bound to the live Anneal tuning artifact; never query a generation under different index parameters",
+            ));
+        }
         let indexed_slots: BTreeSet<SlotId> = generation
             .slots
             .iter()

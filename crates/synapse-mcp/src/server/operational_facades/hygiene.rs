@@ -867,5 +867,172 @@ pub(super) async fn handle(
                 |out| out.anneal_status = Some(response),
             )))
         }
+        HygieneOperation::AnnealSearchPropose => {
+            let spec = params
+                .0
+                .anneal_search_propose
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "anneal_search_propose"))?;
+            require_maintenance_profile(
+                service,
+                &request_context,
+                HYGIENE_TOOL,
+                operation.as_str(),
+                &format!("panel_{}", spec.panel_version),
+                HYGIENE_SOT,
+            )?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_anneal_mutation(),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_anneal",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the Anneal search proposal",
+                )
+            })?;
+            let status = db.calyx_vault_status().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_anneal",
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("read live Anneal tuning before proposal: {error}"),
+                    ),
+                    "repair the native Anneal pointer before proposing a search generation",
+                )
+            })?;
+            let mut candidate = status
+                .anneal
+                .ok_or_else(|| {
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        "Calyx vault status has no native Anneal readback",
+                    )
+                })?
+                .effective_tuning;
+            candidate.index_m_max = spec.index_m_max;
+            candidate.index_ef_construction = spec.index_ef_construction;
+            candidate.index_beamwidth = spec.index_beamwidth;
+            candidate.index_ef_search = spec.index_ef_search;
+            candidate.index_alpha = spec.index_alpha;
+            let panel_version = spec.panel_version;
+            let description = spec.description;
+            let report = tokio::task::spawn_blocking(move || {
+                db.propose_calyx_search_tuning(panel_version, candidate, &description)
+            })
+            .await
+            .map_err(|error| {
+                crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!("Anneal search proposal blocking task failed to join: {error}"),
+                )
+            })?
+            .map_err(|error| {
+                crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    format!("Anneal search proposal failed: {error}"),
+                )
+            })?;
+            let (outcome, change_id) = match report.change.outcome {
+                calyx_anneal::ChangeOutcome::Promoted(id) => ("promoted".to_owned(), Some(id.0)),
+                calyx_anneal::ChangeOutcome::Reverted { change_id, .. } => {
+                    ("reverted".to_owned(), Some(change_id.0))
+                }
+            };
+            let response = super::types::HygieneAnnealSearchProposeResponse {
+                outcome,
+                change_id,
+                panel_version: report.panel_version,
+                source_base_seq: report.source_base_seq,
+                query_count: report.query_count,
+                prior_artifact_sha256: report.change.prior_artifact_sha256,
+                candidate_artifact_sha256: report.change.candidate_artifact_sha256,
+                live_artifact_sha256_after: report.change.live_artifact_sha256_after,
+                incumbent_manifest_sha256: report.incumbent_manifest_sha256,
+                candidate_manifest_sha256: report.candidate_manifest_sha256,
+                live_manifest_sha256_after: report.live_manifest_sha256_after,
+            };
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "outcome={} change_id={:?} panel={} base_seq={} queries={} live_artifact={} live_manifest={}",
+                    response.outcome,
+                    response.change_id,
+                    response.panel_version,
+                    response.source_base_seq,
+                    response.query_count,
+                    response.live_artifact_sha256_after,
+                    response.live_manifest_sha256_after,
+                ),
+                |out| out.anneal_search_propose = Some(response),
+            )))
+        }
+        HygieneOperation::AnnealRollback => {
+            let spec = params
+                .0
+                .anneal_rollback
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "anneal_rollback"))?;
+            require_maintenance_profile(
+                service,
+                &request_context,
+                HYGIENE_TOOL,
+                operation.as_str(),
+                &format!("change_{}", spec.change_id),
+                HYGIENE_SOT,
+            )?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_anneal_mutation(),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_anneal",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry the Anneal rollback",
+                )
+            })?;
+            let report =
+                tokio::task::spawn_blocking(move || db.rollback_calyx_anneal(spec.change_id))
+                    .await
+                    .map_err(|error| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!("Anneal rollback blocking task failed to join: {error}"),
+                        )
+                    })?
+                    .map_err(|error| {
+                        crate::m1::mcp_error(
+                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                            format!("Anneal rollback failed: {error}"),
+                        )
+                    })?;
+            let response = super::types::HygieneAnnealRollbackResponse {
+                change_id: report.change_id,
+                candidate_artifact_sha256: report.candidate_artifact_sha256,
+                restored_artifact_sha256: report.restored_artifact_sha256,
+                restored_artifact_bytes: report.restored_artifact_bytes,
+                rollback_rows_after: report.rollback_rows_after,
+            };
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "change_id={} restored_artifact={} bytes={} rollback_rows={}",
+                    response.change_id,
+                    response.restored_artifact_sha256,
+                    response.restored_artifact_bytes,
+                    response.rollback_rows_after,
+                ),
+                |out| out.anneal_rollback = Some(response),
+            )))
+        }
     }
 }

@@ -29,13 +29,15 @@ pub use engine::{
 };
 pub use error::{CliResult, SearchError};
 pub use persisted::{
-    MarkerClearOutcome, PersistedDenseIndexConfig, PersistedDenseQuantization,
-    PersistedSearchGeneration, PersistedSearchIndexes, PersistedSearchSlot,
-    REBUILD_REQUIRED_REMEDIATION, REBUILD_REQUIRED_SCHEMA, RebuildProgress, RebuildRequiredMarker,
-    clear_rebuild_required_marker, clear_rebuild_required_marker_if_owned, load_docs,
-    manifest_path, read_rebuild_required_marker, rebuild_for_vault,
-    rebuild_for_vault_with_fallible_progress, rebuild_for_vault_with_panel_state,
-    rebuild_for_vault_with_panel_state_and_dense_config,
+    CandidateSearchGeneration, MarkerClearOutcome, PersistedDenseIndexConfig,
+    PersistedDenseQuantization, PersistedSearchGeneration, PersistedSearchIndexes,
+    PersistedSearchManifestArtifact, PersistedSearchSlot, REBUILD_REQUIRED_REMEDIATION,
+    REBUILD_REQUIRED_SCHEMA, RebuildProgress, RebuildRequiredMarker, clear_rebuild_required_marker,
+    clear_rebuild_required_marker_if_owned, load_docs, manifest_path,
+    publish_live_manifest_artifact, read_candidate_manifest_artifact, read_live_manifest_artifact,
+    read_rebuild_required_marker, rebuild_candidate_for_vault_with_panel_state_and_dense_config,
+    rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
+    rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_and_dense_config,
     rebuild_for_vault_with_panel_state_dense_config_progress,
     rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,

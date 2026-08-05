@@ -4495,6 +4495,10 @@ pub fn required_permissions_anneal_status() -> RequiredPermissions {
     required([Permission::ReadStorage])
 }
 
+pub fn required_permissions_anneal_mutation() -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
 /// Verifies the live vault and fails closed on any non-green surface.
 ///
 /// Delegates to the existing `verify_vault_restore` and `verify_ledger_chain`

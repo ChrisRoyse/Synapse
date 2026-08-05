@@ -13,7 +13,7 @@ use crate::{
 
 pub const CALYX_ANNEAL_SHADOW_MEASUREMENT_MISSING: &str = "CALYX_ANNEAL_SHADOW_MEASUREMENT_MISSING";
 
-const SHADOW_METRICS: [TripwireMetric; 5] = [
+pub const ALL_SHADOW_METRICS: [TripwireMetric; 5] = [
     TripwireMetric::RecallAtK,
     TripwireMetric::GuardFAR,
     TripwireMetric::GuardFRR,
@@ -163,6 +163,7 @@ pub struct ShadowExecutor<'a> {
     pub registry: TripwireRegistry,
     pub replay: HeldOutReplay,
     pub budget: BudgetHandle,
+    required_metrics: Vec<TripwireMetric>,
     clock: &'a dyn Clock,
 }
 
@@ -177,8 +178,14 @@ impl<'a> ShadowExecutor<'a> {
             registry,
             replay,
             budget,
+            required_metrics: ALL_SHADOW_METRICS.to_vec(),
             clock,
         }
+    }
+
+    pub fn with_required_metrics(mut self, required_metrics: Vec<TripwireMetric>) -> Self {
+        self.required_metrics = required_metrics;
+        self
     }
 
     pub fn run_shadow<C, I>(&mut self, candidate: &C, incumbent: &I) -> ShadowVerdict
@@ -194,7 +201,24 @@ impl<'a> ShadowExecutor<'a> {
             };
         }
 
-        let mut accumulator = MetricAccumulator::default();
+        if self.required_metrics.is_empty() {
+            return ShadowVerdict::Revert {
+                reason: ShadowRevertReason::NoRequiredMetrics,
+                metrics: MetricSnapshot::empty(evaluated_at),
+            };
+        }
+        let mut unique = Vec::with_capacity(self.required_metrics.len());
+        for metric in &self.required_metrics {
+            if unique.contains(metric) {
+                return ShadowVerdict::Revert {
+                    reason: ShadowRevertReason::DuplicateRequiredMetric(*metric),
+                    metrics: MetricSnapshot::empty(evaluated_at),
+                };
+            }
+            unique.push(*metric);
+        }
+
+        let mut accumulator = MetricAccumulator::new(unique);
         for query in &self.replay.queries {
             if !self.budget.try_consume() {
                 return ShadowVerdict::Revert {
@@ -288,6 +312,8 @@ pub enum ShadowRevertReason {
     MetricRegression(TripwireMetric),
     BudgetExhausted,
     InsufficientReplay,
+    NoRequiredMetrics,
+    DuplicateRequiredMetric(TripwireMetric),
     MissingMetric {
         metric: TripwireMetric,
         side: MetricSide,
@@ -313,20 +339,28 @@ pub enum MetricSide {
     Incumbent,
 }
 
-#[derive(Default)]
 struct MetricAccumulator {
+    required_metrics: Vec<TripwireMetric>,
     totals: HashMap<TripwireMetric, MetricTotals>,
     query_count: usize,
 }
 
 impl MetricAccumulator {
+    fn new(required_metrics: Vec<TripwireMetric>) -> Self {
+        Self {
+            required_metrics,
+            totals: HashMap::new(),
+            query_count: 0,
+        }
+    }
+
     fn add_query(
         &mut self,
         candidate: &ActionMetricSnapshot,
         incumbent: &ActionMetricSnapshot,
     ) -> Option<ShadowRevertReason> {
-        let mut pairs = Vec::with_capacity(SHADOW_METRICS.len());
-        for metric in SHADOW_METRICS {
+        let mut pairs = Vec::with_capacity(self.required_metrics.len());
+        for metric in self.required_metrics.iter().copied() {
             let candidate_value = match metric_value(candidate, metric, MetricSide::Candidate) {
                 Ok(value) => value,
                 Err(reason) => return Some(reason),
@@ -360,7 +394,8 @@ impl MetricAccumulator {
     }
 
     fn snapshot(&self, evaluated_at: Ts) -> MetricSnapshot {
-        let metrics = SHADOW_METRICS
+        let metrics = self
+            .required_metrics
             .iter()
             .filter_map(|metric| self.totals.get(metric).map(|totals| (*metric, totals)))
             .map(|(metric, totals)| MetricComparison {

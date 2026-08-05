@@ -185,6 +185,45 @@ pub(super) fn search(
         .map_err(Into::into)
 }
 
+pub(super) fn ids(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    panel_version: u32,
+    slot: SlotId,
+) -> CliResult<Vec<CxId>> {
+    if entry.kind != "diskann" && entry.kind != "flat_dense" {
+        return Err(stale(format!(
+            "persistent slot {slot} is {}, not a dense lane",
+            entry.kind
+        )));
+    }
+    read_ids(vault_dir, entry, panel_version, slot)
+}
+
+pub(super) fn exact_search(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    panel_version: u32,
+    slot: SlotId,
+    query: &SlotVector,
+    k: usize,
+    config: PersistedDenseIndexConfig,
+) -> CliResult<Vec<IndexSearchHit>> {
+    if entry.kind == "flat_dense" {
+        return flat::search(vault_dir, entry, slot, query, k, None);
+    }
+    let SlotVector::Dense { dim, data } = query else {
+        return Err(stale(format!(
+            "persistent exact dense search slot {slot} received non-dense query"
+        )));
+    };
+    let index = open(vault_dir, entry, panel_version, slot, *dim, config)?;
+    let candidates = read_ids(vault_dir, entry, panel_version, slot)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    exact_filtered_hits(&index, data, k, &candidates)
+}
+
 pub(super) fn search_filtered(
     vault_dir: &Path,
     entry: &SearchIndexEntry,

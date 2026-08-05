@@ -2,7 +2,8 @@
 
 mod anneal;
 pub use anneal::{
-    SynapseCalyxAnnealChangeReport, SynapseCalyxAnnealRollbackReport, SynapseCalyxAnnealStatus,
+    SynapseCalyxAnnealChangeReport, SynapseCalyxAnnealRollbackReport,
+    SynapseCalyxAnnealSearchReport, SynapseCalyxAnnealStatus,
 };
 mod async_vault;
 pub mod backup;

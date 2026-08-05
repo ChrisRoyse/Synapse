@@ -1390,6 +1390,28 @@ impl Db {
             .rebuild_calyx_search_indexes(expected_panel_version)
     }
 
+    /// Builds an isolated persisted-search generation, replays real vault
+    /// records through candidate and incumbent, then publishes only a passing
+    /// tuning+manifest pair.
+    pub fn propose_calyx_search_tuning(
+        &self,
+        expected_panel_version: u32,
+        candidate: synapse_calyx::SynapseCalyxTuningConfig,
+        description: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealSearchReport> {
+        self.backend
+            .propose_calyx_search_tuning(expected_panel_version, candidate, description)
+    }
+
+    /// Restores the prior native Anneal artifact and its exact bound search
+    /// manifests, with independent physical readback.
+    pub fn rollback_calyx_anneal(
+        &self,
+        change_id: u64,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealRollbackReport> {
+        self.backend.rollback_calyx_anneal(change_id)
+    }
+
     /// Runs one fused Calyx find-similar pass (per-slot recall, RRF fusion,
     /// optional bounded temporal boost, agree/disagree evidence) over the
     /// persisted per-slot indexes for the active panel. Read-only; the heavy

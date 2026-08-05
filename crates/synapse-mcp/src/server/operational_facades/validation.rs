@@ -78,6 +78,11 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("guard_calibrate", params.guard_calibrate.is_some()),
             ("guard_verify", params.guard_verify.is_some()),
             ("anneal_status", params.anneal_status.is_some()),
+            (
+                "anneal_search_propose",
+                params.anneal_search_propose.is_some(),
+            ),
+            ("anneal_rollback", params.anneal_rollback.is_some()),
         ],
     )
 }

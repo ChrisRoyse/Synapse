@@ -80,6 +80,8 @@ pub(super) fn hygiene_response(
         guard_calibrate: None,
         guard_verify: None,
         anneal_status: None,
+        anneal_search_propose: None,
+        anneal_rollback: None,
     };
     fill(&mut response);
     response

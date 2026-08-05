@@ -283,6 +283,10 @@ pub enum HygieneOperation {
     GuardVerify,
     /// Read native Anneal pointer, tripwire, budget, and ledger state (#1681).
     AnnealStatus,
+    /// Build and measure an isolated persisted-search candidate (#1681).
+    AnnealSearchPropose,
+    /// Restore a prior tuning artifact and its bound search manifests (#1681).
+    AnnealRollback,
 }
 
 impl HygieneOperation {
@@ -301,6 +305,8 @@ impl HygieneOperation {
             Self::GuardCalibrate => "guard_calibrate",
             Self::GuardVerify => "guard_verify",
             Self::AnnealStatus => "anneal_status",
+            Self::AnnealSearchPropose => "anneal_search_propose",
+            Self::AnnealRollback => "anneal_rollback",
         }
     }
 }
@@ -335,6 +341,10 @@ pub struct HygieneParams {
     pub guard_verify: Option<HygieneGuardVerifyParams>,
     #[serde(default)]
     pub anneal_status: Option<HygieneAnnealStatusParams>,
+    #[serde(default)]
+    pub anneal_search_propose: Option<HygieneAnnealSearchProposeParams>,
+    #[serde(default)]
+    pub anneal_rollback: Option<HygieneAnnealRollbackParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -369,6 +379,10 @@ pub struct HygieneResponse {
     pub guard_verify: Option<HygieneGuardVerifyResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anneal_status: Option<HygieneAnnealStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anneal_search_propose: Option<HygieneAnnealSearchProposeResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anneal_rollback: Option<HygieneAnnealRollbackResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -391,6 +405,48 @@ pub struct HygieneAnnealStatusResponse {
     pub budget_vram_used_bytes: u64,
     pub budget_warning_code: Option<String>,
     pub tripwire_count: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneAnnealSearchProposeParams {
+    pub panel_version: u32,
+    pub index_m_max: usize,
+    pub index_ef_construction: usize,
+    pub index_beamwidth: usize,
+    pub index_ef_search: usize,
+    pub index_alpha: f32,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HygieneAnnealSearchProposeResponse {
+    pub outcome: String,
+    pub change_id: Option<u64>,
+    pub panel_version: u32,
+    pub source_base_seq: u64,
+    pub query_count: usize,
+    pub prior_artifact_sha256: String,
+    pub candidate_artifact_sha256: String,
+    pub live_artifact_sha256_after: String,
+    pub incumbent_manifest_sha256: String,
+    pub candidate_manifest_sha256: String,
+    pub live_manifest_sha256_after: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneAnnealRollbackParams {
+    pub change_id: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HygieneAnnealRollbackResponse {
+    pub change_id: u64,
+    pub candidate_artifact_sha256: String,
+    pub restored_artifact_sha256: String,
+    pub restored_artifact_bytes: usize,
+    pub rollback_rows_after: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

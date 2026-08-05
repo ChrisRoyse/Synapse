@@ -647,6 +647,16 @@ pub trait StorageBackend: Send + Sync {
         &self,
         expected_panel_version: u32,
     ) -> StorageResult<SynapseCalyxSearchRebuildReport>;
+    fn propose_calyx_search_tuning(
+        &self,
+        expected_panel_version: u32,
+        candidate: synapse_calyx::SynapseCalyxTuningConfig,
+        description: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealSearchReport>;
+    fn rollback_calyx_anneal(
+        &self,
+        change_id: u64,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealRollbackReport>;
     fn find_similar(
         &self,
         params: &SynapseCalyxFindParams,
@@ -3832,6 +3842,60 @@ impl StorageBackend for CalyxBackend {
                             &source,
                         )
                     })
+            },
+        )
+    }
+
+    fn propose_calyx_search_tuning(
+        &self,
+        expected_panel_version: u32,
+        candidate: synapse_calyx::SynapseCalyxTuningConfig,
+        description: &str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealSearchReport> {
+        self.with_vault(
+            "calyx_anneal",
+            "build and shadow-measure a Calyx search tuning candidate",
+            true,
+            |vault| {
+                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                let panel = resolve_panel_contract(vault, expected_panel_version, created_at_ms)?
+                    .ok_or_else(|| {
+                        StorageError::BackendInvalidConfig {
+                            value: expected_panel_version.to_string(),
+                            detail: format!(
+                                "SYNAPSE_CALYX_ANNEAL_PANEL_UNKNOWN: panel {expected_panel_version} has no declared contract; remediation=use a declared Synapse panel version"
+                            ),
+                        }
+                    })?;
+                vault
+                    .anneal_propose_search_tuning(candidate.clone(), &panel, description)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_anneal",
+                            "build and shadow-measure a Calyx search tuning candidate",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn rollback_calyx_anneal(
+        &self,
+        change_id: u64,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAnnealRollbackReport> {
+        self.with_vault(
+            "calyx_anneal",
+            "roll back a native Calyx Anneal change",
+            true,
+            |vault| {
+                vault.anneal_rollback(change_id).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_anneal",
+                        "roll back a native Calyx Anneal change",
+                        &source,
+                    )
+                })
             },
         )
     }

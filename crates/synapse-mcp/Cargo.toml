@@ -26,6 +26,7 @@ default = []
 calyx-cuda = ["synapse-calyx/calyx-cuda"]
 
 [dependencies]
+calyx-anneal.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true

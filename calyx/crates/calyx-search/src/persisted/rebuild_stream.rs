@@ -53,26 +53,71 @@ where
     rebuild_for_vault_with_slot_filter(
         vault_dir,
         vault,
-        Some(panel_version),
-        Some(active_slots),
-        sparse_scoring,
-        dense_index_config,
+        RebuildRequest {
+            requested_panel_version: Some(panel_version),
+            active_slots: Some(active_slots),
+            sparse_scoring,
+            dense_index_config,
+            destination: RebuildDestination::Live,
+        },
         progress,
     )
+    .map(|_| ())
+}
+
+pub(super) fn rebuild_candidate_for_vault_with_active_slots<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    panel_version: u32,
+    active_slots: &BTreeSet<SlotId>,
+    sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
+    dense_index_config: PersistedDenseIndexConfig,
+    candidate_key: [u8; 32],
+) -> CliResult<RebuildSummary> {
+    rebuild_for_vault_with_slot_filter(
+        vault_dir,
+        vault,
+        RebuildRequest {
+            requested_panel_version: Some(panel_version),
+            active_slots: Some(active_slots),
+            sparse_scoring,
+            dense_index_config,
+            destination: RebuildDestination::Candidate(candidate_key),
+        },
+        |_| Ok(()),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum RebuildDestination {
+    Live,
+    Candidate([u8; 32]),
+}
+
+struct RebuildRequest<'a> {
+    requested_panel_version: Option<u32>,
+    active_slots: Option<&'a BTreeSet<SlotId>>,
+    sparse_scoring: &'a BTreeMap<SlotId, sparse::SparseScoring>,
+    dense_index_config: PersistedDenseIndexConfig,
+    destination: RebuildDestination,
 }
 
 fn rebuild_for_vault_with_slot_filter<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
-    requested_panel_version: Option<u32>,
-    active_slots: Option<&BTreeSet<SlotId>>,
-    sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
-    dense_index_config: PersistedDenseIndexConfig,
+    request: RebuildRequest<'_>,
     mut progress: F,
-) -> CliResult
+) -> CliResult<RebuildSummary>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
+    let RebuildRequest {
+        requested_panel_version,
+        active_slots,
+        sparse_scoring,
+        dense_index_config,
+        destination,
+    } = request;
     validate_parallel_rebuild_config()?;
     let snapshot = vault.pin_reader(
         Freshness::FreshDerived,
@@ -118,6 +163,7 @@ where
             sparse_scoring,
             build_policy,
             dense_index_config,
+            destination,
         },
         &mut progress,
     )?;
@@ -127,8 +173,7 @@ where
         manifest_path: Some(&summary.manifest_path),
         ..RebuildProgress::phase("done")
     })?;
-    let _ = (summary.slots, summary.total_rows, &summary.manifest_path);
-    Ok(())
+    Ok(summary)
 }
 
 #[derive(Clone)]
@@ -139,6 +184,7 @@ struct RebuildOptions<'a> {
     sparse_scoring: &'a BTreeMap<SlotId, sparse::SparseScoring>,
     build_policy: DiskAnnBuildPolicy,
     dense_index_config: PersistedDenseIndexConfig,
+    destination: RebuildDestination,
 }
 
 fn rebuild_from_base_with_progress<C: Clock, F>(
@@ -159,12 +205,60 @@ where
         sparse_scoring,
         build_policy,
         dense_index_config,
+        destination,
     } = options;
-    let root = panel_index_root(vault_dir, panel_version);
-    fs::create_dir_all(&root)?;
     let base_seq = snapshot.seq();
+    let root = match destination {
+        RebuildDestination::Live => panel_index_root(vault_dir, panel_version),
+        RebuildDestination::Candidate(candidate_key) => {
+            candidate_index_root(vault_dir, panel_version, candidate_key, base_seq)
+        }
+    };
+    if let RebuildDestination::Candidate(candidate_key) = destination
+        && root.exists()
+    {
+        // A retry of the same content-addressed candidate at the same Base cut
+        // is allowed only after the complete generation is independently
+        // reopened and every referenced artifact is re-hashed. Partial output
+        // remains a hard failure; it is crash evidence, not a cache hit.
+        let indexes = PersistedSearchIndexes::open_candidate(
+            vault_dir,
+            panel_version,
+            candidate_key,
+            base_seq,
+        )?;
+        let generation = indexes.generation()?;
+        if generation.dense_index_config != dense_index_config {
+            return Err(stale(format!(
+                "candidate search generation at {} has dense config {:?}, expected {:?}",
+                root.display(),
+                generation.dense_index_config,
+                dense_index_config
+            )));
+        }
+        let verified_manifest_path =
+            candidate_manifest_path(vault_dir, panel_version, candidate_key, base_seq);
+        progress(RebuildProgress {
+            rows: Some(generation.slots.iter().map(|slot| slot.len).sum()),
+            base_seq: Some(base_seq),
+            manifest_path: Some(&verified_manifest_path),
+            detail: Some(
+                "reused only after manifest and referenced-artifact hash readback".to_owned(),
+            ),
+            ..RebuildProgress::phase("candidate_generation_verified_reuse")
+        })?;
+        return Ok(RebuildSummary {
+            total_rows: generation.slots.iter().map(|slot| slot.len).sum(),
+            manifest_path: verified_manifest_path,
+            base_seq,
+        });
+    }
+    fs::create_dir_all(&root)?;
     progress(RebuildProgress::phase("previous_manifest_start"))?;
-    let previous_manifest = previous_manifest(vault_dir, panel_version)?;
+    let previous_manifest = match destination {
+        RebuildDestination::Live => previous_manifest(vault_dir, panel_version)?,
+        RebuildDestination::Candidate(_) => None,
+    };
     progress(RebuildProgress::phase("previous_manifest_ok"))?;
 
     let plans = slot_build_plans(
@@ -196,17 +290,24 @@ where
     })?;
     // Stake the write-ahead rebuild intent after the read-only preflight and
     // before creating any derived index artifact.
-    match marker::read_rebuild_required_marker(vault_dir, panel_version)? {
-        Some(_) => progress(RebuildProgress::phase("rebuild_marker_preserved"))?,
-        None => {
-            let mut intent = marker::RebuildRequiredMarker::new(
-                panel_version,
-                "search_index_rebuild",
-                "panel-scoped search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
-            )?;
-            intent.required_base_seq = Some(base_seq);
-            marker::write_rebuild_required_marker(vault_dir, &intent)?;
-            progress(RebuildProgress::phase("rebuild_marker_written"))?;
+    match destination {
+        RebuildDestination::Candidate(_) => {
+            progress(RebuildProgress::phase("candidate_generation_isolated"))?;
+        }
+        RebuildDestination::Live => {
+            match marker::read_rebuild_required_marker(vault_dir, panel_version)? {
+                Some(_) => progress(RebuildProgress::phase("rebuild_marker_preserved"))?,
+                None => {
+                    let mut intent = marker::RebuildRequiredMarker::new(
+                        panel_version,
+                        "search_index_rebuild",
+                        "panel-scoped search-index rebuild in progress; derived indexes are unproven until the manifest is republished",
+                    )?;
+                    intent.required_base_seq = Some(base_seq);
+                    marker::write_rebuild_required_marker(vault_dir, &intent)?;
+                    progress(RebuildProgress::phase("rebuild_marker_written"))?;
+                }
+            }
         }
     }
     let parallelism = bounded_parallel_slot_count(&plans)?;
@@ -319,7 +420,12 @@ where
         base_seq: Some(base_seq),
         ..RebuildProgress::phase("manifest_validate_ok")
     })?;
-    let manifest_path = manifest_path(vault_dir, panel_version);
+    let manifest_path = match destination {
+        RebuildDestination::Live => manifest_path(vault_dir, panel_version),
+        RebuildDestination::Candidate(candidate_key) => {
+            candidate_manifest_path(vault_dir, panel_version, candidate_key, base_seq)
+        }
+    };
     progress(RebuildProgress::manifest(
         "manifest_write_start",
         &manifest_path,
@@ -338,15 +444,17 @@ where
     progress(RebuildProgress::phase("prune_start"))?;
     prune_stale_index_artifacts(vault_dir, &root, &manifest)?;
     progress(RebuildProgress::phase("prune_ok"))?;
-    let cleared = marker::clear_rebuild_required_marker(vault_dir, panel_version, base_seq)?;
-    progress(RebuildProgress::phase(match cleared {
-        marker::MarkerClearOutcome::Cleared => "rebuild_marker_cleared",
-        marker::MarkerClearOutcome::Absent => "rebuild_marker_absent",
-    }))?;
+    if matches!(destination, RebuildDestination::Live) {
+        let cleared = marker::clear_rebuild_required_marker(vault_dir, panel_version, base_seq)?;
+        progress(RebuildProgress::phase(match cleared {
+            marker::MarkerClearOutcome::Cleared => "rebuild_marker_cleared",
+            marker::MarkerClearOutcome::Absent => "rebuild_marker_absent",
+        }))?;
+    }
     Ok(RebuildSummary {
-        slots: manifest.slots.len(),
         total_rows,
         manifest_path,
+        base_seq,
     })
 }
 
