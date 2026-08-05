@@ -165,6 +165,62 @@ pub fn rebuild_candidate_for_vault_with_panel_state_and_dense_config<C: Clock>(
     })
 }
 
+pub fn rebuild_for_vault_with_panel_state_and_dense_config_at_snapshot<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    state: &VaultPanelState,
+    dense_index_config: PersistedDenseIndexConfig,
+    snapshot: Snapshot,
+) -> CliResult {
+    let active_slots = active_panel_slots(state);
+    let sparse_scoring = active_sparse_scoring(state)?;
+    super::rebuild_stream::rebuild_for_vault_with_active_slots_at_snapshot(
+        vault_dir,
+        vault,
+        snapshot,
+        state.panel.version,
+        &active_slots,
+        &sparse_scoring,
+        dense_index_config.validate()?,
+    )?;
+    PersistedSearchIndexes::open(vault_dir, state.panel.version)?;
+    Ok(())
+}
+
+pub fn rebuild_candidate_for_vault_with_panel_state_and_dense_config_at_snapshot<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    state: &VaultPanelState,
+    dense_index_config: PersistedDenseIndexConfig,
+    candidate_key: [u8; 32],
+    snapshot: Snapshot,
+) -> CliResult<CandidateSearchGeneration> {
+    let active_slots = active_panel_slots(state);
+    let sparse_scoring = active_sparse_scoring(state)?;
+    let summary = super::rebuild_stream::rebuild_candidate_for_vault_with_active_slots_at_snapshot(
+        vault_dir,
+        vault,
+        super::rebuild_stream::CandidateRebuildAtSnapshot {
+            snapshot,
+            panel_version: state.panel.version,
+            active_slots: &active_slots,
+            sparse_scoring: &sparse_scoring,
+            dense_index_config: dense_index_config.validate()?,
+            candidate_key,
+        },
+    )?;
+    let indexes = PersistedSearchIndexes::open_candidate(
+        vault_dir,
+        state.panel.version,
+        candidate_key,
+        summary.base_seq,
+    )?;
+    Ok(CandidateSearchGeneration {
+        candidate_key,
+        generation: indexes.generation()?,
+    })
+}
+
 pub fn rebuild_for_vault_with_panel_state_dense_config_progress<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,

@@ -88,6 +88,67 @@ pub(super) fn rebuild_candidate_for_vault_with_active_slots<C: Clock>(
     )
 }
 
+pub(super) fn rebuild_for_vault_with_active_slots_at_snapshot<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    snapshot: Snapshot,
+    panel_version: u32,
+    active_slots: &BTreeSet<SlotId>,
+    sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
+    dense_index_config: PersistedDenseIndexConfig,
+) -> CliResult<RebuildSummary> {
+    rebuild_for_vault_with_request_at_snapshot(
+        vault_dir,
+        vault,
+        snapshot,
+        RebuildRequest {
+            requested_panel_version: Some(panel_version),
+            active_slots: Some(active_slots),
+            sparse_scoring,
+            dense_index_config,
+            destination: RebuildDestination::Live,
+        },
+        |_| Ok(()),
+    )
+}
+
+pub(super) struct CandidateRebuildAtSnapshot<'a> {
+    pub snapshot: Snapshot,
+    pub panel_version: u32,
+    pub active_slots: &'a BTreeSet<SlotId>,
+    pub sparse_scoring: &'a BTreeMap<SlotId, sparse::SparseScoring>,
+    pub dense_index_config: PersistedDenseIndexConfig,
+    pub candidate_key: [u8; 32],
+}
+
+pub(super) fn rebuild_candidate_for_vault_with_active_slots_at_snapshot<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    request: CandidateRebuildAtSnapshot<'_>,
+) -> CliResult<RebuildSummary> {
+    let CandidateRebuildAtSnapshot {
+        snapshot,
+        panel_version,
+        active_slots,
+        sparse_scoring,
+        dense_index_config,
+        candidate_key,
+    } = request;
+    rebuild_for_vault_with_request_at_snapshot(
+        vault_dir,
+        vault,
+        snapshot,
+        RebuildRequest {
+            requested_panel_version: Some(panel_version),
+            active_slots: Some(active_slots),
+            sparse_scoring,
+            dense_index_config,
+            destination: RebuildDestination::Candidate(candidate_key),
+        },
+        |_| Ok(()),
+    )
+}
+
 #[derive(Clone, Copy)]
 enum RebuildDestination {
     Live,
@@ -106,11 +167,37 @@ fn rebuild_for_vault_with_slot_filter<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
     request: RebuildRequest<'_>,
+    progress: F,
+) -> CliResult<RebuildSummary>
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    validate_parallel_rebuild_config()?;
+    let snapshot = vault.pin_reader(
+        Freshness::FreshDerived,
+        configured_rebuild_reader_lease_ms()?,
+    );
+    let guard = PinnedReadGuard::new(vault, snapshot);
+    rebuild_for_vault_with_request_at_snapshot(
+        vault_dir,
+        vault,
+        guard.snapshot(),
+        request,
+        progress,
+    )
+}
+
+fn rebuild_for_vault_with_request_at_snapshot<C: Clock, F>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    snapshot: Snapshot,
+    request: RebuildRequest<'_>,
     mut progress: F,
 ) -> CliResult<RebuildSummary>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
+    validate_parallel_rebuild_config()?;
     let RebuildRequest {
         requested_panel_version,
         active_slots,
@@ -118,18 +205,12 @@ where
         dense_index_config,
         destination,
     } = request;
-    validate_parallel_rebuild_config()?;
-    let snapshot = vault.pin_reader(
-        Freshness::FreshDerived,
-        configured_rebuild_reader_lease_ms()?,
-    );
-    let guard = PinnedReadGuard::new(vault, snapshot);
-    let base_seq = guard.snapshot().seq();
+    let base_seq = snapshot.seq();
     progress(RebuildProgress::phase("load_docs_start"))?;
     let page_rows = configured_rebuild_scan_page_rows()?;
     let base_docs = load_base_docs_at(
         vault,
-        guard.snapshot(),
+        snapshot,
         page_rows,
         requested_panel_version,
         &mut progress,
@@ -154,7 +235,7 @@ where
     let summary = rebuild_from_base_with_progress(
         vault_dir,
         vault,
-        guard.snapshot(),
+        snapshot,
         &base_docs,
         RebuildOptions {
             page_rows,

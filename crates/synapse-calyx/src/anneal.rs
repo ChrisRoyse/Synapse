@@ -36,6 +36,45 @@ struct AnnealProposalOptions<'a> {
     description: &'a str,
 }
 
+struct AnnealReaderLease<'a> {
+    owner: &'a SynapseCalyxVault,
+    lease_id: Option<u64>,
+}
+
+impl AnnealReaderLease<'_> {
+    fn release(mut self) -> Result<(), SynapseCalyxError> {
+        let lease_id = self.lease_id.take().ok_or_else(|| {
+            anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_READER_LEASE_INVALID",
+                "Anneal shared MVCC reader lease was already released",
+                "repair the single-owner proposal flow before retrying",
+            )
+        })?;
+        if !self.owner.vault.release_reader(lease_id) {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_READER_LEASE_LOST",
+                format!("Anneal shared MVCC reader lease {lease_id} expired before readback"),
+                "reduce the bounded shadow workload or increase its explicit lease after measuring production duration",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for AnnealReaderLease<'_> {
+    fn drop(&mut self) {
+        if let Some(lease_id) = self.lease_id.take()
+            && !self.owner.vault.release_reader(lease_id)
+        {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_ANNEAL_READER_LEASE_LOST",
+                lease_id,
+                "Anneal shared MVCC reader lease expired or disappeared before release"
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct SynapseCalyxAnnealStatus {
     pub live_artifact_sha256: String,
@@ -272,12 +311,18 @@ impl SynapseCalyxVault {
         let candidate_tuning = candidate_tuning.validate()?;
         let (prior_hash, _, incumbent_tuning) = self.read_live_tuning()?;
         ensure_index_only_candidate(&incumbent_tuning, &candidate_tuning)?;
+        let snapshot = self.vault.pin_reader(Freshness::FreshDerived, 300_000);
+        let reader_lease = AnnealReaderLease {
+            owner: self,
+            lease_id: Some(snapshot.lease().id()),
+        };
 
-        calyx_search::rebuild_for_vault_with_panel_state_and_dense_config(
+        calyx_search::rebuild_for_vault_with_panel_state_and_dense_config_at_snapshot(
             &self.config.vault_dir,
             &self.vault,
             panel,
             incumbent_tuning.dense_index_config(),
+            snapshot,
         )
         .map_err(|error| search_shadow_error("rebuild incumbent generation", error))?;
         let incumbent_artifact =
@@ -292,14 +337,16 @@ impl SynapseCalyxVault {
             )
         })?;
         let candidate_hash = tuning_artifact_hash(&candidate_bytes);
-        let built = calyx_search::rebuild_candidate_for_vault_with_panel_state_and_dense_config(
-            &self.config.vault_dir,
-            &self.vault,
-            panel,
-            candidate_tuning.dense_index_config(),
-            candidate_hash,
-        )
-        .map_err(|error| search_shadow_error("build candidate search generation", error))?;
+        let built =
+            calyx_search::rebuild_candidate_for_vault_with_panel_state_and_dense_config_at_snapshot(
+                &self.config.vault_dir,
+                &self.vault,
+                panel,
+                candidate_tuning.dense_index_config(),
+                candidate_hash,
+                snapshot,
+            )
+            .map_err(|error| search_shadow_error("build candidate search generation", error))?;
         if built.generation.base_seq != incumbent_artifact.base_seq {
             return Err(anneal_error(
                 "SYNAPSE_CALYX_ANNEAL_SEARCH_CUT_CHANGED",
@@ -328,13 +375,11 @@ impl SynapseCalyxVault {
             built.generation.base_seq,
         )
         .map_err(|error| search_shadow_error("open candidate search generation", error))?;
-        let (replay, query_slots) = self.build_search_replay(
-            &candidate_indexes,
-            &built.generation,
-            built.generation.base_seq,
-        )?;
+        let (replay, query_slots) =
+            self.build_search_replay(&candidate_indexes, &built.generation, snapshot)?;
         let candidate_action = measure_search_action(&candidate_indexes, &replay, &query_slots)?;
         let incumbent_action = measure_search_action(&incumbent_indexes, &replay, &query_slots)?;
+        reader_lease.release()?;
 
         self.persist_search_binding(prior_hash, prior_hash, incumbent_artifact.clone())?;
         self.persist_search_binding(candidate_hash, candidate_hash, candidate_artifact.clone())?;
@@ -508,21 +553,9 @@ impl SynapseCalyxVault {
         &self,
         indexes: &PersistedSearchIndexes,
         generation: &PersistedSearchGeneration,
-        base_seq: u64,
+        snapshot: calyx_aster::mvcc::Snapshot,
     ) -> Result<(HeldOutReplay, BTreeMap<u64, SlotId>), SynapseCalyxError> {
-        let snapshot = self.vault.pin_reader(Freshness::FreshDerived, 60_000);
-        let lease_id = snapshot.lease().id();
-        let result = (|| {
-            if snapshot.seq() != base_seq {
-                return Err(anneal_error(
-                    "SYNAPSE_CALYX_ANNEAL_SEARCH_CUT_CHANGED",
-                    format!(
-                        "candidate was built at Base seq {base_seq}, but replay pinned seq {}",
-                        snapshot.seq()
-                    ),
-                    "retry after writes quiesce so replay vectors and both generations share one cut",
-                ));
-            }
+        (|| {
             let dense_slots = generation
                 .slots
                 .iter()
@@ -620,16 +653,7 @@ impl SynapseCalyxVault {
                 },
                 query_slots,
             ))
-        })();
-        let released = self.vault.release_reader(lease_id);
-        if !released && result.is_ok() {
-            return Err(anneal_error(
-                "SYNAPSE_CALYX_ANNEAL_SEARCH_LEASE_LOST",
-                format!("pinned replay lease {lease_id} expired before explicit release"),
-                "reduce replay work or increase the fixed bounded lease only after measuring the workload",
-            ));
-        }
-        result
+        })()
     }
 
     fn persist_search_binding(

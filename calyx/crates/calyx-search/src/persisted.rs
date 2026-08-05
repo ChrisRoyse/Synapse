@@ -45,9 +45,11 @@ pub use marker::{
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub use rebuild::{
     CandidateSearchGeneration, RebuildProgress, load_docs,
-    rebuild_candidate_for_vault_with_panel_state_and_dense_config, rebuild_for_vault,
+    rebuild_candidate_for_vault_with_panel_state_and_dense_config,
+    rebuild_candidate_for_vault_with_panel_state_and_dense_config_at_snapshot, rebuild_for_vault,
     rebuild_for_vault_with_fallible_progress, rebuild_for_vault_with_panel_state,
     rebuild_for_vault_with_panel_state_and_dense_config,
+    rebuild_for_vault_with_panel_state_and_dense_config_at_snapshot,
     rebuild_for_vault_with_panel_state_dense_config_progress,
     rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
