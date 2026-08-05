@@ -9,6 +9,7 @@ pub(crate) fn weights_for(
     strategy: &FusionStrategy,
     panel: &Panel,
     slots: &[SlotId],
+    tuning: &crate::FusionTuning,
 ) -> CliResult<BTreeMap<SlotId, f32>> {
     let Some(profile) = weighted_profile(strategy) else {
         return Ok(BTreeMap::new());
@@ -28,10 +29,39 @@ pub(crate) fn weights_for(
         }
         .into());
     }
-    Ok(slots
+    let unknown = tuning.slot_weights.keys().find(|slot| {
+        !panel
+            .slots
+            .iter()
+            .any(|candidate| candidate.slot_id == **slot)
+    });
+    if let Some(slot) = unknown {
+        return Err(CalyxError::fusion_tuning_invalid(format!(
+            "configured fusion weight names slot {slot}, which is absent from panel {}",
+            panel.version
+        ))
+        .into());
+    }
+    let weights = slots
         .iter()
-        .map(|slot| (*slot, profile_weights[slot]))
-        .collect())
+        .map(|slot| {
+            (
+                *slot,
+                tuning
+                    .slot_weights
+                    .get(slot)
+                    .copied()
+                    .unwrap_or(profile_weights[slot]),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if !weights.is_empty() && weights.values().all(|weight| *weight == 0.0) {
+        return Err(CalyxError::fusion_tuning_invalid(
+            "all effective weights for the searched slots are zero",
+        )
+        .into());
+    }
+    Ok(weights)
 }
 
 pub(crate) fn stage1_slots(

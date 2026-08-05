@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Edge 1: an empty replay must be persisted as a rejected native change and
     // must not move the live pointer.
-    let mut empty_tuning = baseline.effective_tuning;
+    let mut empty_tuning = baseline.effective_tuning.clone();
     empty_tuning.fusion_k = 7;
     let empty = vault.anneal_propose_tuning(
         empty_tuning,
@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Edge 2: byte-identical tuning is rejected before a native change is
     // prepared. The structured error is printed as evidence.
     let unchanged_error = match vault.anneal_propose_tuning(
-        baseline.effective_tuning,
+        baseline.effective_tuning.clone(),
         replay.clone(),
         &good,
         &good,
@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
 
     // Happy path: the only changed value is the load-bearing production RRF k.
-    let mut promoted_tuning = baseline.effective_tuning;
+    let mut promoted_tuning = baseline.effective_tuning.clone();
     promoted_tuning.fusion_k = 5;
     let promoted = vault.anneal_propose_tuning(
         promoted_tuning,
@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // Forced bad candidate: identical measured host/guard metrics but recall is
     // deliberately zero, so native per-metric non-regression must reject it.
-    let mut bad_tuning = baseline.effective_tuning;
+    let mut bad_tuning = baseline.effective_tuning.clone();
     bad_tuning.fusion_k = 6;
     let rejected = vault.anneal_propose_tuning(
         bad_tuning,

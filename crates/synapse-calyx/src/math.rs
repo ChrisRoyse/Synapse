@@ -250,7 +250,7 @@ impl SynapseCalyxMathRuntime {
 pub fn math_backend(
     config: &SynapseCalyxTuningConfig,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
-    config.validate()?;
+    config.clone().validate()?;
     let cpu_reference = CpuBackend::new();
     let cpu_readback = CpuReadback::from_backend(&cpu_reference);
     match config.math_backend {

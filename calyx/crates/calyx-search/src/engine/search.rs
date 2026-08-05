@@ -215,7 +215,7 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         rrf_k: tuning.rrf_k,
         explain,
         strategy: strategy.clone(),
-        weights: weights_for(&strategy, panel, &slots)?,
+        weights: weights_for(&strategy, panel, &slots, &tuning)?,
         stage1_slots: stage1_slots(&strategy, query_vectors, &slots),
     };
     trace.emit_detail(

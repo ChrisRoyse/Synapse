@@ -80,7 +80,8 @@ use calyx_sextant::TemporalScores;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    SynapseCalyxError, SynapseCalyxTemporalCandidate, SynapseCalyxVault, hex_bytes, parse_cx_id,
+    SynapseCalyxError, SynapseCalyxTemporalCandidate, SynapseCalyxTuningConfig, SynapseCalyxVault,
+    hex_bytes, parse_cx_id,
 };
 
 /// Hard upper bound on `k` for one fused-find pass. Matches the temporal rerank
@@ -529,19 +530,15 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxFindParams,
         supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
-        self.find_similar_in_panel_with_fusion_k(
-            params,
-            supplied,
-            self.effective_tuning()?.fusion_k,
-        )
+        self.find_similar_in_panel_with_tuning(params, supplied, self.effective_tuning()?)
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn find_similar_in_panel_with_fusion_k(
+    pub(crate) fn find_similar_in_panel_with_tuning(
         &self,
         params: &SynapseCalyxFindParams,
         supplied: Option<&VaultPanelState>,
-        rrf_k: u32,
+        tuning: SynapseCalyxTuningConfig,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
         // Hot-path boundary (#1686): fused find is an off-runtime intelligence
         // query and must never be driven from a tagged reflex/capture tick.
@@ -717,11 +714,19 @@ impl SynapseCalyxVault {
         // scoring law it names (#1883). Validated at config load, re-validated
         // here so an out-of-domain value fails the query loudly rather than
         // producing a silently misordered ranking.
-        let fusion_tuning = FusionTuning::new(rrf_k).map_err(|error| {
+        let rrf_k = tuning.fusion_k;
+        let slot_weights = tuning
+            .fusion_slot_weights
+            .iter()
+            .map(|(slot, weight)| (SlotId::new(*slot), *weight))
+            .collect();
+        let fusion_tuning = FusionTuning::new(rrf_k)
+            .and_then(|fusion| fusion.with_slot_weights(slot_weights))
+            .map_err(|error| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_FIND_FUSION_TUNING_INVALID",
-                format!("configured calyx_fusion_k={rrf_k} cannot score a fused query: {error}"),
-                "set calyx_fusion_k to a positive integer; the Cormack et al. default is 60",
+                format!("configured fusion tuning cannot score a fused query: {error}"),
+                "set fusion_k to 1..=2^24 and provide only finite non-negative weights for slots on the active panel",
             )
         })?;
         let outcome: SearchOutcome = search_outcome_with_query_vectors_freshness_cached(

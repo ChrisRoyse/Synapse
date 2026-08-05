@@ -1937,7 +1937,7 @@ impl SynapseCalyxClockMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SynapseCalyxTuningConfig {
     pub bit_floor_bits: f32,
@@ -1949,6 +1949,7 @@ pub struct SynapseCalyxTuningConfig {
     pub kernel_fraction: f32,
     pub kernel_recall_gate: f32,
     pub fusion_k: u32,
+    pub fusion_slot_weights: BTreeMap<u16, f32>,
     pub temporal_boost_min: f32,
     pub temporal_boost_max: f32,
     pub index_m_max: usize,
@@ -1975,6 +1976,7 @@ impl Default for SynapseCalyxTuningConfig {
             kernel_fraction: DEFAULT_KERNEL_FRACTION,
             kernel_recall_gate: DEFAULT_KERNEL_RECALL_GATE,
             fusion_k: DEFAULT_FUSION_K,
+            fusion_slot_weights: BTreeMap::new(),
             temporal_boost_min: DEFAULT_TEMPORAL_BOOST_MIN,
             temporal_boost_max: DEFAULT_TEMPORAL_BOOST_MAX,
             index_m_max: DEFAULT_INDEX_M_MAX,
@@ -2031,6 +2033,24 @@ impl SynapseCalyxTuningConfig {
         if self.fusion_k == 0 {
             return Err(invalid_config("fusion_k must be positive"));
         }
+        if self
+            .fusion_slot_weights
+            .values()
+            .all(|weight| *weight == 0.0)
+            && !self.fusion_slot_weights.is_empty()
+        {
+            return Err(invalid_config(
+                "fusion_slot_weights must contain at least one positive weight",
+            ));
+        }
+        for (slot, weight) in &self.fusion_slot_weights {
+            validate_f32(
+                &format!("fusion_slot_weights[{slot}]"),
+                *weight,
+                0.0,
+                f32::INFINITY,
+            )?;
+        }
         validate_f32(
             "temporal_boost_min",
             self.temporal_boost_min,
@@ -2062,7 +2082,7 @@ impl SynapseCalyxTuningConfig {
         Ok(self)
     }
 
-    fn dense_index_config(self) -> PersistedDenseIndexConfig {
+    fn dense_index_config(&self) -> PersistedDenseIndexConfig {
         PersistedDenseIndexConfig {
             m_max: self.index_m_max,
             ef_construction: self.index_ef_construction,
@@ -2516,7 +2536,7 @@ impl SynapseCalyxVaultStatus {
         self.machine_salt_path = Some(config.machine_salt_path.clone());
         self.lock_path = Some(lock_path(&config.vault_dir));
         self.pid_path = Some(pid_path(&config.vault_dir));
-        self.tuning = Some(config.tuning);
+        self.tuning = Some(config.tuning.clone());
     }
 }
 

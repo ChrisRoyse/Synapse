@@ -168,16 +168,19 @@ impl SearchOutcome {
 /// reaches the scoring law it names. Before #1883 the knob was validated,
 /// lowered to an artifact and echoed to health while every fused query scored
 /// with a constant, so tuning it changed nothing and reported success.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct FusionTuning {
     /// The Reciprocal Rank Fusion rank constant.
     pub rrf_k: f32,
+    /// Optional exact per-slot multipliers over a weighted RRF profile.
+    pub slot_weights: BTreeMap<SlotId, f32>,
 }
 
 impl Default for FusionTuning {
     fn default() -> Self {
         Self {
             rrf_k: DEFAULT_RRF_K_F32,
+            slot_weights: BTreeMap::new(),
         }
     }
 }
@@ -201,6 +204,30 @@ impl FusionTuning {
                 "fusion rrf_k must be in 1..=2^24 so it is exactly representable in the f32 the scoring law runs in, got {rrf_k}"
             ))
         })?;
-        Ok(Self { rrf_k })
+        Ok(Self {
+            rrf_k,
+            slot_weights: BTreeMap::new(),
+        })
+    }
+
+    /// Installs validated per-slot weighted-RRF overrides.
+    pub fn with_slot_weights(
+        mut self,
+        slot_weights: BTreeMap<SlotId, f32>,
+    ) -> calyx_core::Result<Self> {
+        if !slot_weights.is_empty() && slot_weights.values().all(|weight| *weight == 0.0) {
+            return Err(calyx_core::CalyxError::fusion_tuning_invalid(
+                "fusion slot weights must contain at least one positive value",
+            ));
+        }
+        for (slot, weight) in &slot_weights {
+            if !weight.is_finite() || *weight < 0.0 {
+                return Err(calyx_core::CalyxError::fusion_tuning_invalid(format!(
+                    "fusion weight for slot {slot} must be finite and non-negative, got {weight}"
+                )));
+            }
+        }
+        self.slot_weights = slot_weights;
+        Ok(self)
     }
 }

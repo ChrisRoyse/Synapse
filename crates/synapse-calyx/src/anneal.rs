@@ -46,7 +46,7 @@ pub struct SynapseCalyxAnnealRollbackReport {
 
 impl SynapseCalyxVault {
     pub(crate) fn initialize_anneal_tuning(&self) -> Result<(), SynapseCalyxError> {
-        let configured = self.config.tuning.validate()?;
+        let configured = self.config.tuning.clone().validate()?;
         let bytes = serde_json::to_vec(&configured).map_err(|error| {
             anneal_error(
                 "SYNAPSE_CALYX_ANNEAL_ARTIFACT_ENCODE_FAILED",
@@ -447,8 +447,9 @@ fn ensure_supported_candidate(
     incumbent: &SynapseCalyxTuningConfig,
     candidate: &SynapseCalyxTuningConfig,
 ) -> Result<(), SynapseCalyxError> {
-    let mut expected = *incumbent;
+    let mut expected = incumbent.clone();
     expected.fusion_k = candidate.fusion_k;
+    expected.fusion_slot_weights = candidate.fusion_slot_weights.clone();
     expected.guard_far_identity = candidate.guard_far_identity;
     expected.guard_far_content = candidate.guard_far_content;
     expected.guard_far_stylistic = candidate.guard_far_stylistic;

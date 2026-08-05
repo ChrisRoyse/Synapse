@@ -365,6 +365,13 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
         effect_of_tuning: "sets the k in the Reciprocal Rank Fusion law score(d) = SUM w_s/(k + rank_s(d)) that every fused find scores with; the reported rrf_k and rrf_formula on each find report are interpolated from this same value, and each reproducible fusion payload records the k it ran under so retuning cannot change what a past query replays to",
     },
     CalyxTuningKnobFacts {
+        knob: "fusion_slot_weights",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "crates/synapse-calyx/src/find.rs -> calyx_search::FusionTuning::slot_weights -> engine_fusion::weights_for -> calyx_sextant::FusionContext::weights",
+        blocked_by_issue: "",
+        effect_of_tuning: "overrides the exact per-slot multiplier used by weighted RRF; unknown panel slots and an all-zero effective searched set fail closed",
+    },
+    CalyxTuningKnobFacts {
         knob: "temporal_boost_min",
         enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
         declared_at: "none: no code anywhere reads temporal_boost_min",
@@ -449,6 +456,7 @@ fn calyx_tuning_knob_value(tuning: &synapse_calyx::SynapseCalyxTuningConfig, kno
         "kernel_fraction" => tuning.kernel_fraction.to_string(),
         "kernel_recall_gate" => tuning.kernel_recall_gate.to_string(),
         "fusion_k" => tuning.fusion_k.to_string(),
+        "fusion_slot_weights" => format!("{:?}", tuning.fusion_slot_weights),
         "temporal_boost_min" => tuning.temporal_boost_min.to_string(),
         "temporal_boost_max" => tuning.temporal_boost_max.to_string(),
         "index_m_max" => tuning.index_m_max.to_string(),
@@ -1354,9 +1362,11 @@ impl SynapseService {
                 status.torn_tail.as_deref().unwrap_or("none"),
                 status.last_error_code.as_deref().unwrap_or("none"),
                 status.last_calyx_error_code.as_deref().unwrap_or("none"),
-                tuning.map_or("none", |config| config.clock_mode.as_str()),
-                tuning.map(|config| config.bit_floor_bits),
-                tuning.map(|config| config.correlation_ceiling),
+                tuning
+                    .as_ref()
+                    .map_or("none", |config| config.clock_mode.as_str()),
+                tuning.as_ref().map(|config| config.bit_floor_bits),
+                tuning.as_ref().map(|config| config.correlation_ceiling),
                 math_backend
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), |math| math.detail()),
@@ -1389,8 +1399,10 @@ impl SynapseService {
             calyx_vault_last_calyx_error_code: status.last_calyx_error_code,
             calyx_vault_last_error: status.last_error,
             calyx_vault_remediation: status.remediation,
-            calyx_bit_floor_bits: tuning.map(|config| config.bit_floor_bits),
-            calyx_correlation_ceiling: tuning.map(|config| config.correlation_ceiling),
+            calyx_bit_floor_bits: tuning.as_ref().map(|config| config.bit_floor_bits),
+            calyx_correlation_ceiling: tuning
+                .as_ref()
+                .map(|config| config.correlation_ceiling),
             calyx_tuning_knobs: tuning_knobs,
             calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
             calyx_row_guard_sites: row_guard_sites,
@@ -1398,7 +1410,7 @@ impl SynapseService {
             calyx_row_guard_holds_total: Some(row_guard_holds_total),
             calyx_row_guard_over_budget_total: Some(row_guard_over_budget_total),
             calyx_row_guard_starved_total: Some(row_guard_starved_total),
-            calyx_vram_budget_bytes: tuning.map(|config| config.vram_budget_bytes),
+            calyx_vram_budget_bytes: tuning.as_ref().map(|config| config.vram_budget_bytes),
             calyx_vram_budget_enforced: math_backend
                 .as_ref()
                 .map(|math| math.vram_dispatch.is_some()),
@@ -1496,7 +1508,11 @@ impl SynapseService {
             calyx_math_backend_requested: math_backend
                 .as_ref()
                 .map(|math| math.requested_backend.as_str().to_owned())
-                .or_else(|| tuning.map(|config| config.math_backend.as_str().to_owned())),
+                .or_else(|| {
+                    tuning
+                        .as_ref()
+                        .map(|config| config.math_backend.as_str().to_owned())
+                }),
             calyx_math_cuda_compiled: math_backend.as_ref().map(|math| math.cuda_compiled),
             calyx_math_device_name: math_backend.as_ref().map(|math| math.device_name.clone()),
             calyx_math_device_vram_mib: math_backend.as_ref().and_then(|math| math.device_vram_mib),
@@ -1532,9 +1548,13 @@ impl SynapseService {
                     })
                     .collect()
             }),
-            calyx_clock_mode: tuning.map(|config| config.clock_mode.as_str().to_owned()),
-            calyx_fixed_clock_unix_ms: tuning.and_then(|config| config.fixed_clock_unix_ms),
-            calyx_rng_seed: tuning.map(|config| config.rng_seed),
+            calyx_clock_mode: tuning
+                .as_ref()
+                .map(|config| config.clock_mode.as_str().to_owned()),
+            calyx_fixed_clock_unix_ms: tuning
+                .as_ref()
+                .and_then(|config| config.fixed_clock_unix_ms),
+            calyx_rng_seed: tuning.as_ref().map(|config| config.rng_seed),
             ..SubsystemHealth::default()
         }
     }
