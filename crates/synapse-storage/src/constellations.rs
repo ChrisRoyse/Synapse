@@ -6536,7 +6536,7 @@ pub fn publish_graph_position_snapshot(
         .concat(),
     );
     vault
-        .reserve_panel_generations(&[(kind.panel_name().to_owned(), kind.base_panel_version())])
+        .reserve_panel_generations(&derived_snapshot_base_generations())
         .map_err(|error| measurement_error("reserve graph panel generation", error))?;
     let allocation = vault
         .allocate_panel_generation(kind.panel_name(), &operation_id)
@@ -6698,10 +6698,7 @@ pub fn publish_path_hierarchy_snapshot(
         .concat(),
     );
     vault
-        .reserve_panel_generations(&[(
-            SYN_PATH_HIERARCHY_PANEL_NAME.to_owned(),
-            SYN_PATH_HIERARCHY_PANEL_VERSION,
-        )])
+        .reserve_panel_generations(&derived_snapshot_base_generations())
         .map_err(|error| measurement_error("reserve path panel generation", error))?;
     let allocation = vault
         .allocate_panel_generation(SYN_PATH_HIERARCHY_PANEL_NAME, &operation_id)
@@ -6795,6 +6792,23 @@ pub fn publish_path_hierarchy_snapshot(
             snapshot,
         })
         .map_err(|error| measurement_error("publish path hierarchy snapshot", error))
+}
+
+fn derived_snapshot_base_generations() -> Vec<(String, u32)> {
+    vec![
+        (
+            SYN_GRAPHPOS_APP_PANEL_NAME.to_owned(),
+            SYN_GRAPHPOS_APP_PANEL_VERSION,
+        ),
+        (
+            SYN_GRAPHPOS_PROCESS_PANEL_NAME.to_owned(),
+            SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+        ),
+        (
+            SYN_PATH_HIERARCHY_PANEL_NAME.to_owned(),
+            SYN_PATH_HIERARCHY_PANEL_VERSION,
+        ),
+    ]
 }
 
 /// Returns the canonical parent/child edge set used to fingerprint a path

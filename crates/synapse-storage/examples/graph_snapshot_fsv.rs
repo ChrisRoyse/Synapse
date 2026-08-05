@@ -116,6 +116,26 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("EDGE_REPLAY readback={replay:?}");
     println!("EDGE_REPLAY after={:?}", counts(&vault)?);
 
+    let mut evolved_edges = edges.clone();
+    evolved_edges.push(("leaf-d".to_owned(), "leaf-e".to_owned(), 1));
+    println!("EDGE_EVOLVE before={:?}", counts(&vault)?);
+    let evolved = publish_graph_position_snapshot(
+        &vault,
+        GraphPositionKind::App,
+        41,
+        1_786_000_000_001,
+        &evolved_edges,
+    )?;
+    println!("EDGE_EVOLVE readback={evolved:?}");
+    println!("EDGE_EVOLVE after={:?}", counts(&vault)?);
+    if evolved.panel_version <= first.panel_version {
+        return Err(format!(
+            "changed snapshot did not advance generation: first={} evolved={}",
+            first.panel_version, evolved.panel_version
+        )
+        .into());
+    }
+
     let paths = vec![
         "docs/calyx/guide.md".to_owned(),
         "docs/calyx/reference.md".to_owned(),

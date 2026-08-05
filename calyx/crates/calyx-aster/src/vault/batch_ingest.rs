@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::store::DuplicatePutPolicy;
-use super::{AsterVault, PutDisposition, PutOutcome, anchor_merge, ledger_hook, prepared};
+use super::{
+    AsterVault, DerivedRegistryRevisionGuard, PutDisposition, PutOutcome, anchor_merge,
+    ledger_hook, prepared,
+};
 use crate::cf::{ColumnFamily, base_key};
 use crate::media_artifact::{
     DerivedMediaArtifactDraft, DerivedMediaArtifactRecord, derived_media_artifact_write_rows,
@@ -162,6 +165,7 @@ where
         payload: Vec<u8>,
         actor: ActorId,
         additional_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        registry_guard: Option<DerivedRegistryRevisionGuard>,
     ) -> Result<Vec<CxId>>
     where
         I: IntoIterator<Item = Constellation>,
@@ -175,6 +179,22 @@ where
             ));
         }
         self.with_durable_commit_lock(|| {
+            if let Some(guard) = registry_guard {
+                let observed = self
+                    .read_cf_latest(ColumnFamily::Registry, &guard.key)?
+                    .as_deref()
+                    .map(super::value_revision);
+                if observed != guard.expected_revision {
+                    return Err(CalyxError {
+                        code: "CALYX_ASTER_DERIVED_SNAPSHOT_REVISION_CONFLICT",
+                        message: format!(
+                            "derived Registry row changed before atomic publication: expected={:?} observed={observed:?}",
+                            guard.expected_revision
+                        ),
+                        remediation: "reread the exact Registry lifecycle row, allocate a generation newer than the observed state, and retry the complete snapshot publication",
+                    });
+                }
+            }
             self.put_batch_locked_with_options(
                 input,
                 Some(BatchLedgerEntry {

@@ -6,6 +6,14 @@ mod anchor_merge;
 mod backup;
 pub mod base_rewrite;
 mod batch_ingest;
+
+/// Expected physical revision of the Registry lifecycle row guarded by an
+/// atomic derived-snapshot publication.
+#[derive(Clone, Debug)]
+pub struct DerivedRegistryRevisionGuard {
+    pub key: Vec<u8>,
+    pub expected_revision: Option<[u8; 32]>,
+}
 pub(crate) mod cf_codec;
 mod commit;
 mod compaction_bridge;

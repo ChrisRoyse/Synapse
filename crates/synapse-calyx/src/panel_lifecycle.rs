@@ -242,21 +242,43 @@ impl SynapseCalyxVault {
                 request.panel_name
             ))
         })?;
-        if let Some(existing) = self.read_cf_latest(ColumnFamily::Registry, &key)? {
-            if existing == lifecycle_value {
+        let existing = self.read_cf_latest(ColumnFamily::Registry, &key)?;
+        let expected_revision = existing.as_deref().map(sha256_array);
+        if let Some(existing) = existing.as_ref() {
+            if existing.as_slice() == lifecycle_value {
                 return derived_snapshot_readback(self, &request, &lifecycle_value);
             }
-            return Err(conflict(format!(
-                "panel {} already has a different lifecycle state",
-                request.panel_name
-            )));
+            let prior: SynapseCalyxPanelLifecycleState =
+                serde_json::from_slice(existing).map_err(|error| {
+                    conflict(format!(
+                        "panel {} has an undecodable lifecycle state: {error}",
+                        request.panel_name
+                    ))
+                })?;
+            let prior_is_derived = prior.added_lenses.values().all(|lens| {
+                matches!(
+                    lens.source_projection,
+                    SynapseCalyxSourceProjection::DerivedSnapshot { .. }
+                )
+            });
+            if prior.panel_name != request.panel_name
+                || !prior_is_derived
+                || prior.controller.panel().version >= request.panel.version
+            {
+                return Err(conflict(format!(
+                    "panel {} lifecycle cannot advance from generation {} to {} (derived={prior_is_derived})",
+                    request.panel_name,
+                    prior.controller.panel().version,
+                    request.panel.version
+                )));
+            }
         }
         let mut rows = request
             .graph_rows
             .iter()
             .map(|row| (ColumnFamily::Graph, row.key.clone(), row.value.clone()))
             .collect::<Vec<_>>();
-        rows.push((ColumnFamily::Registry, key, lifecycle_value.clone()));
+        rows.push((ColumnFamily::Registry, key.clone(), lifecycle_value.clone()));
         let payload = canonical_json_bytes(&serde_json::json!({
             "operation": "publish_derived_snapshot",
             "operation_id": request.operation_id,
@@ -275,6 +297,10 @@ impl SynapseCalyxVault {
                 payload,
                 calyx_ledger::ActorId::Service("synapse-derived-state".to_owned()),
                 rows,
+                Some(calyx_aster::vault::DerivedRegistryRevisionGuard {
+                    key,
+                    expected_revision,
+                }),
             )
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("publish atomic derived graph snapshot", &error)
@@ -1198,4 +1224,9 @@ fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(bytes);
     digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn sha256_array(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest as _, Sha256};
+    Sha256::digest(bytes).into()
 }
