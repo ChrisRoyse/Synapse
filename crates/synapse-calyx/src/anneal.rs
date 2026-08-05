@@ -1191,6 +1191,17 @@ fn measure_search_action(
             .iter()
             .map(|anchor| anchor.cx_id)
             .collect::<Vec<_>>();
+        let kth_similarity = query
+            .expected_top_k
+            .last()
+            .map(|anchor| anchor.similarity)
+            .ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_SEARCH_EXPECTED_RANK_EMPTY",
+                    format!("query {} has no exact-reference neighbor", query.query_id),
+                    "rebuild the product-owned replay from a non-empty dense lane",
+                )
+            })?;
         let mut elapsed = Vec::with_capacity(SEARCH_REPLAY_PASSES);
         let mut observed = Vec::new();
         for _ in 0..SEARCH_REPLAY_PASSES {
@@ -1204,10 +1215,18 @@ fn measure_search_action(
                     )
                 })?;
             elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
-            observed = hits.into_iter().map(|hit| hit.cx_id).collect();
+            observed = hits;
         }
         elapsed.sort_by(f64::total_cmp);
-        let matched = observed.iter().filter(|id| expected.contains(id)).count();
+        // Exact top-k IDs are arbitrary at a tied kth boundary. Persisted dense
+        // search rescored every returned hit, so geometric recall accepts an
+        // equivalent tied neighbor instead of reporting a false miss.
+        let matched = observed
+            .iter()
+            .filter(|hit| {
+                expected.contains(&hit.cx_id) || hit.score + f32::EPSILON >= kth_similarity
+            })
+            .count();
         let recall = matched as f64 / expected.len() as f64;
         let p99 = *elapsed.last().ok_or_else(|| {
             anneal_error(
