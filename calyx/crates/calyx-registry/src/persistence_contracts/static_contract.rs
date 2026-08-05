@@ -308,6 +308,12 @@ pub fn algorithmic_encoder(kind: &str, shape: SlotShape) -> Option<AlgorithmicEn
         ["syn_aggregation", dim] => Some(AlgorithmicEncoder::SynAggregation {
             dim: parse_u32(dim)?,
         }),
+        ["syn_graph_signature", snapshot] => Some(AlgorithmicEncoder::SynGraphSignature {
+            snapshot: parse_u64(snapshot)?,
+        }),
+        ["syn_path_signature", snapshot] => Some(AlgorithmicEncoder::SynPathSignature {
+            snapshot: parse_u64(snapshot)?,
+        }),
         _ => None,
     }
 }

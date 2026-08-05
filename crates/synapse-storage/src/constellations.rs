@@ -11,6 +11,9 @@ use calyx_core::{
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
+use calyx_mincut::{
+    StructuralParams, TransitionEdge, build_transition_graph, structural_signatures,
+};
 use calyx_registry::{
     AlgorithmicEncoder as RegistryAlgorithmicEncoder, AlgorithmicLens as RegistryAlgorithmicLens,
     LensRuntime, LensSpec, Registry, default_recall_delta,
@@ -19,7 +22,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use synapse_calyx::SynapseCalyxPutDisposition;
+use synapse_calyx::SynapseCalyxVault;
 use synapse_calyx::lens_provenance;
+use synapse_calyx::panel_lifecycle::{
+    SynapseCalyxDerivedGraphRow, SynapseCalyxDerivedSnapshotReadback,
+    SynapseCalyxDerivedSnapshotRequest,
+};
 use synapse_core::types::{
     AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord, EpisodeBoundary,
     EpisodeRecord, GenAiOperationName, SensorStatus, StoredObservation, StoredReflexAudit,
@@ -3483,6 +3491,12 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
         RegistryAlgorithmicEncoder::SynAggregation { dim } => {
             format!("syn_aggregation:{dim}")
         }
+        RegistryAlgorithmicEncoder::SynGraphSignature { snapshot } => {
+            format!("syn_graph_signature:{snapshot}")
+        }
+        RegistryAlgorithmicEncoder::SynPathSignature { snapshot } => {
+            format!("syn_path_signature:{snapshot}")
+        }
         other => {
             return Err(panel_lifecycle_error(
                 "CALYX_PANEL_REGISTRY_INVALID",
@@ -6481,6 +6495,277 @@ fn optional_onehot_slot(
             )
         },
     )
+}
+
+/// Builds and atomically publishes one complete graph-position snapshot.
+///
+/// The caller supplies the exact source MVCC sequence used to aggregate
+/// `transitions`. Empty graphs and zero-count edges fail before generation
+/// allocation. Publication independently reads Registry, Graph, Base, and Slot
+/// rows before returning.
+pub fn publish_graph_position_snapshot(
+    vault: &SynapseCalyxVault,
+    kind: GraphPositionKind,
+    source_seq: u64,
+    created_at_ms: u64,
+    transitions: &[(String, String, u64)],
+) -> StorageResult<SynapseCalyxDerivedSnapshotReadback> {
+    if transitions.is_empty() {
+        return Err(measurement_error(
+            "graph-position snapshot has no transitions",
+            kind.panel_name(),
+        ));
+    }
+    if transitions
+        .iter()
+        .any(|(src, dst, count)| src.trim().is_empty() || dst.trim().is_empty() || *count == 0)
+    {
+        return Err(measurement_error(
+            "graph-position transitions require non-blank endpoints and positive counts",
+            kind.panel_name(),
+        ));
+    }
+    let snapshot = graph_snapshot_fingerprint(transitions);
+    let operation_id = sha256_hex(
+        &[
+            b"synapse-derived-graph-operation-v1".as_slice(),
+            kind.panel_name().as_bytes(),
+            &source_seq.to_be_bytes(),
+            &snapshot.to_be_bytes(),
+        ]
+        .concat(),
+    );
+    vault
+        .reserve_panel_generations(&[(kind.panel_name().to_owned(), kind.base_panel_version())])
+        .map_err(|error| measurement_error("reserve graph panel generation", error))?;
+    let allocation = vault
+        .allocate_panel_generation(kind.panel_name(), &operation_id)
+        .map_err(|error| measurement_error("allocate graph panel generation", error))?;
+    let panel_version = allocation.panel_generation;
+
+    let mut names = BTreeSet::new();
+    for (src, dst, _) in transitions {
+        names.insert(src.clone());
+        names.insert(dst.clone());
+    }
+    let ids = names
+        .iter()
+        .map(|name| (name.clone(), graph_node_cx_id(kind, name)))
+        .collect::<BTreeMap<_, _>>();
+    let edges = transitions
+        .iter()
+        .map(|(src, dst, count)| TransitionEdge {
+            src: ids[src],
+            dst: ids[dst],
+            count: *count as f64,
+        })
+        .collect::<Vec<_>>();
+    let graph = build_transition_graph(&edges)
+        .map_err(|error| measurement_error("build transition graph", error))?;
+    let structural = structural_signatures(&graph, StructuralParams::default())
+        .map_err(|error| measurement_error("measure structural signatures", error))?;
+    let mut neighbors = BTreeMap::<String, BTreeSet<String>>::new();
+    for (src, dst, _) in transitions {
+        neighbors
+            .entry(src.clone())
+            .or_default()
+            .insert(dst.clone());
+        neighbors
+            .entry(dst.clone())
+            .or_default()
+            .insert(src.clone());
+    }
+    let contract = syn_graph_position_panel_contract(kind, panel_version, snapshot, created_at_ms)?;
+    let vault_id = vault.vault_id_value();
+    let mut constellations = Vec::with_capacity(names.len());
+    for (index, name) in names.iter().enumerate() {
+        let observed = structural.get(&ids[name]).ok_or_else(|| {
+            measurement_error("structural pass omitted a graph node", kind.panel_name())
+        })?;
+        let signature = GraphPositionSignature {
+            in_degree: observed.in_degree as u64,
+            out_degree: observed.out_degree as u64,
+            total_degree: observed.total_degree as u64,
+            betweenness: observed.betweenness,
+            eigenvector: observed.eigenvector,
+            pagerank: observed.pagerank,
+            clustering: observed.clustering,
+            neighbor_labels: neighbors.get(name).into_iter().flatten().cloned().collect(),
+        };
+        let identity = graph_position_identity_bytes(kind, snapshot, name);
+        let context = NativeConstellationContext {
+            vault_id,
+            cx_id: vault.cx_id_for_input(&identity, panel_version),
+            created_at_ms,
+            next_ledger_seq: source_seq.saturating_add(index as u64).saturating_add(1),
+        };
+        constellations.push(build_graph_position_constellation(
+            context,
+            kind,
+            panel_version,
+            snapshot,
+            name,
+            &signature,
+        )?);
+    }
+    let mut graph_rows = Vec::with_capacity(transitions.len() + 1);
+    graph_rows.push(SynapseCalyxDerivedGraphRow {
+        key: derived_graph_key(kind, snapshot, b"manifest"),
+        value: serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "panel_name": kind.panel_name(),
+            "panel_version": panel_version,
+            "source_seq": source_seq,
+            "snapshot": snapshot,
+            "node_count": names.len(),
+            "edge_count": transitions.len(),
+        }))
+        .map_err(|error| measurement_error("encode graph snapshot manifest", error))?,
+    });
+    for (index, (src, dst, count)) in transitions.iter().enumerate() {
+        graph_rows.push(SynapseCalyxDerivedGraphRow {
+            key: derived_graph_key(kind, snapshot, &(index as u64).to_be_bytes()),
+            value: serde_json::to_vec(&json!({"src": src, "dst": dst, "count": count}))
+                .map_err(|error| measurement_error("encode graph snapshot edge", error))?,
+        });
+    }
+    vault
+        .publish_derived_snapshot(SynapseCalyxDerivedSnapshotRequest {
+            panel_name: kind.panel_name(),
+            operation_id: &operation_id,
+            panel: contract.panel,
+            registry: contract.registry,
+            constellations,
+            graph_rows,
+            source_seq,
+            snapshot,
+        })
+        .map_err(|error| measurement_error("publish graph-position snapshot", error))
+}
+
+fn graph_node_cx_id(kind: GraphPositionKind, name: &str) -> CxId {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-derived-graph-node-v1");
+    hasher.update(kind.identity_tag());
+    hasher.update((name.len() as u64).to_be_bytes());
+    hasher.update(name.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    CxId::from_bytes(bytes)
+}
+
+fn derived_graph_key(kind: GraphPositionKind, snapshot: u64, suffix: &[u8]) -> Vec<u8> {
+    let mut key = b"derived-graph\0v1\0".to_vec();
+    append_framed(&mut key, kind.panel_name().as_bytes());
+    append_framed(&mut key, &snapshot.to_be_bytes());
+    append_framed(&mut key, suffix);
+    key
+}
+
+/// Builds the immutable contract for one derived graph-position snapshot.
+///
+/// Unlike built-in source-row panels, the generation is allocated when the
+/// whole-graph snapshot is published. The snapshot fingerprint is part of the
+/// signature lens id, so callers must persist this exact contract beside the
+/// derived rows and must never infer it from the logical panel name.
+pub fn syn_graph_position_panel_contract(
+    kind: GraphPositionKind,
+    panel_version: u32,
+    snapshot: u64,
+    created_at_ms: u64,
+) -> StorageResult<SynActivePanelContract> {
+    let mut registry = Registry::new();
+    let slots = vec![
+        syn_content_slot(
+            kind.signature_slot(),
+            "syn.graphpos.signature.v1",
+            RegistryAlgorithmicLens::syn_graph_signature(
+                "syn.graphpos.signature.v1",
+                Modality::Structured,
+                snapshot,
+            ),
+            panel_version,
+            &mut registry,
+        )?,
+        syn_content_slot(
+            kind.neighbors_slot(),
+            "syn.graphpos.neighbor_histogram.v1",
+            RegistryAlgorithmicLens::syn_multi_hot(
+                "syn.graphpos.neighbor_histogram.v1",
+                Modality::Structured,
+                GP_NEIGHBOR_HISTOGRAM_DIM,
+            ),
+            panel_version,
+            &mut registry,
+        )?,
+    ];
+    assert_panel_carries_graded_dense_lens(panel_version, &slots, &registry)?;
+    Ok(SynActivePanelContract {
+        panel: Panel {
+            version: panel_version,
+            slots,
+            created_at: created_at_ms,
+            kernel_ref: None,
+            guard_ref: None,
+        },
+        registry,
+    })
+}
+
+/// Builds the immutable contract for one derived hierarchy snapshot.
+pub fn syn_path_hierarchy_panel_contract(
+    panel_version: u32,
+    snapshot: u64,
+    created_at_ms: u64,
+) -> StorageResult<SynActivePanelContract> {
+    let mut registry = Registry::new();
+    let slots = vec![
+        syn_content_slot(
+            PH_SLOT_SIGNATURE,
+            "syn.path_hierarchy.signature.v1",
+            RegistryAlgorithmicLens::syn_path_signature(
+                "syn.path_hierarchy.signature.v1",
+                Modality::Structured,
+                snapshot,
+            ),
+            panel_version,
+            &mut registry,
+        )?,
+        syn_content_slot(
+            PH_SLOT_ANCESTORS,
+            "syn.path_hierarchy.ancestor_set.v1",
+            RegistryAlgorithmicLens::syn_multi_hot(
+                "syn.path_hierarchy.ancestor_set.v1",
+                Modality::Structured,
+                PH_ANCESTOR_DIM,
+            ),
+            panel_version,
+            &mut registry,
+        )?,
+        syn_content_slot(
+            PH_SLOT_PATH_HASH,
+            "syn.path_hierarchy.path_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.path_hierarchy.path_hash.v1",
+                Modality::Structured,
+                PH_PATH_HASH_DIM,
+            ),
+            panel_version,
+            &mut registry,
+        )?,
+    ];
+    assert_panel_carries_graded_dense_lens(panel_version, &slots, &registry)?;
+    Ok(SynActivePanelContract {
+        panel: Panel {
+            version: panel_version,
+            slots,
+            created_at: created_at_ms,
+            kernel_ref: None,
+            guard_ref: None,
+        },
+        registry,
+    })
 }
 
 fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {

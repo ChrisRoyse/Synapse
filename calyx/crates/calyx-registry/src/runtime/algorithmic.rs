@@ -169,6 +169,10 @@ pub enum AlgorithmicEncoder {
     SynCross { dim: u32 },
     /// Dense deterministic aggregation summary over structured numerics.
     SynAggregation { dim: u32 },
+    /// Frozen structural-position signature bound to one graph snapshot.
+    SynGraphSignature { snapshot: u64 },
+    /// Frozen hierarchy-position signature bound to one graph snapshot.
+    SynPathSignature { snapshot: u64 },
 }
 
 impl AlgorithmicEncoder {
@@ -197,6 +201,7 @@ impl AlgorithmicEncoder {
             Self::SynOneHot { buckets } | Self::SynBin { buckets, .. } => buckets,
             Self::SynOneHotIndex { levels } => levels,
             Self::AstStyle => 8,
+            Self::SynGraphSignature { .. } | Self::SynPathSignature { .. } => 8,
             Self::SparseKeywords { dim }
             | Self::SparseKeywordsTf { dim }
             | Self::SynHash { dim }
@@ -337,6 +342,8 @@ impl AlgorithmicEncoder {
             | Self::SynRate { .. }
             | Self::SynCross { .. }
             | Self::SynAggregation { .. }
+            | Self::SynGraphSignature { .. }
+            | Self::SynPathSignature { .. }
             // Fixed-layout GDELT row parsers, reachable via their Text modality.
             | Self::GdeltCameo
             | Self::GdeltActorGeo { .. }
@@ -820,6 +827,22 @@ impl AlgorithmicLens {
         Self::new(name, modality, AlgorithmicEncoder::SynAggregation { dim })
     }
 
+    pub fn syn_graph_signature(name: impl Into<String>, modality: Modality, snapshot: u64) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynGraphSignature { snapshot },
+        )
+    }
+
+    pub fn syn_path_signature(name: impl Into<String>, modality: Modality, snapshot: u64) -> Self {
+        Self::new(
+            name,
+            modality,
+            AlgorithmicEncoder::SynPathSignature { snapshot },
+        )
+    }
+
     /// Creates an algorithmic lens from an encoder.
     pub fn new(name: impl Into<String>, modality: Modality, encoder: AlgorithmicEncoder) -> Self {
         let name = name.into();
@@ -944,6 +967,12 @@ impl AlgorithmicLens {
             AlgorithmicEncoder::SynRate { scale_micros } => syn::rate(&input.bytes, scale_micros)?,
             AlgorithmicEncoder::SynCross { dim } => syn::cross(&input.bytes, dim)?,
             AlgorithmicEncoder::SynAggregation { dim } => syn::aggregation(&input.bytes, dim)?,
+            AlgorithmicEncoder::SynGraphSignature { snapshot } => {
+                syn::graph_signature(&input.bytes, snapshot)?
+            }
+            AlgorithmicEncoder::SynPathSignature { snapshot } => {
+                syn::path_signature(&input.bytes, snapshot)?
+            }
         })
     }
 }

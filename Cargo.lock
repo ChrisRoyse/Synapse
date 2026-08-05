@@ -5373,6 +5373,7 @@ dependencies = [
  "calyx-forge",
  "calyx-lenses",
  "calyx-loom",
+ "calyx-mincut",
  "calyx-registry",
  "calyx-search",
  "calyx-sextant",

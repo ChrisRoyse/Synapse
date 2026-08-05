@@ -52,6 +52,9 @@ pub enum SynapseCalyxSourceProjection {
         pointer: String,
         encoding: SynapseCalyxProjectedValueEncoding,
     },
+    /// Whole-corpus measurement derived from one pinned source sequence.
+    /// These rows are published atomically and cannot use source-row backfill.
+    DerivedSnapshot { source_seq: u64, snapshot: u64 },
 }
 
 /// Stable byte encoding for a JSON-pointer projection.
@@ -72,6 +75,36 @@ pub struct SynapseCalyxPanelLifecycleState {
     pub panel_name: String,
     pub controller: SwapController,
     pub added_lenses: BTreeMap<LensId, SynapseCalyxAddedLens>,
+}
+
+/// One graph row staged into the atomic derived-snapshot publication.
+pub struct SynapseCalyxDerivedGraphRow {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+/// Exact immutable state for one whole-corpus derived snapshot.
+pub struct SynapseCalyxDerivedSnapshotRequest<'a> {
+    pub panel_name: &'a str,
+    pub operation_id: &'a str,
+    pub panel: Panel,
+    pub registry: Registry,
+    pub constellations: Vec<Constellation>,
+    pub graph_rows: Vec<SynapseCalyxDerivedGraphRow>,
+    pub source_seq: u64,
+    pub snapshot: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxDerivedSnapshotReadback {
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub source_seq: u64,
+    pub snapshot: u64,
+    pub constellation_count: u64,
+    pub graph_row_count: u64,
+    pub committed_seq: u64,
+    pub lifecycle_sha256: String,
 }
 
 /// One idempotent add-lens mutation request.
@@ -147,6 +180,107 @@ pub struct SynapseCalyxBackfillCompleteReadback {
 }
 
 impl SynapseCalyxVault {
+    /// Atomically publishes a fingerprinted graph snapshot, its exact frozen
+    /// panel contract, all derived constellations, and one ledger entry.
+    pub fn publish_derived_snapshot(
+        &self,
+        request: SynapseCalyxDerivedSnapshotRequest<'_>,
+    ) -> Result<SynapseCalyxDerivedSnapshotReadback, SynapseCalyxError> {
+        lifecycle_key(request.panel_name)?;
+        validate_operation_id(request.operation_id)?;
+        if request.constellations.is_empty() || request.graph_rows.is_empty() {
+            return Err(invalid(
+                "derived snapshot requires at least one graph row and one constellation",
+            ));
+        }
+        let allocation =
+            self.allocate_panel_generation(request.panel_name, request.operation_id)?;
+        if allocation.panel_generation != request.panel.version {
+            return Err(invalid(format!(
+                "derived snapshot generation {} differs from operation allocation {}",
+                request.panel.version, allocation.panel_generation
+            )));
+        }
+        let key = lifecycle_key(request.panel_name)?;
+        let mut added_lenses = BTreeMap::new();
+        for snapshot_row in request.registry.lens_snapshots() {
+            let spec = snapshot_row.spec.ok_or_else(|| {
+                invalid(format!(
+                    "derived panel lens {} has no durable LensSpec",
+                    snapshot_row.lens_id
+                ))
+            })?;
+            added_lenses.insert(
+                snapshot_row.lens_id,
+                SynapseCalyxAddedLens {
+                    operation_id: request.operation_id.to_owned(),
+                    lens_spec: spec,
+                    source_projection: SynapseCalyxSourceProjection::DerivedSnapshot {
+                        source_seq: request.source_seq,
+                        snapshot: request.snapshot,
+                    },
+                },
+            );
+        }
+        for slot in &request.panel.slots {
+            if !added_lenses.contains_key(&slot.lens_id) {
+                return Err(invalid(format!(
+                    "derived panel slot {} references unregistered lens {}",
+                    slot.slot_id, slot.lens_id
+                )));
+            }
+        }
+        let state = SynapseCalyxPanelLifecycleState {
+            schema_version: SCHEMA_VERSION,
+            panel_name: request.panel_name.to_owned(),
+            controller: SwapController::new(request.panel.clone()),
+            added_lenses,
+        };
+        let lifecycle_value = serde_json::to_vec(&state).map_err(|error| {
+            invalid(format!(
+                "encode derived lifecycle state for {}: {error}",
+                request.panel_name
+            ))
+        })?;
+        if let Some(existing) = self.read_cf_latest(ColumnFamily::Registry, &key)? {
+            if existing == lifecycle_value {
+                return derived_snapshot_readback(self, &request, &lifecycle_value);
+            }
+            return Err(conflict(format!(
+                "panel {} already has a different lifecycle state",
+                request.panel_name
+            )));
+        }
+        let mut rows = request
+            .graph_rows
+            .iter()
+            .map(|row| (ColumnFamily::Graph, row.key.clone(), row.value.clone()))
+            .collect::<Vec<_>>();
+        rows.push((ColumnFamily::Registry, key, lifecycle_value.clone()));
+        let payload = canonical_json_bytes(&serde_json::json!({
+            "operation": "publish_derived_snapshot",
+            "operation_id": request.operation_id,
+            "panel_name": request.panel_name,
+            "panel_version": request.panel.version,
+            "source_seq": request.source_seq,
+            "snapshot": request.snapshot,
+            "constellation_count": request.constellations.len(),
+            "graph_row_count": request.graph_rows.len(),
+        }))
+        .map_err(|error| SynapseCalyxError::from_calyx("encode derived snapshot ledger", &error))?;
+        self.vault
+            .put_batch_with_ingest_ledger_and_derived_rows(
+                request.constellations.clone(),
+                calyx_ledger::SubjectId::Query(request.operation_id.as_bytes().to_vec()),
+                payload,
+                calyx_ledger::ActorId::Service("synapse-derived-state".to_owned()),
+                rows,
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("publish atomic derived graph snapshot", &error)
+            })?;
+        derived_snapshot_readback(self, &request, &lifecycle_value)
+    }
     /// Lists every physical Base id in one panel, bounded before allocation.
     ///
     /// # Errors
@@ -826,7 +960,75 @@ fn project_source_bytes(
                 },
             }
         }
+        SynapseCalyxSourceProjection::DerivedSnapshot {
+            source_seq,
+            snapshot,
+        } => Err(SynapseCalyxError::new(
+            SYNAPSE_CALYX_PANEL_LIFECYCLE_INVALID,
+            format!(
+                "lens is derived from whole snapshot {snapshot} at source sequence {source_seq}, not one authoritative source row"
+            ),
+            "rebuild and atomically publish a new derived snapshot generation; source-row backfill is not valid for whole-graph measurements",
+        )),
     }
+}
+
+fn derived_snapshot_readback(
+    vault: &SynapseCalyxVault,
+    request: &SynapseCalyxDerivedSnapshotRequest<'_>,
+    lifecycle_value: &[u8],
+) -> Result<SynapseCalyxDerivedSnapshotReadback, SynapseCalyxError> {
+    let stored = vault
+        .read_cf_latest(ColumnFamily::Registry, &lifecycle_key(request.panel_name)?)?
+        .ok_or_else(|| conflict("derived lifecycle row is absent after publication"))?;
+    if stored != lifecycle_value {
+        return Err(conflict(
+            "derived lifecycle physical readback differs from published bytes",
+        ));
+    }
+    for row in &request.graph_rows {
+        let observed = vault
+            .read_cf_latest(ColumnFamily::Graph, &row.key)?
+            .ok_or_else(|| conflict("derived Graph row is absent after publication"))?;
+        if observed != row.value {
+            return Err(conflict(
+                "derived Graph row physical readback differs from published bytes",
+            ));
+        }
+    }
+    for constellation in &request.constellations {
+        let hydrated = vault
+            .hydrate_constellation_latest(constellation.cx_id)
+            .map_err(|error| {
+                SynapseCalyxError::new(
+                    error.code,
+                    format!(
+                        "read back derived constellation {}: {}",
+                        constellation.cx_id, error.message
+                    ),
+                    error.remediation,
+                )
+            })?;
+        // Aster assigns the batch's authoritative ledger reference at commit;
+        // every other byte must match the caller's measured constellation.
+        let mut expected = constellation.clone();
+        expected.provenance = hydrated.provenance.clone();
+        if hydrated != expected {
+            return Err(conflict(
+                "derived constellation physical Base/Slot readback differs from published value",
+            ));
+        }
+    }
+    Ok(SynapseCalyxDerivedSnapshotReadback {
+        panel_name: request.panel_name.to_owned(),
+        panel_version: request.panel.version,
+        source_seq: request.source_seq,
+        snapshot: request.snapshot,
+        constellation_count: request.constellations.len() as u64,
+        graph_row_count: request.graph_rows.len() as u64,
+        committed_seq: vault.latest_seq(),
+        lifecycle_sha256: hex_sha256(&stored),
+    })
 }
 
 fn decode_source_json(source_bytes: &[u8]) -> Result<serde_json::Value, SynapseCalyxError> {

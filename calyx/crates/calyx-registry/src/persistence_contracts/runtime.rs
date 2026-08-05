@@ -267,6 +267,12 @@ fn algorithmic_lens(spec: &LensSpec, kind: &str) -> Option<AlgorithmicLens> {
         ["syn_aggregation", dim] => AlgorithmicEncoder::SynAggregation {
             dim: parse_u32(dim)?,
         },
+        ["syn_graph_signature", snapshot] => AlgorithmicEncoder::SynGraphSignature {
+            snapshot: parse_u64(snapshot)?,
+        },
+        ["syn_path_signature", snapshot] => AlgorithmicEncoder::SynPathSignature {
+            snapshot: parse_u64(snapshot)?,
+        },
         _ => return None,
     };
     Some(AlgorithmicLens::new(&spec.name, spec.modality, encoder))

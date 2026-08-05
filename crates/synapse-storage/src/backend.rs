@@ -768,6 +768,13 @@ pub trait StorageBackend: Send + Sync {
         &self,
         panel_version: u32,
     ) -> StorageResult<Option<synapse_calyx::panel_lifecycle::SynapseCalyxPanelLifecycleState>>;
+    fn publish_graph_position_snapshot(
+        &self,
+        kind: constellations::GraphPositionKind,
+        source_seq: u64,
+        created_at_ms: u64,
+        transitions: &[(String, String, u64)],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback>;
     fn run_panel_backfill(
         &self,
         panel_version: u32,
@@ -2588,11 +2595,21 @@ fn resolve_panel_contract(
     }
     let mut matched = None;
     for entry in constellations::builtin_panel_catalog() {
-        let Some(base) = syn_active_panel_contract(entry.panel_version, created_at_ms)? else {
-            continue;
+        let base_registry = match syn_active_panel_contract(entry.panel_version, created_at_ms)? {
+            Some(base) => base.registry,
+            None if matches!(
+                entry.panel_name,
+                constellations::SYN_GRAPHPOS_APP_PANEL_NAME
+                    | constellations::SYN_GRAPHPOS_PROCESS_PANEL_NAME
+                    | constellations::SYN_PATH_HIERARCHY_PANEL_NAME
+            ) =>
+            {
+                calyx_registry::Registry::new()
+            }
+            None => continue,
         };
         let Some(candidate) = vault
-            .reconstruct_panel_lifecycle_contract(entry.panel_name, base.registry)
+            .reconstruct_panel_lifecycle_contract(entry.panel_name, base_registry)
             .map_err(|source| {
                 calyx_write_failed(
                     "calyx_registry",
@@ -4452,6 +4469,29 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn publish_graph_position_snapshot(
+        &self,
+        kind: constellations::GraphPositionKind,
+        source_seq: u64,
+        created_at_ms: u64,
+        transitions: &[(String, String, u64)],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback> {
+        self.with_vault(
+            "calyx_graph",
+            "publish atomic graph-position snapshot",
+            true,
+            |vault| {
+                constellations::publish_graph_position_snapshot(
+                    vault,
+                    kind,
+                    source_seq,
+                    created_at_ms,
+                    transitions,
+                )
             },
         )
     }

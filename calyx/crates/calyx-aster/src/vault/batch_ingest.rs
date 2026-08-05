@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::store::DuplicatePutPolicy;
 use super::{AsterVault, PutDisposition, PutOutcome, anchor_merge, ledger_hook, prepared};
@@ -7,6 +7,7 @@ use crate::media_artifact::{
     DerivedMediaArtifactDraft, DerivedMediaArtifactRecord, derived_media_artifact_write_rows,
     ensure_no_artifact_collision,
 };
+use crate::vault::encode::WriteRow;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, VaultStore};
 use calyx_ledger::{ActorId, EntryKind, PayloadBuilder, RedactionPolicy, SubjectId};
 use serde_json::json;
@@ -46,6 +47,7 @@ where
                 input,
                 None,
                 None,
+                Vec::new(),
                 DuplicatePutPolicy::StrictConstellation,
             )
             .map(|commit| commit.outcomes)
@@ -70,6 +72,7 @@ where
                 input,
                 None,
                 None,
+                Vec::new(),
                 DuplicatePutPolicy::ContentObservation,
             )
             .map(|commit| commit.outcomes)
@@ -125,6 +128,7 @@ where
                     actor,
                 }),
                 Some(artifact),
+                Vec::new(),
                 DuplicatePutPolicy::StrictConstellation,
             )?;
             let artifact = commit.artifact.ok_or_else(|| {
@@ -143,6 +147,55 @@ where
         })
     }
 
+    /// Atomically ingests derived constellations and their Graph/Registry
+    /// publication rows under one ledger entry and one MVCC sequence.
+    ///
+    /// This is the publication boundary for whole-corpus derived snapshots:
+    /// readers can never observe a graph marker or immutable panel contract
+    /// without the Base/Slot rows it describes. Additional writes are limited
+    /// to Graph and Registry so callers cannot bypass constellation encoding,
+    /// ledger construction, or the dedicated APIs for sacred row families.
+    pub fn put_batch_with_ingest_ledger_and_derived_rows<I>(
+        &self,
+        constellations: I,
+        subject: SubjectId,
+        payload: Vec<u8>,
+        actor: ActorId,
+        additional_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<CxId>>
+    where
+        I: IntoIterator<Item = Constellation>,
+    {
+        RedactionPolicy::check_payload(&payload)?;
+        validate_derived_rows(&additional_rows)?;
+        let input = constellations.into_iter().collect::<Vec<_>>();
+        if input.is_empty() {
+            return Err(derived_batch_invalid(
+                "derived snapshot publication requires at least one constellation",
+            ));
+        }
+        self.with_durable_commit_lock(|| {
+            self.put_batch_locked_with_options(
+                input,
+                Some(BatchLedgerEntry {
+                    subject,
+                    payload,
+                    actor,
+                }),
+                None,
+                additional_rows,
+                DuplicatePutPolicy::StrictConstellation,
+            )
+            .map(|commit| {
+                commit
+                    .outcomes
+                    .into_iter()
+                    .map(|outcome| outcome.cx_id)
+                    .collect()
+            })
+        })
+    }
+
     fn put_batch_locked_with_ledger(
         &self,
         input: Vec<Constellation>,
@@ -152,6 +205,7 @@ where
             input,
             ledger_entry,
             None,
+            Vec::new(),
             DuplicatePutPolicy::StrictConstellation,
         )
         .map(|commit| {
@@ -168,6 +222,7 @@ where
         input: Vec<Constellation>,
         ledger_entry: Option<BatchLedgerEntry>,
         artifact: Option<DerivedMediaArtifactDraft>,
+        additional_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
         duplicate_policy: DuplicatePutPolicy,
     ) -> Result<BatchIngestCommit> {
         let latest = self.snapshot();
@@ -273,7 +328,7 @@ where
                 encoding: prepared,
             });
         }
-        if accepted.is_empty() && artifact.is_none() {
+        if accepted.is_empty() && artifact.is_none() && additional_rows.is_empty() {
             if !anchor_merge_rows.is_empty() {
                 self.commit_rows_locked(&anchor_merge_rows)?;
             }
@@ -283,6 +338,11 @@ where
             });
         }
         let mut rows = anchor_merge_rows;
+        rows.extend(
+            additional_rows
+                .into_iter()
+                .map(|(cf, key, value)| WriteRow { cf, key, value }),
+        );
         let mut hook_guard = match &self.ledger_hook {
             Some(hook) => Some(ledger_hook::lock_hook(hook)?),
             None => None,
@@ -419,4 +479,42 @@ fn batch_payload(constellations: &[PreparedBatchConstellation]) -> Vec<u8> {
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn validate_derived_rows(rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)]) -> Result<()> {
+    if rows.is_empty() {
+        return Err(derived_batch_invalid(
+            "derived snapshot publication requires Graph/Registry rows",
+        ));
+    }
+    let mut identities = BTreeSet::new();
+    for (cf, key, value) in rows {
+        if !matches!(cf, ColumnFamily::Graph | ColumnFamily::Registry) {
+            return Err(derived_batch_invalid(format!(
+                "derived snapshot row targets {}, only Graph and Registry are admitted",
+                cf.name()
+            )));
+        }
+        if key.is_empty() || value.is_empty() {
+            return Err(derived_batch_invalid(format!(
+                "derived snapshot {} row has an empty key or value",
+                cf.name()
+            )));
+        }
+        if !identities.insert((*cf, key.as_slice())) {
+            return Err(derived_batch_invalid(format!(
+                "derived snapshot repeats one {} key inside the atomic batch",
+                cf.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn derived_batch_invalid(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_DERIVED_BATCH_INVALID",
+        message: message.into(),
+        remediation: "stage one non-empty, duplicate-free Graph/Registry snapshot plus at least one constellation through the atomic derived-batch API",
+    }
 }

@@ -509,6 +509,117 @@ pub(super) fn aggregation(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     dense(data)
 }
 
+pub(super) fn graph_signature(bytes: &[u8], _snapshot: u64) -> Result<SlotVector> {
+    let value = parse_json(bytes, "syn graph signature input")?;
+    let obj = require_object(&value, "syn graph signature")?;
+    let in_degree = require_nonneg(obj, "in_degree", "syn graph signature")?;
+    let out_degree = require_nonneg(obj, "out_degree", "syn graph signature")?;
+    let total_degree = require_nonneg(obj, "total_degree", "syn graph signature")?;
+    let betweenness = require_unit(obj, "betweenness", "syn graph signature")?;
+    let eigenvector = require_unit(obj, "eigenvector", "syn graph signature")?;
+    let pagerank = require_unit(obj, "pagerank", "syn graph signature")?;
+    let clustering = require_unit(obj, "clustering", "syn graph signature")?;
+    let in_ratio = if total_degree > 0.0 {
+        in_degree / total_degree
+    } else {
+        0.5
+    };
+    dense(vec![
+        finite_f32(in_degree.ln_1p().tanh(), "syn graph signature in_degree")?,
+        finite_f32(out_degree.ln_1p().tanh(), "syn graph signature out_degree")?,
+        finite_f32(
+            total_degree.ln_1p().tanh(),
+            "syn graph signature total_degree",
+        )?,
+        finite_f32(betweenness, "syn graph signature betweenness")?,
+        finite_f32(eigenvector, "syn graph signature eigenvector")?,
+        finite_f32(pagerank, "syn graph signature pagerank")?,
+        finite_f32(clustering, "syn graph signature clustering")?,
+        finite_f32(in_ratio, "syn graph signature in_ratio")?,
+    ])
+}
+
+pub(super) fn path_signature(bytes: &[u8], _snapshot: u64) -> Result<SlotVector> {
+    let value = parse_json(bytes, "syn path signature input")?;
+    let obj = require_object(&value, "syn path signature")?;
+    let depth = require_nonneg(obj, "depth", "syn path signature")?;
+    let sibling_rank = require_nonneg(obj, "sibling_rank", "syn path signature")?;
+    let sibling_count = require_nonneg(obj, "sibling_count", "syn path signature")?;
+    let subtree_size = require_nonneg(obj, "subtree_size", "syn path signature")?;
+    let ancestor_count = require_nonneg(obj, "ancestor_count", "syn path signature")?;
+    let path_len = require_nonneg(obj, "path_len", "syn path signature")?;
+    let is_root = optional_bool(obj, "is_root", "syn path signature")?;
+    let is_leaf = optional_bool(obj, "is_leaf", "syn path signature")?;
+    if sibling_count > 0.0 && sibling_rank > sibling_count - 1.0 {
+        return Err(numerical(
+            "syn path signature sibling_rank must be < sibling_count",
+        ));
+    }
+    let sibling_norm = if sibling_count > 1.0 {
+        sibling_rank / (sibling_count - 1.0)
+    } else {
+        0.0
+    };
+    dense(vec![
+        finite_f32(depth.ln_1p().tanh(), "syn path signature depth")?,
+        finite_f32(sibling_norm, "syn path signature sibling_rank")?,
+        finite_f32(
+            subtree_size.ln_1p().tanh(),
+            "syn path signature subtree_size",
+        )?,
+        finite_f32(
+            ancestor_count.ln_1p().tanh(),
+            "syn path signature ancestor_count",
+        )?,
+        finite_f32(path_len.ln_1p().tanh(), "syn path signature path_len")?,
+        finite_f32(is_root, "syn path signature is_root")?,
+        finite_f32(is_leaf, "syn path signature is_leaf")?,
+        finite_f32(
+            sibling_count.ln_1p().tanh(),
+            "syn path signature sibling_count",
+        )?,
+    ])
+}
+
+fn require_object<'a>(value: &'a Value, label: &str) -> Result<&'a serde_json::Map<String, Value>> {
+    value
+        .as_object()
+        .ok_or_else(|| numerical(format!("{label} input must be a JSON object")))
+}
+
+fn require_number(obj: &serde_json::Map<String, Value>, key: &str, label: &str) -> Result<f64> {
+    let field = obj
+        .get(key)
+        .ok_or_else(|| numerical(format!("{label} missing field {key}")))?;
+    numeric_from_json(&format!("{label} field {key}"), field)
+}
+
+fn require_nonneg(obj: &serde_json::Map<String, Value>, key: &str, label: &str) -> Result<f64> {
+    let value = require_number(obj, key, label)?;
+    if value < 0.0 {
+        return Err(numerical(format!("{label} field {key} must be >= 0")));
+    }
+    Ok(value)
+}
+
+fn require_unit(obj: &serde_json::Map<String, Value>, key: &str, label: &str) -> Result<f64> {
+    let value = require_number(obj, key, label)?;
+    if !(0.0..=1.0).contains(&value) {
+        return Err(numerical(format!("{label} field {key} must be in [0, 1]")));
+    }
+    Ok(value)
+}
+
+fn optional_bool(obj: &serde_json::Map<String, Value>, key: &str, label: &str) -> Result<f64> {
+    match obj.get(key) {
+        None => Ok(0.0),
+        Some(Value::Bool(value)) => Ok(f64::from(*value)),
+        Some(other) => Err(numerical(format!(
+            "{label} field {key} must be boolean, got {other:?}"
+        ))),
+    }
+}
+
 fn scaled_tanh(bytes: &[u8], scale_micros: u64, label: &str) -> Result<SlotVector> {
     if scale_micros == 0 {
         return Err(numerical(format!("{label} scale_micros must be > 0")));

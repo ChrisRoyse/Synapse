@@ -229,6 +229,11 @@ fn syn_output_shape(kind: &str, dim: u32) -> Result<Option<SlotShape>> {
         ["syn_record_vector"] | ["syn_record_vector_unit_fields"] | ["syn_aggregation"] => {
             SlotShape::Dense(checked_positive(kind, dim)?)
         }
+        ["syn_graph_signature", snapshot] | ["syn_path_signature", snapshot] => {
+            parse_u64_value(kind, snapshot)?;
+            checked_match(kind, dim, 8)?;
+            SlotShape::Dense(8)
+        }
         ["syn_record_vector", parsed]
         | ["syn_record_vector_unit_fields", parsed]
         | ["syn_aggregation", parsed] => {
@@ -367,6 +372,12 @@ fn syn_encoder_from_kind(kind: &str, shape: SlotShape) -> Result<Option<Algorith
         },
         ["syn_aggregation", dim] => AlgorithmicEncoder::SynAggregation {
             dim: parse_u32_value(kind, dim)?,
+        },
+        ["syn_graph_signature", snapshot] => AlgorithmicEncoder::SynGraphSignature {
+            snapshot: parse_u64_value(kind, snapshot)?,
+        },
+        ["syn_path_signature", snapshot] => AlgorithmicEncoder::SynPathSignature {
+            snapshot: parse_u64_value(kind, snapshot)?,
         },
         _ => return Ok(None),
     };

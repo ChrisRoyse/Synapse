@@ -1798,6 +1798,19 @@ impl Db {
         self.backend.close_calyx_vault(reason)
     }
 
+    /// Atomically publishes structural positions computed from one coherent
+    /// source snapshot into Graph, Registry, Base, Slot, and Ledger families.
+    pub fn publish_graph_position_snapshot(
+        &self,
+        kind: constellations::GraphPositionKind,
+        source_seq: u64,
+        created_at_ms: u64,
+        transitions: &[(String, String, u64)],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback> {
+        self.backend
+            .publish_graph_position_snapshot(kind, source_seq, created_at_ms, transitions)
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_TIMELINE` row.
     ///

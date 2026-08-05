@@ -43,6 +43,9 @@ use synapse_calyx::{
 };
 
 use crate::Db;
+use crate::cf;
+use crate::constellations::{GraphPositionKind, SYN_GRAPHPOS_APP_PANEL_VERSION};
+use synapse_core::types::{TimelineKind, TimelineRecord};
 
 /// How often the derived-state maintainer runs.
 ///
@@ -420,6 +423,11 @@ pub(crate) fn run_derived_state_maintenance() {
     let mut any_failed = false;
     let mut current_panel_coverage = None;
 
+    if let Err(error) = drive_app_transition_graph(&db) {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_APP_GRAPH_FAILED", error.to_string());
+    }
+
     // --- Durable hot-added lens backfill (#1668) ---
     // Run before search maintenance so a generation rebuilt on this same tick
     // can include the newly materialized Slot CF rows.
@@ -721,6 +729,102 @@ pub(crate) fn run_derived_state_maintenance() {
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+}
+
+fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
+    let mut lease = db.pin_cf_physical_scan(cf::CF_TIMELINE, crate::COHERENT_SCAN_MAX_AGE_MS)?;
+    let source_seq = lease.snapshot_seq;
+    let mut previous = None::<String>;
+    let mut counts = BTreeMap::<(String, String), u64>::new();
+    loop {
+        let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = db.release_coherent_scan(&mut lease);
+                return Err(error);
+            }
+        };
+        for (key, value) in page.rows {
+            let record: TimelineRecord = match serde_json::from_slice(&value) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = db.release_coherent_scan(&mut lease);
+                    return Err(crate::StorageError::BackendInvalidConfig {
+                        value: format!("{key:02x?}"),
+                        detail: format!(
+                            "decode coherent CF_TIMELINE row for app-transition graph: {error}"
+                        ),
+                    });
+                }
+            };
+            if record.kind != TimelineKind::FocusChange {
+                continue;
+            }
+            let Some(app) = record.app.filter(|value| !value.trim().is_empty()) else {
+                continue;
+            };
+            if let Some(from) = previous.replace(app.clone())
+                && from != app
+            {
+                *counts.entry((from, app)).or_default() += 1;
+            }
+        }
+        if !page.more {
+            break;
+        }
+    }
+    db.release_coherent_scan(&mut lease)?;
+    if counts.is_empty() {
+        tracing::debug!(
+            code = "STORAGE_DERIVED_STATE_APP_GRAPH_INELIGIBLE",
+            source_seq,
+            "coherent timeline snapshot has fewer than two distinct consecutive focus apps"
+        );
+        return Ok(());
+    }
+    let transitions = counts
+        .into_iter()
+        .map(|((src, dst), count)| (src, dst, count))
+        .collect::<Vec<_>>();
+    let fingerprint = crate::constellations::graph_snapshot_fingerprint(&transitions);
+    if let Some(state) = db.read_panel_lifecycle(SYN_GRAPHPOS_APP_PANEL_VERSION)? {
+        let already_published = state.added_lenses.values().any(|added| {
+            matches!(
+                added.source_projection,
+                synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection::DerivedSnapshot {
+                    snapshot,
+                    ..
+                } if snapshot == fingerprint
+            )
+        });
+        if already_published {
+            tracing::debug!(
+                code = "STORAGE_DERIVED_STATE_APP_GRAPH_CURRENT",
+                source_seq,
+                fingerprint,
+                "app-transition graph snapshot is already physically published"
+            );
+            return Ok(());
+        }
+    }
+    let readback = db.publish_graph_position_snapshot(
+        GraphPositionKind::App,
+        source_seq,
+        now_unix_ms().unwrap_or(lease.read_at_unix_ms),
+        &transitions,
+    )?;
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_APP_GRAPH_PUBLISHED",
+        panel_version = readback.panel_version,
+        source_seq = readback.source_seq,
+        snapshot = readback.snapshot,
+        constellation_count = readback.constellation_count,
+        graph_row_count = readback.graph_row_count,
+        committed_seq = readback.committed_seq,
+        lifecycle_sha256 = readback.lifecycle_sha256,
+        "scheduled app-transition graph snapshot was atomically published and physically read back"
+    );
+    Ok(())
 }
 
 fn drive_scheduled_kernels(
