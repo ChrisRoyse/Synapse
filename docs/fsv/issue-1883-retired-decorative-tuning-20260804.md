@@ -78,3 +78,46 @@ temporal_boost_max   a6d6013b...5f69b6
 
 The final accepted tuning schema contains only fields with a named production
 consumer. Health therefore cannot report an inert configured value.
+
+## Installed-system verification
+
+The first official deployment attempt failed closed and rolled back because the
+production Anneal live pointer referenced an old tuning JSON artifact containing
+the retired fields. The candidate log named the exact artifact and field; the
+installed binary remained the prior SHA-256 after rollback.
+
+Commit `23fba6f9` added a narrow durable migration at the Anneal artifact
+boundary. It removes only the seven documented retired keys from a hash-verified
+legacy JSON object, strictly deserializes every remaining field, validates the
+tuning, writes canonical new content-addressed bytes, swaps the native
+AnnealRollback live pointer, and reads it back. TOML config parsing remains
+strict and does not use this migration.
+
+The second `synapse-setup.ps1` transaction succeeded. Independent post-setup
+readback:
+
+```text
+installed exe = C:\Users\hotra\.cargo\bin\synapse-mcp.exe
+exe sha256    = E3C15810E0D12C88108A986AEE923E3217A4735236524EDA912EDD87E855D39D
+process pid   = 22324
+listener pid  = 22324 (127.0.0.1:7700)
+/health ok    = true
+calyx_vault   = ok
+inert knobs   = 0
+```
+
+Authenticated `/health` contained 11 tuning rows and every row declared
+`enforcement=load_bearing`. The response had no `calyx_bit_floor_bits` or
+`calyx_correlation_ceiling` field.
+
+The production structured log independently recorded the durable pointer
+transition:
+
+```text
+code=SYNAPSE_CALYX_ANNEAL_TUNING_SCHEMA_MIGRATED
+prior=8ed7f65833059660a0f15ebcf2afea1701bbd42bd9d63db3a1b5842230872a78
+live =f27f4058998e32f90ba18253d0de8e51c506575309dd1c449c480e4a4b5a3634
+```
+
+The next log row reopened the migrated pointer and reported the retained
+load-bearing values `fusion_k=60` and `index_ef_search=64`.
