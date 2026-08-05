@@ -434,13 +434,14 @@ pub(super) async fn handle(
             Ok(Json(storage_response(
                 operation,
                 format!(
-                    "Calyx Base temporal migration source_cf={} scope={} examined={} inserted={} changed={} current={} latest_seq={}",
+                    "Calyx Base temporal migration source_cf={} scope={} examined={} inserted={} changed={} current={} temporal_ineligible={} latest_seq={}",
                     response.source_cf,
                     response.source_scope,
                     response.examined_rows,
                     response.inserted_rows,
                     response.backfilled_rows,
                     response.already_current_rows,
+                    response.temporal_ineligible_rows,
                     response.latest_seq
                 ),
                 |out| out.temporal_backfill = Some(response),

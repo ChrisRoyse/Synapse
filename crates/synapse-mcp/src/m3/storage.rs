@@ -1380,6 +1380,9 @@ pub struct StorageTemporalBackfillResponse {
     pub inserted_rows: u64,
     pub backfilled_rows: u64,
     pub already_current_rows: u64,
+    /// Rows whose authoritative source has no event time and therefore no
+    /// temporal lane to migrate.
+    pub temporal_ineligible_rows: u64,
     /// Rows this page grounded with a declared tool-call outcome (#1926).
     pub outcome_anchored_rows: u64,
     /// Rows this page examined that carried no outcome to write at all.
@@ -3462,6 +3465,7 @@ pub fn run_temporal_backfill(
         inserted_rows: report.inserted_rows,
         backfilled_rows: report.backfilled_rows,
         already_current_rows: report.already_current_rows,
+        temporal_ineligible_rows: report.temporal_ineligible_rows,
         outcome_anchored_rows: report.outcome_anchored_rows,
         outcome_absent_rows: report.outcome_absent_rows,
         outcome_unadjudicable_rows: report.outcome_unadjudicable_rows,

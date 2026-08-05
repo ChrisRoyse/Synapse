@@ -5290,6 +5290,7 @@ impl StorageBackend for CalyxBackend {
         let mut inserted_rows = 0_u64;
         let mut backfilled_rows = 0_u64;
         let mut already_current_rows = 0_u64;
+        let mut temporal_ineligible_rows = 0_u64;
         let mut outcome_anchored_rows = 0_u64;
         let mut outcome_absent_rows = 0_u64;
         let mut outcome_unadjudicable_rows = 0_u64;
@@ -5435,28 +5436,37 @@ impl StorageBackend for CalyxBackend {
                         })?;
                     let (identity, temporal) =
                         constellations::temporal_migration_metadata(&expected);
-                    let migration = vault
-                        .backfill_temporal_metadata(
-                            expected.cx_id,
-                            expected.panel_version,
-                            &identity,
-                            &temporal,
+                    let migration = if !constellations::temporal_migration_eligible(&temporal)? {
+                        None
+                    } else {
+                        Some(
+                            vault
+                                .backfill_temporal_metadata(
+                                    expected.cx_id,
+                                    expected.panel_version,
+                                    &identity,
+                                    &temporal,
+                                )
+                                .map_err(|error| {
+                                    calyx_write_failed(
+                                        "calyx_temporal_metadata_backfill",
+                                        "backfill Calyx temporal metadata",
+                                        &error,
+                                    )
+                                })?,
                         )
-                        .map_err(|error| {
-                            calyx_write_failed(
-                                "calyx_temporal_metadata_backfill",
-                                "backfill Calyx temporal metadata",
-                                &error,
-                            )
-                        })?;
+                    };
                     Ok((put.disposition, migration, expected.cx_id))
                 },
             )?;
+            if disposition.1.is_none() {
+                temporal_ineligible_rows = temporal_ineligible_rows.saturating_add(1);
+            }
             if disposition.0.inserted() {
                 inserted_rows = inserted_rows.saturating_add(1);
-            } else if disposition.1.changed() {
+            } else if disposition.1.as_ref().is_some_and(|value| value.changed()) {
                 backfilled_rows = backfilled_rows.saturating_add(1);
-            } else {
+            } else if disposition.1.is_some() {
                 already_current_rows = already_current_rows.saturating_add(1);
             }
 
@@ -5536,6 +5546,7 @@ impl StorageBackend for CalyxBackend {
             inserted_rows,
             backfilled_rows,
             already_current_rows,
+            temporal_ineligible_rows,
             outcome_anchored_rows,
             outcome_absent_rows,
             outcome_unadjudicable_rows,

@@ -766,6 +766,10 @@ pub struct TemporalMetadataBackfillReport {
     pub inserted_rows: u64,
     pub backfilled_rows: u64,
     pub already_current_rows: u64,
+    /// Rows whose authoritative source declares no event time and therefore no
+    /// active temporal lane. They remain valid panel records but are not
+    /// candidates for temporal metadata migration.
+    pub temporal_ineligible_rows: u64,
     /// Rows this page grounded with a declared tool-call outcome anchor
     /// (#1926). Always 0 for CFs that carry no adjudicated outcome. A sweep
     /// that re-measures rows but grounds none of them is a visible fact here
@@ -999,6 +1003,44 @@ pub fn temporal_migration_metadata(
     })
     .collect();
     (identity, temporal)
+}
+
+/// Classifies the authoritative temporal metadata contract for migration.
+///
+/// An explicitly inactive lane is valid only when it carries a non-empty
+/// reason and no event-time coordinates. Every other non-active shape is a
+/// contract error rather than an ineligible-row shortcut.
+pub fn temporal_migration_eligible(temporal: &BTreeMap<String, String>) -> StorageResult<bool> {
+    match temporal
+        .get(METADATA_TEMPORAL_LANE_STATE)
+        .map(String::as_str)
+    {
+        Some(TEMPORAL_LANE_ACTIVE) => Ok(true),
+        Some(TEMPORAL_LANE_INACTIVE) => {
+            let reason_present = temporal
+                .get(METADATA_TEMPORAL_INACTIVE_REASON)
+                .is_some_and(|value| !value.is_empty());
+            let coordinates_absent = [
+                METADATA_SOURCE_EVENT_TIME_SECS,
+                METADATA_SOURCE_EVENT_TIME_RAW,
+                METADATA_SOURCE_SEQUENCE,
+            ]
+            .into_iter()
+            .all(|key| !temporal.contains_key(key));
+            if reason_present && coordinates_absent {
+                Ok(false)
+            } else {
+                Err(measurement_error(
+                    "inactive temporal lane requires a non-empty reason and no event-time coordinates",
+                    format!("temporal_metadata={temporal:?}"),
+                ))
+            }
+        }
+        state => Err(measurement_error(
+            "authoritative temporal metadata has no recognized lane state",
+            format!("lane_state={state:?} temporal_metadata={temporal:?}"),
+        )),
+    }
 }
 
 impl ConstellationPutReport {
@@ -4672,7 +4714,7 @@ pub fn build_process_constellation(
 ) -> StorageResult<Constellation> {
     ensure_json_object(record, cf::CF_PROCESS_HISTORY)?;
     let mut slots = BTreeMap::new();
-    let ts_ns = process_ts_ns(record);
+    let ts_ns = process_ts_ns(record)?;
     slots.insert(
         PR_SLOT_PROCESS_HASH,
         optional_hash_slot(
@@ -4719,7 +4761,7 @@ pub fn build_process_constellation(
     );
 
     let scalars = process_scalars(record, raw_bytes)?;
-    let metadata = process_metadata(source_key, raw_bytes, record);
+    let metadata = process_metadata(source_key, raw_bytes, record)?;
     constellation(
         context,
         SYN_PROCESS_PANEL_VERSION,
@@ -5565,7 +5607,7 @@ fn process_scalars(record: &Value, raw_bytes: &[u8]) -> StorageResult<BTreeMap<S
     insert_optional_u64_scalar(
         &mut scalars,
         "ts_unix_ms",
-        process_ts_ns(record).map(|value| value / NS_PER_MS),
+        process_ts_ns(record)?.map(|value| value / NS_PER_MS),
     )?;
     insert_optional_u64_scalar(&mut scalars, "pid", json_u64(record, &["pid"]))?;
     insert_optional_u64_scalar(
@@ -6159,7 +6201,7 @@ fn process_metadata(
     source_key: &[u8],
     raw_bytes: &[u8],
     record: &Value,
-) -> BTreeMap<String, String> {
+) -> StorageResult<BTreeMap<String, String>> {
     let mut metadata = common_metadata(
         SYN_PROCESS_PANEL_NAME,
         cf::CF_PROCESS_HISTORY,
@@ -6167,7 +6209,7 @@ fn process_metadata(
         raw_bytes,
     );
     metadata.insert("process_event_kind".to_owned(), process_event_kind(record));
-    if let Some(ts_ns) = process_ts_ns(record) {
+    if let Some(ts_ns) = process_ts_ns(record)? {
         metadata.insert(META_EXACT_TS_NS.to_owned(), ts_ns.to_string());
         metadata.insert(META_TIME_BASIS.to_owned(), TIME_BASIS_UTC.to_owned());
         activate_temporal_lane(&mut metadata, ts_ns, source_key);
@@ -6191,7 +6233,7 @@ fn process_metadata(
         "process_status",
         json_string(record, &["status"]).as_deref(),
     );
-    metadata
+    Ok(metadata)
 }
 
 fn observation_metadata(
@@ -8069,9 +8111,34 @@ fn process_identity_text(record: &Value) -> Option<String> {
     )
 }
 
-fn process_ts_ns(record: &Value) -> Option<u64> {
-    json_u64(record, &["ts_ns"]).or_else(|| {
-        json_u64(record, &["launched_at_unix_ms"]).map(|value| value.saturating_mul(NS_PER_MS))
+fn process_ts_ns(record: &Value) -> StorageResult<Option<u64>> {
+    if let Some(value) = record.get("ts_ns") {
+        return optional_exact_u64(value, "ts_ns");
+    }
+    let Some(value) = record.get("launched_at_unix_ms") else {
+        return Ok(None);
+    };
+    optional_exact_u64(value, "launched_at_unix_ms")?
+        .map(|value| {
+            value.checked_mul(NS_PER_MS).ok_or_else(|| {
+                measurement_error(
+                    "process timestamp overflows nanoseconds",
+                    format!("launched_at_unix_ms={value}"),
+                )
+            })
+        })
+        .transpose()
+}
+
+fn optional_exact_u64(value: &Value, field: &str) -> StorageResult<Option<u64>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    value.as_u64().map(Some).ok_or_else(|| {
+        measurement_error(
+            "process timestamp must be an unsigned JSON integer or null",
+            format!("field={field} value={value}"),
+        )
     })
 }
 
