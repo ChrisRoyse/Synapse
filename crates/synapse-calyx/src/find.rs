@@ -529,6 +529,20 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxFindParams,
         supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
+        self.find_similar_in_panel_with_fusion_k(
+            params,
+            supplied,
+            self.effective_tuning()?.fusion_k,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn find_similar_in_panel_with_fusion_k(
+        &self,
+        params: &SynapseCalyxFindParams,
+        supplied: Option<&VaultPanelState>,
+        rrf_k: u32,
+    ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
         // Hot-path boundary (#1686): fused find is an off-runtime intelligence
         // query and must never be driven from a tagged reflex/capture tick.
         crate::lowering::hot_context::assert_cold_calyx("find_similar");
@@ -703,7 +717,6 @@ impl SynapseCalyxVault {
         // scoring law it names (#1883). Validated at config load, re-validated
         // here so an out-of-domain value fails the query loudly rather than
         // producing a silently misordered ranking.
-        let rrf_k = self.config.tuning.fusion_k;
         let fusion_tuning = FusionTuning::new(rrf_k).map_err(|error| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_FIND_FUSION_TUNING_INVALID",

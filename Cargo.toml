@@ -42,6 +42,7 @@ publish = false
 # Same reason as calyx/Cargo.toml: a bare `{ path = ... }` is a `*` requirement
 # and `deny.toml` bans wildcards (#1930).
 calyx-assay = { version = "0.1.0", path = "calyx/crates/calyx-assay" }
+calyx-anneal = { version = "0.1.0", path = "calyx/crates/calyx-anneal" }
 calyx-aster = { version = "0.1.0", path = "calyx/crates/calyx-aster" }
 calyx-core = { version = "0.1.0", path = "calyx/crates/calyx-core" }
 calyx-forge = { version = "0.1.0", path = "calyx/crates/calyx-forge" }

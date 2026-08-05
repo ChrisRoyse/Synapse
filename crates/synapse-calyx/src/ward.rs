@@ -521,9 +521,10 @@ impl SynapseCalyxVault {
         let mut inputs = Vec::with_capacity(params.slots.len());
         let mut evidence = Vec::with_capacity(params.slots.len());
         for spec in &params.slots {
-            let target_far = params
-                .target_far
-                .unwrap_or_else(|| self.configured_guard_target_far(spec.aspect));
+            let target_far = match params.target_far {
+                Some(target_far) => target_far,
+                None => self.configured_guard_target_far(spec.aspect)?,
+            };
             let good_scores = leave_one_out_scores(&corpus.good, spec.slot);
             let bad_scores = nearest_good_scores(&corpus.bad, &corpus.good, spec.slot);
             if good_scores.len() < SYNAPSE_GUARD_MIN_GOOD_SCORES {
@@ -1011,13 +1012,16 @@ impl SynapseCalyxVault {
     /// than policy takes effect, and configuring one looser than policy is
     /// refused loudly (`target_far exceeds slot_kind maximum`) rather than
     /// quietly ignored.
-    const fn configured_guard_target_far(&self, aspect: SynapseCalyxGuardAspect) -> f32 {
-        let tuning = &self.config.tuning;
-        match aspect {
+    fn configured_guard_target_far(
+        &self,
+        aspect: SynapseCalyxGuardAspect,
+    ) -> Result<f32, SynapseCalyxError> {
+        let tuning = self.effective_tuning()?;
+        Ok(match aspect {
             SynapseCalyxGuardAspect::Identity => tuning.guard_far_identity,
             SynapseCalyxGuardAspect::Stylistic => tuning.guard_far_stylistic,
             SynapseCalyxGuardAspect::Content => tuning.guard_far_content,
-        }
+        })
     }
 
     /// Resolves the [`Panel`] definition the guard validates its slots against.

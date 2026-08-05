@@ -1,5 +1,7 @@
 //! Synapse-owned lifecycle wrapper for the embedded Calyx Aster vault.
 
+mod anneal;
+pub use anneal::SynapseCalyxAnnealStatus;
 mod async_vault;
 pub mod backup;
 mod drift;
@@ -2076,7 +2078,9 @@ pub enum SynapseCalyxClock {
 }
 
 impl SynapseCalyxClock {
-    fn from_tuning(config: &SynapseCalyxTuningConfig) -> Result<Self, SynapseCalyxError> {
+    pub(crate) fn from_tuning(
+        config: &SynapseCalyxTuningConfig,
+    ) -> Result<Self, SynapseCalyxError> {
         match config.clock_mode {
             SynapseCalyxClockMode::System => Ok(Self::System),
             SynapseCalyxClockMode::Fixed => {
@@ -2428,6 +2432,7 @@ pub struct SynapseCalyxVaultStatus {
     pub last_error: Option<String>,
     pub remediation: Option<String>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
+    pub anneal: Option<SynapseCalyxAnnealStatus>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
     /// Per-site row-table read-guard tallies since this vault was opened.
     ///
@@ -2630,6 +2635,20 @@ impl SynapseCalyxReadOnlyVault {
     /// Reads all visible native Reactive outbox rows from the read-only handle.
     pub fn scan_reactive_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
         self.scan_cf_latest(ColumnFamily::Reactive)
+    }
+
+    /// Reads content-addressed tuning artifacts for physical Anneal verification.
+    pub fn scan_anneal_tuning_artifacts_latest(
+        &self,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_latest(ColumnFamily::Kv)
+    }
+
+    /// Reads native rollback snapshots and live pointers for physical verification.
+    pub fn scan_anneal_rollback_latest(
+        &self,
+    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+        self.scan_cf_latest(ColumnFamily::AnnealRollback)
     }
 
     /// Opens an existing Calyx vault for physical inspection of the **`Kv`
@@ -3282,23 +3301,37 @@ impl SynapseCalyxVault {
             Ok(runtime) => runtime,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
         };
-        let status = status_from_vault(&config, &vault, math_runtime.status(), open_mode);
+        let opened = Self {
+            config,
+            vault,
+            lock,
+            math_runtime,
+            open_mode,
+            lineage,
+        };
+        opened.initialize_anneal_tuning()?;
+        let status = status_from_vault(
+            &opened.config,
+            &opened.vault,
+            opened.math_runtime.status(),
+            opened.open_mode,
+        );
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_OPENED",
-            vault_dir = %config.vault_dir.display(),
-            open_mode = open_mode.as_str(),
+            vault_dir = %opened.config.vault_dir.display(),
+            open_mode = opened.open_mode.as_str(),
             restore_mvcc_rows = options.restore_mvcc_rows,
             eager_router_lookup_on_open = options.eager_router_lookup_on_open,
-            lock_path = %lock.path.display(),
-            pid_path = %lock.pid_path.display(),
+            lock_path = %opened.lock.path.display(),
+            pid_path = %opened.lock.pid_path.display(),
             vault_id = status.vault_id.as_deref().unwrap_or(""),
             latest_seq = status.latest_seq,
             last_recovered_seq = status.last_recovered_seq,
             torn_tail = status.torn_tail.as_deref().unwrap_or("none"),
             elapsed_ms = started_at.elapsed().as_millis(),
-            clock_mode = ?config.tuning.clock_mode,
-            fixed_clock_unix_ms = config.tuning.fixed_clock_unix_ms,
-            rng_seed = config.tuning.rng_seed,
+            clock_mode = ?opened.config.tuning.clock_mode,
+            fixed_clock_unix_ms = opened.config.tuning.fixed_clock_unix_ms,
+            rng_seed = opened.config.tuning.rng_seed,
             math_backend_requested = status
                 .math_backend
                 .as_ref()
@@ -3328,20 +3361,13 @@ impl SynapseCalyxVault {
                 .math_backend
                 .as_ref()
                 .map_or("none", |math| math.probe.status.as_str()),
-            lineage_path = %lineage.lineage_path.display(),
-            vault_generation = lineage.generation,
-            vault_lineage_reset_count = lineage.reset_count,
-            chain_origin = %lineage.chain_origin,
+            lineage_path = %opened.lineage.lineage_path.display(),
+            vault_generation = opened.lineage.generation,
+            vault_lineage_reset_count = opened.lineage.reset_count,
+            chain_origin = %opened.lineage.chain_origin,
             "opened durable Calyx Aster vault"
         );
-        Ok(Self {
-            config,
-            vault,
-            lock,
-            math_runtime,
-            open_mode,
-            lineage,
-        })
+        Ok(opened)
     }
 
     /// Lineage of the vault directory this handle has open: which generation it
@@ -4245,7 +4271,7 @@ impl SynapseCalyxVault {
             &self.config.vault_dir,
             &self.vault,
             &state,
-            self.config.tuning.dense_index_config(),
+            self.effective_tuning()?.dense_index_config(),
         )
         .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))?;
         let generation =
@@ -4405,6 +4431,16 @@ impl SynapseCalyxVault {
                 "repair the named process-local/host-wide GPU Source of Truth; never infer safety from a stale startup snapshot"
                     .to_owned(),
             );
+        }
+        match self.anneal_status() {
+            Ok(anneal) => status.anneal = Some(anneal),
+            Err(error) => {
+                "error".clone_into(&mut status.phase);
+                status.last_error_code = Some(error.code.to_owned());
+                status.last_calyx_error_code = error.source_code.map(str::to_owned);
+                status.last_error = Some(error.message);
+                status.remediation = Some(error.remediation.to_owned());
+            }
         }
         status
     }
