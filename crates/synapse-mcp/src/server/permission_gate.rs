@@ -717,6 +717,9 @@ fn oracle_preflight(
                 "CALYX_ORACLE_INSUFFICIENT"
                     | "CALYX_ORACLE_NO_RECURRENCE"
                     | "CALYX_ORACLE_DOMAIN_NOT_FOUND"
+                    | "SYNAPSE_CALYX_ENSEMBLE_NO_ANCHORED_RECORDS"
+                    | "SYNAPSE_CALYX_ENSEMBLE_ANCHOR_NOT_BINARY"
+                    | "SYNAPSE_CALYX_ENSEMBLE_NO_COPRESENT_LENSES"
             ) =>
         {
             Ok(json!({
