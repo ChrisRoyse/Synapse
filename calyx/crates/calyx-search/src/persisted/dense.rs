@@ -64,7 +64,7 @@ where
     let slot = panel_slot.slot_id();
     let panel_version = panel_slot.panel_version();
     let quant_bits = config.quant_bits_for(slot);
-    if quant_bits == 32 && should_use_flat_dense_index(rows.rows.len()) {
+    if quant_bits == 32 && should_use_flat_dense_index(rows.rows.len(), rows.dim) {
         return flat::write(vault_dir, root, slot, rows, base_seq);
     }
     let dir_name = format!(
@@ -439,8 +439,8 @@ fn exact_filtered_hits(
     Ok(ranked(scored))
 }
 
-pub(super) fn should_use_flat_dense_index(row_count: usize) -> bool {
-    flat::should_use_index(row_count)
+pub(super) fn should_use_flat_dense_index(row_count: usize, dim: u32) -> bool {
+    flat::should_use_index(row_count, dim)
 }
 
 pub(super) fn score_replacements(

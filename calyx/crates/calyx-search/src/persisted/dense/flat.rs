@@ -16,10 +16,16 @@ use crate::persisted::{SearchIndexEntry, rel, sha256_hex, stale, write_atomic_ha
 const FORMAT: &str = "calyx-search-flat-dense-v1";
 const MAGIC: &[u8; 16] = b"CALYXFLATDENSE01";
 const DEFAULT_MAX_ROWS: usize = 32_768;
+// Exact search is both faster and recall-perfect for large low-dimensional
+// structured lanes. Row count alone sent 50k x 1/2/8/16 lanes with extensive
+// ties through graph ANN even though their complete scalar scan is cheaper
+// than a high-dimensional graph traversal.
+const DEFAULT_MAX_SCALAR_VALUES: usize = 1_000_000;
 const PIN_KIND: &str = "flat_dense";
 
-pub(super) fn should_use_index(row_count: usize) -> bool {
+pub(super) fn should_use_index(row_count: usize, dim: u32) -> bool {
     row_count <= DEFAULT_MAX_ROWS
+        || row_count.saturating_mul(dim as usize) <= DEFAULT_MAX_SCALAR_VALUES
 }
 
 pub(super) fn write(
