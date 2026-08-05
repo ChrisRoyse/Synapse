@@ -87,13 +87,17 @@ pub(super) fn search(
         .filter(|(cx_id, _)| candidates.is_none_or(|allowed| allowed.contains(cx_id)))
         .map(|(cx_id, values)| (*cx_id, cosine(data, values)))
         .collect::<Vec<_>>();
-    scored.sort_by(|left, right| {
+    let compare = |left: &(CxId, f32), right: &(CxId, f32)| {
         right
             .1
             .total_cmp(&left.1)
-            .then_with(|| left.0.to_string().cmp(&right.0.to_string()))
-    });
-    scored.truncate(k);
+            .then_with(|| left.0.cmp(&right.0))
+    };
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k, compare);
+        scored.truncate(k);
+    }
+    scored.sort_unstable_by(compare);
     Ok(ranked(scored))
 }
 
