@@ -1026,7 +1026,10 @@ impl SynapseService {
         })
     }
 
-    fn agent_cost_impl(&self, params: AgentCostParams) -> Result<AgentCostResponse, ErrorData> {
+    pub(crate) fn agent_cost_impl(
+        &self,
+        params: AgentCostParams,
+    ) -> Result<AgentCostResponse, ErrorData> {
         if params.spawn_id.is_none() {
             // #1688: fleet cost analytics are answered from the materialized
             // TimeSeries rollups (bounded window-cell reads), never a scan over

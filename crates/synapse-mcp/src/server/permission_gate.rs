@@ -291,8 +291,16 @@ impl SynapseService {
         }
 
         let db = self.m3_storage()?;
+        let oracle_preflight = oracle_preflight(&db, tool_name)?;
         let now = now_unix_ms();
-        let request = build_request(tool_name, input, tool_use_id, spawn_id, decision)?;
+        let request = build_request(
+            tool_name,
+            input,
+            tool_use_id,
+            spawn_id,
+            decision,
+            &oracle_preflight,
+        )?;
         let created = approvals::request_approval(&db, &request, by_session)?;
         let approval_id = created.item.approval_id.clone();
         self.publish_approval_queue_event(
@@ -304,6 +312,7 @@ impl SynapseService {
             json!({
                 "tool_name": tool_name,
                 "spawn_id": spawn_id,
+                "oracle_preflight": &oracle_preflight,
                 "deduped": created.deduped,
                 "item_row": &created.item_row,
                 "audit_row": &created.audit_row,
@@ -548,6 +557,7 @@ fn build_request(
     tool_use_id: Option<&str>,
     spawn_id: Option<&str>,
     decision: GateDecision,
+    oracle_preflight: &Value,
 ) -> Result<ApprovalRequestParams, ErrorData> {
     let input_repr = truncate_for_payload(input);
     let payload = json!({
@@ -556,6 +566,7 @@ fn build_request(
         "spawn_id": spawn_id,
         "input": input_repr,
         "destructive": decision.destructive(),
+        "steering_preflight": oracle_preflight,
     });
     let payload_json = serde_json::to_string(&payload).map_err(|error| {
         mcp_internal(format!("approval_gate failed to encode payload: {error}"))
@@ -590,6 +601,66 @@ fn build_request(
         // `ApprovalAllow::for_kind(AgentPermission)` in `request_approval`.
         allow: None,
     })
+}
+
+fn oracle_preflight(db: &synapse_storage::Db, tool_name: &str) -> Result<Value, ErrorData> {
+    match db.oracle_predict_action(tool_name) {
+        Ok(prediction) => {
+            let outcome = prediction
+                .pointer("/outcome/bool")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    mcp_internal(format!(
+                        "STEERING_ORACLE_SHAPE_INVALID: action={tool_name:?} prediction lacks /outcome/bool"
+                    ))
+                })?;
+            let sufficient = prediction
+                .pointer("/bound/sufficient")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| {
+                    mcp_internal(format!(
+                        "STEERING_ORACLE_SHAPE_INVALID: action={tool_name:?} prediction lacks /bound/sufficient"
+                    ))
+                })?;
+            Ok(json!({
+                "schema": "synapse.steering.risky_preflight.v1",
+                "grounding": if sufficient { "grounded_oracle_ward_unavailable" } else { "provisional_insufficient" },
+                "oracle": prediction,
+                "grounded_bad_outcome": sufficient && !outcome,
+                "ward": {
+                    "status": "unavailable_unmaterialized_candidate",
+                    "remediation": "add a Ward API that measures the pending tool input into a non-executable preflight constellation before enabling autonomous deny"
+                },
+                "enforcement": "operator_gate",
+            }))
+        }
+        Err(error)
+            if matches!(
+                error.code(),
+                "CALYX_ORACLE_INSUFFICIENT"
+                    | "CALYX_ORACLE_NO_RECURRENCE"
+                    | "CALYX_ORACLE_DOMAIN_NOT_FOUND"
+            ) =>
+        {
+            Ok(json!({
+                "schema": "synapse.steering.risky_preflight.v1",
+                "grounding": "provisional_insufficient",
+                "oracle": {
+                    "code": error.code(),
+                    "detail": error.to_string(),
+                },
+                "grounded_bad_outcome": false,
+                "ward": {
+                    "status": "not_run_without_oracle_evidence",
+                },
+                "enforcement": "operator_gate",
+            }))
+        }
+        Err(error) => Err(mcp_internal(format!(
+            "STEERING_ORACLE_PREFLIGHT_FAILED: action={tool_name:?} code={} detail={error}; remediation=repair the Oracle evidence/ledger failure before retrying the risky call",
+            error.code()
+        ))),
+    }
 }
 
 fn build_question_request(

@@ -1377,6 +1377,11 @@ pub struct ActSpawnAgentResponse {
     pub spawn_id: String,
     pub cli: ActSpawnAgentCli,
     pub kind: ActSpawnAgentCli,
+    /// Exact model requested for this spawn. This mirrors the immutable spawn
+    /// manifest so downstream outcome records never have to join against a
+    /// mutable template to recover historical model identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_ref: Option<String>,
     pub launcher_process_id: u32,

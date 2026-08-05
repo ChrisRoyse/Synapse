@@ -1165,9 +1165,14 @@ impl CalyxVaultRuntime {
                     .slots
                     .retain(|slot| capability.measured_slots.contains(&slot.slot_id.get()));
                 if panel.slots.is_empty() {
-                    return Err(calyx_write_failed_detail(
+                    return Err(calyx_write_failed(
                         "calyx_oracle",
-                        "action-panel sufficiency produced no measured slots; anchor at least 50 diverse terminal outcomes before prediction",
+                        "measure action-panel sufficiency before prediction",
+                        &SynapseCalyxError::new(
+                            "CALYX_ORACLE_INSUFFICIENT",
+                            "action-panel sufficiency produced no measured slots",
+                            "anchor at least 50 diverse terminal outcomes before prediction",
+                        ),
                     ));
                 }
                 vault

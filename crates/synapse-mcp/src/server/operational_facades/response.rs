@@ -53,6 +53,7 @@ pub(super) fn model_response(
         register: None,
         update: None,
         remove: None,
+        recommend: None,
     };
     fill(&mut response);
     response

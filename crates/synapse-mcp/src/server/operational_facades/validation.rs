@@ -56,6 +56,7 @@ pub(super) fn validate_model_params(params: &ModelParams) -> Result<(), ErrorDat
             ("register", params.register.is_some()),
             ("update", params.update.is_some()),
             ("remove", params.remove.is_some()),
+            ("recommend", params.recommend.is_some()),
         ],
     )
 }

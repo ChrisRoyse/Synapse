@@ -176,6 +176,14 @@ pub struct TaskAttempt {
     /// Template version this attempt was dispatched with, when applicable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub template_version: Option<u32>,
+    /// Immutable model identity captured from the successful spawn response.
+    /// Absent on direct claims and legacy rows; those rows are not eligible for
+    /// grounded model-routing evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Immutable hash of the exact template configuration used by the spawn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_config_hash: Option<String>,
     pub outcome: AttemptOutcome,
     pub started_unix_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2215,6 +2223,8 @@ impl SynapseService {
                 session_id: reservation_session_id(&reservation.reservation_id),
                 spawn_id: None,
                 template_version: None,
+                model: None,
+                template_config_hash: None,
                 outcome: AttemptOutcome::Pending,
                 started_unix_ms: now,
                 ended_unix_ms: None,
@@ -2274,6 +2284,8 @@ impl SynapseService {
         session_id: &str,
         spawn_id: String,
         template_version: Option<u32>,
+        model: Option<String>,
+        template_config_hash: Option<String>,
         context: &str,
     ) -> Result<(AgentTask, TaskRowReadback), ErrorData> {
         if session_id.trim().is_empty() || !is_spawn_id_shape(&spawn_id) {
@@ -2324,6 +2336,8 @@ impl SynapseService {
             if pending.session_id != expected_session
                 || pending.spawn_id.is_some()
                 || pending.template_version.is_some()
+                || pending.model.is_some()
+                || pending.template_config_hash.is_some()
             {
                 return Err(mcp_error(
                     error_codes::STORAGE_CORRUPTED,
@@ -2336,6 +2350,8 @@ impl SynapseService {
             pending.session_id = session_id.to_owned();
             pending.spawn_id = Some(spawn_id.clone());
             pending.template_version = template_version;
+            pending.model = model.clone();
+            pending.template_config_hash = template_config_hash.clone();
             task.dispatch_reservation = None;
             Ok(task)
         })
@@ -2624,6 +2640,8 @@ impl SynapseService {
                 session_id: session_id.to_owned(),
                 spawn_id: spawn_id.clone(),
                 template_version,
+                model: None,
+                template_config_hash: None,
                 outcome: AttemptOutcome::Pending,
                 started_unix_ms: now,
                 ended_unix_ms: None,
@@ -3899,6 +3917,12 @@ impl SynapseService {
             &response.session_id,
             response.spawn_id.clone(),
             response.template_version,
+            response
+                .model
+                .clone()
+                .or_else(|| response.model_ref.clone())
+                .or_else(|| Some(response.cli.as_str().to_owned())),
+            response.template_config_hash.clone(),
             "mcp_task_dispatch_bind",
         ) {
             Ok((task, _readback)) => task,
@@ -4162,6 +4186,12 @@ impl SynapseService {
             &response.session_id,
             response.spawn_id.clone(),
             response.template_version,
+            response
+                .model
+                .clone()
+                .or_else(|| response.model_ref.clone())
+                .or_else(|| Some(response.cli.as_str().to_owned())),
+            response.template_config_hash.clone(),
             "dashboard_task_dispatch_bind",
         ) {
             Ok((task, _readback)) => task,

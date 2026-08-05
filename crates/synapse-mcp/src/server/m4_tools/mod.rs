@@ -2777,6 +2777,7 @@ impl SynapseService {
             spawn_id,
             cli: agent_kind,
             kind: agent_kind,
+            model: params.model.clone(),
             model_ref: local_model_row
                 .as_ref()
                 .map(|row| row.name.clone())

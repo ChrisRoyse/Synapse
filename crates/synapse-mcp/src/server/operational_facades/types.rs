@@ -187,6 +187,7 @@ pub enum ModelOperation {
     Register,
     Update,
     Remove,
+    Recommend,
 }
 
 impl ModelOperation {
@@ -198,6 +199,7 @@ impl ModelOperation {
             Self::Register => "register",
             Self::Update => "update",
             Self::Remove => "remove",
+            Self::Recommend => "recommend",
         }
     }
 }
@@ -207,6 +209,52 @@ impl ModelOperation {
 pub struct ModelStatusParams {
     #[serde(default)]
     pub include_disabled: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRecommendParams {
+    /// Explicit task class. Agent-task dispatch uses the immutable template id
+    /// as its class; free-text prompt inference is deliberately unsupported.
+    pub task_class: String,
+    /// Minimum terminal observations required before the result is grounded.
+    #[serde(default = "default_model_recommend_min_evidence")]
+    pub min_evidence: usize,
+}
+
+fn default_model_recommend_min_evidence() -> usize {
+    4
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRecommendationEvidence {
+    pub model: String,
+    pub successes: u64,
+    pub failures: u64,
+    pub evidence_count: u64,
+    pub expected_success: f64,
+    pub success_ci95_low: f64,
+    pub success_ci95_high: f64,
+    pub outcome_information_bits: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_cost_micro_usd: Option<u64>,
+    pub priced_observations: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelRecommendResponse {
+    pub task_class: String,
+    pub grounding: String,
+    pub evidence_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recommended_model: Option<String>,
+    pub candidates: Vec<ModelRecommendationEvidence>,
+    pub excluded_legacy_attempts: u64,
+    pub decision_id: String,
+    pub decision_row_key: String,
+    pub decision_row_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -225,6 +273,8 @@ pub struct ModelParams {
     pub update: Option<LocalModelUpdateParams>,
     #[serde(default)]
     pub remove: Option<LocalModelRemoveParams>,
+    #[serde(default)]
+    pub recommend: Option<ModelRecommendParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -260,6 +310,8 @@ pub struct ModelResponse {
     pub update: Option<LocalModelUpdateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remove: Option<LocalModelRemoveResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommend: Option<ModelRecommendResponse>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
