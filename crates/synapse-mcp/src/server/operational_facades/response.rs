@@ -79,6 +79,7 @@ pub(super) fn hygiene_response(
         kernel_rebuild: None,
         guard_calibrate: None,
         guard_verify: None,
+        anneal_status: None,
     };
     fill(&mut response);
     response

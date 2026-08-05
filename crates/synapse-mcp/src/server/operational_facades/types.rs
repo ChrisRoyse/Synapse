@@ -281,6 +281,8 @@ pub enum HygieneOperation {
     GuardCalibrate,
     /// Evaluate one record against the persisted Ward guard profile (#1677).
     GuardVerify,
+    /// Read native Anneal pointer, tripwire, budget, and ledger state (#1681).
+    AnnealStatus,
 }
 
 impl HygieneOperation {
@@ -298,6 +300,7 @@ impl HygieneOperation {
             Self::KernelRebuild => "kernel_rebuild",
             Self::GuardCalibrate => "guard_calibrate",
             Self::GuardVerify => "guard_verify",
+            Self::AnnealStatus => "anneal_status",
         }
     }
 }
@@ -330,6 +333,8 @@ pub struct HygieneParams {
     pub guard_calibrate: Option<HygieneGuardCalibrateParams>,
     #[serde(default)]
     pub guard_verify: Option<HygieneGuardVerifyParams>,
+    #[serde(default)]
+    pub anneal_status: Option<HygieneAnnealStatusParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -362,6 +367,30 @@ pub struct HygieneResponse {
     pub guard_calibrate: Option<HygieneGuardCalibrateResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guard_verify: Option<HygieneGuardVerifyResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anneal_status: Option<HygieneAnnealStatusResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct HygieneAnnealStatusParams {}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HygieneAnnealStatusResponse {
+    pub live_artifact_sha256: String,
+    pub live_artifact_bytes: usize,
+    pub rollback_rows: usize,
+    pub recent_changes: usize,
+    pub fusion_k: u32,
+    pub index_m_max: usize,
+    pub index_ef_construction: usize,
+    pub index_beamwidth: usize,
+    pub index_ef_search: usize,
+    pub index_alpha: f32,
+    pub budget_cpu_used_fraction: f64,
+    pub budget_vram_used_bytes: u64,
+    pub budget_warning_code: Option<String>,
+    pub tripwire_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

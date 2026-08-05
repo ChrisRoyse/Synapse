@@ -77,6 +77,7 @@ pub(super) fn validate_hygiene_params(params: &HygieneParams) -> Result<(), Erro
             ("kernel_rebuild", params.kernel_rebuild.is_some()),
             ("guard_calibrate", params.guard_calibrate.is_some()),
             ("guard_verify", params.guard_verify.is_some()),
+            ("anneal_status", params.anneal_status.is_some()),
         ],
     )
 }

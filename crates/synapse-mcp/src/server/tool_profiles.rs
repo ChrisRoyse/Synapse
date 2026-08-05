@@ -2481,6 +2481,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::STORAGE_READ_FAILED,
                 "run hygiene guard_calibrate for the active panel; verification fails closed rather than guess a tau",
             ),
+            op(
+                "anneal_status",
+                false,
+                false,
+                "Calyx Kv content-addressed tuning artifact + AnnealRollback live pointer/history",
+                Some(
+                    "artifact hash/bytes, decoded effective tuning, rollback rows, budget, tripwires, and recent native Anneal changes",
+                ),
+                error_codes::STORAGE_READ_FAILED,
+                "inspect the Calyx Kv artifact and AnnealRollback rows; status fails closed on a missing, malformed, or hash-mismatched live pointer",
+            ),
         ],
     ),
     facade_contract(

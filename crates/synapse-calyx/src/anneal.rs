@@ -1,7 +1,7 @@
 use calyx_anneal::{
-    AnnealLedger, AnnealLedgerEntry, ArtifactKey, ArtifactPtr, AsterAnnealLedgerStore,
-    AsterRollbackStorage, BudgetConfig, BudgetEnforcer, BudgetStatus, RollbackStore,
-    TripwireRegistry, TripwireStatus,
+    AnnealAction, AnnealLedger, AnnealLedgerEntry, AnnealSubstrate, ArtifactKey, ArtifactPtr,
+    AsterAnnealLedgerStore, AsterRollbackStorage, BudgetConfig, BudgetEnforcer, BudgetStatus,
+    ChangeId, ChangeOutcome, HeldOutReplay, RollbackStore, TripwireRegistry, TripwireStatus,
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_ledger::{ActorId, LedgerAppender};
@@ -23,6 +23,25 @@ pub struct SynapseCalyxAnnealStatus {
     pub tripwires: Vec<TripwireStatus>,
     pub budget: BudgetStatus,
     pub recent_changes: Vec<AnnealLedgerEntry>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SynapseCalyxAnnealChangeReport {
+    pub outcome: ChangeOutcome,
+    pub prior_artifact_sha256: String,
+    pub candidate_artifact_sha256: String,
+    pub live_artifact_sha256_after: String,
+    pub live_artifact_bytes_after: usize,
+    pub rollback_rows_after: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SynapseCalyxAnnealRollbackReport {
+    pub change_id: u64,
+    pub candidate_artifact_sha256: String,
+    pub restored_artifact_sha256: String,
+    pub restored_artifact_bytes: usize,
+    pub rollback_rows_after: usize,
 }
 
 impl SynapseCalyxVault {
@@ -112,6 +131,179 @@ impl SynapseCalyxVault {
             budget,
             recent_changes,
         })
+    }
+
+    /// Runs a caller-owned, real held-out replay through Calyx's native shadow gate.
+    ///
+    /// The actions must measure the actual candidate and incumbent. This API
+    /// deliberately accepts no metric values or predeclared verdict, so callers
+    /// cannot promote by asserting that a candidate was healthy.
+    pub fn anneal_propose_tuning<Candidate, Incumbent>(
+        &self,
+        candidate_tuning: SynapseCalyxTuningConfig,
+        replay: HeldOutReplay,
+        candidate_action: &Candidate,
+        incumbent_action: &Incumbent,
+        description: &str,
+    ) -> Result<SynapseCalyxAnnealChangeReport, SynapseCalyxError>
+    where
+        Candidate: AnnealAction,
+        Incumbent: AnnealAction,
+    {
+        let candidate_tuning = candidate_tuning.validate()?;
+        let (_, prior_bytes, incumbent_tuning) = self.read_live_tuning()?;
+        ensure_supported_candidate(&incumbent_tuning, &candidate_tuning)?;
+        let candidate_bytes = serde_json::to_vec(&candidate_tuning).map_err(|error| {
+            anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_ARTIFACT_ENCODE_FAILED",
+                format!("encode candidate tuning artifact: {error}"),
+                "repair the validated tuning serializer before proposing the candidate",
+            )
+        })?;
+        let prior_hash = tuning_artifact_hash(&prior_bytes);
+        let candidate_hash = tuning_artifact_hash(&candidate_bytes);
+        if candidate_hash == prior_hash {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_CANDIDATE_UNCHANGED",
+                format!(
+                    "candidate tuning artifact {} is already live",
+                    hex32(candidate_hash)
+                ),
+                "change at least one load-bearing Anneal-owned tuning field before proposing",
+            ));
+        }
+        self.persist_tuning_artifact(candidate_hash, &candidate_bytes)?;
+
+        let clock = self.anneal_clock()?;
+        let rollback = RollbackStore::open(
+            &clock,
+            self.config.tuning.rng_seed,
+            AsterRollbackStorage::new(&self.vault),
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("open Anneal rollback store", &error))?;
+        let ledger = self.anneal_ledger(clock.clone())?;
+        let tripwires =
+            TripwireRegistry::load_from_vault(&self.config.vault_dir).map_err(|error| {
+                SynapseCalyxError::from_calyx("load Anneal tripwire registry", &error)
+            })?;
+        let budget_config =
+            BudgetConfig::load_from_vault(&self.config.vault_dir).map_err(|error| {
+                SynapseCalyxError::from_calyx("load Anneal resource budget", &error)
+            })?;
+        let budget = BudgetEnforcer::new(budget_config, &clock).map_err(|error| {
+            SynapseCalyxError::from_calyx("open Anneal resource budget", &error)
+        })?;
+        let mut substrate =
+            AnnealSubstrate::new(tripwires, replay, rollback, ledger, budget, &clock);
+        let outcome = substrate
+            .propose_change_with_description(
+                tuning_artifact_key(),
+                ArtifactPtr::ConfigCacheKeyHash(candidate_hash),
+                candidate_action,
+                incumbent_action,
+                description,
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("shadow-test Anneal tuning candidate", &error)
+            })?;
+        let (live_hash, live_bytes, _) = self.read_live_tuning()?;
+        Ok(SynapseCalyxAnnealChangeReport {
+            outcome,
+            prior_artifact_sha256: hex32(prior_hash),
+            candidate_artifact_sha256: hex32(candidate_hash),
+            live_artifact_sha256_after: hex32(live_hash),
+            live_artifact_bytes_after: live_bytes.len(),
+            rollback_rows_after: self.anneal_rollback_row_count("after proposal")?,
+        })
+    }
+
+    pub fn anneal_rollback(
+        &self,
+        change_id: u64,
+    ) -> Result<SynapseCalyxAnnealRollbackReport, SynapseCalyxError> {
+        let clock = self.anneal_clock()?;
+        let rollback = RollbackStore::open(
+            &clock,
+            self.config.tuning.rng_seed,
+            AsterRollbackStorage::new(&self.vault),
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("open Anneal rollback store", &error))?;
+        let snapshot = rollback
+            .snapshot(ChangeId(change_id))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("read Anneal rollback snapshot", &error)
+            })?
+            .ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_CHANGE_UNKNOWN",
+                    format!("Anneal change_id {change_id} does not exist"),
+                    "read anneal status and use an existing uncommitted promoted change id",
+                )
+            })?;
+        let candidate_hash = ptr_config_hash(&snapshot.candidate_ptr)?;
+        let ledger = self.anneal_ledger(clock.clone())?;
+        let tripwires =
+            TripwireRegistry::load_from_vault(&self.config.vault_dir).map_err(|error| {
+                SynapseCalyxError::from_calyx("load Anneal tripwire registry", &error)
+            })?;
+        let budget_config =
+            BudgetConfig::load_from_vault(&self.config.vault_dir).map_err(|error| {
+                SynapseCalyxError::from_calyx("load Anneal resource budget", &error)
+            })?;
+        let budget = BudgetEnforcer::new(budget_config, &clock).map_err(|error| {
+            SynapseCalyxError::from_calyx("open Anneal resource budget", &error)
+        })?;
+        let mut substrate = AnnealSubstrate::new(
+            tripwires,
+            HeldOutReplay {
+                queries: Vec::new(),
+                seed: self.config.tuning.rng_seed,
+            },
+            rollback,
+            ledger,
+            budget,
+            &clock,
+        );
+        substrate
+            .rollback_explicit(ChangeId(change_id))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("rollback Anneal tuning change", &error)
+            })?;
+        let (restored_hash, restored_bytes, _) = self.read_live_tuning()?;
+        Ok(SynapseCalyxAnnealRollbackReport {
+            change_id,
+            candidate_artifact_sha256: hex32(candidate_hash),
+            restored_artifact_sha256: hex32(restored_hash),
+            restored_artifact_bytes: restored_bytes.len(),
+            rollback_rows_after: self.anneal_rollback_row_count("after rollback")?,
+        })
+    }
+
+    fn anneal_ledger(
+        &self,
+        clock: crate::SynapseCalyxClock,
+    ) -> Result<
+        AnnealLedger<
+            AsterAnnealLedgerStore<'_, crate::SynapseCalyxClock>,
+            crate::SynapseCalyxClock,
+        >,
+        SynapseCalyxError,
+    > {
+        let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&self.vault), clock)
+            .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
+        AnnealLedger::new(appender, ActorId::Service("synapse-anneal".to_owned()))
+            .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger actor", &error))
+    }
+
+    fn anneal_rollback_row_count(&self, phase: &str) -> Result<usize, SynapseCalyxError> {
+        self.vault
+            .count_cf_latest(ColumnFamily::AnnealRollback)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("count Anneal rollback rows {phase}"),
+                    &error,
+                )
+            })
     }
 
     fn read_live_tuning(
@@ -232,6 +424,41 @@ impl SynapseCalyxVault {
 
 fn tuning_artifact_key() -> ArtifactKey {
     ArtifactKey::ConfigCache(tuning_artifact_hash(TUNING_ARTIFACT_KEY))
+}
+
+fn ensure_supported_candidate(
+    incumbent: &SynapseCalyxTuningConfig,
+    candidate: &SynapseCalyxTuningConfig,
+) -> Result<(), SynapseCalyxError> {
+    let mut expected = *incumbent;
+    expected.fusion_k = candidate.fusion_k;
+    expected.guard_far_identity = candidate.guard_far_identity;
+    expected.guard_far_content = candidate.guard_far_content;
+    expected.guard_far_stylistic = candidate.guard_far_stylistic;
+    expected.index_m_max = candidate.index_m_max;
+    expected.index_ef_construction = candidate.index_ef_construction;
+    expected.index_beamwidth = candidate.index_beamwidth;
+    expected.index_ef_search = candidate.index_ef_search;
+    expected.index_alpha = candidate.index_alpha;
+    if expected != *candidate {
+        return Err(anneal_error(
+            "SYNAPSE_CALYX_ANNEAL_TARGET_NOT_LOAD_BEARING",
+            "candidate changes a field outside the fusion, guard-FAR, or persisted-index owners",
+            "change only fields with a measured shadow consumer; inert and runtime-identity fields are never promotable",
+        ));
+    }
+    Ok(())
+}
+
+fn ptr_config_hash(ptr: &ArtifactPtr) -> Result<[u8; 32], SynapseCalyxError> {
+    match ptr {
+        ArtifactPtr::ConfigCacheKeyHash(hash) => Ok(*hash),
+        other => Err(anneal_error(
+            "SYNAPSE_CALYX_ANNEAL_POINTER_KIND_INVALID",
+            format!("Synapse tuning snapshot has incompatible pointer kind: {other:?}"),
+            "repair the AnnealRollback snapshot to reference a ConfigCacheKeyHash tuning artifact",
+        )),
+    }
 }
 
 fn tuning_artifact_hash(bytes: &[u8]) -> [u8; 32] {

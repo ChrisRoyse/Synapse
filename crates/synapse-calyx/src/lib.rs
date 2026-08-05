@@ -1,7 +1,9 @@
 //! Synapse-owned lifecycle wrapper for the embedded Calyx Aster vault.
 
 mod anneal;
-pub use anneal::SynapseCalyxAnnealStatus;
+pub use anneal::{
+    SynapseCalyxAnnealChangeReport, SynapseCalyxAnnealRollbackReport, SynapseCalyxAnnealStatus,
+};
 mod async_vault;
 pub mod backup;
 mod drift;

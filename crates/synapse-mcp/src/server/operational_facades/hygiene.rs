@@ -800,5 +800,72 @@ pub(super) async fn handle(
                 |out| out.guard_verify = Some(response),
             )))
         }
+        HygieneOperation::AnnealStatus => {
+            let _spec = params
+                .0
+                .anneal_status
+                .ok_or_else(|| missing_spec(HYGIENE_TOOL, "anneal_status"))?;
+            service.require_m3_permissions(
+                HYGIENE_TOOL,
+                &crate::m3::hygiene::required_permissions_anneal_status(),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_anneal",
+                    HYGIENE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry hygiene anneal_status",
+                )
+            })?;
+            let status = db.calyx_vault_status().map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    "calyx_anneal",
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("read Calyx vault status for Anneal: {error}"),
+                    ),
+                    "inspect the structured Calyx vault error and repair the native Anneal state",
+                )
+            })?;
+            let anneal = status.anneal.ok_or_else(|| {
+                crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "Calyx vault status has no native Anneal readback",
+                )
+            })?;
+            let tuning = anneal.effective_tuning;
+            let response = super::types::HygieneAnnealStatusResponse {
+                live_artifact_sha256: anneal.live_artifact_sha256,
+                live_artifact_bytes: anneal.live_artifact_bytes,
+                rollback_rows: anneal.rollback_rows,
+                recent_changes: anneal.recent_changes.len(),
+                fusion_k: tuning.fusion_k,
+                index_m_max: tuning.index_m_max,
+                index_ef_construction: tuning.index_ef_construction,
+                index_beamwidth: tuning.index_beamwidth,
+                index_ef_search: tuning.index_ef_search,
+                index_alpha: tuning.index_alpha,
+                budget_cpu_used_fraction: anneal.budget.cpu_used_fraction,
+                budget_vram_used_bytes: anneal.budget.vram_used_bytes,
+                budget_warning_code: anneal.budget.warning_code,
+                tripwire_count: anneal.tripwires.len(),
+            };
+            Ok(Json(hygiene_response(
+                operation,
+                format!(
+                    "anneal_live_artifact={} rollback_rows={} recent_changes={} tripwires={}",
+                    response.live_artifact_sha256,
+                    response.rollback_rows,
+                    response.recent_changes,
+                    response.tripwire_count,
+                ),
+                |out| out.anneal_status = Some(response),
+            )))
+        }
     }
 }
