@@ -4,10 +4,10 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
     ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerHeadAnchor,
-    LedgerRow, QueryId, RedactionPolicy, ReproduceInputResolver, ReproduceLensRegistry,
-    ReproduceResult, StagedLedgerRow, SubjectId, VerifyResult, decode as decode_ledger_entry,
-    reproduce_payload_bytes, reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
-    verify_chain,
+    LedgerRow, LedgerSnapshot, QueryId, RedactionPolicy, ReproduceInputResolver,
+    ReproduceLensRegistry, ReproduceResult, StagedLedgerRow, SubjectId, VerifyResult,
+    decode as decode_ledger_entry, reproduce_payload_bytes, reproduce_verdict_with_input_resolver,
+    reproduce_with_input_resolver, verify_snapshot,
 };
 use std::ops::Range;
 
@@ -271,11 +271,12 @@ where
             });
         }
         let store = AsterRawLedgerStore { vault: self };
-        let head = store.head_anchor()?;
+        let (snapshot_seq, snapshot) = store.coherent_snapshot()?;
+        let head = snapshot.head_anchor().cloned();
         let head_height = head.as_ref().map_or(0, |anchor| anchor.height);
         let verified_range = range.unwrap_or(0..head_height);
-        let result = verify_chain(&store, verified_range.clone())?;
-        let raw_commitments = self.verify_raw_commitments(&store)?;
+        let result = verify_snapshot(&snapshot, verified_range.clone())?;
+        let raw_commitments = self.verify_raw_commitments(snapshot_seq, snapshot.rows())?;
         Ok(AsterLedgerChainVerification {
             result,
             head_height,
@@ -287,9 +288,10 @@ where
 
     fn verify_raw_commitments(
         &self,
-        ledger_store: &AsterRawLedgerStore<'_, C>,
+        snapshot_seq: u64,
+        ledger_rows: &[LedgerRow],
     ) -> Result<AsterRawCommitmentVerification> {
-        let rows = self.scan_cf_at(self.latest_seq(), ColumnFamily::RawCommitment)?;
+        let rows = self.scan_cf_at(snapshot_seq, ColumnFamily::RawCommitment)?;
         let mut commitments = Vec::with_capacity(rows.len());
         for (key, value) in rows {
             match raw_commitment::decode_commitment(&key, &value) {
@@ -323,7 +325,6 @@ where
             ));
         }
 
-        let ledger_rows = ledger_store.scan()?;
         let mut cursor = 0_usize;
         let mut seal_count = 0_u64;
         let mut sealed_through_seq = None;
@@ -917,6 +918,35 @@ fn anchor_rows(
 
 struct AsterRawLedgerStore<'a, C> {
     vault: &'a AsterVault<C>,
+}
+
+impl<C> AsterRawLedgerStore<'_, C>
+where
+    C: Clock,
+{
+    fn coherent_snapshot(&self) -> Result<(u64, LedgerSnapshot<'static>)> {
+        let durable = self.vault.durable.as_ref().ok_or_else(|| CalyxError {
+            code: "CALYX_ASTER_LEDGER_VERIFY_UNAVAILABLE",
+            message: "ledger snapshot requires a durable vault handle".to_owned(),
+            remediation: "verify through a write-capable handle or use verify_restore",
+        })?;
+        let _commit_guard = crate::file_lock::FileLockGuard::acquire(
+            &durable.root().join("locks").join("durable.commit.lock"),
+        )?;
+        let snapshot_seq = self.vault.snapshot();
+        let mut rows = Vec::new();
+        for (key, bytes) in self.vault.scan_cf_at(snapshot_seq, ColumnFamily::Ledger)? {
+            rows.push(LedgerRow {
+                seq: parse_aster_ledger_seq(&key)?,
+                bytes,
+            });
+        }
+        rows.sort_by_key(|row| row.seq);
+        let anchor = crate::ledger_head::read_head_anchor(durable.root())?;
+        let anchor =
+            crate::ledger_head::require_head_anchor_for_rows(durable.root(), anchor, &rows)?;
+        Ok((snapshot_seq, LedgerSnapshot::owned(rows, anchor)))
+    }
 }
 
 impl<C> LedgerCfStore for AsterRawLedgerStore<'_, C>
