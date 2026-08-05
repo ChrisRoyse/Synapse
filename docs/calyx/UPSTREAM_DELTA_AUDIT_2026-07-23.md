@@ -517,3 +517,85 @@ was inspected read-only and was neither merged nor synchronized.
 
 The 17 candidate rows above are exhaustive for retained production paths in the incremental
 range. No candidate remains in `applicable` or `needs-review` state after this adjudication.
+
+---
+
+## 10. Incremental audit through `06508c0a` (2026-08-04)
+
+The source-history Source of Truth was fetched again before this audit. `origin/main` resolved to
+`06508c0a15ac6bd80130467639829e825408741f`, **530 commits** after the absorption baseline and
+**24 non-merge commits** after the previously adjudicated `1fc85aa7` head. Each of those 24
+commits appears exactly once below.
+
+The comparison remained semantic. No upstream commit was merged or cherry-picked, and the local
+`C:\code\Calyx-Dev` worktree was not changed. Synapse's current `calyx/` tree and this host's
+physical capabilities are the product authorities.
+
+| Commit | Subject | Terminal decision | Native evidence / rationale |
+|---|---|---|---|
+| `5bd2c36d` | stop a TEI lane stop taking lawdemo down | not applicable | Changes only pruned Linux lawdemo deployment units and shell infrastructure. |
+| `b0f64fce` | track leapablelaw cloudflared unit | not applicable | Changes only pruned Linux/cloudflared deployment infrastructure. |
+| `59006838` | add atomic grounding batch ingest | not applicable to retained producer | Introduces an Aster API for a new external grounding-plan format whose only producer is the pruned `calyx-cli` command. Synapse already owns the reachable operation: `anchors_for_many_with_ledger_entry` atomically commits Base, Anchors, and Ledger rows, and `put_grounding_anchors_for_many` exposes it with structured physical readback. Importing the unused foreign plan protocol would create a second grounding identity authority. |
+| `775aac5b` | validate grounding hashes before coercion | not applicable | CLI input parser for the absent grounding-plan producer. |
+| `ed655f58` | report grounding conflicts precisely | not applicable to retained producer | Follow-up error taxonomy inside the absent grounding-plan protocol; the native anchor batch path already fails on missing constellations, conflicting anchor bytes, and Base/Anchors divergence before commit. |
+| `c7e65f35` | canonicalize grounding hashes across languages | not applicable | CLI/Cargo support for the absent external plan format. Synapse uses its own content-addressed native anchor and ledger identities. |
+| `3813ff82` | migrate grounding ledger identities atomically | not applicable to retained producer | Migration for prior versions of the absent external plan protocol; no such rows or producer exist in Synapse. |
+| `abc377a2` | classify grounding plan failures precisely | not applicable | CLI-only plan classification. |
+| `818010d1` | accept digest-only grounding intervention ids | not applicable | CLI-only external intervention-id parsing. |
+| `5584e2bd` | renew grounding ledger scan leases | not applicable to retained producer | Scan policy used only by the absent grounding-plan reconciliation path. |
+| `bcf89db0` | merge MVCC overlays into grounding ledger scans | already adapted and superseded | Synapse's current Aster scan resolves every active and sealed in-memory table plus immutable levels under the CF shard guard, pins one snapshot, derives the exact visible key set, and point-reads values in bounded pages. That is broader than the upstream grounding-only renewing scan and prevents mixed views rather than merely checking the sequence after each page. |
+| `95f50fde` | deduplicate grounding Base preflight reads | not applicable to retained producer | Optimization confined to the absent grounding-plan preflight. |
+| `003f7ca4` | bound grounding checkpoint memory | not applicable to retained producer | Checkpoint/reclaim policy confined to the absent grounding-plan importer and its CLI. |
+| `702f1542` | parallelize grounding row preparation | not applicable to retained producer | CPU optimization inside the absent grounding-plan importer. |
+| `14b90f4b` | index and byte-check grounding preflight | not applicable to retained producer | Preflight optimization inside the absent grounding-plan importer. |
+| `6f0302b8` | stream grounding anchor reconciliation | not applicable to retained producer | Reconciliation optimization inside the absent grounding-plan importer. |
+| `5b3b3d71` | stream grounding Base reconciliation | not applicable to retained producer | Reconciliation optimization inside the absent grounding-plan importer. |
+| `5ece85e5` | give lawdemo six foreign TEI lanes | not applicable | Changes only pruned Linux lawdemo deployment infrastructure. |
+| `03557649` | admit audited TEI endpoint relocation | intentionally incompatible | Synapse's frozen TEI contract includes the endpoint in the lens identity. The repository's binding encoders-only decision has no configured learned TEI lane, and silently preserving a LensId while dialing a different endpoint would create a second identity rule. A future learned lens must use pinned weights and a new frozen identity, not an endpoint relocation table. |
+| `00eb290d` | pass relocation table to spawned calyx | not applicable | Retained-crate portion is formatting only; behavior is in the pruned lawdemo subprocess launcher. |
+| `a9385418` | correct foreign SPECTER2 deployment | not applicable | Changes only pruned Linux lawdemo deployment configuration. |
+| `f94b8be4` | size CAGRA cache from device memory; configurable GPU floors | not applicable | The cache change targets the absent resident `cagra_serve` path. This host has only Intel Iris Xe (`PCI\\VEN_8086`), no NVIDIA adapter or `nvidia-smi`, and the deployed build cannot execute CUDA/cuVS. The environment-overridable safety-floor half is reverted by the next commit. |
+| `723b67b7` | revert environment-overridable GPU floors | not applicable | Reverts the preceding Forge policy. Synapse already keeps its host-wide reservation safety policy non-environment-overridable. |
+| `06508c0a` | optimize research workspace for mobile | not applicable | Changes only the pruned lawdemo web UI. |
+
+### 10.1 Research and decision checks
+
+Research was performed after the streams above were diagnosed:
+
+- Exa MCP `exa-search-server` v3.4.0 was driven through real stdio `initialize`, `tools/list`,
+  and `tools/call` queries for atomic durable batch/idempotency practice and CUDA device-memory
+  sizing. Both calls succeeded; the structured lane readback is
+  `%TEMP%\synapse-research-lane-readback.json`.
+- PostgreSQL's primary transaction documentation describes the relevant all-or-nothing contract:
+  intermediate states must not become visible and concurrent transactions must not observe
+  incomplete updates. Synapse's existing one-commit Base + Anchors + Ledger operation satisfies
+  that retained requirement without adopting a second input protocol:
+  <https://www.postgresql.org/docs/current/tutorial-transactions.html>.
+- Rust's `RwLock` documentation confirms the read/write exclusion primitive used by the native CF
+  shard boundary; the implementation additionally retains the guard across the protected SST
+  reads: <https://doc.rust-lang.org/std/sync/struct.RwLock.html>.
+- NVIDIA's runtime documentation makes device memory a CUDA-device property. There is no CUDA
+  device on this host and no retained CAGRA serving cache to size, so importing that code would not
+  optimize or enable a reachable path:
+  <https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html>.
+
+### 10.2 Reproducible source and host readback
+
+```powershell
+git -C C:\code\Calyx-Dev fetch origin main
+git -C C:\code\Calyx-Dev rev-parse origin/main
+# 06508c0a15ac6bd80130467639829e825408741f
+
+git -C C:\code\Calyx-Dev rev-list --count 9894f84f..origin/main
+# 530
+
+git -C C:\code\Calyx-Dev rev-list --count --no-merges 1fc85aa7..origin/main
+# 24
+
+Get-CimInstance Win32_VideoController | Select-Object Name,PNPDeviceID
+# Intel(R) Iris(R) Xe Graphics; PCI\VEN_8086...
+```
+
+No row in this incremental range remains `applicable` or `needs-review`. This closes the source
+history classification through `06508c0a`; it does not retroactively replace the separate manual
+runtime evidence attached to native ports from earlier ranges.
