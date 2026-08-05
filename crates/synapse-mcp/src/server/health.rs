@@ -302,20 +302,6 @@ struct CalyxTuningKnobFacts {
 
 const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
     CalyxTuningKnobFacts {
-        knob: "bit_floor_bits",
-        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
-        declared_at: "crates/synapse-storage/src/constellations.rs PANEL_ADMISSION_BIT_FLOOR",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: lens admission compares signal_bits against the hardcoded PANEL_ADMISSION_BIT_FLOOR, not this value",
-    },
-    CalyxTuningKnobFacts {
-        knob: "correlation_ceiling",
-        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
-        declared_at: "crates/synapse-storage/src/constellations.rs PANEL_ADMISSION_CORRELATION_CEILING",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: lens redundancy compares max_redundancy_nmi against the hardcoded PANEL_ADMISSION_CORRELATION_CEILING, not this value",
-    },
-    CalyxTuningKnobFacts {
         knob: "guard_far_identity",
         enforcement: CalyxTuningKnobEnforcement::LoadBearing,
         declared_at: "crates/synapse-calyx/src/ward.rs SynapseCalyxVault::configured_guard_target_far",
@@ -337,27 +323,6 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
         effect_of_tuning: "sets the default target false-accept rate hygiene operation=guard_calibrate certifies for stylistic slots; an explicit per-request target_far still wins, and a value above calyx-ward's per-aspect ceiling is refused loudly rather than ignored",
     },
     CalyxTuningKnobFacts {
-        knob: "guard_cold_start_tau",
-        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
-        declared_at: "calyx/crates/calyx-ward/src/guard.rs cold-start tau constant",
-        blocked_by_issue: "1677",
-        effect_of_tuning: "none: the cold-start tau the guard applies is a Ward constant; this value only travels into the lowered artifact",
-    },
-    CalyxTuningKnobFacts {
-        knob: "kernel_fraction",
-        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
-        declared_at: "none: no code anywhere reads kernel_fraction",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: validated, lowered into the guard-threshold artifact, and read by nothing",
-    },
-    CalyxTuningKnobFacts {
-        knob: "kernel_recall_gate",
-        enforcement: CalyxTuningKnobEnforcement::InertHardcodedElsewhere,
-        declared_at: "crates/synapse-calyx/src/intelligence.rs SYNAPSE_KERNEL_DEFAULT_MIN_RECALL",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: the kernel recall gate enforced on the intelligence path is the hardcoded SYNAPSE_KERNEL_DEFAULT_MIN_RECALL",
-    },
-    CalyxTuningKnobFacts {
         knob: "fusion_k",
         enforcement: CalyxTuningKnobEnforcement::LoadBearing,
         declared_at: "crates/synapse-calyx/src/find.rs -> calyx_search::FusionTuning::rrf_k -> calyx_sextant::FusionContext::rrf_k -> fusion::rrf::rrf_contribution; the untuned default is the single workspace declaration calyx_core::RRF_K_DEFAULT",
@@ -370,20 +335,6 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
         declared_at: "crates/synapse-calyx/src/find.rs -> calyx_search::FusionTuning::slot_weights -> engine_fusion::weights_for -> calyx_sextant::FusionContext::weights",
         blocked_by_issue: "",
         effect_of_tuning: "overrides the exact per-slot multiplier used by weighted RRF; unknown panel slots and an all-zero effective searched set fail closed",
-    },
-    CalyxTuningKnobFacts {
-        knob: "temporal_boost_min",
-        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
-        declared_at: "none: no code anywhere reads temporal_boost_min",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: validated at startup and reported here; the temporal rerank bounds come from the registered temporal policy, not from this knob",
-    },
-    CalyxTuningKnobFacts {
-        knob: "temporal_boost_max",
-        enforcement: CalyxTuningKnobEnforcement::InertNoConsumer,
-        declared_at: "none: no code anywhere reads temporal_boost_max",
-        blocked_by_issue: "1883",
-        effect_of_tuning: "none: validated at startup and reported here; the temporal rerank bounds come from the registered temporal policy, not from this knob",
     },
     CalyxTuningKnobFacts {
         knob: "index_m_max",
@@ -454,18 +405,11 @@ fn calyx_tuning_knob_report(
 /// `CALYX_TUNING_KNOB_FACTS` shows up as unreported instead of disappearing.
 fn calyx_tuning_knob_value(tuning: &synapse_calyx::SynapseCalyxTuningConfig, knob: &str) -> String {
     match knob {
-        "bit_floor_bits" => tuning.bit_floor_bits.to_string(),
-        "correlation_ceiling" => tuning.correlation_ceiling.to_string(),
         "guard_far_identity" => tuning.guard_far_identity.to_string(),
         "guard_far_content" => tuning.guard_far_content.to_string(),
         "guard_far_stylistic" => tuning.guard_far_stylistic.to_string(),
-        "guard_cold_start_tau" => tuning.guard_cold_start_tau.to_string(),
-        "kernel_fraction" => tuning.kernel_fraction.to_string(),
-        "kernel_recall_gate" => tuning.kernel_recall_gate.to_string(),
         "fusion_k" => tuning.fusion_k.to_string(),
         "fusion_slot_weights" => format!("{:?}", tuning.fusion_slot_weights),
-        "temporal_boost_min" => tuning.temporal_boost_min.to_string(),
-        "temporal_boost_max" => tuning.temporal_boost_max.to_string(),
         "index_m_max" => tuning.index_m_max.to_string(),
         "index_ef_construction" => tuning.index_ef_construction.to_string(),
         "index_beamwidth" => tuning.index_beamwidth.to_string(),
@@ -1356,7 +1300,7 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -1373,8 +1317,6 @@ impl SynapseService {
                 tuning
                     .as_ref()
                     .map_or("none", |config| config.clock_mode.as_str()),
-                tuning.as_ref().map(|config| config.bit_floor_bits),
-                tuning.as_ref().map(|config| config.correlation_ceiling),
                 math_backend
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), |math| math.detail()),
@@ -1407,10 +1349,6 @@ impl SynapseService {
             calyx_vault_last_calyx_error_code: status.last_calyx_error_code,
             calyx_vault_last_error: status.last_error,
             calyx_vault_remediation: status.remediation,
-            calyx_bit_floor_bits: tuning.as_ref().map(|config| config.bit_floor_bits),
-            calyx_correlation_ceiling: tuning
-                .as_ref()
-                .map(|config| config.correlation_ceiling),
             calyx_tuning_knobs: tuning_knobs,
             calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
             calyx_row_guard_sites: row_guard_sites,

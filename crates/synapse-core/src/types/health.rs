@@ -292,10 +292,6 @@ pub struct SubsystemHealth {
     pub calyx_vault_last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault_remediation: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_bit_floor_bits: Option<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_correlation_ceiling: Option<f32>,
     /// #1883: every configurable Calyx tuning knob, each reported WITH whether
     /// anything actually reads it. The nine `calyx_*` knobs that used to be
     /// printed here as bare numbers were validated, lowered and echoed, and read

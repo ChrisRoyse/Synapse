@@ -1883,19 +1883,12 @@ const CLOSE_REMEDIATION: &str = "inspect the vault directory and shutdown logs; 
 const CONFIG_REMEDIATION: &str =
     "fix the [calyx] configuration file or unset SYNAPSE_CALYX_CONFIG to use handbook defaults";
 
-const DEFAULT_BIT_FLOOR_BITS: f32 = 0.05;
-const DEFAULT_CORRELATION_CEILING: f32 = 0.6;
 const DEFAULT_GUARD_FAR_IDENTITY: f32 = 0.01;
 const DEFAULT_GUARD_FAR_CONTENT: f32 = 0.03;
 const DEFAULT_GUARD_FAR_STYLISTIC: f32 = 0.05;
-const DEFAULT_GUARD_COLD_START_TAU: f32 = 0.7;
-const DEFAULT_KERNEL_FRACTION: f32 = 0.01;
-const DEFAULT_KERNEL_RECALL_GATE: f32 = 0.95;
 /// The vault's untuned `fusion_k`. Bound to the single workspace declaration
 /// rather than restated, so this cannot drift from what actually scores (#1883).
 const DEFAULT_FUSION_K: u32 = calyx_core::RRF_K_DEFAULT;
-const DEFAULT_TEMPORAL_BOOST_MIN: f32 = 0.0;
-const DEFAULT_TEMPORAL_BOOST_MAX: f32 = 0.10;
 const DEFAULT_INDEX_M_MAX: usize = 32;
 const DEFAULT_INDEX_EF_CONSTRUCTION: usize = 64;
 const DEFAULT_INDEX_BEAMWIDTH: usize = 32;
@@ -1943,18 +1936,11 @@ impl SynapseCalyxClockMode {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SynapseCalyxTuningConfig {
-    pub bit_floor_bits: f32,
-    pub correlation_ceiling: f32,
     pub guard_far_identity: f32,
     pub guard_far_content: f32,
     pub guard_far_stylistic: f32,
-    pub guard_cold_start_tau: f32,
-    pub kernel_fraction: f32,
-    pub kernel_recall_gate: f32,
     pub fusion_k: u32,
     pub fusion_slot_weights: BTreeMap<u16, f32>,
-    pub temporal_boost_min: f32,
-    pub temporal_boost_max: f32,
     pub index_m_max: usize,
     pub index_ef_construction: usize,
     pub index_beamwidth: usize,
@@ -1971,18 +1957,11 @@ pub struct SynapseCalyxTuningConfig {
 impl Default for SynapseCalyxTuningConfig {
     fn default() -> Self {
         Self {
-            bit_floor_bits: DEFAULT_BIT_FLOOR_BITS,
-            correlation_ceiling: DEFAULT_CORRELATION_CEILING,
             guard_far_identity: DEFAULT_GUARD_FAR_IDENTITY,
             guard_far_content: DEFAULT_GUARD_FAR_CONTENT,
             guard_far_stylistic: DEFAULT_GUARD_FAR_STYLISTIC,
-            guard_cold_start_tau: DEFAULT_GUARD_COLD_START_TAU,
-            kernel_fraction: DEFAULT_KERNEL_FRACTION,
-            kernel_recall_gate: DEFAULT_KERNEL_RECALL_GATE,
             fusion_k: DEFAULT_FUSION_K,
             fusion_slot_weights: BTreeMap::new(),
-            temporal_boost_min: DEFAULT_TEMPORAL_BOOST_MIN,
-            temporal_boost_max: DEFAULT_TEMPORAL_BOOST_MAX,
             index_m_max: DEFAULT_INDEX_M_MAX,
             index_ef_construction: DEFAULT_INDEX_EF_CONSTRUCTION,
             index_beamwidth: DEFAULT_INDEX_BEAMWIDTH,
@@ -2006,8 +1985,6 @@ impl SynapseCalyxTuningConfig {
     /// Returns a structured error when any value is non-finite, outside the
     /// accepted range, or when clock settings contradict each other.
     pub fn validate(self) -> Result<Self, SynapseCalyxError> {
-        validate_f32("bit_floor_bits", self.bit_floor_bits, 0.0, f32::INFINITY)?;
-        validate_f32("correlation_ceiling", self.correlation_ceiling, 0.0, 1.0)?;
         validate_f32(
             "guard_far_identity",
             self.guard_far_identity,
@@ -2029,12 +2006,6 @@ impl SynapseCalyxTuningConfig {
             0.0,
             DEFAULT_GUARD_FAR_STYLISTIC,
         )?;
-        validate_f32("guard_cold_start_tau", self.guard_cold_start_tau, 0.0, 1.0)?;
-        validate_f32("kernel_fraction", self.kernel_fraction, 0.0, 1.0)?;
-        if self.kernel_fraction == 0.0 {
-            return Err(invalid_config("kernel_fraction must be greater than 0.0"));
-        }
-        validate_f32("kernel_recall_gate", self.kernel_recall_gate, 0.0, 1.0)?;
         if self.fusion_k == 0 {
             return Err(invalid_config("fusion_k must be positive"));
         }
@@ -2056,18 +2027,6 @@ impl SynapseCalyxTuningConfig {
                 f32::INFINITY,
             )?;
         }
-        validate_f32(
-            "temporal_boost_min",
-            self.temporal_boost_min,
-            0.0,
-            DEFAULT_TEMPORAL_BOOST_MAX,
-        )?;
-        validate_f32(
-            "temporal_boost_max",
-            self.temporal_boost_max,
-            self.temporal_boost_min,
-            DEFAULT_TEMPORAL_BOOST_MAX,
-        )?;
         if self.vram_budget_bytes == 0 {
             return Err(invalid_config("vram_budget_bytes must be positive"));
         }

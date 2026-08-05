@@ -47,17 +47,10 @@ pub const LOWERED_ARTIFACT_SCHEMA_VERSION: u32 = 1;
 /// for a lowered artifact.
 pub const LOWERED_ARTIFACT_MAGIC: &str = "SYN-LOWERED-V1";
 
-// Documented safe defaults for the guard-threshold hot set. These mirror the
-// conservative daemon-startup defaults; the hot path degrades to them when no
-// fresh artifact is available so the boundary never needs a live Calyx call.
-const DEFAULT_BIT_FLOOR_BITS: f32 = 0.05;
-const DEFAULT_CORRELATION_CEILING: f32 = 0.6;
+// Documented safe defaults for the load-bearing guard FAR thresholds.
 const DEFAULT_GUARD_FAR_IDENTITY: f32 = 0.01;
 const DEFAULT_GUARD_FAR_CONTENT: f32 = 0.03;
 const DEFAULT_GUARD_FAR_STYLISTIC: f32 = 0.05;
-const DEFAULT_GUARD_COLD_START_TAU: f32 = 0.7;
-const DEFAULT_KERNEL_FRACTION: f32 = 0.01;
-const DEFAULT_KERNEL_RECALL_GATE: f32 = 0.95;
 
 /// Thread-local hot-context boundary.
 ///
@@ -163,14 +156,9 @@ impl fmt::Display for LoweredArtifactKind {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LoweredGuardThresholds {
-    pub bit_floor_bits: f32,
-    pub correlation_ceiling: f32,
     pub guard_far_identity: f32,
     pub guard_far_content: f32,
     pub guard_far_stylistic: f32,
-    pub guard_cold_start_tau: f32,
-    pub kernel_fraction: f32,
-    pub kernel_recall_gate: f32,
 }
 
 impl LoweredGuardThresholds {
@@ -181,14 +169,9 @@ impl LoweredGuardThresholds {
     #[must_use]
     pub const fn fail_closed_default() -> Self {
         Self {
-            bit_floor_bits: DEFAULT_BIT_FLOOR_BITS,
-            correlation_ceiling: DEFAULT_CORRELATION_CEILING,
             guard_far_identity: DEFAULT_GUARD_FAR_IDENTITY,
             guard_far_content: DEFAULT_GUARD_FAR_CONTENT,
             guard_far_stylistic: DEFAULT_GUARD_FAR_STYLISTIC,
-            guard_cold_start_tau: DEFAULT_GUARD_COLD_START_TAU,
-            kernel_fraction: DEFAULT_KERNEL_FRACTION,
-            kernel_recall_gate: DEFAULT_KERNEL_RECALL_GATE,
         }
     }
 
@@ -297,14 +280,9 @@ impl SynapseCalyxVault {
         hot_context::assert_cold_calyx("lower_guard_thresholds");
         let tuning = &self.config.tuning;
         let payload = LoweredGuardThresholds {
-            bit_floor_bits: tuning.bit_floor_bits,
-            correlation_ceiling: tuning.correlation_ceiling,
             guard_far_identity: tuning.guard_far_identity,
             guard_far_content: tuning.guard_far_content,
             guard_far_stylistic: tuning.guard_far_stylistic,
-            guard_cold_start_tau: tuning.guard_cold_start_tau,
-            kernel_fraction: tuning.kernel_fraction,
-            kernel_recall_gate: tuning.kernel_recall_gate,
         };
         let content_sha256 = sha256_hex(&payload.canonical_bytes()?);
         let produced_at_unix_ms = self.clock_now_ms()?;
