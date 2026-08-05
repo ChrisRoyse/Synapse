@@ -681,17 +681,16 @@ impl SynapseCalyxVault {
             .read_cf_latest(ColumnFamily::Kv, &key)
             .map_err(|error| SynapseCalyxError::from_calyx("read Anneal search binding", &error))?
         {
-            if existing != bytes {
-                return Err(anneal_error(
-                    "SYNAPSE_CALYX_ANNEAL_SEARCH_BINDING_CONFLICT",
-                    format!(
-                        "tuning artifact {} panel {} already binds different manifest bytes",
-                        binding.tuning_artifact_sha256, binding.manifest.panel_version
-                    ),
-                    "stop and inspect the content-addressed binding; one tuning hash cannot identify two search generations",
-                ));
+            if existing == bytes {
+                return Ok(());
             }
-            return Ok(());
+            tracing::info!(
+                code = "SYNAPSE_CALYX_ANNEAL_SEARCH_BINDING_ADVANCED",
+                tuning_artifact_sha256 = %binding.tuning_artifact_sha256,
+                panel_version = binding.manifest.panel_version,
+                manifest_sha256 = %binding.manifest.manifest_sha256,
+                "advancing the verified tuning/panel binding to the proposal's newer corpus generation"
+            );
         }
         self.vault
             .write_cf(ColumnFamily::Kv, key.clone(), bytes.clone())
@@ -745,12 +744,15 @@ impl SynapseCalyxVault {
                     "restore the exact manifest binding before reopening the vault",
                 ));
             }
-            let current = calyx_search::read_live_manifest_artifact(
+            let current_generation = PersistedSearchIndexes::open(
                 &self.config.vault_dir,
                 binding.manifest.panel_version,
             )
+            .and_then(|indexes| indexes.generation())
             .ok();
-            if current.as_ref() != Some(&binding.manifest) {
+            if current_generation.as_ref().is_none_or(|generation| {
+                generation.dense_index_config != tuning.dense_index_config()
+            }) {
                 calyx_search::publish_live_manifest_artifact(
                     &self.config.vault_dir,
                     binding.manifest.panel_version,
