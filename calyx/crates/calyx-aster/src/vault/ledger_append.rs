@@ -275,6 +275,16 @@ where
         let head = snapshot.head_anchor().cloned();
         let head_height = head.as_ref().map_or(0, |anchor| anchor.height);
         let verified_range = range.unwrap_or(0..head_height);
+        if verified_range.start > verified_range.end || verified_range.end > head_height {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_LEDGER_VERIFY_RANGE_INVALID",
+                message: format!(
+                    "ledger verification range [{}..{}) is outside the pinned durable head [0..{})",
+                    verified_range.start, verified_range.end, head_height
+                ),
+                remediation: "use a half-open range with start <= end <= the reported pinned durable head; omit the range to verify the complete pinned chain",
+            });
+        }
         let result = verify_snapshot(&snapshot, verified_range.clone())?;
         let raw_commitments = self.verify_raw_commitments(snapshot_seq, snapshot.rows())?;
         Ok(AsterLedgerChainVerification {
