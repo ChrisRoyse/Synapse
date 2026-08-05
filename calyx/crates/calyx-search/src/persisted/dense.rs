@@ -197,6 +197,9 @@ pub(super) fn ids(
             entry.kind
         )));
     }
+    if entry.kind == "flat_dense" {
+        return flat::ids(vault_dir, entry, slot);
+    }
     read_ids(vault_dir, entry, panel_version, slot)
 }
 

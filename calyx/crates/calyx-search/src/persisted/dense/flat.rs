@@ -91,6 +91,18 @@ pub(super) fn search(
     Ok(ranked(scored))
 }
 
+pub(super) fn ids(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    slot: SlotId,
+) -> CliResult<Vec<CxId>> {
+    Ok(pinned_index(vault_dir, entry, slot)?
+        .rows
+        .iter()
+        .map(|(cx_id, _)| *cx_id)
+        .collect())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct Header {
     format: String,
