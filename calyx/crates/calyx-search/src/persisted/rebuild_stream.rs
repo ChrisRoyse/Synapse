@@ -452,9 +452,11 @@ where
             root,
             PanelSlotId::new(plan.panel_version, plan.slot),
             rows,
-            base_seq,
-            build_policy,
-            dense_index_config,
+            dense::DenseBuildOptions {
+                base_seq,
+                policy: build_policy,
+                config: dense_index_config,
+            },
             |event| match progress {
                 Some(progress) => emit_shared_progress(progress, event),
                 None => Ok(()),

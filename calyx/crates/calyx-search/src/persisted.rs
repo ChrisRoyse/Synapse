@@ -272,12 +272,14 @@ impl PersistedSearchIndexes {
             SlotVector::Dense { .. } => dense::search_filtered(
                 &self.vault_dir,
                 entry,
-                self.manifest.panel_version,
-                slot,
+                dense::DenseSearchContext {
+                    panel_version: self.manifest.panel_version,
+                    slot,
+                    config: self.manifest.dense_index_config.validate()?,
+                },
                 query,
                 k,
                 candidates,
-                self.manifest.dense_index_config.validate()?,
             ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,

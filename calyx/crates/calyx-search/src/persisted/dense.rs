@@ -23,6 +23,20 @@ pub(super) struct DenseSlotRows {
     pub(super) rows: Vec<(CxId, Vec<f32>)>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct DenseBuildOptions {
+    pub(super) base_seq: u64,
+    pub(super) policy: DiskAnnBuildPolicy,
+    pub(super) config: PersistedDenseIndexConfig,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct DenseSearchContext {
+    pub(super) panel_version: u32,
+    pub(super) slot: SlotId,
+    pub(super) config: PersistedDenseIndexConfig,
+}
+
 impl DenseSlotRows {
     pub(super) fn len(&self) -> usize {
         self.rows.len()
@@ -34,14 +48,17 @@ pub(super) fn write_with_progress<F>(
     root: &Path,
     panel_slot: PanelSlotId,
     rows: DenseSlotRows,
-    base_seq: u64,
-    build_policy: DiskAnnBuildPolicy,
-    config: PersistedDenseIndexConfig,
+    options: DenseBuildOptions,
     mut progress: F,
 ) -> CliResult<SearchIndexEntry>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult,
 {
+    let DenseBuildOptions {
+        base_seq,
+        policy: build_policy,
+        config,
+    } = options;
     let slot = panel_slot.slot_id();
     let panel_version = panel_slot.panel_version();
     if should_use_flat_dense_index(rows.rows.len()) {
@@ -123,13 +140,16 @@ pub(super) fn search(
 pub(super) fn search_filtered(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
-    panel_version: u32,
-    slot: SlotId,
+    context: DenseSearchContext,
     query: &SlotVector,
     k: usize,
     candidates: &BTreeSet<CxId>,
-    config: PersistedDenseIndexConfig,
 ) -> CliResult<Vec<IndexSearchHit>> {
+    let DenseSearchContext {
+        panel_version,
+        slot,
+        config,
+    } = context;
     if entry.kind == "flat_dense" {
         return flat::search(vault_dir, entry, slot, query, k, Some(candidates));
     }
