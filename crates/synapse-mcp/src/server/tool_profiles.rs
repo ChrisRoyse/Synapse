@@ -2310,6 +2310,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to an explicit maintenance profile before removing endpoints",
             ),
+            op(
+                "recommend",
+                true,
+                false,
+                "CF_KV task attempt rows + immutable spawn model/template provenance + CF_AGENT_TRANSCRIPTS cost rows",
+                Some(
+                    "append-only CF_KV steering decision readback + CF_ACTION_LOG/Oracle/Ledger publication",
+                ),
+                error_codes::STORAGE_WRITE_FAILED,
+                "repair corrupt task/cost evidence or steering decision persistence before retrying recommendation",
+            ),
         ],
     ),
     facade_contract(
