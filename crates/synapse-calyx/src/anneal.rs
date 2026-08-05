@@ -6,6 +6,7 @@ use calyx_anneal::{
 use calyx_aster::cf::ColumnFamily;
 use calyx_ledger::{ActorId, LedgerAppender};
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
 use crate::{SynapseCalyxError, SynapseCalyxTuningConfig, SynapseCalyxVault};
@@ -73,12 +74,49 @@ impl SynapseCalyxVault {
             .is_none()
         {
             rollback
-                .install_live_ptr(key, ArtifactPtr::ConfigCacheKeyHash(hash))
+                .install_live_ptr(key.clone(), ArtifactPtr::ConfigCacheKeyHash(hash))
                 .map_err(|error| {
                     SynapseCalyxError::from_calyx("install initial Anneal tuning pointer", &error)
                 })?;
         }
-        let effective = self.effective_tuning()?;
+        let (prior_hash, prior_bytes, effective) = self.read_live_tuning()?;
+        let canonical_bytes = serde_json::to_vec(&effective).map_err(|error| {
+            anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_ARTIFACT_ENCODE_FAILED",
+                format!("encode migrated live tuning artifact: {error}"),
+                "repair the validated tuning serializer before reopening the vault",
+            )
+        })?;
+        if canonical_bytes != prior_bytes {
+            let canonical_hash = tuning_artifact_hash(&canonical_bytes);
+            self.persist_tuning_artifact(canonical_hash, &canonical_bytes)?;
+            rollback
+                .install_live_ptr(key, ArtifactPtr::ConfigCacheKeyHash(canonical_hash))
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx("install migrated Anneal tuning pointer", &error)
+                })?;
+            let (observed_hash, observed_bytes, observed_tuning) = self.read_live_tuning()?;
+            if observed_hash != canonical_hash
+                || observed_bytes != canonical_bytes
+                || observed_tuning != effective
+            {
+                return Err(anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_MIGRATION_READBACK_MISMATCH",
+                    format!(
+                        "migrated live tuning pointer readback {} does not match canonical {}",
+                        hex32(observed_hash),
+                        hex32(canonical_hash)
+                    ),
+                    "inspect the native AnnealRollback live pointer and Kv artifact rows before reopening the vault",
+                ));
+            }
+            tracing::info!(
+                code = "SYNAPSE_CALYX_ANNEAL_TUNING_SCHEMA_MIGRATED",
+                prior_artifact_sha256 = %hex32(prior_hash),
+                live_artifact_sha256 = %hex32(canonical_hash),
+                "migrated durable Anneal tuning artifact after retiring inert fields"
+            );
+        }
         tracing::info!(
             code = "SYNAPSE_CALYX_ANNEAL_TUNING_OPENED",
             fusion_k = effective.fusion_k,
@@ -376,15 +414,7 @@ impl SynapseCalyxVault {
                 "restore the exact artifact bytes referenced by the AnnealRollback pointer",
             ));
         }
-        let tuning = serde_json::from_slice::<SynapseCalyxTuningConfig>(&bytes)
-            .map_err(|error| {
-                anneal_error(
-                    "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
-                    format!("decode live tuning artifact {}: {error}", hex32(hash)),
-                    "restore a valid versioned Synapse tuning artifact and pointer",
-                )
-            })?
-            .validate()?;
+        let tuning = decode_tuning_artifact(&bytes, hash)?;
         Ok((hash, bytes, tuning))
     }
 
@@ -436,6 +466,70 @@ impl SynapseCalyxVault {
 
     fn anneal_clock(&self) -> Result<crate::SynapseCalyxClock, SynapseCalyxError> {
         crate::SynapseCalyxClock::from_tuning(&self.config.tuning)
+    }
+}
+
+fn decode_tuning_artifact(
+    bytes: &[u8],
+    hash: [u8; 32],
+) -> Result<SynapseCalyxTuningConfig, SynapseCalyxError> {
+    match serde_json::from_slice::<SynapseCalyxTuningConfig>(bytes) {
+        Ok(tuning) => tuning.validate(),
+        Err(direct_error) => {
+            let mut value = serde_json::from_slice::<Value>(bytes).map_err(|error| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
+                    format!("decode live tuning artifact {}: {error}", hex32(hash)),
+                    "restore a valid versioned Synapse tuning artifact and pointer",
+                )
+            })?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
+                    format!(
+                        "decode live tuning artifact {}: expected a JSON object; original error: {direct_error}",
+                        hex32(hash)
+                    ),
+                    "restore a valid versioned Synapse tuning artifact and pointer",
+                )
+            })?;
+            let mut removed = Vec::new();
+            for key in [
+                "bit_floor_bits",
+                "correlation_ceiling",
+                "guard_cold_start_tau",
+                "kernel_fraction",
+                "kernel_recall_gate",
+                "temporal_boost_min",
+                "temporal_boost_max",
+            ] {
+                if object.remove(key).is_some() {
+                    removed.push(key);
+                }
+            }
+            if removed.is_empty() {
+                return Err(anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
+                    format!(
+                        "decode live tuning artifact {}: {direct_error}",
+                        hex32(hash)
+                    ),
+                    "restore a valid versioned Synapse tuning artifact and pointer",
+                ));
+            }
+            serde_json::from_value::<SynapseCalyxTuningConfig>(value)
+                .map_err(|error| {
+                    anneal_error(
+                        "SYNAPSE_CALYX_ANNEAL_ARTIFACT_DECODE_FAILED",
+                        format!(
+                            "decode legacy live tuning artifact {} after removing retired fields {removed:?}: {error}",
+                            hex32(hash)
+                        ),
+                        "restore a valid versioned Synapse tuning artifact and pointer; only the documented retired fields are migrated",
+                    )
+                })?
+                .validate()
+        }
     }
 }
 
