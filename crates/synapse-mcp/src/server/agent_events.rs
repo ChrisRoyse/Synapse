@@ -1154,7 +1154,7 @@ fn terminal_agent_outcome(record: &AgentEventRecord) -> Option<&'static str> {
     }
 }
 
-fn tool_call_error_present(record: &AgentEventRecord) -> bool {
+pub(crate) fn tool_call_error_present(record: &AgentEventRecord) -> bool {
     record
         .attributes
         .error_type

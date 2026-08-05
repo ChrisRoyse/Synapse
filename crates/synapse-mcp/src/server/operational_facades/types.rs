@@ -188,6 +188,7 @@ pub enum ModelOperation {
     Update,
     Remove,
     Recommend,
+    Override,
 }
 
 impl ModelOperation {
@@ -200,6 +201,7 @@ impl ModelOperation {
             Self::Update => "update",
             Self::Remove => "remove",
             Self::Recommend => "recommend",
+            Self::Override => "override",
         }
     }
 }
@@ -255,6 +257,33 @@ pub struct ModelRecommendResponse {
     pub decision_id: String,
     pub decision_row_key: String,
     pub decision_row_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operator_override: Option<ModelOverrideReadback>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOverrideParams {
+    pub task_class: String,
+    pub decision_id: String,
+    pub decision_row_key: String,
+    pub selected_model: String,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ModelOverrideReadback {
+    pub schema: String,
+    pub task_class: String,
+    pub decision_id: String,
+    pub selected_model: String,
+    pub reason: String,
+    pub observed_unix_ns: u128,
+    pub current_row_key: String,
+    pub history_row_key: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -275,6 +304,8 @@ pub struct ModelParams {
     pub remove: Option<LocalModelRemoveParams>,
     #[serde(default)]
     pub recommend: Option<ModelRecommendParams>,
+    #[serde(default)]
+    pub r#override: Option<ModelOverrideParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -312,6 +343,8 @@ pub struct ModelResponse {
     pub remove: Option<LocalModelRemoveResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recommend: Option<ModelRecommendResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub r#override: Option<ModelOverrideReadback>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

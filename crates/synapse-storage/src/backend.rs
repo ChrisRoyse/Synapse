@@ -696,6 +696,11 @@ pub trait StorageBackend: Send + Sync {
     fn read_calyx_ledger_entry(&self, seq: u64) -> StorageResult<SynapseCalyxLedgerEntryReadback>;
     /// Re-derives a record's recorded provenance binding and bounds drift.
     fn reproduce_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxReproduceReport>;
+    /// Reads the authoritative source-row pointer from one physical Calyx Base row.
+    fn read_calyx_base_source_pointer(
+        &self,
+        cx_id: &str,
+    ) -> StorageResult<Option<synapse_calyx::SynapseCalyxBaseSourcePointer>>;
     /// Lawfully erases one record by content-addressed id via a ledger-stamped
     /// tombstone, then re-verifies the chain.
     fn erase_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxErasureReport>;
@@ -4076,6 +4081,25 @@ impl StorageBackend for CalyxBackend {
                 })
             },
         )
+    }
+
+    fn read_calyx_base_source_pointer(
+        &self,
+        cx_id: &str,
+    ) -> StorageResult<Option<synapse_calyx::SynapseCalyxBaseSourcePointer>> {
+        let parsed =
+            cx_id
+                .trim()
+                .parse::<calyx_core::CxId>()
+                .map_err(|error| StorageError::ReadFailed {
+                    cf_name: "base".to_owned(),
+                    detail: format!("Calyx Base source-pointer id {cx_id:?} is invalid: {error}"),
+                })?;
+        self.with_vault("calyx_base", "read Base source pointer", false, |vault| {
+            vault.read_base_source_pointer(parsed).map_err(|source| {
+                calyx_write_failed("calyx_base", "read Base source pointer", &source)
+            })
+        })
     }
 
     fn erase_calyx_record(&self, cx_id: &str) -> StorageResult<SynapseCalyxErasureReport> {

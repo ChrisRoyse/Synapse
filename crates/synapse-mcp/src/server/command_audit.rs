@@ -953,7 +953,7 @@ fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
-fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_hex(value: &str) -> Result<Vec<u8>, String> {
     let value = value.trim();
     if !value.len().is_multiple_of(2) {
         return Err("audit query cursor must be even-length hex".to_owned());

@@ -998,6 +998,14 @@ impl Db {
         self.backend.oracle_readiness()
     }
 
+    /// Reads the authoritative source-row pointer stored on a physical Calyx Base row.
+    pub fn read_calyx_base_source_pointer(
+        &self,
+        cx_id: &str,
+    ) -> StorageResult<Option<synapse_calyx::SynapseCalyxBaseSourcePointer>> {
+        self.backend.read_calyx_base_source_pointer(cx_id)
+    }
+
     /// Commits one validated recurrence notification intent to Calyx
     /// `Reactive` and independently reads the exact bytes back.
     ///

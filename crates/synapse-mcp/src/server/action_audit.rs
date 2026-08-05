@@ -14,6 +14,34 @@ use crate::server::url_redaction::redact_url_fields_for_public_readback;
 static ACTION_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 
 impl SynapseService {
+    pub(super) fn audit_action_preflight_candidate(
+        &self,
+        tool: &str,
+        details: &Value,
+        action_session_id: Option<&str>,
+    ) -> Result<String, ErrorData> {
+        let row = self.write_action_audit_row_readback(
+            tool,
+            "preflight",
+            None,
+            details,
+            action_session_id,
+        )?;
+        let db = self.m3_storage()?;
+        let constellation = db
+            .put_action_constellation(&row.audit_key, &row.encoded, &row.value)
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!(
+                        "STEERING_PREFLIGHT_CONSTELLATION_FAILED: tool={tool} source_key_hex={} detail={error}; remediation=repair the action-panel projection before retrying the risky call",
+                        synapse_storage::constellations::hex_encode(&row.audit_key)
+                    ),
+                )
+            })?;
+        Ok(constellation.cx_id)
+    }
+
     pub(super) fn audit_action_started_for_request(
         &self,
         tool: &'static str,
@@ -324,6 +352,18 @@ impl SynapseService {
         details: &Value,
         action_session_id: Option<&str>,
     ) -> Result<(), ErrorData> {
+        self.write_action_audit_row_readback(tool, status, error_code, details, action_session_id)?;
+        Ok(())
+    }
+
+    fn write_action_audit_row_readback(
+        &self,
+        tool: &str,
+        status: &'static str,
+        error_code: Option<&str>,
+        details: &Value,
+        action_session_id: Option<&str>,
+    ) -> Result<ActionAuditRowReadback, ErrorData> {
         let (ts_ns, seq) = next_audit_key_parts();
         let active_profile = self.action_audit_active_profile();
         let mut audit_context = self.current_action_audit_context()?;
@@ -444,7 +484,7 @@ impl SynapseService {
             );
         } else {
             runtime
-                .storage_put_action_log_rows(vec![(audit_key.clone(), encoded)])
+                .storage_put_action_log_rows(vec![(audit_key.clone(), encoded.clone())])
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         }
         drop(runtime);
@@ -456,7 +496,11 @@ impl SynapseService {
             seq,
             "action audit row written"
         );
-        Ok(())
+        Ok(ActionAuditRowReadback {
+            audit_key,
+            encoded,
+            value,
+        })
     }
 
     fn action_audit_foreground(&self) -> Value {
@@ -614,7 +658,7 @@ impl SynapseService {
     /// this shared human OS foreground tier.
     fn action_audit_foreground_tier(
         &self,
-        tool: &'static str,
+        tool: &str,
         status: &str,
         session_id: Option<&str>,
         details: &Value,
@@ -710,6 +754,12 @@ impl SynapseService {
                 .map(|profile| profile.schema_version)
         })
     }
+}
+
+struct ActionAuditRowReadback {
+    audit_key: Vec<u8>,
+    encoded: Vec<u8>,
+    value: Value,
 }
 
 fn action_audit_detail_redactions(details: &Value) -> Vec<String> {

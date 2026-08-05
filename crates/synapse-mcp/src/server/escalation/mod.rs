@@ -7933,6 +7933,7 @@ pub(crate) fn ensure_guard_quarantine_escalation(
     let now_unix_ms = checked_unix_time_ms("Ward quarantine escalation")?;
     let revisioned_policy = load_policy_revisioned(db)?;
     let policy = &revisioned_policy.policy;
+    let agent = resolve_guard_agent_identity(db, finding)?;
     let severity = Severity::Critical;
     let anchor = format!("ward:{}:{}", finding.guard_id, finding.query_cx_id);
     let attention_state = "quarantine";
@@ -7945,26 +7946,51 @@ pub(crate) fn ensure_guard_quarantine_escalation(
         escalation_id,
         approval_id,
         anchor: anchor.clone(),
-        spawn_id: None,
-        session_id: None,
+        spawn_id: agent
+            .as_ref()
+            .and_then(|identity| identity.spawn_id.clone()),
+        session_id: agent
+            .as_ref()
+            .and_then(|identity| identity.session_id.clone()),
         severity,
         attention_state: attention_state.to_owned(),
         reason_code: Some("ward_guard_quarantine".to_owned()),
         context: EscalationContext {
             action: "Ward quarantined an out-of-distribution record".to_owned(),
-            reason: format!(
-                "guard {} rejected record {} on slots {:?}",
-                finding.guard_id, finding.query_cx_id, finding.failing_slots
-            ),
+            reason: if agent.is_some() {
+                format!(
+                    "guard {} rejected agent record {} on slots {:?}; pause is recommended pending operator review",
+                    finding.guard_id, finding.query_cx_id, finding.failing_slots
+                )
+            } else {
+                format!(
+                    "guard {} rejected record {} on slots {:?}",
+                    finding.guard_id, finding.query_cx_id, finding.failing_slots
+                )
+            },
             reversible: false,
             alternatives: vec![
                 "inspect the Ward verdict and matched exemplars".to_owned(),
                 "acknowledge only after the record identity is resolved".to_owned(),
             ],
-            waiting_for: Some("operator quarantine review".to_owned()),
+            waiting_for: Some(if agent.is_some() {
+                "operator pause/kill decision".to_owned()
+            } else {
+                "operator quarantine review".to_owned()
+            }),
             agent_detail_deep_link: format!("/calyx/guard/{}", finding.guard_id),
             approval_deadline_unix_ms: now_unix_ms.saturating_add(ttl),
-            evidence: serde_json::to_value(finding).map_err(|error| {
+            evidence: serde_json::to_value(json!({
+                "ward_finding": finding,
+                "agent_identity": agent,
+                "steering": agent.as_ref().map(|_| json!({
+                    "grounding": "grounded_ward_quarantine",
+                    "recommended_action": "pause",
+                    "kill_eligible_after_operator_review": true,
+                    "enforcement": "operator_policy"
+                }))
+            }))
+            .map_err(|error| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
                     format!("encode Ward quarantine evidence: {error}"),
@@ -8043,6 +8069,104 @@ pub(crate) fn ensure_guard_quarantine_escalation(
             "Ward quarantine escalation for anchor {anchor:?} could not acquire a stable item/index revision after {ACK_REVISION_MAX_ATTEMPTS} attempts"
         ),
     ))
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct GuardAgentIdentity {
+    spawn_id: Option<String>,
+    session_id: Option<String>,
+    source_cf: String,
+    source_key_hex: String,
+}
+
+fn resolve_guard_agent_identity(
+    db: &Db,
+    finding: &synapse_calyx::SynapseCalyxPersistedNoveltyFinding,
+) -> Result<Option<GuardAgentIdentity>, ErrorData> {
+    let pointer = db
+        .read_calyx_base_source_pointer(&finding.query_cx_id)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "WARD_AGENT_SOURCE_POINTER_READ_FAILED: query_cx_id={} detail={error}; remediation=repair the named Calyx Base row before relaying quarantine",
+                    finding.query_cx_id
+                ),
+            )
+        })?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "WARD_AGENT_SOURCE_POINTER_ABSENT: query_cx_id={} has no physical Calyx Base row; remediation=restore or re-project the source constellation before relaying quarantine",
+                    finding.query_cx_id
+                ),
+            )
+        })?;
+    let source_cf = pointer.source_cf.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "WARD_AGENT_SOURCE_CF_ABSENT: query_cx_id={} Base row has no source CF; remediation=re-project the agent event constellation with its authoritative source pointer",
+                finding.query_cx_id
+            ),
+        )
+    })?;
+    if source_cf != synapse_storage::cf::CF_AGENT_EVENTS {
+        return Ok(None);
+    }
+    let source_key_hex = pointer.source_key_hex.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "WARD_AGENT_SOURCE_KEY_ABSENT: query_cx_id={} Base row has no source key; remediation=re-project the agent event constellation with its authoritative source pointer",
+                finding.query_cx_id
+            ),
+        )
+    })?;
+    let source_key = crate::server::command_audit::decode_hex(&source_key_hex).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "WARD_AGENT_SOURCE_KEY_INVALID: query_cx_id={} source_key_hex={source_key_hex:?} detail={error}; remediation=repair the corrupt Base source pointer",
+                finding.query_cx_id
+            ),
+        )
+    })?;
+    let bytes = db
+        .get_cf(synapse_storage::cf::CF_AGENT_EVENTS, &source_key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "WARD_AGENT_SOURCE_ROW_ABSENT: CF_AGENT_EVENTS key {source_key_hex} referenced by query_cx_id={} is absent; remediation=restore the source event or quarantine the broken projection",
+                    finding.query_cx_id
+                ),
+            )
+        })?;
+    let event: synapse_core::AgentEventRecord = synapse_storage::decode_json(&bytes).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "WARD_AGENT_SOURCE_ROW_INVALID: CF_AGENT_EVENTS key {source_key_hex} failed to decode: {error}; remediation=repair or quarantine the corrupt source row"
+            ),
+        )
+    })?;
+    if event.spawn_id.is_none() && event.session_id.is_none() {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "WARD_AGENT_IDENTITY_ABSENT: CF_AGENT_EVENTS key {source_key_hex} carries neither spawn_id nor session_id; remediation=repair agent-event attribution before relaying quarantine"
+            ),
+        ));
+    }
+    Ok(Some(GuardAgentIdentity {
+        spawn_id: event.spawn_id,
+        session_id: event.session_id,
+        source_cf,
+        source_key_hex,
+    }))
 }
 
 fn open_escalation(

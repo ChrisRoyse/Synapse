@@ -35,7 +35,10 @@ use super::{
 use rmcp::{RoleServer, model::ErrorCode, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use synapse_core::error_codes;
+use synapse_storage::{RevisionGuard, cf, constellations, decode_json};
 
 const AGENT_TOOL: &str = "agent";
 const TASK_TOOL: &str = "task";
@@ -66,6 +69,7 @@ pub enum AgentOperation {
     Pause,
     Resume,
     Respawn,
+    RecommendTools,
 }
 
 impl AgentOperation {
@@ -91,6 +95,7 @@ impl AgentOperation {
             Self::Pause => "pause",
             Self::Resume => "resume",
             Self::Respawn => "respawn",
+            Self::RecommendTools => "recommend_tools",
         }
     }
 }
@@ -139,6 +144,8 @@ pub struct AgentParams {
     pub resume: Option<AgentPauseParams>,
     #[serde(default)]
     pub respawn: Option<AgentRespawnParams>,
+    #[serde(default)]
+    pub recommend_tools: Option<AgentToolRecommendParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -187,6 +194,46 @@ pub struct AgentResponse {
     pub resume: Option<AgentSuspendResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub respawn: Option<AgentRespawnResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recommend_tools: Option<AgentToolRecommendResponse>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentToolRecommendParams {
+    pub task_class: String,
+    #[schemars(range(min = 1, max = 100000))]
+    pub min_evidence: usize,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentToolEvidence {
+    pub tool: String,
+    pub successes: u64,
+    pub failures: u64,
+    pub evidence_count: u64,
+    pub expected_success: f64,
+    pub success_ci95_low: f64,
+    pub success_ci95_high: f64,
+    pub outcome_information_bits: f64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AgentToolRecommendResponse {
+    pub task_class: String,
+    pub grounding: String,
+    pub evidence_count: u64,
+    pub task_attempts_considered: u64,
+    pub recommended_tools: Vec<String>,
+    pub discouraged_tools: Vec<String>,
+    pub tools: Vec<AgentToolEvidence>,
+    pub failure_mode_arrows: Vec<Value>,
+    pub failure_mode_arrow_grounding: String,
+    pub decision_id: String,
+    pub decision_row_key: String,
+    pub decision_row_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -837,6 +884,39 @@ impl SynapseService {
                     |out| out.respawn = Some(response),
                 )))
             }
+            AgentOperation::RecommendTools => {
+                let spec = params
+                    .0
+                    .recommend_tools
+                    .ok_or_else(|| missing_agent_spec("recommend_tools"))?;
+                self.require_m3_permissions(
+                    AGENT_TOOL,
+                    &crate::m3::permissions::required([
+                        crate::m3::permissions::Permission::ReadStorage,
+                        crate::m3::permissions::Permission::WriteStorage,
+                    ]),
+                )?;
+                let db = self.m3_storage()?;
+                let response = recommend_tools(&db, &spec.task_class, spec.min_evidence)?;
+                self.audit_action_ok_with_details_for_request(
+                    "steering_tool_recommend",
+                    &serde_json::to_value(&response).map_err(|error| {
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            format!("STEERING_TOOL_DECISION_AUDIT_ENCODE_FAILED: {error}"),
+                        )
+                    })?,
+                    &request_context,
+                )?;
+                Ok(Json(agent_response(
+                    operation,
+                    format!(
+                        "CF_AGENT_EVENTS outcomes={} grounding={} decision_row={}",
+                        response.evidence_count, response.grounding, response.decision_row_key
+                    ),
+                    |out| out.recommend_tools = Some(response),
+                )))
+            }
         }
     }
 
@@ -1233,6 +1313,7 @@ fn validate_agent_facade_params(params: &AgentParams) -> Result<(), ErrorData> {
             ("pause", params.pause.is_some()),
             ("resume", params.resume.is_some()),
             ("respawn", params.respawn.is_some()),
+            ("recommend_tools", params.recommend_tools.is_some()),
         ],
     )
 }
@@ -1423,9 +1504,291 @@ fn agent_response(
         pause: None,
         resume: None,
         respawn: None,
+        recommend_tools: None,
     };
     populate(&mut response);
     response
+}
+
+#[derive(Default)]
+struct ToolOutcomeCounts {
+    success: u64,
+    failure: u64,
+}
+
+fn recommend_tools(
+    db: &synapse_storage::Db,
+    task_class: &str,
+    min_evidence: usize,
+) -> Result<AgentToolRecommendResponse, ErrorData> {
+    const MAX_EVENT_ROWS: usize = 2_000_000;
+    const PAGE_ROWS: usize = 8_192;
+    let task_class = task_class.trim();
+    if task_class.is_empty() || min_evidence == 0 || min_evidence > 100_000 {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "agent recommend_tools requires a nonblank task_class and min_evidence in 1..=100000",
+        ));
+    }
+    let tasks = SynapseService::read_all_tasks(db)?;
+    let mut spawn_ids = BTreeSet::new();
+    let mut task_attempts_considered = 0_u64;
+    for task in tasks.iter().filter(|task| task.template_id == task_class) {
+        for attempt in &task.attempts {
+            if !matches!(
+                attempt.outcome,
+                super::agent_tasks::AttemptOutcome::Succeeded
+                    | super::agent_tasks::AttemptOutcome::Failed
+            ) {
+                continue;
+            }
+            if let Some(spawn_id) = attempt.spawn_id.as_deref() {
+                spawn_ids.insert(spawn_id.to_owned());
+                task_attempts_considered = task_attempts_considered.saturating_add(1);
+            }
+        }
+    }
+
+    let mut counts: BTreeMap<String, ToolOutcomeCounts> = BTreeMap::new();
+    let mut scanned = 0_usize;
+    let mut start = Vec::new();
+    while !spawn_ids.is_empty() {
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_AGENT_EVENTS, &start, PAGE_ROWS)
+            .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        for (key, value) in &rows {
+            scanned = scanned.saturating_add(1);
+            if scanned > MAX_EVENT_ROWS {
+                return Err(crate::m1::mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "STEERING_TOOL_EVENT_SCAN_BUDGET_EXHAUSTED: scanned more than {MAX_EVENT_ROWS} CF_AGENT_EVENTS rows; remediation=add a task-class tool-outcome aggregate before retrying this corpus"
+                    ),
+                ));
+            }
+            let event: synapse_core::AgentEventRecord = decode_json(value).map_err(|error| {
+                crate::m1::mcp_error(
+                    error_codes::STORAGE_READ_FAILED,
+                    format!(
+                        "STEERING_TOOL_EVENT_ROW_INVALID: key_hex={} detail={error}; remediation=repair or quarantine the corrupt CF_AGENT_EVENTS row",
+                        constellations::hex_encode(key)
+                    ),
+                )
+            })?;
+            if event.kind != synapse_core::AgentEventKind::ToolCallFinished
+                || !event
+                    .spawn_id
+                    .as_deref()
+                    .is_some_and(|spawn_id| spawn_ids.contains(spawn_id))
+            {
+                continue;
+            }
+            let tool = event
+                .attributes
+                .tool_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .ok_or_else(|| {
+                    crate::m1::mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "STEERING_TOOL_NAME_ABSENT: terminal tool event key_hex={} has no tool name; remediation=repair agent-event ingestion before measuring tool outcomes",
+                            constellations::hex_encode(key)
+                        ),
+                    )
+                })?;
+            let failed = super::agent_events::tool_call_error_present(&event);
+            let cell = counts.entry(tool.to_owned()).or_default();
+            if failed {
+                cell.failure = cell.failure.saturating_add(1);
+            } else {
+                cell.success = cell.success.saturating_add(1);
+            }
+        }
+        if !more {
+            break;
+        }
+        let Some((last, _)) = rows.last() else { break };
+        start = last.clone();
+        start.push(0);
+    }
+
+    let total_success = counts.values().map(|cell| cell.success).sum::<u64>();
+    let total_failure = counts.values().map(|cell| cell.failure).sum::<u64>();
+    let total = total_success.saturating_add(total_failure);
+    let mut tools = counts
+        .iter()
+        .map(|(tool, cell)| {
+            let n = cell.success.saturating_add(cell.failure);
+            let (low, high) = steering_wilson_interval(cell.success, n);
+            AgentToolEvidence {
+                tool: tool.clone(),
+                successes: cell.success,
+                failures: cell.failure,
+                evidence_count: n,
+                expected_success: (cell.success as f64 + 1.0) / (n as f64 + 2.0),
+                success_ci95_low: low,
+                success_ci95_high: high,
+                outcome_information_bits: steering_indicator_mi(
+                    cell.success,
+                    cell.failure,
+                    total_success,
+                    total_failure,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+    tools.sort_by(|left, right| {
+        right
+            .expected_success
+            .total_cmp(&left.expected_success)
+            .then_with(|| right.evidence_count.cmp(&left.evidence_count))
+            .then_with(|| left.tool.cmp(&right.tool))
+    });
+    let grounding = if total as usize >= min_evidence && tools.len() >= 2 {
+        "grounded"
+    } else {
+        "provisional_insufficient_evidence"
+    };
+    let recommended_tools = tools
+        .iter()
+        .filter(|tool| tool.evidence_count as usize >= min_evidence && tool.success_ci95_low >= 0.5)
+        .map(|tool| tool.tool.clone())
+        .collect::<Vec<_>>();
+    let discouraged_tools = tools
+        .iter()
+        .filter(|tool| tool.evidence_count as usize >= min_evidence && tool.success_ci95_high < 0.5)
+        .map(|tool| tool.tool.clone())
+        .collect::<Vec<_>>();
+    let observed_ns = super::agent_events::unix_time_ns_now();
+    let seed = serde_json::to_vec(&(&task_class, observed_ns, &tools)).map_err(|error| {
+        crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("STEERING_TOOL_DECISION_ENCODE_FAILED: {error}"),
+        )
+    })?;
+    let decision_id = steering_sha256(&seed);
+    let decision_row_key = format!("steering/v1/decision/tool/{observed_ns}/{decision_id}");
+    let row = serde_json::to_vec(&json!({
+        "schema": "synapse.steering.tool_decision.v1",
+        "decision_id": decision_id,
+        "observed_unix_ns": observed_ns,
+        "task_class": task_class,
+        "grounding": grounding,
+        "evidence_count": total,
+        "task_attempts_considered": task_attempts_considered,
+        "recommended_tools": recommended_tools,
+        "discouraged_tools": discouraged_tools,
+        "tools": tools,
+        "failure_mode_arrows": [],
+        "failure_mode_arrow_grounding": "provisional_no_transfer_entropy_assay"
+    }))
+    .map_err(|error| {
+        crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("STEERING_TOOL_DECISION_ENCODE_FAILED: {error}"),
+        )
+    })?;
+    let mutation = db
+        .mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_KV,
+            [RevisionGuard::new(decision_row_key.as_bytes(), None)],
+            std::iter::empty::<Vec<u8>>(),
+            [(decision_row_key.as_bytes(), row.as_slice())],
+        )
+        .map_err(|error| {
+            crate::m1::mcp_error(
+                error.code(),
+                format!("STEERING_TOOL_DECISION_COMMIT_FAILED: {error}"),
+            )
+        })?;
+    if !mutation.applied {
+        return Err(crate::m1::mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "STEERING_TOOL_DECISION_ID_COLLISION: append-only decision key already exists",
+        ));
+    }
+    let readback = db
+        .get_cf(cf::CF_KV, decision_row_key.as_bytes())
+        .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
+    if readback.as_deref() != Some(row.as_slice()) {
+        return Err(crate::m1::mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            "STEERING_TOOL_DECISION_READBACK_MISMATCH: committed bytes differ from the requested decision",
+        ));
+    }
+    Ok(AgentToolRecommendResponse {
+        task_class: task_class.to_owned(),
+        grounding: grounding.to_owned(),
+        evidence_count: total,
+        task_attempts_considered,
+        recommended_tools,
+        discouraged_tools,
+        tools,
+        failure_mode_arrows: Vec::new(),
+        failure_mode_arrow_grounding: "provisional_no_transfer_entropy_assay".to_owned(),
+        decision_id,
+        decision_row_key,
+        decision_row_sha256: steering_sha256(&row),
+    })
+}
+
+fn steering_sha256(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    out
+}
+
+fn steering_wilson_interval(success: u64, total: u64) -> (f64, f64) {
+    if total == 0 {
+        return (0.0, 1.0);
+    }
+    let n = total as f64;
+    let p = success as f64 / n;
+    let z = 1.959_963_984_540_054_f64;
+    let denominator = 1.0 + z * z / n;
+    let center = (p + z * z / (2.0 * n)) / denominator;
+    let half = z * ((p * (1.0 - p) / n + z * z / (4.0 * n * n)).sqrt()) / denominator;
+    ((center - half).max(0.0), (center + half).min(1.0))
+}
+
+fn steering_indicator_mi(ms: u64, mf: u64, total_s: u64, total_f: u64) -> f64 {
+    let total = total_s.saturating_add(total_f);
+    if total == 0 {
+        return 0.0;
+    }
+    let cells = [
+        (ms, ms.saturating_add(mf), total_s),
+        (mf, ms.saturating_add(mf), total_f),
+        (
+            total_s.saturating_sub(ms),
+            total.saturating_sub(ms.saturating_add(mf)),
+            total_s,
+        ),
+        (
+            total_f.saturating_sub(mf),
+            total.saturating_sub(ms.saturating_add(mf)),
+            total_f,
+        ),
+    ];
+    cells
+        .into_iter()
+        .filter(|(joint, row, col)| *joint > 0 && *row > 0 && *col > 0)
+        .map(|(joint, row, col)| {
+            let pxy = joint as f64 / total as f64;
+            pxy * ((joint as f64 * total as f64) / (row as f64 * col as f64)).log2()
+        })
+        .sum::<f64>()
+        .max(0.0)
 }
 
 fn task_response(

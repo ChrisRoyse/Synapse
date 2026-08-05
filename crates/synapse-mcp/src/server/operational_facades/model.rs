@@ -16,8 +16,8 @@ use super::{
     policy::{require_maintenance_profile, session_or_stdio},
     response::model_response,
     types::{
-        ModelOperation, ModelParams, ModelRecommendResponse, ModelRecommendationEvidence,
-        ModelResponse, ModelStatusResponse,
+        ModelOperation, ModelOverrideParams, ModelOverrideReadback, ModelParams,
+        ModelRecommendResponse, ModelRecommendationEvidence, ModelResponse, ModelStatusResponse,
     },
     validation::validate_model_params,
 };
@@ -283,6 +283,38 @@ pub(super) async fn handle(
                 |out| out.recommend = Some(recommendation),
             )))
         }
+        ModelOperation::Override => {
+            let spec = params
+                .0
+                .r#override
+                .ok_or_else(|| missing_spec(MODEL_TOOL, "override"))?;
+            service.require_m3_permissions(
+                MODEL_TOOL,
+                &crate::m3::permissions::required([
+                    crate::m3::permissions::Permission::ReadStorage,
+                    crate::m3::permissions::Permission::WriteStorage,
+                ]),
+            )?;
+            let readback = persist_model_override(&db, &spec)?;
+            service.audit_action_ok_with_details_for_request(
+                "steering_model_override",
+                &serde_json::to_value(&readback).map_err(|error| {
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!("STEERING_OVERRIDE_AUDIT_ENCODE_FAILED: {error}"),
+                    )
+                })?,
+                &request_context,
+            )?;
+            Ok(Json(model_response(
+                operation,
+                format!(
+                    "override task_class={} selected_model={} row={}",
+                    readback.task_class, readback.selected_model, readback.history_row_key
+                ),
+                |out| out.r#override = Some(readback),
+            )))
+        }
     }
 }
 
@@ -292,6 +324,218 @@ struct CandidateCounts {
     failure: u64,
     priced_total: u64,
     priced_count: u64,
+}
+
+fn model_override_current_key(task_class: &str) -> String {
+    format!(
+        "steering/v1/override/model/current/{}",
+        hex_sha256(task_class.as_bytes())
+    )
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredModelOverride {
+    schema: String,
+    task_class: String,
+    decision_id: String,
+    selected_model: String,
+    reason: String,
+    observed_unix_ns: u128,
+    history_row_key: String,
+}
+
+fn model_override_readback(
+    stored: StoredModelOverride,
+    current_row_key: String,
+    bytes: &[u8],
+) -> ModelOverrideReadback {
+    ModelOverrideReadback {
+        schema: stored.schema,
+        task_class: stored.task_class,
+        decision_id: stored.decision_id,
+        selected_model: stored.selected_model,
+        reason: stored.reason,
+        observed_unix_ns: stored.observed_unix_ns,
+        current_row_key,
+        history_row_key: stored.history_row_key,
+        value_len_bytes: bytes.len() as u64,
+        value_sha256: hex_sha256(bytes),
+    }
+}
+
+fn read_model_override(
+    db: &synapse_storage::Db,
+    task_class: &str,
+) -> Result<Option<ModelOverrideReadback>, ErrorData> {
+    let key = model_override_current_key(task_class);
+    let Some(bytes) = db.get_cf(cf::CF_KV, key.as_bytes()).map_err(|error| {
+        crate::m1::mcp_error(
+            error.code(),
+            format!("STEERING_OVERRIDE_READ_FAILED: key={key} detail={error}"),
+        )
+    })?
+    else {
+        return Ok(None);
+    };
+    let stored: StoredModelOverride = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::STORAGE_READ_FAILED,
+            format!(
+                "STEERING_OVERRIDE_ROW_INVALID: key={key} detail={error}; remediation=repair or remove the corrupt override row with explicit operator intent"
+            ),
+        )
+    })?;
+    if stored.task_class != task_class || stored.schema != "synapse.steering.model_override.v1" {
+        return Err(crate::m1::mcp_error(
+            synapse_core::error_codes::STORAGE_READ_FAILED,
+            format!(
+                "STEERING_OVERRIDE_IDENTITY_MISMATCH: key={key} decoded task_class={:?} schema={:?}; remediation=repair the corrupt override row",
+                stored.task_class, stored.schema
+            ),
+        ));
+    }
+    Ok(Some(model_override_readback(stored, key, &bytes)))
+}
+
+fn persist_model_override(
+    db: &synapse_storage::Db,
+    spec: &ModelOverrideParams,
+) -> Result<ModelOverrideReadback, ErrorData> {
+    let task_class = spec.task_class.trim();
+    let decision_id = spec.decision_id.trim();
+    let decision_row_key = spec.decision_row_key.trim();
+    let selected_model = spec.selected_model.trim();
+    let reason = spec.reason.trim();
+    if task_class.is_empty()
+        || selected_model.is_empty()
+        || reason.is_empty()
+        || decision_row_key.is_empty()
+        || decision_id.len() != 64
+        || !decision_id.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(crate::m1::mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "model override requires nonblank task_class/decision_row_key/selected_model/reason and a 64-character hex decision_id",
+        ));
+    }
+    if task_class.len() > 512 || selected_model.len() > 512 || reason.len() > 4_096 {
+        return Err(crate::m1::mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "model override caps task_class and selected_model at 512 bytes and reason at 4096 bytes",
+        ));
+    }
+    let expected_suffix = format!("/{decision_id}");
+    if !decision_row_key.starts_with("steering/v1/decision/model/")
+        || !decision_row_key.ends_with(&expected_suffix)
+    {
+        return Err(crate::m1::mcp_error(
+            synapse_core::error_codes::TOOL_PARAMS_INVALID,
+            "model override decision_row_key must identify the supplied decision_id under steering/v1/decision/model/",
+        ));
+    }
+    let decision_bytes = db
+        .get_cf(cf::CF_KV, decision_row_key.as_bytes())
+        .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?
+        .ok_or_else(|| {
+            crate::m1::mcp_error(
+                synapse_core::error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "STEERING_OVERRIDE_DECISION_ABSENT: decision row {decision_row_key:?} does not exist"
+                ),
+            )
+        })?;
+    let decision: serde_json::Value = serde_json::from_slice(&decision_bytes).map_err(|error| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::STORAGE_READ_FAILED,
+            format!(
+                "STEERING_OVERRIDE_DECISION_INVALID: decision row {decision_row_key:?} failed to decode: {error}"
+            ),
+        )
+    })?;
+    if decision.get("schema").and_then(serde_json::Value::as_str)
+        != Some("synapse.steering.model_decision.v1")
+        || decision
+            .get("decision_id")
+            .and_then(serde_json::Value::as_str)
+            != Some(decision_id)
+        || decision
+            .get("task_class")
+            .and_then(serde_json::Value::as_str)
+            != Some(task_class)
+    {
+        return Err(crate::m1::mcp_error(
+            synapse_core::error_codes::STORAGE_READ_FAILED,
+            format!(
+                "STEERING_OVERRIDE_DECISION_IDENTITY_MISMATCH: row {decision_row_key:?} does not bind the supplied task_class and decision_id"
+            ),
+        ));
+    }
+    let observed_unix_ns = unix_time_ns();
+    let current_key = model_override_current_key(task_class);
+    let history_key =
+        format!("steering/v1/override/model/history/{observed_unix_ns}/{decision_id}");
+    let stored = StoredModelOverride {
+        schema: "synapse.steering.model_override.v1".to_owned(),
+        task_class: task_class.to_owned(),
+        decision_id: decision_id.to_ascii_lowercase(),
+        selected_model: selected_model.to_owned(),
+        reason: reason.to_owned(),
+        observed_unix_ns,
+        history_row_key: history_key.clone(),
+    };
+    let encoded = serde_json::to_vec(&stored).map_err(|error| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            format!("STEERING_OVERRIDE_ENCODE_FAILED: {error}"),
+        )
+    })?;
+    for _ in 0..8 {
+        let current = db
+            .get_cf_revisioned(cf::CF_KV, current_key.as_bytes())
+            .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
+        let guard = RevisionGuard::new(
+            current_key.as_bytes(),
+            current.as_ref().map(|value| value.revision_sha256),
+        );
+        let outcome = db
+            .mutate_batch_if_revisions_pressure_bypass(
+                cf::CF_KV,
+                [guard, RevisionGuard::new(history_key.as_bytes(), None)],
+                std::iter::empty::<Vec<u8>>(),
+                [
+                    (current_key.as_bytes(), encoded.as_slice()),
+                    (history_key.as_bytes(), encoded.as_slice()),
+                ],
+            )
+            .map_err(|error| {
+                crate::m1::mcp_error(
+                    error.code(),
+                    format!("STEERING_OVERRIDE_COMMIT_FAILED: {error}"),
+                )
+            })?;
+        if !outcome.applied {
+            continue;
+        }
+        for key in [&current_key, &history_key] {
+            let readback = db
+                .get_cf(cf::CF_KV, key.as_bytes())
+                .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))?;
+            if readback.as_deref() != Some(encoded.as_slice()) {
+                return Err(crate::m1::mcp_error(
+                    synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "STEERING_OVERRIDE_READBACK_MISMATCH: key={key} differs from the committed override bytes"
+                    ),
+                ));
+            }
+        }
+        return Ok(model_override_readback(stored, current_key, &encoded));
+    }
+    Err(crate::m1::mcp_error(
+        synapse_core::error_codes::STORAGE_WRITE_FAILED,
+        "STEERING_OVERRIDE_REVISION_CONFLICT: current override changed during 8 guarded attempts; retry after concurrent operator changes stop",
+    ))
 }
 
 fn recommend_model(
@@ -402,7 +646,11 @@ fn recommend_model(
     } else {
         "provisional_insufficient_evidence"
     };
-    let recommended_model = candidates.first().map(|candidate| candidate.model.clone());
+    let operator_override = read_model_override(db, task_class)?;
+    let recommended_model = operator_override
+        .as_ref()
+        .map(|override_row| override_row.selected_model.clone())
+        .or_else(|| candidates.first().map(|candidate| candidate.model.clone()));
     let observed_ns = unix_time_ns();
     let decision_seed =
         serde_json::to_vec(&(&task_class, observed_ns, &candidates)).map_err(|error| {
@@ -423,6 +671,7 @@ fn recommend_model(
         "recommended_model": recommended_model,
         "candidates": candidates,
         "excluded_legacy_attempts": excluded_legacy,
+        "operator_override": operator_override,
     }))
     .map_err(|error| {
         crate::m1::mcp_error(
@@ -473,6 +722,7 @@ fn recommend_model(
         decision_id,
         decision_row_key,
         decision_row_sha256: hex_sha256(&row),
+        operator_override,
     })
 }
 
