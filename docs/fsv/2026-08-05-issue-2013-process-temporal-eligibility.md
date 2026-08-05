@@ -77,3 +77,15 @@ after readback.
 `cargo check --workspace` passed. `pwsh -File scripts/lint.ps1` passed all seven
 gates in both workspaces, including format, deny, clippy, and the Calyx public-API
 ratchet at 363.
+
+## Production deployment
+
+Commit `5b941e2a` was deployed through the supported setup path. Installed daemon
+PID `11788` owned `127.0.0.1:7700`; installed executable SHA-256 was
+`F151F796C735BD95A0323A0C02E5725A106B1E614E7E604FEE0932C42E3AF34E`.
+A fresh HTTP MCP `storage/temporal_backfill` call against
+`CF_PROCESS_HISTORY` succeeded and returned the new structured
+`temporal_ineligible_rows` field. Production's TTL-managed source had zero live
+rows at that read (`examined=0`, `more=false`, `latest_seq=657409`), so the
+nonempty behavioral proof remains the four-row real scratch vault above rather
+than being inferred from an empty production pass.
