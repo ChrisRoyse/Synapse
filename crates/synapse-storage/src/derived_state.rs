@@ -943,7 +943,14 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
             if record.kind != AgentEventKind::SpawnRequested {
                 continue;
             }
-            let (Some(session_id), Some(spawn_id)) = (record.session_id, record.spawn_id) else {
+            let parent_session_id = record
+                .payload
+                .get("started_by_session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .or(record.session_id)
+                .or(record.attributes.conversation_id);
+            let (Some(session_id), Some(spawn_id)) = (parent_session_id, record.spawn_id) else {
                 continue;
             };
             if session_id.trim().is_empty() || spawn_id.trim().is_empty() {
