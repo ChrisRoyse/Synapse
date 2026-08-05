@@ -956,13 +956,22 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
             if session_id.trim().is_empty() || spawn_id.trim().is_empty() {
                 continue;
             }
-            *counts.entry((session_id, spawn_id)).or_default() += 1;
+            *counts
+                .entry((
+                    format!("agent-session:{session_id}"),
+                    format!("agent-spawn:{spawn_id}"),
+                ))
+                .or_default() += 1;
         }
         if !page.more {
             break;
         }
     }
     db.release_coherent_scan(&mut lease)?;
+    let (process_source_seq, process_read_at_unix_ms) =
+        collect_process_parent_edges(db, &mut counts)?;
+    let source_seq = source_seq.max(process_source_seq);
+    let read_at_unix_ms = read_at_unix_ms.max(process_read_at_unix_ms);
     if counts.is_empty() {
         tracing::debug!(
             code = "STORAGE_DERIVED_STATE_AGENT_GRAPH_INELIGIBLE",
@@ -998,9 +1007,108 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
         graph_row_count = readback.graph_row_count,
         committed_seq = readback.committed_seq,
         lifecycle_sha256 = readback.lifecycle_sha256,
-        "scheduled agent spawn graph snapshot was atomically published and physically read back"
+        "scheduled process and agent-spawn graph snapshot was atomically published and physically read back"
     );
     Ok(())
+}
+
+fn collect_process_parent_edges(
+    db: &Db,
+    counts: &mut BTreeMap<(String, String), u64>,
+) -> crate::StorageResult<(u64, u64)> {
+    let mut lease =
+        db.pin_cf_physical_scan(cf::CF_PROCESS_HISTORY, crate::COHERENT_SCAN_MAX_AGE_MS)?;
+    let source_seq = lease.snapshot_seq;
+    let read_at_unix_ms = lease.read_at_unix_ms;
+    loop {
+        let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = db.release_coherent_scan(&mut lease);
+                return Err(error);
+            }
+        };
+        for (key, value) in page.rows {
+            let record: serde_json::Value = match serde_json::from_slice(&value) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = db.release_coherent_scan(&mut lease);
+                    return Err(crate::StorageError::BackendInvalidConfig {
+                        value: format!("{key:02x?}"),
+                        detail: format!(
+                            "decode coherent CF_PROCESS_HISTORY row for process graph: {error}"
+                        ),
+                    });
+                }
+            };
+            let Some(object) = record.as_object() else {
+                let _ = db.release_coherent_scan(&mut lease);
+                return Err(crate::StorageError::BackendInvalidConfig {
+                    value: format!("{key:02x?}"),
+                    detail: "CF_PROCESS_HISTORY row for process graph is not a JSON object"
+                        .to_owned(),
+                });
+            };
+            let edge = match process_parent_edge(object, &key) {
+                Ok(edge) => edge,
+                Err(error) => {
+                    let _ = db.release_coherent_scan(&mut lease);
+                    return Err(error);
+                }
+            };
+            let Some((parent_pid, pid)) = edge else {
+                continue;
+            };
+            if pid == 0 || parent_pid == 0 || pid == parent_pid {
+                continue;
+            }
+            *counts
+                .entry((format!("process:{parent_pid}"), format!("process:{pid}")))
+                .or_default() += 1;
+        }
+        if !page.more {
+            break;
+        }
+    }
+    db.release_coherent_scan(&mut lease)?;
+    Ok((source_seq, read_at_unix_ms))
+}
+
+fn process_parent_edge(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &[u8],
+) -> crate::StorageResult<Option<(u64, u64)>> {
+    let pid = exact_json_u64(object.get("pid"), "pid", key)?;
+    let parent_pid = exact_json_u64(
+        object
+            .get("parent_pid")
+            .or_else(|| object.get("ppid"))
+            .or_else(|| object.get("inherited_from_pid")),
+        "parent_pid|ppid|inherited_from_pid",
+        key,
+    )?;
+    Ok(pid
+        .zip(parent_pid)
+        .map(|(pid, parent_pid)| (parent_pid, pid)))
+}
+
+fn exact_json_u64(
+    value: Option<&serde_json::Value>,
+    field: &str,
+    key: &[u8],
+) -> crate::StorageResult<Option<u64>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    value
+        .as_u64()
+        .map(Some)
+        .ok_or_else(|| crate::StorageError::BackendInvalidConfig {
+            value: format!("{key:02x?}"),
+            detail: format!(
+                "CF_PROCESS_HISTORY process-graph field {field} must be an unsigned JSON integer"
+            ),
+        })
 }
 
 fn drive_scheduled_kernels(
