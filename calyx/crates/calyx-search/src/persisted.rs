@@ -34,7 +34,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::error::{CliError, CliResult};
-pub use generation::{PersistedSearchGeneration, PersistedSearchSlot, slot_scoring_law};
+pub use generation::{
+    PersistedDenseQuantization, PersistedSearchGeneration, PersistedSearchSlot, slot_scoring_law,
+};
 pub use marker::{
     MarkerClearOutcome, REBUILD_REQUIRED_REMEDIATION, REBUILD_REQUIRED_SCHEMA,
     RebuildRequiredMarker, clear_rebuild_required_marker, clear_rebuild_required_marker_if_owned,
@@ -59,13 +61,19 @@ pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_RE
 ///
 /// Values are sealed into the immutable generation manifest and read back by
 /// query-time open, so tuning cannot silently change an existing artifact.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PersistedDenseIndexConfig {
     pub m_max: usize,
     pub ef_construction: usize,
     pub beamwidth: usize,
     pub ef_search: usize,
     pub alpha: f32,
+    /// Product-quantizer bits per subvector for explicitly selected slots.
+    /// Unlisted slots remain exact; `4` and `8` require exact raw-sidecar
+    /// reranking. Quantization is slot-scoped because some panel lanes are
+    /// intentionally constant and cannot train a meaningful codebook.
+    #[serde(default)]
+    pub quant_bits_by_slot: BTreeMap<u16, u8>,
 }
 
 impl Default for PersistedDenseIndexConfig {
@@ -76,6 +84,7 @@ impl Default for PersistedDenseIndexConfig {
             beamwidth: 32,
             ef_search: 64,
             alpha: 1.2,
+            quant_bits_by_slot: BTreeMap::new(),
         }
     }
 }
@@ -83,7 +92,7 @@ impl Default for PersistedDenseIndexConfig {
 impl Eq for PersistedDenseIndexConfig {}
 
 impl PersistedDenseIndexConfig {
-    pub fn validate(self) -> CliResult<Self> {
+    pub fn validate(&self) -> CliResult<Self> {
         if self.m_max == 0
             || self.ef_construction == 0
             || self.beamwidth == 0
@@ -96,7 +105,23 @@ impl PersistedDenseIndexConfig {
                 self.m_max, self.ef_construction, self.beamwidth, self.ef_search, self.alpha
             )));
         }
-        Ok(self)
+        if let Some((slot, bits)) = self
+            .quant_bits_by_slot
+            .iter()
+            .find(|(_, bits)| !matches!(bits, 4 | 8))
+        {
+            return Err(stale(format!(
+                "invalid persisted dense index quantization for slot {slot}: {bits} bits; explicitly selected slots must use 4 or 8 bits, and exact slots must be omitted"
+            )));
+        }
+        Ok(self.clone())
+    }
+
+    pub fn quant_bits_for(&self, slot: SlotId) -> u8 {
+        self.quant_bits_by_slot
+            .get(&slot.get())
+            .copied()
+            .unwrap_or(32)
     }
 }
 
@@ -138,6 +163,19 @@ pub(crate) struct SearchIndexEntry {
     sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dense_quantization: Option<Box<DenseQuantizationEntry>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct DenseQuantizationEntry {
+    bits: u8,
+    subvectors: usize,
+    centroids: usize,
+    pq_rel: String,
+    pq_sha256: String,
+    raw_rel: String,
+    raw_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -474,6 +512,7 @@ impl SearchIndexEntry {
         base_seq: u64,
         graph_rel: String,
         id_map_rel: String,
+        dense_quantization: Option<DenseQuantizationEntry>,
     ) -> Self {
         Self {
             slot: slot.get(),
@@ -487,6 +526,7 @@ impl SearchIndexEntry {
             index_rel: None,
             sha256: None,
             token_count: None,
+            dense_quantization: dense_quantization.map(Box::new),
         }
     }
 
@@ -510,6 +550,7 @@ impl SearchIndexEntry {
             index_rel: Some(index_rel),
             sha256: Some(sha256),
             token_count: None,
+            dense_quantization: None,
         }
     }
 
@@ -534,6 +575,7 @@ impl SearchIndexEntry {
             index_rel: Some(index_rel),
             sha256: Some(sha256),
             token_count: None,
+            dense_quantization: None,
         }
     }
 
@@ -558,6 +600,7 @@ impl SearchIndexEntry {
             index_rel: Some(index_rel),
             sha256: Some(sha256),
             token_count: Some(token_count),
+            dense_quantization: None,
         }
     }
 

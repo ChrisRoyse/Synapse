@@ -79,7 +79,10 @@ pub use calyx_registry::{
 // `find_similar_in_panel` / `rebuild_search_indexes_for_panel` (#1668) without
 // depending on calyx-registry directly.
 pub use calyx_registry::VaultPanelState as SynapseCalyxPanelState;
-pub use calyx_search::{PersistedDenseIndexConfig, PersistedSearchGeneration, PersistedSearchSlot};
+pub use calyx_search::{
+    PersistedDenseIndexConfig, PersistedDenseQuantization, PersistedSearchGeneration,
+    PersistedSearchSlot,
+};
 use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
@@ -1957,6 +1960,7 @@ pub struct SynapseCalyxTuningConfig {
     pub index_beamwidth: usize,
     pub index_ef_search: usize,
     pub index_alpha: f32,
+    pub index_quant_bits_by_slot: BTreeMap<u16, u8>,
     pub vram_budget_bytes: u64,
     pub math_backend: SynapseCalyxMathBackend,
     pub clock_mode: SynapseCalyxClockMode,
@@ -1984,6 +1988,7 @@ impl Default for SynapseCalyxTuningConfig {
             index_beamwidth: DEFAULT_INDEX_BEAMWIDTH,
             index_ef_search: DEFAULT_INDEX_EF_SEARCH,
             index_alpha: DEFAULT_INDEX_ALPHA,
+            index_quant_bits_by_slot: BTreeMap::new(),
             vram_budget_bytes: DEFAULT_VRAM_BUDGET_BYTES,
             math_backend: SynapseCalyxMathBackend::Auto,
             clock_mode: SynapseCalyxClockMode::System,
@@ -2089,6 +2094,7 @@ impl SynapseCalyxTuningConfig {
             beamwidth: self.index_beamwidth,
             ef_search: self.index_ef_search,
             alpha: self.index_alpha,
+            quant_bits_by_slot: self.index_quant_bits_by_slot.clone(),
         }
     }
 }

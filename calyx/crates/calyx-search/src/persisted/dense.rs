@@ -4,13 +4,15 @@ use std::path::Path;
 
 use calyx_core::{CalyxError, CxId, PanelSlotId, SlotId, SlotVector};
 use calyx_sextant::index::{
-    DiskAnnBuildParams, DiskAnnSearch, DiskAnnSearchParams, IndexSearchHit, SextantIndex, ranked,
+    DiskAnnBuildParams, DiskAnnPqBuildParams, DiskAnnPqSearchBuild, DiskAnnSearch,
+    DiskAnnSearchParams, IndexSearchHit, SextantIndex, ranked,
 };
 
 use super::rebuild::RebuildProgress;
 use super::rebuild_plan::DiskAnnBuildPolicy;
 use super::{
-    PersistedDenseIndexConfig, SearchIndexEntry, SlotIdMap, rel, stale, write_json_atomic,
+    DenseQuantizationEntry, PersistedDenseIndexConfig, SearchIndexEntry, SlotIdMap, rel,
+    sha256_hex, stale, write_json_atomic,
 };
 use crate::error::CliResult;
 
@@ -23,14 +25,14 @@ pub(super) struct DenseSlotRows {
     pub(super) rows: Vec<(CxId, Vec<f32>)>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct DenseBuildOptions {
     pub(super) base_seq: u64,
     pub(super) policy: DiskAnnBuildPolicy,
     pub(super) config: PersistedDenseIndexConfig,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct DenseSearchContext {
     pub(super) panel_version: u32,
     pub(super) slot: SlotId,
@@ -61,7 +63,8 @@ where
     } = options;
     let slot = panel_slot.slot_id();
     let panel_version = panel_slot.panel_version();
-    if should_use_flat_dense_index(rows.rows.len()) {
+    let quant_bits = config.quant_bits_for(slot);
+    if quant_bits == 32 && should_use_flat_dense_index(rows.rows.len()) {
         return flat::write(vault_dir, root, slot, rows, base_seq);
     }
     let dir_name = format!(
@@ -76,25 +79,69 @@ where
     }
     fs::create_dir_all(&dir)?;
     let graph_path = dir.join("graph.cda");
-    DiskAnnSearch::build_with_backend_and_progress(
-        slot,
-        &graph_path,
-        &rows.rows,
-        build_params(rows.dim as usize, config),
-        None,
-        search_params(config),
-        build_policy.backend,
-        |event| {
-            progress(RebuildProgress::slot(
-                event.phase,
-                panel_version,
-                slot,
-                Some(event.rows),
-                Some(base_seq),
-            ))
-            .map_err(CalyxError::from)
-        },
-    )?;
+    let mut quantization = None;
+    if quant_bits == 32 {
+        DiskAnnSearch::build_with_backend_and_progress(
+            slot,
+            &graph_path,
+            &rows.rows,
+            build_params(rows.dim as usize, &config),
+            None,
+            search_params(&config, quant_bits),
+            build_policy.backend,
+            |event| {
+                progress(RebuildProgress::slot(
+                    event.phase,
+                    panel_version,
+                    slot,
+                    Some(event.rows),
+                    Some(base_seq),
+                ))
+                .map_err(CalyxError::from)
+            },
+        )?;
+    } else {
+        progress(RebuildProgress::slot(
+            "slot.dense.quantized.start",
+            panel_version,
+            slot,
+            Some(rows.rows.len()),
+            Some(base_seq),
+        ))?;
+        let params = pq_params(rows.dim as usize, quant_bits)?;
+        DiskAnnSearch::build_with_pq_plan(
+            slot,
+            &graph_path,
+            &rows.rows,
+            build_params(rows.dim as usize, &config),
+            None,
+            DiskAnnPqSearchBuild {
+                search: search_params(&config, quant_bits),
+                pq: params,
+                backend: build_policy.backend,
+            },
+        )?;
+        progress(RebuildProgress::slot(
+            "slot.dense.quantized.done",
+            panel_version,
+            slot,
+            Some(rows.rows.len()),
+            Some(base_seq),
+        ))?;
+        let pq_path = graph_path.with_extension("pq");
+        let raw_path = graph_path.with_extension("raw");
+        let pq_bytes = fs::read(&pq_path)?;
+        let raw_bytes = fs::read(&raw_path)?;
+        quantization = Some(DenseQuantizationEntry {
+            bits: quant_bits,
+            subvectors: params.subvectors,
+            centroids: params.centroids.min(rows.rows.len()),
+            pq_rel: rel(vault_dir, &pq_path)?,
+            pq_sha256: sha256_hex(&pq_bytes),
+            raw_rel: rel(vault_dir, &raw_path)?,
+            raw_sha256: sha256_hex(&raw_bytes),
+        });
+    }
     let id_map_path = dir.join("ids.json");
     write_json_atomic(
         &id_map_path,
@@ -112,6 +159,7 @@ where
         base_seq,
         rel(vault_dir, &graph_path)?,
         rel(vault_dir, &id_map_path)?,
+        quantization,
     ))
 }
 
@@ -132,7 +180,7 @@ pub(super) fn search(
             "persistent dense search slot {slot} received non-dense query"
         )));
     };
-    open(vault_dir, entry, panel_version, slot, *dim, config)?
+    open(vault_dir, entry, panel_version, slot, *dim, config.clone())?
         .search(query, want(k, entry.len), Some(config.ef_search.max(k)))
         .map_err(Into::into)
 }
@@ -186,9 +234,55 @@ fn open(
         )));
     }
     let graph = vault_dir.join(entry.require_graph_rel(slot)?);
-    let mut index = DiskAnnSearch::open(slot, graph, ids, None, search_params(config))?;
+    let quant_bits = config.quant_bits_for(slot);
+    validate_quantization_artifacts(vault_dir, entry, slot, quant_bits)?;
+    let mut index =
+        DiskAnnSearch::open(slot, graph, ids, None, search_params(&config, quant_bits))?;
     index.set_base_seq(entry.built_at_seq);
     Ok(index)
+}
+
+fn validate_quantization_artifacts(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    slot: SlotId,
+    quant_bits: u8,
+) -> CliResult {
+    let Some(quantization) = &entry.dense_quantization else {
+        if quant_bits == 32 {
+            return Ok(());
+        }
+        return Err(stale(format!(
+            "persistent slot {slot} config requires {}-bit quantization but the manifest has no quantization artifacts",
+            quant_bits
+        )));
+    };
+    if quantization.bits != quant_bits || quant_bits == 32 {
+        return Err(stale(format!(
+            "persistent slot {slot} quantization bits {} disagree with generation config {}",
+            quantization.bits, quant_bits
+        )));
+    }
+    for (kind, rel_path, expected_hash) in [
+        ("pq", &quantization.pq_rel, &quantization.pq_sha256),
+        ("raw", &quantization.raw_rel, &quantization.raw_sha256),
+    ] {
+        let path = vault_dir.join(rel_path);
+        let bytes = fs::read(&path).map_err(|error| {
+            stale(format!(
+                "persistent slot {slot} {kind} artifact {} cannot be read: {error}",
+                path.display()
+            ))
+        })?;
+        let observed = sha256_hex(&bytes);
+        if &observed != expected_hash {
+            return Err(stale(format!(
+                "persistent slot {slot} {kind} artifact {} sha256 {observed} != manifest {expected_hash}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn read_ids(
@@ -364,7 +458,7 @@ pub(super) fn validate_dense(slot: SlotId, cx_id: CxId, dim: u32, data: &[f32]) 
     Ok(())
 }
 
-fn build_params(dim: usize, config: PersistedDenseIndexConfig) -> DiskAnnBuildParams {
+fn build_params(dim: usize, config: &PersistedDenseIndexConfig) -> DiskAnnBuildParams {
     DiskAnnBuildParams {
         dim,
         m_max: config.m_max,
@@ -373,13 +467,29 @@ fn build_params(dim: usize, config: PersistedDenseIndexConfig) -> DiskAnnBuildPa
     }
 }
 
-fn search_params(config: PersistedDenseIndexConfig) -> DiskAnnSearchParams {
+fn search_params(config: &PersistedDenseIndexConfig, quant_bits: u8) -> DiskAnnSearchParams {
     DiskAnnSearchParams {
         beamwidth: config.beamwidth,
         ef_search: config.ef_search,
         rescore_k: config.ef_search,
-        rescore_from_raw: false,
+        rescore_from_raw: quant_bits != 32,
     }
+}
+
+fn pq_params(dim: usize, quant_bits: u8) -> CliResult<DiskAnnPqBuildParams> {
+    let subvectors = (1..=dim.min(16))
+        .rev()
+        .find(|candidate| dim.is_multiple_of(*candidate))
+        .ok_or_else(|| {
+            stale(format!(
+                "dense dimension {dim} has no valid PQ subvector count"
+            ))
+        })?;
+    Ok(DiskAnnPqBuildParams {
+        subvectors,
+        centroids: 1_usize << quant_bits,
+        iterations: 8,
+    })
 }
 
 fn want(k: usize, len: usize) -> usize {

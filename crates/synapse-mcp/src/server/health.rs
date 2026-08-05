@@ -420,6 +420,13 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
         blocked_by_issue: "",
         effect_of_tuning: "sets DiskANN RobustPrune alpha when a new generation is built",
     },
+    CalyxTuningKnobFacts {
+        knob: "index_quant_bits_by_slot",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.quant_bits_by_slot -> DiskAnn PQ candidate sidecar -> exact packed raw-sidecar rerank",
+        blocked_by_issue: "",
+        effect_of_tuning: "32 keeps full-precision candidate scoring; 4 or 8 builds a PQ sidecar, over-retrieves candidates, and requires exact raw-vector reranking before returning hits",
+    },
 ];
 
 /// Renders every tuning knob as `value + enforcement verdict + the code that
@@ -464,6 +471,7 @@ fn calyx_tuning_knob_value(tuning: &synapse_calyx::SynapseCalyxTuningConfig, kno
         "index_beamwidth" => tuning.index_beamwidth.to_string(),
         "index_ef_search" => tuning.index_ef_search.to_string(),
         "index_alpha" => tuning.index_alpha.to_string(),
+        "index_quant_bits_by_slot" => format!("{:?}", tuning.index_quant_bits_by_slot),
         other => format!("<unmapped tuning knob {other}>"),
     }
 }

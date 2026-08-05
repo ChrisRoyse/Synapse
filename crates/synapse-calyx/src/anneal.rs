@@ -458,6 +458,7 @@ fn ensure_supported_candidate(
     expected.index_beamwidth = candidate.index_beamwidth;
     expected.index_ef_search = candidate.index_ef_search;
     expected.index_alpha = candidate.index_alpha;
+    expected.index_quant_bits_by_slot = candidate.index_quant_bits_by_slot.clone();
     if expected != *candidate {
         return Err(anneal_error(
             "SYNAPSE_CALYX_ANNEAL_TARGET_NOT_LOAD_BEARING",

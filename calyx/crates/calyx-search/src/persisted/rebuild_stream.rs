@@ -131,7 +131,7 @@ where
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct RebuildOptions<'a> {
     page_rows: usize,
     panel_version: u32,
@@ -240,7 +240,7 @@ where
                     plan,
                     page_rows,
                     build_policy,
-                    dense_index_config,
+                    dense_index_config.clone(),
                     Some(&progress_lock),
                 )
             })
@@ -304,7 +304,7 @@ where
         diskann_build_backend: Some(backend),
         diskann_build_backend_source: Some(backend_source),
         sextant_cuvs_compiled: Some(cuvs_compiled),
-        dense_index_config,
+        dense_index_config: dense_index_config.clone(),
         filter: Some(filter),
         slots: entries,
     };

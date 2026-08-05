@@ -32,6 +32,16 @@ pub struct PersistedSearchSlot {
     /// no IDF and no length saturation at all — so a caller reading a rank has
     /// to be told which one produced it.
     pub scoring_law: String,
+    pub quantization: Option<PersistedDenseQuantization>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PersistedDenseQuantization {
+    pub bits: u8,
+    pub subvectors: usize,
+    pub centroids: usize,
+    pub pq_sha256: String,
+    pub raw_sha256: String,
 }
 
 /// The within-lane scoring law for one persisted index kind.
@@ -77,7 +87,7 @@ impl PersistedSearchIndexes {
             diskann_build_backend: self.manifest.diskann_build_backend.clone(),
             diskann_build_backend_source: self.manifest.diskann_build_backend_source.clone(),
             sextant_cuvs_compiled: self.manifest.sextant_cuvs_compiled,
-            dense_index_config: self.manifest.dense_index_config,
+            dense_index_config: self.manifest.dense_index_config.clone(),
             slots,
         })
     }
@@ -103,13 +113,29 @@ impl PersistedSearchSlot {
                 .into());
             }
         };
+        let mut scoring_law = slot_scoring_law(&entry.kind);
+        if let Some(quantization) = &entry.dense_quantization {
+            scoring_law.push_str(&format!(
+                "; candidate distances use {}-bit PQ ({} subvectors, {} centroids) and final ordering is exact cosine reranking from the hash-bound packed raw sidecar",
+                quantization.bits, quantization.subvectors, quantization.centroids
+            ));
+        }
         Ok(Self {
             panel_slot: PanelSlotId::new(panel_version, SlotId::new(entry.slot)),
-            scoring_law: slot_scoring_law(&entry.kind),
+            scoring_law,
             kind: entry.kind.clone(),
             shape,
             len: entry.len,
             built_at_seq: entry.built_at_seq,
+            quantization: entry.dense_quantization.as_ref().map(|quantization| {
+                PersistedDenseQuantization {
+                    bits: quantization.bits,
+                    subvectors: quantization.subvectors,
+                    centroids: quantization.centroids,
+                    pq_sha256: quantization.pq_sha256.clone(),
+                    raw_sha256: quantization.raw_sha256.clone(),
+                }
+            }),
         })
     }
 }
