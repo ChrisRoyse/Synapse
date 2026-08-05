@@ -2645,9 +2645,7 @@ impl SynapseCalyxReadOnlyVault {
     }
 
     /// Reads native rollback snapshots and live pointers for physical verification.
-    pub fn scan_anneal_rollback_latest(
-        &self,
-    ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
+    pub fn scan_anneal_rollback_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
         self.scan_cf_latest(ColumnFamily::AnnealRollback)
     }
 

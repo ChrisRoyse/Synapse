@@ -1279,6 +1279,7 @@ impl SynapseService {
         };
         let tuning = status.tuning;
         let math_backend = status.math_backend;
+        let anneal = status.anneal.as_ref();
         let gpu_reservation_snapshot = math_backend
             .as_ref()
             .and_then(|math| math.host_reservation.as_ref());
@@ -1339,7 +1340,7 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
+                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} bit_floor_bits={:?} correlation_ceiling={:?} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -1359,6 +1360,13 @@ impl SynapseService {
                 math_backend
                     .as_ref()
                     .map_or_else(|| "none".to_owned(), |math| math.detail()),
+                anneal.map_or("none", |status| status.live_artifact_sha256.as_str()),
+                anneal.map_or(0, |status| status.live_artifact_bytes),
+                anneal.map_or(0, |status| status.rollback_rows),
+                anneal.map_or(0, |status| status.recent_changes.len()),
+                anneal
+                    .and_then(|status| status.budget.warning_code.as_deref())
+                    .unwrap_or("none"),
                 tuning_knobs.len(),
                 inert_tuning_knob_count,
                 inert_tuning_knob_names,
