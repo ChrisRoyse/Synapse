@@ -115,6 +115,18 @@ pub struct SynapseCalyxAnnealSearchReport {
     pub candidate_manifest_sha256: String,
     pub live_manifest_sha256_after: String,
     pub candidate_generation: PersistedSearchGeneration,
+    pub candidate_slot_metrics: Vec<SynapseCalyxAnnealSearchSlotMetrics>,
+    pub incumbent_slot_metrics: Vec<SynapseCalyxAnnealSearchSlotMetrics>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SynapseCalyxAnnealSearchSlotMetrics {
+    pub slot: u16,
+    pub query_count: usize,
+    pub recall_mean: f64,
+    pub recall_min: f64,
+    pub search_p99_ms_mean: f64,
+    pub search_p99_ms_max: f64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -377,8 +389,10 @@ impl SynapseCalyxVault {
         .map_err(|error| search_shadow_error("open candidate search generation", error))?;
         let (replay, query_slots) =
             self.build_search_replay(&candidate_indexes, &built.generation, snapshot)?;
-        let candidate_action = measure_search_action(&candidate_indexes, &replay, &query_slots)?;
-        let incumbent_action = measure_search_action(&incumbent_indexes, &replay, &query_slots)?;
+        let (candidate_action, candidate_slot_metrics) =
+            measure_search_action(&candidate_indexes, &replay, &query_slots)?;
+        let (incumbent_action, incumbent_slot_metrics) =
+            measure_search_action(&incumbent_indexes, &replay, &query_slots)?;
         reader_lease.release()?;
 
         self.persist_search_binding(prior_hash, prior_hash, incumbent_artifact.clone())?;
@@ -440,6 +454,8 @@ impl SynapseCalyxVault {
             candidate_manifest_sha256: candidate_artifact.manifest_sha256,
             live_manifest_sha256_after: live.manifest_sha256,
             candidate_generation: built.generation,
+            candidate_slot_metrics,
+            incumbent_slot_metrics,
         })
     }
 
@@ -1166,8 +1182,15 @@ fn measure_search_action(
     indexes: &PersistedSearchIndexes,
     replay: &HeldOutReplay,
     query_slots: &BTreeMap<u64, SlotId>,
-) -> Result<MeasuredSearchAction, SynapseCalyxError> {
+) -> Result<
+    (
+        MeasuredSearchAction,
+        Vec<SynapseCalyxAnnealSearchSlotMetrics>,
+    ),
+    SynapseCalyxError,
+> {
     let mut by_query = BTreeMap::new();
+    let mut by_slot = BTreeMap::<u16, (usize, f64, f64, f64, f64)>::new();
     for query in &replay.queries {
         let slot = query_slots.get(&query.query_id).copied().ok_or_else(|| {
             anneal_error(
@@ -1235,6 +1258,14 @@ fn measure_search_action(
                 "repair the fixed replay pass count before optimizer evaluation",
             )
         })?;
+        let aggregate = by_slot
+            .entry(slot.get())
+            .or_insert((0, 0.0, f64::INFINITY, 0.0, 0.0));
+        aggregate.0 += 1;
+        aggregate.1 += recall;
+        aggregate.2 = aggregate.2.min(recall);
+        aggregate.3 += p99;
+        aggregate.4 = aggregate.4.max(p99);
         by_query.insert(
             query.query_id,
             ActionMetricSnapshot::from_values([
@@ -1243,7 +1274,22 @@ fn measure_search_action(
             ]),
         );
     }
-    Ok(MeasuredSearchAction { by_query })
+    let slot_metrics = by_slot
+        .into_iter()
+        .map(
+            |(slot, (query_count, recall_sum, recall_min, p99_sum, p99_max))| {
+                SynapseCalyxAnnealSearchSlotMetrics {
+                    slot,
+                    query_count,
+                    recall_mean: recall_sum / query_count as f64,
+                    recall_min,
+                    search_p99_ms_mean: p99_sum / query_count as f64,
+                    search_p99_ms_max: p99_max,
+                }
+            },
+        )
+        .collect();
+    Ok((MeasuredSearchAction { by_query }, slot_metrics))
 }
 
 fn search_binding_hash_prefix(tuning_hash: [u8; 32]) -> Vec<u8> {

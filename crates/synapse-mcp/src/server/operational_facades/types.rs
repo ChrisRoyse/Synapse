@@ -432,6 +432,18 @@ pub struct HygieneAnnealSearchProposeResponse {
     pub incumbent_manifest_sha256: String,
     pub candidate_manifest_sha256: String,
     pub live_manifest_sha256_after: String,
+    pub candidate_slot_metrics: Vec<HygieneAnnealSearchSlotMetrics>,
+    pub incumbent_slot_metrics: Vec<HygieneAnnealSearchSlotMetrics>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+pub struct HygieneAnnealSearchSlotMetrics {
+    pub slot: u16,
+    pub query_count: usize,
+    pub recall_mean: f64,
+    pub recall_min: f64,
+    pub search_p99_ms_mean: f64,
+    pub search_p99_ms_max: f64,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

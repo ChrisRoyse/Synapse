@@ -957,6 +957,30 @@ pub(super) async fn handle(
                 incumbent_manifest_sha256: report.incumbent_manifest_sha256,
                 candidate_manifest_sha256: report.candidate_manifest_sha256,
                 live_manifest_sha256_after: report.live_manifest_sha256_after,
+                candidate_slot_metrics: report
+                    .candidate_slot_metrics
+                    .into_iter()
+                    .map(|metric| super::types::HygieneAnnealSearchSlotMetrics {
+                        slot: metric.slot,
+                        query_count: metric.query_count,
+                        recall_mean: metric.recall_mean,
+                        recall_min: metric.recall_min,
+                        search_p99_ms_mean: metric.search_p99_ms_mean,
+                        search_p99_ms_max: metric.search_p99_ms_max,
+                    })
+                    .collect(),
+                incumbent_slot_metrics: report
+                    .incumbent_slot_metrics
+                    .into_iter()
+                    .map(|metric| super::types::HygieneAnnealSearchSlotMetrics {
+                        slot: metric.slot,
+                        query_count: metric.query_count,
+                        recall_mean: metric.recall_mean,
+                        recall_min: metric.recall_min,
+                        search_p99_ms_mean: metric.search_p99_ms_mean,
+                        search_p99_ms_max: metric.search_p99_ms_max,
+                    })
+                    .collect(),
             };
             Ok(Json(hygiene_response(
                 operation,
