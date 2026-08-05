@@ -125,3 +125,19 @@ Collections rows=1 bytes=95 sha256=40eb572e0db2d841f4b4cf5b98c6c94aafdebeb77b944
 
 The temporary daemon was stopped by exact PID after evidence capture. Temporary FSV vaults and
 shell-job roots were removed only after resolving and proving their paths were below `%TEMP%`.
+
+## Final production retirement readback
+
+Commit `119d95ab` was deployed through `synapse-setup.ps1`. The installed daemon became PID 22412
+with image SHA-256 `26E5CB0063BEF5E4B85FDBCD7F202B0AA8F6685FB5E5169664EE5A3E4F3BBF8D`.
+Before the trigger, an independent physical prefix scan found 227 visible legacy
+`agent-cost/transcript-ts-index/v1/` matches. The real production
+`rollup_backfill reset=true` rescanned 50,973 transcript rows and wrote 105 native points while
+deleting the retired index family. The separate post-trigger physical scan found zero legacy
+prefix rows. A new fleet query still returned 21 spawns, 597,933 tokens, and 926,041 source
+micro-USD with `scanned_rows=0` and `scanned_index_rows=0`. The native-table readback was:
+
+```
+TimeSeries rows=1660 bytes=85990 sha256=9c680c2d55cb76947dbcb2c5e404cd76fa14ac93f5ffafd0c0ebad11b1457533
+Collections rows=5 bytes=403 sha256=4244a95353013fb02c9b5ed8b0f60392d5e440656faf7889d89792a04cdec543
+```
