@@ -44,8 +44,10 @@ use synapse_calyx::{
 
 use crate::Db;
 use crate::cf;
-use crate::constellations::{GraphPositionKind, SYN_GRAPHPOS_APP_PANEL_VERSION};
-use synapse_core::types::{TimelineKind, TimelineRecord};
+use crate::constellations::{
+    GraphPositionKind, SYN_GRAPHPOS_APP_PANEL_VERSION, SYN_PATH_HIERARCHY_PANEL_VERSION,
+};
+use synapse_core::types::{AgentEventKind, AgentEventRecord, TimelineKind, TimelineRecord};
 
 /// How often the derived-state maintainer runs.
 ///
@@ -427,6 +429,13 @@ pub(crate) fn run_derived_state_maintenance() {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_APP_GRAPH_FAILED", error.to_string());
     }
+    if let Err(error) = drive_agent_spawn_graph(&db) {
+        any_failed = true;
+        record_failure(
+            "STORAGE_DERIVED_STATE_AGENT_GRAPH_FAILED",
+            error.to_string(),
+        );
+    }
 
     // --- Durable hot-added lens backfill (#1668) ---
     // Run before search maintenance so a generation rebuilt on this same tick
@@ -736,6 +745,7 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
     let source_seq = lease.snapshot_seq;
     let mut previous = None::<String>;
     let mut counts = BTreeMap::<(String, String), u64>::new();
+    let mut hierarchy_paths = std::collections::BTreeSet::<String>::new();
     loop {
         let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
             Ok(page) => page,
@@ -757,6 +767,18 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
                     });
                 }
             };
+            if matches!(
+                record.kind,
+                TimelineKind::BrowserNav | TimelineKind::FileActivity
+            ) {
+                for key in ["url", "path", "document"] {
+                    if let Some(value) = record.payload.get(key).and_then(serde_json::Value::as_str)
+                        && !value.trim().is_empty()
+                    {
+                        hierarchy_paths.insert(value.to_owned());
+                    }
+                }
+            }
             if record.kind != TimelineKind::FocusChange {
                 continue;
             }
@@ -774,6 +796,12 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
         }
     }
     db.release_coherent_scan(&mut lease)?;
+    drive_path_hierarchy(
+        db,
+        source_seq,
+        lease.read_at_unix_ms,
+        hierarchy_paths.into_iter().collect(),
+    )?;
     if counts.is_empty() {
         tracing::debug!(
             code = "STORAGE_DERIVED_STATE_APP_GRAPH_INELIGIBLE",
@@ -823,6 +851,147 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
         committed_seq = readback.committed_seq,
         lifecycle_sha256 = readback.lifecycle_sha256,
         "scheduled app-transition graph snapshot was atomically published and physically read back"
+    );
+    Ok(())
+}
+
+fn drive_path_hierarchy(
+    db: &Db,
+    source_seq: u64,
+    read_at_unix_ms: u64,
+    paths: Vec<String>,
+) -> crate::StorageResult<()> {
+    if paths.is_empty() {
+        tracing::debug!(
+            code = "STORAGE_DERIVED_STATE_PATH_GRAPH_INELIGIBLE",
+            source_seq,
+            "coherent timeline snapshot has no document or URL hierarchy paths"
+        );
+        return Ok(());
+    }
+    let transitions = crate::constellations::path_hierarchy_transitions(&paths)?;
+    let fingerprint = crate::constellations::graph_snapshot_fingerprint(&transitions);
+    if lifecycle_has_snapshot(db, SYN_PATH_HIERARCHY_PANEL_VERSION, fingerprint)? {
+        return Ok(());
+    }
+    let readback = db.publish_path_hierarchy_snapshot(
+        source_seq,
+        now_unix_ms().unwrap_or(read_at_unix_ms),
+        &paths,
+    )?;
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_PATH_GRAPH_PUBLISHED",
+        panel_version = readback.panel_version,
+        source_seq = readback.source_seq,
+        snapshot = readback.snapshot,
+        constellation_count = readback.constellation_count,
+        graph_row_count = readback.graph_row_count,
+        committed_seq = readback.committed_seq,
+        lifecycle_sha256 = readback.lifecycle_sha256,
+        "scheduled path hierarchy snapshot was atomically published and physically read back"
+    );
+    Ok(())
+}
+
+fn lifecycle_has_snapshot(
+    db: &Db,
+    panel_version: u32,
+    fingerprint: u64,
+) -> crate::StorageResult<bool> {
+    Ok(db
+        .read_panel_lifecycle(panel_version)?
+        .is_some_and(|state| {
+            state.added_lenses.values().any(|added| {
+                matches!(
+                    added.source_projection,
+                    synapse_calyx::panel_lifecycle::SynapseCalyxSourceProjection::DerivedSnapshot {
+                        snapshot,
+                        ..
+                    } if snapshot == fingerprint
+                )
+            })
+        }))
+}
+
+fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
+    let mut lease =
+        db.pin_cf_physical_scan(cf::CF_AGENT_EVENTS, crate::COHERENT_SCAN_MAX_AGE_MS)?;
+    let source_seq = lease.snapshot_seq;
+    let read_at_unix_ms = lease.read_at_unix_ms;
+    let mut counts = BTreeMap::<(String, String), u64>::new();
+    loop {
+        let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = db.release_coherent_scan(&mut lease);
+                return Err(error);
+            }
+        };
+        for (key, value) in page.rows {
+            let record: AgentEventRecord = match serde_json::from_slice(&value) {
+                Ok(record) => record,
+                Err(error) => {
+                    let _ = db.release_coherent_scan(&mut lease);
+                    return Err(crate::StorageError::BackendInvalidConfig {
+                        value: format!("{key:02x?}"),
+                        detail: format!(
+                            "decode coherent CF_AGENT_EVENTS row for spawn graph: {error}"
+                        ),
+                    });
+                }
+            };
+            if record.kind != AgentEventKind::SpawnRequested {
+                continue;
+            }
+            let (Some(session_id), Some(spawn_id)) = (record.session_id, record.spawn_id) else {
+                continue;
+            };
+            if session_id.trim().is_empty() || spawn_id.trim().is_empty() {
+                continue;
+            }
+            *counts.entry((session_id, spawn_id)).or_default() += 1;
+        }
+        if !page.more {
+            break;
+        }
+    }
+    db.release_coherent_scan(&mut lease)?;
+    if counts.is_empty() {
+        tracing::debug!(
+            code = "STORAGE_DERIVED_STATE_AGENT_GRAPH_INELIGIBLE",
+            source_seq,
+            "coherent agent-event snapshot has no session-to-spawn edges"
+        );
+        return Ok(());
+    }
+    let transitions = counts
+        .into_iter()
+        .map(|((src, dst), count)| (src, dst, count))
+        .collect::<Vec<_>>();
+    let fingerprint = crate::constellations::graph_snapshot_fingerprint(&transitions);
+    if lifecycle_has_snapshot(
+        db,
+        crate::constellations::SYN_GRAPHPOS_PROCESS_PANEL_VERSION,
+        fingerprint,
+    )? {
+        return Ok(());
+    }
+    let readback = db.publish_graph_position_snapshot(
+        GraphPositionKind::Process,
+        source_seq,
+        now_unix_ms().unwrap_or(read_at_unix_ms),
+        &transitions,
+    )?;
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_AGENT_GRAPH_PUBLISHED",
+        panel_version = readback.panel_version,
+        source_seq = readback.source_seq,
+        snapshot = readback.snapshot,
+        constellation_count = readback.constellation_count,
+        graph_row_count = readback.graph_row_count,
+        committed_seq = readback.committed_seq,
+        lifecycle_sha256 = readback.lifecycle_sha256,
+        "scheduled agent spawn graph snapshot was atomically published and physically read back"
     );
     Ok(())
 }

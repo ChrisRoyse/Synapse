@@ -6643,6 +6643,198 @@ pub fn publish_graph_position_snapshot(
         .map_err(|error| measurement_error("publish graph-position snapshot", error))
 }
 
+/// Builds and atomically publishes one document/URL hierarchy snapshot.
+///
+/// Every supplied path contributes all of its ancestor prefixes. The persisted
+/// records therefore describe both leaves and internal hierarchy nodes, making
+/// subtree size and sibling position independently inspectable.
+pub fn publish_path_hierarchy_snapshot(
+    vault: &SynapseCalyxVault,
+    source_seq: u64,
+    created_at_ms: u64,
+    paths: &[String],
+) -> StorageResult<SynapseCalyxDerivedSnapshotReadback> {
+    let mut node_components = BTreeMap::<String, Vec<String>>::new();
+    for path in paths {
+        let components = hierarchy_components(path);
+        if components.is_empty() {
+            return Err(measurement_error(
+                "build path hierarchy snapshot",
+                "path is blank or contains no hierarchy components",
+            ));
+        }
+        for depth in 1..=components.len() {
+            let prefix = components[..depth].join("/");
+            node_components
+                .entry(prefix)
+                .or_insert_with(|| components[..depth].to_vec());
+        }
+    }
+    if node_components.is_empty() {
+        return Err(measurement_error(
+            "build path hierarchy snapshot",
+            "hierarchy snapshot has no paths",
+        ));
+    }
+    let mut children = BTreeMap::<String, BTreeSet<String>>::new();
+    let transitions = path_hierarchy_transitions(paths)?;
+    for (node, components) in &node_components {
+        if components.len() <= 1 {
+            continue;
+        }
+        let parent = components[..components.len() - 1].join("/");
+        children
+            .entry(parent.clone())
+            .or_default()
+            .insert(node.clone());
+    }
+    let snapshot = graph_snapshot_fingerprint(&transitions);
+    let operation_id = sha256_hex(
+        &[
+            b"synapse-derived-path-operation-v1".as_slice(),
+            &source_seq.to_be_bytes(),
+            &snapshot.to_be_bytes(),
+        ]
+        .concat(),
+    );
+    vault
+        .reserve_panel_generations(&[(
+            SYN_PATH_HIERARCHY_PANEL_NAME.to_owned(),
+            SYN_PATH_HIERARCHY_PANEL_VERSION,
+        )])
+        .map_err(|error| measurement_error("reserve path panel generation", error))?;
+    let allocation = vault
+        .allocate_panel_generation(SYN_PATH_HIERARCHY_PANEL_NAME, &operation_id)
+        .map_err(|error| measurement_error("allocate path panel generation", error))?;
+    let panel_version = allocation.panel_generation;
+    let contract = syn_path_hierarchy_panel_contract(panel_version, snapshot, created_at_ms)?;
+    let vault_id = vault.vault_id_value();
+    let mut constellations = Vec::with_capacity(node_components.len());
+    for (index, (node, components)) in node_components.iter().enumerate() {
+        let parent = if components.len() > 1 {
+            Some(components[..components.len() - 1].join("/"))
+        } else {
+            None
+        };
+        let siblings = parent
+            .as_ref()
+            .and_then(|value| children.get(value))
+            .cloned()
+            .unwrap_or_else(|| BTreeSet::from([node.clone()]));
+        let sibling_rank = siblings.iter().position(|value| value == node).unwrap_or(0) as u64;
+        let subtree_size = node_components
+            .keys()
+            .filter(|candidate| {
+                *candidate == node
+                    || candidate
+                        .strip_prefix(node)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+            .count() as u64;
+        let signature = PathPositionSignature {
+            depth: (components.len() - 1) as u64,
+            sibling_rank,
+            sibling_count: siblings.len() as u64,
+            subtree_size,
+            ancestor_count: (components.len() - 1) as u64,
+            path_len: node.len() as u64,
+            is_root: components.len() == 1,
+            is_leaf: !children.contains_key(node),
+            ancestor_components: components[..components.len() - 1].to_vec(),
+            path_hash_key: node.clone(),
+        };
+        let identity = path_position_identity_bytes(snapshot, node);
+        let context = NativeConstellationContext {
+            vault_id,
+            cx_id: vault.cx_id_for_input(&identity, panel_version),
+            created_at_ms,
+            next_ledger_seq: source_seq.saturating_add(index as u64).saturating_add(1),
+        };
+        constellations.push(build_path_hierarchy_constellation(
+            context,
+            panel_version,
+            snapshot,
+            node,
+            &signature,
+        )?);
+    }
+    let mut graph_rows = Vec::with_capacity(transitions.len() + 1);
+    graph_rows.push(SynapseCalyxDerivedGraphRow {
+        key: derived_path_graph_key(snapshot, b"manifest"),
+        value: serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "panel_name": SYN_PATH_HIERARCHY_PANEL_NAME,
+            "panel_version": panel_version,
+            "source_seq": source_seq,
+            "snapshot": snapshot,
+            "node_count": node_components.len(),
+            "edge_count": transitions.len(),
+        }))
+        .map_err(|error| measurement_error("encode path snapshot manifest", error))?,
+    });
+    for (index, (parent, child, count)) in transitions.iter().enumerate() {
+        graph_rows.push(SynapseCalyxDerivedGraphRow {
+            key: derived_path_graph_key(snapshot, &(index as u64).to_be_bytes()),
+            value: serde_json::to_vec(&json!({
+                "parent": parent,
+                "child": child,
+                "count": count,
+            }))
+            .map_err(|error| measurement_error("encode path snapshot edge", error))?,
+        });
+    }
+    vault
+        .publish_derived_snapshot(SynapseCalyxDerivedSnapshotRequest {
+            panel_name: SYN_PATH_HIERARCHY_PANEL_NAME,
+            operation_id: &operation_id,
+            panel: contract.panel,
+            registry: contract.registry,
+            constellations,
+            graph_rows,
+            source_seq,
+            snapshot,
+        })
+        .map_err(|error| measurement_error("publish path hierarchy snapshot", error))
+}
+
+/// Returns the canonical parent/child edge set used to fingerprint a path
+/// hierarchy snapshot.
+pub fn path_hierarchy_transitions(paths: &[String]) -> StorageResult<Vec<(String, String, u64)>> {
+    let mut transitions = BTreeSet::new();
+    for path in paths {
+        let components = hierarchy_components(path);
+        if components.is_empty() {
+            return Err(measurement_error(
+                "build path hierarchy transitions",
+                "path is blank or contains no hierarchy components",
+            ));
+        }
+        for depth in 2..=components.len() {
+            transitions.insert((
+                components[..depth - 1].join("/"),
+                components[..depth].join("/"),
+                1,
+            ));
+        }
+    }
+    Ok(transitions.into_iter().collect())
+}
+
+fn hierarchy_components(path: &str) -> Vec<String> {
+    path.split(['/', '\\'])
+        .map(str::trim)
+        .filter(|component| !component.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn derived_path_graph_key(snapshot: u64, suffix: &[u8]) -> Vec<u8> {
+    let mut key = b"derived-path\0v1\0".to_vec();
+    append_framed(&mut key, &snapshot.to_be_bytes());
+    append_framed(&mut key, suffix);
+    key
+}
+
 fn graph_node_cx_id(kind: GraphPositionKind, name: &str) -> CxId {
     let mut hasher = Sha256::new();
     hasher.update(b"synapse-derived-graph-node-v1");

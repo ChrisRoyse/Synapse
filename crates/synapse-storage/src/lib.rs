@@ -1811,6 +1811,17 @@ impl Db {
             .publish_graph_position_snapshot(kind, source_seq, created_at_ms, transitions)
     }
 
+    /// Atomically publishes a hierarchy derived from one coherent source cut.
+    pub fn publish_path_hierarchy_snapshot(
+        &self,
+        source_seq: u64,
+        created_at_ms: u64,
+        paths: &[String],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback> {
+        self.backend
+            .publish_path_hierarchy_snapshot(source_seq, created_at_ms, paths)
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_TIMELINE` row.
     ///

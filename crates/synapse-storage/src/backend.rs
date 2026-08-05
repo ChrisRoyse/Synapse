@@ -775,6 +775,12 @@ pub trait StorageBackend: Send + Sync {
         created_at_ms: u64,
         transitions: &[(String, String, u64)],
     ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback>;
+    fn publish_path_hierarchy_snapshot(
+        &self,
+        source_seq: u64,
+        created_at_ms: u64,
+        paths: &[String],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback>;
     fn run_panel_backfill(
         &self,
         panel_version: u32,
@@ -4491,6 +4497,27 @@ impl StorageBackend for CalyxBackend {
                     source_seq,
                     created_at_ms,
                     transitions,
+                )
+            },
+        )
+    }
+
+    fn publish_path_hierarchy_snapshot(
+        &self,
+        source_seq: u64,
+        created_at_ms: u64,
+        paths: &[String],
+    ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback> {
+        self.with_vault(
+            "calyx_graph",
+            "publish atomic path-hierarchy snapshot",
+            true,
+            |vault| {
+                constellations::publish_path_hierarchy_snapshot(
+                    vault,
+                    source_seq,
+                    created_at_ms,
+                    paths,
                 )
             },
         )

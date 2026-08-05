@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use calyx_aster::cf::ColumnFamily;
 use calyx_core::SlotVector;
 use synapse_calyx::{SynapseCalyxConfig, SynapseCalyxVault};
-use synapse_storage::constellations::{GraphPositionKind, publish_graph_position_snapshot};
+use synapse_storage::constellations::{
+    GraphPositionKind, publish_graph_position_snapshot, publish_path_hierarchy_snapshot,
+};
 
 fn counts(vault: &SynapseCalyxVault) -> Result<(usize, usize, usize), Box<dyn Error>> {
     Ok((
@@ -113,5 +115,31 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     println!("EDGE_REPLAY readback={replay:?}");
     println!("EDGE_REPLAY after={:?}", counts(&vault)?);
+
+    let paths = vec![
+        "docs/calyx/guide.md".to_owned(),
+        "docs/calyx/reference.md".to_owned(),
+        "docs/synapse/readme.md".to_owned(),
+    ];
+    println!("PATH_HAPPY before={:?}", counts(&vault)?);
+    let path_readback = publish_path_hierarchy_snapshot(&vault, 41, 1_786_000_000_001, &paths)?;
+    println!("PATH_HAPPY trigger_readback={path_readback:?}");
+    println!("PATH_HAPPY after={:?}", counts(&vault)?);
+    for id in vault.panel_constellation_ids(path_readback.panel_version, 16)? {
+        let cx = vault.hydrate_constellation_latest(id)?;
+        println!(
+            "PATH_PHYSICAL node={} depth={} subtree={} slots={}",
+            cx.metadata
+                .get("path_node_key")
+                .cloned()
+                .unwrap_or_default(),
+            cx.metadata.get("path_depth").cloned().unwrap_or_default(),
+            cx.metadata
+                .get("path_subtree_size")
+                .cloned()
+                .unwrap_or_default(),
+            cx.slots.len(),
+        );
+    }
     Ok(())
 }
