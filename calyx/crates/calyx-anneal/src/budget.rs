@@ -201,7 +201,21 @@ where
     }
 
     pub fn acquire(&self, cpu_weight: f64, vram_bytes: u64) -> Result<BudgetHandle> {
+        self.acquire_with_ticks(cpu_weight, vram_bytes, handle_ticks(self.config))
+    }
+
+    /// Admits a bounded unit of work against the live resource ceiling and
+    /// gives it the exact cooperative work quota declared by its caller.
+    pub fn acquire_with_ticks(
+        &self,
+        cpu_weight: f64,
+        vram_bytes: u64,
+        ticks: usize,
+    ) -> Result<BudgetHandle> {
         validate_request(cpu_weight)?;
+        if ticks == 0 {
+            return Err(invalid_config("cooperative tick quota must be positive"));
+        }
         self.tick()?;
         let mut state = self.lock_state()?;
         if self.config.cpu_fraction <= EPSILON || self.config.vram_bytes == 0 {
@@ -222,8 +236,8 @@ where
         state.reserved_vram_bytes = state.reserved_vram_bytes.saturating_add(vram_bytes);
         state.handles_active += 1;
         Ok(BudgetHandle {
-            remaining_ticks: handle_ticks(self.config),
-            max_ticks: handle_ticks(self.config),
+            remaining_ticks: ticks,
+            max_ticks: ticks,
             release: Some(BudgetRelease {
                 state: Arc::downgrade(&self.state),
                 cpu_weight,

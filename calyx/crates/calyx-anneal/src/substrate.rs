@@ -371,14 +371,19 @@ where
         Candidate: ShadowAnnealAction,
         Incumbent: ShadowAnnealAction,
     {
-        let budget = match self
-            .budget
-            .acquire(self.shadow_cpu_weight, self.shadow_vram_bytes)
-        {
+        let replay_ticks = self.replay.queries.len().max(1);
+        let budget = match self.budget.acquire_with_ticks(
+            self.shadow_cpu_weight,
+            self.shadow_vram_bytes,
+            replay_ticks,
+        ) {
             Ok(handle) => handle,
             Err(error) if error.code == crate::CALYX_ANNEAL_BUDGET_EXHAUSTED => {
                 return Ok(ShadowVerdict::Revert {
-                    reason: ShadowRevertReason::BudgetExhausted,
+                    reason: ShadowRevertReason::BudgetExhausted {
+                        evaluated_queries: 0,
+                        replay_queries: self.replay.queries.len(),
+                    },
                     metrics: MetricSnapshot::empty(self.clock.now()),
                 });
             }

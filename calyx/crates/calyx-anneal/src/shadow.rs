@@ -219,10 +219,13 @@ impl<'a> ShadowExecutor<'a> {
         }
 
         let mut accumulator = MetricAccumulator::new(unique);
-        for query in &self.replay.queries {
+        for (query_index, query) in self.replay.queries.iter().enumerate() {
             if !self.budget.try_consume() {
                 return ShadowVerdict::Revert {
-                    reason: ShadowRevertReason::BudgetExhausted,
+                    reason: ShadowRevertReason::BudgetExhausted {
+                        evaluated_queries: query_index,
+                        replay_queries: self.replay.queries.len(),
+                    },
                     metrics: accumulator.snapshot(evaluated_at),
                 };
             }
@@ -310,7 +313,10 @@ pub enum ShadowVerdict {
 pub enum ShadowRevertReason {
     TripwireCrossed(TripwireMetric),
     MetricRegression(TripwireMetric),
-    BudgetExhausted,
+    BudgetExhausted {
+        evaluated_queries: usize,
+        replay_queries: usize,
+    },
     InsufficientReplay,
     NoRequiredMetrics,
     DuplicateRequiredMetric(TripwireMetric),
