@@ -389,10 +389,13 @@ impl SynapseCalyxVault {
         .map_err(|error| search_shadow_error("open candidate search generation", error))?;
         let (replay, query_slots) =
             self.build_search_replay(&candidate_indexes, &built.generation, snapshot)?;
-        let (candidate_action, candidate_slot_metrics) =
-            measure_search_action(&candidate_indexes, &replay, &query_slots)?;
-        let (incumbent_action, incumbent_slot_metrics) =
-            measure_search_action(&incumbent_indexes, &replay, &query_slots)?;
+        let (candidate_action, candidate_slot_metrics, incumbent_action, incumbent_slot_metrics) =
+            measure_search_actions_paired(
+                &candidate_indexes,
+                &incumbent_indexes,
+                &replay,
+                &query_slots,
+            )?;
         reader_lease.release()?;
 
         self.persist_search_binding(prior_hash, prior_hash, incumbent_artifact.clone())?;
@@ -1178,19 +1181,24 @@ fn ensure_index_only_candidate(
     Ok(())
 }
 
-fn measure_search_action(
-    indexes: &PersistedSearchIndexes,
+fn measure_search_actions_paired(
+    candidate_indexes: &PersistedSearchIndexes,
+    incumbent_indexes: &PersistedSearchIndexes,
     replay: &HeldOutReplay,
     query_slots: &BTreeMap<u64, SlotId>,
 ) -> Result<
     (
         MeasuredSearchAction,
         Vec<SynapseCalyxAnnealSearchSlotMetrics>,
+        MeasuredSearchAction,
+        Vec<SynapseCalyxAnnealSearchSlotMetrics>,
     ),
     SynapseCalyxError,
 > {
-    let mut by_query = BTreeMap::new();
-    let mut by_slot = BTreeMap::<u16, (usize, f64, f64, f64, f64)>::new();
+    let mut candidate_by_query = BTreeMap::new();
+    let mut incumbent_by_query = BTreeMap::new();
+    let mut candidate_by_slot = BTreeMap::<u16, (usize, f64, f64, f64, f64)>::new();
+    let mut incumbent_by_slot = BTreeMap::<u16, (usize, f64, f64, f64, f64)>::new();
     for query in &replay.queries {
         let slot = query_slots.get(&query.query_id).copied().ok_or_else(|| {
             anneal_error(
@@ -1228,79 +1236,148 @@ fn measure_search_action(
         // Opening a persisted generation verifies and pins its sidecars. That
         // one-time integrity/read cost is not query latency and otherwise
         // penalizes whichever side of an A/B replay is measured first.
-        indexes
-            .search(slot, &vector, expected.len())
-            .map_err(|error| {
-                search_shadow_error(
-                    &format!("warm replay query {} slot {slot}", query.query_id),
-                    error,
-                )
-            })?;
-        let mut elapsed = Vec::with_capacity(SEARCH_REPLAY_PASSES);
-        let mut observed = Vec::new();
-        for _ in 0..SEARCH_REPLAY_PASSES {
-            let started = Instant::now();
-            let hits = indexes
+        for (label, indexes) in [
+            ("candidate", candidate_indexes),
+            ("incumbent", incumbent_indexes),
+        ] {
+            indexes
                 .search(slot, &vector, expected.len())
                 .map_err(|error| {
                     search_shadow_error(
-                        &format!("measure replay query {} slot {slot}", query.query_id),
+                        &format!("warm {label} replay query {} slot {slot}", query.query_id),
                         error,
                     )
                 })?;
-            elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
-            observed = hits;
         }
-        elapsed.sort_by(f64::total_cmp);
+        let mut candidate_elapsed = Vec::with_capacity(SEARCH_REPLAY_PASSES);
+        let mut incumbent_elapsed = Vec::with_capacity(SEARCH_REPLAY_PASSES);
+        let mut candidate_observed = Vec::new();
+        let mut incumbent_observed = Vec::new();
+        for pass in 0..SEARCH_REPLAY_PASSES {
+            let candidate_first = pass % 2 == 0;
+            for (label, indexes, elapsed, observed) in if candidate_first {
+                [
+                    (
+                        "candidate",
+                        candidate_indexes,
+                        &mut candidate_elapsed,
+                        &mut candidate_observed,
+                    ),
+                    (
+                        "incumbent",
+                        incumbent_indexes,
+                        &mut incumbent_elapsed,
+                        &mut incumbent_observed,
+                    ),
+                ]
+            } else {
+                [
+                    (
+                        "incumbent",
+                        incumbent_indexes,
+                        &mut incumbent_elapsed,
+                        &mut incumbent_observed,
+                    ),
+                    (
+                        "candidate",
+                        candidate_indexes,
+                        &mut candidate_elapsed,
+                        &mut candidate_observed,
+                    ),
+                ]
+            } {
+                let started = Instant::now();
+                *observed = indexes
+                    .search(slot, &vector, expected.len())
+                    .map_err(|error| {
+                        search_shadow_error(
+                            &format!(
+                                "measure {label} replay query {} slot {slot}",
+                                query.query_id
+                            ),
+                            error,
+                        )
+                    })?;
+                elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
+            }
+        }
+        candidate_elapsed.sort_by(f64::total_cmp);
+        incumbent_elapsed.sort_by(f64::total_cmp);
         // Exact top-k IDs are arbitrary at a tied kth boundary. Persisted dense
         // search rescored every returned hit, so geometric recall accepts an
         // equivalent tied neighbor instead of reporting a false miss.
-        let matched = observed
-            .iter()
-            .filter(|hit| {
-                expected.contains(&hit.cx_id) || hit.score + f32::EPSILON >= kth_similarity
-            })
-            .count();
-        let recall = matched as f64 / expected.len() as f64;
-        let p99 = *elapsed.last().ok_or_else(|| {
-            anneal_error(
-                "SYNAPSE_CALYX_ANNEAL_SEARCH_MEASUREMENT_EMPTY",
-                format!("query {} produced no timing samples", query.query_id),
-                "repair the fixed replay pass count before optimizer evaluation",
-            )
-        })?;
-        let aggregate = by_slot
-            .entry(slot.get())
-            .or_insert((0, 0.0, f64::INFINITY, 0.0, 0.0));
-        aggregate.0 += 1;
-        aggregate.1 += recall;
-        aggregate.2 = aggregate.2.min(recall);
-        aggregate.3 += p99;
-        aggregate.4 = aggregate.4.max(p99);
-        by_query.insert(
-            query.query_id,
-            ActionMetricSnapshot::from_values([
-                (TripwireMetric::RecallAtK, recall),
-                (TripwireMetric::SearchP99, p99),
-            ]),
-        );
+        for (observed, elapsed, by_query, by_slot) in [
+            (
+                &candidate_observed,
+                &candidate_elapsed,
+                &mut candidate_by_query,
+                &mut candidate_by_slot,
+            ),
+            (
+                &incumbent_observed,
+                &incumbent_elapsed,
+                &mut incumbent_by_query,
+                &mut incumbent_by_slot,
+            ),
+        ] {
+            let matched = observed
+                .iter()
+                .filter(|hit| {
+                    expected.contains(&hit.cx_id) || hit.score + f32::EPSILON >= kth_similarity
+                })
+                .count();
+            let recall = matched as f64 / expected.len() as f64;
+            let p99 = *elapsed.last().ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_SEARCH_MEASUREMENT_EMPTY",
+                    format!("query {} produced no timing samples", query.query_id),
+                    "repair the fixed replay pass count before optimizer evaluation",
+                )
+            })?;
+            let aggregate = by_slot
+                .entry(slot.get())
+                .or_insert((0, 0.0, f64::INFINITY, 0.0, 0.0));
+            aggregate.0 += 1;
+            aggregate.1 += recall;
+            aggregate.2 = aggregate.2.min(recall);
+            aggregate.3 += p99;
+            aggregate.4 = aggregate.4.max(p99);
+            by_query.insert(
+                query.query_id,
+                ActionMetricSnapshot::from_values([
+                    (TripwireMetric::RecallAtK, recall),
+                    (TripwireMetric::SearchP99, p99),
+                ]),
+            );
+        }
     }
-    let slot_metrics = by_slot
-        .into_iter()
-        .map(
-            |(slot, (query_count, recall_sum, recall_min, p99_sum, p99_max))| {
-                SynapseCalyxAnnealSearchSlotMetrics {
-                    slot,
-                    query_count,
-                    recall_mean: recall_sum / query_count as f64,
-                    recall_min,
-                    search_p99_ms_mean: p99_sum / query_count as f64,
-                    search_p99_ms_max: p99_max,
-                }
-            },
-        )
-        .collect();
-    Ok((MeasuredSearchAction { by_query }, slot_metrics))
+    let summarize = |by_slot: BTreeMap<u16, (usize, f64, f64, f64, f64)>| {
+        by_slot
+            .into_iter()
+            .map(
+                |(slot, (query_count, recall_sum, recall_min, p99_sum, p99_max))| {
+                    SynapseCalyxAnnealSearchSlotMetrics {
+                        slot,
+                        query_count,
+                        recall_mean: recall_sum / query_count as f64,
+                        recall_min,
+                        search_p99_ms_mean: p99_sum / query_count as f64,
+                        search_p99_ms_max: p99_max,
+                    }
+                },
+            )
+            .collect::<Vec<_>>()
+    };
+    Ok((
+        MeasuredSearchAction {
+            by_query: candidate_by_query,
+        },
+        summarize(candidate_by_slot),
+        MeasuredSearchAction {
+            by_query: incumbent_by_query,
+        },
+        summarize(incumbent_by_slot),
+    ))
 }
 
 fn search_binding_hash_prefix(tuning_hash: [u8; 32]) -> Vec<u8> {
