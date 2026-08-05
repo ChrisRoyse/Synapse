@@ -633,7 +633,7 @@ where
             return Ok(());
         };
         let current = self.latest_seq();
-        let recovered = durable.recover_current_batches()?;
+        let recovered = durable.recover_current_batches_under_commit_lock()?;
         self.reconcile_ledger_state_from_recovery_locked(&recovered)?;
         self.replace_retention_horizon(recovered.retention_horizon.clone())?;
         self.rows

@@ -700,7 +700,7 @@ where
                 "Ledger state reconciliation requires a durable vault",
             ));
         };
-        let recovered = durable.recover_current_batches()?;
+        let recovered = durable.recover_current_batches_under_commit_lock()?;
         self.reconcile_ledger_state_from_recovery_locked(&recovered)
     }
 

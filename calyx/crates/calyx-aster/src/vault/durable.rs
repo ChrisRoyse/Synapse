@@ -652,7 +652,13 @@ impl DurableVault {
         self.root.join("locks").join("native.compaction.lock")
     }
 
-    pub(super) fn recover_current_batches(&self) -> Result<RecoveredBatches> {
+    /// Re-reads durable truth while the caller already owns the commit lock.
+    ///
+    /// `read_only` is deliberate even on a writable vault: recovery planning
+    /// must not enter stale-SST reclamation or another repair path that acquires
+    /// `durable.commit.lock` recursively. Windows byte-range locks are not
+    /// reentrant across the second file handle used by the lock guard.
+    pub(super) fn recover_current_batches_under_commit_lock(&self) -> Result<RecoveredBatches> {
         let options = VaultOptions {
             tiering_policy: self.tiering_policy.clone(),
             ledger_checkpoint: self.ledger_checkpoint.clone(),
@@ -663,6 +669,7 @@ impl DurableVault {
             disk_pressure_guard: self.disk_pressure_guard.clone(),
             value_crypto: self.value_crypto.clone(),
             restore_mvcc_rows: true,
+            read_only: true,
             ..VaultOptions::default()
         };
         Self::recover_batches(&self.root, &options)

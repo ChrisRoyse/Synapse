@@ -173,6 +173,12 @@ impl SynapseCalyxVault {
             ));
         }
         self.persist_tuning_artifact(candidate_hash, &candidate_bytes)?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ANNEAL_CANDIDATE_PERSISTED",
+            prior_artifact_sha256 = %hex32(prior_hash),
+            candidate_artifact_sha256 = %hex32(candidate_hash),
+            "persisted and independently read back Anneal candidate artifact"
+        );
 
         let clock = self.anneal_clock()?;
         let rollback = RollbackStore::open(
@@ -195,6 +201,11 @@ impl SynapseCalyxVault {
         })?;
         let mut substrate =
             AnnealSubstrate::new(tripwires, replay, rollback, ledger, budget, &clock);
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ANNEAL_SHADOW_BEGIN",
+            candidate_artifact_sha256 = %hex32(candidate_hash),
+            "beginning native Anneal prepare and shadow transaction"
+        );
         let outcome = substrate
             .propose_change_with_description(
                 tuning_artifact_key(),
@@ -206,6 +217,12 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("shadow-test Anneal tuning candidate", &error)
             })?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ANNEAL_SHADOW_COMPLETE",
+            candidate_artifact_sha256 = %hex32(candidate_hash),
+            outcome = ?outcome,
+            "native Anneal transaction completed"
+        );
         let (live_hash, live_bytes, _) = self.read_live_tuning()?;
         Ok(SynapseCalyxAnnealChangeReport {
             outcome,
