@@ -9,7 +9,9 @@ use calyx_sextant::index::{
 
 use super::rebuild::RebuildProgress;
 use super::rebuild_plan::DiskAnnBuildPolicy;
-use super::{SearchIndexEntry, SlotIdMap, rel, stale, write_json_atomic};
+use super::{
+    PersistedDenseIndexConfig, SearchIndexEntry, SlotIdMap, rel, stale, write_json_atomic,
+};
 use crate::error::CliResult;
 
 #[path = "dense/flat.rs"]
@@ -34,6 +36,7 @@ pub(super) fn write_with_progress<F>(
     rows: DenseSlotRows,
     base_seq: u64,
     build_policy: DiskAnnBuildPolicy,
+    config: PersistedDenseIndexConfig,
     mut progress: F,
 ) -> CliResult<SearchIndexEntry>
 where
@@ -60,9 +63,9 @@ where
         slot,
         &graph_path,
         &rows.rows,
-        build_params(rows.dim as usize),
+        build_params(rows.dim as usize, config),
         None,
-        search_params(rows.rows.len().max(64)),
+        search_params(config),
         build_policy.backend,
         |event| {
             progress(RebuildProgress::slot(
@@ -102,6 +105,7 @@ pub(super) fn search(
     slot: SlotId,
     query: &SlotVector,
     k: usize,
+    config: PersistedDenseIndexConfig,
 ) -> CliResult<Vec<IndexSearchHit>> {
     if entry.kind == "flat_dense" {
         return flat::search(vault_dir, entry, slot, query, k, None);
@@ -111,8 +115,8 @@ pub(super) fn search(
             "persistent dense search slot {slot} received non-dense query"
         )));
     };
-    open(vault_dir, entry, panel_version, slot, *dim, k)?
-        .search(query, want(k, entry.len), Some(want(k, entry.len).max(64)))
+    open(vault_dir, entry, panel_version, slot, *dim, config)?
+        .search(query, want(k, entry.len), Some(config.ef_search.max(k)))
         .map_err(Into::into)
 }
 
@@ -124,6 +128,7 @@ pub(super) fn search_filtered(
     query: &SlotVector,
     k: usize,
     candidates: &BTreeSet<CxId>,
+    config: PersistedDenseIndexConfig,
 ) -> CliResult<Vec<IndexSearchHit>> {
     if entry.kind == "flat_dense" {
         return flat::search(vault_dir, entry, slot, query, k, Some(candidates));
@@ -133,7 +138,7 @@ pub(super) fn search_filtered(
             "persistent dense filtered search slot {slot} received non-dense query"
         )));
     };
-    let index = open(vault_dir, entry, panel_version, slot, *dim, k)?;
+    let index = open(vault_dir, entry, panel_version, slot, *dim, config)?;
     exact_filtered_hits(&index, data, k, candidates)
 }
 
@@ -143,7 +148,7 @@ fn open(
     panel_version: u32,
     slot: SlotId,
     query_dim: u32,
-    k: usize,
+    config: PersistedDenseIndexConfig,
 ) -> CliResult<DiskAnnSearch> {
     entry.require_kind("diskann", slot)?;
     let dim = entry.require_dim(slot)?;
@@ -161,7 +166,7 @@ fn open(
         )));
     }
     let graph = vault_dir.join(entry.require_graph_rel(slot)?);
-    let mut index = DiskAnnSearch::open(slot, graph, ids, None, search_params(k.max(64)))?;
+    let mut index = DiskAnnSearch::open(slot, graph, ids, None, search_params(config))?;
     index.set_base_seq(entry.built_at_seq);
     Ok(index)
 }
@@ -339,20 +344,20 @@ pub(super) fn validate_dense(slot: SlotId, cx_id: CxId, dim: u32, data: &[f32]) 
     Ok(())
 }
 
-fn build_params(dim: usize) -> DiskAnnBuildParams {
+fn build_params(dim: usize, config: PersistedDenseIndexConfig) -> DiskAnnBuildParams {
     DiskAnnBuildParams {
         dim,
-        m_max: 32,
-        ef_construction: 64,
-        alpha: 1.2,
+        m_max: config.m_max,
+        ef_construction: config.ef_construction,
+        alpha: config.alpha,
     }
 }
 
-fn search_params(ef: usize) -> DiskAnnSearchParams {
+fn search_params(config: PersistedDenseIndexConfig) -> DiskAnnSearchParams {
     DiskAnnSearchParams {
-        beamwidth: 32,
-        ef_search: ef,
-        rescore_k: ef,
+        beamwidth: config.beamwidth,
+        ef_search: config.ef_search,
+        rescore_k: config.ef_search,
         rescore_from_raw: false,
     }
 }

@@ -378,6 +378,41 @@ const CALYX_TUNING_KNOB_FACTS: &[CalyxTuningKnobFacts] = &[
         blocked_by_issue: "1883",
         effect_of_tuning: "none: validated at startup and reported here; the temporal rerank bounds come from the registered temporal policy, not from this knob",
     },
+    CalyxTuningKnobFacts {
+        knob: "index_m_max",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.m_max",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets DiskANN graph maximum degree when a new generation is built; the immutable manifest records and query open reads the same configuration",
+    },
+    CalyxTuningKnobFacts {
+        knob: "index_ef_construction",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.ef_construction",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets the DiskANN construction candidate width for a newly published generation",
+    },
+    CalyxTuningKnobFacts {
+        knob: "index_beamwidth",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.beamwidth",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets query-time DiskANN beamwidth from the physically published generation manifest",
+    },
+    CalyxTuningKnobFacts {
+        knob: "index_ef_search",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.ef_search",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets query-time DiskANN search and rescore width from the physically published generation manifest",
+    },
+    CalyxTuningKnobFacts {
+        knob: "index_alpha",
+        enforcement: CalyxTuningKnobEnforcement::LoadBearing,
+        declared_at: "calyx-search persisted generation manifest dense_index_config.alpha",
+        blocked_by_issue: "",
+        effect_of_tuning: "sets DiskANN RobustPrune alpha when a new generation is built",
+    },
 ];
 
 /// Renders every tuning knob as `value + enforcement verdict + the code that
@@ -416,6 +451,11 @@ fn calyx_tuning_knob_value(tuning: &synapse_calyx::SynapseCalyxTuningConfig, kno
         "fusion_k" => tuning.fusion_k.to_string(),
         "temporal_boost_min" => tuning.temporal_boost_min.to_string(),
         "temporal_boost_max" => tuning.temporal_boost_max.to_string(),
+        "index_m_max" => tuning.index_m_max.to_string(),
+        "index_ef_construction" => tuning.index_ef_construction.to_string(),
+        "index_beamwidth" => tuning.index_beamwidth.to_string(),
+        "index_ef_search" => tuning.index_ef_search.to_string(),
+        "index_alpha" => tuning.index_alpha.to_string(),
         other => format!("<unmapped tuning knob {other}>"),
     }
 }

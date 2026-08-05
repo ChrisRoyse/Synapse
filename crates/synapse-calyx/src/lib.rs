@@ -75,7 +75,7 @@ pub use calyx_registry::{
 // `find_similar_in_panel` / `rebuild_search_indexes_for_panel` (#1668) without
 // depending on calyx-registry directly.
 pub use calyx_registry::VaultPanelState as SynapseCalyxPanelState;
-pub use calyx_search::{PersistedSearchGeneration, PersistedSearchSlot};
+pub use calyx_search::{PersistedDenseIndexConfig, PersistedSearchGeneration, PersistedSearchSlot};
 use calyx_sextant::{
     CausalConfidence, FreshnessTag, Hit, ProvenanceSource, TemporalScores, apply_temporal_boost,
 };
@@ -1889,6 +1889,11 @@ const DEFAULT_KERNEL_RECALL_GATE: f32 = 0.95;
 const DEFAULT_FUSION_K: u32 = calyx_core::RRF_K_DEFAULT;
 const DEFAULT_TEMPORAL_BOOST_MIN: f32 = 0.0;
 const DEFAULT_TEMPORAL_BOOST_MAX: f32 = 0.10;
+const DEFAULT_INDEX_M_MAX: usize = 32;
+const DEFAULT_INDEX_EF_CONSTRUCTION: usize = 64;
+const DEFAULT_INDEX_BEAMWIDTH: usize = 32;
+const DEFAULT_INDEX_EF_SEARCH: usize = 64;
+const DEFAULT_INDEX_ALPHA: f32 = 1.2;
 const DEFAULT_VRAM_BUDGET_BYTES: u64 = 12 * 1024 * 1024 * 1024;
 const DEFAULT_RNG_SEED: u64 = 0x5A17_5EED_CA1A_1696;
 
@@ -1942,6 +1947,11 @@ pub struct SynapseCalyxTuningConfig {
     pub fusion_k: u32,
     pub temporal_boost_min: f32,
     pub temporal_boost_max: f32,
+    pub index_m_max: usize,
+    pub index_ef_construction: usize,
+    pub index_beamwidth: usize,
+    pub index_ef_search: usize,
+    pub index_alpha: f32,
     pub vram_budget_bytes: u64,
     pub math_backend: SynapseCalyxMathBackend,
     pub clock_mode: SynapseCalyxClockMode,
@@ -1963,6 +1973,11 @@ impl Default for SynapseCalyxTuningConfig {
             fusion_k: DEFAULT_FUSION_K,
             temporal_boost_min: DEFAULT_TEMPORAL_BOOST_MIN,
             temporal_boost_max: DEFAULT_TEMPORAL_BOOST_MAX,
+            index_m_max: DEFAULT_INDEX_M_MAX,
+            index_ef_construction: DEFAULT_INDEX_EF_CONSTRUCTION,
+            index_beamwidth: DEFAULT_INDEX_BEAMWIDTH,
+            index_ef_search: DEFAULT_INDEX_EF_SEARCH,
+            index_alpha: DEFAULT_INDEX_ALPHA,
             vram_budget_bytes: DEFAULT_VRAM_BUDGET_BYTES,
             math_backend: SynapseCalyxMathBackend::Auto,
             clock_mode: SynapseCalyxClockMode::System,
@@ -1988,6 +2003,9 @@ impl SynapseCalyxTuningConfig {
             0.0,
             DEFAULT_GUARD_FAR_IDENTITY,
         )?;
+        self.dense_index_config()
+            .validate()
+            .map_err(|error| invalid_config(format!("persisted dense index tuning: {error}")))?;
         validate_f32(
             "guard_far_content",
             self.guard_far_content,
@@ -2038,6 +2056,16 @@ impl SynapseCalyxTuningConfig {
             (SynapseCalyxClockMode::System, None) | (SynapseCalyxClockMode::Fixed, Some(_)) => {}
         }
         Ok(self)
+    }
+
+    fn dense_index_config(self) -> PersistedDenseIndexConfig {
+        PersistedDenseIndexConfig {
+            m_max: self.index_m_max,
+            ef_construction: self.index_ef_construction,
+            beamwidth: self.index_beamwidth,
+            ef_search: self.index_ef_search,
+            alpha: self.index_alpha,
+        }
     }
 }
 
@@ -4213,10 +4241,11 @@ impl SynapseCalyxVault {
             before_manifest_sha256 = ?before_manifest_sha256,
             "rebuilding persisted Calyx search indexes"
         );
-        calyx_search::rebuild_for_vault_with_panel_state(
+        calyx_search::rebuild_for_vault_with_panel_state_and_dense_config(
             &self.config.vault_dir,
             &self.vault,
             &state,
+            self.config.tuning.dense_index_config(),
         )
         .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))?;
         let generation =

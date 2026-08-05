@@ -69,7 +69,27 @@ pub fn rebuild_for_vault_with_panel_state<C: Clock>(
     vault: &AsterVault<C>,
     state: &calyx_registry::VaultPanelState,
 ) -> CliResult {
-    rebuild_for_vault_with_panel_state_progress(vault_dir, vault, state, |_| {})
+    rebuild_for_vault_with_panel_state_and_dense_config(
+        vault_dir,
+        vault,
+        state,
+        PersistedDenseIndexConfig::default(),
+    )
+}
+
+pub fn rebuild_for_vault_with_panel_state_and_dense_config<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    state: &calyx_registry::VaultPanelState,
+    dense_index_config: PersistedDenseIndexConfig,
+) -> CliResult {
+    rebuild_for_vault_with_panel_state_dense_config_progress(
+        vault_dir,
+        vault,
+        state,
+        dense_index_config,
+        |_| Ok(()),
+    )
 }
 
 pub fn rebuild_for_vault_with_progress<C: Clock, F>(
@@ -95,10 +115,39 @@ pub fn rebuild_for_vault_with_panel_state_progress<C: Clock, F>(
 where
     F: FnMut(RebuildProgress<'_>) + Send,
 {
-    rebuild_for_vault_with_panel_state_fallible_progress(vault_dir, vault, state, |event| {
-        progress(event);
-        Ok(())
-    })
+    rebuild_for_vault_with_panel_state_dense_config_progress(
+        vault_dir,
+        vault,
+        state,
+        PersistedDenseIndexConfig::default(),
+        |event| {
+            progress(event);
+            Ok(())
+        },
+    )
+}
+
+pub fn rebuild_for_vault_with_panel_state_dense_config_progress<C: Clock, F>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    state: &VaultPanelState,
+    dense_index_config: PersistedDenseIndexConfig,
+    progress: F,
+) -> CliResult
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
+    let active_slots = active_panel_slots(state);
+    let sparse_scoring = active_sparse_scoring(state)?;
+    super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
+        vault_dir,
+        vault,
+        state.panel.version,
+        &active_slots,
+        &sparse_scoring,
+        dense_index_config.validate()?,
+        progress,
+    )
 }
 
 pub fn rebuild_for_vault_with_fallible_progress<C: Clock, F>(
@@ -122,14 +171,11 @@ pub fn rebuild_for_vault_with_panel_state_fallible_progress<C: Clock, F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    let active_slots = active_panel_slots(state);
-    let sparse_scoring = active_sparse_scoring(state)?;
-    super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
+    rebuild_for_vault_with_panel_state_dense_config_progress(
         vault_dir,
         vault,
-        state.panel.version,
-        &active_slots,
-        &sparse_scoring,
+        state,
+        PersistedDenseIndexConfig::default(),
         progress,
     )
 }

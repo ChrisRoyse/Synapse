@@ -43,7 +43,9 @@ pub use marker::{
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub use rebuild::{
     RebuildProgress, load_docs, rebuild_for_vault, rebuild_for_vault_with_fallible_progress,
-    rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_fallible_progress,
+    rebuild_for_vault_with_panel_state, rebuild_for_vault_with_panel_state_and_dense_config,
+    rebuild_for_vault_with_panel_state_dense_config_progress,
+    rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
 };
 
@@ -52,6 +54,51 @@ const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";
 const INDEX_ROOT: &str = "idx/search";
 const MANIFEST_NAME: &str = "manifest.json";
 pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
+
+/// Load-bearing parameters for persisted dense DiskANN generations.
+///
+/// Values are sealed into the immutable generation manifest and read back by
+/// query-time open, so tuning cannot silently change an existing artifact.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersistedDenseIndexConfig {
+    pub m_max: usize,
+    pub ef_construction: usize,
+    pub beamwidth: usize,
+    pub ef_search: usize,
+    pub alpha: f32,
+}
+
+impl Default for PersistedDenseIndexConfig {
+    fn default() -> Self {
+        Self {
+            m_max: 32,
+            ef_construction: 64,
+            beamwidth: 32,
+            ef_search: 64,
+            alpha: 1.2,
+        }
+    }
+}
+
+impl Eq for PersistedDenseIndexConfig {}
+
+impl PersistedDenseIndexConfig {
+    pub fn validate(self) -> CliResult<Self> {
+        if self.m_max == 0
+            || self.ef_construction == 0
+            || self.beamwidth == 0
+            || self.ef_search == 0
+            || !self.alpha.is_finite()
+            || self.alpha < 1.0
+        {
+            return Err(stale(format!(
+                "invalid persisted dense index config m_max={} ef_construction={} beamwidth={} ef_search={} alpha={}; counts must be positive and alpha must be finite and >= 1.0",
+                self.m_max, self.ef_construction, self.beamwidth, self.ef_search, self.alpha
+            )));
+        }
+        Ok(self)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct SearchIndexManifest {
@@ -64,6 +111,8 @@ pub(crate) struct SearchIndexManifest {
     diskann_build_backend_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sextant_cuvs_compiled: Option<bool>,
+    #[serde(default)]
+    dense_index_config: PersistedDenseIndexConfig,
     #[serde(default)]
     filter: Option<FilterIndexEntry>,
     slots: Vec<SearchIndexEntry>,
@@ -182,6 +231,7 @@ impl PersistedSearchIndexes {
                 slot,
                 query,
                 k,
+                self.manifest.dense_index_config.validate()?,
             ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
@@ -227,6 +277,7 @@ impl PersistedSearchIndexes {
                 query,
                 k,
                 candidates,
+                self.manifest.dense_index_config.validate()?,
             ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,

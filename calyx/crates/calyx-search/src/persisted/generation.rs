@@ -1,7 +1,7 @@
 use calyx_core::{CalyxError, PanelSlotId, SlotId, SlotShape};
 use serde::Serialize;
 
-use super::{PersistedSearchIndexes, SearchIndexEntry};
+use super::{PersistedDenseIndexConfig, PersistedSearchIndexes, SearchIndexEntry};
 use crate::error::CliResult;
 
 /// Public, path-free identity for one immutable persisted search generation.
@@ -13,6 +13,7 @@ pub struct PersistedSearchGeneration {
     pub diskann_build_backend: Option<String>,
     pub diskann_build_backend_source: Option<String>,
     pub sextant_cuvs_compiled: Option<bool>,
+    pub dense_index_config: PersistedDenseIndexConfig,
     pub slots: Vec<PersistedSearchSlot>,
 }
 
@@ -76,6 +77,7 @@ impl PersistedSearchIndexes {
             diskann_build_backend: self.manifest.diskann_build_backend.clone(),
             diskann_build_backend_source: self.manifest.diskann_build_backend_source.clone(),
             sextant_cuvs_compiled: self.manifest.sextant_cuvs_compiled,
+            dense_index_config: self.manifest.dense_index_config,
             slots,
         })
     }

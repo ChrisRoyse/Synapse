@@ -44,6 +44,7 @@ pub(super) fn rebuild_for_vault_with_active_slots_progress<C: Clock, F>(
     panel_version: u32,
     active_slots: &BTreeSet<SlotId>,
     sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
+    dense_index_config: PersistedDenseIndexConfig,
     progress: F,
 ) -> CliResult
 where
@@ -55,6 +56,7 @@ where
         Some(panel_version),
         Some(active_slots),
         sparse_scoring,
+        dense_index_config,
         progress,
     )
 }
@@ -65,6 +67,7 @@ fn rebuild_for_vault_with_slot_filter<C: Clock, F>(
     requested_panel_version: Option<u32>,
     active_slots: Option<&BTreeSet<SlotId>>,
     sparse_scoring: &BTreeMap<SlotId, sparse::SparseScoring>,
+    dense_index_config: PersistedDenseIndexConfig,
     mut progress: F,
 ) -> CliResult
 where
@@ -114,6 +117,7 @@ where
             active_slots,
             sparse_scoring,
             build_policy,
+            dense_index_config,
         },
         &mut progress,
     )?;
@@ -134,6 +138,7 @@ struct RebuildOptions<'a> {
     active_slots: Option<&'a BTreeSet<SlotId>>,
     sparse_scoring: &'a BTreeMap<SlotId, sparse::SparseScoring>,
     build_policy: DiskAnnBuildPolicy,
+    dense_index_config: PersistedDenseIndexConfig,
 }
 
 fn rebuild_from_base_with_progress<C: Clock, F>(
@@ -153,6 +158,7 @@ where
         active_slots,
         sparse_scoring,
         build_policy,
+        dense_index_config,
     } = options;
     let root = panel_index_root(vault_dir, panel_version);
     fs::create_dir_all(&root)?;
@@ -234,6 +240,7 @@ where
                     plan,
                     page_rows,
                     build_policy,
+                    dense_index_config,
                     Some(&progress_lock),
                 )
             })
@@ -297,6 +304,7 @@ where
         diskann_build_backend: Some(backend),
         diskann_build_backend_source: Some(backend_source),
         sextant_cuvs_compiled: Some(cuvs_compiled),
+        dense_index_config,
         filter: Some(filter),
         slots: entries,
     };
@@ -380,6 +388,7 @@ fn build_slot_entry<C: Clock, F>(
     plan: &SlotBuildPlan,
     page_rows: usize,
     build_policy: DiskAnnBuildPolicy,
+    dense_index_config: PersistedDenseIndexConfig,
     progress: Option<&SharedRebuildProgress<'_, F>>,
 ) -> CliResult<BuiltSlot>
 where
@@ -445,6 +454,7 @@ where
             rows,
             base_seq,
             build_policy,
+            dense_index_config,
             |event| match progress {
                 Some(progress) => emit_shared_progress(progress, event),
                 None => Ok(()),
