@@ -1225,6 +1225,17 @@ fn measure_search_action(
                     "rebuild the product-owned replay from a non-empty dense lane",
                 )
             })?;
+        // Opening a persisted generation verifies and pins its sidecars. That
+        // one-time integrity/read cost is not query latency and otherwise
+        // penalizes whichever side of an A/B replay is measured first.
+        indexes
+            .search(slot, &vector, expected.len())
+            .map_err(|error| {
+                search_shadow_error(
+                    &format!("warm replay query {} slot {slot}", query.query_id),
+                    error,
+                )
+            })?;
         let mut elapsed = Vec::with_capacity(SEARCH_REPLAY_PASSES);
         let mut observed = Vec::new();
         for _ in 0..SEARCH_REPLAY_PASSES {
