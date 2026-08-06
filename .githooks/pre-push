@@ -108,12 +108,26 @@ echo "pre-push: running the full gate set via scripts/lint.ps1 ($shell_bin) ..."
 echo "pre-push:   1 clippy.toml contract   2 toolchain pin   3 lock-graph agreement"
 echo "pre-push:   4 cargo fmt              5 cargo deny      6 cargo clippy"
 
-if "$shell_bin" -NoProfile -File "$lint_script"; then
+# Capture the status from the command itself, NOT from after the `if`.
+#
+# This used to read `if "$shell_bin" ... ; then ... exit 0; fi` followed by
+# `status=$?`. In POSIX sh an `if` with no `else` branch evaluates to 0 when its
+# condition FAILS, so `$?` after the `fi` was 0 every time the gate failed. The
+# hook then printed the self-contradicting "BLOCKED — scripts/lint.ps1 exited 0"
+# and ran `exit 0`, letting the push through.
+#
+# So the backstop that #351 calls "the automated backstop" has been reporting
+# failures while permitting them. Observed 2026-08-06: a real
+# SYNAPSE_LINT_FMT_ROOT_FAILED printed BLOCKED and the push still landed on
+# origin/main. A gate that announces it is blocking and then does not is worse
+# than no gate, because the operator reads the word BLOCKED and believes it.
+"$shell_bin" -NoProfile -File "$lint_script"
+status=$?
+
+if [ "$status" -eq 0 ]; then
   echo "pre-push: gate green — every gate passed in both workspaces."
   exit 0
 fi
-
-status=$?
 echo ""
 echo "pre-push: BLOCKED — scripts/lint.ps1 exited $status. The failing gate, its error code"
 echo "          and its remediation are printed above; lint.ps1 names all three and does not"

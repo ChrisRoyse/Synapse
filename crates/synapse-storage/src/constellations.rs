@@ -6607,8 +6607,12 @@ fn measure_float(
 /// the registry lens tables is deliberately left untouched.
 fn saturating_rank_input(value: u64, min_micros: i64, max_micros: i64) -> u64 {
     // `.max(0)` first, so the sign is provably gone before the cast.
-    let lower = (min_micros / RANK_BOUND_MICROS_PER_UNIT).max(0).cast_unsigned();
-    let upper = (max_micros / RANK_BOUND_MICROS_PER_UNIT).max(0).cast_unsigned();
+    let lower = (min_micros / RANK_BOUND_MICROS_PER_UNIT)
+        .max(0)
+        .cast_unsigned();
+    let upper = (max_micros / RANK_BOUND_MICROS_PER_UNIT)
+        .max(0)
+        .cast_unsigned();
     // `clamp` panics when lo > hi; the lens itself rejects min >= max, but this
     // helper must not be the thing that panics if that ever changes.
     value.clamp(lower, upper.max(lower))
