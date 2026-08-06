@@ -6194,10 +6194,37 @@ pub fn action_outcome_anchor(
     source_key: &[u8],
     record: &Value,
 ) -> StorageResult<Option<GroundingAnchor>> {
-    let outcome = match json_string(record, &["status"]).as_deref() {
-        Some("ok") => true,
-        Some("error" | "denied") => false,
-        _ => return Ok(None),
+    let row_kind = json_string(record, &["row_kind"]);
+    let outcome = match row_kind.as_deref() {
+        Some("command_audit") => match json_string(record, &["phase"]).as_deref() {
+            Some("intent") => return Ok(None),
+            Some("final") => match json_string(record, &["outcome"]).as_deref() {
+                Some("ok") => true,
+                Some("error") => false,
+                value => {
+                    return Err(StorageError::ReadFailed {
+                        cf_name: cf::CF_ACTION_LOG.to_owned(),
+                        detail: format!(
+                            "terminal command_audit row has unsupported outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error or extend the versioned adjudication contract"
+                        ),
+                    });
+                }
+            },
+            value => {
+                return Err(StorageError::ReadFailed {
+                    cf_name: cf::CF_ACTION_LOG.to_owned(),
+                    detail: format!(
+                        "command_audit row has unsupported phase {value:?}; remediation=repair the authoritative row to phase=intent|final or extend the versioned adjudication contract"
+                    ),
+                });
+            }
+        },
+        None | Some("action_audit") => match json_string(record, &["status"]).as_deref() {
+            Some("ok") => true,
+            Some("error" | "denied") => false,
+            _ => return Ok(None),
+        },
+        Some(_) => return Ok(None),
     };
     let observed_at_ms = json_u64(record, &["ts_ns"])
         .ok_or_else(|| StorageError::ReadFailed {
