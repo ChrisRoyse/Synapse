@@ -222,13 +222,16 @@ impl SynapseService {
                     )
                 })?
                 .map_err(|error| {
+                    let remediation = error.remediation().unwrap_or(
+                        "inspect the physical CF_LEDGER hash chain and restore from a verified backup before trusting audit output",
+                    );
                     delegate_error(
                         AUDIT_TOOL,
                         operation.as_str(),
                         "calyx_ledger",
                         LEDGER_SOT,
                         crate::m1::mcp_error(error.code(), error.to_string()),
-                        "inspect the physical CF_LEDGER hash chain and restore from a verified backup before trusting audit output",
+                        remediation,
                     )
                 })?;
                 let response = verify_chain_response(&verify, entry.as_ref());
