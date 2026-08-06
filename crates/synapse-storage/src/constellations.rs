@@ -3,11 +3,12 @@ use std::env;
 use std::time::Duration;
 
 use calyx_core::{
-    AbsentReason, Asymmetry, CalyxErrorCode, Constellation, CxFlags, CxId, Input, InputRef,
-    LedgerRef, Lens, METADATA_SOURCE_EVENT_TIME_RAW, METADATA_SOURCE_EVENT_TIME_SECS,
-    METADATA_SOURCE_SEQUENCE, METADATA_TEMPORAL_INACTIVE_REASON, METADATA_TEMPORAL_LANE_STATE,
-    Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey, SlotResource, SlotState, SlotVector,
-    TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE, TEMPORAL_MISSING_CREATED_AT, VaultId,
+    AbsentReason, Anchor, AnchorKind, AnchorValue, Asymmetry, CalyxErrorCode, Constellation,
+    CxFlags, CxId, Input, InputRef, LedgerRef, Lens, METADATA_SOURCE_EVENT_TIME_RAW,
+    METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE, METADATA_TEMPORAL_INACTIVE_REASON,
+    METADATA_TEMPORAL_LANE_STATE, Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey,
+    SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE,
+    TEMPORAL_MISSING_CREATED_AT, VaultId,
 };
 use calyx_lenses::AlgorithmicLens;
 use calyx_lenses::measure::{absent, input_hash};
@@ -4620,7 +4621,7 @@ pub fn build_action_constellation(
 
     let scalars = action_scalars(record, raw_bytes)?;
     let metadata = action_metadata(source_key, raw_bytes, record);
-    constellation(
+    let mut constellation = constellation(
         context,
         SYN_ACTION_PANEL_VERSION,
         source_pointer(cf::CF_ACTION_LOG, source_key),
@@ -4628,7 +4629,27 @@ pub fn build_action_constellation(
         slots,
         scalars,
         metadata,
-    )
+    )?;
+    if let Some(anchor) = action_outcome_anchor(source_key, record)? {
+        let value = match anchor.value {
+            GroundingAnchorValue::Bool(value) => AnchorValue::Bool(value),
+            _ => {
+                return Err(StorageError::WriteFailed {
+                    cf_name: cf::CF_ACTION_LOG.to_owned(),
+                    detail: "action outcome adjudication emitted a non-boolean reward; remediation=repair action_outcome_anchor to preserve the declared binary contract".to_owned(),
+                });
+            }
+        };
+        constellation.anchors.push(Anchor {
+            kind: AnchorKind::Reward,
+            value,
+            source: anchor.source,
+            observed_at: anchor.observed_at_ms,
+            confidence: anchor.confidence,
+        });
+        constellation.flags.ungrounded = false;
+    }
+    Ok(constellation)
 }
 
 /// Build the Calyx constellation for a reflex audit row.
@@ -6131,6 +6152,8 @@ fn action_metadata(
         raw_bytes,
     );
     metadata.insert("action_kind".to_owned(), action_identity(record));
+    metadata.insert("oracle.domain".to_owned(), "synapse.action".to_owned());
+    metadata.insert("oracle.action".to_owned(), action_identity(record));
     insert_optional_metadata(
         &mut metadata,
         "action_tool",
@@ -6163,6 +6186,32 @@ fn action_metadata(
         );
     }
     metadata
+}
+
+/// Derives the one declared terminal action outcome. Nonterminal audit rows
+/// remain measurable but ungrounded; no other status is assigned a polarity.
+pub fn action_outcome_anchor(
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<Option<GroundingAnchor>> {
+    let outcome = match json_string(record, &["status"]).as_deref() {
+        Some("ok") => true,
+        Some("error" | "denied") => false,
+        _ => return Ok(None),
+    };
+    let observed_at_ms = json_u64(record, &["ts_ns"])
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf::CF_ACTION_LOG.to_owned(),
+            detail: "terminal action outcome has no finite u64 ts_ns; remediation=repair the authoritative action audit row before grounding it".to_owned(),
+        })?
+        / 1_000_000;
+    Ok(Some(GroundingAnchor {
+        kind_label: "reward".to_owned(),
+        value: GroundingAnchorValue::Bool(outcome),
+        source: source_pointer(cf::CF_ACTION_LOG, source_key),
+        observed_at_ms,
+        confidence: 1.0,
+    }))
 }
 
 fn reflex_metadata(

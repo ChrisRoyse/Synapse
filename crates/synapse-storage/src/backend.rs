@@ -1455,7 +1455,7 @@ impl CalyxVaultRuntime {
                     })?;
 
                 let action_cx_id = vault.cx_id_for_input(raw_bytes, SYN_ACTION_PANEL_VERSION);
-                let mut action_constellation = constellations::build_action_constellation(
+                let action_constellation = constellations::build_action_constellation(
                     NativeConstellationContext {
                         vault_id: vault.vault_id_value(),
                         cx_id: action_cx_id,
@@ -1466,32 +1466,16 @@ impl CalyxVaultRuntime {
                     raw_bytes,
                     record,
                 )?;
-                let outcome = record.get("status").and_then(Value::as_str) == Some("ok");
-                let action_anchor = Anchor {
-                    kind: AnchorKind::Reward,
-                    value: AnchorValue::Bool(outcome),
-                    source: format!(
-                        "synapse://{}/{}",
-                        cf::CF_ACTION_LOG,
-                        constellations::hex_encode(source_key)
-                    ),
-                    observed_at: created_at_ms,
-                    confidence: 1.0,
-                };
-                action_anchor.validate_schema().map_err(|error| {
-                    calyx_write_failed_detail(
+                if action_constellation.anchors.len() != 1 {
+                    return Err(calyx_write_failed_detail(
                         "calyx_action_oracle_publication",
-                        format!("terminal action outcome anchor is invalid: {error}"),
-                    )
-                })?;
-                action_constellation.anchors.push(action_anchor);
-                action_constellation
-                    .metadata
-                    .insert("oracle.domain".to_owned(), "synapse.action".to_owned());
-                action_constellation
-                    .metadata
-                    .insert("oracle.action".to_owned(), action.to_owned());
-                action_constellation.flags.ungrounded = false;
+                        format!(
+                            "terminal action source must derive exactly one outcome anchor; derived {} for source_key_hex={}",
+                            action_constellation.anchors.len(),
+                            constellations::hex_encode(source_key)
+                        ),
+                    ));
+                }
                 let event_time_secs =
                     i64::try_from(event_time_ns / 1_000_000_000).map_err(|error| {
                         calyx_write_failed_detail(
@@ -2009,7 +1993,11 @@ impl CalyxBackend {
             },
         )?;
         if let Some(existing) = existing {
-            if existing.anchor != calyx_anchor {
+            let same_outcome = existing.anchor.kind == calyx_anchor.kind
+                && existing.anchor.value == calyx_anchor.value
+                && existing.anchor.source == calyx_anchor.source
+                && (existing.anchor.confidence - calyx_anchor.confidence).abs() <= f32::EPSILON;
+            if !same_outcome {
                 return Err(calyx_write_failed_detail(
                     "calyx_agent_transcript_outcome_anchor",
                     format!(
@@ -2031,6 +2019,73 @@ impl CalyxBackend {
         <Self as StorageBackend>::put_grounding_anchor_for_source(
             self,
             cf::CF_AGENT_TRANSCRIPTS,
+            source_key,
+            source_value,
+            anchor,
+            &payload,
+        )?;
+        Ok(Some(()))
+    }
+
+    /// Grounds one already-measured terminal action from its authoritative
+    /// audit row. Nonterminal audit phases intentionally return `Ok(None)`.
+    fn put_action_outcome_anchor_row(
+        &self,
+        source_key: &[u8],
+        source_value: &[u8],
+        record: &Value,
+    ) -> StorageResult<Option<()>> {
+        let Some(anchor) = constellations::action_outcome_anchor(source_key, record)? else {
+            return Ok(None);
+        };
+        let panel = constellations::anchor_panel_for_source_row(cf::CF_ACTION_LOG, source_key)?;
+        let input_bytes = constellations::source_constellation_input_bytes(
+            panel.input_mode,
+            cf::CF_ACTION_LOG,
+            source_key,
+            source_value,
+        );
+        let calyx_anchor = grounding_anchor_to_calyx(anchor.clone())?;
+        let existing = self.with_vault(
+            "calyx_action_outcome_anchor",
+            "read exact current action outcome before anchoring",
+            false,
+            |vault| {
+                let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
+                vault
+                    .read_anchor_exact(cx_id, &calyx_anchor.kind)
+                    .map_err(|error| {
+                        calyx_read_failed(
+                            "calyx_action_outcome_anchor",
+                            "read exact current action outcome before anchoring",
+                            &error,
+                        )
+                    })
+            },
+        )?;
+        if let Some(existing) = existing {
+            if existing.anchor != calyx_anchor {
+                return Err(calyx_write_failed_detail(
+                    "calyx_action_outcome_anchor",
+                    format!(
+                        "active action anchor kind already exists with conflicting evidence: source_key_hex={} panel_version={} kind={}; immutable grounded outcomes cannot be overwritten",
+                        constellations::hex_encode(source_key),
+                        panel.panel_version,
+                        synapse_calyx::anchor_kind_label(&calyx_anchor.kind),
+                    ),
+                ));
+            }
+            return Ok(Some(()));
+        }
+        let payload = constellations::grounding_anchor_ledger_payload(
+            cf::CF_ACTION_LOG,
+            source_key,
+            source_value,
+            &anchor,
+        );
+        <Self as StorageBackend>::put_grounding_anchor_for_source(
+            self,
+            cf::CF_ACTION_LOG,
             source_key,
             source_value,
             anchor,
@@ -5587,6 +5642,21 @@ impl StorageBackend for CalyxBackend {
                     outcome_unadjudicable_rows = outcome_unadjudicable_rows.saturating_add(1);
                 }
                 match self.put_agent_transcript_outcome_anchor_row(&key, &raw, &record)? {
+                    Some(()) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
+                    None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
+                }
+            }
+            if source_cf == cf::CF_ACTION_LOG {
+                let record: Value = serde_json::from_slice(&raw).map_err(|error| {
+                    StorageError::ReadFailed {
+                        cf_name: source_cf.to_owned(),
+                        detail: format!(
+                            "decode authoritative action audit row for outcome anchoring key_hex={}: {error}",
+                            constellations::hex_encode(&key)
+                        ),
+                    }
+                })?;
+                match self.put_action_outcome_anchor_row(&key, &raw, &record)? {
                     Some(()) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
                     None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
                 }

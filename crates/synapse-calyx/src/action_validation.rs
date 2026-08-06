@@ -250,6 +250,9 @@ impl SynapseCalyxVault {
                 .filter(|anchor| anchor.kind == AnchorKind::Reward && anchor.confidence > 0.0)
                 .filter_map(|anchor| match anchor.value { AnchorValue::Bool(value) => Some(value), _ => None })
                 .collect::<BTreeSet<_>>();
+            if outcomes.is_empty() {
+                return Ok(SynapseCalyxWalkStep::Continue);
+            }
             if outcomes.len() != 1 {
                 return Err(validation_error(
                     "SYNAPSE_CALYX_ACTION_VALIDATION_OUTCOME_INVALID",
