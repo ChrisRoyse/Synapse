@@ -78,7 +78,11 @@ $pythonPackages = @(
     'onnxruntime==1.19.2',
     'onnxruntime-extensions==0.12.0',
     'numpy==1.26.4',
-    'librosa==0.10.2.post1'
+    'librosa==0.10.2.post1',
+    # The ORT Whisper parity check imports this and otherwise invokes an
+    # unqualified `pip install datasets`, which can mutate the build host's
+    # global interpreter instead of the isolated environment.
+    'datasets==3.2.0'
 )
 
 $resolvedSource = [System.IO.Path]::GetFullPath($SourceDir)
@@ -140,7 +144,10 @@ import sys
 
 import numpy as np
 import onnx
-from onnxruntime_extensions import PyOrtFunction, util
+import onnxruntime as ort
+from onnx import TensorProto
+from onnxruntime.quantization import QuantType, quantize_dynamic
+from onnxruntime_extensions import PyOrtFunction, get_library_path, util
 from onnxruntime_extensions.cvt import gen_processing_models
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
@@ -164,16 +171,19 @@ def main() -> int:
     os.makedirs(core_dir, exist_ok=True)
     convert_argv = [
         "--model_name_or_path", model_name,
+        "--cache_dir", os.path.join(work_dir, "cache"),
         "--output", core_dir,
-        "--precision", "int8",
-        "--quantize_embedding_layer",
+        "--precision", "fp32",
         "--optimize_onnx",
         "--use_external_data_format",
-        "--no_beam_search_op",
+        "--overwrite",
+        "--use_forced_decoder_ids",
     ]
     print(f"[export] convert_to_onnx {' '.join(convert_argv)}", flush=True)
-    core_model_path = convert_main(convert_argv)
-    if not core_model_path or not os.path.exists(core_model_path):
+    convert_main(convert_argv)
+    model_slug = model_name.rsplit("/", 1)[-1]
+    core_model_path = os.path.join(core_dir, f"{model_slug}_beamsearch.onnx")
+    if not os.path.exists(core_model_path):
         raise RuntimeError(f"whisper converter produced no model at {core_model_path!r}")
 
     print("[export] generating pre/post processing graphs", flush=True)
@@ -186,11 +196,25 @@ def main() -> int:
     core = onnx.load(core_model_path)
     fused = util.quick_merge(pre_model, core, post_model)
 
+    fp32_path = os.path.join(work_dir, "whisper-e2e-fp32.onnx")
     onnx.save(
         fused,
-        output_path,
+        fp32_path,
         save_as_external_data=False,
         all_tensors_to_one_file=True,
+    )
+    print("[export] quantizing assembled E2E graph", flush=True)
+    quantize_dynamic(
+        fp32_path,
+        output_path,
+        weight_type=QuantType.QInt8,
+        op_types_to_quantize=["MatMul", "Gemm", "Gather"],
+        use_external_data_format=False,
+        extra_options={
+            "EnableSubgraph": True,
+            "MatMulConstBOnly": True,
+            "DefaultTensorType": TensorProto.FLOAT,
+        },
     )
 
     # Prove the produced graph honours the contract the Rust runtime relies on
@@ -201,6 +225,7 @@ def main() -> int:
     required_inputs = {
         "audio_stream", "max_length", "min_length", "num_beams",
         "num_return_sequences", "length_penalty", "repetition_penalty",
+        "decoder_input_ids",
     }
     missing = required_inputs - input_names
     if missing:
@@ -212,6 +237,17 @@ def main() -> int:
         raise RuntimeError(
             f"produced graph has no `str` output; it has {sorted(output_names)}"
         )
+
+    # Metadata alone cannot prove that contrib/custom-domain nodes survived
+    # merging and quantization. Load the graph through the same ORT Extensions
+    # registration contract used by the runtime before any bytes are pinned.
+    session_options = ort.SessionOptions()
+    session_options.register_custom_ops_library(get_library_path())
+    ort.InferenceSession(
+        output_path,
+        sess_options=session_options,
+        providers=["CPUExecutionProvider"],
+    )
 
     print(f"[export] wrote {output_path} ({os.path.getsize(output_path)} bytes)", flush=True)
     print(f"[export] inputs: {sorted(input_names)}", flush=True)
