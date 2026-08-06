@@ -7605,15 +7605,35 @@ function Get-SynapseEmbeddedModelPins {
         -RustLengthConstantName 'ORT_EXTENSIONS_WHISPER_LENGTH' `
         -RustSourceRelativePath 'crates\synapse-models\src\registry.rs'
     $extensionsPath = Join-Path $env:LOCALAPPDATA 'synapse\models\ort-extensions\onnxruntime_extensions.dll'
+    # ABSENT and WRONG are not the same fault, and only one of them may stop an
+    # install.
+    #
+    # These custom operators are a prerequisite of exactly one OPTIONAL slot -
+    # the end-to-end Whisper graph, `Required = $false`,
+    # `Capability = audio_speech_to_text`. `Install-SynapsePinnedDetectionModels`
+    # states the rule directly: "a disabled optional capability must never fail
+    # the whole install (#1863)". Failing closed here inverted that - it made an
+    # optional STT capability a hard gate on the entire deploy, so a host that
+    # had never run the heavy Olive/PyTorch Whisper recipe could not install
+    # Synapse at all. Observed 2026-08-06: setup died at
+    # SYNAPSE_ORT_EXTENSIONS_LIBRARY_MISSING before reaching the build phase,
+    # on a machine where every required model was present.
+    #
+    # So: absent -> the Whisper slot is unavailable and says so, and the install
+    # continues with a recorded capability gap. Present-but-wrong-bytes stays
+    # fatal, because that is a supply-chain integrity fault, not a gap.
+    $whisperPrerequisiteMissing = $null
     if (-not (Test-Path -LiteralPath $extensionsPath -PathType Leaf)) {
-        Die "SYNAPSE_ORT_EXTENSIONS_LIBRARY_MISSING path=$extensionsPath pin=$($extensionsPin.PinPath) remediation=run scripts\build-whisper-e2e-onnx.ps1; the end-to-end Whisper graph cannot load without its pinned custom operators"
+        $whisperPrerequisiteMissing = "pinned ONNX Runtime Extensions library absent at $extensionsPath (pin=$($extensionsPin.PinPath)); the end-to-end Whisper graph cannot load its custom operators without it. Produce it with scripts\build-whisper-e2e-onnx.ps1"
+        Warn "SYNAPSE_ORT_EXTENSIONS_LIBRARY_ABSENT path=$extensionsPath pin=$($extensionsPin.PinPath) effect=the optional audio_speech_to_text capability will be packaged as unavailable and the install continues remediation=run scripts\build-whisper-e2e-onnx.ps1 to enable end-to-end Whisper"
+    } else {
+        $extensionsActualLength = [int64](Get-Item -LiteralPath $extensionsPath).Length
+        $extensionsActualSha = Get-SynapseFileSha256 -Path $extensionsPath
+        if ($extensionsActualLength -ne $extensionsPin.Length -or $extensionsActualSha -ne $extensionsPin.Sha256) {
+            Die "SYNAPSE_ORT_EXTENSIONS_LIBRARY_IDENTITY_MISMATCH path=$extensionsPath expected_sha256=$($extensionsPin.Sha256) actual_sha256=$extensionsActualSha expected_length=$($extensionsPin.Length) actual_length=$extensionsActualLength remediation=remove the mismatched file and regenerate it with scripts\build-whisper-e2e-onnx.ps1"
+        }
+        Info "Pinned ONNX Runtime Extensions library verified path=$extensionsPath sha256=$extensionsActualSha length=$extensionsActualLength"
     }
-    $extensionsActualLength = [int64](Get-Item -LiteralPath $extensionsPath).Length
-    $extensionsActualSha = Get-SynapseFileSha256 -Path $extensionsPath
-    if ($extensionsActualLength -ne $extensionsPin.Length -or $extensionsActualSha -ne $extensionsPin.Sha256) {
-        Die "SYNAPSE_ORT_EXTENSIONS_LIBRARY_IDENTITY_MISMATCH path=$extensionsPath expected_sha256=$($extensionsPin.Sha256) actual_sha256=$extensionsActualSha expected_length=$($extensionsPin.Length) actual_length=$extensionsActualLength remediation=remove the mismatched file and regenerate it with scripts\build-whisper-e2e-onnx.ps1"
-    }
-    Info "Pinned ONNX Runtime Extensions library verified path=$extensionsPath sha256=$extensionsActualSha length=$extensionsActualLength"
 
     # Candidate sources for the optional artifact, in precedence order. The
     # operator override comes first so a freshly produced artifact can be
@@ -7656,6 +7676,11 @@ function Get-SynapseEmbeddedModelPins {
             Recipe = $whisperPin.Recipe
             OverrideEnv = $whisperPin.OverrideEnv
             PinPath = $whisperPin.PinPath
+            # Non-null when a prerequisite of this optional slot is absent, so
+            # the acquisition pass records the REAL cause of the gap instead of
+            # reporting "no verified source artifact found" and sending the
+            # operator looking for a missing .onnx that was never the problem.
+            PrerequisiteMissing = $whisperPrerequisiteMissing
         }
     )
     return @($models)
@@ -7679,6 +7704,22 @@ function Install-SynapsePinnedDetectionModels {
     $models = @(Get-SynapseEmbeddedModelPins -SourceDir $SourceDir)
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
     foreach ($model in $models) {
+        # An optional slot whose PREREQUISITE is missing is unavailable no
+        # matter what bytes are on disk, so acquiring the artifact would prove
+        # nothing. Record the real cause and move on. A required slot in this
+        # state is still fatal: nothing optional is being protected there.
+        $prerequisiteMissing = [string]$model.PrerequisiteMissing
+        if (-not [string]::IsNullOrWhiteSpace($prerequisiteMissing)) {
+            if ($model.Required) {
+                Die "SYNAPSE_EMBEDDED_MODEL_PREREQUISITE_MISSING model=$($model.Name) detail=$prerequisiteMissing remediation=a REQUIRED model slot cannot be packaged while its prerequisite is absent"
+            }
+            $model | Add-Member -NotePropertyName Path -NotePropertyValue $null -Force
+            $model | Add-Member -NotePropertyName Present -NotePropertyValue $false -Force
+            $model | Add-Member -NotePropertyName AbsenceReason -NotePropertyValue $prerequisiteMissing -Force
+            Warn ("SYNAPSE_OPTIONAL_MODEL_ABSENT model={0} capability={1} reason=prerequisite_missing detail={2} recipe={3} effect=the install continues and this capability reports itself unavailable" -f `
+                $model.Name, $model.Capability, $prerequisiteMissing, $model.Recipe)
+            continue
+        }
         $path = Join-Path $Root $model.FileName
         $valid = (Test-Path -LiteralPath $path -PathType Leaf) -and
             ((Get-Item -LiteralPath $path).Length -eq $model.Length) -and
