@@ -1993,11 +1993,7 @@ impl CalyxBackend {
             },
         )?;
         if let Some(existing) = existing {
-            let same_outcome = existing.anchor.kind == calyx_anchor.kind
-                && existing.anchor.value == calyx_anchor.value
-                && existing.anchor.source == calyx_anchor.source
-                && (existing.anchor.confidence - calyx_anchor.confidence).abs() <= f32::EPSILON;
-            if !same_outcome {
+            if existing.anchor != calyx_anchor {
                 return Err(calyx_write_failed_detail(
                     "calyx_agent_transcript_outcome_anchor",
                     format!(
@@ -2019,73 +2015,6 @@ impl CalyxBackend {
         <Self as StorageBackend>::put_grounding_anchor_for_source(
             self,
             cf::CF_AGENT_TRANSCRIPTS,
-            source_key,
-            source_value,
-            anchor,
-            &payload,
-        )?;
-        Ok(Some(()))
-    }
-
-    /// Grounds one already-measured terminal action from its authoritative
-    /// audit row. Nonterminal audit phases intentionally return `Ok(None)`.
-    fn put_action_outcome_anchor_row(
-        &self,
-        source_key: &[u8],
-        source_value: &[u8],
-        record: &Value,
-    ) -> StorageResult<Option<()>> {
-        let Some(anchor) = constellations::action_outcome_anchor(source_key, record)? else {
-            return Ok(None);
-        };
-        let panel = constellations::anchor_panel_for_source_row(cf::CF_ACTION_LOG, source_key)?;
-        let input_bytes = constellations::source_constellation_input_bytes(
-            panel.input_mode,
-            cf::CF_ACTION_LOG,
-            source_key,
-            source_value,
-        );
-        let calyx_anchor = grounding_anchor_to_calyx(anchor.clone())?;
-        let existing = self.with_vault(
-            "calyx_action_outcome_anchor",
-            "read exact current action outcome before anchoring",
-            false,
-            |vault| {
-                let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
-                vault
-                    .read_anchor_exact(cx_id, &calyx_anchor.kind)
-                    .map_err(|error| {
-                        calyx_read_failed(
-                            "calyx_action_outcome_anchor",
-                            "read exact current action outcome before anchoring",
-                            &error,
-                        )
-                    })
-            },
-        )?;
-        if let Some(existing) = existing {
-            if existing.anchor != calyx_anchor {
-                return Err(calyx_write_failed_detail(
-                    "calyx_action_outcome_anchor",
-                    format!(
-                        "active action anchor kind already exists with conflicting evidence: source_key_hex={} panel_version={} kind={}; immutable grounded outcomes cannot be overwritten",
-                        constellations::hex_encode(source_key),
-                        panel.panel_version,
-                        synapse_calyx::anchor_kind_label(&calyx_anchor.kind),
-                    ),
-                ));
-            }
-            return Ok(Some(()));
-        }
-        let payload = constellations::grounding_anchor_ledger_payload(
-            cf::CF_ACTION_LOG,
-            source_key,
-            source_value,
-            &anchor,
-        );
-        <Self as StorageBackend>::put_grounding_anchor_for_source(
-            self,
-            cf::CF_ACTION_LOG,
             source_key,
             source_value,
             anchor,
@@ -5656,12 +5585,18 @@ impl StorageBackend for CalyxBackend {
                         ),
                     }
                 })?;
-                match self.put_action_outcome_anchor_row(&key, &raw, &record)? {
-                    Some(()) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
+                match constellations::action_outcome_anchor(&key, &record)? {
+                    Some(_) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
                     None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
                 }
             }
-            carry_targets.push((key, disposition.2));
+            // #2020: action outcomes are exhaustively derivable from the
+            // authoritative dual-schema audit row. Carrying the superseded
+            // generation would also carry the contaminated `label:reward`
+            // alias, defeating the generation repair.
+            if source_cf != cf::CF_ACTION_LOG {
+                carry_targets.push((key, disposition.2));
+            }
         }
 
         // Carry only after every active generation row and fresh outcome in the

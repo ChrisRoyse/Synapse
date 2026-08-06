@@ -120,7 +120,11 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // would be reinterpreted under the new meaning. The `_1776` generation is the
 // first that writes into the panel's own block.
 pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_006_001;
+/// #2020 separates the canonical native Reward axis from the legacy
+/// `label:reward` bridge write. A panel generation is the immutable meaning of
+/// its rows, so repairing an anchor-kind contract requires a new generation.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_020_001;
+pub const SYN_ACTION_PANEL_VERSION_PRE_2020: u32 = 2_006_001;
 pub const SYN_ACTION_PANEL_VERSION_PRE_2006: u32 = 1_965_003;
 pub const SYN_ACTION_PANEL_VERSION_PRE_1965: u32 = 1_776_001;
 pub const SYN_REFLEX_PANEL_NAME: &str = "syn-reflex-v1";
@@ -2475,7 +2479,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_name: SYN_TIMELINE_PANEL_NAME,
             panel_version: SYN_TIMELINE_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_TIMELINE),
-            outcome_bearing: false,
+            outcome_bearing: true,
             source_ttl_managed: false,
             superseded_versions: &[
                 SYN_TIMELINE_PANEL_VERSION_PRE_1963,
@@ -2493,6 +2497,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 1_666_001,
                 SYN_ACTION_PANEL_VERSION_PRE_1965,
                 SYN_ACTION_PANEL_VERSION_PRE_2006,
+                SYN_ACTION_PANEL_VERSION_PRE_2020,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },

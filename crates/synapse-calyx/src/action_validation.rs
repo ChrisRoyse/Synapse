@@ -15,7 +15,7 @@ use crate::{SynapseCalyxError, SynapseCalyxVault, SynapseCalyxWalkStep};
 
 pub(crate) const ACTION_DOMAIN: &str = "synapse.action";
 pub(crate) const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v1/synapse.action";
-const ACTION_PANEL_VERSION: u32 = 2_006_001;
+const ACTION_PANEL_VERSION: u32 = 2_020_001;
 const MIN_ACTION_RECORDS: usize = 50;
 const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;

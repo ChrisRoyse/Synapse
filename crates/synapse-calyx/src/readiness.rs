@@ -147,7 +147,7 @@ impl SynapseCalyxVault {
             }
             Err(error) => return validation_failed(error.remediation),
         };
-        if evidence.domain != ACTION_DOMAIN || evidence.panel_version != 2_006_001 {
+        if evidence.domain != ACTION_DOMAIN || evidence.panel_version != 2_020_001 {
             return validation_failed(
                 "discard the mismatched action validation row and rerun oracle_validate for syn-action-v1",
             );
