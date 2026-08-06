@@ -1616,7 +1616,7 @@ pub fn inspect_routine(
     })
 }
 
-fn predict_routine_next_occurrence(
+pub(crate) fn predict_routine_next_occurrence(
     db: &Db,
     record: &RoutineRecord,
 ) -> Result<RoutineNextOccurrence, ErrorData> {

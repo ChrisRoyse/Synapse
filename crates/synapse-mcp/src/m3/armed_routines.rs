@@ -14,6 +14,7 @@ use rmcp::{ErrorData, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use synapse_calyx::SynapseCalyxReadinessSnapshot;
 use synapse_core::error_codes;
 use synapse_core::intent::IntentCandidate;
 use synapse_core::types::{RoutineDowClass, RoutineLifecycle, RoutineRecord};
@@ -25,7 +26,10 @@ use super::episodes::{hex_encode, key_after, local_day_start, next_local_day_sta
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::profile_authoring::load_routine_automation_record;
-use super::routines::{load_routine_record, load_state_row, validate_routine_id_param};
+use super::routines::{
+    RoutineNextOccurrenceStatus, load_routine_record, load_state_row,
+    predict_routine_next_occurrence, validate_routine_id_param,
+};
 
 const ARMED_ROUTINE_PREFIX: &str = "armed_routine/v1/";
 const ARMED_ROUTINE_RUN_PREFIX: &str = "armed_routine_run/v1/";
@@ -39,6 +43,8 @@ const MAX_FAILURE_THRESHOLD: u32 = 20;
 const MIN_SCHEDULE_WINDOW_MINUTES: u32 = 5;
 const MAX_SCAN_ROWS: usize = 200_000;
 const SCAN_CHUNK_ROWS: usize = 4_096;
+const MIN_ARM_PERIODIC_CONFIDENCE: f32 = 0.6;
+const MIN_ARM_GROUNDED_CONFIDENCE: f32 = 0.05;
 
 pub const ARMED_ROUTINE_SOURCE_OF_TRUTH: &str = "CF_KV armed_routine/v1, armed_routine_due/v1/schedule, armed_routine_due_by_id/v1/schedule, and armed_routine_run/v1 rows plus CF_ROUTINES/CF_ROUTINE_STATE joins and plan_execution/v1 rows";
 
@@ -334,7 +340,7 @@ pub fn arm_routine(
             ),
         ));
     }
-    let Some(_routine) = load_routine_record(db.as_ref(), routine_id)? else {
+    let Some(routine) = load_routine_record(db.as_ref(), routine_id)? else {
         return Err(invalid(format!(
             "ROUTINE_NOT_MINED: routine_id {routine_id} is not in CF_ROUTINES; run routine_mine before arming"
         )));
@@ -350,6 +356,7 @@ pub fn arm_routine(
             automation.state, automation.plan_ref
         )));
     }
+    validate_autonomy_eligibility(db, &routine, config)?;
 
     let now = now_ts_ns();
     let existing = load_armed_routine_record(db, routine_id)?;
@@ -395,6 +402,113 @@ pub fn arm_routine(
     record.last_run_status = None;
     write_armed_routine_record(db, &record)?;
     read_armed_required(db, routine_id)
+}
+
+fn validate_autonomy_eligibility(
+    db: &Arc<Db>,
+    routine: &RoutineRecord,
+    config: ArmRoutineConfig,
+) -> Result<(), ErrorData> {
+    let state = load_state_row(db, &routine.routine_id)?.ok_or_else(|| {
+        autonomy_not_ready(
+            &routine.routine_id,
+            "identity_lock_absent",
+            "confirm the currently mined routine identity before arming",
+        )
+    })?;
+    if state.lifecycle != RoutineLifecycle::Confirmed {
+        return Err(autonomy_not_ready(
+            &routine.routine_id,
+            "lifecycle_not_confirmed",
+            "confirm the currently mined routine before arming",
+        ));
+    }
+    let identity = state.identity_lock.as_ref().ok_or_else(|| {
+        autonomy_not_ready(
+            &routine.routine_id,
+            "identity_lock_absent",
+            "confirm the currently mined routine identity before arming",
+        )
+    })?;
+    if identity.canonical_sha256 != identity.last_observed_sha256 {
+        return Err(autonomy_not_ready(
+            &routine.routine_id,
+            "identity_lock_mismatch",
+            "inspect the changed routine evidence and explicitly confirm the intended identity",
+        ));
+    }
+
+    let readiness_value = db
+        .oracle_readiness()
+        .map_err(|error| mcp_error(error.code(), format!(
+            "ROUTINE_AUTONOMY_READINESS_READ_FAILED: routine_id={} could not read the persisted action-domain readiness snapshot: {error}; remediation: repair the Calyx readiness row and remeasure readiness",
+            routine.routine_id
+        )))?
+        .ok_or_else(|| autonomy_not_ready(
+            &routine.routine_id,
+            "readiness_snapshot_absent",
+            "run storage intelligence oracle_readiness and resolve every failed tier before arming",
+        ))?;
+    let readiness: SynapseCalyxReadinessSnapshot = serde_json::from_value(readiness_value)
+        .map_err(|error| mcp_error(error_codes::STORAGE_CORRUPTED, format!(
+            "ROUTINE_AUTONOMY_READINESS_DECODE_FAILED: routine_id={} readiness snapshot schema is invalid: {error}; remediation: quarantine the corrupt Anneal row and remeasure readiness",
+            routine.routine_id
+        )))?;
+    if !readiness.report.overall {
+        let predicate = readiness.report.failing_tier.map_or_else(
+            || "readiness_unknown".to_owned(),
+            |tier| format!("readiness_{tier}"),
+        );
+        let remediation = readiness
+            .report
+            .cheapest_fix
+            .as_deref()
+            .unwrap_or("remeasure readiness and resolve every failed tier before arming");
+        return Err(autonomy_not_ready(
+            &routine.routine_id,
+            &predicate,
+            remediation,
+        ));
+    }
+
+    if config.schedule_enabled {
+        let prediction = predict_routine_next_occurrence(db, routine)?;
+        if prediction.status != RoutineNextOccurrenceStatus::Predicted {
+            return Err(autonomy_not_ready(
+                &routine.routine_id,
+                "schedule_prediction_insufficient",
+                prediction.remediation.as_deref().unwrap_or(
+                    "collect at least three grounded routine occurrences and rerun routine_mine",
+                ),
+            ));
+        }
+        let periodic = prediction.periodic_confidence.unwrap_or(0.0);
+        let grounded = prediction.confidence.unwrap_or(0.0);
+        if periodic < MIN_ARM_PERIODIC_CONFIDENCE {
+            return Err(autonomy_not_ready(
+                &routine.routine_id,
+                "periodic_confidence_below_floor",
+                "collect more regular grounded occurrences before enabling schedule autonomy",
+            ));
+        }
+        if grounded < MIN_ARM_GROUNDED_CONFIDENCE {
+            return Err(autonomy_not_ready(
+                &routine.routine_id,
+                "grounded_confidence_below_floor",
+                "collect more supported regular occurrences before enabling schedule autonomy",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn autonomy_not_ready(routine_id: &str, predicate: &str, remediation: &str) -> ErrorData {
+    mcp_error(
+        error_codes::ROUTINE_AUTONOMY_NOT_READY,
+        format!(
+            "routine_id={routine_id} cannot be armed: failing_predicate={predicate}; remediation: {remediation}"
+        ),
+    )
 }
 
 pub fn disarm_routine(

@@ -159,6 +159,8 @@ pub const SUBSCRIPTION_CAP_REACHED: &str = "SUBSCRIPTION_CAP_REACHED";
 pub const TOOL_NOT_FOUND: &str = "TOOL_NOT_FOUND";
 pub const TOOL_PROFILE_POLICY_DENIED: &str = "TOOL_PROFILE_POLICY_DENIED";
 pub const TOOL_PARAMS_INVALID: &str = "TOOL_PARAMS_INVALID";
+/// Autonomous routine arming was refused because grounded eligibility failed.
+pub const ROUTINE_AUTONOMY_NOT_READY: &str = "ROUTINE_AUTONOMY_NOT_READY";
 pub const TOOL_INTERNAL_ERROR: &str = "TOOL_INTERNAL_ERROR";
 pub const HTTP_BIND_NON_LOOPBACK_REFUSED: &str = "HTTP_BIND_NON_LOOPBACK_REFUSED";
 pub const HTTP_TOKEN_INVALID: &str = "HTTP_TOKEN_INVALID";
