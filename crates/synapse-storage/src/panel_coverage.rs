@@ -207,7 +207,8 @@ pub struct PanelCoverageRow {
     /// were carried on to the active generation first.
     pub superseded_grounded_records: usize,
     /// Grounded records a superseded generation holds that the active one does
-    /// not — anchors **stranded by a panel-version bump** (#1980).
+    /// not and whose source row still exists — replayable anchors **stranded by
+    /// a panel-version bump** (#1980, #2021).
     ///
     /// Exact source-row identities grounded on a superseded generation but not
     /// on the active generation. A record id is
@@ -222,7 +223,9 @@ pub struct PanelCoverageRow {
     /// report. `syn-episode-v1` sat at 171 stranded and read as an ordinary
     /// grounding gap.
     ///
-    /// Zero once the backfill's carry-forward has run over the panel.
+    /// Zero once the backfill's carry-forward has run over every surviving
+    /// source row. Anchors whose TTL-managed source has expired remain sacred
+    /// superseded history, but are not actionable backfill debt.
     pub anchors_stranded_on_superseded: usize,
     /// Grounded superseded records with no source identity. They cannot be
     /// compared across generations and are reported as unknown, never silently
@@ -707,15 +710,35 @@ pub fn build_panel_coverage_report(
                     .extend(keys.iter().cloned());
             }
         }
-        let anchors_stranded_on_superseded = superseded_grounded_keys
-            .iter()
-            .map(|(source_cf, keys)| {
-                let active_keys = active_grounded_keys.get(source_cf);
-                keys.iter()
-                    .filter(|key| active_keys.is_none_or(|active| !active.contains(*key)))
-                    .count()
-            })
-            .sum();
+        // #2021: an anchor can be replayed only while its source event exists.
+        // TTL-managed audit CFs deliberately expire source rows while Calyx
+        // retains their constellations as sacred history. Counting those
+        // irrecoverable rows as backfill debt made an exhaustive sweep report
+        // `backfill_owed=true` forever. The physical source-key census is the
+        // authority: retain the old anchor, report it through the orphan
+        // counters below, and owe replay only for keys the source still holds.
+        // A missing CF census proves nothing and therefore contributes no
+        // actionable debt; the coverage/orphan readbacks remain unknown rather
+        // than manufacturing completion from an absent measurement.
+        let anchors_stranded_on_superseded = if entry.carry_superseded_anchors {
+            superseded_grounded_keys
+                .iter()
+                .map(|(source_cf, keys)| {
+                    let active_keys = active_grounded_keys.get(source_cf);
+                    let Some(present_source_keys) = source_cf_keys.get(source_cf) else {
+                        return 0;
+                    };
+                    keys.iter()
+                        .filter(|key| {
+                            present_source_keys.contains(*key)
+                                && active_keys.is_none_or(|active| !active.contains(*key))
+                        })
+                        .count()
+                })
+                .sum()
+        } else {
+            0
+        };
         if anchors_stranded_on_superseded > 0 {
             let from = superseded_versions_present
                 .iter()

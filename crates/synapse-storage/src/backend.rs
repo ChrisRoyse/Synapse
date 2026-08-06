@@ -5384,9 +5384,27 @@ impl StorageBackend for CalyxBackend {
         // exact historical Base-row lineage across later pages. Recomputing an
         // old cx_id from a mutable row's current bytes names a record that never
         // existed; probing it 100k times was both slow and always empty.
-        let anchor_lineage = self.anchor_carry_lineage(source_cf, after_physical.is_none())?;
-        let superseded_generation_count =
-            constellations::superseded_panel_versions_for_source_cf(source_cf)?.len() as u64;
+        let active_panel_version = backfill_panel_version(source_cf)?;
+        let carry_superseded_anchors = constellations::builtin_panel_catalog()
+            .into_iter()
+            .find(|entry| entry.panel_version == active_panel_version)
+            .ok_or_else(|| StorageError::BackendInvalidConfig {
+                value: active_panel_version.to_string(),
+                detail: format!(
+                    "active backfill panel for source {source_cf} is absent from builtin_panel_catalog"
+                ),
+            })?
+            .carry_superseded_anchors;
+        let anchor_lineage = if carry_superseded_anchors {
+            self.anchor_carry_lineage(source_cf, after_physical.is_none())?
+        } else {
+            Arc::new(BTreeMap::new())
+        };
+        let superseded_generation_count = if carry_superseded_anchors {
+            constellations::superseded_panel_versions_for_source_cf(source_cf)?.len() as u64
+        } else {
+            0
+        };
         let mut carry_targets = Vec::with_capacity(rows.len());
         for (key, raw) in rows {
             let identity_input = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
@@ -5403,7 +5421,7 @@ impl StorageBackend for CalyxBackend {
                 |vault| {
                     let context = NativeConstellationContext {
                         vault_id: vault.vault_id_value(),
-                        cx_id: vault.cx_id_for_input(&identity_input, backfill_panel_version(source_cf)?),
+                        cx_id: vault.cx_id_for_input(&identity_input, active_panel_version),
                         created_at_ms: calyx_clock_now_for_write(
                             vault,
                             backfill_physical_source_cf(source_cf),
@@ -5590,11 +5608,7 @@ impl StorageBackend for CalyxBackend {
                     None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
                 }
             }
-            // #2020: action outcomes are exhaustively derivable from the
-            // authoritative dual-schema audit row. Carrying the superseded
-            // generation would also carry the contaminated `label:reward`
-            // alias, defeating the generation repair.
-            if source_cf != cf::CF_ACTION_LOG {
+            if carry_superseded_anchors {
                 carry_targets.push((key, disposition.2));
             }
         }

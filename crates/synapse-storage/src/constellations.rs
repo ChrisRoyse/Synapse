@@ -2405,6 +2405,13 @@ pub struct PanelCatalogEntry {
     /// (`syn-action-v1` 224, `syn-process-v1` 2, `syn-observation-v1` 1). Zero
     /// belonged to a non-TTL source.
     pub source_ttl_managed: bool,
+    /// Whether grounded anchors on superseded generations retain the same
+    /// meaning and may be carried to the active generation.
+    ///
+    /// False when the generation bump deliberately changes outcome
+    /// adjudication. In that case historical anchors remain sacred evidence,
+    /// but are neither replay debt nor valid inputs to the new contract.
+    pub carry_superseded_anchors: bool,
     /// Generations this panel has been through, newest-superseded first.
     ///
     /// Rows at these versions are still physically in the `Base` CF and are
@@ -2481,6 +2488,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_TIMELINE),
             outcome_bearing: false,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[
                 SYN_TIMELINE_PANEL_VERSION_PRE_1963,
                 SYN_TIMELINE_PANEL_VERSION_PRE_1900,
@@ -2493,6 +2501,8 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_ACTION_LOG),
             outcome_bearing: true,
             source_ttl_managed: true,
+            // #2020/#2021: 2020001 replaced over-broad action adjudication.
+            carry_superseded_anchors: false,
             superseded_versions: &[
                 1_666_001,
                 SYN_ACTION_PANEL_VERSION_PRE_1965,
@@ -2507,6 +2517,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_REFLEX_AUDIT),
             outcome_bearing: false,
             source_ttl_managed: true,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_666_002, SYN_REFLEX_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_REFLEX_AUDIT),
         },
@@ -2516,6 +2527,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_PROCESS_HISTORY),
             outcome_bearing: false,
             source_ttl_managed: true,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_666_003, SYN_PROCESS_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_PROCESS_HISTORY),
         },
@@ -2528,6 +2540,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_OBSERVATIONS),
             outcome_bearing: false,
             source_ttl_managed: true,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_666_004, SYN_OBSERVATION_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_OBSERVATIONS),
         },
@@ -2539,6 +2552,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::Derived,
             outcome_bearing: false,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_667_001],
             backfill_source_cf: None,
         },
@@ -2548,6 +2562,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::Derived,
             outcome_bearing: false,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983],
             backfill_source_cf: None,
         },
@@ -2557,6 +2572,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::Derived,
             outcome_bearing: false,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[],
             backfill_source_cf: None,
         },
@@ -2566,6 +2582,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::Derived,
             outcome_bearing: false,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[],
             backfill_source_cf: None,
         },
@@ -2576,6 +2593,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_EPISODES),
             outcome_bearing: true,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[
                 SYN_EPISODE_PANEL_VERSION_PRE_1964,
                 SYN_EPISODE_PANEL_VERSION_PRE_1904,
@@ -2588,6 +2606,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_AGENT_EVENTS),
             outcome_bearing: true,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(cf::CF_AGENT_EVENTS),
         },
@@ -2597,6 +2616,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::FullCf(cf::CF_AGENT_TRANSCRIPTS),
             outcome_bearing: true,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1965,
                 SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1983,
@@ -2613,6 +2633,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_669_001, SYN_OUTCOME_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(SYN_OUTCOME_BACKFILL_SOURCE),
         },
@@ -2623,6 +2644,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             source: PanelSource::SubsetOfCf(cf::CF_KV),
             outcome_bearing: true,
             source_ttl_managed: false,
+            carry_superseded_anchors: true,
             superseded_versions: &[1_691_001, SYN_MCP_USAGE_PANEL_VERSION_PRE_1965],
             backfill_source_cf: Some(SYN_MCP_USAGE_BACKFILL_SOURCE),
         },

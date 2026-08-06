@@ -3433,9 +3433,10 @@ pub fn run_temporal_backfill(
         .map(hex_decode)
         .transpose()
         .map_err(|detail| {
-            mcp_error(
+            mcp_error_with_remediation(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!("storage operation=temporal_backfill key_hex invalid: {detail}"),
+                "set key_hex to the even-length hexadecimal source-row key returned by an authoritative storage read; no storage operation was attempted",
             )
         })?;
     let after_physical = params
@@ -3445,9 +3446,10 @@ pub fn run_temporal_backfill(
         .map(hex_decode)
         .transpose()
         .map_err(|detail| {
-            mcp_error(
+            mcp_error_with_remediation(
                 error_codes::TOOL_PARAMS_INVALID,
                 format!("storage operation=temporal_backfill after_physical_hex invalid: {detail}"),
+                "set after_physical_hex to the even-length hexadecimal resume_after_physical_hex returned by the preceding temporal_backfill page; no storage operation was attempted",
             )
         })?;
     let report = db
