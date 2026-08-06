@@ -22,10 +22,7 @@ anyhow.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-synapse-core = { version = "0.1.0", path = "../synapse-core" }
-synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
-tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true

@@ -18,7 +18,6 @@ serde.workspace = true
 sha2.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
-tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 

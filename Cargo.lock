@@ -701,7 +701,6 @@ dependencies = [
 name = "calyx-loom"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "calyx-aster",
  "calyx-core",
  "calyx-forge",
@@ -820,7 +819,6 @@ version = "0.1.0"
 dependencies = [
  "calyx-aster",
  "calyx-core",
- "calyx-forge",
  "calyx-ledger",
  "ort",
  "serde",
@@ -3662,76 +3660,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "opentelemetry"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0142c63252a9e054e68a4c61a5778f7b14f576274d593f8ce883d191a099682"
-dependencies = [
- "futures-core",
- "futures-sink",
- "js-sys",
- "pin-project-lite",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "opentelemetry-http"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5683015d09e2df236ef005b17f6f196f0d5f6313c4fa43a7b6a53b52776e4331"
-dependencies = [
- "async-trait",
- "bytes",
- "http",
- "opentelemetry",
- "reqwest 0.13.3",
-]
-
-[[package]]
-name = "opentelemetry-otlp"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9966929966d17620d7c316c643ba62631826e10021409357772d5eea84f62c35"
-dependencies = [
- "http",
- "opentelemetry",
- "opentelemetry-http",
- "opentelemetry-proto",
- "opentelemetry_sdk",
- "prost",
- "reqwest 0.13.3",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "opentelemetry-proto"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "56d658ba1faf63f7b9c492cfbe6e0ec365440a16132d3270c1065f7b33f1b638"
-dependencies = [
- "opentelemetry",
- "opentelemetry_sdk",
- "prost",
-]
-
-[[package]]
-name = "opentelemetry_sdk"
-version = "0.32.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "368afaed344110f40b179bb8fbe54bc52d98f9bd2b281799ef32487c2650c956"
-dependencies = [
- "futures-channel",
- "futures-executor",
- "futures-util",
- "opentelemetry",
- "percent-encoding",
- "portable-atomic",
- "rand 0.9.4",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "option-ext"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3958,29 +3886,6 @@ version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
- "quote",
- "syn",
-]
-
-[[package]]
-name = "prost"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
-dependencies = [
- "bytes",
- "prost-derive",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.14.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
-dependencies = [
- "anyhow",
- "itertools",
- "proc-macro2",
  "quote",
  "syn",
 ]
@@ -4425,7 +4330,6 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "encoding_rs",
- "futures-channel",
  "futures-core",
  "futures-util",
  "h2",
@@ -5150,7 +5054,6 @@ dependencies = [
  "synapse-core",
  "synapse-models",
  "thiserror 2.0.18",
- "tokio",
  "tracing",
  "wasapi",
  "windows 0.62.2",
@@ -5181,7 +5084,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -5196,7 +5098,6 @@ name = "synapse-capture"
 version = "0.1.0"
 dependencies = [
  "crossbeam",
- "serde",
  "synapse-core",
  "synapse-telemetry",
  "thiserror 2.0.18",
@@ -5216,7 +5117,6 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "thiserror 2.0.18",
- "tracing",
  "uuid",
 ]
 
@@ -5239,7 +5139,6 @@ dependencies = [
  "fs2",
  "futures-util",
  "http",
- "hyper",
  "image",
  "metrics",
  "notify",
@@ -5270,7 +5169,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
- "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -5300,10 +5198,7 @@ dependencies = [
  "reqwest 0.13.3",
  "serde",
  "serde_json",
- "synapse-core",
- "synapse-telemetry",
  "tokio",
- "tracing",
  "windows 0.62.2",
 ]
 
@@ -5316,12 +5211,9 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "synapse-a11y",
  "synapse-capture",
  "synapse-core",
  "thiserror 2.0.18",
- "tokio",
- "tracing",
  "windows 0.62.2",
 ]
 
@@ -5337,7 +5229,6 @@ dependencies = [
  "sha2 0.11.0",
  "synapse-core",
  "thiserror 2.0.18",
- "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
 ]
@@ -5397,10 +5288,6 @@ version = "0.1.0"
 dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
- "opentelemetry",
- "opentelemetry-otlp",
- "serde",
- "synapse-core",
  "thiserror 2.0.18",
  "tracing",
  "tracing-appender",

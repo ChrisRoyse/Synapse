@@ -11,7 +11,6 @@ publish.workspace = true
 
 [dependencies]
 crossbeam.workspace = true
-serde.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 thiserror.workspace = true

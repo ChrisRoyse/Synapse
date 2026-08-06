@@ -10,7 +10,6 @@ publish.workspace = true
 [dependencies]
 calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
-calyx-forge = { workspace = true }
 calyx-ledger = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true

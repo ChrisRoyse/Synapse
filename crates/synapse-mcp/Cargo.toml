@@ -40,7 +40,6 @@ ed25519-dalek.workspace = true
 fs2.workspace = true
 futures-util.workspace = true
 http.workspace = true
-hyper.workspace = true
 image.workspace = true
 metrics.workspace = true
 notify.workspace = true
@@ -76,7 +75,6 @@ synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
 synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 tokio.workspace = true
 tokio-util.workspace = true
-tower.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true

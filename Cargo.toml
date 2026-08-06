@@ -79,8 +79,6 @@ futures-util = "0.3.32"
 http = "1.4.0"
 metrics = "0.24.6"
 metrics-exporter-prometheus = "0.18.3"
-opentelemetry = "0.32.0"
-opentelemetry-otlp = "0.32.0"
 rmcp = { version = "1.7.0", features = ["server", "transport-io", "transport-streamable-http-server", "macros", "schemars"] }
 axum = { version = "0.8.9", features = ["ws"] }
 hyper = "1.9.0"

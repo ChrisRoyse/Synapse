@@ -12,7 +12,6 @@ default = []
 cuda = ["calyx-forge/cuda"]
 
 [dependencies]
-blake3.workspace = true
 calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
 # Not optional: `agreement_scalar` routes its reduction at the shared
