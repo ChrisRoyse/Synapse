@@ -178,7 +178,7 @@ impl VersionedCfStore {
 /// inverted range read as "this family is empty" instead of "this request is
 /// malformed". Neither is acceptable; an empty-but-ordered range (`end ==
 /// start`) is legal and yields nothing, as it did before.
-fn overlay_range<'a>(
+pub(super) fn overlay_range<'a>(
     cf_rows: &'a BTreeMap<Vec<u8>, VersionChain>,
     cf: ColumnFamily,
     range: Option<&KeyRange>,

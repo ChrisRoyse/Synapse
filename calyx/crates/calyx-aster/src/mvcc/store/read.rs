@@ -794,10 +794,27 @@ fn latest_rows_from_view(
     .collect::<BTreeMap<_, _>>();
 
     if let Some(cf_rows) = table.get(&cf) {
-        for (key, versions) in cf_rows {
-            if range.is_some_and(|range| !range.contains(key)) {
-                continue;
-            }
+        // Seek the range; do not walk the family and filter (#2036).
+        //
+        // This is the same defect #1973 fixed in the overlay, left behind in the
+        // latest-view reader: it iterated every key in the CF's row BTreeMap and
+        // applied `KeyRange::contains` as a filter, so a prefix read of a dozen
+        // anchors cost the whole family — while holding the vault-wide row-table
+        // read guard every constellation writer needs (#1950).
+        //
+        // Measured on the live daemon before this change: 4,417
+        // CALYX_ASTER_ROW_READ_GUARD_SLOW warnings, 3,772 of them (85%) from
+        // `scan_cf_range_latest`, with 512 of 512 sampled commits over the
+        // duration floor and /health taking 13.5-23.7 s on every request because
+        // every writer queued behind these reads.
+        //
+        // `overlay_range` is shared with the overlay reader rather than
+        // reimplemented, so both paths keep one definition of the bounds and one
+        // inverted-range contract. The bounds do not change which keys are
+        // visited: a BTreeMap range over `[start, end)` yields exactly the keys
+        // for which `KeyRange::contains` is true, because `contains` is
+        // start-inclusive and end-exclusive.
+        for (key, versions) in latest::overlay_range(cf_rows, cf, range)? {
             match visible_value_state(versions, seq) {
                 Some(VisibleValue::Live(value)) => {
                     rows.insert(key.clone(), value);
