@@ -476,7 +476,6 @@ dependencies = [
 name = "calyx-loom"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "calyx-aster",
  "calyx-core",
  "calyx-forge",
@@ -597,7 +596,6 @@ version = "0.1.0"
 dependencies = [
  "calyx-aster",
  "calyx-core",
- "calyx-forge",
  "calyx-ledger",
  "ort",
  "serde",
