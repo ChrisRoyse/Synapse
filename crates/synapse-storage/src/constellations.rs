@@ -216,6 +216,29 @@ const RECENCY_RANK_MAX_UNIX_MS: i64 = 4_102_444_800_000;
 const RECENCY_RANK_MAX_UNIX_MS_MICROS: i64 = RECENCY_RANK_MAX_UNIX_MS * RANK_BOUND_MICROS_PER_UNIT;
 const MAX_DAY_DURATION_MS: i64 = 86_400_000;
 const MAX_DAY_DURATION_MS_MICROS: i64 = MAX_DAY_DURATION_MS * RANK_BOUND_MICROS_PER_UNIT;
+/// Saturation point for `syn.agent_transcript.line_rank.v1`, in transcript lines.
+///
+/// Unlike its sibling bounds this is NOT a quantity that cannot be exceeded:
+/// year 2100 (`RECENCY_RANK_MAX_UNIX_MS`) and 24 hours (`MAX_DAY_DURATION_MS`)
+/// are real ceilings, but an agent transcript has no maximum line count. This
+/// is the point past which the line number stops discriminating for a
+/// retrieval-only ordering ordinate, so inputs above it saturate here rather
+/// than failing measurement — see [`saturating_rank_input`] (#2030).
+///
+/// The value is byte-identical to the literal it replaced (10_000_000_000
+/// micros), because it is part of the lens id `syn_scalar_rank:0:10000000000`
+/// and therefore of the frozen panel contract. Changing it is a panel version
+/// bump and a full re-measure, never an edit here alone.
+const AT_LINE_RANK_MAX_LINES: i64 = 10_000;
+const AT_LINE_RANK_MAX_LINES_MICROS: i64 = AT_LINE_RANK_MAX_LINES * RANK_BOUND_MICROS_PER_UNIT;
+const _: () = assert!(
+    AT_LINE_RANK_MAX_LINES_MICROS == 10_000_000_000,
+    "syn.agent_transcript.line_rank.v1 resolves to the lens id \
+     syn_scalar_rank:0:10000000000, which is part of the frozen panel contract every stored \
+     record was measured under. Naming the bound (#2030) must not move it: changing this value \
+     silently re-measures nothing while making stored vectors mean something else. Bump the \
+     panel version and re-measure instead"
+);
 
 const TL_SLOT_KIND_ONEHOT: SlotId = SlotId::new(1);
 const TL_SLOT_APP_HASH: SlotId = SlotId::new(2);
@@ -2801,14 +2824,11 @@ pub fn build_timeline_constellation(
     );
     slots.insert(
         TL_SLOT_RECENCY_RANK,
-        measure_number(
+        measure_scalar_rank(
             SYN_TIMELINE_PANEL_NAME,
-            AlgorithmicLens::syn_scalar_rank(
-                "syn.timeline.event_time_rank.v1",
-                Modality::Structured,
-                0,
-                RECENCY_RANK_MAX_UNIX_MS_MICROS,
-            ),
+            "syn.timeline.event_time_rank.v1",
+            0,
+            RECENCY_RANK_MAX_UNIX_MS_MICROS,
             record.ts_ns / NS_PER_MS,
         )?,
     );
@@ -2961,14 +2981,11 @@ pub fn build_episode_constellation(
     );
     slots.insert(
         EP_SLOT_DURATION_RANK,
-        measure_number(
+        measure_scalar_rank(
             SYN_EPISODE_PANEL_NAME,
-            AlgorithmicLens::syn_scalar_rank(
-                "syn.episode.duration_rank.v1",
-                Modality::Structured,
-                0,
-                MAX_DAY_DURATION_MS_MICROS,
-            ),
+            "syn.episode.duration_rank.v1",
+            0,
+            MAX_DAY_DURATION_MS_MICROS,
             duration_ms,
         )?,
     );
@@ -3693,7 +3710,7 @@ fn agent_transcript_panel_slots(
                 "syn.agent_transcript.line_rank.v1",
                 Modality::Structured,
                 0,
-                10_000_000_000,
+                AT_LINE_RANK_MAX_LINES_MICROS,
             ),
             panel_version,
             registry,
@@ -4517,14 +4534,11 @@ pub fn build_agent_transcript_constellation(
     );
     slots.insert(
         AT_SLOT_LINE_RANK,
-        measure_number(
+        measure_scalar_rank(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_scalar_rank(
-                "syn.agent_transcript.line_rank.v1",
-                Modality::Structured,
-                0,
-                10_000_000_000,
-            ),
+            "syn.agent_transcript.line_rank.v1",
+            0,
+            AT_LINE_RANK_MAX_LINES_MICROS,
             record.line_no,
         )?,
     );
@@ -6562,6 +6576,64 @@ fn measure_float(
     measure_text(panel_name, lens, &value.to_string())
 }
 
+/// Saturates a rank input at the frozen bounds its lens declares (#2030).
+///
+/// `syn_scalar_rank` fails closed outside `[min, max]`, and that is correct:
+/// the domain is part of the lens identity (`syn_scalar_rank:{min}:{max}`), so
+/// a silently widened domain would mean two different encodings sharing one
+/// lens id.
+///
+/// The defect is on this side of the boundary. Several quantities measured this
+/// way are *unbounded counters*, not naturally bounded ones. `line_no` is the
+/// clearest: an agent transcript grows without limit, so line `10_001` of a
+/// long run is an ordinary value, not a corrupt one. Feeding it raw made the
+/// lens reject the record, and because a backfill page aborts on its first
+/// unmeasurable record, ONE long transcript stalled the entire
+/// `syn-agent-transcript-v1` panel indefinitely: 107 of 111 backfill attempts
+/// failed with `pages=0 inserted=0 anchored=0`, pinning five panels below the
+/// 0.95 coverage floor and leaving `126_184` transcript records unmeasured.
+///
+/// Saturation is the semantics this module already documents for bounded
+/// encodings. The frozen scales beside [`count_norm`] are described as "the
+/// order of magnitude at which the field stops discriminating, not a maximum",
+/// and `count_norm`/`ratio_norm` both `.clamp(0.0, 1.0)` for exactly this
+/// reason. A `12_000`-line and a `20_000`-line transcript both reading 1.0 on a
+/// retrieval-only ordering ordinate is the intended statement, just as a
+/// 4-hour and an 8-hour episode both read ~1.0 on `EP_DURATION_SCALE_MS`.
+///
+/// Widening the frozen range was rejected: it changes the lens id, so it forces
+/// a panel version bump and a full re-measure of every stored record, and it
+/// only moves the cliff instead of removing it. The declared panel contract in
+/// the registry lens tables is deliberately left untouched.
+fn saturating_rank_input(value: u64, min_micros: i64, max_micros: i64) -> u64 {
+    // `.max(0)` first, so the sign is provably gone before the cast.
+    let lower = (min_micros / RANK_BOUND_MICROS_PER_UNIT).max(0).cast_unsigned();
+    let upper = (max_micros / RANK_BOUND_MICROS_PER_UNIT).max(0).cast_unsigned();
+    // `clamp` panics when lo > hi; the lens itself rejects min >= max, but this
+    // helper must not be the thing that panics if that ever changes.
+    value.clamp(lower, upper.max(lower))
+}
+
+/// The only way this module measures a `syn_scalar_rank`.
+///
+/// Bounds are passed once and used for BOTH the lens declaration and the input
+/// saturation, so the two cannot drift and a caller cannot forget to saturate.
+/// That structural coupling is the actual fix for #2030 — clamping at four
+/// individual call sites would have left the fifth to be written later.
+fn measure_scalar_rank(
+    panel_name: &'static str,
+    lens_name: &'static str,
+    min_micros: i64,
+    max_micros: i64,
+    value: u64,
+) -> StorageResult<SlotVector> {
+    measure_number(
+        panel_name,
+        AlgorithmicLens::syn_scalar_rank(lens_name, Modality::Structured, min_micros, max_micros),
+        saturating_rank_input(value, min_micros, max_micros),
+    )
+}
+
 fn measure_json<T>(
     panel_name: &'static str,
     lens: AlgorithmicLens,
@@ -7223,18 +7295,7 @@ fn optional_rank_slot(
 ) -> StorageResult<SlotVector> {
     value.map_or_else(
         || Ok(absent(AbsentReason::NotApplicable)),
-        |value| {
-            measure_number(
-                panel_name,
-                AlgorithmicLens::syn_scalar_rank(
-                    lens_name,
-                    Modality::Structured,
-                    min_micros,
-                    max_micros,
-                ),
-                value,
-            )
-        },
+        |value| measure_scalar_rank(panel_name, lens_name, min_micros, max_micros, value),
     )
 }
 

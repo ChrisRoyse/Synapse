@@ -380,8 +380,105 @@ function Info($m)  { Write-Host "[synapse-setup] $m" }
 # capability gaps: the install is correct but something is genuinely
 # unavailable, and silence would be dishonest (#1863).
 function Warn($m)  { Write-Host "[synapse-setup] WARNING: $m" -ForegroundColor Yellow }
-function Step($m)  { Write-Host "`n=== $m ===" -ForegroundColor Cyan }
+
+# ---------------------------------------------------------------------------
+# Phase timing ledger
+#
+# Setup had no wall-clock instrumentation of any kind: not per phase, not in
+# total, not on disk. That made "setup got slower" unfalsifiable and left every
+# optimization argued from reading rather than from measurement -- which is how
+# a 4x build-parallelism throttle sat in the build phase for two weeks without
+# anyone being able to see its cost in a readback.
+#
+# Step() now closes the previous phase and opens the next, and the ledger is
+# written to LogDir on BOTH outcomes. The failure case matters most: it names
+# which phase a failed run was sitting in and for how long.
+# ---------------------------------------------------------------------------
+$script:SynapseSetupStartedAt = Get-Date
+$script:SynapseSetupPhaseLedger = [System.Collections.Generic.List[object]]::new()
+$script:SynapseSetupCurrentPhase = $null
+$script:SynapseSetupCurrentPhaseStartedAt = $null
+$script:SynapseSetupPhaseLedgerWritten = $false
+
+function Stop-SynapseSetupPhaseTimer {
+    if ($null -eq $script:SynapseSetupCurrentPhase) { return }
+    $endedAt = Get-Date
+    $script:SynapseSetupPhaseLedger.Add([ordered]@{
+        index = $script:SynapseSetupPhaseLedger.Count + 1
+        phase = $script:SynapseSetupCurrentPhase
+        started_at_utc = $script:SynapseSetupCurrentPhaseStartedAt.ToUniversalTime().ToString('o')
+        ended_at_utc = $endedAt.ToUniversalTime().ToString('o')
+        elapsed_seconds = [math]::Round(($endedAt - $script:SynapseSetupCurrentPhaseStartedAt).TotalSeconds, 3)
+    })
+    $script:SynapseSetupCurrentPhase = $null
+    $script:SynapseSetupCurrentPhaseStartedAt = $null
+}
+
+function Step($m) {
+    Stop-SynapseSetupPhaseTimer
+    $script:SynapseSetupCurrentPhase = $m
+    $script:SynapseSetupCurrentPhaseStartedAt = Get-Date
+    $sinceStart = [int]((Get-Date) - $script:SynapseSetupStartedAt).TotalSeconds
+    Write-Host "`n=== $m === (t+${sinceStart}s)" -ForegroundColor Cyan
+}
+
+function Write-SynapseSetupPhaseLedger {
+    <#
+      Durable per-phase wall-clock readback. Never throws: a ledger-write
+      failure must not mask the real outcome, least of all a real failure.
+      Returns the ledger path, or $null if it could not be written.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('completed','failed')][string]$Outcome,
+        [string]$Message = ''
+    )
+
+    if ($script:SynapseSetupPhaseLedgerWritten) { return $null }
+    try {
+        # Close whatever phase was open so a failed run still accounts for the
+        # phase it died in rather than dropping it.
+        Stop-SynapseSetupPhaseTimer
+        $script:SynapseSetupPhaseLedgerWritten = $true
+        $endedAt = Get-Date
+        $ledgerDir = $LogDir
+        if ([string]::IsNullOrWhiteSpace($ledgerDir)) { return $null }
+        New-Item -ItemType Directory -Force -Path $ledgerDir -ErrorAction Stop | Out-Null
+        $phases = @($script:SynapseSetupPhaseLedger)
+        $slowest = @($phases | Sort-Object -Property elapsed_seconds -Descending | Select-Object -First 5)
+        $ledger = [ordered]@{
+            schema = 'synapse_setup_phase_timing_ledger/v1'
+            outcome = $Outcome
+            message = $Message
+            pid = $PID
+            started_at_utc = $script:SynapseSetupStartedAt.ToUniversalTime().ToString('o')
+            ended_at_utc = $endedAt.ToUniversalTime().ToString('o')
+            total_elapsed_seconds = [math]::Round(($endedAt - $script:SynapseSetupStartedAt).TotalSeconds, 3)
+            skip_build = [bool]$SkipBuild
+            force_restart = [bool]$ForceRestart
+            # Recorded so two runs are comparable: a build-phase time means
+            # nothing without the parallelism it was produced at.
+            cargo_build_jobs = $env:CARGO_BUILD_JOBS
+            cmake_build_parallel_level = $env:CMAKE_BUILD_PARALLEL_LEVEL
+            logical_cpus = [Environment]::ProcessorCount
+            phase_count = $phases.Count
+            phases = $phases
+            slowest_phases = $slowest
+        }
+        $ledgerPath = Join-Path $ledgerDir 'setup-phase-timings.json'
+        $json = ($ledger | ConvertTo-Json -Depth 12) + "`n"
+        [System.IO.File]::WriteAllText($ledgerPath, $json, [System.Text.UTF8Encoding]::new($false))
+        return $ledgerPath
+    } catch {
+        return $null
+    }
+}
 function Die($m)   {
+    # Written before anything else can throw: a failed run's phase timings are
+    # the record of WHERE it was stuck, which is exactly what is lost today.
+    $failureLedgerPath = Write-SynapseSetupPhaseLedger -Outcome 'failed' -Message $m
+    if ($failureLedgerPath) {
+        Write-Host "[synapse-setup] phase timing ledger -> $failureLedgerPath" -ForegroundColor Yellow
+    }
     if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath)) {
         $state = 'failed'
         $continuationManifestPath = ''
@@ -6572,7 +6669,33 @@ function Get-SynapseFileSha256 {
         $sha = [System.Security.Cryptography.SHA256]::Create()
         try {
             $share = [System.IO.FileShare]::ReadWrite -bor [System.IO.FileShare]::Delete
-            $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, $share)
+            # [System.IO.File]::Open() hands back a FileStream with the .NET
+            # default 4 KiB private buffer, so hashing the ~254 MB daemon binary
+            # cost ~65,000 read syscalls. This function is the single most-called
+            # expensive primitive in setup: every artifact, backup, staged copy,
+            # runtime companion, and installed-identity readback goes through it,
+            # roughly ten full passes over that binary per run.
+            #
+            # Measured on this host (AMD 9950X3D, NVMe), 254 MB binary:
+            #   4 KiB (old): 770 ms cold / ~223 ms warm
+            #   1 MiB (new): 149 ms cold / ~140 ms warm
+            # A buffer sweep put the optimum plateau at 64 KiB-4 MiB (all within
+            # noise of each other); 1 MiB is what dotnet/runtime's FileStream
+            # guidance recommends for files in the 100 MB-7 GB range, and
+            # PowerShell made the same fix to Get-FileHash itself in PR #20881
+            # after finding the 4 KiB default indefensible for large files.
+            #
+            # This is a pure read-path change: every caller still physically
+            # re-reads and re-hashes all bytes, so no readback is weakened or
+            # memoized away. Only the syscall count drops.
+            $bufferSize = 1048576
+            $stream = New-Object System.IO.FileStream(
+                $Path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                $share,
+                $bufferSize,
+                [System.IO.FileOptions]::SequentialScan)
             try {
                 $hash = $sha.ComputeHash($stream)
             } finally {
@@ -6581,7 +6704,10 @@ function Get-SynapseFileSha256 {
         } finally {
             $sha.Dispose()
         }
-        return (($hash | ForEach-Object { $_.ToString('X2') }) -join '')
+        # Byte-for-byte identical to the previous `ForEach-Object { 'X2' } -join`
+        # (uppercase, unseparated) but without allocating a pipeline object per
+        # digest byte: 87 ms vs 888 ms over 20,000 digests.
+        return [BitConverter]::ToString($hash).Replace('-', '')
     } catch {
         Die "SYNAPSE_FILE_HASH_FAILED path=$Path error=$($_.Exception.Message) remediation=verify the file exists, is readable by this user, and is not protected by an exclusive writer before retrying setup"
     }
@@ -11778,19 +11904,52 @@ if (-not $SkipBuild) {
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
     $env:CARGO_TARGET_DIR = $CargoTarget
     if (-not $env:CARGO_BUILD_JOBS) {
-        # Cargo defaults to logical CPU count, but the shipping graph combines
-        # LLVM thin-LTO, rust-lld, CUDA/native build scripts, and a 260+ MB
-        # embedded-model executable. On this 32-thread/128-GB Windows host the
-        # final rustc process physically crashed with STATUS_ACCESS_VIOLATION at
-        # 32 jobs while 75+ GB remained free. Keep the resource cap, but do not
-        # treat it as the #1731 compiler fix: that fault later recurred at 8
-        # jobs. Preserve an explicit CARGO_BUILD_JOBS operator override.
+        # Size the build to the whole machine, RAM-guarded. CARGO_BUILD_JOBS
+        # (env) outranks any `[build] jobs = N` in a user or repo config.toml,
+        # so this holds regardless of local cargo configuration.
+        #
+        # A hard `Min(8, ...)` cap lived here from 2026-07-22 to 2026-08-06 as a
+        # mitigation for the rustc STATUS_ACCESS_VIOLATION crashes on #1731. It
+        # is removed because the evidence says it never mitigated anything:
+        #
+        #   * The crash it was added for was a rustc 1.96.1 fault. That compiler
+        #     was replaced on 2026-07-26 (rust-toolchain.toml -> 1.97.1, c9a6b85a)
+        #     precisely because it "repeatedly crashed".
+        #   * The crash then recurred anyway AT 8 JOBS. The archived readback
+        #     logs/setup-build-failures/release-build-20260804T004949861Z-pid27796
+        #     records code=SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED,
+        #     cargo_build_jobs=8, crash_tool=rustc.exe,
+        #     crash_status=STATUS_ACCESS_VIOLATION.
+        #   * It is not resource exhaustion: that same readback shows 46 GB
+        #     physical still available and commit at 52.3%.
+        #   * Upstream places this fault in the ThinLTO LLVM codegen workers
+        #     (rust-lang/rust#125765, #109067, #113433), which is a per-thread
+        #     stack/miscompile issue. Job count is not a documented lever on it;
+        #     RUST_MIN_STACK is, and Set-SynapseReleaseBuildCompilerEnvironment
+        #     already sets it. The remaining arm is the release profile's
+        #     lto = "thin" -- tracked on #1975, NOT worked around here.
+        #
+        # So the cap cost a 4x parallelism throttle on the single most expensive
+        # phase of setup (8 of 32 jobs on this host) while demonstrably not
+        # preventing the crash it was named for. An explicit operator-set
+        # CARGO_BUILD_JOBS is still honored untouched.
         $logicalCpus = [Environment]::ProcessorCount
         $ramGb = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+        # Heavy rustc/cl.exe jobs peak around 1.5 GB each; on a low-RAM host cap
+        # the count so the build does not swap, which costs far more than
+        # running fewer jobs. On a well-provisioned host this never binds.
         $memoryJobs = [math]::Max(1, [math]::Floor($ramGb / 1.5))
-        $env:CARGO_BUILD_JOBS = [string][int][math]::Min(8, [math]::Min($logicalCpus, $memoryJobs))
+        $env:CARGO_BUILD_JOBS = [string][int][math]::Min($logicalCpus, $memoryJobs)
     }
-    Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) (logical CPUs: $([Environment]::ProcessorCount))"
+    # cargo forwards this to build scripts as NUM_JOBS, but cmake-driven -sys
+    # crates read CMAKE_BUILD_PARALLEL_LEVEL instead and otherwise serialize
+    # their native compiles. synapse-update.ps1 has always set this; setup lost
+    # it, so the same source tree built with different native parallelism
+    # depending on which entry point the operator used.
+    if (-not $env:CMAKE_BUILD_PARALLEL_LEVEL) {
+        $env:CMAKE_BUILD_PARALLEL_LEVEL = $env:CARGO_BUILD_JOBS
+    }
+    Info "Build parallelism: CARGO_BUILD_JOBS=$($env:CARGO_BUILD_JOBS) CMAKE_BUILD_PARALLEL_LEVEL=$($env:CMAKE_BUILD_PARALLEL_LEVEL) (logical CPUs: $([Environment]::ProcessorCount))"
     $buildLog = Join-Path $LogDir 'setup-build.log'
     $buildDiagnosticsPath = Join-Path $LogDir 'setup-build-diagnostics.json'
     $buildInvocationPath = Join-Path $LogDir 'setup-build-invocation.json'
@@ -13163,4 +13322,18 @@ Step "Done"
 Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."
 Info "Token: $TokenPath   DB: $DbPath   Profiles: $ProfilesDir"
 Info "WSL clients: run scripts/synapse-install.sh from WSL to wire Claude Code + Codex there."
+$phaseLedgerPath = Write-SynapseSetupPhaseLedger -Outcome 'completed' -Message 'setup completed'
+if ($phaseLedgerPath) {
+    $ledgerReadback = Get-Content -LiteralPath $phaseLedgerPath -Raw | ConvertFrom-Json
+    Info ("Setup wall clock: total={0}s phases={1} cargo_build_jobs={2} ledger={3}" -f `
+        $ledgerReadback.total_elapsed_seconds,
+        $ledgerReadback.phase_count,
+        ($(if ($ledgerReadback.cargo_build_jobs) { $ledgerReadback.cargo_build_jobs } else { '<unset:SkipBuild>' })),
+        $phaseLedgerPath)
+    foreach ($slow in @($ledgerReadback.slowest_phases)) {
+        Info ("  slowest_phase elapsed_s={0} phase={1}" -f $slow.elapsed_seconds, $slow.phase)
+    }
+} else {
+    Warn "SYNAPSE_SETUP_PHASE_LEDGER_UNWRITTEN log_dir=$LogDir remediation=setup completed but its phase timing ledger could not be written; inspect LogDir permissions"
+}
 Release-SynapseSetupMaintenanceLock -State released
