@@ -445,8 +445,8 @@ fn append_autonomy_decision_required(
         &routine.routine_id,
         &json!({
             "outcome": outcome,
-            "code": code,
-            "detail": detail,
+            "error_code_sha256": code.map(sha256_text),
+            "detail_sha256": detail.map(sha256_text),
             "schedule_enabled": config.schedule_enabled,
             "intent_enabled": config.intent_enabled,
             "failure_threshold": config.failure_threshold,
@@ -468,6 +468,12 @@ fn append_autonomy_decision_required(
             ),
         )
     })
+}
+
+fn sha256_text(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    hex_encode(&hasher.finalize())
 }
 
 fn validate_autonomy_eligibility(

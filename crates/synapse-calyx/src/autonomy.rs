@@ -5,8 +5,6 @@ use sha2::{Digest as _, Sha256};
 
 use crate::{SynapseCalyxError, SynapseCalyxVault};
 
-const AUTONOMY_DECISION_TAG: &str = "synapse_autonomy_decision_v1";
-
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxAutonomyDecisionReadback {
     pub routine_id: String,
@@ -39,15 +37,13 @@ impl SynapseCalyxVault {
             ));
         }
         let payload = serde_json::to_vec(&serde_json::json!({
-            "tag": AUTONOMY_DECISION_TAG,
-            "routine_id": routine_id,
             "decision": decision,
         }))
         .map_err(|error| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_AUTONOMY_DECISION_ENCODE_FAILED",
                 format!("encode autonomy decision payload: {error}"),
-                "repair the structured autonomy decision before retrying",
+                "repair the structured, secret-free autonomy decision before retrying",
             )
         })?;
         let payload_sha256 = hex(&Sha256::digest(&payload));
