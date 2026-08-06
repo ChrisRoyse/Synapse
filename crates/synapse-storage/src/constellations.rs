@@ -2479,7 +2479,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_name: SYN_TIMELINE_PANEL_NAME,
             panel_version: SYN_TIMELINE_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_TIMELINE),
-            outcome_bearing: true,
+            outcome_bearing: false,
             source_ttl_managed: false,
             superseded_versions: &[
                 SYN_TIMELINE_PANEL_VERSION_PRE_1963,
@@ -2491,7 +2491,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             panel_name: SYN_ACTION_PANEL_NAME,
             panel_version: SYN_ACTION_PANEL_VERSION,
             source: PanelSource::FullCf(cf::CF_ACTION_LOG),
-            outcome_bearing: false,
+            outcome_bearing: true,
             source_ttl_managed: true,
             superseded_versions: &[
                 1_666_001,
