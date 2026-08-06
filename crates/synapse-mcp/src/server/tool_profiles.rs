@@ -747,6 +747,28 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
                 "only the owning session can release; call act operation=lease_status to inspect the owner",
             ),
+            op(
+                "operator_panic_status",
+                false,
+                false,
+                "synapse_action operator-panic safety readback + synapse_a11y browser-owner registry + extension chrome.storage.local owner ledger/live readback + act facade CF_ACTION_LOG command audit row",
+                Some(
+                    "independent process, daemon browser-owner, and extension-owner generation/state readbacks",
+                ),
+                error_codes::TOOL_INTERNAL_ERROR,
+                "repair the specifically reported bridge/readback failure, then retry status",
+            ),
+            op(
+                "operator_panic_recover",
+                true,
+                false,
+                "exact operator-panic epoch + synapse_a11y browser-owner disable generation + extension chrome.storage.local owner-ledger disable generation + act facade CF_ACTION_LOG command audit row",
+                Some(
+                    "independent process, daemon browser-owner, and extension-owner post-enable readbacks",
+                ),
+                error_codes::SAFETY_OPERATOR_HOTKEY_FIRED,
+                "call operator_panic_status; resolve pending safety work or unhealthy/non-empty owners, then retry with all exact current generations and a non-empty reason",
+            ),
         ],
     ),
     facade_contract(

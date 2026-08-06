@@ -43,7 +43,8 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-07-27-reboot-stable-path-v1";
+const EXPECTED_EXTENSION_BUILD_ID: &str =
+    "synapse-chrome-bridge-2026-08-06-operator-panic-recovery-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";

@@ -1138,6 +1138,145 @@ async fn reconcile_operator_panic_lease_finalization(
     }
 }
 
+/// Read the three independent Sources of Truth needed to recover a browser
+/// mutation gate stranded after the extension worker is replaced mid-K2.
+pub(crate) async fn operator_panic_browser_gate_status() -> Result<serde_json::Value, String> {
+    let safety = synapse_action::operator_panic_safety_readback();
+    let browser = synapse_a11y::durable_browser_mutation_owners_readback();
+    let extension = crate::chrome_debugger_bridge::operator_panic_readback()
+        .await
+        .map_err(|error| {
+            format!(
+                "extension owner readback failed: {}: {}",
+                error.code(),
+                error.detail()
+            )
+        })?;
+    Ok(serde_json::json!({
+        "source_of_truth": "synapse_action::operator_panic_safety_readback + synapse_a11y durable browser-owner registry + extension chrome.storage.local durable-owner ledger/live readback",
+        "operator_panic": safety,
+        "browser_owners": browser,
+        "extension_owners": extension,
+    }))
+}
+
+/// Explicit compare-and-swap recovery for a completed panic wave whose browser
+/// gates remained closed. Nothing is drained or discarded here: both owner
+/// registries must already be healthy and empty, and a newer panic generation
+/// makes either conditional enable refuse the stale request.
+pub(crate) async fn recover_operator_panic_browser_gates(
+    expected_operator_panic_epoch: u64,
+    expected_extension_disable_sequence: u64,
+    expected_browser_disable_sequence: u64,
+) -> Result<serde_json::Value, String> {
+    let safety_before = synapse_action::operator_panic_safety_readback();
+    if safety_before.pending || safety_before.epoch != expected_operator_panic_epoch {
+        return Err(format!(
+            "operator-panic generation is pending or changed: expected_epoch={expected_operator_panic_epoch} actual={safety_before:?}"
+        ));
+    }
+    let extension_before = crate::chrome_debugger_bridge::operator_panic_readback()
+        .await
+        .map_err(|error| {
+            format!(
+                "extension precondition readback failed: {}: {}",
+                error.code(),
+                error.detail()
+            )
+        })?;
+    let extension_healthy_empty = extension_before.disable_sequence
+        == expected_extension_disable_sequence
+        && extension_before.owner_continuity_healthy
+        && extension_before.active_after == Default::default();
+    if !extension_healthy_empty {
+        return Err(format!(
+            "extension gate is not healthy, empty, and at the exact generation: expected_disable_sequence={expected_extension_disable_sequence} readback={extension_before:?}"
+        ));
+    }
+    let browser_before = synapse_a11y::durable_browser_mutation_owners_readback();
+    if browser_before.disable_sequence != expected_browser_disable_sequence
+        || !browser_before.registry_readback_healthy
+        || !browser_before.registry_readback_failures.is_empty()
+        || browser_before.fetch_interception_active_count != 0
+        || browser_before.network_override_active_count != 0
+        || browser_before.dialog_auto_policy_active_count != 0
+        || browser_before.clock_active_count != 0
+        || browser_before.init_script_active_count != 0
+        || browser_before.persisted_cdp_mutation_owner_count != 0
+        || browser_before.unresolved_raw_cdp_evaluate_timeout_count != 0
+        || browser_before.unresolved_raw_cdp_input_owner_count != 0
+    {
+        return Err(format!(
+            "daemon browser gate is not a healthy empty exact-generation latch: expected_disable_sequence={expected_browser_disable_sequence} readback={browser_before:?}"
+        ));
+    }
+
+    let extension_enable = if extension_before.enabled {
+        None
+    } else {
+        Some(
+            crate::chrome_debugger_bridge::operator_panic_enable_if_unchanged(
+                expected_extension_disable_sequence,
+            )
+            .await
+            .map_err(|error| {
+                format!(
+                    "extension conditional enable failed: {}: {}",
+                    error.code(),
+                    error.detail()
+                )
+            })?,
+        )
+    };
+    let safety_mid = synapse_action::operator_panic_safety_readback();
+    if safety_mid.pending || safety_mid.epoch != expected_operator_panic_epoch {
+        return Err(format!(
+            "a newer panic wave crossed extension recovery; safety={safety_mid:?} extension_enable={extension_enable:?}"
+        ));
+    }
+    let browser_enable = if browser_before.enabled {
+        browser_before.clone()
+    } else {
+        synapse_a11y::durable_browser_mutation_owners_enable_if_unchanged(
+            expected_browser_disable_sequence,
+        )
+        .await
+    };
+    let safety_after = synapse_action::operator_panic_safety_readback();
+    let extension_after = crate::chrome_debugger_bridge::operator_panic_readback()
+        .await
+        .map_err(|error| {
+            format!(
+                "extension postcondition readback failed: {}: {}",
+                error.code(),
+                error.detail()
+            )
+        })?;
+    let browser_after = synapse_a11y::durable_browser_mutation_owners_readback();
+    if safety_after.pending
+        || safety_after.epoch != expected_operator_panic_epoch
+        || !extension_after.enabled
+        || extension_after.disable_sequence != expected_extension_disable_sequence
+        || !extension_after.owner_continuity_healthy
+        || extension_after.active_after != Default::default()
+        || !browser_after.enabled
+        || browser_after.disable_sequence != expected_browser_disable_sequence
+        || browser_enable != browser_after
+    {
+        return Err(format!(
+            "recovery did not reach an independently verified terminal state: safety={safety_after:?} extension_enable={extension_enable:?} extension_after={extension_after:?} browser_enable={browser_enable:?} browser_after={browser_after:?}"
+        ));
+    }
+    tracing::info!(
+        code = "MCP_OPERATOR_PANIC_EXPLICIT_BROWSER_GATE_RECOVERY_READBACK",
+        expected_operator_panic_epoch,
+        expected_extension_disable_sequence,
+        expected_browser_disable_sequence,
+        "explicit operator recovery reopened both healthy empty browser mutation gates"
+    );
+    operator_panic_browser_gate_status().await
+}
+
 fn chrome_extension_owner_closed_for_exact_wave(
     expected_disable_sequence: u64,
     readback: &crate::chrome_debugger_bridge::ChromeDebuggerExtensionOwnerReadback,

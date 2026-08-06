@@ -1,5 +1,5 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-07-27-reboot-stable-path-v1";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-06-operator-panic-recovery-v1";
 const BRIDGE_DECLARED_BUILD_SHA256 = "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
@@ -13118,8 +13118,6 @@ function operatorPanicActiveOwners() {
     debugger_attached_tab_count: DURABLE_OWNER_LEDGER.debuggerTabs.length,
     unresolved_debugger_command_timeout_count:
       DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
-    resolved_prior_session_debugger_command_timeouts:
-      RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS,
     executed_init_script_effect_unresolved_count:
       DURABLE_OWNER_LEDGER.executedInitScriptEffects.length,
     dialog_policy_count: DURABLE_OWNER_LEDGER.dialogTabs.length,
@@ -13171,6 +13169,8 @@ function operatorPanicOwnerReadback() {
         timed_out_at_unix_ms: entry.timedOutAtUnixMs,
         neutralization_method: entry.neutralizationMethod
       })),
+    resolved_prior_session_debugger_command_timeouts:
+      RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS,
     unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
     owner_continuity_healthy: DURABLE_OWNER_STATE_LOADED &&
       !DURABLE_OWNER_STATE_LOAD_ERROR &&

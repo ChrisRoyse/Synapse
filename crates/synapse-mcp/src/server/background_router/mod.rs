@@ -75,6 +75,8 @@ enum ActOperation {
     LeaseAcquire,
     LeaseStatus,
     LeaseRelease,
+    OperatorPanicStatus,
+    OperatorPanicRecover,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -91,6 +93,17 @@ struct ActParams {
     #[serde(default)]
     #[schemars(range(min = 100, max = 300000))]
     ttl_ms: Option<u64>,
+    /// Exact extension-owner disable generation returned by
+    /// operation=operator_panic_status. Required for recovery.
+    #[serde(default)]
+    expected_extension_disable_sequence: Option<u64>,
+    /// Exact daemon browser-owner disable generation returned by
+    /// operation=operator_panic_status. Required for recovery.
+    #[serde(default)]
+    expected_browser_disable_sequence: Option<u64>,
+    /// Exact process-global operator-panic epoch returned by status.
+    #[serde(default)]
+    expected_operator_panic_epoch: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -104,6 +117,8 @@ struct ActResponse {
     foreground: Option<ActForegroundEscalation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lease: Option<super::lease_tools::ControlLeaseResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operator_panic: Option<Value>,
 }
 
 #[derive(Clone, Debug, JsonSchema)]
@@ -446,7 +461,7 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
         "properties": {
             "operation": {
                 "type": "string",
-                "enum": ["invoke", "foreground", "lease_acquire", "lease_status", "lease_release"],
+                "enum": ["invoke", "foreground", "lease_acquire", "lease_status", "lease_release", "operator_panic_status", "operator_panic_recover"],
                 "default": "invoke",
                 "description": "Act facade operation. Omit only for the default invoke operation."
             },
@@ -460,7 +475,7 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
             "reason": {
                 "type": ["string", "null"],
                 "minLength": 1,
-                "description": "Foreground escalation reason. Required by operation=foreground; rejected by invoke and lease operations."
+                "description": "Required non-empty reason for operation=foreground and operation=operator_panic_recover; rejected by other operations."
             },
             "ttl_ms": {
                 "type": ["integer", "null"],
@@ -468,6 +483,21 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
                 "maximum": max_ttl_ms,
                 "default": default_ttl_ms,
                 "description": "Foreground input lease lifetime in milliseconds. Accepted by operation=foreground and operation=lease_acquire."
+            },
+            "expected_extension_disable_sequence": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Exact extension-owner disable generation returned by operator_panic_status; required only by operator_panic_recover."
+            },
+            "expected_browser_disable_sequence": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Exact daemon browser-owner disable generation returned by operator_panic_status; required only by operator_panic_recover."
+            },
+            "expected_operator_panic_epoch": {
+                "type": ["integer", "null"],
+                "minimum": 0,
+                "description": "Exact process-global operator-panic epoch returned by operator_panic_status; required only by operator_panic_recover."
             }
         },
         "oneOf": [
@@ -544,6 +574,36 @@ fn act_input_schema() -> Arc<Map<String, Value>> {
                         "const": "lease_release",
                         "description": "Release this session's foreground input lease."
                     }
+                }
+            },
+            {
+                "title": "act operation=operator_panic_status",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "operator_panic_status",
+                        "description": "Independently read the process-global panic wave and both browser mutation-owner gates."
+                    }
+                }
+            },
+            {
+                "title": "act operation=operator_panic_recover",
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["operation", "reason", "expected_extension_disable_sequence", "expected_browser_disable_sequence", "expected_operator_panic_epoch"],
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "const": "operator_panic_recover",
+                        "description": "Explicitly reopen healthy empty browser mutation gates using exact status generations."
+                    },
+                    "reason": { "$ref": "#/properties/reason" },
+                    "expected_extension_disable_sequence": { "$ref": "#/properties/expected_extension_disable_sequence" },
+                    "expected_browser_disable_sequence": { "$ref": "#/properties/expected_browser_disable_sequence" },
+                    "expected_operator_panic_epoch": { "$ref": "#/properties/expected_operator_panic_epoch" }
                 }
             }
         ]
@@ -1589,6 +1649,8 @@ fn act_operator_panic_prearm_error(
         ActOperation::LeaseAcquire => "ACT_LEASE_ACQUIRE_OPERATOR_PANIC_PREARMED",
         ActOperation::LeaseStatus => "ACT_LEASE_STATUS_OPERATOR_PANIC_PREARMED",
         ActOperation::LeaseRelease => "ACT_LEASE_RELEASE_OPERATOR_PANIC_PREARMED",
+        ActOperation::OperatorPanicStatus => "ACT_OPERATOR_PANIC_STATUS_PREARMED",
+        ActOperation::OperatorPanicRecover => "ACT_OPERATOR_PANIC_RECOVER_PREARMED",
     };
     let operator_panic = synapse_action::operator_panic_safety_readback();
     let operator_panic_epoch_after = operator_panic.epoch;
@@ -1772,7 +1834,7 @@ fn cleanup_act_foreground_after_shutdown_cancellation(
 #[tool_router(router = background_router_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease as a facade route without adding raw control_lease_* tools to the public surface. Raw foreground primitives remain profile-gated; this facade only delegates to capability-preserving routes and returns the action/lease readback source of truth.",
+        description = "Public action facade. operation=invoke routes one target-scoped action through target_act. operation=foreground runs the action through the audited foreground escalation path with a required non-empty reason. operation=lease_acquire/status/release exposes the foreground input lease. operation=operator_panic_status independently reads the process, daemon browser-owner, and Chrome-extension owner gates. operation=operator_panic_recover explicitly reopens only healthy empty gates using all three exact generations from status plus a required reason; stale generations and pending panic work fail closed.",
         input_schema = act_input_schema()
     )]
     pub async fn act(
@@ -1795,6 +1857,7 @@ impl SynapseService {
             | ActOperation::LeaseAcquire
             | ActOperation::LeaseStatus
             | ActOperation::LeaseRelease => true,
+            ActOperation::OperatorPanicStatus | ActOperation::OperatorPanicRecover => false,
         };
         let operator_panic_epoch_at_entry = if mutation_guarded_by_operator_panic {
             let epoch = synapse_action::operator_panic_epoch();
@@ -1996,6 +2059,7 @@ impl SynapseService {
                         action: Some(action),
                         foreground: None,
                         lease: None,
+                        operator_panic: None,
                     })
                 }
                 ActOperation::Foreground => {
@@ -2040,6 +2104,7 @@ impl SynapseService {
                         action: Some(response.action),
                         foreground: Some(response.escalation),
                         lease: None,
+                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseAcquire => {
@@ -2065,6 +2130,7 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
+                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseStatus => {
@@ -2085,6 +2151,7 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
+                        operator_panic: None,
                     })
                 }
                 ActOperation::LeaseRelease => {
@@ -2105,6 +2172,52 @@ impl SynapseService {
                         action: None,
                         foreground: None,
                         lease: Some(lease),
+                        operator_panic: None,
+                    })
+                }
+                ActOperation::OperatorPanicStatus => {
+                    validate_act_operator_panic_status_params(&params)?;
+                    let readback = crate::safety::operator_panic_browser_gate_status().await
+                        .map_err(|detail| act_operator_panic_recovery_error("ACT_OPERATOR_PANIC_STATUS_FAILED", detail))?;
+                    Ok(ActResponse {
+                        operation,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: None,
+                        foreground: None,
+                        lease: None,
+                        operator_panic: Some(readback),
+                    })
+                }
+                ActOperation::OperatorPanicRecover => {
+                    validate_act_operator_panic_recover_params(&params)?;
+                    let expected_operator_panic_epoch = params.expected_operator_panic_epoch
+                        .ok_or_else(|| act_operator_panic_recovery_error(
+                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
+                            "validated expected_operator_panic_epoch disappeared before dispatch".to_owned(),
+                        ))?;
+                    let expected_extension_disable_sequence = params.expected_extension_disable_sequence
+                        .ok_or_else(|| act_operator_panic_recovery_error(
+                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
+                            "validated expected_extension_disable_sequence disappeared before dispatch".to_owned(),
+                        ))?;
+                    let expected_browser_disable_sequence = params.expected_browser_disable_sequence
+                        .ok_or_else(|| act_operator_panic_recovery_error(
+                            "ACT_OPERATOR_PANIC_RECOVERY_PARAMS_LOST",
+                            "validated expected_browser_disable_sequence disappeared before dispatch".to_owned(),
+                        ))?;
+                    let readback = crate::safety::recover_operator_panic_browser_gates(
+                        expected_operator_panic_epoch,
+                        expected_extension_disable_sequence,
+                        expected_browser_disable_sequence,
+                    ).await.map_err(|detail| act_operator_panic_recovery_error(
+                        "ACT_OPERATOR_PANIC_RECOVERY_REFUSED", detail))?;
+                    Ok(ActResponse {
+                        operation,
+                        source_of_truth: ACT_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                        action: None,
+                        foreground: None,
+                        lease: None,
+                        operator_panic: Some(readback),
                     })
                 }
             }
@@ -7882,6 +7995,8 @@ fn act_operation_name(operation: ActOperation) -> &'static str {
         ActOperation::LeaseAcquire => "lease_acquire",
         ActOperation::LeaseStatus => "lease_status",
         ActOperation::LeaseRelease => "lease_release",
+        ActOperation::OperatorPanicStatus => "operator_panic_status",
+        ActOperation::OperatorPanicRecover => "operator_panic_recover",
     }
 }
 
@@ -7892,6 +8007,9 @@ fn act_command_audit_payload(params: &ActParams) -> Value {
         "action_verb": params.action.as_ref().map(|action| action.verb.as_str()),
         "reason_present": params.reason.as_ref().is_some_and(|reason| !reason.trim().is_empty()),
         "ttl_ms": params.ttl_ms,
+        "expected_extension_disable_sequence": params.expected_extension_disable_sequence,
+        "expected_browser_disable_sequence": params.expected_browser_disable_sequence,
+        "expected_operator_panic_epoch": params.expected_operator_panic_epoch,
     })
 }
 
@@ -7910,6 +8028,7 @@ fn act_command_audit_success_after(response: &ActResponse) -> Value {
         "lease": response.lease,
         "action_status": response.action.as_ref().map(|action| action.status.as_str()),
         "profile_restored": response.foreground.as_ref().map(|foreground| foreground.profile_restored),
+        "operator_panic": response.operator_panic,
     })
 }
 
@@ -7922,6 +8041,7 @@ fn act_command_audit_error_after(operation: ActOperation) -> Value {
 }
 
 fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_operator_panic_generations(params, ActOperation::Invoke)?;
     require_act_action(params, ActOperation::Invoke)?;
     if params.reason.is_some() {
         return Err(act_facade_error(
@@ -7943,6 +8063,7 @@ fn validate_act_invoke_params(params: &ActParams) -> Result<(), ErrorData> {
 }
 
 fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_operator_panic_generations(params, ActOperation::Foreground)?;
     require_act_action(params, ActOperation::Foreground)?;
     if let Some(ttl_ms) = params.ttl_ms {
         super::lease_tools::validate_lease_ttl_ms("act operation=foreground", ttl_ms)?;
@@ -7963,6 +8084,7 @@ fn validate_act_foreground_params(params: &ActParams) -> Result<(), ErrorData> {
 }
 
 fn validate_act_lease_acquire_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_operator_panic_generations(params, ActOperation::LeaseAcquire)?;
     reject_act_action(params, ActOperation::LeaseAcquire)?;
     reject_act_reason(params, ActOperation::LeaseAcquire)?;
     if let Some(ttl_ms) = params.ttl_ms {
@@ -7975,9 +8097,102 @@ fn validate_act_lease_read_params(
     params: &ActParams,
     operation: ActOperation,
 ) -> Result<(), ErrorData> {
+    reject_act_operator_panic_generations(params, operation)?;
     reject_act_action(params, operation)?;
     reject_act_reason(params, operation)?;
     reject_act_ttl(params, operation)?;
+    Ok(())
+}
+
+fn validate_act_operator_panic_status_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_action(params, ActOperation::OperatorPanicStatus)?;
+    reject_act_reason(params, ActOperation::OperatorPanicStatus)?;
+    reject_act_ttl(params, ActOperation::OperatorPanicStatus)?;
+    if params.expected_extension_disable_sequence.is_some()
+        || params.expected_browser_disable_sequence.is_some()
+        || params.expected_operator_panic_epoch.is_some()
+    {
+        return Err(act_facade_error(
+            ActOperation::OperatorPanicStatus,
+            "act operation=operator_panic_status rejects expected generations",
+            "remove expected_* fields; copy them from the returned status only when calling operator_panic_recover",
+            "expected_*",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_act_operator_panic_recover_params(params: &ActParams) -> Result<(), ErrorData> {
+    reject_act_action(params, ActOperation::OperatorPanicRecover)?;
+    reject_act_ttl(params, ActOperation::OperatorPanicRecover)?;
+    if params
+        .reason
+        .as_deref()
+        .is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(act_facade_error(
+            ActOperation::OperatorPanicRecover,
+            "act operation=operator_panic_recover requires a non-empty reason",
+            "state why the operator is explicitly reopening browser mutation admission",
+            "reason",
+        ));
+    }
+    for (name, present) in [
+        (
+            "expected_extension_disable_sequence",
+            params.expected_extension_disable_sequence.is_some(),
+        ),
+        (
+            "expected_browser_disable_sequence",
+            params.expected_browser_disable_sequence.is_some(),
+        ),
+        (
+            "expected_operator_panic_epoch",
+            params.expected_operator_panic_epoch.is_some(),
+        ),
+    ] {
+        if !present {
+            return Err(act_facade_error(
+                ActOperation::OperatorPanicRecover,
+                format!("act operation=operator_panic_recover requires {name}"),
+                "call act operation=operator_panic_status, then pass all three exact generations unchanged",
+                name,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn act_operator_panic_recovery_error(code: &'static str, detail: String) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        "operator-panic browser mutation recovery failed closed",
+        Some(json!({
+            "code": code,
+            "detail": detail,
+            "remediation": "inspect act operation=operator_panic_status; resolve pending safety work or non-empty/unhealthy owner registries, then retry with the newly read exact generations"
+        })),
+    )
+}
+
+fn reject_act_operator_panic_generations(
+    params: &ActParams,
+    operation: ActOperation,
+) -> Result<(), ErrorData> {
+    if params.expected_extension_disable_sequence.is_some()
+        || params.expected_browser_disable_sequence.is_some()
+        || params.expected_operator_panic_epoch.is_some()
+    {
+        return Err(act_facade_error(
+            operation,
+            format!(
+                "act operation={} rejects operator-panic expected generations",
+                act_operation_name(operation)
+            ),
+            "remove expected_* fields; they are valid only for operation=operator_panic_recover",
+            "expected_*",
+        ));
+    }
     Ok(())
 }
 
