@@ -114,7 +114,12 @@ pub const WHISPER_TINY_INT8_ONNX_FILENAME: &str = "whisper-tiny-int8.onnx";
 /// daemon and the installer can never disagree about which bytes are legitimate
 /// (#1863).
 pub const WHISPER_TINY_INT8_ONNX_SHA256: &str =
-    "sha256:147afac751f89ad8e8f82133464edc81ecff9391e98ccdcae2474384be68ec86";
+    "sha256:f43e21f9aaa360ebcf94270a83c900a8ce69d2f402040d30e05cfaa73074602f";
+pub const WHISPER_TINY_INT8_ONNX_LENGTH: u64 = 77_318_368;
+pub const ORT_EXTENSIONS_WHISPER_FILENAME: &str = "onnxruntime_extensions.dll";
+pub const ORT_EXTENSIONS_WHISPER_SHA256: &str =
+    "sha256:0a0acea84ac7d90e5b6e81a6c37e19b8c356bd19809d44839ef945b3f2fee353";
+pub const ORT_EXTENSIONS_WHISPER_LENGTH: u64 = 3_333_664;
 /// How the optional STT artifact is acquired.
 ///
 /// Deliberately not a URL: no public repository publishes the ONNX Runtime

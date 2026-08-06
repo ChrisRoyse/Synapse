@@ -214,6 +214,13 @@ pub struct ObserveParams {
     #[serde(default)]
     #[schemars(range(min = 1, max = 4_294_967_295_u64))]
     pub window_hwnd: Option<i64>,
+    /// When present, transcribe this many seconds from the live loopback tail.
+    /// The request implies `include: ["audio"]` and the result is persisted in
+    /// the observation row before the call returns.
+    #[serde(default)]
+    pub transcribe_audio_seconds: Option<f64>,
+    #[serde(default)]
+    pub transcribe_audio_language: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Deserialize, JsonSchema)]
@@ -3592,6 +3599,9 @@ pub fn observe_include(params: &ObserveParams) -> ObserveInclude {
                 include.interactable_only = true;
             }
         }
+    }
+    if params.transcribe_audio_seconds.is_some() {
+        include.audio = true;
     }
     include.max_subtree_depth = observe_gather_depth(params);
     include.max_subtree_nodes = params.max_elements.unwrap_or(60).clamp(1, 500);

@@ -47,25 +47,35 @@ pub fn model_download_failed(source: &str) -> ModelError {
 }
 
 #[cfg(feature = "ort")]
-pub fn local_ort_extensions_library() -> Option<PathBuf> {
-    let dir = default_model_dir()
+pub fn local_ort_extensions_library() -> crate::ModelResult<PathBuf> {
+    let path = default_model_dir()
         .join("ort-extensions")
-        .join("wheel")
-        .join("onnxruntime_extensions");
-    let mut candidates = std::fs::read_dir(std::path::Path::new(&dir))
-        .ok()?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("_extensions_pydll"))
-                && path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("pyd"))
-        })
-        .collect::<Vec<_>>();
-    candidates.sort();
-    candidates.into_iter().next()
+        .join(crate::ORT_EXTENSIONS_WHISPER_FILENAME);
+    let metadata = std::fs::metadata(&path).map_err(|err| crate::ModelError::LoadFailed {
+        path: path.clone(),
+        detail: format!("pinned ONNX Runtime Extensions library is missing: {err}"),
+    })?;
+    if metadata.len() != crate::ORT_EXTENSIONS_WHISPER_LENGTH {
+        return Err(crate::ModelError::LoadFailed {
+            path,
+            detail: format!(
+                "ONNX Runtime Extensions length mismatch: expected {}, got {}",
+                crate::ORT_EXTENSIONS_WHISPER_LENGTH,
+                metadata.len()
+            ),
+        });
+    }
+    let actual = crate::sha256_file(&path).map_err(|err| crate::ModelError::LoadFailed {
+        path: path.clone(),
+        detail: format!("failed to hash ONNX Runtime Extensions library: {err}"),
+    })?;
+    let expected = crate::normalize_sha256(crate::ORT_EXTENSIONS_WHISPER_SHA256);
+    if actual != expected {
+        return Err(crate::ModelError::HashMismatch {
+            path,
+            expected,
+            actual,
+        });
+    }
+    Ok(path)
 }

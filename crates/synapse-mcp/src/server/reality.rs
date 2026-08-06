@@ -1026,6 +1026,8 @@ impl SynapseService {
             subtree_root: None,
             since_event_seq: None,
             window_hwnd: None,
+            transcribe_audio_seconds: None,
+            transcribe_audio_language: String::new(),
         };
         let include = observe_include(&params);
         let observation_snapshot = {

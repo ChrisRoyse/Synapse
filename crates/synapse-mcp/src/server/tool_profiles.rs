@@ -525,15 +525,28 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
         "observe",
         FLAT_FACADE_OPERATION_ENUM,
         "capture backend readback + perception observation payload",
-        &[op(
-            "current",
-            false,
-            true,
-            "active session target + capture backend readback",
-            None,
-            error_codes::CAPTURE_TARGET_INVALID,
-            "bind a target or pass an explicit target, then retry observe",
-        )],
+        &[
+            op(
+                "current",
+                false,
+                true,
+                "active session target + capture backend readback",
+                None,
+                error_codes::CAPTURE_TARGET_INVALID,
+                "bind a target or pass an explicit target, then retry observe",
+            ),
+            op(
+                "transcribe_audio",
+                false,
+                true,
+                "live WASAPI loopback ring -> Whisper inference + persisted CF_OBSERVATIONS observation.audio.transcription",
+                Some(
+                    "a separately decoded CF_OBSERVATIONS row containing the exact transcription, confidence provenance, latency, and model id",
+                ),
+                error_codes::AUDIO_STT_MODEL_NOT_LOADED,
+                "enable audio, install the pinned Whisper artifact, grant READ_AUDIO, and retry with a duration in the supported ring window",
+            ),
+        ],
     ),
     facade_contract(
         "find",

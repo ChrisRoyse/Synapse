@@ -89,6 +89,7 @@ impl SharedDetectorState {
                 vad_speech_recent: state.vad_speech_recent,
                 recent_events: state.recent_events.iter().cloned().collect(),
                 direction_estimate: None,
+                transcription: None,
             },
             moving_rms_db: linear_to_db(state.moving_rms),
             speech_active: state.speech_active,

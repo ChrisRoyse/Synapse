@@ -57,26 +57,16 @@ pub fn create_ort_session(
                 })?;
     }
     if descriptor.id == "whisper_tiny_int8" {
-        if let Some(library) = crate::download::local_ort_extensions_library() {
-            builder = builder.with_operator_library(&library).map_err(|err| {
-                crate::ModelError::LoadFailed {
-                    path: descriptor.path.clone(),
-                    detail: format!(
-                        "failed to register ONNX Runtime extensions library {}: {err}",
-                        library.display()
-                    ),
-                }
-            })?;
-        } else {
-            builder = builder.with_extensions().map_err(|err| {
-                crate::ModelError::LoadFailed {
-                    path: descriptor.path.clone(),
-                    detail: format!(
-                        "ONNX Runtime extensions unavailable and no local extension library found: {err}"
-                    ),
-                }
-            })?;
-        }
+        let library = crate::download::local_ort_extensions_library()?;
+        builder = builder.with_operator_library(&library).map_err(|err| {
+            crate::ModelError::LoadFailed {
+                path: descriptor.path.clone(),
+                detail: format!(
+                    "failed to register pinned ONNX Runtime Extensions library {}: {err}",
+                    library.display()
+                ),
+            }
+        })?;
     }
     let execution_provider = match provider {
         Cuda => ep::CUDA::default().build().error_on_failure(),

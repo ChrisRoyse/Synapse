@@ -230,6 +230,18 @@ pub struct AudioContext {
     pub recent_events: Vec<AudioEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub direction_estimate: Option<DirectionEstimate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcription: Option<AudioTranscription>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AudioTranscription {
+    pub text: String,
+    pub confidence: f32,
+    pub confidence_source: String,
+    pub latency_ms: u64,
+    pub model_id: String,
 }
 
 pub type AudioCue = AudioEvent;

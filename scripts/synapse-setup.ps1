@@ -7405,6 +7405,7 @@ function Get-SynapseOptionalModelPin {
         [Parameter(Mandatory=$true)][string]$SourceDir,
         [Parameter(Mandatory=$true)][string]$PinRelativePath,
         [Parameter(Mandatory=$true)][string]$RustConstantName,
+        [Parameter(Mandatory=$true)][string]$RustLengthConstantName,
         [Parameter(Mandatory=$true)][string]$RustSourceRelativePath
     )
 
@@ -7438,6 +7439,14 @@ function Get-SynapseOptionalModelPin {
     if ($rustSha -ne $pinSha) {
         Die "SYNAPSE_OPTIONAL_MODEL_PIN_DRIFT pin_path=$pinPath pin_sha256=$pinSha rust_path=$rustPath rust_constant=$RustConstantName rust_sha256=$rustSha remediation=the committed pin and the compiled daemon constant disagree; run scripts/build-whisper-e2e-onnx.ps1 which rewrites both, or reconcile them by hand before installing"
     }
+    $lengthMatch = [regex]::Match($rustText, "$([regex]::Escape($RustLengthConstantName))\s*:\s*u64\s*=\s*([0-9_]+)")
+    if (-not $lengthMatch.Success) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_LENGTH_CONSTANT_NOT_FOUND constant=$RustLengthConstantName path=$rustPath remediation=the daemon length constant could not be located; the installer refuses to certify runtime health metadata it cannot verify"
+    }
+    $rustLength = [int64]($lengthMatch.Groups[1].Value.Replace('_', ''))
+    if ($rustLength -ne [int64]$pin.length) {
+        Die "SYNAPSE_OPTIONAL_MODEL_PIN_LENGTH_DRIFT pin_path=$pinPath pin_length=$($pin.length) rust_path=$rustPath rust_constant=$RustLengthConstantName rust_length=$rustLength remediation=run scripts/build-whisper-e2e-onnx.ps1 to repin hash and length atomically"
+    }
     Info "Optional model pin verified id=$($pin.id) sha256=$pinSha length=$($pin.length) pin=$pinPath rust_constant=$RustConstantName"
     return [pscustomobject]@{
         Id = [string]$pin.id
@@ -7462,7 +7471,23 @@ function Get-SynapseEmbeddedModelPins {
     $whisperPin = Get-SynapseOptionalModelPin -SourceDir $SourceDir `
         -PinRelativePath 'models\whisper-tiny-int8.pin.json' `
         -RustConstantName 'WHISPER_TINY_INT8_ONNX_SHA256' `
+        -RustLengthConstantName 'WHISPER_TINY_INT8_ONNX_LENGTH' `
         -RustSourceRelativePath 'crates\synapse-models\src\registry.rs'
+    $extensionsPin = Get-SynapseOptionalModelPin -SourceDir $SourceDir `
+        -PinRelativePath 'models\onnxruntime-extensions-whisper.pin.json' `
+        -RustConstantName 'ORT_EXTENSIONS_WHISPER_SHA256' `
+        -RustLengthConstantName 'ORT_EXTENSIONS_WHISPER_LENGTH' `
+        -RustSourceRelativePath 'crates\synapse-models\src\registry.rs'
+    $extensionsPath = Join-Path $env:LOCALAPPDATA 'synapse\models\ort-extensions\onnxruntime_extensions.dll'
+    if (-not (Test-Path -LiteralPath $extensionsPath -PathType Leaf)) {
+        Die "SYNAPSE_ORT_EXTENSIONS_LIBRARY_MISSING path=$extensionsPath pin=$($extensionsPin.PinPath) remediation=run scripts\build-whisper-e2e-onnx.ps1; the end-to-end Whisper graph cannot load without its pinned custom operators"
+    }
+    $extensionsActualLength = [int64](Get-Item -LiteralPath $extensionsPath).Length
+    $extensionsActualSha = Get-SynapseFileSha256 -Path $extensionsPath
+    if ($extensionsActualLength -ne $extensionsPin.Length -or $extensionsActualSha -ne $extensionsPin.Sha256) {
+        Die "SYNAPSE_ORT_EXTENSIONS_LIBRARY_IDENTITY_MISMATCH path=$extensionsPath expected_sha256=$($extensionsPin.Sha256) actual_sha256=$extensionsActualSha expected_length=$($extensionsPin.Length) actual_length=$extensionsActualLength remediation=remove the mismatched file and regenerate it with scripts\build-whisper-e2e-onnx.ps1"
+    }
+    Info "Pinned ONNX Runtime Extensions library verified path=$extensionsPath sha256=$extensionsActualSha length=$extensionsActualLength"
 
     # Candidate sources for the optional artifact, in precedence order. The
     # operator override comes first so a freshly produced artifact can be

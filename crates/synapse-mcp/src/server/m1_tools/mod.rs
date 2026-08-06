@@ -44,6 +44,7 @@ use crate::m1::{
     hidden_desktop_input_from_worker_snapshot, observe_input_from_snapshot,
 };
 use crate::m3::activity_recorder::BrowserNavigationEvent;
+use crate::m3::audio::{AudioTranscribeParams, transcribe_audio};
 use crate::server::session_continuity::PersistedCdpTargetOwner;
 use crate::server::target_claims::{
     DEFAULT_TARGET_CLAIM_TTL_MS, TargetClaimAdoptParams, TargetClaimAdoptResponse,
@@ -565,6 +566,24 @@ impl SynapseService {
 
         if include.audio && input.audio == synapse_core::AudioContext::default() {
             populate_audio_summary(&self.m3_state, &mut input);
+        }
+        if let Some(seconds) = params.0.transcribe_audio_seconds {
+            let transcription_params = AudioTranscribeParams {
+                seconds,
+                language: params.0.transcribe_audio_language.clone(),
+            };
+            self.require_m3_permissions(
+                "observe.transcribe_audio",
+                &crate::m3::audio::required_permissions_transcribe(&transcription_params),
+            )?;
+            let transcription = transcribe_audio(&self.m3_state, &transcription_params)?;
+            input.audio.transcription = Some(synapse_core::AudioTranscription {
+                text: transcription.text,
+                confidence: transcription.confidence,
+                confidence_source: transcription.confidence_source,
+                latency_ms: transcription.latency_ms,
+                model_id: transcription.model_id,
+            });
         }
         if include.diagnostics {
             self.populate_input_backend_diagnostics(&mut input);

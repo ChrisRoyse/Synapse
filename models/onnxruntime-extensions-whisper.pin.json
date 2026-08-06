@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "id": "onnxruntime_extensions_whisper",
+  "filename": "onnxruntime_extensions.dll",
+  "sha256": "0A0ACEA84AC7D90E5B6E81A6C37E19B8C356BD19809D44839EF945B3F2FEE353",
+  "length": 3333664,
+  "recipe": "scripts/build-whisper-e2e-onnx.ps1",
+  "acquisition": {
+    "override_env": ""
+  }
+}

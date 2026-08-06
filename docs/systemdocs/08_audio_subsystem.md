@@ -222,8 +222,8 @@ Error mapping: `loopback_init` -> `LoopbackInitFailed`; `device_lost` -> `Device
 | Constant | Value |
 |---|---|
 | `WHISPER_TINY_INT8_FILENAME` | `whisper-tiny-int8.onnx` |
-| `WHISPER_TINY_INT8_SHA256` | `147afac751f89ad8e8f82133464edc81ecff9391e98ccdcae2474384be68ec86` |
-| `WHISPER_TINY_INT8_EXPECTED_LEN` | `77356651` |
+| `WHISPER_TINY_INT8_SHA256` | aliases the single pinned `synapse-models` registry digest |
+| `WHISPER_TINY_INT8_EXPECTED_LEN` | aliases the single pinned `synapse-models` registry byte length (`77318368`) |
 
 Model is **Whisper tiny, INT8 ONNX**, run with backend `ModelBackend::Cpu` (via
 `ModelLoader::new(vec![ModelBackend::Cpu])`). `default_model_path()` =
