@@ -345,6 +345,7 @@ pub fn arm_routine(
             "ROUTINE_NOT_MINED: routine_id {routine_id} is not in CF_ROUTINES; run routine_mine before arming"
         )));
     };
+    validate_autonomy_eligibility(db, &routine, config)?;
     let Some(automation) = load_routine_automation_record(db, routine_id)? else {
         return Err(invalid(format!(
             "ROUTINE_AUTOMATION_NOT_INSTALLED: routine_id {routine_id} has no routine_automation row; run routine_automate and accept the profile-authoring candidate before arming"
@@ -356,8 +357,6 @@ pub fn arm_routine(
             automation.state, automation.plan_ref
         )));
     }
-    validate_autonomy_eligibility(db, &routine, config)?;
-
     let now = now_ts_ns();
     let existing = load_armed_routine_record(db, routine_id)?;
     let mut record = existing.unwrap_or_else(|| ArmedRoutineRecord {
