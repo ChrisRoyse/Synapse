@@ -5,6 +5,8 @@ pub use anneal::{
     SynapseCalyxAnnealChangeReport, SynapseCalyxAnnealRollbackReport,
     SynapseCalyxAnnealSearchReport, SynapseCalyxAnnealSearchSlotMetrics, SynapseCalyxAnnealStatus,
 };
+mod autonomy;
+pub use autonomy::SynapseCalyxAutonomyDecisionReadback;
 mod async_vault;
 pub mod backup;
 mod drift;

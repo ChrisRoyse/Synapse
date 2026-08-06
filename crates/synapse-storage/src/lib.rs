@@ -998,6 +998,15 @@ impl Db {
         self.backend.oracle_readiness()
     }
 
+    /// Appends a proactive-autonomy decision to the native Calyx Policy ledger.
+    pub fn append_autonomy_decision(
+        &self,
+        routine_id: &str,
+        decision: &serde_json::Value,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAutonomyDecisionReadback> {
+        self.backend.append_autonomy_decision(routine_id, decision)
+    }
+
     /// Reads the authoritative source-row pointer stored on a physical Calyx Base row.
     pub fn read_calyx_base_source_pointer(
         &self,

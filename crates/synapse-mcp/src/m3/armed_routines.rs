@@ -345,18 +345,48 @@ pub fn arm_routine(
             "ROUTINE_NOT_MINED: routine_id {routine_id} is not in CF_ROUTINES; run routine_mine before arming"
         )));
     };
-    validate_autonomy_eligibility(db, &routine, config)?;
+    if let Err(error) = validate_autonomy_eligibility(db, &routine, config) {
+        append_autonomy_decision_required(
+            db,
+            &routine,
+            config,
+            "refused",
+            Some(error_codes::ROUTINE_AUTONOMY_NOT_READY),
+            Some(&error.message),
+        )?;
+        return Err(error);
+    }
     let Some(automation) = load_routine_automation_record(db, routine_id)? else {
-        return Err(invalid(format!(
+        let detail = format!(
             "ROUTINE_AUTOMATION_NOT_INSTALLED: routine_id {routine_id} has no routine_automation row; run routine_automate and accept the profile-authoring candidate before arming"
-        )));
+        );
+        append_autonomy_decision_required(
+            db,
+            &routine,
+            config,
+            "refused",
+            Some("ROUTINE_AUTOMATION_NOT_INSTALLED"),
+            Some(&detail),
+        )?;
+        return Err(invalid(detail));
     };
     if automation.state != "installed" || automation.plan_ref.trim().is_empty() {
-        return Err(invalid(format!(
+        let detail = format!(
             "ROUTINE_AUTOMATION_NOT_INSTALLED: routine_id {routine_id} automation state is {:?}, plan_ref={:?}; accept the profile-authoring candidate before arming",
             automation.state, automation.plan_ref
-        )));
+        );
+        append_autonomy_decision_required(
+            db,
+            &routine,
+            config,
+            "refused",
+            Some("ROUTINE_AUTOMATION_NOT_INSTALLED"),
+            Some(&detail),
+        )?;
+        return Err(invalid(detail));
     }
+
+    append_autonomy_decision_required(db, &routine, config, "allowed", None, None)?;
     let now = now_ts_ns();
     let existing = load_armed_routine_record(db, routine_id)?;
     let mut record = existing.unwrap_or_else(|| ArmedRoutineRecord {
@@ -401,6 +431,43 @@ pub fn arm_routine(
     record.last_run_status = None;
     write_armed_routine_record(db, &record)?;
     read_armed_required(db, routine_id)
+}
+
+fn append_autonomy_decision_required(
+    db: &Arc<Db>,
+    routine: &RoutineRecord,
+    config: ArmRoutineConfig,
+    outcome: &str,
+    code: Option<&str>,
+    detail: Option<&str>,
+) -> Result<synapse_calyx::SynapseCalyxAutonomyDecisionReadback, ErrorData> {
+    db.append_autonomy_decision(
+        &routine.routine_id,
+        &json!({
+            "outcome": outcome,
+            "code": code,
+            "detail": detail,
+            "schedule_enabled": config.schedule_enabled,
+            "intent_enabled": config.intent_enabled,
+            "failure_threshold": config.failure_threshold,
+            "routine": {
+                "confidence": routine.confidence,
+                "support_days": routine.support_days,
+                "opportunity_days": routine.opportunity_days,
+                "occurrence_count": routine.occurrence_count,
+                "mined_at_ns": routine.ts_ns,
+            },
+        }),
+    )
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!(
+                "AUTONOMY_DECISION_LEDGER_APPEND_FAILED: routine_id={} outcome={outcome}: {error}; remediation: repair the Calyx Ledger append path and verify_chain before retrying; no autonomy decision was released or applied",
+                routine.routine_id
+            ),
+        )
+    })
 }
 
 fn validate_autonomy_eligibility(

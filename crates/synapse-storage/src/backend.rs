@@ -726,6 +726,11 @@ pub trait StorageBackend: Send + Sync {
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value>;
     fn oracle_measure_readiness(&self) -> StorageResult<Value>;
     fn oracle_readiness(&self) -> StorageResult<Option<Value>>;
+    fn append_autonomy_decision(
+        &self,
+        routine_id: &str,
+        decision: &Value,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAutonomyDecisionReadback>;
     fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -1334,6 +1339,29 @@ impl CalyxVaultRuntime {
                     )
                 })
         })
+    }
+
+    fn append_autonomy_decision(
+        &self,
+        routine_id: &str,
+        decision: &Value,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAutonomyDecisionReadback> {
+        self.with_vault(
+            "calyx_ledger",
+            "append autonomy decision policy ledger",
+            true,
+            |vault| {
+                vault
+                    .append_autonomy_decision(routine_id, decision)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_ledger",
+                            "append autonomy decision policy ledger",
+                            &source,
+                        )
+                    })
+            },
+        )
     }
 
     fn put_action_oracle_publication_inner(
@@ -4182,6 +4210,14 @@ impl StorageBackend for CalyxBackend {
 
     fn oracle_readiness(&self) -> StorageResult<Option<Value>> {
         self.vault.oracle_readiness()
+    }
+
+    fn append_autonomy_decision(
+        &self,
+        routine_id: &str,
+        decision: &Value,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxAutonomyDecisionReadback> {
+        self.vault.append_autonomy_decision(routine_id, decision)
     }
 
     fn persist_recurrence_finding(
