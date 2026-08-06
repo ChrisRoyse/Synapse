@@ -94,22 +94,7 @@ impl SynapseCalyxVault {
             ),
             Err(error) => failed(Tier::Calibrated, calyx_oracle::CALIBRATION_BUDGET, &error),
         };
-        // #1681 owns these two persisted measurement sources. Absence is an
-        // explicit failed tier, which is the fail-closed autonomy behavior.
-        let goodhart = TierResult::new(
-            Tier::GoodhartDefended,
-            false,
-            0.0,
-            calyx_oracle::GOODHART_THRESHOLD,
-            Some("run and persist the Anneal held-out Goodhart defense report".to_owned()),
-        );
-        let mistakes = TierResult::new(
-            Tier::MistakeClosed,
-            false,
-            1.0,
-            0.0,
-            Some("run and persist Anneal mistake replay and regression closure".to_owned()),
-        );
+        let (goodhart, mistakes) = self.action_validation_tiers();
         let report = SuperIntelReport::new(
             domain,
             vec![
@@ -152,6 +137,60 @@ impl SynapseCalyxVault {
         })
     }
 
+    fn action_validation_tiers(&self) -> (TierResult, TierResult) {
+        let evidence = match self.read_action_validation() {
+            Ok(Some(evidence)) => evidence,
+            Ok(None) => {
+                return validation_failed(
+                    "run storage intelligence oracle_validate to persist a chronological action-domain holdout",
+                );
+            }
+            Err(error) => return validation_failed(error.remediation),
+        };
+        if evidence.domain != ACTION_DOMAIN || evidence.panel_version != 2_006_001 {
+            return validation_failed(
+                "discard the mismatched action validation row and rerun oracle_validate for syn-action-v1",
+            );
+        }
+        let (current_count, current_hash) = match self.current_action_corpus_binding() {
+            Ok(binding) => binding,
+            Err(error) => return validation_failed(error.remediation),
+        };
+        if current_count != evidence.action_record_count
+            || current_hash != evidence.action_corpus_sha256
+        {
+            return validation_failed(
+                "action outcomes changed after validation; rerun oracle_validate before measuring readiness",
+            );
+        }
+        let pass_rate = evidence.goodhart.in_region_frac.unwrap_or(0.0) as f32;
+        let goodhart_passed = evidence.goodhart.passed
+            && pass_rate.is_finite()
+            && pass_rate >= calyx_oracle::GOODHART_THRESHOLD;
+        let goodhart = TierResult::new(
+            Tier::GoodhartDefended,
+            goodhart_passed,
+            pass_rate,
+            calyx_oracle::GOODHART_THRESHOLD,
+            (!goodhart_passed).then(|| {
+                "held-out successful actions crossed the calibrated Ward boundary; inspect the persisted Goodhart violations and recalibrate from real outcomes".to_owned()
+            }),
+        );
+        let mistakes_valid = calyx_anneal::regression_rate(&evidence.mistakes).is_ok();
+        let mistakes_passed =
+            mistakes_valid && evidence.mistakes.passed && evidence.mistakes.regression_count == 0;
+        let mistakes = TierResult::new(
+            Tier::MistakeClosed,
+            mistakes_passed,
+            evidence.mistakes.regression_count as f32,
+            0.0,
+            (!mistakes_passed).then(|| {
+                "one or more chronological action mistakes still recur under current evidence; improve the action predictor and rerun oracle_validate".to_owned()
+            }),
+        );
+        (goodhart, mistakes)
+    }
+
     /// Reads the last persisted readiness snapshot without recomputation.
     pub fn read_action_readiness(
         &self,
@@ -180,6 +219,20 @@ impl SynapseCalyxVault {
                 .collect(),
         }))
     }
+}
+
+fn validation_failed(remediation: impl Into<String>) -> (TierResult, TierResult) {
+    let remediation = remediation.into();
+    (
+        TierResult::new(
+            Tier::GoodhartDefended,
+            false,
+            0.0,
+            calyx_oracle::GOODHART_THRESHOLD,
+            Some(remediation.clone()),
+        ),
+        TierResult::new(Tier::MistakeClosed, false, 1.0, 0.0, Some(remediation)),
+    )
 }
 
 fn failed(tier: Tier, threshold: f32, error: &SynapseCalyxError) -> TierResult {

@@ -1222,6 +1222,14 @@ pub(super) async fn handle(
                             },
                         )
                     }
+                    StorageIntelligenceOperation::OracleValidate => {
+                        crate::m3::storage::run_intelligence_oracle_validate(&db, &spec).map(
+                            |oracle| StorageIntelligenceResponse {
+                                oracle: Some(oracle),
+                                ..base
+                            },
+                        )
+                    }
                     StorageIntelligenceOperation::OracleReadiness => {
                         crate::m3::storage::run_intelligence_oracle_readiness(&db, &spec).map(
                             |oracle| StorageIntelligenceResponse {

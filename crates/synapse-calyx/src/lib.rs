@@ -7,6 +7,8 @@ pub use anneal::{
 };
 mod autonomy;
 pub use autonomy::SynapseCalyxAutonomyDecisionReadback;
+mod action_validation;
+pub use action_validation::SynapseCalyxActionValidationEvidence;
 mod async_vault;
 pub mod backup;
 mod drift;

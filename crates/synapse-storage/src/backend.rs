@@ -724,6 +724,7 @@ pub trait StorageBackend: Send + Sync {
     fn oracle_predict_action(&self, action_id: &str) -> StorageResult<Value>;
     fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<Value>;
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value>;
+    fn oracle_validate_action(&self) -> StorageResult<Value>;
     fn oracle_measure_readiness(&self) -> StorageResult<Value>;
     fn oracle_readiness(&self) -> StorageResult<Option<Value>>;
     fn append_autonomy_decision(
@@ -1320,6 +1321,31 @@ impl CalyxVaultRuntime {
                 calyx_write_failed_detail("calyx_oracle", format!("encode readiness snapshot: {error}"))
             })
         })
+    }
+
+    fn oracle_validate_action(&self) -> StorageResult<Value> {
+        self.with_vault(
+            "calyx_oracle",
+            "validate action readiness evidence",
+            true,
+            |vault| {
+                let evidence = vault
+                    .validate_action_readiness(SYN_ACTION_PANEL_VERSION)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_oracle",
+                            "validate action readiness evidence",
+                            &source,
+                        )
+                    })?;
+                serde_json::to_value(evidence).map_err(|error| {
+                    calyx_write_failed_detail(
+                        "calyx_oracle",
+                        format!("encode action validation evidence: {error}"),
+                    )
+                })
+            },
+        )
     }
 
     fn oracle_readiness(&self) -> StorageResult<Option<Value>> {
@@ -4202,6 +4228,10 @@ impl StorageBackend for CalyxBackend {
 
     fn oracle_complete_action(&self, cx_id: &str, free_slots: &[u16]) -> StorageResult<Value> {
         self.vault.oracle_complete_action(cx_id, free_slots)
+    }
+
+    fn oracle_validate_action(&self) -> StorageResult<Value> {
+        self.vault.oracle_validate_action()
     }
 
     fn oracle_measure_readiness(&self) -> StorageResult<Value> {

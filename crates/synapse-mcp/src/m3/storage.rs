@@ -1441,6 +1441,7 @@ pub enum StorageIntelligenceOperation {
     OraclePredict,
     OracleReverse,
     OracleComplete,
+    OracleValidate,
     OracleReadiness,
     OlapAggregate,
     /// The ensemble capability card: per-lens marginal value, the PID triple,
@@ -1468,6 +1469,7 @@ impl StorageIntelligenceOperation {
             Self::OraclePredict => "oracle_predict",
             Self::OracleReverse => "oracle_reverse",
             Self::OracleComplete => "oracle_complete",
+            Self::OracleValidate => "oracle_validate",
             Self::OracleReadiness => "oracle_readiness",
             Self::OlapAggregate => "olap_aggregate",
             Self::EnsembleCard => "ensemble_card",
@@ -4488,6 +4490,16 @@ pub fn run_intelligence_oracle_readiness(
 ) -> Result<serde_json::Value, ErrorData> {
     require_action_panel(params, "oracle_readiness")?;
     db.oracle_measure_readiness()
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+/// Produces and atomically persists chronological action-domain validation evidence.
+pub fn run_intelligence_oracle_validate(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<serde_json::Value, ErrorData> {
+    require_action_panel(params, "oracle_validate")?;
+    db.oracle_validate_action()
         .map_err(|error| mcp_error(error.code(), error.to_string()))
 }
 

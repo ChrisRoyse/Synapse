@@ -994,6 +994,10 @@ impl Db {
         self.backend.oracle_measure_readiness()
     }
 
+    pub fn oracle_validate_action(&self) -> StorageResult<serde_json::Value> {
+        self.backend.oracle_validate_action()
+    }
+
     pub fn oracle_readiness(&self) -> StorageResult<Option<serde_json::Value>> {
         self.backend.oracle_readiness()
     }
