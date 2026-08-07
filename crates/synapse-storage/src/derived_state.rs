@@ -1699,6 +1699,36 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
             continue;
         }
 
+        // #2076: the weave already classifies directionless (zero-norm) slot
+        // vectors out of the cosine lane and reports which records they came
+        // from, but nothing on the unattended path had ever read that field, so
+        // the corpus property that stalled this maintainer for six ticks was
+        // invisible in the maintainer's own log. Report it where it happens.
+        if !report.knn_zero_norm_exclusions.is_empty() {
+            let excluded_records: usize = report
+                .knn_zero_norm_exclusions
+                .iter()
+                .map(|exclusion| exclusion.records)
+                .sum();
+            let slots = report
+                .knn_zero_norm_exclusions
+                .iter()
+                .map(|exclusion| exclusion.slot.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::info!(
+                code = "STORAGE_DERIVED_STATE_WEAVE_ZERO_NORM_EXCLUSIONS",
+                panel_version,
+                since_ns = part_since,
+                until_ns = part_until,
+                excluded_slot_count = report.knn_zero_norm_exclusions.len(),
+                excluded_records,
+                slots = %slots,
+                "slot vectors that measure to exactly zero carry no direction and were classified \
+                 out of the geometric lane; they remain measured, and every other lane wove"
+            );
+        }
+
         completed_parts += 1;
         records_woven = records_woven.saturating_add(report.records_woven as u64);
         last_xterm_rows = report.xterm_cf_rows_after;
