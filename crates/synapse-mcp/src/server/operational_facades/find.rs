@@ -135,7 +135,7 @@ pub(crate) async fn run_fused_find(
                     "calyx_search",
                     FIND_SIMILAR_SOT,
                     error,
-                    "run storage operation=search_rebuild when the persisted generation is missing, stale, or marked rebuild-required; a generation lagging further behind the vault than the bounded delta-reconciliation limit fails every query with CALYX_SEARCH_DELTA_REBASE_REQUIRED, and `health` subsystem calyx_search_generation reports which of those states the vault is in, or correct query_mode/fusion/example before retrying",
+                    "run storage operation=search_rebuild expected_panel_version=<the panel_version this call named, or the active panel when it named none> when the persisted generation is missing, stale, or marked rebuild-required; the substrate names the `calyx rebuild-search-index` CLI, which is NOT on the MCP surface — search_rebuild is the reachable equivalent and it is panel-scoped. A generation lagging further behind the vault than the bounded delta-reconciliation limit fails every query with CALYX_SEARCH_DELTA_REBASE_REQUIRED; `health` subsystem calyx_search_generation reports per-panel state in calyx_search_generation_panels, and a panel listed in calyx_search_generations_unbuilt_declared_queryable_panel_versions has never had a generation built at all rather than having a stale one (#2075) — the unattended sweep now enrolls those for an initial build, so waiting one derived-state tick also clears it. Otherwise correct query_mode/fusion/example before retrying",
                 )
             })?;
     tracing::info!(

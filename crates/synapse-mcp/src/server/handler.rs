@@ -635,6 +635,25 @@ fn tool_operation_from_arguments(
     }
 }
 
+/// Gives the rmcp-generated failures a Synapse-shaped `data.code`.
+///
+/// **Scope, and why it is narrow (#2074).** This is a last-resort labeller for
+/// errors *rmcp itself* raised — the router's "tool not found" and the
+/// `deny_unknown_fields` deserialize dead-ends — which are the only failures on
+/// this surface with nothing better to say than "your parameters are wrong".
+/// The guard is deliberately structural (`data.is_none()` plus the JSON-RPC
+/// code) and never reads the message, because a normalizer that classified by
+/// message text would be doing exactly the string-parsing that having a
+/// `data.code` exists to remove.
+///
+/// The consequence is a standing obligation on every tool path: **a refusal that
+/// knows its own cause must carry it in `data`**, via
+/// [`crate::m1::mcp_error`] / [`crate::m1::mcp_error_with_remediation`] or an
+/// equivalent structured error. A raw `ErrorData::invalid_params(msg, None)`
+/// reaching here is relabelled `TOOL_PARAMS_INVALID` whatever its message says —
+/// which is how `observe` came to report a daemon-side
+/// `DETECTION_MODEL_NOT_LOADED` profile fault as a caller parameter error. That
+/// is fixed where such errors are built, not here.
 fn normalize_tool_error(tool_name: &str, error: ErrorData) -> ErrorData {
     if error.data.is_none() && error.message == "tool not found" {
         return mcp_error(

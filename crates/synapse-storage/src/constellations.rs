@@ -2859,6 +2859,53 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
     ]
 }
 
+/// Every live panel generation a caller may name in `panel_version` on a fused
+/// query — the **declared-queryable set** (#2075).
+///
+/// `find operation=similar` / `storage operation=find_similar` accept an
+/// explicit `panel_version` and search it directly. What they accept is decided
+/// by exactly one thing: whether [`syn_active_panel_contract`] declares a slot
+/// contract for that version. A version with no contract fails closed rather
+/// than being searched through a neighbouring panel's slot map, so the set of
+/// versions a query can *reach* is precisely the live catalog generations that
+/// have a contract.
+///
+/// This exists because three different questions were being answered with two
+/// different facts:
+///
+/// * *which generations exist on disk* — `published_search_generations`;
+/// * *which generation the vault manifest names active* — the active pointer;
+/// * *which generations a caller may query* — nothing answered this, so the
+///   unattended search-generation maintainer used the first two as a stand-in.
+///
+/// A panel that is re-versioned gets a brand-new version with no directory on
+/// disk and (unless it is the active panel) no maintainer, so its first
+/// generation was never built by anything: `find panel_version=<new>` failed
+/// with `SYNAPSE_CALYX_FIND_INDEX_STALE` indefinitely while health called
+/// search `ok`. Derived here, never declared twice, so the maintained set
+/// cannot drift from the queryable set.
+///
+/// A version whose contract build *fails* is still declared-queryable: the code
+/// declares it, the declaration is merely broken, and the caller of this
+/// function must report that as a failure against that panel rather than
+/// silently narrowing the set it maintains.
+#[must_use]
+pub fn declared_queryable_panel_versions(created_at_ms: u64) -> Vec<u32> {
+    let mut versions: Vec<u32> = builtin_panel_catalog()
+        .into_iter()
+        .filter(|entry| {
+            !matches!(
+                syn_active_panel_contract(entry.panel_version, created_at_ms),
+                Ok(None)
+            )
+        })
+        .map(|entry| entry.panel_version)
+        .collect();
+    versions.sort_unstable();
+    versions.dedup();
+    versions
+}
+
 /// The catalog entry owning one panel version, whether active or superseded.
 #[must_use]
 pub fn panel_catalog_entry_for_version(panel_version: u32) -> Option<PanelCatalogEntry> {
@@ -6949,14 +6996,6 @@ pub fn publish_graph_position_snapshot(
         ]
         .concat(),
     );
-    vault
-        .reserve_panel_generations(&derived_snapshot_base_generations())
-        .map_err(|error| measurement_error("reserve graph panel generation", error))?;
-    let allocation = vault
-        .allocate_panel_generation(kind.panel_name(), &operation_id)
-        .map_err(|error| measurement_error("allocate graph panel generation", error))?;
-    let panel_version = allocation.panel_generation;
-
     let mut names = BTreeSet::new();
     for (src, dst, _) in transitions {
         names.insert(src.clone());
@@ -6978,6 +7017,35 @@ pub fn publish_graph_position_snapshot(
         .map_err(|error| measurement_error("build transition graph", error))?;
     let structural = structural_signatures(&graph, StructuralParams::default())
         .map_err(|error| measurement_error("measure structural signatures", error))?;
+
+    // #2081: the generation is minted only after the structure has actually
+    // been measured.
+    //
+    // Every input to this publish that can fail — the transition graph, and the
+    // spectral/betweenness/PageRank pass over it — is now upstream of the
+    // allocator. That ordering matters because an allocated generation cannot
+    // be given back: owner rows are permanent by design (attribution depends on
+    // them), and `MAX_OWNERS` is a hard cliff. Under the previous ordering a
+    // publisher whose compute failed deterministically minted one permanent,
+    // zero-row, un-retirable owner per tick — and a zero-row generation
+    // produces no `Base` census entry, so none of #2062's three safety nets
+    // could see it: `dynamic_panels_multi_live` read `[]`, the unretired sweep
+    // never fired, and the ORPHANED error's own advice ("swept by the next
+    // successful publish") was unreachable because there was never going to be
+    // a next successful publish. Twenty allocator-live generations read as one
+    // on the public census.
+    //
+    // Nothing between here and the commit can fail without the vault having
+    // already accepted rows, so what remains after this point is the ordinary
+    // #2062 orphan case the retirement ledger was built for.
+    vault
+        .reserve_panel_generations(&derived_snapshot_base_generations())
+        .map_err(|error| measurement_error("reserve graph panel generation", error))?;
+    let allocation = vault
+        .allocate_panel_generation(kind.panel_name(), &operation_id)
+        .map_err(|error| measurement_error("allocate graph panel generation", error))?;
+    let panel_version = allocation.panel_generation;
+
     let mut neighbors = BTreeMap::<String, BTreeSet<String>>::new();
     for (src, dst, _) in transitions {
         neighbors

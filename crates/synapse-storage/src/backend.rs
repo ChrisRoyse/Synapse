@@ -3390,12 +3390,31 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })?;
+                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                // #2075: discovering the set from disk fixed maintenance and
+                // left bootstrap broken. A generation that has never been built
+                // has no directory to be discovered by, and the only exemption
+                // was the active panel — so the active panel could be born and
+                // no other panel could. A panel version bump produces exactly
+                // that state, and on the live vault it left the three
+                // outcome-bearing corpora (episode, agent-transcript,
+                // mcp-usage) with no persisted generation at all, so every
+                // fused query naming them failed closed with
+                // SYNAPSE_CALYX_FIND_INDEX_STALE while health reported search
+                // `ok` from the active generation alone.
+                //
+                // "Which generations may be queried" is its own question and is
+                // now asked directly, of the same declaration `find` fails
+                // closed against.
+                let declared_queryable =
+                    constellations::declared_queryable_panel_versions(created_at_ms);
                 let mut targets = published.panels.clone();
                 if let Some(active) = active_panel_version
                     && !targets.contains(&active)
                 {
                     targets.push(active);
                 }
+                targets.extend(declared_queryable.iter().copied());
                 targets.sort_unstable();
                 targets.dedup();
                 // The active generation is swept **first**, not in version
@@ -3411,7 +3430,6 @@ impl StorageBackend for CalyxBackend {
                     targets[..=position].rotate_right(1);
                 }
 
-                let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
                 // Genuinely pass-level, so it is checked once here rather than
                 // once per panel inside `syn_active_panel_contract`. An
                 // undeclared lens provenance is a property of the *code*, not of
@@ -3422,6 +3440,11 @@ impl StorageBackend for CalyxBackend {
                 let mut generations = Vec::with_capacity(targets.len());
                 for panel_version in targets {
                     let is_active_panel = active_panel_version == Some(panel_version);
+                    let is_declared_queryable = declared_queryable.contains(&panel_version);
+                    // The pre-pass disk census, captured per target so the
+                    // post-pass manifest presence is defined for dispositions
+                    // that produce no report (#2075).
+                    let manifest_present_at_start = published.panels.contains(&panel_version);
                     // A non-active generation can only be rebuilt from its own
                     // code-declared contract. Resolving it here, before the
                     // attempt, turns "no contract" from a rebuild failure into a
@@ -3454,6 +3477,8 @@ impl StorageBackend for CalyxBackend {
                             generations.push(PanelGenerationMaintenance {
                                 panel_version,
                                 is_active_panel,
+                                is_declared_queryable,
+                                manifest_present_at_start,
                                 disposition: GenerationDisposition::Failed {
                                     code: "STORAGE_SEARCH_GENERATION_CONTRACT_BUILD_FAILED"
                                         .to_owned(),
@@ -3508,6 +3533,8 @@ impl StorageBackend for CalyxBackend {
                         generations.push(PanelGenerationMaintenance {
                             panel_version,
                             is_active_panel,
+                            is_declared_queryable,
+                            manifest_present_at_start,
                             disposition,
                         });
                         continue;
@@ -3541,6 +3568,8 @@ impl StorageBackend for CalyxBackend {
                     generations.push(PanelGenerationMaintenance {
                         panel_version,
                         is_active_panel,
+                        is_declared_queryable,
+                        manifest_present_at_start,
                         disposition,
                     });
                 }
@@ -3548,12 +3577,33 @@ impl StorageBackend for CalyxBackend {
                 let sweep = SearchGenerationSweep {
                     index_root: published.index_root.display().to_string(),
                     active_panel_version,
+                    declared_queryable_panel_versions: declared_queryable,
                     generations,
                     unrecognized_index_entries: published.unrecognized,
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 };
+                // #2075: named loudly, at the pass that owns the condition. A
+                // declared-queryable panel with no manifest is not a pending
+                // chore — every fused query naming it is failing closed right
+                // now, and the active generation's health says nothing about it.
+                let unbuilt = sweep.unbuilt_declared_queryable_panel_versions();
+                if !unbuilt.is_empty() {
+                    tracing::warn!(
+                        code = "STORAGE_SEARCH_GENERATION_DECLARED_QUERYABLE_UNBUILT",
+                        unbuilt_declared_queryable_panels = ?unbuilt,
+                        declared_queryable_panels = ?sweep.declared_queryable_panel_versions,
+                        index_root = %sweep.index_root,
+                        detail = %sweep.summary_line(),
+                        "one or more panel generations the tool contract declares queryable have \
+                         no persisted search generation, so every fused find naming them fails \
+                         closed with SYNAPSE_CALYX_FIND_INDEX_STALE; the sweep enrolled them for \
+                         an initial build, and a version still listed here after the next pass \
+                         means that build did not complete"
+                    );
+                }
                 tracing::info!(
                     code = "STORAGE_SEARCH_GENERATION_SWEEP_COMPLETED",
+                    unbuilt_declared_queryable = unbuilt.len(),
                     generations = sweep.generations.len(),
                     any_failed = sweep.any_failed(),
                     closest_to_bound = ?sweep.closest_to_bound(),

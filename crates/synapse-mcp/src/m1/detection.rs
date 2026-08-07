@@ -647,6 +647,30 @@ pub fn default_detection_config() -> DetectionRuntimeConfig {
     DetectionRuntimeConfig::default()
 }
 
+/// Runs the detection stage for one observation.
+///
+/// # Errors
+///
+/// Every refusal here is built with [`crate::m1::mcp_error`] /
+/// [`crate::m1::mcp_error_with_remediation`], so the **specific** cause travels
+/// in `error.data.code` (#2074).
+///
+/// This was the last m1 module still constructing raw
+/// `ErrorData::invalid_params(msg, None)`, and that `None` was load-bearing in
+/// the wrong direction: `normalize_tool_error` in `server/handler.rs` rewrites
+/// any error with `data == None` and JSON-RPC code `INVALID_PARAMS` into
+/// `data.code = "TOOL_PARAMS_INVALID"`. Its guard is purely structural — it
+/// cannot tell an rmcp `deny_unknown_fields` deserialize dead-end from a
+/// daemon-side profile fault — so `observe` reported
+/// `data.code = "TOOL_PARAMS_INVALID"` for a `DETECTION_MODEL_NOT_LOADED`
+/// refusal whose caller's parameters were entirely valid. The real code was
+/// recoverable only by string-parsing the message, so no consumer could use one
+/// branching rule across the surface the way the storage/hygiene facades allow.
+///
+/// Supplying `data` here short-circuits that rewrite at the source rather than
+/// teaching the normalizer to read messages, which would re-introduce the same
+/// string-parsing one layer down. The message text is deliberately unchanged, so
+/// anything matching on it today still matches.
 pub fn populate_detection_from_state(
     runtime: &mut DetectionRuntime,
     config: &DetectionRuntimeConfig,
@@ -659,13 +683,13 @@ pub fn populate_detection_from_state(
         return Ok(());
     }
     if input.foreground.window_bounds.w <= 0 || input.foreground.window_bounds.h <= 0 {
-        return Err(ErrorData::invalid_params(
+        return Err(crate::m1::mcp_error(
+            error_codes::DETECTION_NO_FRAME,
             format!(
                 "{}: detection requires positive foreground bounds, got {:?}",
                 error_codes::DETECTION_NO_FRAME,
                 input.foreground.window_bounds
             ),
-            None,
         ));
     }
     if !valid_detection_config(config) {
@@ -675,14 +699,14 @@ pub fn populate_detection_from_state(
             max_detections = config.max_detections,
             "detection configuration is invalid"
         );
-        return Err(ErrorData::invalid_params(
+        return Err(crate::m1::mcp_error(
+            error_codes::DETECTION_MODEL_INFER_FAILED,
             format!(
                 "{}: confidence_threshold={} max_detections={}",
                 error_codes::DETECTION_MODEL_INFER_FAILED,
                 config.confidence_threshold,
                 config.max_detections
             ),
-            None,
         ));
     }
     // GPU inference is profile-opt-in. A numeric default must never silently
@@ -726,14 +750,15 @@ pub fn populate_detection_from_state(
                     remediation = %fault.remediation,
                     "detection stage refused inference: the active profile names a detector this daemon cannot load"
                 );
-                return Err(ErrorData::invalid_params(
+                return Err(crate::m1::mcp_error_with_remediation(
+                    error_codes::DETECTION_MODEL_NOT_LOADED,
                     format!(
                         "{}: {}; {}",
                         error_codes::DETECTION_MODEL_NOT_LOADED,
                         fault.detail,
                         fault.remediation
                     ),
-                    None,
+                    &fault.remediation,
                 ));
             }
         }
@@ -749,7 +774,10 @@ pub fn populate_detection_from_state(
                     error = %error,
                     "foreground capture failed before detection inference"
                 );
-                return Err(rmcp::ErrorData::internal_error(error.to_string(), None));
+                return Err(crate::m1::mcp_error(
+                    error_codes::DETECTION_NO_FRAME,
+                    error.to_string(),
+                ));
             }
         };
     let rgb = match bgra_to_rgb(&captured.bytes, captured.width, captured.height) {
@@ -760,7 +788,10 @@ pub fn populate_detection_from_state(
                 detail,
                 "captured detection frame was invalid"
             );
-            return Err(rmcp::ErrorData::invalid_params(detail, None));
+            return Err(crate::m1::mcp_error(
+                error_codes::DETECTION_NO_FRAME,
+                detail,
+            ));
         }
     };
 
@@ -796,9 +827,9 @@ pub fn populate_detection_from_state(
                 error = %error,
                 "detection inference failed"
             );
-            return Err(rmcp::ErrorData::internal_error(
+            return Err(crate::m1::mcp_error(
+                error.code(),
                 format!("{}: {error}", error.code()),
-                None,
             ));
         }
     };

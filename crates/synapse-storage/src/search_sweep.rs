@@ -52,6 +52,30 @@
 //! query that starts failing after an unpredictable amount of unrelated write
 //! traffic — which is precisely the failure mode this module exists to remove.
 //!
+//! ## The set that was still missing (#2075)
+//!
+//! Discovering the set from disk fixed *maintenance* and left *bootstrap*
+//! broken, because a generation that has never been built has no directory to
+//! be discovered by. The one exemption was the active panel, explicitly, for
+//! exactly that reason — so the active panel could be born and no other panel
+//! could.
+//!
+//! That is not a corner case: a panel version bump gives the panel a brand-new
+//! version number, and the new version starts with no directory. Measured on
+//! the live vault, `syn-episode-v1@1964001`, `syn-agent-transcript-v1@1965002`
+//! and `syn-mcp-usage-v1@1965007` — 4,968 / 363,591 / 18,109 rows, the three
+//! outcome-bearing corpora — had no persisted generation at all, so every
+//! `find panel_version=…` naming them failed closed with
+//! `SYNAPSE_CALYX_FIND_INDEX_STALE` from the moment they were re-versioned,
+//! while the active panel's healthy generation reported search `ok`.
+//!
+//! The target set is therefore the union of three *different* questions, each
+//! answered by its own fact: what exists on disk (`published_search_generations`),
+//! what the manifest names active (the active pointer), and what a caller may
+//! query ([`crate::constellations::declared_queryable_panel_versions`]). The
+//! third one had no answer, which is why the first two were made to stand in
+//! for it.
+//!
 //! Nothing here deletes a generation directory. Reclaiming disk is a
 //! destructive, operator-owned act; naming the condition is not.
 
@@ -128,6 +152,22 @@ pub struct PanelGenerationMaintenance {
     /// a maintained generation from an abandoned one, and an operator reading
     /// the sweep should be able to see that it no longer does.
     pub is_active_panel: bool,
+    /// Whether a caller may name this version in `panel_version` on a fused
+    /// query — i.e. whether it is in
+    /// [`crate::constellations::declared_queryable_panel_versions`] (#2075).
+    ///
+    /// This is what makes a missing manifest a *defect* rather than an absence.
+    /// A generation nobody can ask for and that has no index is nothing at all;
+    /// a generation the tool contract promises is queryable and that has no
+    /// index is a capability that hard-errors on first use.
+    pub is_declared_queryable: bool,
+    /// Whether a manifest was on disk for this generation when the sweep began.
+    ///
+    /// Carried so the post-pass presence below is defined for *every*
+    /// disposition, including the ones that produce no report. Inferring it
+    /// from the disposition is what would let "maintenance failed" read as "no
+    /// index" for a generation that has one.
+    pub manifest_present_at_start: bool,
     pub disposition: GenerationDisposition,
 }
 
@@ -168,12 +208,53 @@ impl PanelGenerationMaintenance {
             .map(|keys| limit.saturating_sub(keys))
     }
 
+    /// Whether a persisted manifest exists for this generation **after** the
+    /// pass — the exact fact a fused query opens, and therefore the only honest
+    /// answer to "can `find panel_version=N` serve".
+    ///
+    /// Taken from the post-build readback when the generation was maintained,
+    /// and from the pre-pass disk census otherwise. Defined for every
+    /// disposition on purpose: an undefined value here would have to be
+    /// interpreted, and every interpretation is a guess about whether recall
+    /// works.
+    #[must_use]
+    pub fn manifest_present(&self) -> bool {
+        match &self.disposition {
+            GenerationDisposition::Maintained(report) => report
+                .after
+                .as_ref()
+                .map_or(report.before.manifest_present, |after| {
+                    after.manifest_present
+                }),
+            GenerationDisposition::UnmaintainableNoContract
+            | GenerationDisposition::RetirableSupersededGeneration { .. }
+            | GenerationDisposition::Failed { .. } => self.manifest_present_at_start,
+        }
+    }
+
+    /// A declared-queryable panel with no persisted generation: every fused
+    /// query naming it fails closed with `SYNAPSE_CALYX_FIND_INDEX_STALE`
+    /// right now (#2075).
+    #[must_use]
+    pub fn is_unbuilt_declared_queryable(&self) -> bool {
+        self.is_declared_queryable && !self.manifest_present()
+    }
+
     /// One line of the health detail: everything an operator needs to decide
     /// whether to act, per generation.
     #[must_use]
     pub fn summary_line(&self) -> String {
         let disposition = self.disposition.as_str();
         let active = if self.is_active_panel { " active" } else { "" };
+        // Named on every line, not only on the failing ones: an operator
+        // reading a `maintained` generation must be able to see whether the
+        // pass actually left an index behind, which is the fact a query opens.
+        let queryable = match (self.is_declared_queryable, self.manifest_present()) {
+            (true, true) => " declared_queryable manifest_present",
+            (true, false) => " declared_queryable NO_MANIFEST",
+            (false, true) => " not_declared_queryable manifest_present",
+            (false, false) => " not_declared_queryable no_manifest",
+        };
         match &self.disposition {
             GenerationDisposition::Maintained(report) => {
                 let state = report
@@ -185,7 +266,7 @@ impl PanelGenerationMaintenance {
                     .as_ref()
                     .map_or(report.before.built_at_seq, |after| after.built_at_seq);
                 format!(
-                    "panel {}{active} {disposition} action={} state={state} built_at_seq={:?} \
+                    "panel {}{active}{queryable} {disposition} action={} state={state} built_at_seq={:?} \
                      delta_changed_keys={:?} keys_to_bound={:?} limit={} elapsed_ms={}",
                     self.panel_version,
                     report.action.as_str(),
@@ -197,7 +278,7 @@ impl PanelGenerationMaintenance {
                 )
             }
             GenerationDisposition::UnmaintainableNoContract => format!(
-                "panel {}{active} {disposition}: a search generation is published for a panel \
+                "panel {}{active}{queryable} {disposition}: a search generation is published for a panel \
                  version with no code-declared slot contract and no place in any live panel's \
                  declared lineage, so no rebuild can reconstruct it, no query can measure \
                  through it, and nothing establishes what it is; action=investigate what wrote \
@@ -209,7 +290,7 @@ impl PanelGenerationMaintenance {
                 panel_name,
                 live_panel_version,
             } => format!(
-                "panel {}{active} {disposition}: a search generation is published for a closed \
+                "panel {}{active}{queryable} {disposition}: a search generation is published for a closed \
                  superseded version of {panel_name}, whose live generation {live_panel_version} \
                  carries the corpus; no query can reach this one and no rebuild can reconstruct \
                  it; action=storage operation=retire_search_generation panel_version={}",
@@ -217,7 +298,7 @@ impl PanelGenerationMaintenance {
             ),
             GenerationDisposition::Failed { code, detail } => {
                 format!(
-                    "panel {}{active} {disposition} code={code} detail={detail}",
+                    "panel {}{active}{queryable} {disposition} code={code} detail={detail}",
                     self.panel_version
                 )
             }
@@ -232,6 +313,13 @@ pub struct SearchGenerationSweep {
     pub index_root: String,
     /// The panel the vault manifest publishes as active, when one is published.
     pub active_panel_version: Option<u32>,
+    /// Every live panel generation a fused query may name, from
+    /// [`crate::constellations::declared_queryable_panel_versions`] (#2075).
+    ///
+    /// Carried on the sweep so `health` reports the queryable set the daemon
+    /// actually maintained, rather than re-deriving it from a second source
+    /// that could disagree with the one the sweep acted on.
+    pub declared_queryable_panel_versions: Vec<u32>,
     /// One entry per generation considered, ascending by panel version.
     pub generations: Vec<PanelGenerationMaintenance>,
     /// Entries under the index root that are not published generations, carried
@@ -246,6 +334,41 @@ impl SearchGenerationSweep {
         self.generations
             .iter()
             .any(|entry| entry.disposition.is_failure())
+    }
+
+    /// The declared-queryable panels that have **no persisted generation** after
+    /// this pass, ascending (#2075).
+    ///
+    /// Non-empty means `find` / `storage operation=find_similar` hard-error with
+    /// `SYNAPSE_CALYX_FIND_INDEX_STALE` for every one of these versions right
+    /// now. It is the exact list an operator needs, and the reason the search
+    /// subsystem may not report `ok`: the active generation being healthy says
+    /// nothing about a corpus that has never been indexed at all.
+    #[must_use]
+    pub fn unbuilt_declared_queryable_panel_versions(&self) -> Vec<u32> {
+        let mut versions: Vec<u32> = self
+            .generations
+            .iter()
+            .filter(|entry| entry.is_unbuilt_declared_queryable())
+            .map(|entry| entry.panel_version)
+            .collect();
+        // A declared-queryable panel that the sweep never reached at all is
+        // still unbuilt, and silence about it would be the same defect one
+        // level down. Nothing should produce this today — every declared
+        // version is enrolled as a target — so it is folded in rather than
+        // assumed away.
+        for version in &self.declared_queryable_panel_versions {
+            if !self
+                .generations
+                .iter()
+                .any(|entry| entry.panel_version == *version)
+            {
+                versions.push(*version);
+            }
+        }
+        versions.sort_unstable();
+        versions.dedup();
+        versions
     }
 
     /// The entry for the vault's active panel, which is what the pre-#1938
@@ -279,9 +402,12 @@ impl SearchGenerationSweep {
             .collect::<Vec<_>>()
             .join("; ");
         format!(
-            "index_root={} active_panel={:?} generations={} unrecognized={:?} elapsed_ms={} [{}]",
+            "index_root={} active_panel={:?} declared_queryable={:?} unbuilt_declared_queryable={:?} \
+             generations={} unrecognized={:?} elapsed_ms={} [{}]",
             self.index_root,
             self.active_panel_version,
+            self.declared_queryable_panel_versions,
+            self.unbuilt_declared_queryable_panel_versions(),
             self.generations.len(),
             self.unrecognized_index_entries,
             self.elapsed_ms,
