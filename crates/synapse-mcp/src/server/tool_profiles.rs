@@ -378,6 +378,7 @@ const PUBLIC_TOOL_IMPLEMENTATION_DENYLIST: &[&str] = &[
     "storage_pressure_sample",
     "storage_put_probe_rows",
     "suggestion_accept",
+    "suggestion_decline",
     "suggestion_list",
     "suggestion_tick",
     "task_cancel",
@@ -1978,6 +1979,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("accepted suggestion and plan execution row readback"),
                 error_codes::ACTION_TARGET_INVALID,
                 "bind any required browser target and inspect suggestion/plan rows",
+            ),
+            op(
+                "suggestion_decline",
+                true,
+                false,
+                "CF_KV suggestion/v1 row + Calyx Anchors rows for the exact suggestion",
+                Some(
+                    "declined suggestion row point read + independent Anchors CF rescan of the outcome anchor",
+                ),
+                error_codes::STORAGE_READ_FAILED,
+                "pass the exact durable suggestion/v1 id (not a routine_id) and inspect the suggestion row plus its Calyx Anchors rows",
             ),
             op(
                 "guide",

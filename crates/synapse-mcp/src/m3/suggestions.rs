@@ -32,13 +32,18 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_core::intent::IntentCandidate;
-use synapse_core::types::{RoutineFeedbackOutcome, RoutineGranularity, RoutineLifecycle};
+use synapse_core::types::{
+    EpisodeRecord, RoutineFeedbackOutcome, RoutineGranularity, RoutineLifecycle,
+};
 use synapse_core::{SCHEMA_VERSION, StoredEvent};
-use synapse_storage::{Db, cf, decode_json, encode_json};
+use synapse_storage::{
+    Db, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION, cf, decode_json, encode_json,
+};
 
 use crate::m1::mcp_error;
 
-use super::episodes::{key_after, now_ts_ns};
+use super::episodes::{decode_episode_row, hex_decode, key_after, now_ts_ns, recent_episode_rows};
+use super::grounding::{self, SOURCE_OPERATOR};
 use super::intent::{IntentCurrentParams, current_intents};
 use super::permissions::{Permission, RequiredPermissions, required};
 use super::plan::{PlanBackend, PlanDocument, PlanStep, Postcondition};
@@ -63,6 +68,37 @@ const DEFAULT_ASSIST_LOOKBACK_SECS: u64 = 900;
 const MAX_ASSIST_LOOKBACK_SECS: u64 = 86_400;
 const ASSIST_EVENT_SCAN_ROWS: usize = 4_096;
 const ASSIST_PLAN_RECORD_VERSION: u32 = 1;
+
+// --- Kernel/graph next-action composition (#2046, #1690 clause 2) ---
+
+/// `CF_KV` key of the pointer row naming the current frozen next-action artifact.
+const NEXT_ACTION_CURRENT_KEY: &str = "assist_next_action/v1/current";
+/// `CF_KV` key prefix of the content-addressed frozen next-action artifacts.
+const NEXT_ACTION_FROZEN_PREFIX: &str = "assist_next_action/v1/frozen/";
+/// Schema version for [`NextActionArtifact`] and its pointer row.
+const NEXT_ACTION_ARTIFACT_RECORD_VERSION: u32 = 1;
+/// Routine-id prefix for a composed next-action suggestion.
+const NEXT_ACTION_ROUTINE_PREFIX: &str = "next1-";
+/// How long a frozen artifact is trusted before the composer re-runs.
+const DEFAULT_NEXT_ACTION_STALENESS_SECS: u64 = 3_600;
+/// Context lookback handed to the atomic context measurement (6h).
+const DEFAULT_NEXT_ACTION_CONTEXT_LOOKBACK_SECS: u64 = 21_600;
+const MAX_NEXT_ACTION_CONTEXT_LOOKBACK_SECS: u64 = 604_800;
+/// Kernel-graph hop budget for one composition.
+const DEFAULT_NEXT_ACTION_MAX_HOPS: u32 = 4;
+const MAX_NEXT_ACTION_MAX_HOPS: u32 = 16;
+/// Context episodes read per composition (newest first).
+const NEXT_ACTION_CONTEXT_ROWS: usize = 32;
+/// Hard cap on composed candidates in one artifact.
+const MAX_NEXT_ACTION_CANDIDATES: usize = 8;
+/// Anchor kind stamped on an accept/decline of any suggestion.
+const SUGGESTION_OUTCOME_ANCHOR_KIND: &str = "synapse:suggestion_outcome";
+/// Anchor kind stamped on the episode rows that GENERATED a next-action
+/// suggestion, so the decision lands on the evidence, not only on the offer.
+const NEXT_ACTION_EVIDENCE_ANCHOR_KIND: &str = "synapse:suggestion_next_action_outcome";
+const SUGGESTION_ANCHOR_SOURCE_OF_TRUTH: &str =
+    "Calyx Anchors CF (independently rescanned) + Calyx provenance ledger";
+const NEXT_ACTION_SOURCE_OF_TRUTH: &str = "CF_KV assist_next_action/v1 frozen artifact derived from Calyx Kernel/Base CF over CF_EPISODES";
 
 const ENGINE_VERSION_DEFAULTS: &str = "see SuggestionConfig::from_env";
 
@@ -153,6 +189,10 @@ pub enum SuggestionStatus {
 pub enum SuggestionSource {
     RoutineIntent,
     AssistOpportunity,
+    /// Composed from the Calyx domain kernel plus the between-record graph over
+    /// `CF_EPISODES` (#2046). Always carries [`SuggestionRecord::next_action`];
+    /// a next-action suggestion without its grounding evidence cannot exist.
+    KernelNextAction,
 }
 
 const fn default_suggestion_source() -> SuggestionSource {
@@ -186,6 +226,68 @@ pub struct AssistMitigation {
     pub evidence: Value,
 }
 
+/// One hop of the kernel-graph evidence path that produced a next action.
+///
+/// `from`/`to` are Calyx constellation ids; `edge_weight` is the measured
+/// between-record association strength and `hop_score` is Calyx's attenuated
+/// path score (`edge_weight · 0.9^hop`). Nothing here is estimated locally.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionHop {
+    pub from_cx_id: String,
+    pub to_cx_id: String,
+    pub edge_weight: f64,
+    pub hop_index: u32,
+    pub hop_score: f64,
+}
+
+/// The complete grounding evidence for one composed next action.
+///
+/// Every field names a physical row or a Calyx-measured quantity: which
+/// `CF_EPISODES` row supplied the context, which constellation it measured to,
+/// which kernel answered, which graph edges were walked, which Base row the
+/// terminal kernel node points at, and which `CF_EPISODES` row that Base row
+/// resolves back to. A suggestion is never built without this — an ungrounded
+/// next action is not a weak suggestion, it is a refused one (#2046).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionGrounding {
+    pub source_of_truth: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub kernel_id: String,
+    pub kernel_members: u64,
+    pub anchor_kernel_node: String,
+    /// Kernel-only recall against the full corpus, and the gate it had to clear.
+    pub recall_ratio: f64,
+    pub min_recall_ratio: f64,
+    /// Calyx's own total score for the answered path.
+    pub total_score: f64,
+    pub context_episode_id: String,
+    pub context_episode_key_hex: String,
+    pub context_cx_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_app: Option<String>,
+    pub context_start_ts_ns: u64,
+    pub hops: Vec<NextActionHop>,
+    pub target_cx_id: String,
+    pub target_source_cf: String,
+    pub target_source_key_hex: String,
+    pub target_episode_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_app: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_document: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_url: Option<String>,
+    /// `hop_score · recall_ratio`: both factors measured, neither invented.
+    pub grounded_confidence: f64,
+    /// Content fingerprint of the frozen artifact this candidate was lowered
+    /// into. A hot-path consumer reads that artifact, never Calyx.
+    pub artifact_sha256: String,
+}
+
 /// One surfaced suggestion, persisted in `CF_KV`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -203,6 +305,10 @@ pub struct SuggestionRecord {
     pub offer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mitigation: Option<AssistMitigation>,
+    /// Kernel/graph grounding evidence. Required for
+    /// [`SuggestionSource::KernelNextAction`], absent for every other source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<NextActionGrounding>,
     pub created_ts_ns: u64,
     pub expiry_ts_ns: u64,
     pub status: SuggestionStatus,
@@ -351,6 +457,21 @@ pub struct SuggestionTickParams {
     /// Recent assist-event lookback. Defaults to 15 minutes, capped at 24h.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assist_lookback_secs: Option<u64>,
+    /// Include kernel/graph-composed next actions in the same gated pass
+    /// (#2046). The common path reads the frozen artifact and issues no live
+    /// Calyx call.
+    #[serde(default = "default_true")]
+    pub include_next_actions: bool,
+    /// Force recomposition from Calyx even when the frozen artifact is fresh.
+    #[serde(default)]
+    pub refresh_next_actions: bool,
+    /// Context lookback for the atomic next-action context measurement.
+    /// Defaults to 6h, capped at 7 days.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action_context_lookback_secs: Option<u64>,
+    /// Kernel-graph hop budget per composition (default 4, max 16).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action_max_hops: Option<u32>,
 }
 
 const fn default_true() -> bool {
@@ -382,6 +503,9 @@ pub struct SuggestionTickResponse {
     pub abandoned: Vec<String>,
     pub assist_events_scanned: u32,
     pub assist_events_evaluated: u32,
+    /// What the kernel/graph next-action composer did this pass — including the
+    /// verbatim Calyx refusal when it stayed silent (#2046).
+    pub next_action: NextActionCompositionReport,
     /// Every candidate's gate decision (created or suppressed-with-reason).
     pub decisions: Vec<GateDecisionRow>,
     pub config: SuggestionConfigEcho,
@@ -727,6 +851,826 @@ fn load_recent_assist_opportunities(
     Ok((candidates, scanned))
 }
 
+// === Kernel/graph next-action composition (#2046) ===
+//
+// The #1690 clause: "given current context (foreground app, time, recent
+// episodes), kernel + between-record graph propose the operator's historically-
+// next steps with grounded confidence; honesty-gated (silent when evidence is
+// insufficient — no noise)."
+//
+// The pipeline follows the handbook loop in `docs/BUILDING_ON_CALYX.md` §6.2
+// exactly, and does not shortcut any stage:
+//
+//   ① DECOMPOSE  — the atomic context measurement is the newest `CF_EPISODES`
+//                  row, measured into its native episode constellation.
+//   ② ASSOCIATE  — Calyx's own between-record nearest-neighbour graph over the
+//                  episode panel supplies the edges; we never build our own.
+//   ③ DIFFERENTIATE — the kernel's recall gate decides whether the graph
+//                  explains the corpus at all; below the gate Calyx refuses.
+//   ④ DISTILL→COMPOSE — `kernel_answer` walks the grounded path; each terminal
+//                  kernel node is resolved back through its Base source pointer
+//                  to the physical `CF_EPISODES` row that IS the next action.
+//   ⑧ LOWER      — the result is frozen into a content-addressed `CF_KV`
+//                  artifact so a hot-path consumer reads bytes, never Calyx.
+//
+// Honesty gate: Calyx refuses (ungrounded kernel, unmeasured query record, no
+// anchored path) with a structured error. That refusal is reported verbatim in
+// the tick response and creates NO suggestion. It is never rewritten into a
+// low-confidence guess, and never reported as healthy.
+
+/// One composed next-action candidate, before it becomes a suggestion row.
+#[derive(Clone, Debug)]
+struct NextActionCandidate {
+    routine_id: String,
+    label: String,
+    offer: String,
+    confidence: f64,
+    grounding: NextActionGrounding,
+}
+
+/// The frozen, content-addressed next-action artifact persisted in `CF_KV`.
+///
+/// Field order is fixed and every member is an explicit value, so the canonical
+/// JSON bytes — and therefore `content_sha256` — are deterministic: the
+/// fingerprint changes if and only if the composed intelligence changes.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionArtifact {
+    pub record_version: u32,
+    pub source_of_truth: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub content_slot: u32,
+    pub kernel_id: String,
+    pub recall_ratio: f64,
+    pub min_recall_ratio: f64,
+    pub context_episode_id: String,
+    pub context_cx_id: String,
+    pub produced_ts_ns: u64,
+    pub candidates: Vec<NextActionGrounding>,
+    /// sha256 over the canonical bytes of every field above. Self-describing:
+    /// a reader recomputes it and refuses a torn or edited artifact.
+    pub content_sha256: String,
+}
+
+/// The `CF_KV` pointer naming the artifact a reader should load.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionArtifactPointer {
+    pub record_version: u32,
+    pub content_sha256: String,
+    pub produced_ts_ns: u64,
+    pub frozen_key: String,
+}
+
+/// What one composition pass actually did, reported verbatim on every tick.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NextActionCompositionReport {
+    pub source_of_truth: String,
+    /// `disabled` | `frozen_artifact` | `calyx_kernel_graph` | `refused`
+    pub outcome: String,
+    pub grounded: bool,
+    pub candidates: u32,
+    pub context_episodes_read: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_produced_ts_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_age_secs: Option<u64>,
+    pub artifact_staleness_bound_secs: u64,
+    /// Kernel nodes whose Base source pointer was not visible at the read
+    /// snapshot. Reported, never silently dropped.
+    pub unresolved_kernel_nodes: Vec<String>,
+    /// Kernel nodes resolving to a source CF the episode composer cannot use.
+    pub off_panel_kernel_nodes: Vec<String>,
+    /// The exact Calyx/refusal code when nothing was composed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_detail: Option<String>,
+}
+
+impl NextActionCompositionReport {
+    fn base(outcome: &str, staleness_bound_secs: u64) -> Self {
+        Self {
+            source_of_truth: NEXT_ACTION_SOURCE_OF_TRUTH.to_owned(),
+            outcome: outcome.to_owned(),
+            grounded: false,
+            candidates: 0,
+            context_episodes_read: 0,
+            artifact_sha256: None,
+            artifact_produced_ts_ns: None,
+            artifact_age_secs: None,
+            artifact_staleness_bound_secs: staleness_bound_secs,
+            unresolved_kernel_nodes: Vec::new(),
+            off_panel_kernel_nodes: Vec::new(),
+            refusal_code: None,
+            refusal_detail: None,
+        }
+    }
+
+    fn refused(
+        staleness_bound_secs: u64,
+        code: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let mut report = Self::base("refused", staleness_bound_secs);
+        report.refusal_code = Some(code.into());
+        report.refusal_detail = Some(detail.into());
+        report
+    }
+}
+
+fn next_action_staleness_secs() -> u64 {
+    SuggestionConfig::env_u64(
+        "SYNAPSE_ASSIST_NEXT_ACTION_STALENESS_SECS",
+        DEFAULT_NEXT_ACTION_STALENESS_SECS,
+    )
+}
+
+fn next_action_context_lookback_secs(params: &SuggestionTickParams) -> u64 {
+    params
+        .next_action_context_lookback_secs
+        .unwrap_or_else(|| {
+            SuggestionConfig::env_u64(
+                "SYNAPSE_ASSIST_NEXT_ACTION_CONTEXT_LOOKBACK_SECS",
+                DEFAULT_NEXT_ACTION_CONTEXT_LOOKBACK_SECS,
+            )
+        })
+        .clamp(1, MAX_NEXT_ACTION_CONTEXT_LOOKBACK_SECS)
+}
+
+fn next_action_max_hops(params: &SuggestionTickParams) -> usize {
+    params
+        .next_action_max_hops
+        .unwrap_or(DEFAULT_NEXT_ACTION_MAX_HOPS)
+        .clamp(1, MAX_NEXT_ACTION_MAX_HOPS) as usize
+}
+
+fn next_action_frozen_key(content_sha256: &str) -> Vec<u8> {
+    format!("{NEXT_ACTION_FROZEN_PREFIX}{content_sha256}").into_bytes()
+}
+
+/// Canonical bytes of the artifact with the fingerprint field itself blanked,
+/// so `content_sha256` is a hash OF the payload rather than a hash including
+/// itself.
+fn next_action_artifact_fingerprint(artifact: &NextActionArtifact) -> Result<String, ErrorData> {
+    let mut canonical = artifact.clone();
+    // Blank every field that CARRIES the fingerprint before hashing. A digest
+    // cannot include itself: leaving these populated makes stamping a fixpoint
+    // problem with no solution, because each restamp changes the bytes the next
+    // digest is taken over.
+    canonical.content_sha256 = String::new();
+    for candidate in &mut canonical.candidates {
+        candidate.artifact_sha256 = String::new();
+    }
+    let bytes = serde_json::to_vec(&canonical).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("NEXT_ACTION_ARTIFACT_ENCODE_FAILED: {error}"),
+        )
+    })?;
+    Ok(sha256_hex(&bytes))
+}
+
+/// Reads the frozen artifact a hot-path consumer would read, verifying the
+/// content fingerprint before trusting a single field of it.
+pub fn load_next_action_artifact(db: &Arc<Db>) -> Result<Option<NextActionArtifact>, ErrorData> {
+    let Some(pointer_value) = load_exact_kv_value(
+        db,
+        NEXT_ACTION_CURRENT_KEY.as_bytes(),
+        "next-action artifact pointer",
+    )?
+    else {
+        return Ok(None);
+    };
+    let pointer: NextActionArtifactPointer = decode_json(&pointer_value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_POINTER_DECODE_FAILED in CF_KV at {NEXT_ACTION_CURRENT_KEY}: {error}"
+            ),
+        )
+    })?;
+    if pointer.record_version != NEXT_ACTION_ARTIFACT_RECORD_VERSION {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_POINTER_VERSION_UNSUPPORTED: expected {}, got {}",
+                NEXT_ACTION_ARTIFACT_RECORD_VERSION, pointer.record_version
+            ),
+        ));
+    }
+    let frozen_key = next_action_frozen_key(&pointer.content_sha256);
+    let Some(frozen_value) = load_exact_kv_value(db, &frozen_key, "next-action frozen artifact")?
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_ARTIFACT_DANGLING: pointer names {} but CF_KV holds no frozen row at {}",
+                pointer.content_sha256,
+                String::from_utf8_lossy(&frozen_key)
+            ),
+        ));
+    };
+    let artifact: NextActionArtifact = decode_json(&frozen_value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_ARTIFACT_DECODE_FAILED in CF_KV at {}: {error}",
+                String::from_utf8_lossy(&frozen_key)
+            ),
+        )
+    })?;
+    let recomputed = next_action_artifact_fingerprint(&artifact)?;
+    if recomputed != artifact.content_sha256 || recomputed != pointer.content_sha256 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_ARTIFACT_FINGERPRINT_MISMATCH: recomputed={recomputed}, artifact={}, pointer={}",
+                artifact.content_sha256, pointer.content_sha256
+            ),
+        ));
+    }
+    Ok(Some(artifact))
+}
+
+fn write_next_action_artifact(
+    db: &Arc<Db>,
+    artifact: &NextActionArtifact,
+) -> Result<(), ErrorData> {
+    let frozen_key = next_action_frozen_key(&artifact.content_sha256);
+    let frozen_value = encode_json(artifact).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "failed to encode next-action artifact {}: {error}",
+                artifact.content_sha256
+            ),
+        )
+    })?;
+    let pointer = NextActionArtifactPointer {
+        record_version: NEXT_ACTION_ARTIFACT_RECORD_VERSION,
+        content_sha256: artifact.content_sha256.clone(),
+        produced_ts_ns: artifact.produced_ts_ns,
+        frozen_key: String::from_utf8_lossy(&frozen_key).into_owned(),
+    };
+    let pointer_value = encode_json(&pointer).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!("failed to encode next-action artifact pointer: {error}"),
+        )
+    })?;
+    // The frozen row is content-addressed, so re-publishing an unchanged
+    // artifact rewrites byte-identical bytes; the pointer swap is what makes a
+    // new generation visible, and both land in one batch so a reader never sees
+    // a pointer without its artifact.
+    db.mutate_batch_pressure_bypass(
+        cf::CF_KV,
+        Vec::<Vec<u8>>::new(),
+        [
+            (frozen_key, frozen_value),
+            (NEXT_ACTION_CURRENT_KEY.as_bytes().to_vec(), pointer_value),
+        ],
+    )
+    .map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "failed to publish next-action artifact {} atomically: {error}",
+                artifact.content_sha256
+            ),
+        )
+    })?;
+    let readback = load_next_action_artifact(db)?.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_ARTIFACT_READBACK_MISSING: {} vanished immediately after publish",
+                artifact.content_sha256
+            ),
+        )
+    })?;
+    if &readback != artifact {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_ARTIFACT_READBACK_MISMATCH for {}: persisted artifact != value just written",
+                artifact.content_sha256
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves one kernel node back to the physical `CF_EPISODES` row it measures.
+///
+/// `Ok(None)` means the node is genuinely not usable as a next action (no Base
+/// pointer visible at this snapshot, or it points at another panel's CF); the
+/// caller records that in the report. A pointer that DOES resolve but whose row
+/// is missing or undecodable is corruption and fails loud.
+fn resolve_kernel_node_episode(
+    db: &Arc<Db>,
+    cx_id: &str,
+    report: &mut NextActionCompositionReport,
+) -> Result<Option<(String, EpisodeRecord)>, ErrorData> {
+    let pointer = db
+        .read_calyx_base_source_pointer(cx_id)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let Some(pointer) = pointer else {
+        report.unresolved_kernel_nodes.push(cx_id.to_owned());
+        return Ok(None);
+    };
+    let (Some(source_cf), Some(source_key_hex)) = (pointer.source_cf, pointer.source_key_hex)
+    else {
+        report.unresolved_kernel_nodes.push(cx_id.to_owned());
+        return Ok(None);
+    };
+    if source_cf != cf::CF_EPISODES {
+        report
+            .off_panel_kernel_nodes
+            .push(format!("{cx_id}:{source_cf}"));
+        return Ok(None);
+    }
+    let source_key = hex_decode(&source_key_hex).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_SOURCE_KEY_NOT_HEX: Calyx Base row {cx_id} declares source_key_hex={source_key_hex}"
+            ),
+        )
+    })?;
+    let Some(source_value) = db
+        .get_cf(cf::CF_EPISODES, &source_key)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?
+    else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_SOURCE_ROW_DANGLING: Calyx Base row {cx_id} points at CF_EPISODES key {source_key_hex}, which holds no row"
+            ),
+        ));
+    };
+    let (_ts_ns, _ordinal, episode) = decode_episode_row(&source_key, &source_value)?;
+    Ok(Some((source_key_hex, episode)))
+}
+
+fn next_action_routine_id(context_app: Option<&str>, grounding: &NextActionGrounding) -> String {
+    // Stable across ticks for the same observed transition, so the per-routine
+    // frequency cap and the #856 decline cooldown both bite on repeats.
+    let material = format!(
+        "{}\n{}\n{}\n{}",
+        context_app.unwrap_or_default(),
+        grounding.target_app.as_deref().unwrap_or_default(),
+        grounding.target_document.as_deref().unwrap_or_default(),
+        grounding.target_url.as_deref().unwrap_or_default(),
+    );
+    format!(
+        "{NEXT_ACTION_ROUTINE_PREFIX}{}",
+        sha256_short_hex(&material)
+    )
+}
+
+fn next_action_label(grounding: &NextActionGrounding) -> String {
+    match grounding.target_app.as_deref() {
+        Some(app) if !app.trim().is_empty() => format!("Next: {app}"),
+        _ => "Next: historically-following step".to_owned(),
+    }
+}
+
+fn next_action_offer(context_app: Option<&str>, grounding: &NextActionGrounding) -> String {
+    let target = grounding
+        .target_app
+        .as_deref()
+        .filter(|app| !app.trim().is_empty())
+        .unwrap_or("your next usual step");
+    match context_app.filter(|app| !app.trim().is_empty()) {
+        Some(context) => format!(
+            "After {context} you historically move to {target}. {} kernel-graph hops of grounded evidence support it (confidence {:.2}). Accept to act on it, or dismiss it.",
+            grounding.hops.len(),
+            grounding.grounded_confidence
+        ),
+        None => format!(
+            "You historically move to {target} next. {} kernel-graph hops of grounded evidence support it (confidence {:.2}). Accept to act on it, or dismiss it.",
+            grounding.hops.len(),
+            grounding.grounded_confidence
+        ),
+    }
+}
+
+fn candidates_from_artifact(artifact: &NextActionArtifact) -> Vec<NextActionCandidate> {
+    artifact
+        .candidates
+        .iter()
+        .map(|grounding| {
+            let context_app = grounding.context_app.as_deref();
+            NextActionCandidate {
+                routine_id: next_action_routine_id(context_app, grounding),
+                label: next_action_label(grounding),
+                offer: next_action_offer(context_app, grounding),
+                confidence: grounding.grounded_confidence,
+                grounding: grounding.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Composes next actions from the Calyx kernel + between-record graph and
+/// lowers them into the frozen artifact.
+fn compose_next_actions_from_calyx(
+    db: &Arc<Db>,
+    now: u64,
+    params: &SuggestionTickParams,
+    staleness_bound_secs: u64,
+) -> Result<(NextActionCompositionReport, Vec<NextActionCandidate>), ErrorData> {
+    let mut report = NextActionCompositionReport::base("calyx_kernel_graph", staleness_bound_secs);
+    let lookback_ns = next_action_context_lookback_secs(params).saturating_mul(1_000_000_000);
+    let context_rows = recent_episode_rows(
+        db,
+        now.saturating_sub(lookback_ns),
+        now,
+        NEXT_ACTION_CONTEXT_ROWS,
+    )?;
+    report.context_episodes_read = u32::try_from(context_rows.len()).unwrap_or(u32::MAX);
+    let Some((context_key, context_value, context_episode)) = context_rows.first() else {
+        return Ok((
+            NextActionCompositionReport::refused(
+                staleness_bound_secs,
+                "ASSIST_NEXT_ACTION_NO_CONTEXT_EPISODE",
+                format!(
+                    "no CF_EPISODES row started within the last {} seconds; there is no atomic context measurement to compose from",
+                    next_action_context_lookback_secs(params)
+                ),
+            ),
+            Vec::new(),
+        ));
+    };
+
+    let Some(content_slot) = Db::kernel_content_slot_for_panel(SYN_EPISODE_PANEL_VERSION) else {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "NEXT_ACTION_PANEL_HAS_NO_KERNEL_LANE: panel {SYN_EPISODE_PANEL_VERSION} declares no cold kernel content slot; assist cannot compose next actions off a lane the scheduler does not rebuild"
+            ),
+        ));
+    };
+
+    // ① the atomic context measurement: the episode's own native constellation.
+    let context_constellation = db
+        .put_episode_constellation(context_key, context_value, context_episode)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "NEXT_ACTION_CONTEXT_MEASUREMENT_FAILED for episode {}: {error}",
+                    context_episode.episode_id
+                ),
+            )
+        })?;
+
+    // ②–④ associate, differentiate, distill: Calyx's kernel + graph, not ours.
+    let kernel_params =
+        synapse_calyx::SynapseCalyxKernelParams::new(SYN_EPISODE_PANEL_VERSION, content_slot);
+    let answer = match db.kernel_answer_intelligence(
+        &kernel_params,
+        &context_constellation.cx_id,
+        next_action_max_hops(params),
+    ) {
+        Ok(answer) => answer,
+        Err(error) => {
+            // The honesty gate fired. Report the refusal exactly as Calyx
+            // phrased it and surface ZERO suggestions — never a downgraded
+            // guess, never a healthy-looking empty result.
+            let code = error.code();
+            let detail = error.to_string();
+            tracing::warn!(
+                code = "ASSIST_NEXT_ACTION_REFUSED",
+                refusal_code = code,
+                panel_version = SYN_EPISODE_PANEL_VERSION,
+                content_slot,
+                context_cx_id = %context_constellation.cx_id,
+                context_episode_id = %context_episode.episode_id,
+                detail = %detail,
+                "Calyx refused to compose next actions; assist stays silent"
+            );
+            let mut refused =
+                NextActionCompositionReport::refused(staleness_bound_secs, code, detail);
+            refused.context_episodes_read = report.context_episodes_read;
+            return Ok((refused, Vec::new()));
+        }
+    };
+    if answer.hops.is_empty() {
+        let mut refused = NextActionCompositionReport::refused(
+            staleness_bound_secs,
+            "ASSIST_NEXT_ACTION_NO_HOP_EVIDENCE",
+            format!(
+                "kernel {} answered from context {} with zero graph hops; there is no between-record evidence to propose a next action from",
+                answer.kernel_id, context_constellation.cx_id
+            ),
+        );
+        refused.context_episodes_read = report.context_episodes_read;
+        return Ok((refused, Vec::new()));
+    }
+
+    let recall_ratio = f64::from(answer.recall_ratio).clamp(0.0, 1.0);
+    let context_app = context_episode.app.clone();
+    let hops: Vec<NextActionHop> = answer
+        .hops
+        .iter()
+        .map(|hop| NextActionHop {
+            from_cx_id: hop.from.clone(),
+            to_cx_id: hop.to.clone(),
+            edge_weight: f64::from(hop.edge_weight),
+            hop_index: hop.hop_index,
+            hop_score: f64::from(hop.hop_score),
+        })
+        .collect();
+
+    let mut groundings: Vec<NextActionGrounding> = Vec::new();
+    let mut seen_targets: BTreeSet<String> = BTreeSet::new();
+    for (index, hop) in answer.hops.iter().enumerate() {
+        let Some((target_source_key_hex, target_episode)) =
+            resolve_kernel_node_episode(db, &hop.to, &mut report)?
+        else {
+            continue;
+        };
+        // A hop back onto the context itself is not a next action.
+        if target_episode.episode_id == context_episode.episode_id {
+            continue;
+        }
+        let dedup_key = format!(
+            "{}\u{1f}{}\u{1f}{}",
+            target_episode.app.as_deref().unwrap_or_default(),
+            target_episode.document.as_deref().unwrap_or_default(),
+            target_episode.url.as_deref().unwrap_or_default(),
+        );
+        if !seen_targets.insert(dedup_key) {
+            continue;
+        }
+        let grounded_confidence =
+            (f64::from(hop.hop_score).clamp(0.0, 1.0) * recall_ratio).clamp(0.0, 1.0);
+        groundings.push(NextActionGrounding {
+            source_of_truth: NEXT_ACTION_SOURCE_OF_TRUTH.to_owned(),
+            panel_name: SYN_EPISODE_PANEL_NAME.to_owned(),
+            panel_version: answer.panel_version,
+            content_slot: u32::from(answer.content_slot),
+            kernel_id: answer.kernel_id.clone(),
+            kernel_members: answer.kernel_members as u64,
+            anchor_kernel_node: answer.anchor_kernel_node.clone(),
+            recall_ratio,
+            min_recall_ratio: f64::from(answer.min_recall_ratio),
+            total_score: f64::from(answer.total_score),
+            context_episode_id: context_episode.episode_id.clone(),
+            context_episode_key_hex: hex_encode(context_key),
+            context_cx_id: context_constellation.cx_id.clone(),
+            context_app: context_app.clone(),
+            context_start_ts_ns: context_episode.start_ts_ns,
+            // Every hop up to and including this one is the evidence path.
+            hops: hops.iter().take(index + 1).cloned().collect(),
+            target_cx_id: hop.to.clone(),
+            target_source_cf: cf::CF_EPISODES.to_owned(),
+            target_source_key_hex,
+            target_episode_id: target_episode.episode_id.clone(),
+            target_app: target_episode.app.clone(),
+            target_document: target_episode.document.clone(),
+            target_url: target_episode.url.clone(),
+            grounded_confidence,
+            // Filled once the artifact fingerprint exists.
+            artifact_sha256: String::new(),
+        });
+        if groundings.len() >= MAX_NEXT_ACTION_CANDIDATES {
+            break;
+        }
+    }
+
+    if groundings.is_empty() {
+        let mut refused = NextActionCompositionReport::refused(
+            staleness_bound_secs,
+            "ASSIST_NEXT_ACTION_NO_RESOLVABLE_TARGET",
+            format!(
+                "kernel {} produced {} hop(s) from context {}, but none resolved to a distinct CF_EPISODES next action (unresolved={}, off_panel={})",
+                answer.kernel_id,
+                answer.hops.len(),
+                context_constellation.cx_id,
+                report.unresolved_kernel_nodes.len(),
+                report.off_panel_kernel_nodes.len()
+            ),
+        );
+        refused.context_episodes_read = report.context_episodes_read;
+        refused.unresolved_kernel_nodes = report.unresolved_kernel_nodes;
+        refused.off_panel_kernel_nodes = report.off_panel_kernel_nodes;
+        return Ok((refused, Vec::new()));
+    }
+
+    // ⑧ lower: freeze the composed intelligence behind a content fingerprint.
+    let mut artifact = NextActionArtifact {
+        record_version: NEXT_ACTION_ARTIFACT_RECORD_VERSION,
+        source_of_truth: NEXT_ACTION_SOURCE_OF_TRUTH.to_owned(),
+        panel_name: SYN_EPISODE_PANEL_NAME.to_owned(),
+        panel_version: answer.panel_version,
+        content_slot: u32::from(answer.content_slot),
+        kernel_id: answer.kernel_id.clone(),
+        recall_ratio,
+        min_recall_ratio: f64::from(answer.min_recall_ratio),
+        context_episode_id: context_episode.episode_id.clone(),
+        context_cx_id: context_constellation.cx_id,
+        produced_ts_ns: now,
+        candidates: groundings,
+        content_sha256: String::new(),
+    };
+    let fingerprint = next_action_artifact_fingerprint(&artifact)?;
+    artifact.content_sha256.clone_from(&fingerprint);
+    for grounding in &mut artifact.candidates {
+        grounding.artifact_sha256.clone_from(&fingerprint);
+    }
+    // Stamping is idempotent by construction (the stamped fields are excluded
+    // from the digest input), so this is a real check, not a formality: it fails
+    // loud if that invariant is ever broken.
+    let restamped = next_action_artifact_fingerprint(&artifact)?;
+    if restamped != artifact.content_sha256 {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "NEXT_ACTION_ARTIFACT_FINGERPRINT_UNSTABLE: restamping changed the digest from {} to {restamped}",
+                artifact.content_sha256
+            ),
+        ));
+    }
+    write_next_action_artifact(db, &artifact)?;
+
+    report.grounded = true;
+    report.artifact_sha256 = Some(artifact.content_sha256.clone());
+    report.artifact_produced_ts_ns = Some(artifact.produced_ts_ns);
+    report.artifact_age_secs = Some(0);
+    let candidates = candidates_from_artifact(&artifact);
+    report.candidates = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+    tracing::info!(
+        code = "ASSIST_NEXT_ACTION_COMPOSED",
+        kernel_id = %artifact.kernel_id,
+        panel_version = artifact.panel_version,
+        content_slot = artifact.content_slot,
+        recall_ratio = artifact.recall_ratio,
+        context_cx_id = %artifact.context_cx_id,
+        candidates = report.candidates,
+        artifact_sha256 = %artifact.content_sha256,
+        "next actions composed from the Calyx kernel/graph and lowered into a frozen artifact"
+    );
+    Ok((report, candidates))
+}
+
+/// Produces next-action candidates for one tick, preferring the frozen artifact
+/// so the common path issues no live Calyx call at all.
+fn next_action_candidates(
+    db: &Arc<Db>,
+    now: u64,
+    params: &SuggestionTickParams,
+) -> Result<(NextActionCompositionReport, Vec<NextActionCandidate>), ErrorData> {
+    let staleness_bound_secs = next_action_staleness_secs();
+    if !params.include_next_actions {
+        return Ok((
+            NextActionCompositionReport::base("disabled", staleness_bound_secs),
+            Vec::new(),
+        ));
+    }
+    let existing = load_next_action_artifact(db)?;
+    if let Some(artifact) = &existing {
+        let age_secs = now.saturating_sub(artifact.produced_ts_ns) / 1_000_000_000;
+        let fresh = age_secs <= staleness_bound_secs;
+        if fresh && !params.refresh_next_actions {
+            let candidates = candidates_from_artifact(artifact);
+            let mut report =
+                NextActionCompositionReport::base("frozen_artifact", staleness_bound_secs);
+            report.grounded = !candidates.is_empty();
+            report.candidates = u32::try_from(candidates.len()).unwrap_or(u32::MAX);
+            report.artifact_sha256 = Some(artifact.content_sha256.clone());
+            report.artifact_produced_ts_ns = Some(artifact.produced_ts_ns);
+            report.artifact_age_secs = Some(age_secs);
+            return Ok((report, candidates));
+        }
+    }
+    if params.dry_run {
+        // Recomposition measures and publishes; a dry run must not. Say so
+        // instead of pretending there is nothing to compose.
+        let mut report = NextActionCompositionReport::refused(
+            staleness_bound_secs,
+            "ASSIST_NEXT_ACTION_DRY_RUN_ARTIFACT_STALE",
+            match &existing {
+                Some(artifact) => format!(
+                    "frozen artifact {} is older than the {staleness_bound_secs}s bound and dry_run must not measure or publish; re-run without dry_run to recompose",
+                    artifact.content_sha256
+                ),
+                None => "no frozen next-action artifact exists and dry_run must not measure or publish; re-run without dry_run to compose one".to_owned(),
+            },
+        );
+        report.artifact_sha256 = existing.as_ref().map(|a| a.content_sha256.clone());
+        report.artifact_produced_ts_ns = existing.as_ref().map(|a| a.produced_ts_ns);
+        return Ok((report, Vec::new()));
+    }
+    compose_next_actions_from_calyx(db, now, params, staleness_bound_secs)
+}
+
+fn build_next_action_suggestion(
+    candidate: &NextActionCandidate,
+    now: u64,
+    config: &SuggestionConfig,
+) -> SuggestionRecord {
+    SuggestionRecord {
+        record_version: SUGGESTION_RECORD_VERSION,
+        suggestion_id: format!("sg1-{}-{now:020}", candidate.routine_id),
+        routine_id: candidate.routine_id.clone(),
+        source: SuggestionSource::KernelNextAction,
+        source_event_id: Some(candidate.grounding.target_cx_id.clone()),
+        label: Some(candidate.label.clone()),
+        offer: Some(candidate.offer.clone()),
+        mitigation: None,
+        next_action: Some(candidate.grounding.clone()),
+        created_ts_ns: now,
+        expiry_ts_ns: now.saturating_add(config.expiry_secs.saturating_mul(1_000_000_000)),
+        status: SuggestionStatus::Live,
+        confidence: candidate.confidence,
+        matched_prefix_len: 1,
+        total_steps: 1,
+        remaining_step_count: 1,
+        proposed_plan_ref: None,
+        resolved_ts_ns: None,
+        resolution_note: None,
+    }
+}
+
+/// The plan for a composed next action.
+///
+/// Deliberately a single `AgentTask` step: the composition proves *what* the
+/// operator historically does next, not that opening it blindly is correct. The
+/// executor refuses an `AgentTask` step with its reason, which surfaces the full
+/// grounding to the caller instead of launching something unverified.
+pub fn next_action_plan_for_suggestion(
+    record: &SuggestionRecord,
+    compiled_ts_ns: u64,
+) -> Result<PlanDocument, ErrorData> {
+    if record.source != SuggestionSource::KernelNextAction {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "NEXT_ACTION_PLAN_SOURCE_MISMATCH: suggestion {} has source {:?}",
+                record.suggestion_id, record.source
+            ),
+        ));
+    }
+    let Some(grounding) = &record.next_action else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "NEXT_ACTION_SUGGESTION_MISSING_GROUNDING: suggestion {} claims kernel/graph composition but carries no evidence",
+                record.suggestion_id
+            ),
+        ));
+    };
+    let target_app = grounding
+        .target_app
+        .clone()
+        .unwrap_or_else(|| "kernel-next-action".to_owned());
+    Ok(PlanDocument {
+        record_version: ASSIST_PLAN_RECORD_VERSION,
+        routine_id: record.routine_id.clone(),
+        compiled_ts_ns,
+        granularity: RoutineGranularity::App,
+        schedule_label: "kernel next action".to_owned(),
+        total_steps: 1,
+        deterministic_steps: 0,
+        agent_task_steps: 1,
+        fully_deterministic: false,
+        steps: vec![PlanStep {
+            index: 0,
+            source_app: target_app.clone(),
+            source_document: grounding.target_document.clone(),
+            backend: PlanBackend::AgentTask,
+            deterministic: false,
+            action: format!(
+                "act on the composed next action {target_app} for suggestion {}",
+                record.suggestion_id
+            ),
+            postcondition: Postcondition::AgentReported,
+            agent_task_reason: Some(format!(
+                "Composed from Calyx kernel {} on panel {} slot {} (recall {:.4} >= gate {:.4}) walking {} graph hop(s) from context episode {} ({}) to episode {} ({}). Grounded confidence {:.4}; frozen artifact {}. Verify the operator actually wants this step before acting: the evidence proves what historically followed, not that it is correct now.",
+                grounding.kernel_id,
+                grounding.panel_version,
+                grounding.content_slot,
+                grounding.recall_ratio,
+                grounding.min_recall_ratio,
+                grounding.hops.len(),
+                grounding.context_episode_id,
+                grounding.context_app.as_deref().unwrap_or("unknown app"),
+                grounding.target_episode_id,
+                target_app,
+                grounding.grounded_confidence,
+                grounding.artifact_sha256,
+            )),
+        }],
+    })
+}
+
 /// Loads every suggestion row, newest decode first is irrelevant (callers
 /// aggregate). Loud on undecodable rows.
 fn load_all_suggestions(db: &Arc<Db>) -> Result<Vec<(Vec<u8>, SuggestionRecord)>, ErrorData> {
@@ -860,7 +1804,14 @@ fn validate_suggestion_id_index(
     Ok(())
 }
 
-fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), ErrorData> {
+/// Persists one suggestion row and returns the exact key and the exact
+/// persisted bytes. The bytes are load-bearing: a Calyx constellation id is
+/// derived from the source value, so an anchor built from a re-encoded record
+/// would name a different `cx_id` than the row storage actually holds.
+fn write_suggestion(
+    db: &Arc<Db>,
+    record: &SuggestionRecord,
+) -> Result<(Vec<u8>, Vec<u8>), ErrorData> {
     validate_suggestion_id("suggestion_write", &record.suggestion_id)?;
     let key = suggestion_key(&record.routine_id, record.created_ts_ns);
     let value = encode_json(record).map_err(|error| {
@@ -967,7 +1918,8 @@ fn write_suggestion(db: &Arc<Db>, record: &SuggestionRecord) -> Result<(), Error
         &key,
         &primary_readback_value,
         "write readback",
-    )
+    )?;
+    Ok((key, primary_readback_value))
 }
 
 fn load_suggestion_primary_from_index(
@@ -1040,6 +1992,439 @@ pub fn load_suggestion_by_id(
     load_suggestion_primary_from_index(db, &index).map(Some)
 }
 
+// === Grounded accept/decline outcome anchors (#2046, #1690 clause 3) ===
+//
+// "operator accept/dismiss of suggestions written back as anchors (the steering
+// loop grounds itself)."
+//
+// Two anchor lanes, and the second is the one that makes steering learn:
+//
+//  1. the OFFER lane — an outcome anchor on the exact `CF_KV suggestion/v1` row
+//     (the durable row IS the identity of the decision, so a later reader can
+//     tie the anchor back to one suggestion id and nothing else);
+//  2. the EVIDENCE lane — for a kernel/graph-composed suggestion, the same
+//     decision is anchored onto the `CF_EPISODES` rows that PRODUCED it (the
+//     context episode and the proposed target episode). Recommender practice is
+//     unambiguous here: an explicit dismissal has to attach to the generating
+//     evidence, not only to the impression, or the next composition proposes
+//     the same thing again from the same untouched edges.
+//
+// Both lanes go through the shared `m3::grounding` helpers, so the ledger
+// payload is byte-identical to every other Synapse anchor of the same shape.
+
+/// One evidence-lane anchor, independently rescanned from the Anchors CF.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionEvidenceAnchorReport {
+    pub anchor_kind: String,
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub episode_id: String,
+    pub cx_id: String,
+    /// Provenance-ledger sequence of the write that created this anchor.
+    /// Absent on an idempotent replay: the replay lane rescans the physical
+    /// Anchors CF, which carries the anchor but not the seq of the commit that
+    /// first stamped it. Reporting a placeholder there would be a lie.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_seq: Option<u64>,
+    pub readback_exact_match_count: u64,
+}
+
+/// The grounded anchor written for one accept/decline decision.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionOutcomeAnchorReport {
+    pub source_of_truth: String,
+    pub suggestion_id: String,
+    /// `accepted` or `declined` — the anchor's enum value, verbatim.
+    pub decision: String,
+    pub anchor_kind: String,
+    pub source_cf: String,
+    pub source_key_hex: String,
+    pub source_value_sha256: String,
+    pub panel_name: String,
+    pub panel_version: u32,
+    pub cx_id: String,
+    /// Provenance-ledger sequence/hash of the write that created this anchor.
+    /// Both are absent on an idempotent replay — see
+    /// [`SuggestionEvidenceAnchorReport::ledger_seq`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ledger_hash: Option<String>,
+    /// Anchors on this constellation after the write, read back from the
+    /// physical Anchors CF by a second, independent scan.
+    pub readback_anchor_count: u64,
+    /// How many of those match this exact kind AND value.
+    pub readback_exact_match_count: u64,
+    pub evidence_anchors: Vec<SuggestionEvidenceAnchorReport>,
+    /// Evidence rows the anchor could not reach. `CF_EPISODES` is replaceable
+    /// derived state, so a re-segmented day legitimately removes a row — that is
+    /// reported here, never silently dropped.
+    pub missing_evidence_rows: Vec<String>,
+}
+
+fn suggestion_decision_label(status: SuggestionStatus) -> Option<&'static str> {
+    match status {
+        SuggestionStatus::Accepted => Some("accepted"),
+        SuggestionStatus::Declined => Some("declined"),
+        SuggestionStatus::Live | SuggestionStatus::Expired | SuggestionStatus::Abandoned => None,
+    }
+}
+
+/// Counts anchors of one kind+value on a source row by a fresh physical scan of
+/// the Calyx `Anchors` CF — never by trusting the write report.
+fn rescan_anchor_matches(
+    db: &Arc<Db>,
+    source_cf: &'static str,
+    source_key: &[u8],
+    source_value: &[u8],
+    anchor_kind: &str,
+    decision: &str,
+) -> Result<(u64, u64), ErrorData> {
+    let scan = db
+        .calyx_anchor_scan_for_source(source_cf, source_key, source_value)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "SUGGESTION_ANCHOR_RESCAN_FAILED for {source_cf} key {}: {error}",
+                    hex_encode(source_key)
+                ),
+            )
+        })?;
+    let total = scan.anchors.len() as u64;
+    let exact = scan
+        .anchors
+        .iter()
+        .filter(|row| anchor_row_matches(row, anchor_kind, decision))
+        .count() as u64;
+    Ok((total, exact))
+}
+
+/// An anchor matches only when the kind, the value TYPE, and the value all
+/// agree. Matching on the text alone would let an unrelated free-text anchor
+/// masquerade as the operator's enum decision.
+fn anchor_row_matches(
+    row: &synapse_storage::CalyxAnchorRow,
+    anchor_kind: &str,
+    decision: &str,
+) -> bool {
+    row.kind == anchor_kind
+        && row.value.value_type == "enum"
+        && row.value.text_value.as_deref() == Some(decision)
+}
+
+/// Writes the offer-lane and evidence-lane anchors for one resolved suggestion.
+///
+/// Idempotent by construction: the anchor is content-addressed by the persisted
+/// row's `cx_id` plus its kind/value/source/observed_at, so replaying an
+/// unchanged decision re-derives the identical anchor and Calyx's own
+/// exactly-one-match readback holds. This is why `resolved_ts_ns` must never be
+/// regenerated on a replay — a fresh clock stamp would mint a second anchor for
+/// one logical decision.
+fn anchor_suggestion_outcome(
+    db: &Arc<Db>,
+    suggestion_key: &[u8],
+    suggestion_value: &[u8],
+    record: &SuggestionRecord,
+) -> Result<SuggestionOutcomeAnchorReport, ErrorData> {
+    let Some(decision) = suggestion_decision_label(record.status) else {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "SUGGESTION_OUTCOME_ANCHOR_NOT_A_DECISION: suggestion {} has status {:?}, which is not an operator decision",
+                record.suggestion_id, record.status
+            ),
+        ));
+    };
+    let observed_at_ms =
+        grounding::observed_at_ms_from_ns(record.resolved_ts_ns.unwrap_or(record.created_ts_ns));
+    let record_value = serde_json::to_value(record).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "suggestion outcome anchor failed to project suggestion {}: {error}",
+                record.suggestion_id
+            ),
+        )
+    })?;
+    let offer = grounding::write_outcome_constellation_and_anchor(
+        db,
+        cf::CF_KV,
+        suggestion_key,
+        suggestion_value,
+        &record_value,
+        grounding::enum_anchor(
+            SUGGESTION_OUTCOME_ANCHOR_KIND,
+            decision,
+            SOURCE_OPERATOR,
+            observed_at_ms,
+        ),
+        "suggestion outcome anchor",
+    )?;
+    let (readback_anchor_count, readback_exact_match_count) = rescan_anchor_matches(
+        db,
+        cf::CF_KV,
+        suggestion_key,
+        suggestion_value,
+        SUGGESTION_OUTCOME_ANCHOR_KIND,
+        decision,
+    )?;
+    if readback_exact_match_count != 1 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_OUTCOME_ANCHOR_READBACK_MISMATCH for {}: independent Anchors CF scan of cx_id {} found {readback_exact_match_count} anchors of kind {SUGGESTION_OUTCOME_ANCHOR_KIND}={decision}, expected exactly 1",
+                record.suggestion_id, offer.cx_id
+            ),
+        ));
+    }
+
+    let mut evidence_anchors = Vec::new();
+    let mut missing_evidence_rows = Vec::new();
+    if let Some(grounding_evidence) = &record.next_action {
+        let evidence_kind = format!(
+            "{NEXT_ACTION_EVIDENCE_ANCHOR_KIND}:{}",
+            record.suggestion_id
+        );
+        for (role, key_hex, episode_id) in [
+            (
+                "context",
+                grounding_evidence.context_episode_key_hex.as_str(),
+                grounding_evidence.context_episode_id.as_str(),
+            ),
+            (
+                "target",
+                grounding_evidence.target_source_key_hex.as_str(),
+                grounding_evidence.target_episode_id.as_str(),
+            ),
+        ] {
+            let Some(episode_key) = hex_decode(key_hex) else {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "SUGGESTION_EVIDENCE_KEY_NOT_HEX: suggestion {} {role} evidence declares key {key_hex}",
+                        record.suggestion_id
+                    ),
+                ));
+            };
+            let Some(episode_value) = db
+                .get_cf(cf::CF_EPISODES, &episode_key)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            else {
+                missing_evidence_rows.push(format!(
+                    "{role}:{episode_id}:CF_EPISODES key {key_hex} no longer holds a row (re-segmented day)"
+                ));
+                continue;
+            };
+            let (_ts_ns, _ordinal, episode) = decode_episode_row(&episode_key, &episode_value)?;
+            db.put_episode_constellation(&episode_key, &episode_value, &episode)
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!(
+                            "suggestion evidence anchor failed to ensure the {role} episode constellation for {}: {error}",
+                            episode.episode_id
+                        ),
+                    )
+                })?;
+            let report = grounding::write_anchor_for_existing_constellation(
+                db,
+                cf::CF_EPISODES,
+                &episode_key,
+                &episode_value,
+                grounding::enum_anchor(
+                    evidence_kind.clone(),
+                    decision,
+                    SOURCE_OPERATOR,
+                    observed_at_ms,
+                ),
+                "suggestion next-action evidence anchor",
+            )?;
+            let (_total, exact) = rescan_anchor_matches(
+                db,
+                cf::CF_EPISODES,
+                &episode_key,
+                &episode_value,
+                &evidence_kind,
+                decision,
+            )?;
+            evidence_anchors.push(SuggestionEvidenceAnchorReport {
+                anchor_kind: evidence_kind.clone(),
+                source_cf: cf::CF_EPISODES.to_owned(),
+                source_key_hex: key_hex.to_owned(),
+                episode_id: episode.episode_id.clone(),
+                cx_id: report.cx_id.clone(),
+                ledger_seq: Some(report.ledger_seq),
+                readback_exact_match_count: exact,
+            });
+            tracing::info!(
+                code = "SUGGESTION_EVIDENCE_ANCHORED",
+                suggestion_id = %record.suggestion_id,
+                role,
+                decision,
+                episode_id = %episode.episode_id,
+                cx_id = %report.cx_id,
+                ledger_seq = report.ledger_seq,
+                "suggestion decision grounded on the episode constellation that produced it"
+            );
+        }
+    }
+
+    tracing::info!(
+        code = "SUGGESTION_OUTCOME_ANCHORED",
+        suggestion_id = %record.suggestion_id,
+        routine_id = %record.routine_id,
+        source = ?record.source,
+        decision,
+        source_key_hex = %offer.source_key_hex,
+        cx_id = %offer.cx_id,
+        ledger_seq = offer.ledger_seq,
+        evidence_anchors = evidence_anchors.len(),
+        missing_evidence_rows = missing_evidence_rows.len(),
+        "suggestion decision grounded as a Calyx outcome anchor"
+    );
+
+    Ok(SuggestionOutcomeAnchorReport {
+        source_of_truth: SUGGESTION_ANCHOR_SOURCE_OF_TRUTH.to_owned(),
+        suggestion_id: record.suggestion_id.clone(),
+        decision: decision.to_owned(),
+        anchor_kind: SUGGESTION_OUTCOME_ANCHOR_KIND.to_owned(),
+        source_cf: offer.source_cf,
+        source_key_hex: offer.source_key_hex,
+        source_value_sha256: offer.source_value_sha256,
+        panel_name: offer.panel_name,
+        panel_version: offer.panel_version,
+        cx_id: offer.cx_id,
+        ledger_seq: Some(offer.ledger_seq),
+        ledger_hash: Some(offer.ledger_hash),
+        readback_anchor_count,
+        readback_exact_match_count,
+        evidence_anchors,
+        missing_evidence_rows,
+    })
+}
+
+/// Rebuilds the anchor report for an ALREADY-anchored decision by reading the
+/// physical Anchors CF only. Used on an idempotent replay, where re-running the
+/// side effect is exactly what must not happen.
+fn read_suggestion_outcome_anchor(
+    db: &Arc<Db>,
+    suggestion_key: &[u8],
+    suggestion_value: &[u8],
+    record: &SuggestionRecord,
+) -> Result<SuggestionOutcomeAnchorReport, ErrorData> {
+    let Some(decision) = suggestion_decision_label(record.status) else {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "SUGGESTION_OUTCOME_ANCHOR_NOT_A_DECISION: suggestion {} has status {:?}",
+                record.suggestion_id, record.status
+            ),
+        ));
+    };
+    let scan = db
+        .calyx_anchor_scan_for_source(cf::CF_KV, suggestion_key, suggestion_value)
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "SUGGESTION_ANCHOR_REPLAY_SCAN_FAILED for {}: {error}",
+                    record.suggestion_id
+                ),
+            )
+        })?;
+    let exact = scan
+        .anchors
+        .iter()
+        .filter(|row| anchor_row_matches(row, SUGGESTION_OUTCOME_ANCHOR_KIND, decision))
+        .count() as u64;
+    if exact != 1 {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ANCHOR_REPLAY_MISSING for {}: the row is already {decision} but the physical Anchors CF holds {exact} anchors of kind {SUGGESTION_OUTCOME_ANCHOR_KIND}={decision} on cx_id {}; the durable decision and its grounding disagree",
+                record.suggestion_id, scan.cx_id
+            ),
+        ));
+    }
+    let mut evidence_anchors = Vec::new();
+    let mut missing_evidence_rows = Vec::new();
+    if let Some(grounding_evidence) = &record.next_action {
+        let evidence_kind = format!(
+            "{NEXT_ACTION_EVIDENCE_ANCHOR_KIND}:{}",
+            record.suggestion_id
+        );
+        for (role, key_hex, episode_id) in [
+            (
+                "context",
+                grounding_evidence.context_episode_key_hex.as_str(),
+                grounding_evidence.context_episode_id.as_str(),
+            ),
+            (
+                "target",
+                grounding_evidence.target_source_key_hex.as_str(),
+                grounding_evidence.target_episode_id.as_str(),
+            ),
+        ] {
+            let Some(episode_key) = hex_decode(key_hex) else {
+                return Err(mcp_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    format!(
+                        "SUGGESTION_EVIDENCE_KEY_NOT_HEX: suggestion {} {role} evidence declares key {key_hex}",
+                        record.suggestion_id
+                    ),
+                ));
+            };
+            let Some(episode_value) = db
+                .get_cf(cf::CF_EPISODES, &episode_key)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            else {
+                missing_evidence_rows.push(format!(
+                    "{role}:{episode_id}:CF_EPISODES key {key_hex} no longer holds a row (re-segmented day)"
+                ));
+                continue;
+            };
+            let evidence_scan = db
+                .calyx_anchor_scan_for_source(cf::CF_EPISODES, &episode_key, &episode_value)
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            let evidence_exact = evidence_scan
+                .anchors
+                .iter()
+                .filter(|row| anchor_row_matches(row, &evidence_kind, decision))
+                .count() as u64;
+            evidence_anchors.push(SuggestionEvidenceAnchorReport {
+                anchor_kind: evidence_kind.clone(),
+                source_cf: cf::CF_EPISODES.to_owned(),
+                source_key_hex: key_hex.to_owned(),
+                episode_id: episode_id.to_owned(),
+                cx_id: evidence_scan.cx_id.clone(),
+                ledger_seq: None,
+                readback_exact_match_count: evidence_exact,
+            });
+        }
+    }
+    Ok(SuggestionOutcomeAnchorReport {
+        source_of_truth: SUGGESTION_ANCHOR_SOURCE_OF_TRUTH.to_owned(),
+        suggestion_id: record.suggestion_id.clone(),
+        decision: decision.to_owned(),
+        anchor_kind: SUGGESTION_OUTCOME_ANCHOR_KIND.to_owned(),
+        source_cf: scan.source_cf,
+        source_key_hex: scan.source_key_hex,
+        source_value_sha256: scan.source_value_sha256,
+        panel_name: scan.panel_name,
+        panel_version: scan.panel_version,
+        cx_id: scan.cx_id,
+        ledger_seq: None,
+        ledger_hash: None,
+        readback_anchor_count: scan.anchors.len() as u64,
+        readback_exact_match_count: exact,
+        evidence_anchors,
+        missing_evidence_rows,
+    })
+}
+
 pub fn accept_suggestion_for_execution(
     db: &Arc<Db>,
     suggestion_id: &str,
@@ -1047,7 +2432,7 @@ pub fn accept_suggestion_for_execution(
     plan_ref: &str,
     execution_id: &str,
     dry_run: bool,
-) -> Result<SuggestionRecord, ErrorData> {
+) -> Result<(SuggestionRecord, Option<SuggestionOutcomeAnchorReport>), ErrorData> {
     validate_suggestion_id("suggestion_accept", suggestion_id)?;
     let Some(mut record) = load_suggestion_by_id(db, suggestion_id)? else {
         return Err(mcp_error(
@@ -1072,19 +2457,274 @@ pub fn accept_suggestion_for_execution(
     } else {
         format!("accepted by suggestion_accept; execution_id={execution_id}")
     });
-    if !dry_run {
-        if !db.pressure_permits_write(cf::CF_KV) {
+    if dry_run {
+        return Ok((record, None));
+    }
+    if !db.pressure_permits_write(cf::CF_KV) {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "suggestion_accept refused under disk pressure: pressure_level={:?}",
+                db.pressure_level()
+            ),
+        ));
+    }
+    let (key, value) = write_suggestion(db, &record)?;
+    let anchor = anchor_suggestion_outcome(db, &key, &value, &record)?;
+    Ok((record, Some(anchor)))
+}
+
+// === suggestion_decline: exact, grounded, idempotent dismissal (#2046) ===
+//
+// The generic `routine feedback` operation cannot serve as the dismissal
+// surface: it names a routine, not the durable `suggestion/v1` row, so it can
+// neither resolve WHICH offer was dismissed nor make replay falsifiable.
+//
+// Idempotency model (the standard idempotent-consumer contract):
+//   * the idempotency key is the `suggestion_id` — minted by the producer when
+//     the offer was created, content-stable, and NEVER regenerated by this
+//     consumer from arrival time;
+//   * the durable dedupe store is the `CF_KV suggestion/v1` row itself:
+//     `status == Declined` IS the record that the effect already ran, and it is
+//     written in the same flushed batch as the effect;
+//   * a second dismissal of the same id performs zero side effects and rebuilds
+//     the identical response by READING the persisted row and rescanning the
+//     existing anchor — proof, not assertion;
+//   * the same id carrying a DIFFERENT note is a conflict, not a retry, and is
+//     refused with a structured mismatch naming both notes.
+
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionDeclineParams {
+    /// The exact durable `suggestion/v1` id being dismissed.
+    pub suggestion_id: String,
+    /// Optional operator reason, folded verbatim into the persisted resolution
+    /// note. Must be identical on a replay of the same id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Resolve as of this instant (replay/verification). Defaults to now, and is
+    /// ignored entirely on a replay — the first decision's stamp is the truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now_ts_ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionDeclineResponse {
+    pub source_of_truth: String,
+    /// The row as it exists in `CF_KV` after the call — read back, not echoed.
+    pub suggestion: SuggestionRecord,
+    /// True when this call was a duplicate dismissal that changed nothing.
+    pub replay: bool,
+    pub declined_ts_ns: u64,
+    pub resolution_note: String,
+    pub persisted_row_key: String,
+    pub persisted_row_sha256: String,
+    /// True only when this call recorded new #856 routine feedback. A replay
+    /// records none — one dismissal must not escalate the cooldown twice.
+    pub feedback_recorded: bool,
+    pub anchor: SuggestionOutcomeAnchorReport,
+}
+
+pub fn required_permissions_decline(_params: &SuggestionDeclineParams) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+fn validate_decline_note(note: Option<&str>) -> Result<Option<String>, ErrorData> {
+    let Some(note) = note else {
+        return Ok(None);
+    };
+    let trimmed = note.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if trimmed.chars().count() > 512 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "suggestion_decline note must be at most 512 Unicode scalar values".to_owned(),
+        ));
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "suggestion_decline note must not contain control characters".to_owned(),
+        ));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+/// Deterministic from the params alone, so a genuine retry of the same request
+/// reconstructs the exact note already persisted.
+fn decline_resolution_note(note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("declined by suggestion_decline: {note}"),
+        None => "declined by suggestion_decline".to_owned(),
+    }
+}
+
+/// Dismisses one exact suggestion, grounds the dismissal as a Calyx anchor, and
+/// is a no-op on replay.
+pub fn decline_suggestion(
+    db: &Arc<Db>,
+    params: &SuggestionDeclineParams,
+) -> Result<SuggestionDeclineResponse, ErrorData> {
+    validate_suggestion_id("suggestion_decline", &params.suggestion_id)?;
+    let note = validate_decline_note(params.note.as_deref())?;
+    let expected_note = decline_resolution_note(note.as_deref());
+
+    let Some(existing) = load_suggestion_by_id(db, &params.suggestion_id)? else {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "SUGGESTION_NOT_FOUND: suggestion_id {} is not in CF_KV; suggestion_decline requires the exact durable suggestion/v1 id, not a routine_id",
+                params.suggestion_id
+            ),
+        ));
+    };
+
+    // --- Replay lane: the effect already ran; prove it from storage. ---
+    if existing.status == SuggestionStatus::Declined {
+        let persisted_note = existing.resolution_note.clone().unwrap_or_default();
+        if note.is_some() && persisted_note != expected_note {
             return Err(mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
+                error_codes::TOOL_PARAMS_INVALID,
                 format!(
-                    "suggestion_accept refused under disk pressure: pressure_level={:?}",
-                    db.pressure_level()
+                    "SUGGESTION_DECLINE_REPLAY_NOTE_MISMATCH: suggestion_id {} was already declined with resolution_note {persisted_note:?}; this call supplies {expected_note:?}. The same suggestion_id with different content is a conflict, not a retry — replay the original note or inspect the persisted row",
+                    params.suggestion_id
                 ),
             ));
         }
-        write_suggestion(db, &record)?;
+        let key = suggestion_key(&existing.routine_id, existing.created_ts_ns);
+        let Some(value) = load_exact_kv_value(db, &key, "suggestion_decline replay readback")?
+        else {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "SUGGESTION_DECLINE_REPLAY_ROW_MISSING: suggestion_id {} indexes to CF_KV key {} which holds no row",
+                    params.suggestion_id,
+                    String::from_utf8_lossy(&key)
+                ),
+            ));
+        };
+        let persisted: SuggestionRecord = decode_json(&value).map_err(|error| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "SUGGESTION_DECLINE_REPLAY_DECODE_FAILED for {}: {error}",
+                    params.suggestion_id
+                ),
+            )
+        })?;
+        if persisted != existing {
+            return Err(mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "SUGGESTION_DECLINE_REPLAY_ROW_DRIFTED: the indexed load and the direct point read of {} disagree",
+                    params.suggestion_id
+                ),
+            ));
+        }
+        let declined_ts_ns = persisted.resolved_ts_ns.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "SUGGESTION_DECLINE_REPLAY_UNSTAMPED: suggestion {} is declined but carries no resolved_ts_ns",
+                    params.suggestion_id
+                ),
+            )
+        })?;
+        let anchor = read_suggestion_outcome_anchor(db, &key, &value, &persisted)?;
+        tracing::info!(
+            code = "SUGGESTION_DECLINE_REPLAYED",
+            suggestion_id = %params.suggestion_id,
+            routine_id = %persisted.routine_id,
+            declined_ts_ns,
+            cx_id = %anchor.cx_id,
+            "duplicate suggestion_decline was a no-op; response rebuilt from the persisted row and the physical Anchors CF"
+        );
+        return Ok(SuggestionDeclineResponse {
+            source_of_truth: format!(
+                "CF_KV suggestion/v1 row (point read) + {SUGGESTION_ANCHOR_SOURCE_OF_TRUTH}"
+            ),
+            declined_ts_ns,
+            resolution_note: persisted_note,
+            persisted_row_key: String::from_utf8_lossy(&key).into_owned(),
+            persisted_row_sha256: sha256_hex(&value),
+            replay: true,
+            feedback_recorded: false,
+            anchor,
+            suggestion: persisted,
+        });
     }
-    Ok(record)
+
+    // --- Mismatch lane: a resolved-but-not-declined row is not dismissable. ---
+    if existing.status != SuggestionStatus::Live {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "SUGGESTION_DECLINE_STATUS_CONFLICT: suggestion_id {} has status {:?} (resolved_ts_ns={:?}, resolution_note={:?}); only a live suggestion can be declined, and only an already-declined one is an idempotent replay",
+                params.suggestion_id,
+                existing.status,
+                existing.resolved_ts_ns,
+                existing.resolution_note
+            ),
+        ));
+    }
+
+    // --- Effect lane: first dismissal of a live offer. ---
+    if !db.pressure_permits_write(cf::CF_KV) {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "suggestion_decline refused under disk pressure: pressure_level={:?}",
+                db.pressure_level()
+            ),
+        ));
+    }
+    let now = params.now_ts_ns.unwrap_or_else(now_ts_ns);
+    let mut record = existing;
+    record.status = SuggestionStatus::Declined;
+    record.resolved_ts_ns = Some(now);
+    record.resolution_note = Some(expected_note.clone());
+    let (key, value) = write_suggestion(db, &record)?;
+
+    // #856 feedback: an EXPLICIT dismissal is a distinct, strong negative
+    // signal — never conflated with the soft `ignored_timeout`/`abandoned`
+    // outcomes the tick already records — so it escalates the decline cooldown.
+    record_terminal_feedback(
+        db,
+        &record.routine_id,
+        RoutineFeedbackOutcome::Declined,
+        now,
+        &expected_note,
+    )?;
+    let anchor = anchor_suggestion_outcome(db, &key, &value, &record)?;
+
+    tracing::info!(
+        code = "SUGGESTION_DECLINED",
+        suggestion_id = %record.suggestion_id,
+        routine_id = %record.routine_id,
+        source = ?record.source,
+        declined_ts_ns = now,
+        cx_id = %anchor.cx_id,
+        ledger_seq = anchor.ledger_seq.unwrap_or_default(),
+        evidence_anchors = anchor.evidence_anchors.len(),
+        "suggestion dismissed by exact id, feedback recorded, and grounded as a Calyx anchor"
+    );
+
+    Ok(SuggestionDeclineResponse {
+        source_of_truth: format!(
+            "CF_KV suggestion/v1 row (read-your-write) + {SUGGESTION_ANCHOR_SOURCE_OF_TRUTH}"
+        ),
+        declined_ts_ns: now,
+        resolution_note: expected_note,
+        persisted_row_key: String::from_utf8_lossy(&key).into_owned(),
+        persisted_row_sha256: sha256_hex(&value),
+        replay: false,
+        feedback_recorded: true,
+        anchor,
+        suggestion: record,
+    })
 }
 
 pub fn record_suggestion_execution_feedback(
@@ -1185,6 +2825,7 @@ pub fn suggestion_tick(
     } else {
         (Vec::new(), 0)
     };
+    let (next_action_report, next_actions) = next_action_candidates(db, now, params)?;
 
     let mut suggestions = load_all_suggestions(db)?;
     let mut expired = Vec::new();
@@ -1311,6 +2952,41 @@ pub fn suggestion_tick(
         });
     }
 
+    for candidate in &next_actions {
+        let suppressed = is_routine_suppressed(db, &candidate.routine_id, now)?;
+        let outcome = gate_decision(
+            &candidate.routine_id,
+            candidate.confidence,
+            RoutineLifecycle::Confirmed,
+            suppressed,
+            now,
+            now_minute,
+            &live,
+            &config,
+        );
+        let mut created_id = None;
+        if outcome == GateOutcome::Surface && !params.dry_run {
+            let record = build_next_action_suggestion(candidate, now, &config);
+            write_suggestion(db, &record)?;
+            live.live_routines.insert(record.routine_id.clone());
+            live.last_created_by_routine
+                .insert(record.routine_id.clone(), record.created_ts_ns);
+            live.created_ts.push(record.created_ts_ns);
+            created.push(record.suggestion_id.clone());
+            created_id = Some(record.suggestion_id.clone());
+        } else if outcome == GateOutcome::Surface && params.dry_run {
+            created_id = Some(format!("(dry-run){}", candidate.routine_id));
+        }
+        decisions.push(GateDecisionRow {
+            routine_id: candidate.routine_id.clone(),
+            source: SuggestionSource::KernelNextAction,
+            confidence: candidate.confidence,
+            outcome,
+            suggestion_id: created_id,
+            source_event_id: Some(candidate.grounding.target_cx_id.clone()),
+        });
+    }
+
     Ok(SuggestionTickResponse {
         now_ts_ns: now,
         dry_run: params.dry_run,
@@ -1320,6 +2996,7 @@ pub fn suggestion_tick(
         abandoned,
         assist_events_scanned,
         assist_events_evaluated: u32::try_from(assist_candidates.len()).unwrap_or(u32::MAX),
+        next_action: next_action_report,
         decisions,
         config: config.into(),
     })
@@ -1358,6 +3035,7 @@ fn build_suggestion(
             .as_ref()
             .map(|label| format!("Continue {label}? I can run the remaining setup steps.")),
         mitigation: None,
+        next_action: None,
         created_ts_ns: now,
         expiry_ts_ns: now.saturating_add(config.expiry_secs.saturating_mul(1_000_000_000)),
         status: SuggestionStatus::Live,
@@ -1385,6 +3063,7 @@ fn build_assist_suggestion(
         label: Some(candidate.label.clone()),
         offer: Some(candidate.offer.clone()),
         mitigation: Some(candidate.mitigation.clone()),
+        next_action: None,
         created_ts_ns: now,
         expiry_ts_ns: now.saturating_add(config.expiry_secs.saturating_mul(1_000_000_000)),
         status: SuggestionStatus::Live,
@@ -1509,6 +3188,10 @@ pub struct SuggestionAcceptResponse {
     pub suggestion: SuggestionRecord,
     pub plan: PlanDocument,
     pub execution: PlanExecutionRecord,
+    /// The grounded Calyx anchor written for the acceptance (#2046). `None`
+    /// only for `dry_run`, which mutates nothing and therefore grounds nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_anchor: Option<SuggestionOutcomeAnchorReport>,
 }
 
 pub fn required_permissions_accept(_params: &SuggestionAcceptParams) -> RequiredPermissions {

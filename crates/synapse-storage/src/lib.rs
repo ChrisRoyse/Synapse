@@ -1659,6 +1659,22 @@ impl Db {
         self.backend.temporal_hazard_intelligence(params)
     }
 
+    /// The cold grounding-kernel content-slot contract declared for one panel
+    /// version, or `None` when the panel declares no kernel lane.
+    ///
+    /// Single-sourced from the same table the cold kernel scheduler targets, so
+    /// a caller that composes intelligence off a panel's kernel cannot drift
+    /// onto a slot the scheduler no longer rebuilds. A panel bump that retires a
+    /// lane makes this return `None` instead of silently answering on a stale
+    /// slot id (#2046).
+    #[must_use]
+    pub fn kernel_content_slot_for_panel(panel_version: u32) -> Option<u16> {
+        constellations::SYN_KERNEL_MAINTENANCE_TARGETS
+            .iter()
+            .find(|(declared_version, _)| *declared_version == panel_version)
+            .map(|(_, content_slot)| *content_slot)
+    }
+
     /// Builds the per-domain grounding kernel for one panel, enforces the recall
     /// gate (an ungrounded kernel is a structured error), and persists the kernel
     /// with its corpus fingerprint to the native Kernel CF.

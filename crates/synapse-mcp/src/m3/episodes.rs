@@ -834,7 +834,7 @@ pub fn required_permissions_get(_params: &EpisodeGetParams) -> RequiredPermissio
     required([Permission::ReadStorage])
 }
 
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     let text = text.trim();
     if text.is_empty() || !text.len().is_multiple_of(2) {
         return None;
@@ -899,6 +899,77 @@ pub(crate) fn decode_episode_row(
         )
     })?;
     Ok((key_ts_ns, ordinal, record))
+}
+
+/// One decoded `CF_EPISODES` row with the exact physical bytes it was read
+/// from. The raw bytes are load-bearing: a Calyx constellation id is derived
+/// from the source value, so a caller that re-encodes the record instead of
+/// carrying its bytes computes a different `cx_id` than the one storage holds.
+pub(crate) type EpisodeSourceRow = (Vec<u8>, Vec<u8>, EpisodeRecord);
+
+/// Reads the `CF_EPISODES` rows that started inside `[floor_ts_ns, now_ts_ns]`,
+/// newest first, capped at `max_rows` (#2046).
+///
+/// This is the atomic context measurement the assist next-action composer works
+/// from: the operator's most recent observed episodes, straight off the
+/// authoritative rows. Bounded by the same `MAX_SCAN_ROWS_PER_CALL` budget every
+/// other episode reader uses, and loud on any undecodable row — `CF_EPISODES` is
+/// derived state this module owns, so corruption is surfaced, never skipped.
+pub(crate) fn recent_episode_rows(
+    db: &Arc<synapse_storage::Db>,
+    floor_ts_ns: u64,
+    now_ts_ns: u64,
+    max_rows: usize,
+) -> Result<Vec<EpisodeSourceRow>, ErrorData> {
+    if max_rows == 0 || floor_ts_ns > now_ts_ns {
+        return Ok(Vec::new());
+    }
+    let mut collected: Vec<EpisodeSourceRow> = Vec::new();
+    let mut scanned = 0_usize;
+    let mut start = episode_codec::episode_scan_start(floor_ts_ns);
+    loop {
+        if scanned >= MAX_SCAN_ROWS_PER_CALL {
+            return Err(mcp_error(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "ASSIST_CONTEXT_SCAN_BUDGET_EXHAUSTED: read {MAX_SCAN_ROWS_PER_CALL} \
+                     CF_EPISODES rows from {floor_ts_ns} without reaching {now_ts_ns}; narrow the \
+                     assist context lookback"
+                ),
+            ));
+        }
+        let chunk_rows = SCAN_CHUNK_ROWS.min(MAX_SCAN_ROWS_PER_CALL - scanned);
+        let (rows, more) = db
+            .scan_cf_from(cf::CF_EPISODES, &start, chunk_rows)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if rows.is_empty() {
+            break;
+        }
+        let mut past_end = false;
+        let mut last_key: Option<Vec<u8>> = None;
+        for (key, value) in rows {
+            scanned = scanned.saturating_add(1);
+            let (key_ts_ns, _ordinal, record) = decode_episode_row(&key, &value)?;
+            // Keys iterate in start-timestamp order, so the first start past the
+            // upper bound proves no later row can qualify.
+            if key_ts_ns > now_ts_ns {
+                past_end = true;
+                break;
+            }
+            collected.push((key, value, record));
+            last_key = collected.last().map(|(key, _, _)| key.clone());
+        }
+        if past_end || !more {
+            break;
+        }
+        let Some(last_key) = last_key else {
+            break;
+        };
+        start = key_after(&last_key);
+    }
+    collected.sort_by_key(|(_, _, record)| std::cmp::Reverse(record.start_ts_ns));
+    collected.truncate(max_rows);
+    Ok(collected)
 }
 
 fn episode_view(key: &[u8], ordinal: u32, record: EpisodeRecord) -> EpisodeView {
