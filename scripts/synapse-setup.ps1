@@ -2963,16 +2963,32 @@ function Set-SynapseReleaseBuildCompilerEnvironment {
     # at runtime -- it changes no codegen flag and does not touch the shipped
     # binary, only how much address space rustc's own worker threads reserve.
     #
-    # This is a HYPOTHESIS UNDER TEST, not a proven fix. The mechanism is
-    # plausible (a deep recursion in a codegen worker on a ~189 MB binary) but
-    # unconfirmed: Windows reports a guard-page overrun as 0xC0000005 rather
-    # than 0xC00000FD when the handler itself cannot run, so a stack exhaustion
-    # and a genuine bad access are indistinguishable from the exit code alone.
-    # If deploys keep crashing with this raised, the stack hypothesis is dead
-    # and the next arm is the release profile's `lto = "thin"`. Either way the
-    # failure is now named correctly by SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED
-    # instead of being reported as a compiler error, so the evidence accrues on
-    # #1975 rather than being lost.
+    # THE STACK HYPOTHESIS IS NOW FALSIFIED (#2029). It was recorded here as "a
+    # HYPOTHESIS UNDER TEST" on 2026-08-03; it failed its own test twice:
+    #   2026-08-04  crash recurred, archive ...20260804T004949861Z-pid27796,
+    #               diagnostics record rust_min_stack=67108864, jobs=8
+    #   2026-08-06  crash recurred, archive ...20260806T174951173Z-pid46444,
+    #               same 64 MiB stack, jobs=32, 72.8 GB physical free
+    # The mechanism was sound -- ThinLTO workers are plain std threads, so they
+    # DO honour RUST_MIN_STACK (on Windows std's default is only 2 MiB against
+    # the frontend's 8 MiB, so this closed a real 4x asymmetry) -- but sound
+    # mechanism is not evidence, and the evidence says no.
+    #
+    # This function is KEPT anyway, and deliberately: it costs nothing (it sets
+    # no codegen flag and does not touch the shipped binary, only how much
+    # address space rustc's own worker threads reserve), and leaving it in place
+    # holds the variable constant so the arm now under test is not confounded by
+    # re-introducing a second change. Do not read its survival as an endorsement.
+    #
+    # The arm that replaced it is the release profile's `lto = "thin"` -> false,
+    # taken 2026-08-07 in the root Cargo.toml, where the full evidence table and
+    # the falsification criterion are recorded. Do not add a fourth knob here
+    # until that one has been settled.
+    #
+    # Either way the failure is now named correctly by
+    # SYNAPSE_RELEASE_BUILD_TOOLCHAIN_CRASHED instead of being reported as a
+    # compiler error, so the evidence accrues on #1975/#2029 rather than being
+    # lost.
     $minimumRustStack = 64 * 1024 * 1024
     $existing = $env:RUST_MIN_STACK
     $effective = $minimumRustStack
@@ -12255,12 +12271,26 @@ if (-not $SkipBuild) {
         #     crash_status=STATUS_ACCESS_VIOLATION.
         #   * It is not resource exhaustion: that same readback shows 46 GB
         #     physical still available and commit at 52.3%.
-        #   * Upstream places this fault in the ThinLTO LLVM codegen workers
-        #     (rust-lang/rust#125765, #109067, #113433), which is a per-thread
-        #     stack/miscompile issue. Job count is not a documented lever on it;
-        #     RUST_MIN_STACK is, and Set-SynapseReleaseBuildCompilerEnvironment
-        #     already sets it. The remaining arm is the release profile's
-        #     lto = "thin" -- tracked on #1975, NOT worked around here.
+        #   * It then recurred AT 32 JOBS too (2026-08-06, archive
+        #     release-build-20260806T174951173Z-pid46444, 72.8 GB free). Same
+        #     fault at both ends of the range: job count is not a lever on it in
+        #     EITHER direction, so the cap could not have been preventing it.
+        #
+        # An earlier version of this comment claimed "upstream places this fault
+        # in the ThinLTO LLVM codegen workers (rust-lang/rust#125765, #109067,
+        # #113433)". That citation was checked in #2029 and DOES NOT SUPPORT the
+        # claim -- do not propagate it. #125765 is closed as not-a-bug (the
+        # reporter's build was OOMing under an 8 GiB Docker limit) and is on
+        # windows-gnu; #109067 is a miscompilation needing -Zdylib-lto; #113433
+        # is an unmerged PR about building rustc itself with LTO. All three are
+        # 2023-2024 and none is a compile-time AV under `-C lto=thin` on
+        # windows-msvc. As of 2026-08-07 there is NO open upstream bug matching
+        # this signature, and 1.97.1 is already the newest stable, so there is
+        # no toolchain to bump to either.
+        #
+        # The live arm is the release profile's `lto = "thin"` -> false, taken
+        # 2026-08-07 in the root Cargo.toml (#2029) -- where the evidence and
+        # the falsification criterion live. It is NOT worked around here.
         #
         # So the cap cost a 4x parallelism throttle on the single most expensive
         # phase of setup (8 of 32 jobs on this host) while demonstrably not
