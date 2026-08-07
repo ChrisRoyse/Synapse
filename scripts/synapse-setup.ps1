@@ -7475,6 +7475,216 @@ function Remove-SynapseCurrentDaemonStagingArtifact {
     $script:SynapseCurrentDaemonStagingDirectory = $null
 }
 
+function Get-SynapseAcquisitionTempArtifactDescriptor {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot
+    )
+
+    $rootFull = Get-SynapseFullPathForScopeCheck -Path $ExpectedRoot
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    $rootPrefix = $rootFull + [System.IO.Path]::DirectorySeparatorChar
+    if ($pathFull -eq $rootFull -or
+        -not $pathFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "SYNAPSE_ACQUISITION_TEMP_SCOPE_ESCAPE root=$rootFull path=$pathFull remediation=do not delete anything; acquisition cleanup accepts only descendants of the exact setup-owned root"
+    }
+    if (-not (Test-Path -LiteralPath $pathFull)) {
+        return [pscustomobject][ordered]@{
+            Path = $pathFull
+            Exists = $false
+            IsContainer = $false
+            ItemCount = 0
+            Bytes = [int64]0
+        }
+    }
+    if (-not (Test-Path -LiteralPath $rootFull -PathType Container)) {
+        throw "SYNAPSE_ACQUISITION_ROOT_NOT_DIRECTORY root=$rootFull path=$pathFull remediation=do not delete anything; restore the setup-owned acquisition root as a physical directory"
+    }
+    $ancestor = Get-Item -LiteralPath $rootFull -Force -ErrorAction Stop
+    while ($true) {
+        if ($ancestor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "SYNAPSE_ACQUISITION_TEMP_ANCESTOR_REPARSE_POINT root=$rootFull path=$pathFull ancestor=$($ancestor.FullName) attributes=$($ancestor.Attributes) remediation=do not follow or delete through this link; restore the setup-owned acquisition tree as physical directories"
+        }
+        if ($ancestor.FullName -eq $rootFull) { break }
+        $ancestor = $ancestor.Parent
+        if ($null -eq $ancestor) {
+            throw "SYNAPSE_ACQUISITION_TEMP_ANCESTOR_READ_FAILED root=$rootFull path=$pathFull remediation=do not delete anything; the candidate ancestry did not reach its validated root"
+        }
+    }
+    $parentPath = Split-Path -Parent $pathFull
+    $parent = Get-Item -LiteralPath $parentPath -Force -ErrorAction Stop
+    while ($null -ne $parent -and $parent.FullName -ne $rootFull) {
+        if ($parent.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "SYNAPSE_ACQUISITION_TEMP_ANCESTOR_REPARSE_POINT root=$rootFull path=$pathFull ancestor=$($parent.FullName) attributes=$($parent.Attributes) remediation=do not follow or delete through this link; restore the setup-owned acquisition tree as physical directories"
+        }
+        $parent = $parent.Parent
+    }
+    if ($null -eq $parent) {
+        throw "SYNAPSE_ACQUISITION_TEMP_ANCESTOR_READ_FAILED root=$rootFull path=$pathFull remediation=do not delete anything; the candidate ancestry did not reach its validated root"
+    }
+    $item = Get-Item -LiteralPath $pathFull -Force -ErrorAction Stop
+    if ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_ACQUISITION_TEMP_REPARSE_POINT root=$rootFull path=$pathFull attributes=$($item.Attributes) remediation=do not follow or delete this link; inspect the exact setup-owned acquisition root"
+    }
+    if ($item.PSIsContainer) {
+        $footprint = Get-SynapseDirectoryFootprint -Path $pathFull
+        if (-not $footprint.complete) {
+            $errors = @($footprint.read_errors_sample) -join ' | '
+            throw "SYNAPSE_ACQUISITION_TEMP_FOOTPRINT_INCOMPLETE root=$rootFull path=$pathFull read_error_count=$($footprint.read_error_count) errors=$errors remediation=repair access to the exact temp directory before setup retries cleanup"
+        }
+        return [pscustomobject][ordered]@{
+            Path = $pathFull
+            Exists = $true
+            IsContainer = $true
+            ItemCount = [int64]$footprint.file_count + 1
+            Bytes = [int64]$footprint.byte_len
+        }
+    }
+    return [pscustomobject][ordered]@{
+        Path = $pathFull
+        Exists = $true
+        IsContainer = $false
+        ItemCount = 1
+        Bytes = [int64]$item.Length
+    }
+}
+
+function Remove-SynapseAcquisitionTempArtifact {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][string]$Reason
+    )
+
+    $descriptor = Get-SynapseAcquisitionTempArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    if (-not $descriptor.Exists) { return $descriptor }
+    try {
+        if ($descriptor.IsContainer) {
+            Remove-Item -LiteralPath $descriptor.Path -Recurse -Force -ErrorAction Stop
+        } else {
+            Remove-Item -LiteralPath $descriptor.Path -Force -ErrorAction Stop
+        }
+    } catch {
+        throw "SYNAPSE_ACQUISITION_TEMP_CLEANUP_FAILED reason=$Reason root=$ExpectedRoot path=$($descriptor.Path) item_count=$($descriptor.ItemCount) bytes=$($descriptor.Bytes) error=$($_.Exception.Message) remediation=close the exact process holding this setup-owned temp artifact, repair its permissions, and rerun setup"
+    }
+    if (Test-Path -LiteralPath $descriptor.Path) {
+        throw "SYNAPSE_ACQUISITION_TEMP_CLEANUP_READBACK_FAILED reason=$Reason root=$ExpectedRoot path=$($descriptor.Path) item_count=$($descriptor.ItemCount) bytes=$($descriptor.Bytes) remediation=inspect the exact path; cleanup returned without removing its physical Source of Truth"
+    }
+    Info "Acquisition temp artifact removed reason=$Reason path=$($descriptor.Path) item_count=$($descriptor.ItemCount) bytes=$($descriptor.Bytes) readback_exists=false"
+    return $descriptor
+}
+
+function Remove-SynapseStaleAcquisitionArtifacts {
+    param([Parameter(Mandatory=$true)][string[]]$Roots)
+
+    $observedAt = (Get-Date).ToUniversalTime().ToString('o')
+    $candidates = @()
+    $rootReadbacks = @()
+    foreach ($requestedRoot in @($Roots | Sort-Object -Unique)) {
+        $root = Get-SynapseFullPathForScopeCheck -Path $requestedRoot
+        if (-not (Test-Path -LiteralPath $root)) {
+            $rootReadbacks += [pscustomobject][ordered]@{ root = $root; exists = $false; enumerated_count = 0 }
+            continue
+        }
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) {
+            throw "SYNAPSE_ACQUISITION_ROOT_NOT_DIRECTORY root=$root remediation=do not delete this path; restore the setup-owned acquisition root as a physical directory"
+        }
+        $rootItem = Get-Item -LiteralPath $root -Force -ErrorAction Stop
+        if ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "SYNAPSE_ACQUISITION_ROOT_REPARSE_POINT root=$root attributes=$($rootItem.Attributes) remediation=do not follow or delete this link; restore the setup-owned acquisition root as a physical directory"
+        }
+        $entries = @(Get-ChildItem -LiteralPath $root -Recurse -Force -ErrorAction Stop)
+        if ($entries.Count -gt 65536) {
+            throw "SYNAPSE_ACQUISITION_ROOT_BOUND_EXCEEDED root=$root count=$($entries.Count) max=65536 remediation=inspect the unexpectedly large setup-owned acquisition root before cleanup"
+        }
+        $rootReadbacks += [pscustomobject][ordered]@{ root = $root; exists = $true; enumerated_count = $entries.Count }
+        foreach ($entry in $entries) {
+            $ownerPidText = $null
+            $kind = $null
+            if ($entry.Name -match '\.download-(\d+)$') {
+                if ($entry.PSIsContainer) {
+                    throw "SYNAPSE_ACQUISITION_TEMP_SHAPE_INVALID root=$root path=$($entry.FullName) kind=download expected=file remediation=do not delete the unexpected directory; inspect how it was created"
+                }
+                $ownerPidText = $Matches[1]
+                $kind = 'download'
+            } elseif ($entry.Name -match '^extract-(\d+)$') {
+                if (-not $entry.PSIsContainer) {
+                    throw "SYNAPSE_ACQUISITION_TEMP_SHAPE_INVALID root=$root path=$($entry.FullName) kind=extract expected=directory remediation=do not delete the unexpected file; inspect how it was created"
+                }
+                $ownerPidText = $Matches[1]
+                $kind = 'extract'
+            } elseif ($entry.Name -match '^package-(\d+)\.zip$') {
+                if ($entry.PSIsContainer) {
+                    throw "SYNAPSE_ACQUISITION_TEMP_SHAPE_INVALID root=$root path=$($entry.FullName) kind=package_zip expected=file remediation=do not delete the unexpected directory; inspect how it was created"
+                }
+                $ownerPidText = $Matches[1]
+                $kind = 'package_zip'
+            } else {
+                continue
+            }
+            $ownerPid = [int64]0
+            if (-not [int64]::TryParse($ownerPidText, [ref]$ownerPid) -or
+                $ownerPid -le 0 -or $ownerPid -gt [int]::MaxValue) {
+                throw "SYNAPSE_ACQUISITION_TEMP_PID_INVALID root=$root path=$($entry.FullName) owner_pid=$ownerPidText remediation=do not delete the malformed setup temp artifact; inspect how it was created"
+            }
+            $descriptor = Get-SynapseAcquisitionTempArtifactDescriptor -Path $entry.FullName -ExpectedRoot $root
+            $candidates += [pscustomobject][ordered]@{
+                root = $root
+                path = $descriptor.Path
+                kind = $kind
+                owner_pid = [int]$ownerPid
+                item_count = $descriptor.ItemCount
+                bytes = $descriptor.Bytes
+            }
+        }
+    }
+
+    $reaped = @()
+    $retained = @()
+    foreach ($candidate in @($candidates | Sort-Object { $_.path.Length } -Descending)) {
+        $liveOwner = Get-Process -Id $candidate.owner_pid -ErrorAction SilentlyContinue
+        if ($null -ne $liveOwner) {
+            $retained += $candidate
+            continue
+        }
+        $removed = Remove-SynapseAcquisitionTempArtifact `
+            -Path $candidate.path `
+            -ExpectedRoot $candidate.root `
+            -Reason "stale_dead_owner_$($candidate.owner_pid)"
+        if ($removed.Exists) { $reaped += $candidate }
+    }
+
+    foreach ($candidate in $reaped) {
+        if (Test-Path -LiteralPath $candidate.path) {
+            throw "SYNAPSE_ACQUISITION_STALE_SWEEP_READBACK_FAILED path=$($candidate.path) owner_pid=$($candidate.owner_pid) expected_exists=false remediation=inspect the exact setup-owned artifact that remained after cleanup"
+        }
+    }
+    foreach ($candidate in $retained) {
+        if (-not (Test-Path -LiteralPath $candidate.path)) {
+            throw "SYNAPSE_ACQUISITION_LIVE_OWNER_ARTIFACT_CHANGED path=$($candidate.path) owner_pid=$($candidate.owner_pid) expected_exists=true remediation=a concurrent owner changed its temp artifact during setup; rerun after that acquisition finishes"
+        }
+    }
+    $candidateBytes = ($candidates | Measure-Object -Property bytes -Sum).Sum
+    if ($null -eq $candidateBytes) { $candidateBytes = 0 }
+    $reclaimedBytes = ($reaped | Measure-Object -Property bytes -Sum).Sum
+    if ($null -eq $reclaimedBytes) { $reclaimedBytes = 0 }
+    $readback = [pscustomobject][ordered]@{
+        schema = 'synapse_setup_acquisition_cleanup/v1'
+        observed_at_utc = $observedAt
+        completed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
+        roots = @($rootReadbacks)
+        candidate_count = $candidates.Count
+        candidate_bytes = [int64]$candidateBytes
+        reaped_count = $reaped.Count
+        reclaimed_bytes = [int64]$reclaimedBytes
+        retained_live_count = $retained.Count
+        reaped = @($reaped)
+        retained_live = @($retained)
+    }
+    Info "Acquisition stale sweep candidate_count=$($readback.candidate_count) candidate_bytes=$($readback.candidate_bytes) reaped_count=$($readback.reaped_count) reclaimed_bytes=$($readback.reclaimed_bytes) retained_live_count=$($readback.retained_live_count)"
+    return $readback
+}
+
 function Get-SynapseOrtRuntimeCompanions {
     param([Parameter(Mandatory=$true)][string]$ExecutablePath)
 
@@ -7512,12 +7722,20 @@ function Install-SynapsePinnedOrtGpuRuntime {
     New-Item -ItemType Directory -Force -Path $versionRoot | Out-Null
     if (-not (Test-Path -LiteralPath $packagePath -PathType Leaf)) {
         $downloadPath = "$packagePath.download-$PID"
-        Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Gpu.Windows/$version" -OutFile $downloadPath
-        $downloadHash = Get-SynapseFileSha256 -Path $downloadPath
-        if ($downloadHash -ne $packageSha256) {
-            Die "SYNAPSE_ORT_RUNTIME_PACKAGE_HASH_MISMATCH path=$downloadPath expected_sha256=$packageSha256 actual_sha256=$downloadHash remediation=do not install an unverified ONNX Runtime package; inspect the authoritative Microsoft NuGet release"
+        try {
+            try {
+                Invoke-WebRequest -Uri "https://www.nuget.org/api/v2/package/Microsoft.ML.OnnxRuntime.Gpu.Windows/$version" -OutFile $downloadPath -ErrorAction Stop
+            } catch {
+                Die "SYNAPSE_ORT_RUNTIME_PACKAGE_DOWNLOAD_FAILED path=$downloadPath version=$version error=$($_.Exception.Message) remediation=verify network/TLS access to the authoritative Microsoft NuGet package endpoint and rerun setup"
+            }
+            $downloadHash = Get-SynapseFileSha256 -Path $downloadPath
+            if ($downloadHash -ne $packageSha256) {
+                Die "SYNAPSE_ORT_RUNTIME_PACKAGE_HASH_MISMATCH path=$downloadPath expected_sha256=$packageSha256 actual_sha256=$downloadHash remediation=do not install an unverified ONNX Runtime package; inspect the authoritative Microsoft NuGet release"
+            }
+            Move-Item -LiteralPath $downloadPath -Destination $packagePath -ErrorAction Stop
+        } finally {
+            [void](Remove-SynapseAcquisitionTempArtifact -Path $downloadPath -ExpectedRoot $Root -Reason 'current_ort_download')
         }
-        Move-Item -LiteralPath $downloadPath -Destination $packagePath
     }
     $packageReadback = Get-SynapseFileSha256 -Path $packagePath
     if ($packageReadback -ne $packageSha256) {
@@ -7526,11 +7744,19 @@ function Install-SynapsePinnedOrtGpuRuntime {
     if (-not (Test-Path -LiteralPath $nativeDir -PathType Container)) {
         $zipPath = Join-Path $versionRoot "package-$PID.zip"
         $extractAttempt = Join-Path $versionRoot "extract-$PID"
-        Copy-Item -LiteralPath $packagePath -Destination $zipPath -Force
-        New-Item -ItemType Directory -Force -Path $extractAttempt | Out-Null
-        Expand-Archive -LiteralPath $zipPath -DestinationPath $extractAttempt
-        Move-Item -LiteralPath $extractAttempt -Destination $extractRoot
-        Remove-Item -LiteralPath $zipPath -Force
+        try {
+            try {
+                Copy-Item -LiteralPath $packagePath -Destination $zipPath -Force -ErrorAction Stop
+                New-Item -ItemType Directory -Force -Path $extractAttempt -ErrorAction Stop | Out-Null
+                Expand-Archive -LiteralPath $zipPath -DestinationPath $extractAttempt -ErrorAction Stop
+                Move-Item -LiteralPath $extractAttempt -Destination $extractRoot -ErrorAction Stop
+            } catch {
+                Die "SYNAPSE_ORT_RUNTIME_PACKAGE_EXTRACT_FAILED package=$packagePath zip=$zipPath extract_attempt=$extractAttempt destination=$extractRoot error=$($_.Exception.Message) remediation=verify free disk space and access to the exact runtime cache directory, then rerun setup"
+            }
+        } finally {
+            [void](Remove-SynapseAcquisitionTempArtifact -Path $extractAttempt -ExpectedRoot $Root -Reason 'current_ort_extract')
+            [void](Remove-SynapseAcquisitionTempArtifact -Path $zipPath -ExpectedRoot $Root -Reason 'current_ort_package_zip')
+        }
     }
     foreach ($entry in $expectedFiles.GetEnumerator()) {
         $path = Join-Path $nativeDir $entry.Key
@@ -7756,45 +7982,52 @@ function Install-SynapsePinnedDetectionModels {
             ((Get-SynapseFileSha256 -Path $path) -eq $model.Sha256)
         if (-not $valid) {
             $download = "$path.download-$PID"
-            $acquired = $false
-            $attempted = @()
-            if ($model.Url) {
-                Invoke-WebRequest -Uri $model.Url -OutFile $download
-                $acquired = $true
-                $attempted += $model.Url
-            } else {
-                foreach ($candidate in @($model.SourcePaths)) {
-                    $attempted += $candidate
-                    if (Test-Path -LiteralPath $candidate -PathType Leaf) {
-                        Copy-Item -LiteralPath $candidate -Destination $download -Force
+            try {
+                $acquired = $false
+                $attempted = @()
+                try {
+                    if ($model.Url) {
+                        Invoke-WebRequest -Uri $model.Url -OutFile $download -ErrorAction Stop
                         $acquired = $true
-                        break
+                        $attempted += $model.Url
+                    } else {
+                        foreach ($candidate in @($model.SourcePaths)) {
+                            $attempted += $candidate
+                            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                                Copy-Item -LiteralPath $candidate -Destination $download -Force -ErrorAction Stop
+                                $acquired = $true
+                                break
+                            }
+                        }
                     }
+                } catch {
+                    Die "SYNAPSE_EMBEDDED_MODEL_ACQUISITION_FAILED model=$($model.Name) path=$download attempted_sources=$($attempted -join ';') error=$($_.Exception.Message) remediation=repair access to the exact pinned source or its authoritative URL and rerun setup"
                 }
-            }
-            if (-not $acquired) {
-                if ($model.Required) {
-                    Die "SYNAPSE_EMBEDDED_MODEL_SOURCE_MISSING model=$($model.Name) attempted_sources=$($attempted -join ';') remediation=a required embedded model could not be acquired; restore the pinned source artifact or network access to its pinned URL"
+                if (-not $acquired) {
+                    if ($model.Required) {
+                        Die "SYNAPSE_EMBEDDED_MODEL_SOURCE_MISSING model=$($model.Name) attempted_sources=$($attempted -join ';') remediation=a required embedded model could not be acquired; restore the pinned source artifact or network access to its pinned URL"
+                    }
+                    # Optional and absent: record the capability gap and continue.
+                    # The install is still correct; the dependent capability is not
+                    # available and says so.
+                    $model | Add-Member -NotePropertyName Path -NotePropertyValue $null -Force
+                    $model | Add-Member -NotePropertyName Present -NotePropertyValue $false -Force
+                    $model | Add-Member -NotePropertyName AbsenceReason -NotePropertyValue (
+                        "no verified source artifact found; searched: $($attempted -join '; ')"
+                    ) -Force
+                    Warn ("SYNAPSE_OPTIONAL_MODEL_ABSENT model={0} capability={1} expected_sha256={2} expected_length={3} searched={4} recipe={5} override_env={6} pin={7} effect=the install continues and this capability reports itself unavailable" -f `
+                        $model.Name, $model.Capability, $model.Sha256, $model.Length, ($attempted -join ';'), $model.Recipe, $model.OverrideEnv, $model.PinPath)
+                    continue
                 }
-                # Optional and absent: record the capability gap and continue.
-                # The install is still correct; the dependent capability is not
-                # available and says so.
-                $model | Add-Member -NotePropertyName Path -NotePropertyValue $null -Force
-                $model | Add-Member -NotePropertyName Present -NotePropertyValue $false -Force
-                $model | Add-Member -NotePropertyName AbsenceReason -NotePropertyValue (
-                    "no verified source artifact found; searched: $($attempted -join '; ')"
-                ) -Force
-                Warn ("SYNAPSE_OPTIONAL_MODEL_ABSENT model={0} capability={1} expected_sha256={2} expected_length={3} searched={4} recipe={5} override_env={6} pin={7} effect=the install continues and this capability reports itself unavailable" -f `
-                    $model.Name, $model.Capability, $model.Sha256, $model.Length, ($attempted -join ';'), $model.Recipe, $model.OverrideEnv, $model.PinPath)
-                continue
+                $actualLength = (Get-Item -LiteralPath $download).Length
+                $actualHash = Get-SynapseFileSha256 -Path $download
+                if ($actualLength -ne $model.Length -or $actualHash -ne $model.Sha256) {
+                    Die "SYNAPSE_EMBEDDED_MODEL_DOWNLOAD_INVALID model=$($model.Name) path=$download expected_length=$($model.Length) actual_length=$actualLength expected_sha256=$($model.Sha256) actual_sha256=$actualHash remediation=refuse unverified model bytes; inspect the pinned upstream artifact"
+                }
+                Move-Item -LiteralPath $download -Destination $path -Force -ErrorAction Stop
+            } finally {
+                [void](Remove-SynapseAcquisitionTempArtifact -Path $download -ExpectedRoot $Root -Reason "current_model_$($model.Name)")
             }
-            $actualLength = (Get-Item -LiteralPath $download).Length
-            $actualHash = Get-SynapseFileSha256 -Path $download
-            if ($actualLength -ne $model.Length -or $actualHash -ne $model.Sha256) {
-                Remove-Item -LiteralPath $download -Force -ErrorAction SilentlyContinue
-                Die "SYNAPSE_EMBEDDED_MODEL_DOWNLOAD_INVALID model=$($model.Name) path=$download expected_length=$($model.Length) actual_length=$actualLength expected_sha256=$($model.Sha256) actual_sha256=$actualHash remediation=refuse unverified model bytes; inspect the pinned upstream artifact"
-            }
-            Move-Item -LiteralPath $download -Destination $path -Force
         }
         $model | Add-Member -NotePropertyName Path -NotePropertyValue $path -Force
         $model | Add-Member -NotePropertyName Present -NotePropertyValue $true -Force
@@ -11923,6 +12156,21 @@ if (-not $SkipBuild) {
 # ---------------------------------------------------------------------------
 Set-SynapseCudaBuildEnvironment
 $ortRuntimeRoot = Join-Path $env:LOCALAPPDATA 'synapse\runtime\onnxruntime-gpu'
+$embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
+$acquisitionCleanup = Remove-SynapseStaleAcquisitionArtifacts -Roots @($ortRuntimeRoot, $embeddedModelRoot)
+$acquisitionCleanupPath = Join-Path $LogDir 'setup-acquisition-cleanup.json'
+$acquisitionCleanup | ConvertTo-Json -Depth 16 | Set-Content -LiteralPath $acquisitionCleanupPath -Encoding UTF8
+try {
+    $acquisitionCleanupReadback = Get-Content -LiteralPath $acquisitionCleanupPath -Raw -Encoding UTF8 | ConvertFrom-Json
+} catch {
+    Die "SYNAPSE_ACQUISITION_CLEANUP_READBACK_UNREADABLE path=$acquisitionCleanupPath error=$($_.Exception.Message) remediation=repair the setup log directory; setup cannot prove which stale acquisition bytes it reclaimed"
+}
+if ([int64]$acquisitionCleanupReadback.reclaimed_bytes -ne [int64]$acquisitionCleanup.reclaimed_bytes -or
+    [int]$acquisitionCleanupReadback.reaped_count -ne [int]$acquisitionCleanup.reaped_count) {
+    Die "SYNAPSE_ACQUISITION_CLEANUP_READBACK_MISMATCH path=$acquisitionCleanupPath expected_reaped_count=$($acquisitionCleanup.reaped_count) actual_reaped_count=$($acquisitionCleanupReadback.reaped_count) expected_reclaimed_bytes=$($acquisitionCleanup.reclaimed_bytes) actual_reclaimed_bytes=$($acquisitionCleanupReadback.reclaimed_bytes) remediation=inspect the setup log filesystem; the durable cleanup ledger differs from the in-memory result"
+}
+$acquisitionCleanupSha = Get-SynapseFileSha256 -Path $acquisitionCleanupPath
+Info "Acquisition cleanup readback -> $acquisitionCleanupPath sha256=$acquisitionCleanupSha reaped_count=$($acquisitionCleanupReadback.reaped_count) reclaimed_bytes=$($acquisitionCleanupReadback.reclaimed_bytes) retained_live_count=$($acquisitionCleanupReadback.retained_live_count)"
 $ortRuntime = Install-SynapsePinnedOrtGpuRuntime -Root $ortRuntimeRoot
 $env:ORT_LIB_LOCATION = $ortRuntime.NativeDir
 $env:ORT_PREFER_DYNAMIC_LINK = '1'
@@ -12322,7 +12570,6 @@ if (-not $SkipBuild) {
         $buildTargetReadback.cargo_target_dir_kind,
         $cudaBuildCapability.enabled,
         $buildTargetReadback.artifact_sha256)
-    $embeddedModelRoot = Join-Path $env:LOCALAPPDATA 'synapse\build-models'
     $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot -SourceDir $SourceDir)
     foreach ($slotName in $script:SynapseEmbeddedModelSlotOrder) {
         if (-not @($embeddedModels | Where-Object { $_.Name -eq $slotName })[0]) {
