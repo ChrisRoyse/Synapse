@@ -44,6 +44,13 @@ pub const MIN_LEASE_TTL_MS: u64 = 100;
 /// daemon. A lapsed holder still expires lazily and leaves the cleanup-pending
 /// record described above.
 pub const MAX_LEASE_TTL_MS: u64 = 300_000;
+/// Grace added on top of the planned-emission bound before the synthetic-input
+/// watchdog force-releases a held key or button (#2082).
+///
+/// Covers the emission call itself plus scheduling jitter on the watchdog
+/// thread, so a legitimate hold that finishes exactly at its bound is never
+/// clipped.
+pub const SYNTHETIC_HOLD_WATCHDOG_GRACE_MS: u64 = 2_000;
 /// Synthetic holder used when the operator panic hotkey preempts agents.
 pub const OPERATOR_LEASE_OWNER_SESSION_ID: &str = "__operator__";
 /// How long the operator owns the real-input resource after panic preemption.
@@ -547,6 +554,48 @@ pub fn heartbeat_emission_budget() {
     if renewed {
         EMISSION_BUDGET_RENEWALS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Whether an emission budget is currently armed — i.e. an action is provably
+/// inside its own planned emission timeline.
+///
+/// Read by the synthetic-input watchdog (#2082) to distinguish "a long
+/// `act_type` is legitimately mid-flight" from "nothing is running and this key
+/// has simply been down for too long".
+#[must_use]
+pub fn emission_budget_armed() -> bool {
+    lock_emission_budget().is_some()
+}
+
+/// The exact bound, in milliseconds, past which synthetic input that is still
+/// down is a **strand** rather than a legitimate hold (#2082 fix 4).
+///
+/// The bound is the action's own planned-emission budget, as sized by #2065 and
+/// generalized by #2071:
+///
+/// * While an [`EmissionBudget`] is armed, the acting session is inside a
+///   timeline it declared up front at the MCP acquisition site. That timeline is
+///   clamped at arm time to [`MAX_LEASE_TTL_MS`] (`arm_emission_budget` runs
+///   `ceiling_from_now` through [`ttl_from_ms`]), so `MAX_LEASE_TTL_MS` is the
+///   hard ceiling on any legitimate planned emission. Nothing shorter is safe to
+///   assume, because the plan legitimately spans a minute or more for a long
+///   `act_type`.
+/// * With no budget armed, no action is mid-plan. The only legitimate holds left
+///   are the cross-call `act_key_down`/`act_key_up` pairs, which the emitter's
+///   own [`crate::HELD_KEY_MAX_DURATION_MS`] auto-release already caps. The
+///   watchdog bound tracks that number so it backstops the actor without racing
+///   it.
+///
+/// Both branches add [`SYNTHETIC_HOLD_WATCHDOG_GRACE_MS`], so this never clips a
+/// hold that the layer above was about to release itself.
+#[must_use]
+pub fn synthetic_hold_watchdog_bound_ms() -> u64 {
+    let planned_bound_ms = if emission_budget_armed() {
+        MAX_LEASE_TTL_MS
+    } else {
+        crate::emitter::HELD_KEY_MAX_DURATION_MS
+    };
+    planned_bound_ms.saturating_add(SYNTHETIC_HOLD_WATCHDOG_GRACE_MS)
 }
 
 /// Releases the lease on behalf of its holder. Errors if `session_id` is not the holder.

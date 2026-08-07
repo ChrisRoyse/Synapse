@@ -18,6 +18,7 @@ pub mod rate_limit;
 pub mod recovery;
 pub mod safety;
 pub mod stroke;
+pub mod synthetic_input;
 pub mod validation;
 pub mod velocity;
 
@@ -96,6 +97,11 @@ pub use safety::install_panic_hook;
 pub use stroke::{
     STROKE_TICK_MS, StrokeError, StrokePlan, StrokeResult, plan_timed_stroke,
     screen_point_from_path_point,
+};
+pub use synthetic_input::{
+    HeldButtonStrand, HeldKeyStrand, MODIFIER_SWEEP, SyntheticReleaseReport,
+    release_all_synthetic_input, release_all_synthetic_input_on_panic,
+    release_all_synthetic_input_on_startup, spawn_synthetic_input_watchdog,
 };
 pub use validation::{MAX_DRAG_DISTANCE_PX, validate_action};
 pub use velocity::{

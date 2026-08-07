@@ -44,10 +44,30 @@ pub async fn release_all_with_handles(
         .map_err(|error| action_error_to_mcp(&error))?;
     let response = response_from_snapshot(&before)?;
 
-    handle
+    let execute_result = handle
         .execute(Action::ReleaseAll)
         .await
-        .map_err(|error| action_error_to_mcp(&error))?;
+        .map_err(|error| action_error_to_mcp(&error));
+    // #2082: the release path is the one thing that may not fail. If the actor
+    // round trip errored, the actor's view of held input is exactly what we can
+    // no longer trust, so fall through to the raw, fence-free, lock-free
+    // `SendInput` sweep before surfacing the error. The sweep is idempotent, so
+    // running it after a *successful* actor release would only be redundant —
+    // running it after a failed one is the difference between the operator
+    // getting their keyboard back and not.
+    if let Err(error) = execute_result {
+        let sweep = synapse_action::release_all_synthetic_input();
+        tracing::error!(
+            code = "M2_RELEASE_ALL_ACTOR_FAILED_RAW_SWEEP_RAN",
+            detail = ?error,
+            modifiers_found_down = %sweep.modifiers_found_down_labels(),
+            buttons_found_down = %sweep.buttons_found_down_labels(),
+            tracked_strands_released = sweep.tracked_strands_released,
+            emission_failures = sweep.emission_failures,
+            "release_all could not reach the action actor; the raw synthetic-input release sweep ran instead"
+        );
+        return Err(error);
+    }
 
     let after = snapshot_handle
         .snapshot()

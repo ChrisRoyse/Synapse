@@ -539,6 +539,23 @@ async fn run() -> anyhow::Result<ExitCode> {
         "action crash recovery ledger configured"
     );
 
+    // #2082 fix 2 — the unconditional startup release sweep.
+    //
+    // The ledger-driven recovery above only knows about strands a previous
+    // daemon managed to *write down*. A panic between the OS key-down and the
+    // ledger append, a ledger on a different drive, or a `SYNAPSE_DB` that moved
+    // all leave a real, system-wide stranded key that the ledger has no record
+    // of — and `SendInput` state does not die with the process that set it. This
+    // sweep asks the OS directly (`GetAsyncKeyState`), releases every modifier
+    // and mouse button whether or not anything looked stuck, and logs exactly
+    // what it found down so an inherited strand is visible rather than silently
+    // cleared. It runs before either transport can accept a request, and covers
+    // stdio and HTTP alike because it sits above the mode dispatch.
+    let _startup_sweep = synapse_action::release_all_synthetic_input_on_startup();
+    // #2082 fix 4 — the watchdog. A dedicated OS thread, not a tokio task, so it
+    // still runs when the runtime or the emitter actor is the thing that wedged.
+    let _watchdog_started = synapse_action::spawn_synthetic_input_watchdog();
+
     match cli.mode {
         Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
         Mode::Http => {

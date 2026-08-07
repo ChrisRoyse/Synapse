@@ -3878,7 +3878,7 @@ impl SynapseService {
                 .iter()
                 .any(|attempt| attempt.required_foreground),
             desktop_route: None,
-        desktop_route_hwnds: None,
+            desktop_route_hwnds: None,
             tier_attempts,
             postcondition,
             press_hold_ms: params.hold_ms,

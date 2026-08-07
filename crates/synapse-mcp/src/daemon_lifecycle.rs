@@ -676,10 +676,29 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
     Ok(paths)
 }
 
+/// Installs the daemon-lifecycle panic hook.
+///
+/// # Release before record (#2082)
+///
+/// This hook used to go straight to [`record_panic`], which opens files, takes
+/// the lifecycle state mutex and serializes JSON. All of that is fine for
+/// forensics and useless to the human whose keyboard just died: `SendInput` key
+/// and button state is **global to the OS input queue**, not owned by this
+/// process, so a panic between a key-down and its key-up strands that key
+/// system-wide and killing the daemon does not clear it. The daemon really did
+/// panic mid-action (#2079), which is how #2082 was reported.
+///
+/// So the release runs first, unconditionally, through the raw allocation-free
+/// `SendInput` sweep, and only then does the panic get recorded and the previous
+/// hook chained. The sweep is idempotent, so it is safe that
+/// [`synapse_action::install_panic_hook`] does the same thing: whichever hook
+/// the runtime happens to run first, the input is released before anything that
+/// can block, allocate, or take a lock the panicking thread already holds.
 pub(crate) fn install_panic_hook() {
     PANIC_HOOK_INSTALLED.get_or_init(|| {
         let previous = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
+            let _report = synapse_action::release_all_synthetic_input_on_panic();
             if let Err(error) = record_panic(info) {
                 eprintln!("synapse-mcp daemon lifecycle panic record failed: {error:#}");
             }

@@ -34,6 +34,7 @@ use super::{
 };
 use crate::backend::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
 use crate::foreground_fence::{self, EmissionSite};
+use crate::synthetic_input::{self, HeldButtonStrand};
 use crate::{
     ActionError, EmitState, StrokeError, TimedPathPoint, plan_timed_stroke, recovery, sample_curve,
     screen_point_from_path_point,
@@ -117,22 +118,42 @@ pub(super) fn mouse_button(
     match action {
         ButtonAction::Down => {
             recovery::record_held_button(button)?;
-            send_mouse_button_event(button, ButtonAction::Down)?;
+            // Mirrored *before* the emission: a duplicate button-up is a no-op,
+            // an unpaired button-down stops the human clicking anything (#2082).
+            let mut strand = HeldButtonStrand::arm(button, "software_mouse_button_down");
+            if let Err(error) = send_mouse_button_event(button, ButtonAction::Down) {
+                strand.disarm();
+                let _clear_result = recovery::clear_held_button(button);
+                return Err(error);
+            }
             state.apply_mouse_button(button, ButtonAction::Down);
+            // The hold outlives this call by design (`act_mouse_button
+            // action=down`, drag/stroke bodies); the mirror entry is the
+            // obligation the panic sweep and watchdog read.
+            strand.disarm_without_clearing_mirror();
             Ok(())
         }
         ButtonAction::Up => {
             send_mouse_button_event(button, ButtonAction::Up)?;
+            synthetic_input::clear_button_strand(button);
             state.apply_mouse_button(button, ButtonAction::Up);
             recovery::clear_held_button(button)?;
             Ok(())
         }
         ButtonAction::Press => {
             recovery::record_held_button(button)?;
-            send_mouse_button_event(button, ButtonAction::Down)?;
+            let mut strand = HeldButtonStrand::arm(button, "software_mouse_button_press");
+            if let Err(error) = send_mouse_button_event(button, ButtonAction::Down) {
+                strand.disarm();
+                let _clear_result = recovery::clear_held_button(button);
+                return Err(error);
+            }
             state.apply_mouse_button(button, ButtonAction::Down);
             let _interrupted = sleep_ms(hold_ms);
+            // `?` here would leave the button down; `strand` is what makes the
+            // early return and any unwind between press and release safe.
             send_mouse_button_event(button, ButtonAction::Up)?;
+            strand.disarm();
             state.apply_mouse_button(button, ButtonAction::Up);
             recovery::clear_held_button(button)?;
             Ok(())
@@ -154,9 +175,16 @@ pub(super) fn mouse_drag(
         EmissionSite::delivery("drag_origin_absolute_mouse_move"),
     )?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
+    // Everything between the press and the release runs under a Drop
+    // obligation, so an unwind inside the curve/verify body cannot leave the
+    // human's mouse button held down (#2082).
+    let mut strand = HeldButtonStrand::adopt(button, "software_mouse_drag");
     let drag_result = mouse_move_curve(from, to, curve, duration_ms)
         .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));
     let release_result = mouse_button(button, ButtonAction::Up, 0, state);
+    if release_result.is_ok() {
+        strand.disarm();
+    }
     match (drag_result, release_result) {
         (Ok(()), Ok(())) => Ok(()),
         (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
@@ -214,12 +242,20 @@ pub(super) fn mouse_stroke(
         log_stroke_emit_error(&context, Some(0), Some(first.point), "button_down", &error);
         return Err(error);
     }
+    // The sample stream below spans real time and can refuse at any emission
+    // boundary. The button-up must survive every one of those exits, including
+    // an unwind, so it becomes a Drop obligation for the rest of this function.
+    let mut strand = button.map(|button| HeldButtonStrand::adopt(button, "software_mouse_stroke"));
 
     let stream_result = emit_stroke_stream(&plan.samples, &context);
     if let Err(error) = stream_result {
-        if let Some(button) = button
-            && let Err(release_error) = mouse_button(button, ButtonAction::Up, 0, state)
+        let release_result = button.map(|button| mouse_button(button, ButtonAction::Up, 0, state));
+        if matches!(release_result, None | Some(Ok(())))
+            && let Some(strand) = strand.as_mut()
         {
+            strand.disarm();
+        }
+        if let Some(Err(release_error)) = release_result {
             let sample_index =
                 extract_sample_index(error.detail()).or_else(|| plan.samples.len().checked_sub(1));
             let requested_path_point =
@@ -238,9 +274,16 @@ pub(super) fn mouse_stroke(
         return Err(error);
     }
 
-    if let Some(button) = button
-        && let Err(error) = mouse_button(button, ButtonAction::Up, 0, state)
+    let final_release = button.map(|button| mouse_button(button, ButtonAction::Up, 0, state));
+    if matches!(final_release, None | Some(Ok(())))
+        && let Some(strand) = strand.as_mut()
     {
+        strand.disarm();
+    }
+    // A failed release leaves the guard armed: dropping it here emits the raw
+    // button-up and logs at ERROR rather than returning with the button down.
+    drop(strand);
+    if let Some(Err(error)) = final_release {
         let sample_index = plan.samples.len().checked_sub(1);
         let requested_path_point =
             sample_index.and_then(|index| plan.samples.get(index).map(|sample| sample.point));
@@ -304,14 +347,43 @@ pub(super) fn aim_at(target: &AimTarget, style: AimStyle) -> Result<(), ActionEr
     )
 }
 
+/// Releases every held button, and — unlike a plain `?` loop — **never returns
+/// early leaving a button down** (#2082).
+///
+/// One failed button-up used to skip the rest of the sweep. Now every button is
+/// attempted, a failure is retried through the raw fence-free emitter, and only
+/// the first error is reported afterwards.
 pub(super) fn release_buttons_with(
     _enigo: &mut Enigo,
     buttons: &[MouseButton],
 ) -> Result<(), ActionError> {
+    let mut first_error = None;
     for button in buttons.iter().rev() {
-        send_mouse_button_event(*button, ButtonAction::Up)?;
+        match send_mouse_button_event(*button, ButtonAction::Up) {
+            Ok(()) => synthetic_input::clear_button_strand(*button),
+            Err(error) => {
+                tracing::error!(
+                    code = "SYNTHETIC_INPUT_RELEASE_EMISSION_FAILED",
+                    phase = "release_buttons_with",
+                    button = ?button,
+                    detail = %error,
+                    "a mouse button release failed mid-sweep; retrying it raw and continuing with the remaining buttons"
+                );
+                if !synthetic_input::force_release_button(*button) {
+                    tracing::error!(
+                        code = "SYNTHETIC_INPUT_RELEASE_EMISSION_FAILED",
+                        phase = "release_buttons_with_raw_retry",
+                        button = ?button,
+                        "the raw button-up retry could not be inserted either; the button may still be down system-wide"
+                    );
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
     }
-    Ok(())
+    first_error.map_or(Ok(()), Err)
 }
 
 fn mouse_move_curve(
