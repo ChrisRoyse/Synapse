@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-06-operator-panic-recovery-v1";
+    "synapse-chrome-bridge-2026-08-07-durable-ledger-repair-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "72dc36930746d3cb2ebf1043b04b10cfbf66372896273b4988c0900320529d9a";
+    "be6ecbf7df3da851af634133e08604704c885de504c12340be6b3fb728f093bf";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -5230,11 +5230,94 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
     {
         reasons.push(reason);
     }
+    if let Some(reason) =
+        durable_owner_startup_stale_reason(host.extension_startup_readback.as_ref())
+    {
+        reasons.push(reason);
+    }
     let missing = bridge_missing_required_capabilities(&host.extension_capabilities);
     if !missing.is_empty() {
         reasons.push(format!("missing_capabilities={}", missing.join(",")));
     }
     reasons
+}
+
+fn durable_owner_startup_stale_reason(startup_readback: Option<&Value>) -> Option<String> {
+    let Some(owner) = startup_readback.and_then(|value| value.get("durable_owner_state")) else {
+        return Some(
+            "durable_owner_state=not_seen_yet expected=loaded_continuous_mutation_enabled"
+                .to_owned(),
+        );
+    };
+    let loaded = owner
+        .get("storage_state_loaded")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let enabled = owner
+        .get("mutation_admission_enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let current_present = owner
+        .get("browser_session_id_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ledger_present = owner
+        .get("ledger_browser_session_id_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let ids_match = owner
+        .get("browser_session_ids_match")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let continuity = owner
+        .get("browser_session_continuity_matched")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let healthy = owner
+        .get("owner_continuity_healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let stale_owners = owner
+        .get("stale_browser_session_owner_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let in_flight = owner
+        .get("persisted_in_flight_mutation_present")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let unresolved_timeouts = owner
+        .get("unresolved_debugger_command_timeout_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let unresolved_restart = owner
+        .get("unresolved_worker_restart_mutation_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(u64::MAX);
+    let load_error = owner
+        .get("storage_state_load_error")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if loaded
+        && enabled
+        && current_present
+        && ledger_present
+        && ids_match
+        && continuity
+        && healthy
+        && stale_owners == 0
+        && !in_flight
+        && unresolved_timeouts == 0
+        && unresolved_restart == 0
+        && owner
+            .get("storage_state_load_error")
+            .is_some_and(Value::is_null)
+    {
+        return None;
+    }
+    Some(format!(
+        "durable_owner_state_unhealthy loaded={loaded} enabled={enabled} current_session_present={current_present} ledger_session_present={ledger_present} session_ids_match={ids_match} continuity={continuity} healthy={healthy} stale_owners={stale_owners} in_flight={in_flight} unresolved_timeouts={unresolved_timeouts} unresolved_worker_restart={unresolved_restart} load_error={}",
+        quote_detail_value(load_error),
+    ))
 }
 
 fn reconnect_wake_alarm_stale_reason(startup_readback: Option<&Value>) -> Option<String> {
@@ -5757,7 +5840,7 @@ async fn run_chrome_bridge_host_ui_reload(
             "token": maintenance.token,
             "marker_url": maintenance.marker_url,
             "marker_title": maintenance.marker_title,
-            "ownership_source": "verified_foreground_ctrl_t_marker_then_exact_chrome_tabs_token_resolution",
+            "ownership_source": "verified_uia_new_tab_marker_then_exact_chrome_tabs_token_resolution",
             "preexisting_tab_count": maintenance.tabs_before.len(),
             "script_lease": readback.pointer("/synapse_chrome_auto_install/maintenance_tab"),
         }),
@@ -5861,7 +5944,7 @@ async fn run_chrome_bridge_host_ui_cleanup(
         .and_then(|tab| tab.get("runtime_id"))
         .and_then(Value::as_str)
         .unwrap_or("");
-    if ownership_source != "verified_foreground_ctrl_t_marker"
+    if ownership_source != "verified_uia_new_tab_marker"
         || !created_via_ui
         || chrome_window_hwnd <= 0
         || chrome_window_pid == 0
@@ -6812,6 +6895,25 @@ impl ChromeDebuggerBridge {
                         after.extension_stale,
                         after.extension_stale_reasons.join("|")
                     );
+                    if replacement_host
+                        && after.extension_id.as_deref() == Some(EXTENSION_ID)
+                        && after.extension_build_id.as_deref() == Some(EXPECTED_EXTENSION_BUILD_ID)
+                        && after
+                            .extension_stale_reasons
+                            .iter()
+                            .any(|reason| reason.starts_with("durable_owner_state"))
+                    {
+                        let maintenance_cleanup = self
+                            .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
+                            .await?;
+                        ack.maintenance_cleanup = maintenance_cleanup;
+                        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_MUTATION_GATE_UNHEALTHY host_id={} stale_reasons={} maintenance_cleanup={} remediation=inspect startupReadback.durable_owner_state and the extension service-worker console; repair the exact durable ledger field named there, then reload again; a connected read-only host is not accepted as a working bridge",
+                            after.host_id,
+                            after.extension_stale_reasons.join("|"),
+                            ack.maintenance_cleanup,
+                        )));
+                    }
                     if clean {
                         let waited_ms =
                             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -6819,6 +6921,15 @@ impl ChromeDebuggerBridge {
                             .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
                             .await?;
                         ack.maintenance_cleanup = maintenance_cleanup;
+                        tracing::info!(
+                            code = "CHROME_DEBUGGER_HOST_RELOAD_MUTATION_GATE_VERIFIED",
+                            host_id = %after.host_id,
+                            startup_readback = %after
+                                .extension_startup_readback
+                                .as_ref()
+                                .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+                            "replacement Chrome bridge host published healthy durable mutation-gate startup evidence"
+                        );
                         return Ok(ChromeBridgeReloadResult {
                             before,
                             command_ack: ack,
