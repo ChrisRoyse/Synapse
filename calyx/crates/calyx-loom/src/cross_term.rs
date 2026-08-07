@@ -1,7 +1,7 @@
 //! Cross-term value types and CPU/GPU-parity math kernels.
 
 use calyx_core::{CxId, PanelSlotId, Result, SlotId};
-use calyx_forge::cpu::distance::{CosineFailure, cosine};
+use calyx_forge::cpu::distance::{CosineFailure, CosineSide, cosine};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
@@ -138,6 +138,75 @@ fn agreement_failure_error(failure: CosineFailure) -> calyx_core::CalyxError {
                  explains; this is a defect in the inputs or the reduction, not a value to clamp"
             ),
         ),
+    }
+}
+
+/// Which side of an agreement pair measured to exactly zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ZeroNormSide {
+    A,
+    B,
+}
+
+impl ZeroNormSide {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::A => "a",
+            Self::B => "b",
+        }
+    }
+}
+
+/// The outcome of one agreement cosine, with zero-norm split out from failure.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AgreementOutcome {
+    Scored(f32),
+    /// One side is a valid, exact measurement that happens to have no
+    /// direction, so no cosine over it exists. This is not a defect in the
+    /// input and not a computation that failed — it is a pair that has no
+    /// agreement to contribute.
+    ZeroNorm(ZeroNormSide),
+}
+
+/// [`agreement_scalar`], with the zero-norm case returned rather than raised.
+///
+/// # Why this exists (#2076)
+///
+/// A slot vector of exactly zero is a legitimate measurement on this system's
+/// frozen scalar lenses: `syn_scalar_zscore` with `mean_micros = 0` maps a
+/// keystroke count of 0 to `[0.0]`, and `syn_scalar_raw` maps an interruption
+/// ratio of 0.0 to `[0.0]`. Those are the true values, exactly encoded — an
+/// episode really did have zero keystrokes. They have no *direction*, so no
+/// cosine over them exists, but nothing about them is broken and there is
+/// nothing for a caller to repair.
+///
+/// The between-record kNN lane already draws exactly this distinction and
+/// excludes such records from the geometric lane with a counted, reported
+/// exclusion. The within-record agreement lane did not, so one zero-valued
+/// scalar slot on one episode aborted the weave of an entire panel — on this
+/// vault, 301 in-window episodes produced no association rows at all, six ticks
+/// out of six, because some of them had no keystrokes.
+///
+/// A caller asking for *one named* cross-term still gets the loud
+/// [`crate::error::CALYX_LOOM_ZERO_NORM_VECTOR`] refusal from
+/// [`agreement_scalar`]: it asked a question with no answer and must be told.
+/// A bulk weave over an unattended corpus uses this, skips the pair, and
+/// accounts for it.
+///
+/// # Errors
+///
+/// Every non-zero-norm [`CosineFailure`], mapped exactly as
+/// [`agreement_scalar`] maps it. A dimension mismatch, a non-finite element or
+/// an out-of-range quotient is still a defect and still fails closed.
+pub fn agreement_scalar_classified(a: &[f32], b: &[f32]) -> Result<AgreementOutcome> {
+    match cosine(a, b) {
+        Ok(value) => Ok(AgreementOutcome::Scored(value)),
+        Err(CosineFailure::ZeroNorm { side }) => Ok(AgreementOutcome::ZeroNorm(match side {
+            CosineSide::Left => ZeroNormSide::A,
+            CosineSide::Right => ZeroNormSide::B,
+        })),
+        Err(failure) => Err(agreement_failure_error(failure)),
     }
 }
 

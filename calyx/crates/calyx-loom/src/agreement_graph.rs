@@ -7,8 +7,9 @@ use calyx_core::{CalyxError, CxId, PanelSlotId, Result, SlotId};
 use serde::{Deserialize, Serialize};
 
 use crate::cross_term::{
-    CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_scalar,
-    agreement_weight, canonical_pair, concat_vec, delta_vec, interaction_vec,
+    AgreementOutcome, CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag,
+    ZeroNormSide, agreement_scalar, agreement_scalar_classified, agreement_weight, canonical_pair,
+    concat_vec, delta_vec, interaction_vec,
 };
 use crate::error::{
     CALYX_LOOM_PANEL_SCOPE_REQUIRED, CALYX_LOOM_SLOT_MISSING, CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
@@ -34,11 +35,33 @@ pub struct AgreementEdge {
     pub n: usize,
 }
 
+/// One within-record agreement cross-term that had no cosine to compute
+/// because a slot vector measured to exactly zero (#2076).
+///
+/// Named at the exact `(cx_id, slot_a, slot_b)` the issue asks for, so an
+/// operator reading a weave report can go straight to the source row rather
+/// than being told only that "a vector" was zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZeroNormAgreementSkip {
+    pub cx_id: CxId,
+    pub a: PanelSlotId,
+    pub b: PanelSlotId,
+    /// Which of the pair had no direction. When both do, `A` is reported: the
+    /// cosine primitive classifies the left operand first and stops there.
+    pub zero_side: ZeroNormSide,
+}
+
+/// Cap on individually named skips retained per store. The *total* is always
+/// counted separately, so truncation is visible and never silent.
+pub const MAX_RECORDED_ZERO_NORM_SKIPS: usize = 1_024;
+
 #[derive(Clone, Debug)]
 pub struct LoomStore {
     xterm_cf: BTreeMap<CrossTermKey, XtermRow>,
     measured_tags: BTreeMap<(CxId, PanelSlotId), SignalProvenanceTag>,
     cache: LruCache<CrossTermKey, CrossTermValue>,
+    zero_norm_skips: Vec<ZeroNormAgreementSkip>,
+    zero_norm_skip_total: usize,
 }
 
 impl LoomStore {
@@ -47,6 +70,26 @@ impl LoomStore {
             xterm_cf: BTreeMap::new(),
             measured_tags: BTreeMap::new(),
             cache: LruCache::new(cache_capacity),
+            zero_norm_skips: Vec::new(),
+            zero_norm_skip_total: 0,
+        }
+    }
+
+    /// Agreement cross-terms this store skipped for a zero-norm operand, up to
+    /// [`MAX_RECORDED_ZERO_NORM_SKIPS`] of them.
+    pub fn zero_norm_agreement_skips(&self) -> &[ZeroNormAgreementSkip] {
+        &self.zero_norm_skips
+    }
+
+    /// How many were skipped in total, including any beyond the retained cap.
+    pub const fn zero_norm_agreement_skip_total(&self) -> usize {
+        self.zero_norm_skip_total
+    }
+
+    fn record_zero_norm_skip(&mut self, skip: ZeroNormAgreementSkip) {
+        self.zero_norm_skip_total += 1;
+        if self.zero_norm_skips.len() < MAX_RECORDED_ZERO_NORM_SKIPS {
+            self.zero_norm_skips.push(skip);
         }
     }
 
@@ -82,12 +125,23 @@ impl LoomStore {
             for j in i + 1..ids.len() {
                 let a = ids[i];
                 let b = ids[j];
-                let value = agreement_scalar(&slots[&a], &slots[&b])?;
                 let key = CrossTermKey {
                     cx_id: cx,
                     a: PanelSlotId::new(panel_version, a),
                     b: PanelSlotId::new(panel_version, b),
                     kind: CrossTermKind::Agreement,
+                };
+                let value = match agreement_scalar_classified(&slots[&a], &slots[&b])? {
+                    AgreementOutcome::Scored(value) => value,
+                    AgreementOutcome::ZeroNorm(zero_side) => {
+                        self.record_zero_norm_skip(ZeroNormAgreementSkip {
+                            cx_id: cx,
+                            a: key.a,
+                            b: key.b,
+                            zero_side,
+                        });
+                        continue;
+                    }
                 };
                 self.xterm_cf.insert(
                     key,
@@ -129,7 +183,22 @@ impl LoomStore {
             if self.xterm_cf.contains_key(&key) {
                 continue;
             }
-            let value = compute_cross_term(a, b, entry.kind, slots)?;
+            // #2076: a zero-norm operand is a valid measurement with no
+            // direction, not a write failure. Skip the one pair it makes
+            // undefined, name it, and let the rest of the record — and the rest
+            // of the corpus — weave.
+            let value = match compute_cross_term_classified(a, b, entry.kind, slots)? {
+                CrossTermOutcome::Value(value) => value,
+                CrossTermOutcome::ZeroNormAgreement(zero_side) => {
+                    self.record_zero_norm_skip(ZeroNormAgreementSkip {
+                        cx_id: cx,
+                        a: key.a,
+                        b: key.b,
+                        zero_side,
+                    });
+                    continue;
+                }
+            };
             self.xterm_cf.insert(
                 key,
                 XtermRow {
@@ -282,16 +351,56 @@ fn compute_cross_term(
     kind: CrossTermKind,
     slots: &BTreeMap<SlotId, Vec<f32>>,
 ) -> Result<CrossTermValue> {
-    let left = slots
-        .get(&a)
-        .ok_or_else(|| loom_error(CALYX_LOOM_SLOT_MISSING, format!("slot {} missing", a.get())))?;
-    let right = slots
-        .get(&b)
-        .ok_or_else(|| loom_error(CALYX_LOOM_SLOT_MISSING, format!("slot {} missing", b.get())))?;
+    let (left, right) = slot_pair(a, b, slots)?;
     match kind {
         CrossTermKind::Agreement => Ok(CrossTermValue::Scalar(agreement_scalar(left, right)?)),
         CrossTermKind::Delta => Ok(CrossTermValue::Vector(delta_vec(left, right)?)),
         CrossTermKind::Interaction => Ok(CrossTermValue::Vector(interaction_vec(left, right)?)),
         CrossTermKind::Concat => Ok(CrossTermValue::Vector(concat_vec(left, right)?)),
     }
+}
+
+/// A materialized cross-term, or the reason there is none to materialize.
+enum CrossTermOutcome {
+    Value(CrossTermValue),
+    /// Agreement only: one operand is a directionless exact measurement.
+    /// `Delta`, `Interaction` and `Concat` are all defined at zero and are
+    /// never reported here.
+    ZeroNormAgreement(ZeroNormSide),
+}
+
+fn compute_cross_term_classified(
+    a: SlotId,
+    b: SlotId,
+    kind: CrossTermKind,
+    slots: &BTreeMap<SlotId, Vec<f32>>,
+) -> Result<CrossTermOutcome> {
+    let (left, right) = slot_pair(a, b, slots)?;
+    match kind {
+        CrossTermKind::Agreement => match agreement_scalar_classified(left, right)? {
+            AgreementOutcome::Scored(value) => {
+                Ok(CrossTermOutcome::Value(CrossTermValue::Scalar(value)))
+            }
+            AgreementOutcome::ZeroNorm(side) => Ok(CrossTermOutcome::ZeroNormAgreement(side)),
+        },
+        CrossTermKind::Delta => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(delta_vec(
+            left, right,
+        )?))),
+        CrossTermKind::Interaction => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(
+            interaction_vec(left, right)?,
+        ))),
+        CrossTermKind::Concat => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(concat_vec(
+            left, right,
+        )?))),
+    }
+}
+
+fn slot_pair(a: SlotId, b: SlotId, slots: &BTreeMap<SlotId, Vec<f32>>) -> Result<(&[f32], &[f32])> {
+    let left = slots
+        .get(&a)
+        .ok_or_else(|| loom_error(CALYX_LOOM_SLOT_MISSING, format!("slot {} missing", a.get())))?;
+    let right = slots
+        .get(&b)
+        .ok_or_else(|| loom_error(CALYX_LOOM_SLOT_MISSING, format!("slot {} missing", b.get())))?;
+    Ok((left, right))
 }

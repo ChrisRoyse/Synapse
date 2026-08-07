@@ -18,8 +18,11 @@ where
         return Ok((Vec::new(), Vec::new()));
     }
     if max_iter == 0 || target_dim > n || target_dim > max_iter {
-        return Err(SpectralError::NotConverged {
-            iterations: max_iter,
+        return Err(SpectralError::KrylovIncomplete {
+            built: 0,
+            target: target_dim,
+            nodes: n,
+            max_iter,
         });
     }
     let decomposition = lanczos_decomposition_operator(n, target_dim, max_iter, &mut mat_vec)?;
@@ -97,8 +100,11 @@ where
         }
         Ok(LanczosDecomposition { basis, projected })
     } else {
-        Err(SpectralError::NotConverged {
-            iterations: max_iter,
+        Err(SpectralError::KrylovIncomplete {
+            built: basis.len(),
+            target: target_dim,
+            nodes: n,
+            max_iter,
         })
     }
 }
@@ -166,11 +172,13 @@ fn jacobi_eigen(
 ) -> SpectralResult<(Vec<f32>, Vec<Vec<f32>>)> {
     let n = matrix.len();
     let mut vectors = identity(n);
+    let mut residual = f32::INFINITY;
     for iteration in 0..max_iter {
         let Some((p, q, value)) = max_offdiag(&matrix) else {
             return Ok((diagonal(&matrix), vectors));
         };
-        if value.abs() < JACOBI_TOL {
+        residual = value.abs();
+        if residual < JACOBI_TOL {
             return Ok((diagonal(&matrix), vectors));
         }
         rotate(&mut matrix, &mut vectors, p, q);
@@ -178,8 +186,11 @@ fn jacobi_eigen(
             orthonormalize_columns(&mut vectors)?;
         }
     }
-    Err(SpectralError::NotConverged {
+    Err(SpectralError::JacobiNotConverged {
         iterations: max_iter,
+        residual,
+        tol: JACOBI_TOL,
+        dim: n,
     })
 }
 

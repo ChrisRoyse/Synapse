@@ -34,7 +34,19 @@ pub const CALYX_REACTIVE_ROW_CORRUPT: &str = "CALYX_REACTIVE_ROW_CORRUPT";
 
 pub fn loom_error(code: &'static str, message: impl Into<String>) -> CalyxError {
     let remediation = match code {
-        CALYX_LOOM_ZERO_NORM_VECTOR => "supply non-zero slot vectors before weaving agreements",
+        // #2076: the old text — "supply non-zero slot vectors before weaving
+        // agreements" — was addressed to a caller who has no such control. The
+        // unattended weave runs over whatever the corpus holds, and a record
+        // whose every measurable lens is exactly zero has no non-zero vector
+        // for anyone to supply. Zero is frequently the *correct* measurement,
+        // so the remediation now names the two things that are actually
+        // actionable: exclude the directionless slot from the cosine lane
+        // (which the bulk weave now does, with a counted skip), or re-measure
+        // if zero is not what the source row says.
+        CALYX_LOOM_ZERO_NORM_VECTOR => {
+            "a zero-norm vector has no direction, so no cosine over it exists: exclude the named \
+             slot from the cosine lane, or re-measure it if zero is not the source row's true value"
+        }
         CALYX_LOOM_DIM_MISMATCH => "use slot vectors with matching dimensions for this xterm",
         CALYX_LOOM_NON_FINITE_VECTOR => "remove NaN or infinite values from slot vectors",
         CALYX_LOOM_SLOT_MISSING => "load the requested cx/slot vectors before computing xterms",

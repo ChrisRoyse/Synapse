@@ -14,16 +14,18 @@ pub use abundance::{
     AbundanceReport, CeilingEstimate, NeffEstimate, cross_term_upper_bound, dda_signal_yield,
     meaning_compression_yield,
 };
-pub use agreement_graph::{AgreementEdge, LoomStore};
+pub use agreement_graph::{
+    AgreementEdge, LoomStore, MAX_RECORDED_ZERO_NORM_SKIPS, ZeroNormAgreementSkip,
+};
 pub use blind_spot::{
     BlindSpotAlert, BlindSpotCalibration, BlindSpotCalibrationEvidence, BlindSpotCalibrationParams,
     MAX_DISCRIMINATIVE_MODAL_SHARE, MIN_DISCRIMINATIVE_DISTINCT, SIMILARITY_DISTINCT_TOLERANCE,
     Severity, SimilarityDiscrimination, detect_blind_spot, detect_blind_spot_calibrated,
 };
 pub use cross_term::{
-    CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag, agreement_batch_cpu,
-    agreement_batch_gpu, agreement_scalar, agreement_weight, concat_vec, delta_vec,
-    interaction_vec,
+    AgreementOutcome, CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag,
+    ZeroNormSide, agreement_batch_cpu, agreement_batch_gpu, agreement_scalar,
+    agreement_scalar_classified, agreement_weight, concat_vec, delta_vec, interaction_vec,
 };
 pub use error::{
     CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_FORGE_UNAVAILABLE, CALYX_LOOM_NON_FINITE_VECTOR,
