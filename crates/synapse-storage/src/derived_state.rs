@@ -158,6 +158,15 @@ const PANEL_ANCHOR_DEBT_CURSOR_PERSIST_EVERY: usize = 32;
 /// `(panel generation, backfill source)`.
 const PANEL_ANCHOR_DEBT_STATE_KEY_PREFIX: &str = "syn/anchor-debt/v1/";
 
+/// Schema of the durable anchor-debt repair row.
+///
+/// v2 adds the per-identity failed-attempt ledger (#1984). The key prefix is
+/// deliberately unchanged: v1 rows decode into v2 through `serde(default)` and
+/// keep their cursor and quarantine, so the upgrade costs no repeated work. A
+/// new key would have silently restarted every panel's queue at the head while
+/// looking like a clean first pass.
+const ANCHOR_DEBT_REPAIR_STATE_SCHEMA: &str = "synapse_anchor_debt_repair_state/v2";
+
 /// `CF_KV` key prefix for the durable coverage-sweep cursor.
 const PANEL_COVERAGE_CURSOR_KEY_PREFIX: &str = "syn/panel-backfill-cursor/v1/";
 
@@ -782,6 +791,7 @@ pub(crate) fn run_derived_state_maintenance() {
                      minted a generation without retiring its predecessor, so those records are \
                      stranded as they are created and no reclaim can see them"
                 );
+                any_failed |= sweep_unretired_derived_generations(&db, &report);
             }
             if !report.reserved_generations_absent_from_catalog.is_empty() {
                 tracing::warn!(
@@ -1133,6 +1143,85 @@ fn supersede_derived_generation(
          are now visible to superseded reclaim"
     );
     Ok(())
+}
+
+/// Retires a dynamic panel's un-superseded predecessors even when it did not
+/// publish this tick (#2062 residual).
+///
+/// # The gap this closes
+///
+/// Supersession ran only inside [`publish_graph_snapshot`], so a panel's history
+/// was retired only by its *next publish*. That is correct and sufficient for a
+/// publisher that publishes; it is a permanent stall for one that does not.
+/// Measured on the deployed daemon: across four unattended ticks and 20 minutes,
+/// `syn-graphpos-app-v1` published four times and retired its whole run, while
+/// `drive_path_hierarchy` did not publish once — so `syn-path-hierarchy-v1` sat
+/// at **6 live generations holding 41,220 rows**, live and unreclaimable, for as
+/// long as its snapshot fingerprint stays stable. Which could be days.
+///
+/// # Why this is safe without a publish
+///
+/// The retirement ledger and the allocator's owner identity carry the whole
+/// argument, and neither depends on a publish having just happened:
+///
+/// * **The successor holds rows.** `live_generations` comes from the physical
+///   `Base` census, and a generation with no rows produces no census entry — so
+///   the newest live generation named here has at least one record by
+///   construction. This is exactly the guarantee the publish-time path gets from
+///   its committed read-back, arrived at from the durable side instead.
+/// * **Predecessors are selected by owner identity, never by range.** The
+///   allocator picks every generation owned `dynamic:<panel>:<operation_id>`
+///   other than the successor. Three publishers share one vault-global number
+///   line, so a range guess would retire the other two panels' live generations.
+/// * **A wrong successor is refused, not obeyed.** The allocator refuses when
+///   the panel owns a live generation *above* the requested successor, so the
+///   only way this can be wrong — picking a successor that is not the newest,
+///   e.g. if the census's named-generation cap ever binds — fails closed and
+///   loudly rather than retiring a generation that is still being written.
+/// * **Retirement is a declaration, not a delete.** It makes the predecessors'
+///   *ungrounded* rows visible to `superseded_reclaim_candidates`; grounded rows
+///   stay sacred, and nothing here removes a byte.
+///
+/// Ordering against the publishers is unchanged: this runs on the coverage
+/// census, which is taken after the publishers have run, so a generation minted
+/// earlier in this same tick is already the newest live one when it is read.
+fn sweep_unretired_derived_generations(
+    db: &Db,
+    report: &crate::panel_coverage::PanelCoverageReport,
+) -> bool {
+    let mut failed = false;
+    for rollup in &report.owned_dynamic_generations {
+        if rollup.owner_kind != "dynamic" || rollup.live_generations.len() <= 1 {
+            continue;
+        }
+        let Some(successor) = rollup.live_generations.iter().copied().max() else {
+            continue;
+        };
+        tracing::info!(
+            code = "STORAGE_DERIVED_SNAPSHOT_GENERATION_SWEEP_STARTED",
+            panel_name = %rollup.panel_name,
+            successor,
+            live_generations = ?rollup.live_generations,
+            live_records = rollup.live_records,
+            "a dynamic panel holds more than one live generation and did not publish this tick; \
+             retiring its predecessors behind the newest live generation rather than waiting for a \
+             publish that may not come"
+        );
+        if let Err(error) = supersede_derived_generation(db, &rollup.panel_name, successor) {
+            failed = true;
+            record_failure(
+                "STORAGE_DERIVED_SNAPSHOT_GENERATION_SWEEP_FAILED",
+                format!(
+                    "retiring {}'s predecessors behind live generation {successor} failed: \
+                     {error}; the panel keeps {} live generations and its predecessors stay \
+                     invisible to reclaim",
+                    rollup.panel_name,
+                    rollup.live_generations.len(),
+                ),
+            );
+        }
+    }
+    failed
 }
 
 /// Names the generation a failed publish may have already allocated (#2062
@@ -1898,16 +1987,49 @@ struct AnchorDebtRepairState {
     after_source_key_hex: Option<String>,
     /// Identities an exact attempt proved cannot be re-anchored.
     quarantined: Vec<QuarantinedAnchorIdentity>,
+    /// Per-identity failed-attempt tallies, durable across ticks and restarts
+    /// (#1984).
+    ///
+    /// This row is the only place an attempt count can live. The count used to
+    /// be read out of `quarantined`, which is written *at* the quarantine
+    /// threshold and therefore never holds an identity below it — so every tick
+    /// found no entry, reported "attempt 1 of 3", and
+    /// `PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS` was unreachable by
+    /// construction. The deployed daemon logged `failed on attempt 1 of 3` for
+    /// the same `syn-outcome-v1` row on every one of three consecutive ticks
+    /// with `quarantined_total=0`: an error repeating forever with no path to
+    /// the escape hatch the design had already built.
+    ///
+    /// `serde(default)` so a v1 row upgrades in place. An absent ledger says
+    /// exactly what was true before it existed — nothing has failed yet — rather
+    /// than being assumed.
+    #[serde(default)]
+    attempts: Vec<AnchorDebtIdentityAttempt>,
     passes_completed: u64,
     identities_attempted_total: u64,
     anchors_carried_total: u64,
     updated_at_unix_ms: Option<u64>,
 }
 
+/// One identity's durable failed-attempt tally (#1984).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AnchorDebtIdentityAttempt {
+    source_cf: String,
+    source_key_hex: String,
+    attempts: u32,
+    first_failed_unix_ms: Option<u64>,
+    last_failed_unix_ms: Option<u64>,
+    /// The most recent refusal, verbatim. Kept beside the count because "failed
+    /// three times" and "failed three times for three different reasons" call
+    /// for different remediation, and the quarantine record that eventually
+    /// absorbs this entry is written from it.
+    last_error: String,
+}
+
 impl AnchorDebtRepairState {
     fn new(panel_name: &str, panel_version: u32, source_cf: &str) -> Self {
         Self {
-            schema: "synapse_anchor_debt_repair_state/v1".to_owned(),
+            schema: ANCHOR_DEBT_REPAIR_STATE_SCHEMA.to_owned(),
             issue: 1984,
             panel_name: panel_name.to_owned(),
             panel_version,
@@ -1915,6 +2037,7 @@ impl AnchorDebtRepairState {
             after_source_cf: None,
             after_source_key_hex: None,
             quarantined: Vec::new(),
+            attempts: Vec::new(),
             passes_completed: 0,
             identities_attempted_total: 0,
             anchors_carried_total: 0,
@@ -1926,6 +2049,40 @@ impl AnchorDebtRepairState {
         self.quarantined.iter().any(|entry| {
             entry.source_cf == identity.source_cf && entry.source_key_hex == identity.source_key_hex
         })
+    }
+
+    /// Records one failed attempt against `identity` and returns the durable
+    /// running total, creating the tally on first failure.
+    fn record_failed_attempt(&mut self, identity: &StrandedAnchorIdentity, error: &str) -> u32 {
+        if let Some(entry) = self.attempts.iter_mut().find(|entry| {
+            entry.source_cf == identity.source_cf && entry.source_key_hex == identity.source_key_hex
+        }) {
+            entry.attempts = entry.attempts.saturating_add(1);
+            entry.last_failed_unix_ms = now_unix_ms();
+            error.clone_into(&mut entry.last_error);
+            return entry.attempts;
+        }
+        self.attempts.push(AnchorDebtIdentityAttempt {
+            source_cf: identity.source_cf.clone(),
+            source_key_hex: identity.source_key_hex.clone(),
+            attempts: 1,
+            first_failed_unix_ms: now_unix_ms(),
+            last_failed_unix_ms: now_unix_ms(),
+            last_error: error.to_owned(),
+        });
+        1
+    }
+
+    /// Drops any failed-attempt tally for `identity`.
+    ///
+    /// Called when an attempt succeeds: the tally exists to distinguish a row
+    /// that keeps failing from one that failed once under transient pressure,
+    /// and a success proves the latter. Leaving it would let three unrelated
+    /// transients across three days quarantine a healthy row.
+    fn clear_failed_attempts(&mut self, identity: &StrandedAnchorIdentity) {
+        self.attempts.retain(|entry| {
+            entry.source_cf != identity.source_cf || entry.source_key_hex != identity.source_key_hex
+        });
     }
 
     /// True when `identity` sorts at or before the durable resume position, so
@@ -1987,8 +2144,45 @@ struct CoverageSweepCursor {
     /// interpreted.
     after_physical_hex: Option<String>,
     sweeps_completed: u64,
+    /// Consecutive ticks whose first attempted page of this sweep failed
+    /// (#2070).
+    ///
+    /// Durable because the condition it describes is durable: a page that cannot
+    /// be measured because the stored row and a fresh measurement disagree fails
+    /// identically on every tick and across every restart. The count is what
+    /// turns "this tick failed" into "this panel is blocked", which is the
+    /// distinction that lets the scheduler stop spending the head of its queue
+    /// on it. Reset to zero by any page that succeeds.
+    #[serde(default)]
+    consecutive_page_failures: u32,
+    /// The most recent page refusal, verbatim, so a blocked panel names *why*
+    /// rather than only that it is blocked.
+    #[serde(default)]
+    last_page_failure: Option<String>,
+    #[serde(default)]
+    blocked_since_unix_ms: Option<u64>,
     updated_at_unix_ms: Option<u64>,
 }
+
+/// Consecutive failed ticks after which a coverage target is deferred behind
+/// every healthy one (#2070).
+///
+/// Three, matching [`PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS`]: the two are the
+/// same judgement — "this has now failed often enough to be a property of the
+/// work rather than of the moment" — and using one number for both means an
+/// operator learns the rule once.
+///
+/// A blocked target is **still attempted**, last, every tick. It is never
+/// silently dropped: the refusal is the loudest evidence there is that the panel
+/// needs a version bump or a lens repair, and a sweep that stopped trying would
+/// also stop reporting.
+const COVERAGE_PAGE_FAILURE_BLOCK_THRESHOLD: u32 = 3;
+
+/// Schema of the durable coverage-sweep cursor. v2 adds the page-failure
+/// counters (#2070); v1 rows upgrade in place through `serde(default)` and keep
+/// their physical position, because a new key would restart every sweep at the
+/// head while looking like a clean start.
+const COVERAGE_SWEEP_CURSOR_SCHEMA: &str = "synapse_panel_coverage_sweep_cursor/v2";
 
 /// Whether the un-amortized-primitive finding has already been raised in this
 /// process, so it is loud once rather than once per tick.
@@ -2210,6 +2404,17 @@ fn drive_anchor_debt_repair(
                     && identity.source_key_hex == entry.source_key_hex
             })
         });
+        // The attempt ledger is pruned on exactly the same predicate, for
+        // exactly the same reason: an identity the census no longer names left
+        // the debt, so its failure history is about a row that is no longer
+        // owed. A tally that only grows would eventually quarantine a row on
+        // evidence collected against a different generation.
+        state.attempts.retain(|entry| {
+            target.anchors_stranded_identities.iter().any(|identity| {
+                identity.source_cf == entry.source_cf
+                    && identity.source_key_hex == entry.source_key_hex
+            })
+        });
 
         let queue: Vec<&StrandedAnchorIdentity> = target
             .anchors_stranded_identities
@@ -2307,6 +2512,9 @@ fn drive_anchor_debt_repair(
                 Ok(page) => {
                     inserted = inserted.saturating_add(page.inserted_rows);
                     carried_anchors = carried_anchors.saturating_add(page.anchors_carried_forward);
+                    // The attempt ran to completion, so whatever transient made
+                    // earlier attempts fail is not a property of this row.
+                    state.clear_failed_attempts(identity);
                     if page.anchors_carried_forward > 0 {
                         carried_rows = carried_rows.saturating_add(1);
                     } else {
@@ -2348,19 +2556,12 @@ fn drive_anchor_debt_repair(
                 Err(error) => {
                     // A failed attempt is not proof the row cannot be repaired —
                     // a write shed under disk pressure is not a lineage fault —
-                    // so it accrues attempts and is quarantined only once it has
-                    // failed often enough to be a property of the row.
-                    let attempts = match state.quarantined.iter_mut().find(|entry| {
-                        entry.source_cf == identity.source_cf
-                            && entry.source_key_hex == identity.source_key_hex
-                    }) {
-                        Some(entry) => {
-                            entry.attempts = entry.attempts.saturating_add(1);
-                            entry.last_attempt_unix_ms = now_unix_ms();
-                            entry.attempts
-                        }
-                        None => 1,
-                    };
+                    // so it accrues attempts in the DURABLE ledger and is
+                    // quarantined only once it has failed often enough to be a
+                    // property of the row. Reading the count out of
+                    // `quarantined` (which is only written at the threshold)
+                    // made every tick report "attempt 1 of 3" forever (#1984).
+                    let attempts = state.record_failed_attempt(identity, &error.to_string());
                     record_failure(
                         "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_FAILED",
                         format!(
@@ -2381,18 +2582,24 @@ fn drive_anchor_debt_repair(
                             source_cf: identity.source_cf.clone(),
                             source_key_hex: identity.source_key_hex.clone(),
                             superseded_panel_version: identity.superseded_panel_version,
-                            reason: format!("repair_failed_after_{attempts}_attempts"),
+                            reason: format!("repair_failed_after_{attempts}_attempts: {error}"),
                             attempts,
                             first_seen_unix_ms: now_unix_ms(),
                             last_attempt_unix_ms: now_unix_ms(),
                         });
                         newly_quarantined += 1;
                     }
-                    // Stop this panel, not the tick: an erroring source is not a
-                    // reason to hammer it, and every other panel still has its
-                    // own budget waiting.
-                    queue_exhausted = false;
-                    break;
+                    // Continue to the next identity, and do not abandon the
+                    // panel's queue (#1984). One erroring identity is evidence
+                    // about ONE row: the deployed daemon enumerated 3 stranded
+                    // identities for `syn-outcome-v1`, attempted 1, broke, and
+                    // reported `enumerated=3 attempted=1` on every tick — so the
+                    // disposition of the other two was unknown for the life of
+                    // the process. That is the same head-of-queue denial of
+                    // service #2030 fixed for a record and #2061 fixed for a
+                    // panel, one level further in. Each failure is recorded
+                    // independently above and the budget still bounds the tick.
+                    continue;
                 }
             }
 
@@ -2629,7 +2836,8 @@ fn drive_coverage_backfill(
     started: std::time::Instant,
     anchor: &AnchorDebtPass,
 ) -> bool {
-    let Some(target) = report.most_owed_coverage_backfill() else {
+    let targets = report.coverage_backfill_targets();
+    if targets.is_empty() {
         let action = if !report.anchor_debt_unbackfillable_panels.is_empty() {
             "anchor_debt_unbackfillable"
         } else if report.coverage_deficient_panels.is_empty() {
@@ -2653,56 +2861,264 @@ fn drive_coverage_backfill(
         // deficiency of the panel catalog, already raised by health, not a
         // failure of this driver.
         return false;
-    };
-    let Some(source_cf) = target.backfill_source_cf.clone() else {
-        // `most_owed_coverage_backfill` already filtered on this being present;
-        // reaching here means the two predicates disagree, which is a code
-        // defect worth shouting about rather than a state worth handling.
-        record_failure(
-            "STORAGE_DERIVED_STATE_BACKFILL_TARGET_HAS_NO_SOURCE",
-            format!(
-                "panel {} was selected as most-owed coverage backfill but declares no \
-                 backfill_source_cf; PanelCoverageRow::coverage_backfill_owed and \
-                 PanelCoverageReport::most_owed_coverage_backfill disagree",
-                target.panel_name
-            ),
-        );
-        return true;
-    };
-    let backfill_reason = target.backfill_reason().unwrap_or("coverage_debt");
+    }
 
-    let cursor_key = coverage_cursor_key(target.panel_version, &source_cf);
-    let persisted = match read_durable_maintenance_row::<CoverageSweepCursor>(
-        db,
-        &cursor_key,
-        "coverage sweep cursor",
-    ) {
-        Ok(persisted) => persisted,
-        Err(detail) => {
-            // A cursor that cannot be read must not be silently replaced by a
-            // sweep from the head: that is exactly the restart amnesia that kept
-            // a corpus-length pass from ever completing, and it would present as
-            // a clean start.
+    let mut failed = false;
+    let mut ready: Vec<CoverageTarget<'_>> = Vec::new();
+    let mut deferred: Vec<CoverageTarget<'_>> = Vec::new();
+    let mut blocked_panels: Vec<String> = Vec::new();
+
+    for target in targets {
+        let Some(source_cf) = target.backfill_source_cf.clone() else {
+            // `coverage_backfill_targets` already filtered on this being
+            // present; reaching here means the two predicates disagree, which is
+            // a code defect worth shouting about rather than a state worth
+            // handling. It disqualifies one target, never the rotation.
             record_failure(
-                "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNREADABLE",
+                "STORAGE_DERIVED_STATE_BACKFILL_TARGET_HAS_NO_SOURCE",
                 format!(
-                    "panel {} coverage sweep cursor at CF_KV key {} is unreadable: {detail}; the \
-                     sweep refuses to restart from the head of {source_cf} on an unproven position",
-                    target.panel_name,
-                    String::from_utf8_lossy(&cursor_key)
+                    "panel {} was selected as a coverage backfill target but declares no \
+                     backfill_source_cf; PanelCoverageRow::coverage_backfill_owed and \
+                     PanelCoverageReport::coverage_backfill_targets disagree",
+                    target.panel_name
                 ),
             );
-            return true;
-        }
-    };
-    // A cursor taken under a different panel generation or a different CF says
-    // nothing about where this sweep should resume, so it is discarded rather
-    // than reused.
-    let resume_hex = persisted
-        .as_ref()
-        .filter(|persisted| {
+            failed = true;
+            continue;
+        };
+        let cursor_key = coverage_cursor_key(target.panel_version, &source_cf);
+        let persisted = match read_durable_maintenance_row::<CoverageSweepCursor>(
+            db,
+            &cursor_key,
+            "coverage sweep cursor",
+        ) {
+            Ok(persisted) => persisted,
+            Err(detail) => {
+                // A cursor that cannot be read must not be silently replaced by
+                // a sweep from the head: that is exactly the restart amnesia
+                // that kept a corpus-length pass from ever completing, and it
+                // would present as a clean start.
+                record_failure(
+                    "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNREADABLE",
+                    format!(
+                        "panel {} coverage sweep cursor at CF_KV key {} is unreadable: {detail}; \
+                         the sweep refuses to restart from the head of {source_cf} on an unproven \
+                         position",
+                        target.panel_name,
+                        String::from_utf8_lossy(&cursor_key)
+                    ),
+                );
+                failed = true;
+                continue;
+            }
+        };
+        // A cursor taken under a different panel generation or a different CF
+        // says nothing about where this sweep should resume, so it is discarded
+        // rather than reused.
+        let persisted = persisted.filter(|persisted| {
             persisted.panel_version == target.panel_version && persisted.source_cf == source_cf
-        })
+        });
+        let failures = persisted
+            .as_ref()
+            .map_or(0, |persisted| persisted.consecutive_page_failures);
+        let entry = CoverageTarget {
+            target,
+            source_cf,
+            cursor_key,
+            persisted,
+        };
+        if failures >= COVERAGE_PAGE_FAILURE_BLOCK_THRESHOLD {
+            blocked_panels.push(format!(
+                "{}@{} source_cf={} consecutive_page_failures={failures} uncovered={:?} \
+                 last_failure={}",
+                entry.target.panel_name,
+                entry.target.panel_version,
+                entry.source_cf,
+                entry.target.uncovered_rows(),
+                entry
+                    .persisted
+                    .as_ref()
+                    .and_then(|persisted| persisted.last_page_failure.as_deref())
+                    .unwrap_or("<unrecorded>"),
+            ));
+            deferred.push(entry);
+        } else {
+            ready.push(entry);
+        }
+    }
+    if !blocked_panels.is_empty() {
+        // Named, not dropped. A blocked panel is still swept — last — every
+        // tick, so the refusal keeps being reported and clears itself the moment
+        // the underlying lens or panel-version fault is fixed.
+        tracing::warn!(
+            code = "STORAGE_DERIVED_STATE_COVERAGE_PANEL_BLOCKED",
+            threshold = COVERAGE_PAGE_FAILURE_BLOCK_THRESHOLD,
+            blocked_panels = ?blocked_panels,
+            "coverage targets whose first page has failed on every recent tick are deferred behind \
+             every healthy target so their backlog cannot hold the others hostage"
+        );
+    }
+    // Blocked targets go to the back of the rotation, never off it.
+    ready.append(&mut deferred);
+
+    let mut totals = CoverageTickTotals::default();
+    let mut panel_lines: Vec<String> = Vec::new();
+    let mut primary: Option<CoveragePrimary> = None;
+    let mut targets_attempted = 0_usize;
+    for entry in &ready {
+        if started.elapsed() >= PANEL_BACKFILL_TICK_BUDGET {
+            break;
+        }
+        targets_attempted += 1;
+        let pass = sweep_coverage_target(db, entry, started);
+        failed |= pass.failed;
+        totals.merge(&pass);
+        panel_lines.push(pass.line.clone());
+        if primary.is_none() {
+            primary = Some(CoveragePrimary {
+                panel: entry.target.panel_name.clone(),
+                source_cf: entry.source_cf.clone(),
+                action: pass.action,
+                reason: pass.reason,
+                sweep_complete: pass.sweep_complete,
+            });
+        }
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let primary = primary.unwrap_or(CoveragePrimary {
+        panel: String::new(),
+        source_cf: String::new(),
+        action: "budget_exhausted",
+        reason: "coverage_debt",
+        sweep_complete: false,
+    });
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_BACKFILL_PASS",
+        action = primary.action,
+        panel = %primary.panel,
+        source_cf = %primary.source_cf,
+        reason = primary.reason,
+        targets_owed = ready.len(),
+        targets_attempted,
+        panels = ?panel_lines,
+        blocked_panels = ?blocked_panels,
+        pages = totals.pages,
+        examined = totals.examined,
+        inserted = totals.inserted,
+        already_current = totals.already_current,
+        outcome_anchored = totals.outcome_anchored,
+        anchors_carried = totals.anchors_carried,
+        sweeps_completed = totals.sweeps_completed,
+        elapsed_ms,
+        "drove the unattended panel coverage backfill toward the active generation across every \
+         owed target"
+    );
+
+    publish_backfill_readback(&BackfillReadback {
+        action: primary.action,
+        reason: Some(primary.reason),
+        panel: (!primary.panel.is_empty()).then(|| primary.panel.clone()),
+        source_cf: (!primary.source_cf.is_empty()).then(|| primary.source_cf.clone()),
+        pages: totals.pages,
+        examined: totals.examined,
+        inserted: totals.inserted,
+        already_current: totals.already_current,
+        outcome_anchored: totals.outcome_anchored,
+        anchors_carried: totals.anchors_carried,
+        sweep_complete: Some(primary.sweep_complete),
+        elapsed_ms,
+        anchor,
+    });
+
+    // `page_failed`, `cursor_absent` and an unpersistable cursor are the exits
+    // that already called record_failure; report them so the tick is not also
+    // counted a success.
+    failed
+}
+
+/// One coverage target with its durable cursor already recovered (#2070).
+struct CoverageTarget<'a> {
+    target: &'a crate::panel_coverage::PanelCoverageRow,
+    source_cf: String,
+    cursor_key: Vec<u8>,
+    persisted: Option<CoverageSweepCursor>,
+}
+
+/// The tick's aggregate over every target it swept.
+#[derive(Default)]
+struct CoverageTickTotals {
+    pages: u64,
+    examined: u64,
+    inserted: u64,
+    already_current: u64,
+    outcome_anchored: u64,
+    anchors_carried: u64,
+    sweeps_completed: u64,
+}
+
+impl CoverageTickTotals {
+    fn merge(&mut self, pass: &CoverageTargetPass) {
+        self.pages = self.pages.saturating_add(pass.pages);
+        self.examined = self.examined.saturating_add(pass.examined);
+        self.inserted = self.inserted.saturating_add(pass.inserted);
+        self.already_current = self.already_current.saturating_add(pass.already_current);
+        self.outcome_anchored = self.outcome_anchored.saturating_add(pass.outcome_anchored);
+        self.anchors_carried = self.anchors_carried.saturating_add(pass.anchors_carried);
+        self.sweeps_completed = self
+            .sweeps_completed
+            .saturating_add(u64::from(pass.sweep_complete));
+    }
+}
+
+/// The highest-priority target actually worked this tick, which is what the
+/// single-panel readback fields report.
+struct CoveragePrimary {
+    panel: String,
+    source_cf: String,
+    action: &'static str,
+    reason: &'static str,
+    sweep_complete: bool,
+}
+
+/// What one target's sweep did within a tick.
+struct CoverageTargetPass {
+    action: &'static str,
+    reason: &'static str,
+    pages: u64,
+    examined: u64,
+    inserted: u64,
+    already_current: u64,
+    outcome_anchored: u64,
+    anchors_carried: u64,
+    sweep_complete: bool,
+    failed: bool,
+    line: String,
+}
+
+/// Sweeps one coverage target from its durable cursor, within the tick budget.
+///
+/// Extracted from the driver so that a target's failure is a value the driver
+/// can record and move past. When this was inline, `break` on a page failure
+/// ended the *tick*, and one unmeasurable page therefore denied service to every
+/// panel behind it (#2070) — the same head-of-queue defect as #2030 and #2061,
+/// on the queue those two fixes handed the work to.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sweep: cursor recovery, paging, cursor persistence and reporting are a single \
+              ordered sequence whose correctness depends on that order"
+)]
+fn sweep_coverage_target(
+    db: &Arc<Db>,
+    entry: &CoverageTarget<'_>,
+    started: std::time::Instant,
+) -> CoverageTargetPass {
+    let target = entry.target;
+    let source_cf = entry.source_cf.as_str();
+    let reason = target.backfill_reason().unwrap_or("coverage_debt");
+    let resume_hex = entry
+        .persisted
+        .as_ref()
         .and_then(|persisted| persisted.after_physical_hex.clone());
     let mut after_physical = match resume_hex.as_deref().map(decode_key_hex).transpose() {
         Ok(after_physical) => after_physical,
@@ -2715,7 +3131,22 @@ fn drive_coverage_backfill(
                     target.panel_name
                 ),
             );
-            return true;
+            return CoverageTargetPass {
+                action: "cursor_undecodable",
+                reason,
+                pages: 0,
+                examined: 0,
+                inserted: 0,
+                already_current: 0,
+                outcome_anchored: 0,
+                anchors_carried: 0,
+                sweep_complete: false,
+                failed: true,
+                line: format!(
+                    "{}@{} source_cf={source_cf} action=cursor_undecodable",
+                    target.panel_name, target.panel_version
+                ),
+            };
         }
     };
 
@@ -2727,10 +3158,11 @@ fn drive_coverage_backfill(
     let mut anchors_carried = 0_u64;
     let mut sweep_complete = false;
     let mut action = "budget_exhausted";
+    let mut page_failure: Option<String> = None;
 
     while started.elapsed() < PANEL_BACKFILL_TICK_BUDGET {
         let page = match db.backfill_temporal_metadata(
-            &source_cf,
+            source_cf,
             None,
             after_physical.as_deref(),
             PANEL_BACKFILL_PAGE_ROWS,
@@ -2741,6 +3173,8 @@ fn drive_coverage_backfill(
                 // be retried from the same offset next tick, never skipped:
                 // advancing past a page that did not complete would leave rows
                 // unmeasured with nothing recording that they were passed over.
+                // What changed in #2070 is only the SCOPE of the abandonment:
+                // this target stops, the tick does not.
                 record_failure(
                     "STORAGE_DERIVED_STATE_BACKFILL_PAGE_FAILED",
                     format!(
@@ -2748,6 +3182,7 @@ fn drive_coverage_backfill(
                         target.panel_name
                     ),
                 );
+                page_failure = Some(error.to_string());
                 action = "page_failed";
                 break;
             }
@@ -2783,16 +3218,36 @@ fn drive_coverage_backfill(
         }
     }
 
-    let sweeps_completed = persisted
-        .as_ref()
+    let previous = entry.persisted.as_ref();
+    let sweeps_completed = previous
         .map_or(0, |persisted| persisted.sweeps_completed)
         .saturating_add(u64::from(sweep_complete));
+    // A page that succeeded proves the panel is measurable, so the failure run
+    // resets. Only an unbroken run of failed ticks blocks a target, which is
+    // what keeps one bad afternoon from deprioritising a healthy panel.
+    let consecutive_page_failures = if page_failure.is_some() {
+        previous
+            .map_or(0, |persisted| persisted.consecutive_page_failures)
+            .saturating_add(1)
+    } else if pages > 0 {
+        0
+    } else {
+        previous.map_or(0, |persisted| persisted.consecutive_page_failures)
+    };
+    let blocked_since_unix_ms =
+        if consecutive_page_failures >= COVERAGE_PAGE_FAILURE_BLOCK_THRESHOLD {
+            previous
+                .and_then(|persisted| persisted.blocked_since_unix_ms)
+                .or_else(now_unix_ms)
+        } else {
+            None
+        };
     let cursor = CoverageSweepCursor {
-        schema: "synapse_panel_coverage_sweep_cursor/v1".to_owned(),
+        schema: COVERAGE_SWEEP_CURSOR_SCHEMA.to_owned(),
         issue: 1984,
         panel_name: target.panel_name.clone(),
         panel_version: target.panel_version,
-        source_cf: source_cf.clone(),
+        source_cf: source_cf.to_owned(),
         // A completed sweep resets to the head of the CF. That is the correct
         // posture after a generation bump: the rows re-measured first are the
         // oldest, which are the ones no live write will ever reach.
@@ -2804,10 +3259,19 @@ fn drive_coverage_backfill(
                 .map(crate::constellations::hex_encode)
         },
         sweeps_completed,
+        consecutive_page_failures,
+        last_page_failure: page_failure
+            .or_else(|| previous.and_then(|persisted| persisted.last_page_failure.clone()))
+            .filter(|_| consecutive_page_failures > 0),
+        blocked_since_unix_ms,
         updated_at_unix_ms: now_unix_ms(),
     };
-    let cursor_persisted =
-        write_durable_maintenance_row(db, cursor_key, &cursor, "coverage sweep cursor");
+    let cursor_persisted = write_durable_maintenance_row(
+        db,
+        entry.cursor_key.clone(),
+        &cursor,
+        "coverage sweep cursor",
+    );
     if let Err(detail) = &cursor_persisted {
         record_failure(
             "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNWRITABLE",
@@ -2820,16 +3284,9 @@ fn drive_coverage_backfill(
     }
     let failed = cursor_persisted.is_err() || matches!(action, "page_failed" | "cursor_absent");
 
-    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    tracing::info!(
-        code = "STORAGE_DERIVED_STATE_BACKFILL_PASS",
+    CoverageTargetPass {
         action,
-        panel = %target.panel_name,
-        panel_version = target.panel_version,
-        source_cf = %source_cf,
-        reason = backfill_reason,
-        coverage_fraction = ?target.coverage_fraction,
-        uncovered_rows = ?target.uncovered_rows(),
+        reason,
         pages,
         examined,
         inserted,
@@ -2837,31 +3294,20 @@ fn drive_coverage_backfill(
         outcome_anchored,
         anchors_carried,
         sweep_complete,
-        sweeps_completed,
-        elapsed_ms,
-        "drove the unattended panel coverage backfill toward the active generation"
-    );
-
-    publish_backfill_readback(&BackfillReadback {
-        action,
-        reason: Some(backfill_reason),
-        panel: Some(target.panel_name.clone()),
-        source_cf: Some(source_cf),
-        pages,
-        examined,
-        inserted,
-        already_current,
-        outcome_anchored,
-        anchors_carried,
-        sweep_complete: Some(sweep_complete),
-        elapsed_ms,
-        anchor,
-    });
-
-    // `page_failed`, `cursor_absent` and an unpersistable cursor are the exits
-    // that already called record_failure; report them so the tick is not also
-    // counted a success.
-    failed
+        failed,
+        line: format!(
+            "{}@{} source_cf={source_cf} action={action} reason={reason} \
+             coverage_fraction={:?} uncovered={:?} pages={pages} examined={examined} \
+             inserted={inserted} already_current={already_current} \
+             outcome_anchored={outcome_anchored} anchors_carried={anchors_carried} \
+             sweep_complete={sweep_complete} sweeps_completed={sweeps_completed} \
+             consecutive_page_failures={consecutive_page_failures}",
+            target.panel_name,
+            target.panel_version,
+            target.coverage_fraction,
+            target.uncovered_rows(),
+        ),
+    }
 }
 
 /// The coverage sweep's published outcome, plus the anchor phase sharing its

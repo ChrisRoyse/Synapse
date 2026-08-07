@@ -8,7 +8,24 @@ use crate::server::{ErrorData, Json, Parameters, SynapseService};
 const VAULT_VERIFY_INTERVAL_ENV: &str = "SYNAPSE_VAULT_VERIFY_INTERVAL_SECS";
 const VAULT_VERIFY_STARTUP_DELAY_ENV: &str = "SYNAPSE_VAULT_VERIFY_STARTUP_DELAY_SECS";
 const DEFAULT_VAULT_VERIFY_INTERVAL_SECS: u64 = 24 * 60 * 60;
-const DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS: u64 = 5 * 60;
+/// Startup delay before the first periodic verify, deliberately **not** a whole
+/// multiple of the storage GC interval (#2067).
+///
+/// The verifier holds `native.compaction.lock` for the length of a whole-vault
+/// scan (17.4 s measured), and `GC_INTERVAL` is 5 minutes. A 300 s startup delay
+/// is anchored at the same storage-open instant the GC ticker is, so on **every**
+/// boot the first periodic verify and a GC tick fired in the same second and the
+/// GC tick lost the lock — the deterministic collision measured on daemon
+/// generation 2026-08-07T16:02:48Z (verify started 16:08:26.965, GC tick started
+/// 16:08:26.99, `CALYX_ASTER_NATIVE_COMPACTION_BUSY` at 16:08:33).
+///
+/// 450 s is 300 s + half a GC interval: it is coprime with nothing in
+/// particular, it simply lands the verify at the *midpoint* between two GC ticks
+/// (t=450 s sits between GC ticks at 300 s and 600 s) so a 17-second hold cannot
+/// overlap either. #2067's fair FIFO handoff makes a collision survivable; this
+/// makes the boot-time one stop happening at all, which is cheaper than handing
+/// it off.
+const DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS: u64 = 7 * 60 + 30;
 
 /// Last scheduled vault-verification outcome, for `health` (#2059).
 ///

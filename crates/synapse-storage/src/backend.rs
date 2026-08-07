@@ -61,12 +61,11 @@ use crate::constellations::{
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION,
     SYN_MCP_USAGE_BACKFILL_SOURCE, SYN_MCP_USAGE_KEY_PREFIX, SYN_MCP_USAGE_PANEL_NAME,
     SYN_MCP_USAGE_PANEL_VERSION, SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION,
-    SYN_OUTCOME_BACKFILL_SOURCE, SYN_OUTCOME_KEY_PREFIX, SYN_OUTCOME_PANEL_NAME,
-    SYN_OUTCOME_PANEL_VERSION, SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION,
-    SYN_RECURRENCE_SUBJECT_PANEL_NAME, SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME,
-    SYN_REFLEX_PANEL_VERSION, SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION,
-    SupersededPanelLineage, assert_syn_lens_provenance_complete, superseded_panel_lineage,
-    syn_active_panel_contract,
+    SYN_OUTCOME_BACKFILL_SOURCE, SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION,
+    SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
+    SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
+    SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, SupersededPanelLineage,
+    assert_syn_lens_provenance_complete, superseded_panel_lineage, syn_active_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -3634,7 +3633,6 @@ impl StorageBackend for CalyxBackend {
             // The row COUNT is still only taken for a declared full-CF
             // denominator: a subset-fed panel has no meaningful coverage
             // fraction, and deriving one would read as a permanent outage.
-            //
             // The KEY SET is taken for every source CF, including subset-fed
             // ones (#1940). The orphan probe is a per-record membership test —
             // "is this record's own source row still there" — and that question
@@ -3643,12 +3641,9 @@ impl StorageBackend for CalyxBackend {
             // measured 2026-08-01 it found 226 of the 227 orphans an
             // independent audit found, missing `syn-observation-v1`'s one
             // record purely because its panel is sampled.
-            if entry.source.is_full_cf() {
-                let rows = self.read_all_rows(cf_name)?;
-                source_cf_rows.insert(cf_name.to_owned(), rows.len() as u64);
-            }
+            //
             // The KEY SET is read with expired rows INCLUDED, and that is not
-            // the same question the row count above answers (#1940).
+            // the same question the row count answers (#1940).
             //
             // `source_cf_rows` is a coverage denominator: "how many source rows
             // is this panel supposed to have measured". A row past its TTL is
@@ -3663,16 +3658,59 @@ impl StorageBackend for CalyxBackend {
             // readings of CF_ACTION_LOG differ by a factor of nine (82 unexpired
             // vs 747 physically present), so this is the difference between
             // reporting 665 orphans and the true 224.
-            let present = self.with_vault(cf_name, "scan Calyx KV namespace", false, |vault| {
-                read_all_rows_from_vault_including_expired(vault, cf_name)
-            })?;
-            source_cf_keys.insert(
-                cf_name.to_owned(),
-                present
-                    .iter()
-                    .map(|(key, _)| constellations::hex_encode(key))
-                    .collect(),
-            );
+            //
+            // **#2060.** Both readings come from ONE bounded-hold paged fold,
+            // where they used to be two whole-CF `scan_cf_range_latest` holds.
+            // That site was the one whole-CF fold left on the maintainer's path
+            // after 682e6fdb, and it cost exactly five wide holds of 188-348 ms
+            // per census — ~1.2 s of cumulative commit-blocking every five
+            // minutes, measured on the deployed daemon at 16:08:48-16:08:49Z
+            // (188105/190442/249255/244189/198859 µs), with `health` round-trips
+            // inside the tick window reaching 3.9 s against a 686 ms median.
+            //
+            // The correctness argument is 682e6fdb's, unchanged, and it applies
+            // here more simply than it did to eviction because this fold only
+            // READS: row-table entries are only ever created, so a cursor cannot
+            // skip or double-visit a key; a commit concurrent with the fold
+            // allocates a sequence above the pinned one and is excluded from
+            // every page's answer; and a concurrent reclaim keeps each chain's
+            // newest version at or below the safe point, which is clamped to the
+            // oldest pinned sequence, so the version this fold reads is never
+            // the one dropped. The lease is re-checked per page, so a fold that
+            // outlived its pin fails closed rather than reading a partially
+            // reclaimed view. Unlike the eviction sweep there is no observe-to-
+            // delete window to close: nothing here proposes a mutation, so a row
+            // rewritten between two pages simply contributes its newer value to
+            // a census that is explicitly a five-minute sample.
+            let (live_rows, keys) = self.with_vault(
+                cf_name,
+                "census one Calyx source CF's rows and keys in bounded pages",
+                false,
+                |vault| {
+                    let mut live_rows = 0_u64;
+                    let mut keys: BTreeSet<String> = BTreeSet::new();
+                    sweep_calyx_namespace_rows(
+                        vault,
+                        cf_name,
+                        PANEL_COVERAGE_SOURCE_CENSUS_SITE,
+                        |key, _payload, expired| {
+                            keys.insert(constellations::hex_encode(key));
+                            if !expired {
+                                live_rows = live_rows.saturating_add(1);
+                            }
+                            Ok(())
+                        },
+                    )?;
+                    Ok((live_rows, keys))
+                },
+            )?;
+            // The row COUNT is still only taken for a declared full-CF
+            // denominator: a subset-fed panel has no meaningful coverage
+            // fraction, and deriving one would read as a permanent outage.
+            if entry.source.is_full_cf() {
+                source_cf_rows.insert(cf_name.to_owned(), live_rows);
+            }
+            source_cf_keys.insert(cf_name.to_owned(), keys);
         }
 
         // #2062: the second authority. The catalog is a compile-time table and
@@ -5515,13 +5553,23 @@ impl StorageBackend for CalyxBackend {
                             .to_owned(),
                     });
                 }
+                // #1984: any DECLARED outcome family, not one of them. The
+                // single-prefix test here refused the panel's own repair queue —
+                // the census named a stranded identity under
+                // `approval/v1/audit/`, which is as much this panel's population
+                // as `escalation/v1/audit/` is, and the repair could not use the
+                // path the catalog gave it. See `SYN_OUTCOME_KEY_PREFIXES` for
+                // the writer-by-writer evidence that the declaration, not the
+                // identity, was the thing that was wrong.
                 if source_cf == SYN_OUTCOME_BACKFILL_SOURCE
-                    && !key.starts_with(SYN_OUTCOME_KEY_PREFIX)
+                    && constellations::outcome_backfill_prefix_for_key(key).is_none()
                 {
                     return Err(StorageError::BackendInvalidConfig {
                         value: constellations::hex_encode(key),
-                        detail: "exact outcome backfill key is outside escalation/v1/audit/; remediation=pass a key from the declared prefix"
-                            .to_owned(),
+                        detail: format!(
+                            "exact outcome backfill key is outside every declared outcome row family ({}); remediation=pass a key from one of the declared prefixes, or add this row family to SYN_OUTCOME_KEY_PREFIXES if a writer really measures it into syn-outcome-v1",
+                            constellations::outcome_backfill_prefixes_display()
+                        ),
                     });
                 }
                 let physical_source_cf = backfill_physical_source_cf(source_cf);
@@ -5535,13 +5583,10 @@ impl StorageBackend for CalyxBackend {
                         ),
                     })?
             } else {
-                let prefix = match source_cf {
-                    SYN_MCP_USAGE_BACKFILL_SOURCE => Some(SYN_MCP_USAGE_KEY_PREFIX),
-                    SYN_OUTCOME_BACKFILL_SOURCE => Some(SYN_OUTCOME_KEY_PREFIX),
-                    _ => None,
-                };
-                let page = if let Some(prefix) = prefix {
-                    self.with_vault(
+                let page = match source_cf {
+                    // One contiguous declared prefix, so the physical range can
+                    // be sought directly and no unrelated row is ever read.
+                    SYN_MCP_USAGE_BACKFILL_SOURCE => self.with_vault(
                         cf::CF_KV,
                         "scan candidate-bounded MCP-usage prefix page",
                         false,
@@ -5549,14 +5594,31 @@ impl StorageBackend for CalyxBackend {
                             read_physical_prefix_page_from_vault(
                                 vault,
                                 cf::CF_KV,
-                                prefix,
+                                SYN_MCP_USAGE_KEY_PREFIX,
                                 after_physical,
                                 max_rows,
                             )
                         },
-                    )?
-                } else {
-                    self.scan_cf_physical_page(source_cf, after_physical, max_rows)?
+                    )?,
+                    // #1984: FOUR disjoint declared families, so a single
+                    // seekable range does not describe the population. The page
+                    // is taken over the physical `CF_KV` order — which is what
+                    // the opaque resume cursor already means — and filtered to
+                    // the declared families, so the sweep covers every row this
+                    // panel actually owns instead of the one family that
+                    // happened to be named. `candidate_rows_examined` is
+                    // deliberately left as the UNFILTERED count: it is the
+                    // measure of what the sweep had to look at, and hiding it
+                    // would make a cheap sweep and an expensive one read alike.
+                    SYN_OUTCOME_BACKFILL_SOURCE => {
+                        let mut page =
+                            self.scan_cf_physical_page(cf::CF_KV, after_physical, max_rows)?;
+                        page.rows.retain(|(key, _)| {
+                            constellations::outcome_backfill_prefix_for_key(key).is_some()
+                        });
+                        page
+                    }
+                    _ => self.scan_cf_physical_page(source_cf, after_physical, max_rows)?,
                 };
                 (
                     page.rows,
@@ -6991,19 +7053,30 @@ impl StorageBackend for CalyxBackend {
                     }
                 })?;
                 let (prepared, calyx_entries) = prepare_grounding_anchor_sources(vault, sources)?;
-                let write = vault
-                    .put_grounding_anchors_for_many(
-                        calyx_entries,
-                        payload,
-                        "synapse-outcome-anchors",
-                    )
-                    .map_err(|source| {
-                        calyx_write_failed(
+                let write = match vault.put_grounding_anchors_for_many(
+                    calyx_entries,
+                    payload,
+                    "synapse-outcome-anchors",
+                ) {
+                    Ok(write) => write,
+                    Err(source) => {
+                        let error = calyx_write_failed(
                             "calyx_anchors",
                             "put multi-constellation ledger-stamped grounded anchors",
                             &source,
-                        )
-                    })?;
+                        );
+                        // #2072: a conflict leaves the journal committed and the
+                        // anchor not advanced, which is the silent un-grounding
+                        // #1980/#1984 exist to stop, arriving through a different
+                        // door. Name the exact constellations in ONE record so a
+                        // repair can find them, instead of leaving 106 rows
+                        // carrying a stale value with nothing scheduled.
+                        if error.code() == CALYX_ANCHOR_VALUE_CONFLICT_CODE {
+                            record_anchor_conflict_identities(&prepared, &error);
+                        }
+                        return Err(error);
+                    }
+                };
                 let readback_exact_match_count = readback_grounding_anchor_batch(vault, &prepared)?;
                 Ok(anchor_batch_write_report(
                     write,
@@ -8603,6 +8676,58 @@ fn prepare_grounding_anchor_sources(
     Ok((prepared, calyx_entries))
 }
 
+/// The typed anchor write-conflict code as it reaches Synapse (#2072).
+///
+/// The Synapse-namespace form, because `crates/synapse-calyx/src/error_bridge.rs`
+/// maps `CALYX_ASTER_ANCHOR_VALUE_CONFLICT` onto it — the bridge validator
+/// refuses any PRD-18 code without a mapping, so this is the only form a caller
+/// ever sees.
+const CALYX_ANCHOR_VALUE_CONFLICT_CODE: &str = "SYNAPSE_CALYX_ASTER_ANCHOR_VALUE_CONFLICT";
+
+/// Records the constellations a refused anchor batch left un-advanced (#2072
+/// ask 3 and ask 4).
+///
+/// One structured record per BATCH, naming every affected identity, rather than
+/// one `ERROR` per constellation per retry: the deployed daemon emitted 318
+/// events across 106 constellations in under three minutes, and an operator
+/// cannot act on that shape. The identities are named exactly — source CF,
+/// source key, `cx_id`, anchor kind — because "an anchor somewhere did not
+/// advance" is not a repairable statement.
+///
+/// Deliberately a log record and not a durable queue row: this runs inside the
+/// vault closure of a failing write, and taking a second write path there would
+/// make the failure handler able to fail. The repair that consumes this is the
+/// panel-coverage census, which already finds ungrounded and stale-grounded rows
+/// by physical scan and does not need to be told where to look.
+fn record_anchor_conflict_identities(
+    prepared: &[PreparedGroundingAnchorSource],
+    error: &StorageError,
+) {
+    let identities: Vec<String> = prepared
+        .iter()
+        .map(|source| {
+            format!(
+                "cx_id={} kind={:?} source_cf={} source_key_hex={}",
+                source.cx_id,
+                source.anchor.kind,
+                source.source_cf,
+                constellations::hex_encode(&source.source_key),
+            )
+        })
+        .collect();
+    tracing::error!(
+        code = "CALYX_GROUNDING_ANCHOR_BATCH_CONFLICT",
+        conflict_code = CALYX_ANCHOR_VALUE_CONFLICT_CODE,
+        affected_constellations = identities.len(),
+        identities = ?identities,
+        detail = %error,
+        "a grounded anchor batch was refused as a WRITE CONFLICT, not as corruption: every named \
+         constellation kept its previously stored anchor and none of them advanced. The vault is \
+         not damaged and must not be restored from a snapshot; reconcile the disagreeing \
+         observations at their writers"
+    );
+}
+
 fn readback_grounding_anchor_batch(
     vault: &SynapseCalyxVault,
     prepared: &[PreparedGroundingAnchorSource],
@@ -9248,6 +9373,17 @@ fn decode_schema_version(bytes: &[u8]) -> Option<u32> {
 /// drift apart and one of them would silently be the wrong side of that cliff.
 const CALYX_INSPECT_SWEEP_PAGE_ROWS: usize = synapse_calyx::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS;
 
+/// Sweep label for the panel-coverage census's per-source-CF fold (#2060).
+///
+/// A `site` label on `STORAGE_CALYX_BOUNDED_SWEEP`, not a new
+/// `calyx_row_guard_sites` entry, for the reason
+/// [`CALYX_GC_RETENTION_SWEEP_SITE`] documents: the guard this fold now takes is
+/// `scan_cf_range_page_latest`'s, and the claim to be judged is that
+/// `scan_cf_range_latest` loses the census's five wide holds per tick while the
+/// paged site gains them with `over_budget_holds` still zero. A private census
+/// name would hide exactly that number.
+const PANEL_COVERAGE_SOURCE_CENSUS_SITE: &str = "panel_coverage_source_census";
+
 /// Provenance of one bounded-hold sweep over an ordered Calyx KV range (#2041).
 ///
 /// A sweep trades one long atomic view for many short ones, so the window it
@@ -9405,6 +9541,32 @@ fn sweep_calyx_namespace_live_rows<V>(
 where
     V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
 {
+    sweep_calyx_namespace_rows(vault, cf_name, site, |key, payload, expired| {
+        if expired {
+            return Ok(());
+        }
+        visit(key, payload)
+    })
+}
+
+/// [`sweep_calyx_namespace_live_rows`], but the visitor also learns whether each
+/// row is past its TTL instead of never seeing it.
+///
+/// The two questions the panel-coverage census asks of a source CF differ by
+/// exactly this flag (#1940): the coverage denominator counts rows worth
+/// measuring, so an expired row is excluded, while the orphan probe asks whether
+/// a record's own source row can still be *read*, and an expired-but-present row
+/// can. Reading the CF twice to answer them would double the fold; carrying the
+/// flag answers both from one pass, with the same bounded holds.
+fn sweep_calyx_namespace_rows<V>(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    site: &'static str,
+    mut visit: V,
+) -> StorageResult<CalyxKvSweep>
+where
+    V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
+{
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let now_ms = vault
@@ -9425,9 +9587,11 @@ where
                 detail,
             }
         })?;
-        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-            return Ok(());
-        }
+        let expired = calyx_value_is_expired(envelope.expires_at_ms, now_ms);
+        // The ordering assertion is taken over EVERY decoded key, including
+        // expired ones. Checking only the visited subset would stop detecting a
+        // duplicate or corrupt namespace-one key the moment its neighbour
+        // expired, which is precisely when a corrupt key is hardest to see.
         if previous
             .as_deref()
             .is_some_and(|earlier| user_key.as_slice() <= earlier)
@@ -9438,7 +9602,7 @@ where
                     .to_owned(),
             });
         }
-        visit(&user_key, envelope.payload)?;
+        visit(&user_key, envelope.payload, expired)?;
         previous = Some(user_key);
         Ok(())
     })

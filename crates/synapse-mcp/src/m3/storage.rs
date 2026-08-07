@@ -1254,6 +1254,25 @@ pub struct StoragePanelCoverageResponse {
     /// Panel generations present in `Base` that no catalog entry claims,
     /// as `[panel_version, records]`. Read by no active-panel surface.
     pub unknown_panel_versions: Vec<[u64; 2]>,
+    /// **#2062.** Generations claimed by the panel-generation allocator rather
+    /// than by the compile-time catalog, rolled up per owning panel.
+    ///
+    /// Surfaced here because the census's own criterion names these fields: an
+    /// operator asked to verify "the first pass retired `2020002..2020099`" had
+    /// no way to read them from outside the process and could only infer it from
+    /// `STORAGE_DERIVED_SNAPSHOT_GENERATION_SUPERSEDED` lines in daemon stderr.
+    /// A closure criterion that can only be evidenced by grepping a log file is
+    /// not evidenceable by an operator.
+    pub owned_dynamic_generations: Vec<StorageOwnedGenerationRollup>,
+    /// Dynamic panels holding more than one live generation — the #2062 leak,
+    /// still open, named per panel. **Healthy is empty**: exactly one live
+    /// generation per derived panel is the invariant supersede-on-publish buys.
+    pub dynamic_panels_multi_live: Vec<String>,
+    /// Generations reserved as `builtin:` that the catalog nonetheless does not
+    /// name, as `[panel_version, records]`. Attributed, so not an unclaimed
+    /// generation — a declaration gap, reported on its own rather than folded
+    /// into a neighbour.
+    pub reserved_generations_absent_from_catalog: Vec<[u64; 2]>,
     pub base_cf_rows: u64,
     pub records_total: u64,
     /// `Base` rows that would not decode. `base_cf_rows - decode_failures ==
@@ -1347,6 +1366,36 @@ pub struct StoragePanelCoverageResponse {
     pub records_exceed_source_panels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at_unix_ms: Option<u64>,
+}
+
+/// One panel's allocator-owned `Base` generations in the `panel_coverage`
+/// payload (#2062).
+///
+/// Per panel and not per generation, exactly as the census computes it: the
+/// three derived publishers mint a generation per pass, so a per-generation
+/// response grows without bound and answers the wrong question.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageOwnedGenerationRollup {
+    /// Taken from the owner claim, never inferred from the generation number.
+    pub panel_name: String,
+    /// `dynamic` for an allocated generation, `builtin` for a reserved one the
+    /// catalog does not name.
+    pub owner_kind: String,
+    pub generations_present: u64,
+    /// Generations with no recorded successor. **Healthy is exactly one.**
+    pub live_generations: Vec<u32>,
+    /// Generations with a durably recorded successor, bounded by the census cap.
+    pub retired_generations: Vec<u32>,
+    pub retired_generations_truncated: bool,
+    pub newest_generation: u32,
+    pub records: u64,
+    pub live_records: u64,
+    pub retired_records: u64,
+    pub grounded_records: u64,
+    /// Grounded records on retired generations. **Sacred** — excluded from the
+    /// reclaim candidates exactly as declared superseded ones are.
+    pub retired_grounded_records: u64,
 }
 
 /// The last unattended anchor-debt repair tick, as published by the maintainer
@@ -3670,6 +3719,30 @@ pub fn inspect_panel_coverage(
         panels,
         unknown_panel_versions: report
             .unknown_panel_versions
+            .iter()
+            .map(|(version, records)| [u64::from(*version), *records as u64])
+            .collect(),
+        owned_dynamic_generations: report
+            .owned_dynamic_generations
+            .iter()
+            .map(|rollup| StorageOwnedGenerationRollup {
+                panel_name: rollup.panel_name.clone(),
+                owner_kind: rollup.owner_kind.clone(),
+                generations_present: rollup.generations_present as u64,
+                live_generations: rollup.live_generations.clone(),
+                retired_generations: rollup.retired_generations.clone(),
+                retired_generations_truncated: rollup.retired_generations_truncated,
+                newest_generation: rollup.newest_generation,
+                records: rollup.records as u64,
+                live_records: rollup.live_records as u64,
+                retired_records: rollup.retired_records as u64,
+                grounded_records: rollup.grounded_records as u64,
+                retired_grounded_records: rollup.retired_grounded_records as u64,
+            })
+            .collect(),
+        dynamic_panels_multi_live: report.dynamic_panels_multi_live.clone(),
+        reserved_generations_absent_from_catalog: report
+            .reserved_generations_absent_from_catalog
             .iter()
             .map(|(version, records)| [u64::from(*version), *records as u64])
             .collect(),

@@ -262,6 +262,19 @@ error_catalog! {
     // remediation the qualified slot-write path already names.
     AsterPanelSlotSetImmutable, aster_panel_slot_set_immutable,
     "CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE",
-    "a re-measured constellation declares a different slot set, or different slot vectors, than the stored row of the same CxId",
-    "the stored row's Base slot membership and slot hashes are part of what the row IS, and are immutable once committed. Retrying cannot succeed. Allocate a NEW panel version (which yields new CxIds), give the added slot an id inside a block that panel owns, and re-measure the authoritative source rows into that generation";
+    "a re-measured constellation declares a different slot SET (an added or removed slot id) than the stored row of the same CxId",
+    "the stored row's Base slot membership is part of what the row IS, and is immutable once committed. Retrying cannot succeed. Allocate a NEW panel version (which yields new CxIds), give the added slot an id inside a block that panel owns, and re-measure the authoritative source rows into that generation. Note that a re-measure which keeps every slot id and only changes a lane's measured content is NOT this error (#2070): it is admitted, the stored vectors are retained, and the drifting lanes are reported as CALYX_ASTER_PANEL_SLOT_CONTENT_DRIFT";
+
+    // Two writers proposing DIFFERENT values for the same (CxId, anchor kind) is
+    // a write conflict: a concurrency/idempotency question with a declared
+    // answer, on a shard whose bytes are entirely intact. Reporting it as
+    // CALYX_ASTER_CORRUPT_SHARD told an operator to restore a healthy production
+    // vault from a snapshot in response to a routine replay — 318 such ERRORs
+    // over 106 constellations in under three minutes on a vault with
+    // decode_failures=0 (issue #2072, same misclassification class as #1875,
+    // #1903 and #2059). It also buried the code that must never be noise.
+    AsterAnchorValueConflict, aster_anchor_value_conflict,
+    "CALYX_ASTER_ANCHOR_VALUE_CONFLICT",
+    "a requested anchor and the persisted anchor for the same (CxId, kind) hold different values, and neither observation is newer than the other",
+    "nothing is corrupt and restoring from backup is the WRONG repair. The two observations disagree and the declared rule could not order them: last observation wins, and these carry the same observed_at_ms. Reconcile the two values at the writer — re-observe the subject and write the result with a strictly later observed_at_ms, or erase the stale anchor deliberately (anchor_erase) before re-writing";
 }

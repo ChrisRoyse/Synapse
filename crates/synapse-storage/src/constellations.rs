@@ -203,6 +203,71 @@ pub const SYN_PATH_HIERARCHY_PANEL_VERSION: u32 = 1_685_003;
 pub const SYN_MCP_USAGE_KEY_PREFIX: &[u8] = b"mcp-usage/v1/";
 pub const SYN_OUTCOME_KEY_PREFIX: &[u8] = b"escalation/v1/audit/";
 pub const SYN_OUTCOME_BACKFILL_SOURCE: &str = "CF_KV:escalation/v1/audit/";
+
+/// Every `CF_KV` row family a physical writer measures into `syn-outcome-v1`.
+///
+/// **#1984.** The declaration used to be the single prefix
+/// [`SYN_OUTCOME_KEY_PREFIX`], and it was wrong — not a little wrong, but wrong
+/// in a way that made the panel's own repair refuse its own work. The census
+/// enumerated a stranded identity at
+/// `approval/v1/audit/apr1-019f7466…/00000001784364334939-…`, the exact-key
+/// branch of `Db::backfill_temporal_metadata` refused it as "outside
+/// escalation/v1/audit/", and the panel's anchor debt could not move on any tick.
+///
+/// The physical writers settle which of the two was wrong, and it is the
+/// declaration. [`anchor_panel_for_source_cf`] maps **all** of `CF_KV` (bar the
+/// `mcp-usage/v1/` prefix) to this panel, and four call sites use that mapping to
+/// write outcome constellations into it:
+///
+/// | writer | key family |
+/// |---|---|
+/// | `synapse-mcp/src/server/escalation/mod.rs` | `escalation/v1/audit/` |
+/// | `synapse-mcp/src/m3/approvals.rs` | `approval/v1/audit/` |
+/// | `synapse-mcp/src/server/verification.rs` | `verification/audit/v1/` |
+/// | `synapse-mcp/src/m3/suggestions.rs` | `suggestion/v1/` |
+///
+/// (`CF_ROUTINE_STATE` also feeds this panel, from `m3/routines.rs`, but it is a
+/// different column family and is reported as
+/// `anchors_stranded_source_cf_unmeasured` rather than silently folded in here.)
+///
+/// Re-measuring any of these through the outcome path is byte-exact:
+/// [`outcome_constellation_input_bytes`] frames `(cf::CF_KV, key, value)`
+/// identically for the live write and for the backfill, so the re-measured
+/// `cx_id` is the same content address the original writer produced. The prefix
+/// is a *population* declaration, never an input to the identity.
+///
+/// Ordered and disjoint, which is what lets a paged sweep walk them as one
+/// logical source with a physical cursor that identifies its own prefix.
+pub const SYN_OUTCOME_KEY_PREFIXES: &[&[u8]] = &[
+    b"approval/v1/audit/",
+    b"escalation/v1/audit/",
+    b"suggestion/v1/",
+    b"verification/audit/v1/",
+];
+
+/// The declared outcome prefix one `CF_KV` key belongs to, or `None`.
+///
+/// Used by the exact-key repair to admit any declared family rather than one of
+/// them. Never a `starts_with` on the panel's *whole* CF: `CF_KV` also holds the
+/// MCP-usage panel's rows and a great deal that is no panel's population at all,
+/// so admitting the family would reinterpret unrelated rows as outcomes.
+#[must_use]
+pub fn outcome_backfill_prefix_for_key(key: &[u8]) -> Option<&'static [u8]> {
+    SYN_OUTCOME_KEY_PREFIXES
+        .iter()
+        .copied()
+        .find(|prefix| key.starts_with(prefix))
+}
+
+/// The declared outcome prefixes rendered for an error or a log line.
+#[must_use]
+pub fn outcome_backfill_prefixes_display() -> String {
+    SYN_OUTCOME_KEY_PREFIXES
+        .iter()
+        .map(|prefix| String::from_utf8_lossy(prefix).into_owned())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 /// Logical backfill source for the MCP-usage subset of the shared KV family.
 /// This is deliberately not `CF_KV`: using the whole family would reinterpret
 /// unrelated outcome rows as MCP usage and make a bounded migration impossible.

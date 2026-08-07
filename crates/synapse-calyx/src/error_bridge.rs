@@ -4,7 +4,7 @@ pub const SYNAPSE_CALYX_UNMAPPED_ERROR: &str = "SYNAPSE_CALYX_UNMAPPED_ERROR";
 pub const SYNAPSE_CALYX_ERROR_MAPPING_INVALID: &str = "SYNAPSE_CALYX_ERROR_MAPPING_INVALID";
 pub const SYNAPSE_CALYX_BACKPRESSURE: &str = "SYNAPSE_CALYX_BACKPRESSURE";
 
-const CALYX_CORE_ERROR_CODE_COUNT: usize = 44;
+const CALYX_CORE_ERROR_CODE_COUNT: usize = 45;
 const _: [(); CALYX_CORE_ERROR_CODE_COUNT] = [(); calyx_core::CALYX_ERROR_CODES.len()];
 
 const CALYX_ERROR_BRIDGE: &[(&str, &str)] = &[
@@ -141,6 +141,15 @@ const CALYX_ERROR_BRIDGE: &[(&str, &str)] = &[
     (
         "CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE",
         "SYNAPSE_CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE",
+    ),
+    // #2072. Mapped rather than left to pass through verbatim, because
+    // `validate_calyx_error_bridge` requires every PRD-18 code to have a
+    // Synapse-namespace mapping — and because a conflict code an operator will
+    // see beside `SYNAPSE_CALYX_ASTER_CORRUPT_SHARD` must be namespaced the same
+    // way to read as the deliberate distinction it is.
+    (
+        "CALYX_ASTER_ANCHOR_VALUE_CONFLICT",
+        "SYNAPSE_CALYX_ASTER_ANCHOR_VALUE_CONFLICT",
     ),
 ];
 

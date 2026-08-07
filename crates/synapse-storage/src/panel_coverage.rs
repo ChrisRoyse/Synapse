@@ -858,6 +858,36 @@ impl PanelCoverageReport {
             })
     }
 
+    /// Every panel owed a coverage sweep, most uncovered rows first (#2070).
+    ///
+    /// A list rather than a single target, for the third time and the same
+    /// reason. `most_owed_coverage_backfill` names exactly one panel per tick,
+    /// and when that panel's first page cannot be measured the tick ends there:
+    /// on the deployed daemon `syn-timeline-v1` (174,993 uncovered) failed on
+    /// page 1 with `CALYX_ASTER_PANEL_SLOT_SET_IMMUTABLE` on four consecutive
+    /// ticks, so `syn-process-v1` (991) moved **zero** rows and
+    /// `syn-agent-event-v1` went backwards on live ingest. #2030 fixed this
+    /// shape for one unmeasurable record and #2061 for one unrepairable anchor
+    /// identity; this is the same shape for one unmeasurable page.
+    ///
+    /// Ties break on the lower panel version so the order is deterministic
+    /// across ticks, which is what makes a resume cursor meaningful.
+    #[must_use]
+    pub fn coverage_backfill_targets(&self) -> Vec<&PanelCoverageRow> {
+        let mut targets: Vec<&PanelCoverageRow> = self
+            .panels
+            .iter()
+            .filter(|panel| panel.coverage_backfill_owed())
+            .collect();
+        targets.sort_by_key(|panel| {
+            (
+                std::cmp::Reverse(panel.uncovered_rows().unwrap_or(0)),
+                panel.panel_version,
+            )
+        });
+        targets
+    }
+
     /// Every panel owed an anchor-debt repair, largest debt first (#1984).
     ///
     /// A list rather than a single target on purpose. One target per tick is

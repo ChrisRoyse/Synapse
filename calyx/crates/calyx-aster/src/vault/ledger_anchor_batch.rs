@@ -55,10 +55,20 @@ where
             let mut constellation = self.get(id, latest)?;
             let mut missing = Vec::new();
             let mut existing_count = 0usize;
+            let mut superseding_count = 0usize;
             for anchor in &anchors {
                 match classify_anchor_state(self, latest, id, &constellation, anchor)? {
                     AnchorState::Existing => existing_count += 1,
+                    // A superseding anchor is written exactly like a missing one
+                    // — the Anchors CF key is `(id, kind)`, so the row is
+                    // overwritten in place, and the Base row's same-kind anchor
+                    // is replaced rather than duplicated by
+                    // `anchor_batch_rows_with_ledger_ref`.
                     AnchorState::Missing => missing.push(anchor.clone()),
+                    AnchorState::Superseding => {
+                        superseding_count += 1;
+                        missing.push(anchor.clone());
+                    }
                 }
             }
             if existing_count == anchors.len() {
@@ -71,11 +81,18 @@ where
                 )?;
                 return Ok(constellation.provenance.clone());
             }
-            if existing_count != 0 {
+            // A batch that mixes already-present anchors with genuinely MISSING
+            // ones still fails closed: that is the shape in which a legacy
+            // unstamped anchor gets silently upgraded, which is what this refusal
+            // exists to prevent. A supersession is not a missing anchor — the row
+            // is present and is being rewritten under the declared
+            // last-observation-wins rule (#2072) — so `existing + superseding`
+            // is a legitimate batch and is admitted.
+            if existing_count != 0 && existing_count + superseding_count != anchors.len() {
                 return Err(CalyxError::aster_corrupt_shard(format!(
-                    "partial anchor batch for {id}: {existing_count} existing anchors and {} \
-                     missing anchors",
-                    missing.len()
+                    "partial anchor batch for {id}: {existing_count} existing anchors, \
+                     {superseding_count} superseding anchors and {} missing anchors",
+                    missing.len().saturating_sub(superseding_count)
                 )));
             }
 
@@ -162,7 +179,9 @@ where
                         AnchorState::Existing => {
                             existing_anchor_count = existing_anchor_count.saturating_add(1);
                         }
-                        AnchorState::Missing => missing.push(anchor.clone()),
+                        AnchorState::Missing | AnchorState::Superseding => {
+                            missing.push(anchor.clone());
+                        }
                     }
                 }
                 if !missing.is_empty() {
@@ -238,6 +257,10 @@ where
 enum AnchorState {
     Existing,
     Missing,
+    /// The persisted anchor for this `(CxId, kind)` holds a different value and
+    /// its observation is not newer than the requested one, so the request
+    /// supersedes it under the declared write rule (#2072).
+    Superseding,
 }
 
 fn classify_anchor_state<C: Clock>(
@@ -263,11 +286,69 @@ fn classify_anchor_state<C: Clock>(
         Some(existing_bytes) => {
             let stored_anchor = encode::decode_anchor(&existing_bytes)?;
             if existing_bytes != anchor_bytes || stored_anchor != *anchor {
-                return Err(CalyxError::aster_corrupt_shard(format!(
-                    "conflicting Anchors CF row for {id} {:?}; existing persisted row does not \
-                     match requested anchor",
-                    anchor.kind
-                )));
+                // #2072. Two writers proposing different values for one
+                // `(CxId, kind)` is a WRITE CONFLICT, not a damaged shard, and
+                // it has a declared answer.
+                //
+                // ## The rule: last observation wins, ties to the incoming write
+                //
+                // An anchor is an *observation* of a real outcome, and
+                // `observed_at` exists on it precisely so two observations of
+                // the same subject can be ordered. The newer observation of a
+                // mutable subject is the better one, so it supersedes.
+                //
+                // Ties go to the incoming write, and that is a choice rather
+                // than an accident. The population that produced this on the
+                // live daemon is agent-state resurrection re-deriving
+                // `synapse:agent_end_state` from the same terminal event — same
+                // `observed_at`, different derived value — so an equality
+                // refusal is not a tiebreak but a permanent stall: the write is
+                // deterministic, so retrying is guaranteed to fail identically,
+                // and refusing leaves the row carrying the value the *less*
+                // informed pass computed while its caller records
+                // `operation_committed=true` with the anchor failed. A replay
+                // re-derives from the whole journal; the original wrote
+                // incrementally. Between two observations of one instant, the
+                // later writer is at least as authoritative.
+                //
+                // This is never silent: the supersession is committed inside the
+                // batch's ledger entry, so it has durable provenance, and both
+                // values are named in the warn below.
+                //
+                // A STRICTLY OLDER observation is refused, because
+                // last-observation-wins run backwards would let a late replay of
+                // stale state clobber a newer reading. That refusal now carries
+                // its own code and a remediation that reconciles rather than one
+                // that tells an operator to restore a healthy vault from backup.
+                if anchor.observed_at < stored_anchor.observed_at {
+                    return Err(CalyxError::aster_anchor_value_conflict(format!(
+                        "conflicting Anchors CF row for {id} {:?}: the persisted anchor holds a \
+                         STRICTLY NEWER observation than the requested one \
+                         (stored observed_at={} source={:?}, requested observed_at={} source={:?}), \
+                         so last-observation-wins refuses the write; the row remains grounded by \
+                         the newer observation and NOTHING is corrupt",
+                        anchor.kind,
+                        stored_anchor.observed_at,
+                        stored_anchor.source,
+                        anchor.observed_at,
+                        anchor.source,
+                    )));
+                }
+                tracing::warn!(
+                    code = "CALYX_ASTER_ANCHOR_VALUE_SUPERSEDED",
+                    cx_id = %id,
+                    anchor_kind = ?anchor.kind,
+                    stored_observed_at = stored_anchor.observed_at,
+                    stored_source = %stored_anchor.source,
+                    stored_value = ?stored_anchor.value,
+                    requested_observed_at = anchor.observed_at,
+                    requested_source = %anchor.source,
+                    requested_value = ?anchor.value,
+                    "an anchor rewrite proposed a different value for an existing (CxId, kind); \
+                     last observation wins, so the requested value supersedes the stored one \
+                     inside this batch's ledger entry"
+                );
+                return Ok(AnchorState::Superseding);
             }
             if matching_base_anchor_count != 1 || exact_base_anchor_count != 1 {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -330,6 +411,14 @@ fn anchor_batch_rows_with_ledger_ref(
     ledger_ref: &LedgerRef,
 ) -> Result<Vec<encode::WriteRow>> {
     constellation.provenance = ledger_ref.clone();
+    // Drop any same-kind anchor first, so a supersession replaces the stored
+    // observation instead of leaving the Base row carrying two anchors on one
+    // axis (#2072). This is a no-op for a genuinely missing anchor:
+    // `classify_anchor_state` has already refused the case where the Anchors CF
+    // row is absent while the Base row holds an anchor of that kind.
+    constellation
+        .anchors
+        .retain(|stored| !anchors.iter().any(|anchor| anchor.kind == stored.kind));
     constellation.anchors.extend_from_slice(anchors);
     constellation.flags.ungrounded = false;
     constellation.validate_schema()?;
