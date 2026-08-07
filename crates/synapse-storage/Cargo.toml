@@ -19,6 +19,43 @@ calyx-lenses = { workspace = true }
 calyx-mincut = { version = "0.1.0", path = "../../calyx/crates/calyx-mincut" }
 calyx-registry = { workspace = true }
 fs2.workspace = true
+# --- ordinary dependencies reached only from this crate's examples/ ----------
+#
+# These were a `[dev-dependencies]` block until #2042. Operator directive D1
+# (2026-07-15) bans that section outright: a dev-only dependency surface is the
+# manifest half of a test surface, and it is what let `criterion`/`proptest`/
+# `tempfile` sit here before the purge. Cargo has no example-only dependency
+# table, so an example's dependency IS an ordinary dependency; declaring them
+# here states the real edge instead of hiding it behind a section whose whole
+# meaning is "not shipped".
+#
+# Nothing in `src/` imports any of them, so none is linked into the daemon —
+# `synapse-mcp` pulls in `synapse-storage`'s lib, and an unreferenced crate
+# dependency contributes no code to that binary. Every one is already in the
+# root build graph through `synapse-calyx`, so this costs no extra compilation.
+#
+# crc32fast          provenance_tamper_fsv rewrites an SST with correct
+#                    record/body CRCs so the provenance verifier is the thing
+#                    being read, not the storage layer's frame check (#1874).
+crc32fast = "1"
+# calyx-search       reconciled_recall_fsv drives delta reconciliation directly
+#                    so an empty result is attributed to a named stage (#1907).
+calyx-search = { workspace = true }
+# calyx-forge        host_math_baseline_fsv times the production CPU math
+# calyx-sextant      kernels so the host baseline is a measurement.
+calyx-forge = { workspace = true }
+calyx-sextant = { workspace = true }
+# calyx-assay        ensemble_card_known_synergy_fsv reads the capability card's
+#                    own pair rows back to prove no gain is a clamp (#1942).
+calyx-assay = { workspace = true }
+# calyx-loom         loom_agreement_kernel_fsv measures the weave cosine against
+#                    the scalar loop it replaced (#1917).
+calyx-loom = { workspace = true }
+# tracing-subscriber the instruments that must read the engine's own structured
+#                    log as evidence rather than infer it from return values
+#                    (#1936). The daemon installs its own subscriber.
+tracing-subscriber = { workspace = true }
+# ----------------------------------------------------------------------------
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -28,30 +65,6 @@ synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-# Used only by the provenance_tamper_fsv manual-FSV instrument, which must
-# rewrite an SST with correct record/body CRCs so the storage layer accepts the
-# bytes and the provenance verifier is the thing under test (issue #1874).
-crc32fast = "1"
-# Used only by the reconciled_recall_fsv manual-FSV instrument, which drives the
-# search engine's delta-reconciliation path directly so an empty result can be
-# attributed to a named stage of its own trace rather than inferred (issue #1907).
-calyx-search = { workspace = true }
-# Used only by host_math_baseline_fsv, which times the production CPU math
-# kernels so the host's instruction baseline is chosen from a measurement.
-calyx-forge = { workspace = true }
-calyx-sextant = { workspace = true }
-# Used only by ensemble_card_known_synergy_fsv, which reads the capability
-# card's own pair rows back to prove no reported gain is a silent clamp (#1942).
-calyx-assay = { workspace = true }
-# Used by the FSV instruments that must read the engine's own structured log as
-# evidence rather than inferring it from return values (#1936 row attribution).
-tracing-subscriber = { workspace = true }
-# Used only by loom_agreement_kernel_fsv, which measures the weave cosine
-# against the scalar loop it replaced so the persisted-value delta is a
-# measurement rather than an assertion (issue #1917).
-calyx-loom = { workspace = true }
 
 [lints]
 workspace = true

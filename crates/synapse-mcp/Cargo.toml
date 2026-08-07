@@ -8,6 +8,20 @@ repository.workspace = true
 # PolyForm-Noncommercial-1.0.0: never publishable to crates.io. Also what
 # makes this crate `private` for `cargo deny check licenses` (#1930).
 publish.workspace = true
+# The shipped binary list is CLOSED (#2045).
+#
+# Cargo auto-discovers `src/bin/*.rs` as bin targets, and the two `[[bin]]`
+# blocks below did not turn that off — declaring some targets explicitly does
+# not disable autodiscovery of the rest. That is how `reactive_scheduler_fsv`
+# and `reactive_region_fsv` came to be linked into every `cargo build --release
+# -p synapse-mcp`: they were dropped into `src/bin/` as manual instruments and
+# silently became shipping binaries, against directive D1's ban on FSV harness
+# binaries. Nobody added them to a manifest, so no manifest review could catch
+# them.
+#
+# With `autobins = false` a new file under `src/bin/` builds nothing until
+# someone writes a `[[bin]]` block for it here — which is a reviewable act.
+autobins = false
 
 [[bin]]
 name = "synapse-mcp"

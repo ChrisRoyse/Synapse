@@ -53,15 +53,16 @@ sha2.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+# Ordinary dependency reached only from this crate's examples/, which read the
+# daemon's own structured commit events rather than a side channel and so need a
+# subscriber to capture them. This was a `[dev-dependencies]` block until #2042;
+# operator directive D1 bans that section, and Cargo has no example-only
+# dependency table, so the honest declaration is this one. `src/` never imports
+# it, so it is not linked into the daemon, which installs its own subscriber.
+tracing-subscriber.workspace = true
 ulid.workspace = true
 uuid.workspace = true
 windows-sys.workspace = true
-
-[dev-dependencies]
-# Manual FSV harnesses (examples/) read the daemon's own structured commit
-# events rather than a side channel, so they need a subscriber to capture them.
-# Dev-only: the daemon installs its own.
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

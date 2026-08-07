@@ -25,6 +25,13 @@
   Gates, in order (cheapest first, so a config mistake is not paid for with a
   full compile):
 
+    0. D1 zero-test / zero-harness doctrine (#2037, #2042, #2045). A pure text
+       and manifest scan — no compilation, no execution, nothing behavioural.
+       Rejects `#[test]` / `#[tokio::test]` / `#[bench]` / `#[cfg(test)]`,
+       `[dev-dependencies]` / `[[test]]` / `[[bench]]` manifest sections, and
+       `*_fsv` binary targets, in both workspaces. Runs first because it is the
+       cheapest gate and because gate 6 (`clippy --all-targets`) would otherwise
+       spend a full compile building the very targets this one forbids.
     1. SHARED-LINT-CONTRACT agreement. `clippy.toml` is resolved per workspace,
        so a `disallowed-methods` rule at the root reaches no calyx crate. The
        rule is therefore duplicated into `calyx/clippy.toml`, and the two copies
@@ -94,6 +101,239 @@ function Add-Failure {
     }
     Write-Host "   FAIL $Code" -ForegroundColor Red
     Write-Host "        $Detail" -ForegroundColor Red
+}
+
+# ---------------------------------------------------------------------------
+# Gate 0 — D1 zero-test / zero-harness doctrine (#2037, #2042, #2045)
+# ---------------------------------------------------------------------------
+#
+# Numbered 0, not 8, on purpose: it is inserted BEFORE the seven existing gates
+# rather than appended after them, so the numbering of gates 1-7 (which the
+# pre-push hook, the docs and several issues name by number) does not shift.
+#
+# WHAT THIS IS
+#
+# Operator directive D1 (2026-07-15) deleted the entire automated test surface
+# of this repository: zero `#[test]`, zero `#[tokio::test]`, zero `#[cfg(test)]`
+# modules, zero `[dev-dependencies]`, zero benches, zero FSV harness binaries.
+# Verification is manual Full State Verification against a physical source of
+# truth.
+#
+# By 2026-08-06 that invariant was false again and nothing had noticed. Four
+# inline `#[cfg(test)] mod` blocks (#2037), two `[dev-dependencies]` sections
+# (#2042) and two auto-discovered `*_fsv` bin targets (#2045) had all come back
+# through ordinary feature commits. The invariant depended on memory, and memory
+# is not a gate.
+#
+# WHAT THIS IS NOT
+#
+# It is not a test harness, and it must never become one. It compiles nothing,
+# runs no binary, and asserts nothing about behaviour. It reads text and
+# manifests and reports what it finds — the same category of check as gate 1's
+# byte comparison of two clippy.toml blocks. A gate that enforces "no automated
+# tests" by running an automated test would be self-refuting.
+#
+# KNOWN LIMIT, stated so a green result is not over-read: the Rust scan strips
+# `//` line comments and `/* */` block comments before matching, so doctrine
+# prose that quotes `#[test]` does not trip it — and, symmetrically, an
+# attribute smuggled inside a string literal on a line that also opens a comment
+# would be missed. Attributes live on their own line in real code; this gate
+# catches the regression that actually happens, not an adversary.
+
+$D1RustRoots = @('crates', 'calyx')
+$D1PruneDirs = @('target', '.git', 'node_modules', '.cargo', 'vendor')
+
+function Get-D1Files {
+    param([string]$Root, [string[]]$Extensions, [string[]]$Names)
+
+    $found = [System.Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $Root)) { return $found }
+    $stack = [System.Collections.Generic.Stack[string]]::new()
+    $stack.Push((Resolve-Path -LiteralPath $Root).Path)
+    while ($stack.Count -gt 0) {
+        $dir = $stack.Pop()
+        foreach ($entry in [System.IO.Directory]::EnumerateDirectories($dir)) {
+            $leaf = Split-Path -Leaf $entry
+            if ($D1PruneDirs -contains $leaf) { continue }
+            $stack.Push($entry)
+        }
+        foreach ($entry in [System.IO.Directory]::EnumerateFiles($dir)) {
+            $leaf = Split-Path -Leaf $entry
+            if ($Names -and ($Names -contains $leaf)) { $found.Add($entry); continue }
+            if ($Extensions -and ($Extensions -contains [System.IO.Path]::GetExtension($leaf))) {
+                $found.Add($entry)
+            }
+        }
+    }
+    return $found
+}
+
+# Strips `//` line comments and `/* */` block comments from Rust source, keeping
+# the line count intact so reported line numbers stay true to the file.
+function Remove-RustComments {
+    param([string[]]$Lines)
+
+    $out = [string[]]::new($Lines.Count)
+    $inBlock = $false
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        $line = $Lines[$i]
+        $kept = ''
+        $j = 0
+        while ($j -lt $line.Length) {
+            if ($inBlock) {
+                $close = $line.IndexOf('*/', $j)
+                if ($close -lt 0) { $j = $line.Length; break }
+                $inBlock = $false
+                $j = $close + 2
+                continue
+            }
+            $open = $line.IndexOf('/*', $j)
+            $slash = $line.IndexOf('//', $j)
+            if ($slash -ge 0 -and ($open -lt 0 -or $slash -lt $open)) {
+                $kept += $line.Substring($j, $slash - $j)
+                $j = $line.Length
+                break
+            }
+            if ($open -ge 0) {
+                $kept += $line.Substring($j, $open - $j)
+                $inBlock = $true
+                $j = $open + 2
+                continue
+            }
+            $kept += $line.Substring($j)
+            break
+        }
+        $out[$i] = $kept
+    }
+    return $out
+}
+
+Write-Gate 'Gate 0     D1 zero-test / zero-harness doctrine (#2037, #2042, #2045)'
+try {
+    $RelativeTo = { param([string]$Path) $Path.Substring($RepoRoot.Length).TrimStart('\', '/') }
+
+    # --- 0a: Rust test attributes -------------------------------------------
+    # `#[test]`, `#[tokio::test]`, `#[bench]` and any `path::to::test`.
+    $attrRe = [regex]'^\s*#\[\s*(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(test|bench)\s*[\]\(]'
+    # `#[cfg(...)]` / `#[cfg_attr(...)]` whose predicate list contains a bare
+    # `test` token. Quoted strings are removed first so `feature = "test-only"`
+    # is not mistaken for the `test` cfg.
+    $cfgRe = [regex]'^\s*#\[\s*cfg(_attr)?\s*\('
+    $quoteRe = [regex]'"(?:[^"\\]|\\.)*"'
+    $bareTestRe = [regex]'(?<![A-Za-z0-9_])test(?![A-Za-z0-9_])'
+
+    $rustHits = [System.Collections.Generic.List[string]]::new()
+    $rustScanned = 0
+    foreach ($root in $D1RustRoots) {
+        foreach ($file in Get-D1Files -Root (Join-Path $RepoRoot $root) -Extensions @('.rs')) {
+            $rustScanned++
+            $raw = [IO.File]::ReadAllText($file)
+            if ($raw -notmatch '#\[') { continue }
+            $stripped = Remove-RustComments -Lines ($raw -split "\r?\n")
+            for ($i = 0; $i -lt $stripped.Count; $i++) {
+                $line = $stripped[$i]
+                if ($line -notmatch '#\[') { continue }
+                $what = $null
+                $m = $attrRe.Match($line)
+                if ($m.Success) {
+                    $what = "#[...$($m.Groups[1].Value)]"
+                }
+                elseif ($cfgRe.IsMatch($line) -and $bareTestRe.IsMatch($quoteRe.Replace($line, '""'))) {
+                    $what = '#[cfg(test)]'
+                }
+                if ($what) {
+                    $rustHits.Add("        $(& $RelativeTo $file):$($i + 1)  $what  ->  $($line.Trim())")
+                }
+            }
+        }
+    }
+    if ($rustHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_TEST_ATTRIBUTE_PRESENT' `
+        ("$($rustHits.Count) automated-test attribute(s) in tracked Rust source, which directive D1 deleted repo-wide on 2026-07-15 (#2037):" + [Environment]::NewLine + ($rustHits -join [Environment]::NewLine)) `
+            'delete the test module. If it was protecting a real invariant, express that invariant as ordinary fail-closed production code (a runtime check that logs a structured code, or a debug_assert) and verify it by manual FSV against a physical source of truth — never by re-adding a libtest target.'
+    }
+    else {
+        Write-Host "   OK   $rustScanned .rs files carry no #[test]/#[tokio::test]/#[bench]/#[cfg(test)]" -ForegroundColor Green
+    }
+
+    # --- 0b/0c: forbidden manifest sections and *_fsv bin targets -----------
+    $devDepRe = [regex]'^\s*\[\s*(?:[A-Za-z0-9_."''\-\*\(\)= ]*\.)?dev[-_]dependencies\s*\]'
+    $testTargetRe = [regex]'^\s*\[\[\s*(test|bench)\s*\]\]'
+    $binOpenRe = [regex]'^\s*\[\[\s*bin\s*\]\]'
+    $sectionRe = [regex]'^\s*\['
+    $nameRe = [regex]'^\s*(name|path)\s*=\s*"([^"]*)"'
+
+    $devDepHits = [System.Collections.Generic.List[string]]::new()
+    $testTargetHits = [System.Collections.Generic.List[string]]::new()
+    $fsvBinHits = [System.Collections.Generic.List[string]]::new()
+    $manifests = Get-D1Files -Root $RepoRoot -Names @('Cargo.toml')
+    foreach ($file in $manifests) {
+        $lines = [IO.File]::ReadAllLines($file)
+        $inBin = $false
+        $binStart = 0
+        $binFlagged = $false
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            $line = $lines[$i]
+            if ($devDepRe.IsMatch($line)) {
+                $devDepHits.Add("        $(& $RelativeTo $file):$($i + 1)  $($line.Trim())")
+            }
+            if ($testTargetRe.IsMatch($line)) {
+                $testTargetHits.Add("        $(& $RelativeTo $file):$($i + 1)  $($line.Trim())")
+            }
+            if ($binOpenRe.IsMatch($line)) {
+                $inBin = $true
+                $binStart = $i + 1
+                $binFlagged = $false
+                continue
+            }
+            if ($inBin -and $sectionRe.IsMatch($line)) { $inBin = $false }
+            # One row per [[bin]] block, not one per key: a target whose name and
+            # path both say fsv is one forbidden target, not two.
+            if ($inBin -and -not $binFlagged) {
+                $m = $nameRe.Match($line)
+                if ($m.Success -and $m.Groups[2].Value -match '(^|[/_\-])fsv([_\-.]|$)') {
+                    $binFlagged = $true
+                    $fsvBinHits.Add("        $(& $RelativeTo $file):$binStart  [[bin]] $($line.Trim())")
+                }
+            }
+        }
+    }
+
+    # Autodiscovered bins: a file under any `src/bin/` whose stem names fsv is a
+    # shipping binary even though no manifest mentions it. That is exactly how
+    # #2045 happened, so the file layout is checked, not only the manifests.
+    foreach ($root in $D1RustRoots) {
+        foreach ($file in Get-D1Files -Root (Join-Path $RepoRoot $root) -Extensions @('.rs')) {
+            if ($file -notmatch '[\\/]src[\\/]bin[\\/]') { continue }
+            $stem = [System.IO.Path]::GetFileNameWithoutExtension($file)
+            if ($stem -match '(^|[_\-])fsv([_\-]|$)') {
+                $fsvBinHits.Add("        $(& $RelativeTo $file)  (autodiscovered src/bin target)")
+            }
+        }
+    }
+
+    if ($devDepHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_DEV_DEPENDENCIES_PRESENT' `
+        ("$($devDepHits.Count) [dev-dependencies] section(s), which directive D1 bans outright (#2042):" + [Environment]::NewLine + ($devDepHits -join [Environment]::NewLine)) `
+            'a dev-only dependency surface is the manifest half of a test surface. Cargo has no example-only dependency table, so either declare the crate as an ordinary [dependencies] entry with a comment naming its example consumer, or delete the dependency together with the code that reached it.'
+    }
+    if ($testTargetHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_TEST_TARGET_SECTION_PRESENT' `
+        ("$($testTargetHits.Count) [[test]]/[[bench]] target section(s), which directive D1 deleted repo-wide:" + [Environment]::NewLine + ($testTargetHits -join [Environment]::NewLine)) `
+            'delete the section and the tests/ or benches/ directory it points at; measurement is manual FSV against a physical source of truth.'
+    }
+    if ($fsvBinHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_FSV_BIN_TARGET_PRESENT' `
+        ("$($fsvBinHits.Count) *_fsv binary target(s), which every release links (#2045):" + [Environment]::NewLine + ($fsvBinHits -join [Environment]::NewLine)) `
+            'delete the target and any support surface it exclusively reached. Set autobins = false in the owning [package] so a file dropped into src/ bin builds nothing until someone writes a reviewable [[bin]] block for it.'
+    }
+    if ($devDepHits.Count -eq 0 -and $testTargetHits.Count -eq 0 -and $fsvBinHits.Count -eq 0) {
+        Write-Host "   OK   $($manifests.Count) Cargo.toml files declare no [dev-dependencies], [[test]], [[bench]] or *_fsv bin" -ForegroundColor Green
+    }
+}
+catch {
+    Add-Failure 'SYNAPSE_LINT_D1_SWEEP_FAILED' $_.Exception.Message `
+        'the doctrine sweep itself failed; this gate fails closed rather than reporting an invariant it did not check'
 }
 
 # ---------------------------------------------------------------------------
