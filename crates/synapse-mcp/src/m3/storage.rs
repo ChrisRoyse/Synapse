@@ -1756,6 +1756,34 @@ pub enum StorageIntelligenceOperation {
 }
 
 impl StorageIntelligenceOperation {
+    /// Every sub-operation this facade can dispatch, in declaration order.
+    ///
+    /// This exists so the measurement-vs-control classification table in
+    /// `server::tool_profiles` can be proven complete at daemon construction
+    /// (#2077): a variant added here without a declared classification refuses
+    /// to start the daemon instead of silently inheriting a gate.
+    pub const ALL: [Self; 19] = [
+        Self::Weave,
+        Self::Abundance,
+        Self::Bits,
+        Self::Sufficiency,
+        Self::Redundancy,
+        Self::Synergy,
+        Self::Causality,
+        Self::Periodicity,
+        Self::Drift,
+        Self::Hazard,
+        Self::Kernel,
+        Self::KernelAnswer,
+        Self::OraclePredict,
+        Self::OracleReverse,
+        Self::OracleComplete,
+        Self::OracleValidate,
+        Self::OracleReadiness,
+        Self::OlapAggregate,
+        Self::EnsembleCard,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {

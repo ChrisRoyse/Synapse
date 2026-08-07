@@ -9,7 +9,7 @@ use crate::server::{ErrorData, Json, Parameters, SynapseService};
 use super::{
     STORAGE_SOT, STORAGE_TOOL,
     errors::{facade_conflict_error, facade_delegate_error, missing_spec},
-    policy::require_maintenance_profile,
+    policy::{require_maintenance_profile, require_storage_operation_authority},
     response::storage_response,
     types::{StorageOperation, StorageParams, StorageResponse},
     validation::validate_storage_params,
@@ -1121,15 +1121,24 @@ pub(super) async fn handle(
             crate::m3::storage::validate_intelligence_numeric_ranges(&spec)?;
             let sub_operation = spec.operation;
             let source_id = format!("panel_{}", spec.panel_version);
-            // The weave sub-operation persists derived XTerm/Graph rows, so it is
-            // maintenance-gated exactly like the other mutating storage ops;
-            // abundance is a read-only physical CF readback.
+            // #2077: a state-changing sub-operation clears the gate its declared
+            // class demands, never a gate inferred here. Control-class
+            // sub-operations (weave, kernel, oracle_complete) keep break_glass +
+            // the foreground input lease; measurement-class ones clear the
+            // measurement grant and are runnable unattended. An undeclared
+            // sub-operation resolves to control and fails closed. Read-only
+            // sub-operations (abundance, kernel_answer, olap_aggregate) reach no
+            // gate at all, exactly as before.
             if sub_operation.mutates_state() {
-                require_maintenance_profile(
+                let (class, rationale) =
+                    crate::server::tool_profiles::classify_intelligence_operation(sub_operation);
+                require_storage_operation_authority(
                     service,
                     &request_context,
                     STORAGE_TOOL,
                     sub_operation.as_str(),
+                    class,
+                    rationale,
                     &source_id,
                     STORAGE_SOT,
                 )?;

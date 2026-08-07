@@ -190,6 +190,25 @@ impl ImmutableToolSurface {
         if schema_parity.blocking_tool_count > 0 {
             anyhow::bail!("{}", schema_parity.startup_failure_message());
         }
+        // #2077: the same discipline for the measurement-vs-control gate. A
+        // sub-operation with no declared classification refuses to start the
+        // daemon rather than silently inheriting whichever gate it happened to
+        // land under.
+        validate_storage_operation_classification()?;
+        tracing::info!(
+            code = "MCP_STORAGE_OPERATION_CLASSIFICATION_VERIFIED",
+            source_of_truth = STORAGE_OPERATION_CLASS_SOURCE_OF_TRUTH,
+            classified_operation_count = INTELLIGENCE_OPERATION_CLASSES.len(),
+            measurement_operation_count = INTELLIGENCE_OPERATION_CLASSES
+                .iter()
+                .filter(|(_, class, _)| matches!(class, StorageOperationClass::Measurement))
+                .count(),
+            control_operation_count = INTELLIGENCE_OPERATION_CLASSES
+                .iter()
+                .filter(|(_, class, _)| matches!(class, StorageOperationClass::Control))
+                .count(),
+            "every storage intelligence sub-operation carries a declared measurement/control classification"
+        );
         tracing::info!(
             code = "MCP_FACADE_CONTRACT_SCHEMA_PARITY_VERIFIED",
             operation = FACADE_SCHEMA_PARITY_OPERATION,
@@ -2285,7 +2304,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "per-sub-operation physical CF readback: derived row counts after the pass, grounded flags, and the exact panel_version the report was computed for",
                 ),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "read-only sub-operations need only READ_STORAGE; the weave sub-operation persists derived rows, so switch to an explicit maintenance profile before running it",
+                "read-only sub-operations need only READ_STORAGE; measurement-class sub-operations (bits, sufficiency, redundancy, synergy, causality, periodicity, drift, hazard, ensemble_card, oracle_predict, oracle_reverse, oracle_validate, oracle_readiness) need READ_STORAGE+WRITE_STORAGE and run under any profile, unattended, with no foreground lease (#2077); control-class sub-operations (weave, kernel, oracle_complete) still require an explicit maintenance profile plus the foreground input lease -- see INTELLIGENCE_OPERATION_CLASSES for the declared classification of every sub-operation",
             ),
             op(
                 "backup",
@@ -3017,6 +3036,315 @@ impl ToolProfileKind {
             Self::BrowserDebugger => BROWSER_DEBUGGER_ALLOWED_EXACT.contains(&tool_name),
         }
     }
+}
+
+/// Whether a storage/hygiene operation is a **measurement** of the corpus or an
+/// act of **control** over it.
+///
+/// The declared tables below ([`INTELLIGENCE_OPERATION_CLASSES`] and
+/// [`HYGIENE_GUARD_CALIBRATE_PERSIST_CLASS`]) are the single source of truth for
+/// which gate an operation must clear. Nothing else may decide it, and an
+/// operation absent from its table resolves to [`StorageOperationClass::Control`]
+/// -- the strict gate -- so a newly added sub-operation fails closed until
+/// somebody classifies it deliberately. [`validate_storage_operation_classification`]
+/// additionally refuses to construct the service when a live sub-operation has no
+/// declared row, so a daemon that starts is a daemon whose every intelligence
+/// sub-operation was classified on purpose (#2077).
+///
+/// # The predicate
+///
+/// An operation is `Measurement` **iff all four** hold:
+///
+/// 1. it reads the corpus that already exists and derives a value from it;
+/// 2. everything it writes is a derived measurement / readiness / validation
+///    artifact attributed to that measurement -- recomputable from the corpus,
+///    additive, and never a replacement of a row a human or another subsystem
+///    owns;
+/// 3. it emits no synthetic input and moves no cursor, window, file, or process
+///    a human owns;
+/// 4. it publishes no live policy or admission surface that governs what future
+///    control decisions will accept.
+///
+/// Anything failing any clause is `Control`.
+///
+/// # Why the split exists
+///
+/// #1684's doctrine is "grounded + calibrated => may control". The operations
+/// that *establish* grounded and calibrated (`bits`, `sufficiency`,
+/// `ensemble_card`, `drift`, `oracle_validate`, `oracle_readiness`) were gated
+/// behind the maintenance profile, and the maintenance profile can only be
+/// entered while holding the foreground input lease -- that is, with a human
+/// present. `oracle_readiness=unmeasured` was therefore a *steady state*, not a
+/// transient: no scheduled or unattended agent could ever run the measurement
+/// that would arm autonomy, so the gate defeated the doctrine it was protecting
+/// (#2077; blocking #2017, #1682, #1690). The risk model that justifies
+/// foreground-gating a control action does not transfer to a measurement:
+/// computing mutual information over rows that already exist, scoring a held-out
+/// report, or re-measuring readiness moves nothing a human owns.
+///
+/// # The security argument, stated so it can be attacked
+///
+/// The worst a hostile *scheduled* agent can do with the measurement class that
+/// it could not already do holding `READ_STORAGE` alone is: **consume compute
+/// (bounded scans over the panel) and write derived measurement artifacts.**
+/// Both are bounded and audited -- every pass is capped by
+/// `MAX_INTELLIGENCE_RECORDS`, admitted through `require_m3_permissions`, logged
+/// with `MCP_STORAGE_MEASUREMENT_CLASS_ADMITTED` naming the session, profile,
+/// grant and sub-operation, and ledgered by Calyx as the artifact it writes. It
+/// cannot type, click, move a window, launch a process, rewrite or delete a Base
+/// row, retire or park a lens, rebuild or republish a search generation, run the
+/// collector, restore a backup, or erase anything: every one of those is
+/// `Control` below (or lives behind a different facade gate entirely) and still
+/// requires break_glass plus the foreground lease exactly as before.
+///
+/// What the split explicitly does **not** do: it does not lower a target FAR, a
+/// minimum-sample floor, an anchor-leakage refusal, a volume gate, or any other
+/// evidence requirement. A measurement admitted here refuses on insufficient
+/// evidence exactly as it does under break_glass. This changes WHO may run a
+/// measurement; it never changes WHAT the measurement accepts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageOperationClass {
+    /// Reads the corpus, writes only derived measurement artifacts. Runnable by
+    /// any profile -- including an unattended `normal_agent` scheduled session --
+    /// that holds the [`MEASURE_INTELLIGENCE_CAPABILITY`] grant. No break_glass,
+    /// no foreground input lease.
+    Measurement,
+    /// Changes state a human or another subsystem owns, or publishes a live
+    /// admission surface. Requires an explicit maintenance profile, which in turn
+    /// requires the foreground input lease, `confirm_break_glass=true`, and a
+    /// non-empty reason.
+    Control,
+}
+
+impl StorageOperationClass {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Measurement => "measurement",
+            Self::Control => "control",
+        }
+    }
+}
+
+/// The grant that authorizes the measurement class.
+///
+/// It is the existing `READ_STORAGE` + `WRITE_STORAGE` pair rather than a new
+/// permission name, and that choice is deliberate. M3 permissions are an
+/// operator-facing allowlist parsed once at startup from
+/// `SYNAPSE_MCP_ALLOWED_PERMISSIONS` / `--allowed-permissions`; the pair already
+/// states exactly the authority a measurement needs -- read the corpus, write
+/// derived rows -- and is what `required_permissions_intelligence` has always
+/// demanded of these very operations. Inventing a third name would not tighten
+/// anything (any host granting it would already be granting `WRITE_STORAGE`),
+/// but it would silently strand the readiness loop on every already-deployed
+/// host until its launch arguments were rewritten. The authority was never the
+/// broken half of this gate; "a human must be watching" was.
+pub(crate) const MEASURE_INTELLIGENCE_CAPABILITY: &str = "measure_intelligence";
+
+/// Human-readable form of [`measure_intelligence_grant`] for audit rows/errors.
+pub(crate) const MEASURE_INTELLIGENCE_GRANT_NAMES: &str = "READ_STORAGE+WRITE_STORAGE";
+
+/// The concrete permission set [`MEASURE_INTELLIGENCE_CAPABILITY`] resolves to.
+pub(crate) fn measure_intelligence_grant() -> crate::m3::permissions::RequiredPermissions {
+    crate::m3::permissions::required([
+        crate::m3::permissions::Permission::ReadStorage,
+        crate::m3::permissions::Permission::WriteStorage,
+    ])
+}
+
+/// The declared measurement-vs-control classification of every
+/// `storage operation=intelligence` sub-operation. See [`StorageOperationClass`]
+/// for the predicate each row was judged against; the third column is the
+/// judgement's stated reason and is carried into the admission audit row.
+///
+/// Read-only sub-operations (`abundance`, `kernel_answer`, `olap_aggregate`)
+/// never reached a profile gate at all -- `mutates_state()` is false for them --
+/// but they are classified here anyway so the table describes the whole surface
+/// rather than only the part that happens to be gated today.
+pub(crate) const INTELLIGENCE_OPERATION_CLASSES: &[(
+    crate::m3::storage::StorageIntelligenceOperation,
+    StorageOperationClass,
+    &str,
+)] = {
+    use crate::m3::storage::StorageIntelligenceOperation as Op;
+    use StorageOperationClass::{Control, Measurement};
+    &[
+        (
+            Op::Weave,
+            Control,
+            "materializes the XTerm/Graph substrate for a whole panel: every later measurement and guarded search reads it as ground truth, and a weave run over the wrong window/knn silently redefines that substrate for everyone. It is the substrate, not a measurement of it (predicate clause 4).",
+        ),
+        (
+            Op::Abundance,
+            Measurement,
+            "pure physical CF readback; writes nothing.",
+        ),
+        (
+            Op::Bits,
+            Measurement,
+            "reads the panel corpus, writes the derived Assay rows holding grounded bits per lens about one outcome anchor. Establishes 'grounded' (#1684).",
+        ),
+        (
+            Op::Sufficiency,
+            Measurement,
+            "reads the panel corpus, writes the derived panel/outcome-entropy Assay rows. Establishes 'grounded' (#1684).",
+        ),
+        (
+            Op::Redundancy,
+            Measurement,
+            "reads the panel corpus, writes derived Assay rows describing lens overlap.",
+        ),
+        (
+            Op::Synergy,
+            Measurement,
+            "reads the panel corpus, writes derived Assay/PairGain rows.",
+        ),
+        (
+            Op::Causality,
+            Measurement,
+            "reads the panel corpus, writes derived Graph/TemporalXTerm rows scoped to the measurement.",
+        ),
+        (
+            Op::Periodicity,
+            Measurement,
+            "reads the panel corpus, writes derived TemporalXTerm rows scoped to the measurement.",
+        ),
+        (
+            Op::Drift,
+            Measurement,
+            "reads the panel corpus, writes the derived CUSUM/MMD TemporalXTerm rows. Establishes whether a calibration still holds (#1684).",
+        ),
+        (
+            Op::Hazard,
+            Measurement,
+            "reads the panel corpus, writes derived TemporalXTerm hazard rows.",
+        ),
+        (
+            Op::Kernel,
+            Control,
+            "publishes the Kernel CF that `kernel_answer` serves: it replaces a live answering surface every later query treats as ground truth (predicate clause 4).",
+        ),
+        (
+            Op::KernelAnswer,
+            Measurement,
+            "read-only query against the persisted kernel; writes nothing.",
+        ),
+        (
+            Op::OraclePredict,
+            Measurement,
+            "honesty-gated read over persisted action evidence; returns a prediction report and mutates no Base row.",
+        ),
+        (
+            Op::OracleReverse,
+            Measurement,
+            "read-only reverse walk over persisted action evidence.",
+        ),
+        (
+            Op::OracleComplete,
+            Control,
+            "writes a completed action constellation into the action corpus -- it emits a proposed action rather than measuring existing ones (predicate clause 2).",
+        ),
+        (
+            Op::OracleValidate,
+            Measurement,
+            "scores held-out chronological evidence and persists the validation-evidence artifact. Establishes 'calibrated' (#1684); the FAR/minimum gates it applies are untouched by this classification.",
+        ),
+        (
+            Op::OracleReadiness,
+            Measurement,
+            "re-measures the six-tier action-domain readiness predicate and persists the readiness snapshot. This is the operation #2017 could not run unattended, and the reason `oracle_readiness=unmeasured` was a steady state.",
+        ),
+        (
+            Op::OlapAggregate,
+            Measurement,
+            "read-only aggregation; writes nothing.",
+        ),
+        (
+            Op::EnsembleCard,
+            Measurement,
+            "reads the panel corpus, writes the derived capability-card Assay row (per-lens marginal value, PID triple, A37 gate verdict). Establishes 'calibrated' (#1684).",
+        ),
+    ]
+};
+
+/// `hygiene operation=guard_calibrate` with `persist=true`, classified against
+/// the same predicate and deliberately left in the control class.
+///
+/// A persisted Ward profile is a tau threshold: from the moment it is written,
+/// every profile-backed guarded search admits or refuses according to it. That is
+/// a live admission surface governing future control decisions (predicate clause
+/// 4), not an artifact describing the corpus -- so it keeps break_glass plus the
+/// foreground lease. `persist=false` writes nothing and is not gated at all.
+/// Revisit this row if #1684's "calibrated" tier is ever required to be
+/// re-established unattended; it is the one row in these tables where the
+/// measurement and control readings genuinely compete.
+pub(crate) const HYGIENE_GUARD_CALIBRATE_PERSIST_CLASS: (StorageOperationClass, &str) = (
+    StorageOperationClass::Control,
+    "a persisted Ward guard profile is the live admission threshold every later guarded search obeys",
+);
+
+/// Resolves the declared class for one intelligence sub-operation.
+///
+/// Fails closed: an operation with no declared row is treated as
+/// [`StorageOperationClass::Control`] and logged, so the strict gate applies
+/// even in a build where [`validate_storage_operation_classification`] was
+/// somehow bypassed.
+pub(crate) fn classify_intelligence_operation(
+    operation: crate::m3::storage::StorageIntelligenceOperation,
+) -> (StorageOperationClass, &'static str) {
+    match INTELLIGENCE_OPERATION_CLASSES
+        .iter()
+        .find(|(declared, _, _)| *declared == operation)
+    {
+        Some((_, class, rationale)) => (*class, rationale),
+        None => {
+            tracing::warn!(
+                code = "MCP_STORAGE_OPERATION_UNCLASSIFIED",
+                operation = operation.as_str(),
+                source_of_truth = STORAGE_OPERATION_CLASS_SOURCE_OF_TRUTH,
+                "storage intelligence sub-operation has no declared measurement/control row; failing closed to the strict maintenance gate"
+            );
+            (
+                StorageOperationClass::Control,
+                "undeclared sub-operation: fail closed to the strict maintenance gate",
+            )
+        }
+    }
+}
+
+pub(crate) const STORAGE_OPERATION_CLASS_SOURCE_OF_TRUTH: &str =
+    "crates/synapse-mcp/src/server/tool_profiles.rs INTELLIGENCE_OPERATION_CLASSES";
+
+/// Refuses service construction when the declared classification table does not
+/// cover every live intelligence sub-operation exactly once.
+///
+/// There is no CI, so this is the enforcement surface: adding a sub-operation
+/// without classifying it stops the daemon at startup with the exact missing
+/// name, rather than letting it inherit a gate nobody chose.
+fn validate_storage_operation_classification() -> anyhow::Result<()> {
+    for operation in crate::m3::storage::StorageIntelligenceOperation::ALL {
+        let declared = INTELLIGENCE_OPERATION_CLASSES
+            .iter()
+            .filter(|(candidate, _, _)| *candidate == operation)
+            .count();
+        if declared != 1 {
+            anyhow::bail!(
+                "MCP_STORAGE_OPERATION_CLASSIFICATION_INVALID: sub-operation {} has {declared} declared measurement/control rows (expected exactly 1) in {}; classify it deliberately as measurement or control before the daemon may start",
+                operation.as_str(),
+                STORAGE_OPERATION_CLASS_SOURCE_OF_TRUTH
+            );
+        }
+    }
+    if INTELLIGENCE_OPERATION_CLASSES.len()
+        != crate::m3::storage::StorageIntelligenceOperation::ALL.len()
+    {
+        anyhow::bail!(
+            "MCP_STORAGE_OPERATION_CLASSIFICATION_INVALID: {} declares {} rows for {} live sub-operations; delete the rows that name no live sub-operation",
+            STORAGE_OPERATION_CLASS_SOURCE_OF_TRUTH,
+            INTELLIGENCE_OPERATION_CLASSES.len(),
+            crate::m3::storage::StorageIntelligenceOperation::ALL.len()
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize)]

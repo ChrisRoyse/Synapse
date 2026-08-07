@@ -175,7 +175,7 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
 use super::{
     HYGIENE_SOT, HYGIENE_TOOL,
     errors::{facade_delegate_error, missing_spec},
-    policy::require_maintenance_profile,
+    policy::{require_maintenance_profile, require_storage_operation_authority},
     response::hygiene_response,
     types::{HygieneOperation, HygieneParams, HygieneResponse},
     validation::validate_hygiene_params,
@@ -966,13 +966,21 @@ pub(super) async fn handle(
                 .guard_calibrate
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "guard_calibrate"))?;
             if spec.persist.unwrap_or(true) {
-                // A persisted profile changes what every profile-backed guarded
-                // search will admit from then on: maintenance-gated.
-                require_maintenance_profile(
+                // #2077: classified deliberately as control, not measurement. A
+                // persisted profile changes what every profile-backed guarded
+                // search will admit from then on -- a live admission surface, not
+                // an artifact describing the corpus -- so it keeps break_glass
+                // plus the foreground input lease. See
+                // tool_profiles::HYGIENE_GUARD_CALIBRATE_PERSIST_CLASS.
+                let (class, rationale) =
+                    crate::server::tool_profiles::HYGIENE_GUARD_CALIBRATE_PERSIST_CLASS;
+                require_storage_operation_authority(
                     service,
                     &request_context,
                     HYGIENE_TOOL,
                     operation.as_str(),
+                    class,
+                    rationale,
                     &format!("panel_{}", spec.panel_version),
                     HYGIENE_SOT,
                 )?;
