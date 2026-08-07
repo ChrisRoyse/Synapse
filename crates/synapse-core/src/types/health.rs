@@ -228,6 +228,18 @@ pub struct SubsystemHealth {
     pub storage_gc_last_successful_after_value_sum: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage_gc_last_unsupported_policy_skips: Vec<String>,
+    /// The one pinned committed MVCC sequence the last successful GC pass took
+    /// its derived-source protection set from (#2058). Its presence is what
+    /// distinguishes a GC pass that actually adjudicated deletions from one
+    /// that was skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_pinned_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_pages: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_base_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_referenced_rows: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_checkpoint_last_started_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -45,7 +45,7 @@ pub use error::{
     STORAGE_REVISION_GUARD_INVALID, STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
     STORAGE_REVISION_GUARDED_OUTCOME_INVALID, StorageError, StorageResult,
 };
-pub use gc::{GcCfReport, GcReport, GcTask, GcTaskReadback};
+pub use gc::{DerivedSourceCensus, GcCfReport, GcReport, GcTask, GcTaskReadback};
 pub use pressure::{DiskPressureLevel, PressureProbeReadback, PressureReport, PressureTask};
 pub use synapse_calyx::timeseries::{SynapseCalyxRollupValue, SynapseCalyxRollupWindow};
 

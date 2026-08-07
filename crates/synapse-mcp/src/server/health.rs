@@ -509,6 +509,15 @@ fn apply_storage_maintenance_fields(
         readback.gc_task.last_successful_after_value_sum;
     health.storage_gc_last_unsupported_policy_skips =
         readback.gc_task.last_unsupported_policy_skips.clone();
+    health.storage_gc_last_successful_source_census_pinned_seq =
+        readback.gc_task.last_successful_source_census_pinned_seq;
+    health.storage_gc_last_successful_source_census_pages =
+        readback.gc_task.last_successful_source_census_pages;
+    health.storage_gc_last_successful_source_census_base_rows =
+        readback.gc_task.last_successful_source_census_base_rows;
+    health.storage_gc_last_successful_source_census_referenced_rows = readback
+        .gc_task
+        .last_successful_source_census_referenced_rows;
     health.storage_checkpoint_last_started_unix_ms = readback.checkpoint_task.last_started_unix_ms;
     health.storage_checkpoint_last_completed_unix_ms =
         readback.checkpoint_task.last_completed_unix_ms;

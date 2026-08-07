@@ -17,6 +17,34 @@ const GC_TERMINAL_ERROR: &str = "terminal_non_retryable";
 #[derive(Debug, Default)]
 pub struct GcReport {
     pub cf_reports: Vec<GcCfReport>,
+    /// The one pinned MVCC instant this pass decided deletions from (#2058).
+    ///
+    /// `None` for maintenance passes that take no deletion decision at all
+    /// (checkpoint, derived state), which is why it is an `Option` rather than a
+    /// zeroed struct: a reported `pinned_seq` of 0 would be indistinguishable
+    /// from a real census that failed to record one.
+    pub source_census: Option<DerivedSourceCensus>,
+}
+
+/// What the #1882 GC protection set was derived from (#2058).
+///
+/// GC's authority to delete a source row is exactly "no live derived
+/// constellation points at it", and that claim is only true relative to some
+/// instant. This records which instant, so a health reader can tell a completed
+/// census from a skipped one without inferring it from the absence of an error.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DerivedSourceCensus {
+    /// The committed sequence the census pinned for its whole walk.
+    pub pinned_seq: u64,
+    /// Bounded pages read at that sequence.
+    pub pages: u64,
+    /// `Base` rows handed to the fold.
+    pub base_rows_visited: u64,
+    /// Source column families with at least one protected row.
+    pub referenced_column_families: u64,
+    /// Source rows protected from eviction because a live derived
+    /// constellation still points at them.
+    pub referenced_rows: u64,
 }
 
 impl GcReport {
@@ -71,6 +99,15 @@ pub struct GcTaskReadback {
     pub last_successful_total_evicted_rows: Option<u64>,
     pub last_successful_after_value_sum: Option<u64>,
     pub last_unsupported_policy_skips: Vec<String>,
+    /// The single pinned committed sequence the last successful pass took its
+    /// #1882 protection set from (#2058).
+    pub last_successful_source_census_pinned_seq: Option<u64>,
+    /// Bounded pages that census read at that one sequence.
+    pub last_successful_source_census_pages: Option<u64>,
+    /// `Base` rows that census folded at that one sequence.
+    pub last_successful_source_census_base_rows: Option<u64>,
+    /// Source rows that census protected from eviction.
+    pub last_successful_source_census_referenced_rows: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -377,6 +414,16 @@ fn mark_gc_tick_completed(
                     .map(|cf| cf.after_value)
                     .fold(0_u64, u64::saturating_add),
             );
+            // Left untouched when this pass carried no census, so the last real
+            // census a GC pass ran is still readable after a checkpoint or
+            // derived-state tick reports through the same readback (#2058).
+            if let Some(census) = report.source_census {
+                readback.last_successful_source_census_pinned_seq = Some(census.pinned_seq);
+                readback.last_successful_source_census_pages = Some(census.pages);
+                readback.last_successful_source_census_base_rows = Some(census.base_rows_visited);
+                readback.last_successful_source_census_referenced_rows =
+                    Some(census.referenced_rows);
+            }
         }
         readback.last_unsupported_policy_skips = result
             .as_ref()

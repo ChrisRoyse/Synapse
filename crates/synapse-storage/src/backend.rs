@@ -11221,94 +11221,354 @@ fn calyx_gc_budget(
 ///
 /// Built once per GC tick and shared across every CF budget, so the Base scan
 /// is paid once rather than per column family.
-/// Attempts before a GC tick gives up on getting an atomic view of `Base`.
 ///
-/// The walk is bounded per page, so a commit landing mid-walk is a lost race
-/// rather than a failure of the vault, and re-running it costs ~78 ms. Three
-/// attempts, then a structured refusal — never a partial reference set, because
-/// a source row missing from that set is one GC is free to delete forever.
-const DERIVED_SOURCE_SCAN_ATTEMPTS: usize = 3;
-
 /// Source column family -> the source row keys a live derived constellation
 /// still points at. The GC tick's protection set (#1882).
 type DerivedSourceReferences = BTreeMap<String, BTreeSet<Vec<u8>>>;
 
-fn collect_derived_source_references(
-    vault: &SynapseCalyxVault,
-) -> StorageResult<DerivedSourceReferences> {
-    // The last walk's own report is what the refusal below quotes, so it is
-    // seeded from a real first attempt rather than kept as an `Option` the
-    // compiler cannot prove was filled.
-    let (referenced, mut walk) = collect_derived_source_references_once(vault)?;
-    if walk.atomic() {
-        return Ok(referenced);
-    }
-    for attempt in 1..DERIVED_SOURCE_SCAN_ATTEMPTS {
-        tracing::warn!(
-            code = "SYNAPSE_CALYX_GC_SOURCE_SCAN_RACED",
-            attempt,
-            attempts = DERIVED_SOURCE_SCAN_ATTEMPTS,
-            snapshot_seq_first = walk.snapshot_seq_first,
-            snapshot_seq_last = walk.snapshot_seq_last,
-            pages = walk.pages,
-            rows_visited = walk.rows_visited,
-            "a commit landed while indexing derived source references; retrying rather than \
-             deciding deletions from a moving window"
-        );
-        let (referenced, next) = collect_derived_source_references_once(vault)?;
-        if next.atomic() {
-            return Ok(referenced);
-        }
-        walk = next;
-    }
-    Err(calyx_write_failed_detail(
-        CALYX_GC_CF,
-        format!(
-            "could not index derived source references from one atomic view of Base in \
-             {DERIVED_SOURCE_SCAN_ATTEMPTS} attempts: the last walk opened at committed sequence \
-             {} and closed at {} over {} page(s). GC is skipped this tick rather than run against \
-             a partial reference set — a source row missing from that set is one GC would delete, \
-             and its bytes are content-addressed by the constellation that pointed at it, so they \
-             exist nowhere else (#1882). It will run on the next tick.",
-            walk.snapshot_seq_first, walk.snapshot_seq_last, walk.pages
-        ),
-    ))
+/// Lease lifetime for the pinned `Base` census snapshot (#2058).
+///
+/// Deliberately [`crate::COHERENT_SCAN_MAX_AGE_MS`] — the crate's already
+/// declared ceiling for how long any storage reader may hold one pinned Calyx
+/// MVCC view — rather than a second, independently guessed number. This is a
+/// **liveness bound on the pin, not a timeout on the walk**: the walk still
+/// runs at whatever speed the corpus dictates (13.5 s over 3,671 pages on the
+/// live vault), and the lease only decides how long the vault's snapshot GC is
+/// obliged to keep the pinned versions reclaimable-but-retained before the
+/// watchdog aborts the reader. A census that somehow ran past it fails loud on
+/// its next page read (`ensure_snapshot_live`) instead of silently reading a
+/// view whose versions have started being reclaimed.
+const CALYX_GC_SOURCE_CENSUS_LEASE_MS: u64 = crate::COHERENT_SCAN_MAX_AGE_MS;
+
+/// A reader lease held for exactly as long as one bounded multi-page read, and
+/// released on **every** exit path including an unwind (#2058).
+///
+/// `SynapseCalyxVault::pin_reader` registers the lease in the vault's
+/// oldest-pinned-seq accounting, which is what makes snapshot version GC keep
+/// the pinned view alive — and equally what makes a leaked lease pin the vault's
+/// GC safe point forever. `Drop` is therefore where the release lives, mirroring
+/// calyx-aster's own `ScopedSnapshot` idiom rather than trusting every `?` in
+/// the walk to route through an explicit release.
+struct CalyxPinnedReader<'vault> {
+    vault: &'vault SynapseCalyxVault,
+    snapshot: calyx_aster::mvcc::Snapshot,
+    cf_name: &'static str,
+    site: &'static str,
 }
 
-/// One bounded pass over `Base`, with the atomicity flag the caller adjudicates.
+impl<'vault> CalyxPinnedReader<'vault> {
+    /// Pins the current committed sequence for the whole read.
+    ///
+    /// Pins **now**, at latest, rather than re-pinning a sequence observed
+    /// earlier: a sequence already in the past may have had versions reclaimed
+    /// before the pin registered, and pinning it then would silently describe a
+    /// view the store no longer holds in full.
+    fn pin(
+        vault: &'vault SynapseCalyxVault,
+        cf_name: &'static str,
+        site: &'static str,
+        max_age_ms: u64,
+    ) -> StorageResult<Self> {
+        let snapshot = vault
+            .pin_reader(Freshness::FreshDerived, max_age_ms)
+            .map_err(|source| {
+                calyx_write_failed(
+                    cf_name,
+                    "pin one committed Calyx MVCC sequence for a bounded census",
+                    &source,
+                )
+            })?;
+        tracing::debug!(
+            code = "STORAGE_CALYX_CENSUS_PINNED",
+            site,
+            cf = cf_name,
+            lease_id = snapshot.lease().id(),
+            pinned_seq = snapshot.seq(),
+            issued_at_unix_ms = snapshot.lease().issued_at(),
+            expires_at_unix_ms = snapshot.lease().expires_at(),
+            "pinned one committed Calyx sequence for a bounded census"
+        );
+        Ok(Self {
+            vault,
+            snapshot,
+            cf_name,
+            site,
+        })
+    }
+
+    const fn snapshot(&self) -> calyx_aster::mvcc::Snapshot {
+        self.snapshot
+    }
+
+    fn pinned_seq(&self) -> u64 {
+        self.snapshot.seq()
+    }
+}
+
+impl Drop for CalyxPinnedReader<'_> {
+    fn drop(&mut self) {
+        let lease_id = self.snapshot.lease().id();
+        if self.vault.release_reader(lease_id) {
+            tracing::debug!(
+                code = "STORAGE_CALYX_CENSUS_UNPINNED",
+                site = self.site,
+                cf = self.cf_name,
+                lease_id,
+                pinned_seq = self.snapshot.seq(),
+                "released the pinned Calyx census sequence"
+            );
+            return;
+        }
+        // The lease was already gone: the watchdog aborted it for exceeding
+        // `max_age_ms`. Every page read after that point failed closed, so this
+        // cannot have produced a wrong census — but it is the exact evidence a
+        // slow census leaves behind, so it is recorded rather than swallowed.
+        tracing::warn!(
+            code = "STORAGE_CALYX_CENSUS_LEASE_EXPIRED",
+            site = self.site,
+            cf = self.cf_name,
+            lease_id,
+            pinned_seq = self.snapshot.seq(),
+            "pinned Calyx census lease was no longer registered at release; the reader watchdog \
+             had already aborted it for exceeding its bounded lifetime"
+        );
+    }
+}
+
+/// What one pinned-sequence walk observed. Provenance of the census, reported
+/// rather than assumed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CalyxPinnedCfWalk {
+    pinned_seq: u64,
+    pages: usize,
+    rows_examined: usize,
+    rows_visited: usize,
+}
+
+/// Folds one whole column family page by page **at one pinned MVCC sequence**,
+/// releasing the row-table read guard between pages (#2058).
 ///
-/// Paged rather than materialized (#1977). `scan_cf_at` folded the whole family
-/// — 112,674 rows on the live vault — under a single hold of the vault-wide
-/// row-table read guard that every constellation writer must acquire (#1950),
-/// measured at 164 ms against a 25 ms budget with every hold over budget. This
-/// runs once per GC tick, and it was the caller actually producing those holds:
-/// #1977 enumerated calyx-aster's own GC and retention passes and did not reach
-/// this one, in a different crate.
+/// This is the difference between a census and a race. `walk_cf_latest` opens a
+/// *new latest* view per page, so its output only describes one instant when no
+/// commit lands during the entire scan — on the live vault that is 3,671 pages
+/// and 13.5 s of continuous-write exposure, and
+/// `SynapseCalyxCfWalk::atomic()` was false on every attempt. Pinning instead
+/// makes every page read the same sequence by construction: the lease enters
+/// the vault's oldest-pinned-seq accounting, snapshot version GC clamps its
+/// safe point to it, and `reclaim_chain` retains each key's boundary version at
+/// or below that safe point — so no compaction can retire a version this walk
+/// still needs, no matter how long it runs or how many commits land.
 ///
-/// The window also *narrows*: the bounded walk completes in ~78 ms against the
-/// whole-family scan's ~164 ms, so there is strictly less time in which a
-/// derivation can land unseen.
-fn collect_derived_source_references_once(
+/// The guard discipline of #2041 is unchanged and deliberately so: one page,
+/// one bounded acquisition of the vault-wide row-table read guard every
+/// constellation writer needs, never one hold across the corpus.
+///
+/// # Errors
+///
+/// Fails closed — never partially — when the pin cannot serve a page (an
+/// expired lease, a blocked row, an unreadable serving view), when a page
+/// resolves a sequence other than the pinned one, when a page reports more rows
+/// without a resume cursor, or when a cursor fails to advance. The visitor's own
+/// error is propagated verbatim.
+fn walk_cf_pages_pinned<V>(
+    reader: &CalyxPinnedReader<'_>,
+    cf: ColumnFamily,
+    mut visit: V,
+) -> StorageResult<CalyxPinnedCfWalk>
+where
+    V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
+{
+    let started = Instant::now();
+    let range = KeyRange::all();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut walk = CalyxPinnedCfWalk {
+        pinned_seq: reader.pinned_seq(),
+        ..CalyxPinnedCfWalk::default()
+    };
+    loop {
+        let page = reader
+            .vault
+            .scan_cf_range_page_snapshot(
+                reader.snapshot(),
+                cf,
+                &range,
+                cursor.as_deref(),
+                CALYX_INSPECT_SWEEP_PAGE_ROWS,
+            )
+            .map_err(|source| {
+                calyx_write_failed(
+                    reader.cf_name,
+                    &format!(
+                        "read page {} of the {} {} census at pinned committed sequence {} \
+                         ({} row(s) visited over {} ms so far)",
+                        walk.pages.saturating_add(1),
+                        cf.name(),
+                        reader.site,
+                        walk.pinned_seq,
+                        walk.rows_visited,
+                        started.elapsed().as_millis()
+                    ),
+                    &source,
+                )
+            })?;
+        if page.snapshot_seq != walk.pinned_seq {
+            return Err(calyx_write_failed_detail(
+                reader.cf_name,
+                format!(
+                    "CALYX_PINNED_CENSUS_SEQUENCE_DRIFTED: page {} of the {} {} census was served \
+                     at committed sequence {} but the census pinned {}; a pinned walk that \
+                     silently changes sequence is a census over an interval, which is exactly the \
+                     moving window this pin exists to remove; remediation=repair the pinned pager \
+                     so every page is served at the sequence its lease pinned",
+                    walk.pages.saturating_add(1),
+                    cf.name(),
+                    reader.site,
+                    page.snapshot_seq,
+                    walk.pinned_seq
+                ),
+            ));
+        }
+        walk.pages = walk.pages.saturating_add(1);
+        walk.rows_examined = walk.rows_examined.saturating_add(page.examined_rows);
+        for (key, value) in &page.rows {
+            walk.rows_visited = walk.rows_visited.saturating_add(1);
+            visit(key, value)?;
+        }
+        if !page.more {
+            break;
+        }
+        // `more` without a cursor, or a cursor that does not advance, would
+        // re-read the same page forever. Both are impossible against the
+        // documented pager contract, which is exactly why they are worth
+        // failing closed on: an unbounded silent loop inside a GC census is a
+        // worse outcome than an error.
+        let Some(resume) = page.resume_after else {
+            return Err(calyx_write_failed_detail(
+                reader.cf_name,
+                format!(
+                    "CALYX_PINNED_CENSUS_CURSOR_MISSING: page {} of the {} {} census reported more \
+                     rows but returned no resume cursor, so the census cannot advance; \
+                     remediation=repair the range pager so a page reporting `more` always carries \
+                     `resume_after`",
+                    walk.pages,
+                    cf.name(),
+                    reader.site
+                ),
+            ));
+        };
+        if cursor
+            .as_deref()
+            .is_some_and(|previous| resume.as_slice() <= previous)
+        {
+            return Err(calyx_write_failed_detail(
+                reader.cf_name,
+                format!(
+                    "CALYX_PINNED_CENSUS_CURSOR_STALLED: page {} of the {} {} census returned a \
+                     resume cursor that does not advance past the previous one, so the census \
+                     would re-read the same page forever; remediation=repair the range pager so \
+                     `resume_after` is strictly greater than the exclusive `after_key` it was \
+                     given",
+                    walk.pages,
+                    cf.name(),
+                    reader.site
+                ),
+            ));
+        }
+        cursor = Some(resume);
+    }
+    tracing::debug!(
+        code = "STORAGE_CALYX_PINNED_CENSUS_WALK",
+        site = reader.site,
+        cf = cf.name(),
+        pinned_seq = walk.pinned_seq,
+        pages = walk.pages,
+        page_rows = CALYX_INSPECT_SWEEP_PAGE_ROWS,
+        rows_visited = walk.rows_visited,
+        rows_examined = walk.rows_examined,
+        elapsed_ms = started.elapsed().as_millis(),
+        "folded a column family page by page at one pinned committed sequence, releasing the \
+         row-table read guard between pages"
+    );
+    Ok(walk)
+}
+
+/// Indexes every live derived constellation's source reference from **one**
+/// pinned committed sequence (#2058, protecting #1882).
+///
+/// The previous shape asked the vault for quiescence: walk `Base` at latest,
+/// require the first and last page to report the same sequence, retry three
+/// times, and refuse the whole GC tick otherwise. On a vault taking continuous
+/// MCP writes that is not a convergence strategy — it needs 13.5 s of *zero*
+/// commits, three times running — and the live daemon's GC therefore never ran
+/// and its storage health sat permanently at `error`.
+///
+/// Pinning replaces the requirement with a guarantee. The lease fixes the
+/// vault's snapshot-GC safe point at the pinned sequence, so every page reads
+/// exactly the view that existed at that instant regardless of what commits
+/// while the walk runs, and writers are never blocked: they allocate later
+/// sequences that this census simply cannot see. There is nothing left to
+/// retry, so there is no retry.
+///
+/// **What the pinned instant does and does not promise.** The protection set is
+/// exact as of the pinned sequence. A derivation that commits *after* the pin
+/// names a source row that already existed at the pin (its `CxId` is
+/// content-addressed over that row's bytes), and cap eviction drains
+/// oldest-written first, so the row a derivation just measured is the last row
+/// in its family eligible for eviction. The same window existed before this
+/// change — a census, however atomic, is always taken before the deletions it
+/// authorises — and it is bounded here by one GC interval.
+fn collect_derived_source_references(
     vault: &SynapseCalyxVault,
-) -> StorageResult<(DerivedSourceReferences, synapse_calyx::SynapseCalyxCfWalk)> {
+) -> StorageResult<(DerivedSourceReferences, gc::DerivedSourceCensus)> {
+    let reader = CalyxPinnedReader::pin(
+        vault,
+        CALYX_GC_CF,
+        "derived_source_references",
+        CALYX_GC_SOURCE_CENSUS_LEASE_MS,
+    )?;
     let mut referenced = DerivedSourceReferences::new();
-    let walk = vault
-        .walk_cf_latest(
-            ColumnFamily::Base,
-            synapse_calyx::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-            |_key, value| {
-                collect_derived_source_reference(value, &mut referenced)
-                    .map(|()| synapse_calyx::SynapseCalyxWalkStep::Continue)
-            },
-        )
-        .map_err(|source| {
+    let walk = walk_cf_pages_pinned(&reader, ColumnFamily::Base, |_key, value| {
+        collect_derived_source_reference(value, &mut referenced).map_err(|source| {
             calyx_write_failed(
                 CALYX_GC_CF,
-                "scan Base CF for derived source references",
+                "index one Base row's derived source reference",
                 &source,
             )
-        })?;
-    Ok((referenced, walk))
+        })
+    })?;
+    let mut referenced_rows = 0_u64;
+    for keys in referenced.values() {
+        referenced_rows = referenced_rows.saturating_add(calyx_len_to_u64(
+            CALYX_GC_CF,
+            "Calyx GC protected source rows",
+            keys.len(),
+        )?);
+    }
+    let census = gc::DerivedSourceCensus {
+        pinned_seq: walk.pinned_seq,
+        pages: calyx_len_to_u64(CALYX_GC_CF, "Calyx GC census pages", walk.pages)?,
+        base_rows_visited: calyx_len_to_u64(
+            CALYX_GC_CF,
+            "Calyx GC census Base rows",
+            walk.rows_visited,
+        )?,
+        referenced_column_families: calyx_len_to_u64(
+            CALYX_GC_CF,
+            "Calyx GC census source column families",
+            referenced.len(),
+        )?,
+        referenced_rows,
+    };
+    tracing::info!(
+        code = "STORAGE_CALYX_GC_SOURCE_CENSUS_COMPLETED",
+        pinned_seq = census.pinned_seq,
+        pages = census.pages,
+        base_rows_visited = census.base_rows_visited,
+        referenced_column_families = census.referenced_column_families,
+        referenced_rows = census.referenced_rows,
+        "indexed every derived constellation's source reference from one pinned committed sequence"
+    );
+    Ok((referenced, census))
 }
 
 /// Indexes one `Base` row's source reference, if it names one.
@@ -11385,7 +11645,7 @@ fn run_calyx_gc_budgets(
     budgets: &[CalyxGcBudget],
 ) -> StorageResult<gc::GcReport> {
     let now_ms = calyx_clock_now_for_write(vault, CALYX_GC_CF)?;
-    let referenced = collect_derived_source_references(vault)?;
+    let (referenced, source_census) = collect_derived_source_references(vault)?;
     let mut cf_reports = Vec::with_capacity(budgets.len());
     let mut tombstones = Vec::new();
     for budget in budgets {
@@ -11489,7 +11749,10 @@ fn run_calyx_gc_budgets(
         "Calyx storage GC completed bounded durable WAL recycling"
     );
 
-    Ok(gc::GcReport { cf_reports })
+    Ok(gc::GcReport {
+        cf_reports,
+        source_census: Some(source_census),
+    })
 }
 
 fn run_calyx_gc_budget(

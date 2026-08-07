@@ -1031,10 +1031,27 @@ pub struct StorageGcOnceResponse {
     pub total_evicted_rows: u64,
     pub cache_evictions_total_delta: u64,
     pub cf_reports: Vec<StorageGcCfReport>,
+    /// The one pinned MVCC instant this pass adjudicated deletions from
+    /// (#2058). Absent for the audit-retention mode, which runs no
+    /// derived-source census.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_census: Option<StorageGcSourceCensus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_report_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention: Option<AuditRetentionReport>,
+}
+
+/// The pinned instant the #1882 protection set came from, reported so an
+/// operator can prove one census covered one sequence (#2058).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageGcSourceCensus {
+    pub pinned_seq: u64,
+    pub pages: u64,
+    pub base_rows_visited: u64,
+    pub referenced_column_families: u64,
+    pub referenced_rows: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
@@ -4711,6 +4728,7 @@ pub fn run_storage_gc_once(
             total_evicted_rows: result.readback_report.total_deleted_rows,
             cache_evictions_total_delta: result.readback_report.total_deleted_rows,
             cf_reports: Vec::new(),
+            source_census: None,
             audit_retention_report_key: Some(result.report_key),
             audit_retention: Some(result.readback_report),
         });
@@ -5445,12 +5463,20 @@ fn gc_response(
     report: GcReport,
 ) -> StorageGcOnceResponse {
     let total_evicted_rows = report.total_evicted_rows();
+    let source_census = report.source_census.map(|census| StorageGcSourceCensus {
+        pinned_seq: census.pinned_seq,
+        pages: census.pages,
+        base_rows_visited: census.base_rows_visited,
+        referenced_column_families: census.referenced_column_families,
+        referenced_rows: census.referenced_rows,
+    });
     StorageGcOnceResponse {
         cf_name: cf_name.to_owned(),
         before_rows,
         after_rows,
         total_evicted_rows,
         cache_evictions_total_delta: total_evicted_rows,
+        source_census,
         cf_reports: report
             .cf_reports
             .into_iter()
