@@ -92,7 +92,16 @@ impl HiddenDesktopValueRoute {
 #[derive(Clone, Debug)]
 pub(crate) struct HiddenDesktopWindowRoute {
     pub(crate) desktop_name: String,
+    /// The HWND the caller addressed: the element's own window for a click, the
+    /// keyboard target for a keystroke. This is the membership/staleness probe
+    /// subject and the delivery target, and must stay exactly as addressed.
     pub(crate) hwnd: i64,
+    /// `GA_ROOT` of [`Self::hwnd`], resolved inside the owning desktop's worker
+    /// (#2063 finding 1). In a classic Win32 dialog every control is its own
+    /// HWND, so this is the only handle whose subtree can contain the effect a
+    /// click has on a *sibling* control. Equal to `hwnd` when the addressed
+    /// window already is the top-level one.
+    pub(crate) root_hwnd: i64,
 }
 
 impl HiddenDesktopWindowRoute {
@@ -119,22 +128,23 @@ pub(crate) fn resolve_hidden_desktop_window_route(
     }
     let mut misses = Vec::with_capacity(desktop_names.len());
     for desktop_name in desktop_names {
-        match crate::desktop_worker::hidden_desktop_window_context(desktop_name, hwnd) {
-            Ok(context) => {
+        match crate::desktop_worker::hidden_desktop_window_context_with_root(desktop_name, hwnd) {
+            Ok(readback) => {
                 tracing::info!(
                     code = "M2_HIDDEN_DESKTOP_ACTION_ROUTE_RESOLVED",
                     tool,
                     hwnd,
+                    root_hwnd = readback.root_hwnd,
                     desktop_name = desktop_name.as_str(),
-                    window_pid = context.pid,
+                    window_pid = readback.context.pid,
                     required_foreground = false,
-                    source_of_truth =
-                        "session-owned desktop worker IsWindow + window context readback",
+                    source_of_truth = "session-owned desktop worker IsWindow + GetAncestor(GA_ROOT) + window context readback",
                     "readback=hidden_desktop_action_route desktop owns the target HWND"
                 );
                 return Ok(Some(HiddenDesktopWindowRoute {
                     desktop_name: desktop_name.clone(),
                     hwnd,
+                    root_hwnd: readback.root_hwnd,
                 }));
             }
             Err(error) if hidden_desktop_target_miss(&error) => {

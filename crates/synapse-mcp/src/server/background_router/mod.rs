@@ -2113,9 +2113,21 @@ impl SynapseService {
                         .ttl_ms
                         .unwrap_or(synapse_action::DEFAULT_LEASE_TTL_MS);
                     super::lease_tools::validate_lease_ttl_ms("act", ttl_ms)?;
+                    // #2078: this is the explicit lease verb, so a TTL the
+                    // caller actually named may deliberately shorten their own
+                    // window (#2071's carve-out). A *defaulted* TTL names
+                    // nothing, so it may only raise the window, never clamp a
+                    // live lease down to `DEFAULT_LEASE_TTL_MS`.
+                    let ttl_intent = if params.ttl_ms.is_some() {
+                        super::lease_tools::LeaseTtlIntent::CallerRequested
+                    } else {
+                        super::lease_tools::LeaseTtlIntent::ToolSized
+                    };
                     let lease = self
-                        .control_lease_acquire_authority_locked(
-                            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
+                        .control_lease_acquire_authority_locked_sized(
+                            "act_lease_acquire",
+                            ttl_ms,
+                            ttl_intent,
                             authority_session_id.clone().ok_or_else(|| {
                                 mcp_error(
                                     error_codes::TOOL_INTERNAL_ERROR,
@@ -3182,8 +3194,15 @@ impl SynapseService {
         // 1) Acquire/renew the foreground input lease. Do not use `?` here:
         // acquire can commit memory + persistence before a later audit error.
         // The already-armed guard reconciles actual ownership on every exit.
-        let lease_acquire_result = self.control_lease_acquire_authority_locked(
-            super::lease_tools::ControlLeaseAcquireParams { ttl_ms },
+        // #2078: `ttl_ms` here is this lane's *own* escalation window — the
+        // caller's `act operation=foreground` payload names an action to run,
+        // not a lease to buy, and when it omits `ttl_ms` the number is the
+        // facade-internal 30 000 above. Sized as a floor: it may raise the
+        // lease, and can never renew the caller's longer live lease downward.
+        let lease_acquire_result = self.control_lease_acquire_authority_locked_sized(
+            "act_foreground",
+            ttl_ms,
+            super::lease_tools::LeaseTtlIntent::ToolSized,
             session_id.clone(),
         );
         let lease_acquire = match lease_acquire_result {
@@ -6202,6 +6221,10 @@ async fn target_act_coordinate_click(
                     &hidden_desktop,
                     coordinate.x,
                     coordinate.y,
+                    // Echo what the caller actually asked for. This refusal is
+                    // raised before the window->screen conversion below, so the
+                    // requested point is still in the caller's own space (#2063).
+                    coordinate.space.as_bridge_str(),
                 );
                 service.audit_action_denied_with_details_for_session(
                     "target_act",

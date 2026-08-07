@@ -1065,6 +1065,10 @@ impl SynapseService {
                 &hidden_desktop,
                 point.x,
                 point.y,
+                // `ActClickPointTarget` is defined in screen coordinates; the
+                // facade has already converted any window-relative request by
+                // the time it reaches this tool.
+                "screen",
             ));
         }
         let Some(session_id) =
@@ -2431,11 +2435,18 @@ fn hidden_desktop_press_stage_error(
 /// owns a hidden Win32 desktop. Named separately from the generic
 /// "foreground moved" guard because the remediation is different in kind: there
 /// is no focus step that can make a hidden desktop the input desktop.
+///
+/// `coordinate_space` is the space the **caller** actually asked in, not the
+/// space this tier would have converted to. The #2063 FSV of `be7386d1` found
+/// the refusal echoing `"screen"` for a `coordinate_space:"window"` request:
+/// the verdict was right but the evidence misquoted the request, and the whole
+/// point of this refusal is that its evidence is exact.
 pub(crate) fn hidden_desktop_coordinate_click_refusal(
     tool: &'static str,
     hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
     x: i32,
     y: i32,
+    coordinate_space: &str,
 ) -> ErrorData {
     tracing::warn!(
         code = error_codes::FOREGROUND_ACTIVATION_REFUSED,
@@ -2445,13 +2456,14 @@ pub(crate) fn hidden_desktop_coordinate_click_refusal(
         desktop_names = ?hidden_desktop.desktop_names,
         x,
         y,
+        coordinate_space,
         source_of_truth = "session process/desktop lease registry",
         "coordinate click refused: the requesting session owns hidden desktops and screen coordinates only exist on the input desktop"
     );
     ErrorData::new(
         ErrorCode(-32099),
         format!(
-            "{tool} refused the screen-coordinate click at ({x}, {y}) because MCP session {:?} owns hidden desktop(s) {:?}. Screen coordinates address the *input* desktop only, so this click could only ever land on the human's visible desktop, never on the session's own desktop. Use an element-addressed action (act_click element_id / act_set_field_text), which routes through the owning desktop's worker.",
+            "{tool} refused the {coordinate_space}-coordinate click at ({x}, {y}) because MCP session {:?} owns hidden desktop(s) {:?}. Coordinates address the *input* desktop only, so this click could only ever land on the human's visible desktop, never on the session's own desktop. Use an element-addressed action (act_click element_id / act_set_field_text), which routes through the owning desktop's worker.",
             hidden_desktop.session_id, hidden_desktop.desktop_names
         ),
         Some(json!({
@@ -2463,7 +2475,7 @@ pub(crate) fn hidden_desktop_coordinate_click_refusal(
             "desktop_names": hidden_desktop.desktop_names,
             "launch_pids": hidden_desktop.launch_pids,
             "resource_count": hidden_desktop.resource_count,
-            "requested_point": { "x": x, "y": y, "coordinate_space": "screen" },
+            "requested_point": { "x": x, "y": y, "coordinate_space": coordinate_space },
             "foreground_tier_allowed": false,
             "session_target_rebound": false,
             "source_of_truth": "session process/desktop lease registry",
@@ -3866,6 +3878,7 @@ impl SynapseService {
                 .iter()
                 .any(|attempt| attempt.required_foreground),
             desktop_route: None,
+        desktop_route_hwnds: None,
             tier_attempts,
             postcondition,
             press_hold_ms: params.hold_ms,

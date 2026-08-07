@@ -240,6 +240,7 @@ pub(crate) async fn act_click_with_handle_and_lease(
         backend_tier_used,
         required_foreground,
         desktop_route: None,
+        desktop_route_hwnds: None,
         tier_attempts,
         postcondition: schema::postcondition_not_requested(),
         press_hold_ms: params.hold_ms,
@@ -257,6 +258,9 @@ const HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH: &str =
     "session_owned_desktop_worker_uia_subtree_readback";
 /// Enough depth to see the state change a click produces (pressed/checked
 /// state, selection, the dialog it opened) without snapshotting a whole app.
+///
+/// Depth is measured from the target's **top-level** window (`route.root_hwnd`),
+/// never from the clicked control: see [`act_click_hidden_desktop_worker`].
 const HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH: u32 = 4;
 
 /// #2063 finding 1: performs the semantic UIA click on the session-owned hidden
@@ -281,6 +285,31 @@ const HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH: u32 = 4;
 /// 3. It keeps exactly one canonical hidden-desktop action path (#2056), so the
 ///    route label, the audit row, and the refusal vocabulary are uniform across
 ///    `set_field`, `click`, and `key`.
+///
+/// # Two HWNDs, two jobs (#2063 FSV of `be7386d1`)
+///
+/// The element id carries the HWND that *owns the clicked element*. In a classic
+/// Win32 dialog every control is a separate window, so for charmap's `Select`
+/// button that is the button itself (`0x21134`), not the dialog (`0x58e0a78`).
+/// Rooting the before/after verification subtree there made the two signatures
+/// identical **by construction**: a depth-capped subtree of the button can never
+/// contain the sibling edit the click actually mutates. Two physically delivered
+/// clicks (the "characters to copy" edit went `"" -> "!\r" -> "!!\r"`) were both
+/// reported as `ok:false` / `ACTION_NO_OBSERVED_DELTA`.
+///
+/// So the two handles are used for different jobs and never interchanged:
+///
+/// - `route.hwnd` — the addressed control. Membership/staleness oracle, the
+///   worker dispatch HWND, and the invoke target. Unchanged.
+/// - `route.root_hwnd` — `GA_ROOT` of that control, resolved *inside* the
+///   worker, because `GetAncestor` walks a parent chain that only exists on the
+///   desktop that owns the window; the daemon cannot resolve the ancestry of an
+///   HWND it cannot even see. This roots the before/after snapshots, which is
+///   what makes the readback able to witness the click it verifies — the same
+///   scope the visible-desktop tier verifies against (`target_window_ui_or_pixels`).
+///
+/// Both are recorded on the response and in the log row so an auditor can see
+/// exactly what was clicked and exactly what was watched.
 pub(crate) async fn act_click_hidden_desktop_worker(
     params: &ActClickParams,
     element_id: &ElementId,
@@ -293,11 +322,12 @@ pub(crate) async fn act_click_hidden_desktop_worker(
     let route_label = route.route_label();
 
     // Worker process #1: the "before" Source of Truth, taken on the owning
-    // desktop. Doubles as the desktop-membership re-check immediately before
-    // delivery.
+    // desktop and rooted at the target's top-level window so a sibling control's
+    // change is inside the observed scope. Doubles as the desktop-membership
+    // re-check immediately before delivery.
     let before = crate::desktop_worker::hidden_desktop_window_snapshot(
         &route.desktop_name,
-        route.hwnd,
+        route.root_hwnd,
         HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
     )
     .map_err(|error| hidden_desktop_click_stage_error(element_id, &route, "before_read", error))?;
@@ -329,10 +359,11 @@ pub(crate) async fn act_click_hidden_desktop_worker(
     .await;
 
     // Worker process #N+1: a fresh desktop connection, fresh COM/UIA client and
-    // fresh element resolution read the "after" state.
+    // fresh element resolution read the "after" state — from the same top-level
+    // root as the "before" read, so the two signatures are comparable.
     let after = crate::desktop_worker::hidden_desktop_window_snapshot(
         &route.desktop_name,
-        route.hwnd,
+        route.root_hwnd,
         HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
     )
     .map_err(|error| hidden_desktop_click_stage_error(element_id, &route, "after_read", error))?;
@@ -358,6 +389,7 @@ pub(crate) async fn act_click_hidden_desktop_worker(
         tool = "act_click",
         element_id = %element_id,
         hwnd = route.hwnd,
+        snapshot_root_hwnd = route.root_hwnd,
         desktop_route = route_label.as_str(),
         backend_tier_used = CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
         required_foreground = false,
@@ -381,6 +413,8 @@ pub(crate) async fn act_click_hidden_desktop_worker(
                 json!({
                     "desktop_route": route_label,
                     "hwnd": route.hwnd,
+                    "snapshot_root_hwnd": route.root_hwnd,
+                    "snapshot_depth": HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
                     "element_id": element_id.to_string(),
                     "uia_outcomes": outcome_labels,
                 }),
@@ -403,7 +437,8 @@ pub(crate) async fn act_click_hidden_desktop_worker(
             before_signature,
             after_signature,
             format!(
-                "separate worker process on session-owned desktop {route_label} observed a UIA subtree change after the click"
+                "separate worker process on session-owned desktop {route_label} observed a UIA subtree change after the click; invoked hwnd {:#x}, subtree rooted at top-level hwnd {:#x} (depth {HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH})",
+                route.hwnd, route.root_hwnd
             ),
         )
     } else {
@@ -417,6 +452,11 @@ pub(crate) async fn act_click_hidden_desktop_worker(
         backend_tier_used: CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER.to_owned(),
         required_foreground: false,
         desktop_route: Some(route_label.clone()),
+        desktop_route_hwnds: Some(schema::ActClickDesktopRouteHwnds {
+            invoked_hwnd: route.hwnd,
+            verify_root_hwnd: route.root_hwnd,
+            verify_subtree_depth: HIDDEN_DESKTOP_CLICK_SNAPSHOT_DEPTH,
+        }),
         tier_attempts: vec![click_tier_delivered(
             CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
             false,
@@ -454,6 +494,7 @@ fn hidden_desktop_click_stage_error(
         tool = "act_click",
         element_id = %element_id,
         hwnd = route.hwnd,
+        snapshot_root_hwnd = route.root_hwnd,
         desktop_route = route_label.as_str(),
         stage,
         required_foreground = false,
@@ -474,6 +515,7 @@ fn hidden_desktop_click_stage_error(
             "desktop_name": route.desktop_name,
             "element_id": element_id.to_string(),
             "hwnd": route.hwnd,
+            "snapshot_root_hwnd": route.root_hwnd,
             "required_foreground": false,
             "backend_tier_used": CLICK_TIER_UIA_HIDDEN_DESKTOP_WORKER,
             "source_of_truth": HIDDEN_DESKTOP_CLICK_SOURCE_OF_TRUTH,
@@ -679,6 +721,7 @@ async fn execute_cdp_click(
         backend_tier_used: CLICK_TIER_CDP.to_owned(),
         required_foreground: false,
         desktop_route: None,
+        desktop_route_hwnds: None,
         tier_attempts: vec![click_tier_delivered(
             CLICK_TIER_CDP,
             false,

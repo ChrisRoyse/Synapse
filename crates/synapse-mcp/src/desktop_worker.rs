@@ -132,6 +132,11 @@ struct WorkerEnvelope {
 enum WorkerPayload {
     Context {
         context: ForegroundContext,
+        /// #2063: `GA_ROOT` of the probed HWND, resolved **on this worker's
+        /// desktop**. `GetAncestor` walks the window manager's parent chain,
+        /// which only exists for windows on the calling thread's desktop, so the
+        /// daemon cannot compute this for a hidden-desktop HWND at all.
+        root_hwnd: i64,
     },
     Snapshot {
         context: ForegroundContext,
@@ -206,7 +211,9 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
         .map_err(|error| worker_error(error.code(), error.to_string()))?;
     match op {
         DesktopWorkerOp::Context => {
-            worker_context(hwnd).map(|context| WorkerPayload::Context { context })
+            let context = worker_context(hwnd)?;
+            let root_hwnd = worker_top_level_root_hwnd(hwnd)?;
+            Ok(WorkerPayload::Context { context, root_hwnd })
         }
         DesktopWorkerOp::Snapshot => {
             let depth = args.depth.unwrap_or(2).min(16);
@@ -420,6 +427,21 @@ fn worker_context(hwnd: i64) -> Result<ForegroundContext, WorkerEnvelope> {
         .map_err(|error| worker_error(error.code(), error.to_string()))
 }
 
+/// #2063: the top-level (`GA_ROOT`) ancestor of `hwnd`, read on this worker's
+/// desktop.
+///
+/// This is deliberately *not* computed in the daemon. `GetAncestor` resolves the
+/// window manager's parent chain, and a thread only reaches windows on its own
+/// desktop, so for a hidden-desktop HWND the daemon has no ancestry to walk —
+/// exactly the same reason `IsWindow` is false there. Resolving it here keeps the
+/// whole chain (membership probe, ancestry, snapshot, invoke) on the one desktop
+/// that physically owns the window.
+#[cfg(windows)]
+fn worker_top_level_root_hwnd(hwnd: i64) -> Result<i64, WorkerEnvelope> {
+    synapse_a11y::top_level_root_hwnd(hwnd)
+        .map_err(|error| worker_error(error.code(), error.to_string()))
+}
+
 #[cfg(windows)]
 fn worker_capture_region(
     hwnd: i64,
@@ -496,11 +518,19 @@ fn write_worker_envelope(path: &Path, envelope: &WorkerEnvelope) -> anyhow::Resu
     Ok(())
 }
 
+/// A hidden-desktop window context readback plus the target's top-level
+/// (`GA_ROOT`) ancestor as resolved **on the owning desktop** (#2063).
+#[derive(Clone, Debug)]
+pub(crate) struct HiddenDesktopWindowContext {
+    pub context: ForegroundContext,
+    pub root_hwnd: i64,
+}
+
 #[cfg(windows)]
-pub(crate) fn hidden_desktop_window_context(
+pub(crate) fn hidden_desktop_window_context_with_root(
     desktop_name: &str,
     hwnd: i64,
-) -> Result<ForegroundContext, rmcp::ErrorData> {
+) -> Result<HiddenDesktopWindowContext, rmcp::ErrorData> {
     match run_worker(
         desktop_name,
         DesktopWorkerOp::Context,
@@ -509,7 +539,9 @@ pub(crate) fn hidden_desktop_window_context(
         false,
         None,
     )? {
-        WorkerPayload::Context { context } => Ok(context),
+        WorkerPayload::Context { context, root_hwnd } => {
+            Ok(HiddenDesktopWindowContext { context, root_hwnd })
+        }
         payload => Err(crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("desktop worker returned unexpected context payload: {payload:?}"),
@@ -518,14 +550,21 @@ pub(crate) fn hidden_desktop_window_context(
 }
 
 #[cfg(not(windows))]
-pub(crate) fn hidden_desktop_window_context(
+pub(crate) fn hidden_desktop_window_context_with_root(
     _desktop_name: &str,
     _hwnd: i64,
-) -> Result<ForegroundContext, rmcp::ErrorData> {
+) -> Result<HiddenDesktopWindowContext, rmcp::ErrorData> {
     Err(crate::m1::mcp_error(
         error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
         "hidden desktop workers are only supported on Windows",
     ))
+}
+
+pub(crate) fn hidden_desktop_window_context(
+    desktop_name: &str,
+    hwnd: i64,
+) -> Result<ForegroundContext, rmcp::ErrorData> {
+    hidden_desktop_window_context_with_root(desktop_name, hwnd).map(|readback| readback.context)
 }
 
 #[cfg(windows)]

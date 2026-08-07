@@ -31,9 +31,58 @@ pub struct ControlLeaseAcquireParams {
     /// renewed on every leased action and on a repeat acquire by the holder, so
     /// a short TTL is the safety floor against a crashed holder, not a hard cap
     /// on how long real work can take.
-    #[serde(default = "default_lease_ttl_ms")]
-    #[schemars(default = "default_lease_ttl_ms", range(min = 100, max = 300000))]
-    pub ttl_ms: u64,
+    ///
+    /// Omitted means "whatever the default is", which is **not** the same
+    /// request as naming that number (#2078): an explicitly named TTL may
+    /// deliberately shorten this session's own live window, a defaulted one
+    /// never may.
+    #[serde(default)]
+    #[schemars(
+        default = "default_lease_ttl_ms_schema",
+        range(min = 100, max = 300000)
+    )]
+    pub ttl_ms: Option<u64>,
+}
+
+/// Why an acquisition's TTL is the number it is — the discriminator for the
+/// non-reducing lease rule (#2065 / #2071 / #2078).
+///
+/// #2071 established the rule as an **action-tier** rule and deliberately left
+/// `lease::try_acquire`'s `Renewed` branch assigning `lease.ttl = ttl`, so an
+/// explicit lease verb can still shorten a window on purpose. The distinction
+/// that carve-out actually turns on is not *which tool* ran, but whether the
+/// caller **named** the number: nobody can deliberately shorten a window with a
+/// TTL they never asked for and cannot see.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum LeaseTtlIntent {
+    /// The caller of an explicit lease verb named this exact TTL. Honored as
+    /// given, including when it shortens this session's own live lease.
+    CallerRequested,
+    /// A default or a facade-internal constant the tool chose for its own
+    /// window. Treated as a **floor**: it may raise the lease, never lower it
+    /// below what the same session's live lease still has left.
+    ToolSized,
+}
+
+impl LeaseTtlIntent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CallerRequested => "caller_requested",
+            Self::ToolSized => "tool_sized",
+        }
+    }
+}
+
+impl ControlLeaseAcquireParams {
+    /// Resolves the requested TTL and how it was chosen. An omitted `ttl_ms`
+    /// falls back to `DEFAULT_LEASE_TTL_MS` exactly as before, but is tagged
+    /// `ToolSized` so the fallback cannot silently clamp a live lease down.
+    pub(super) fn requested_ttl_ms_and_intent(&self) -> (u64, LeaseTtlIntent) {
+        match self.ttl_ms {
+            Some(ttl_ms) => (ttl_ms, LeaseTtlIntent::CallerRequested),
+            None => (default_lease_ttl_ms(), LeaseTtlIntent::ToolSized),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -50,6 +99,12 @@ pub struct ControlLeaseHandoffParams {
 
 const fn default_lease_ttl_ms() -> u64 {
     synapse_action::DEFAULT_LEASE_TTL_MS
+}
+
+/// Schema-only default for the optional `ttl_ms`, so the advertised tool schema
+/// still documents the number an omitted field resolves to.
+const fn default_lease_ttl_ms_schema() -> Option<u64> {
+    Some(synapse_action::DEFAULT_LEASE_TTL_MS)
 }
 
 /// Flattened lease snapshot returned by every lease tool. `LeaseStatus` lives in
@@ -169,7 +224,8 @@ impl SynapseService {
             "tool.invocation kind=control_lease_acquire"
         );
         let params = params.0;
-        validate_lease_ttl_ms("control_lease_acquire", params.ttl_ms)?;
+        let (requested_ttl_ms, ttl_intent) = params.requested_ttl_ms_and_intent();
+        validate_lease_ttl_ms("control_lease_acquire", requested_ttl_ms)?;
         let session_id = require_lease_session_id(&request_context)?;
         let operator_panic_epoch_at_entry =
             arm_control_lease_operator_panic_gate("control_lease_acquire", &session_id)?;
@@ -188,18 +244,47 @@ impl SynapseService {
             operator_panic_epoch_at_entry,
             "after_session_validation_before_mutation",
         )?;
-        self.control_lease_acquire_authority_locked(params, session_id)
+        self.control_lease_acquire_authority_locked_sized(
+            "control_lease_acquire",
+            requested_ttl_ms,
+            ttl_intent,
+            session_id,
+        )
     }
 
-    /// Internal transaction step for callers that already hold this session's
-    /// authority gate (notably `act operation=foreground`).
-    pub(super) fn control_lease_acquire_authority_locked(
+    /// #2078: the single acquisition transaction, with the non-reducing rule
+    /// applied up front and audited.
+    ///
+    /// Also the internal transaction step for callers that already hold this
+    /// session's authority gate — `act operation=foreground` and
+    /// `act operation=lease_acquire`.
+    ///
+    /// `tool` names the lane that asked (it appears on the
+    /// `INPUT_LEASE_ACTION_TTL_SIZED` line); the command-audit row keeps the
+    /// `control_lease_acquire` identity it has always had, so existing audit
+    /// queries are unaffected.
+    pub(super) fn control_lease_acquire_authority_locked_sized(
         &self,
-        params: ControlLeaseAcquireParams,
+        tool: &'static str,
+        requested_ttl_ms: u64,
+        ttl_intent: LeaseTtlIntent,
         session_id: String,
     ) -> Result<Json<ControlLeaseResponse>, ErrorData> {
+        // Restore first: the caller floor is read from the in-memory lease, and
+        // a session-continuity row that has not been restored yet would read as
+        // "nothing left" and let the floor collapse to zero.
         self.restore_session_lease_if_needed(&session_id)?;
-        let command_payload = json!({ "ttl_ms": params.ttl_ms });
+        let sizing =
+            effective_lease_acquire_ttl_ms(tool, &session_id, requested_ttl_ms, ttl_intent);
+        let command_payload = json!({
+            "ttl_ms": sizing.lease_ttl_ms,
+            "requested_ttl_ms": sizing.requested_ttl_ms,
+            "caller_lease_remaining_ms": sizing.caller_lease_remaining_ms,
+            "ttl_intent": sizing.intent.as_str(),
+            "reduced_caller_ttl": sizing.reduced_caller_ttl(),
+            "ttl_sizing_reason": sizing.reason,
+            "tool": tool,
+        });
         let command_before = json!({
             "source_of_truth": "synapse_action::lease",
             "caller": lease_status_for_session(&session_id),
@@ -214,7 +299,7 @@ impl SynapseService {
             Value::Null,
             "pending",
         ))?;
-        let response = match acquire_lease_for_session(&session_id, params.ttl_ms) {
+        let response = match acquire_lease_for_session(&session_id, sizing.lease_ttl_ms) {
             Ok(response) => response,
             Err(error) => {
                 self.command_audit_final(
@@ -832,6 +917,103 @@ pub(super) fn validate_lease_ttl_ms(tool: &'static str, ttl_ms: u64) -> Result<(
             "remediation": "pass ttl_ms in the advertised lease range or omit it for the default",
         })),
     ))
+}
+
+/// The decision record for one lease-acquisition TTL, kept whole so the
+/// response audit and the log line cannot disagree about it.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LeaseAcquireTtlSizing {
+    /// What the lane asked for (a caller's `ttl_ms`, or the default/lane
+    /// constant that stood in for one).
+    requested_ttl_ms: u64,
+    /// What this same session's live lease still had left at decision time.
+    caller_lease_remaining_ms: u64,
+    /// What will actually be installed.
+    lease_ttl_ms: u64,
+    intent: LeaseTtlIntent,
+    reason: &'static str,
+}
+
+impl LeaseAcquireTtlSizing {
+    const fn reduced_caller_ttl(&self) -> bool {
+        self.lease_ttl_ms < self.caller_lease_remaining_ms
+    }
+}
+
+/// #2078: applies the non-reducing lease rule at the **control lane**, the third
+/// acquisition door — the one #2071's m2-tools funnel did not cover.
+///
+/// `act operation=foreground` acquires its escalation window through
+/// `control_lease_acquire_authority_locked` with a facade-internal 30 000 ms it
+/// chose for itself. `lease::try_acquire`'s `Renewed` branch assigns
+/// `lease.ttl = ttl` unconditionally, so a caller holding 60 000 ms with ~47 600
+/// ms left came back holding 30 000 ms — persisted to `CF_SESSIONS`, reported as
+/// `acquired_lease:false`, and with no `INPUT_LEASE_ACTION_TTL_SIZED` line to
+/// reconstruct it from. Physically reproduced on daemon PID 27852,
+/// `f1e429a1c58f`.
+///
+/// The rule here is #2071's, verbatim, plus its own carve-out made explicit:
+///
+/// - [`LeaseTtlIntent::ToolSized`] — `max(requested, owner_remaining).min(MAX)`.
+///   The lane's own requirement stays a floor and can raise the window; it can
+///   never clamp it down.
+/// - [`LeaseTtlIntent::CallerRequested`] — honored exactly, including a
+///   deliberate shorten. #2071 kept `try_acquire`'s `Renewed` branch assigning
+///   unconditionally for precisely this case, and that stays true.
+///
+/// The floor comes from [`synapse_action::lease::owner_remaining_ttl_ms`], which
+/// expires a lapsed lease first and ignores one owned by anyone else, so this
+/// can only preserve authority the same session provably still holds. Nothing
+/// here widens `MAX_LEASE_TTL_MS`, touches the #2057 per-emission fence, or adds
+/// a grace window.
+fn effective_lease_acquire_ttl_ms(
+    tool: &'static str,
+    session_id: &str,
+    requested_ttl_ms: u64,
+    intent: LeaseTtlIntent,
+) -> LeaseAcquireTtlSizing {
+    let caller_lease_remaining_ms = lease::owner_remaining_ttl_ms(session_id);
+    let (lease_ttl_ms, reason) = match intent {
+        LeaseTtlIntent::CallerRequested => (
+            requested_ttl_ms,
+            "explicit_caller_ttl_honored_including_deliberate_shorten",
+        ),
+        LeaseTtlIntent::ToolSized => {
+            let sized = requested_ttl_ms
+                .max(caller_lease_remaining_ms)
+                .min(synapse_action::MAX_LEASE_TTL_MS);
+            let reason = if caller_lease_remaining_ms > requested_ttl_ms {
+                "caller_lease_remaining_preserved"
+            } else {
+                "tool_required_floor"
+            };
+            (sized, reason)
+        }
+    };
+    let sizing = LeaseAcquireTtlSizing {
+        requested_ttl_ms,
+        caller_lease_remaining_ms,
+        lease_ttl_ms,
+        intent,
+        reason,
+    };
+    tracing::info!(
+        code = "INPUT_LEASE_ACTION_TTL_SIZED",
+        tool,
+        session_id,
+        action_required_ttl_ms = requested_ttl_ms,
+        caller_lease_remaining_ms,
+        lease_ttl_ms,
+        ttl_ms_before = caller_lease_remaining_ms,
+        ttl_ms_after = lease_ttl_ms,
+        reduced_caller_ttl = sizing.reduced_caller_ttl(),
+        ttl_intent = intent.as_str(),
+        reason,
+        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        source_of_truth = "synapse_action::lease::owner_remaining_ttl_ms before the lease mutation",
+        "readback=input_lease control-lane lease TTL sized; a tool-sized TTL never shortens a live same-owner lease"
+    );
+    sizing
 }
 
 /// Acquire/renew the lease for `session_id`. Contended → `ACTION_FOREGROUND_LEASE_BUSY`.

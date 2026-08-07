@@ -625,8 +625,12 @@ fn recommend_model(
                     total_success,
                     total_failure,
                 ),
+                // #2079: `then_some` evaluates its argument EAGERLY, so the
+                // guard never protected the division — priced_count == 0
+                // panicked (divide by zero) and killed the daemon. `then`
+                // takes a closure and is lazy.
                 expected_cost_micro_usd: (cell.priced_count > 0)
-                    .then_some(cell.priced_total / cell.priced_count),
+                    .then(|| cell.priced_total / cell.priced_count),
                 priced_observations: cell.priced_count,
             }
         })
