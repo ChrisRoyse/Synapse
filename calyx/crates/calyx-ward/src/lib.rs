@@ -6,17 +6,24 @@ pub mod error;
 pub mod generate;
 pub mod guard;
 pub mod identity;
+#[cfg(feature = "model-lenses")]
 pub mod injection_lens;
 pub mod ledger;
 pub mod novelty;
+#[cfg(feature = "model-lenses")]
 mod ort_runtime;
 pub mod polis;
 pub mod profile;
 pub mod query;
 pub mod required;
+#[cfg(feature = "model-lenses")]
 pub mod speaker_lens;
+#[cfg(feature = "model-lenses")]
 pub mod style_lens;
 pub mod verdict;
+
+/// Whether this build contains the optional ONNX/tokenizer-backed Ward lenses.
+pub const MODEL_LENSES_COMPILED: bool = cfg!(feature = "model-lenses");
 
 pub use calibrate::{
     CalibrationInput, ESTIMATOR, MIN_BAD_SCORES, SlotKind, TAU_COLD_START, calibrate,
@@ -37,13 +44,14 @@ pub use error::{
 };
 pub use generate::{
     GUARDED_PASS_TAG, GUARDED_REJECT_TAG, GUARDED_REJECT_UNPROVENANCED_TAG, GenerateInput,
-    GenerateOutput, guard_generate, guard_generate_with_ledger,
+    GenerateOutput, WAVLM_SAMPLE_RATE, guard_generate, guard_generate_with_ledger,
 };
 pub use guard::{
     DEFAULT_TAU, MatchedSlots, ProducedSlots, guard, guard_non_high_stakes, guard_result,
     guard_result_with_stakes, validate_non_inert_profile,
 };
 pub use identity::{IdentityProfile, IdentitySlotConfig};
+#[cfg(feature = "model-lenses")]
 pub use injection_lens::{
     DEFAULT_INJECTION_MODEL_PATH, DEFAULT_INJECTION_TOKENIZER_PATH,
     INJECTION_INPUT_COVERAGE_POLICY, INJECTION_LABELS, INJECTION_MAX_TOKENS, InjectionLens,
@@ -74,10 +82,12 @@ pub use required::{
     LOAD_BEARING_MIN_BITS, RequiredSlotDerivation, RequiredSlotEvidence, RequiredSlotObservation,
     derive_required_profile, derive_required_slots, derive_required_slots_for_observations,
 };
+#[cfg(feature = "model-lenses")]
 pub use speaker_lens::{
     DEFAULT_WAVLM_MODEL_PATH, SpeakerEmbeddingBackend, SpeakerLens, SpeakerProviderPolicy,
-    WAVLM_DIM, WAVLM_SAMPLE_RATE,
+    WAVLM_DIM,
 };
+#[cfg(feature = "model-lenses")]
 pub use style_lens::{
     DEFAULT_STYLE_MODEL_PATH, DEFAULT_STYLE_TOKENIZER_PATH, STYLE_DIM, STYLE_INPUT_COVERAGE_POLICY,
     STYLE_MAX_TOKENS, StyleEmbeddingBackend, StyleLens, StyleProviderPolicy,

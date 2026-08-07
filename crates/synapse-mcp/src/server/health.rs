@@ -1478,6 +1478,7 @@ impl SynapseService {
             calyx_registry_embedding_runtimes_compiled: Some(
                 calyx_registry::EMBEDDING_RUNTIMES_COMPILED,
             ),
+            calyx_ward_model_lenses_compiled: Some(calyx_ward::MODEL_LENSES_COMPILED),
             calyx_math_device_name: math_backend.as_ref().map(|math| math.device_name.clone()),
             calyx_math_device_vram_mib: math_backend.as_ref().and_then(|math| math.device_vram_mib),
             calyx_math_device_avx512: math_backend.as_ref().map(|math| math.device_avx512),

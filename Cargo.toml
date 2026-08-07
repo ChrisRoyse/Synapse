@@ -55,7 +55,7 @@ calyx-paths = { version = "0.1.0", path = "calyx/crates/calyx-paths" }
 calyx-registry = { version = "0.1.0", path = "calyx/crates/calyx-registry", default-features = false }
 calyx-search = { version = "0.1.0", path = "calyx/crates/calyx-search" }
 calyx-sextant = { version = "0.1.0", path = "calyx/crates/calyx-sextant" }
-calyx-ward = { version = "0.1.0", path = "calyx/crates/calyx-ward" }
+calyx-ward = { version = "0.1.0", path = "calyx/crates/calyx-ward", default-features = false }
 
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.18", features = ["full"] }
@@ -130,7 +130,6 @@ windows-capture = "2.0.0"
 uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
 chromiumoxide = "0.9.1"
 wasapi = "0.23.0"
-enigo = { version = "0.6.1", default-features = false }
 vigem-client = "0.1.4"
 ort = { version = "2.0.0-rc.12", default-features = false }
 clap = { version = "4.6.1", features = ["derive", "env"] }

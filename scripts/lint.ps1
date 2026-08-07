@@ -342,7 +342,7 @@ Write-Gate 'Gate 4/7  cargo fmt, both workspaces'
 # Gate 5 — cargo-deny, both workspaces (#1930)
 # ---------------------------------------------------------------------------
 #
-# `deny.toml` sat in this repository from initial scaffolding and NOTHING ever
+# The root `deny.toml` sat in this repository from initial scaffolding and NOTHING ever
 # ran it, while two docs listed it as an active gate. The first real run
 # (2026-07-31) failed all three checks with 45 findings. So the one thing this
 # gate must never do is report success without having run: an absent binary is a
@@ -351,7 +351,11 @@ Write-Gate 'Gate 4/7  cargo fmt, both workspaces'
 # It runs over BOTH workspaces for the reason gate 3 exists. The root and calyx
 # graphs are not identical even after the lock sync — calyx resolves 13 packages
 # root never sees — and RUSTSEC-2026-0186 (memmap2) was found only in the calyx
-# run before `unsound = "all"` was set in deny.toml.
+# run before `unsound = "all"` was set in both workspace policies. Synapse and
+# standalone Calyx intentionally resolve different optional capability graphs,
+# so each lock file has a colocated policy. Both retain the same fail-closed
+# baseline; only graph-specific licenses, sources, and written advisory
+# exceptions differ.
 
 $DenyMinVersion = [version]'0.20.2'
 
@@ -386,13 +390,10 @@ else {
                 -CargoArgs @('deny', 'check') `
                 -Code 'SYNAPSE_LINT_CARGO_DENY_ROOT_FAILED' `
                 -Remediation 'read the reported RUSTSEC ids / licenses / bans. Fix at the source (cargo update, a manifest floor, a removed wildcard). Only add a deny.toml ignore with a written reason and a removal condition.')
-        # calyx/ has no deny.toml of its own by design — one policy governs the
-        # whole tree, so the root config is passed in explicitly. A second file
-        # would be a second policy that could silently disagree with this one.
         [void](Invoke-CargoGate -WorkspaceLabel 'calyx' -WorkingDirectory $CalyxRoot `
-                -CargoArgs @('deny', '--config', (Join-Path $RepoRoot 'deny.toml'), 'check') `
+                -CargoArgs @('deny', 'check') `
                 -Code 'SYNAPSE_LINT_CARGO_DENY_CALYX_FAILED' `
-                -Remediation 'same as root. Note the calyx graph holds 13 packages the root never resolves, so a finding here can be genuinely calyx-only.')
+                -Remediation 'same as root. Inspect calyx/deny.toml for the standalone graph policy; every exception needs a written reason and removal condition.')
     }
 }
 

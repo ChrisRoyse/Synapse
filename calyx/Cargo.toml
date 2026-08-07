@@ -30,7 +30,7 @@ calyx-mincut = { version = "0.1.0", path = "crates/calyx-mincut" }
 calyx-paths = { version = "0.1.0", path = "crates/calyx-paths" }
 calyx-registry = { version = "0.1.0", path = "crates/calyx-registry", default-features = false }
 calyx-sextant = { version = "0.1.0", path = "crates/calyx-sextant" }
-calyx-ward = { version = "0.1.0", path = "crates/calyx-ward" }
+calyx-ward = { version = "0.1.0", path = "crates/calyx-ward", default-features = false }
 
 aes-gcm = "0.10"
 blake3 = "1"

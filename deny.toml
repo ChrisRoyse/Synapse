@@ -1,9 +1,10 @@
-# cargo-deny — the dependency/advisory/license gate for BOTH workspaces.
+# cargo-deny — the dependency/advisory/license gate for the Synapse workspace.
 #
 # #1930: this file declared a policy from initial scaffolding onward and nothing
 # ever ran it. `cargo-deny` was not installed on the build host and no script
 # invoked it, while two docs described it as an active gate. The first run after
-# installing it (2026-07-31, cargo-deny 0.20.2) failed all three checks:
+# installing it (2026-07-31, cargo-deny 0.20.2) failed all three checks. The
+# standalone Calyx graph now has its colocated policy at `calyx/deny.toml`:
 #
 #   advisories : 3 errors  (anyhow unsoundness, crossbeam-epoch UB, paste unmaintained)
 #   licenses   : 29 errors (15 calyx crates unlicensed, 14 synapse crates rejected)
@@ -51,23 +52,7 @@ yanked = "deny"
 
 # Every entry here is an ACCEPTED risk with a written reason and a named owner
 # of the eventual removal. Never add one to make a run go green.
-ignore = [
-    { id = "RUSTSEC-2024-0436", reason = """
-paste 1.0.15 — the author archived the repository; there is no fixed version and
-no drop-in successor, so this cannot be resolved by upgrading.
-
-Reachability, measured 2026-07-31 with `cargo tree -i paste -e normal`: it is a
-compile-time proc-macro with NO runtime component, reached only through the
-`gemm` / `pulp` numeric stack (gemm, gemm-c32/c64/common/f16/f32/f64, pulp) and
-`macro_rules_attribute` <- tokenizers <- candle-core. Nothing in synapse or calyx
-depends on it directly; it emits code at build time and is absent from the
-shipped binary's dependency surface.
-
-Removal condition: this ignore is deleted the moment `gemm`/`pulp` drop it.
-`unused-ignored-advisory = "deny"` below makes that removal MANDATORY rather
-than optional — a stale entry fails the gate instead of rotting here.
-""" },
-]
+ignore = []
 
 # The half of the ignore-list discipline that keeps it honest. An accepted risk
 # that no longer applies is a lie about what the gate is checking, so a stale
@@ -97,13 +82,11 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "MPL-2.0",
     "ISC",
     "Zlib",
     "Unicode-3.0",
     "BSL-1.0",
     "CC0-1.0",
-    "CDLA-Permissive-2.0",
 ]
 
 [[licenses.clarify]]
@@ -129,3 +112,4 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/enigo-rs/enigo"]

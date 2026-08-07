@@ -13,12 +13,13 @@ use crate::identity::IdentityProfile;
 use crate::ledger::{WardLedgerResult, append_guard_verdict};
 use crate::novelty::{NoveltyHandler, NoveltyRecord};
 use crate::profile::NoveltyAction;
-use crate::speaker_lens::WAVLM_SAMPLE_RATE;
 use crate::verdict::GuardVerdict;
 
 pub const GUARDED_PASS_TAG: &str = "guarded:pass";
 pub const GUARDED_REJECT_TAG: &str = "guarded:reject";
 pub const GUARDED_REJECT_UNPROVENANCED_TAG: &str = "guarded:reject:unprovenanced";
+/// Audio sample rate required by the persisted speaker-slot generation contract.
+pub const WAVLM_SAMPLE_RATE: u32 = 16_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct GenerateInput {

@@ -24,7 +24,7 @@ The `synapse-models` crate manages the lifecycle of ONNX detection models. The p
 
 The `ort` (ONNX Runtime) integration is **feature-gated**. Without the `ort` feature compiled in, sessions fall back to a `Placeholder` handle and `OrtSessionFactory` returns `BackendUnavailable`.
 
-The ONNX Runtime binding is **`ort` version `2.0.0-rc.12`** (workspace pin in `Cargo.toml`), used with API level `api-24` (`crates/synapse-models/Cargo.toml`).
+The ONNX Runtime binding is **`ort` version `2.0.0-rc.12`** (workspace pin in `Cargo.toml`), used with API level `api-24` and `load-dynamic` (`crates/synapse-models/Cargo.toml`). The build never downloads or copies an ORT distribution. Setup owns acquisition of the pinned, hash-verified Microsoft runtime bundle and installs its DLLs beside the daemon; ORT resolves that deployed runtime when the first session is created.
 
 Cross-references:
 - Whisper audio transcription using ONNX Runtime extensions — see [08_audio_subsystem.md](08_audio_subsystem.md). The `whisper_tiny_int8` model receives special handling in `create_ort_session` (operator-library registration).
@@ -278,11 +278,11 @@ Builds one `ort::session::Session` for a descriptor and a single provider:
 | Feature | Enables |
 |---------|---------|
 | `default` | (none) — ORT not compiled, `Placeholder` sessions only |
-| `ort` | `dep:ort`, `ort/api-24`, `ort/copy-dylibs`, `ort/download-binaries`, `ort/std`, `ort/tls-native` |
+| `ort` | `dep:ort`, `ort/api-24`, `ort/load-dynamic`, `ort/std` |
 | `cuda` | `ort` + `ort/cuda` |
 | `directml` | `ort` + `ort/directml` |
 
-ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`.
+ORT is an **optional** dependency (`default-features = false`), pinned at workspace version `2.0.0-rc.12`. `download-binaries`, its TLS client, and `copy-dylibs` are deliberately absent: a development build has no authority to acquire a runtime, while the installer verifies and deploys the one supported runtime bundle.
 
 ---
 

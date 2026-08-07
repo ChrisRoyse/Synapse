@@ -21,7 +21,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-enigo.workspace = true
+enigo = { version = "0.6.1", git = "https://github.com/enigo-rs/enigo", rev = "a9da6367f189d6d6ca95f1d3de34a5ff2f6c2a68", default-features = false }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
 vigem-client = { workspace = true, features = ["unstable_ds4"] }
@@ -29,7 +29,7 @@ windows.workspace = true
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 arboard.workspace = true
-enigo = { workspace = true, features = ["x11rb"] }
+enigo = { version = "0.6.1", git = "https://github.com/enigo-rs/enigo", rev = "a9da6367f189d6d6ca95f1d3de34a5ff2f6c2a68", default-features = false, features = ["x11rb"] }
 
 [lints.rust]
 unsafe_code = "allow"

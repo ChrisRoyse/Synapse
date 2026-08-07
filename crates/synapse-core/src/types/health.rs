@@ -687,6 +687,10 @@ pub struct SubsystemHealth {
     /// embedding execution stack. Synapse deliberately reports `false`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_registry_embedding_runtimes_compiled: Option<bool>,
+    /// Whether the running daemon contains Ward's optional ONNX/tokenizer model
+    /// lenses. Synapse deliberately reports `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_ward_model_lenses_compiled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -15,9 +15,9 @@ use ort::value::{Tensor, TensorElementType, ValueType};
 use sha2::{Digest, Sha256};
 
 use crate::error::WardError;
+use crate::generate::WAVLM_SAMPLE_RATE;
 
 pub const DEFAULT_WAVLM_MODEL_PATH: &str = "/var/lib/calyx/models/wavlm/wavlm-base-plus-sv.onnx";
-pub const WAVLM_SAMPLE_RATE: u32 = 16_000;
 pub const WAVLM_DIM: usize = 512;
 const SPEAKER_LENS_NAME: &str = "wavlm-base-plus-sv";
 const WAVLM_SOURCE_REPO: &str = "Xenova/wavlm-base-plus-sv";

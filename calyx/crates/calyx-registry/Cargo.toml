@@ -38,10 +38,10 @@ blake3.workspace = true
 candle-core = { version = "0.10.2", optional = true }
 candle-nn = { version = "0.10.2", optional = true }
 candle-transformers = { version = "0.10.2", optional = true }
-fastembed = { version = "=5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-download-binaries-native-tls", "qwen3"], optional = true }
+fastembed = { version = "=5.16.0", default-features = false, features = ["hf-hub-rustls-tls", "ort-load-dynamic", "qwen3"], optional = true }
 hf-hub = { version = "0.5.0", default-features = false, features = ["ureq", "rustls-tls"], optional = true }
 memmap2 = { workspace = true, optional = true }
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "cuda", "api-24"], optional = true }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

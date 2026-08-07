@@ -7,6 +7,10 @@ rust-version.workspace = true
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = ["model-lenses"]
+model-lenses = ["dep:ort", "dep:tokenizers"]
+
 [dependencies]
 calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
@@ -14,8 +18,8 @@ calyx-ledger = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "download-binaries", "copy-dylibs", "tls-native", "cuda", "api-24"] }
-tokenizers = { version = "0.22.2", default-features = false, features = ["onig"] }
+ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "load-dynamic", "cuda", "api-24"], optional = true }
+tokenizers = { version = "0.22.2", default-features = false, features = ["onig"], optional = true }
 uuid.workspace = true
 
 [lints]

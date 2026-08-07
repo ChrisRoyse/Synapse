@@ -53,14 +53,14 @@ Default `--mode` is `Stdio` (env `SYNAPSE_MODE`). See [15_mcp_server_architectur
 | Windows APIs | `windows` crate (Win32 Foundation, UI Automation, HiDPI, WindowsAndMessaging, Input KeyboardAndMouse/XboxController, DXGI, Graphics.Capture, JobObjects, Registry, StationsAndDesktops, …) | 0.62.2 |
 | Storage | Calyx vault | see [04_storage_and_persistence.md](04_storage_and_persistence.md) |
 | ML inference | ONNX Runtime via `ort` | 2.0.0-rc.12 (feature api-24) |
-| Metrics | `metrics` + `metrics-exporter-prometheus`; `opentelemetry` / `opentelemetry-otlp` | 0.24.6 / 0.18.3 / 0.32.0 |
+| Metrics | `metrics` + `metrics-exporter-prometheus` | 0.24.6 / 0.18.3 |
 | Tracing/logging | tracing + tracing-subscriber (env-filter, json) + tracing-appender | 0.1.44 / 0.3.23 / 0.2.5 |
 | Concurrency | crossbeam, arc-swap | 0.8.4 / 1.9.1 |
 | Clipboard | arboard | 3.6.1 |
 
 Lint posture: `clippy::unwrap_used` / `clippy::expect_used` are **denied workspace-wide** in production paths, allowed only in test code (`clippy.toml`, `[workspace.lints.clippy]`).
 
-Dependency/advisory/license gating via `cargo-deny` (`deny.toml`), run as **gate 5 of `scripts/lint.ps1`** over both workspaces. Requires `cargo-deny >= 0.20.2`; install with `pwsh -File scripts/install-cargo-deny.ps1`. The gate **fails closed when the binary is absent** rather than skipping — until #1930 (2026-07-31) `cargo-deny` was not installed and no script invoked it, so this sentence described a gate that had never run once. Its first real run failed all three checks with 45 findings.
+Dependency/advisory/license gating via `cargo-deny` (`deny.toml` for Synapse and `calyx/deny.toml` for standalone Calyx), run as **gate 5 of `scripts/lint.ps1`** over both lock files. The baseline is fail-closed in both policies; their written exceptions differ only where their intentionally different optional-capability graphs require it. Requires `cargo-deny >= 0.20.2`; install with `pwsh -File scripts/install-cargo-deny.ps1`. The gate **fails closed when the binary is absent** rather than skipping — until #1930 (2026-07-31) `cargo-deny` was not installed and no script invoked it, so this sentence described a gate that had never run once. Its first real run failed all three checks with 45 findings.
 
 ---
 
