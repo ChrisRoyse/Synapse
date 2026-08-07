@@ -91,6 +91,14 @@ Each flag below has the listed `env` fallback. Type is the parsed Rust type.
 | `--local-agent-allow-non-loopback` | `SYNAPSE_LOCAL_AGENT_ALLOW_NON_LOOPBACK` | bool | `false` | Allow non-loopback model base URL. |
 | `--local-agent-trusted-unattended-exact-contract` | `SYNAPSE_LOCAL_AGENT_TRUSTED_UNATTENDED_EXACT_CONTRACT` | bool | `false` | Trusted unattended exact-contract mode. |
 
+For the installed supervised daemon, use
+`scripts\synapse-setup.ps1 -EnableAudio` rather than relying on the invoking
+shell's environment. Setup
+persists `--enable-audio` in the generated supervisor, includes it in candidate
+and live-process identity checks, and requires `READ_AUDIO` in
+`-AllowedPermissions`. Supplying only one side fails with
+`SYNAPSE_AUDIO_DEPLOYMENT_CONTRACT_INVALID` before a build or daemon handoff.
+
 ---
 
 ## 3. Environment variables (read directly via `std::env::var`/`var_os`)

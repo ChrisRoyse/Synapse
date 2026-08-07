@@ -646,12 +646,15 @@ trail give you a *provable* record of what happened while you slept.
 > system audio live, and while it runs, fill in the CRM form in the background window from
 > yesterday's notes. When someone says my name in the transcript, ping me."*
 
-Audio transcription is not on the default 40-tool production surface. The lower-level
-`audio_tail` and `audio_transcribe` tools are debug-surface tools, require
-`SYNAPSE_DEBUG_TOOLS=1` and `--enable-audio`, and Whisper transcription requires a
-verified local model side-loaded into the configured model path; Synapse does not download
-that model automatically. Background form-fill through `browser_form` / `act` and event
-subscriptions remain part of the production surface.
+Audio transcription is available on the default 40-tool production surface through
+`observe operation=transcribe_audio`. Deploy the supervised daemon with
+`scripts\synapse-setup.ps1 -EnableAudio` and include `READ_AUDIO` in
+`-AllowedPermissions`; setup rejects either setting without the other. The lower-level
+`audio_tail` and `audio_transcribe` tools remain debug-surface tools and require
+`SYNAPSE_DEBUG_TOOLS=1`. Whisper transcription also requires the exact verified local
+model and ONNX Runtime Extensions artifact produced by
+`scripts\build-whisper-e2e-onnx.ps1`. Background form-fill through `browser_form` / `act`
+and event subscriptions remain part of the production surface.
 
 **🖥️ A self-driving install**
 

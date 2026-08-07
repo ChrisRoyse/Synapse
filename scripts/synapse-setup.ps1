@@ -70,6 +70,13 @@
   daemon's fail-closed read-only default. Use a whitespace/comma-separated list
   such as "READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE".
 
+.PARAMETER EnableAudio
+  Persistently enable WASAPI loopback and speech-to-text in the supervised
+  daemon. This is an explicit deployment setting: setup carries
+  --enable-audio through candidate validation, live argument drift checks, and
+  the generated restart supervisor. READ_AUDIO must also be present in
+  -AllowedPermissions; inconsistent configurations fail before the build.
+
 .PARAMETER CalyxConfigPath
   Optional Calyx tuning file passed explicitly to both the isolated candidate
   and the installed daemon as --calyx-config. Defaults to
@@ -230,6 +237,7 @@ param(
     [string]$PostExitContinuationReason = '',
     [string]$PostExitManifestPath = '',
     [switch]$ForceRestart,
+    [switch]$EnableAudio,
     [AllowNull()][string]$AllowedPermissions = $(if ([string]::IsNullOrWhiteSpace($env:SYNAPSE_MCP_ALLOWED_PERMISSIONS)) { 'READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE' } else { $env:SYNAPSE_MCP_ALLOWED_PERMISSIONS }),
     [AllowNull()][string]$CalyxConfigPath = $env:SYNAPSE_CALYX_CONFIG,
     [ValidateRange(60, 3600)]
@@ -1300,6 +1308,12 @@ function Normalize-SynapseAllowedPermissionsArgument {
     return ($tokens -join ',')
 }
 
+$normalizedSetupPermissions = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
+$setupReadAudioGranted = @($normalizedSetupPermissions -split ',' | Where-Object { $_ -ieq 'READ_AUDIO' }).Count -gt 0
+if ([bool]$EnableAudio -ne $setupReadAudioGranted) {
+    Die "SYNAPSE_AUDIO_DEPLOYMENT_CONTRACT_INVALID enable_audio=$([bool]$EnableAudio) read_audio_granted=$setupReadAudioGranted allowed_permissions=$normalizedSetupPermissions remediation=enable audio with -EnableAudio and include READ_AUDIO in -AllowedPermissions, or disable both; Synapse refuses a durable launch configuration where capture and authorization disagree"
+}
+
 function Vbs-Literal {
     param([Parameter(Mandatory=$true)][string]$Value)
     return '"' + ($Value -replace '"', '""') + '"'
@@ -1310,6 +1324,7 @@ function Get-SynapseDaemonArgumentText {
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
+        [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [AllowNull()][string]$CalyxConfigPath
     )
@@ -1323,6 +1338,9 @@ function Get-SynapseDaemonArgumentText {
     )
     if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
         $daemonArguments += @('--calyx-config', (Quote-WindowsCommandArgument $CalyxConfigPath))
+    }
+    if ($EnableAudio) {
+        $daemonArguments += '--enable-audio'
     }
     $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
     if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
@@ -1341,6 +1359,7 @@ function New-HiddenDaemonLauncher {
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [AllowNull()][string]$CalyxConfigPath
     )
@@ -1355,6 +1374,7 @@ function New-HiddenDaemonLauncher {
         -Bind $Bind `
         -DbPath $DbPath `
         -ProfilesDir $ProfilesDir `
+        -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
         -CalyxConfigPath $CalyxConfigPath
     $powerShellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
@@ -1379,6 +1399,7 @@ $MaintenanceLockPath = __MAINTENANCE_LOCK_PATH__
 $ExpectedCalyxConfigPath = __EXPECTED_CALYX_CONFIG_PATH__
 $DaemonArgumentText = __DAEMON_ARGUMENT_TEXT__
 $ExpectedAllowedPermissions = __EXPECTED_ALLOWED_PERMISSIONS__
+$ExpectedEnableAudio = __EXPECTED_ENABLE_AUDIO__
 
 $restartFloorSeconds = 2
 $restartCeilingSeconds = 60
@@ -1541,11 +1562,13 @@ function Test-ExpectedDaemonProcess {
     $actualDb = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--db')
     $actualProfiles = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
     $actualCalyxConfig = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config')
+    $actualEnableAudio = $commandLine -match '(?i)(?:^|\s)--enable-audio(?:\s|$)'
     $baseMatches = ($actualMode -ieq 'http') -and
         ($actualBind -ieq $Bind) -and
         ($actualDb -ieq (Normalize-PathArgument -Value $DbPath)) -and
         ($actualProfiles -ieq (Normalize-PathArgument -Value $ProfilesDir)) -and
-        ($actualCalyxConfig -ieq (Normalize-PathArgument -Value $ExpectedCalyxConfigPath))
+        ($actualCalyxConfig -ieq (Normalize-PathArgument -Value $ExpectedCalyxConfigPath)) -and
+        ($actualEnableAudio -eq [bool]::Parse($ExpectedEnableAudio))
     if (-not $baseMatches) {
         return $false
     }
@@ -1833,7 +1856,8 @@ while ($true) {
         Replace('__MAINTENANCE_LOCK_PATH__', (Quote-PowerShellSingleQuotedString $MaintenanceLockPath)).
         Replace('__EXPECTED_CALYX_CONFIG_PATH__', (Quote-PowerShellSingleQuotedString $CalyxConfigPath)).
         Replace('__DAEMON_ARGUMENT_TEXT__', (Quote-PowerShellSingleQuotedString $daemonArgumentText)).
-        Replace('__EXPECTED_ALLOWED_PERMISSIONS__', (Quote-PowerShellSingleQuotedString $allowedPermissionsArgument))
+        Replace('__EXPECTED_ALLOWED_PERMISSIONS__', (Quote-PowerShellSingleQuotedString $allowedPermissionsArgument)).
+        Replace('__EXPECTED_ENABLE_AUDIO__', (Quote-PowerShellSingleQuotedString ([string]$EnableAudio)))
 
     $supervisorScript | Set-Content -Path $supervisorPath -Encoding ascii
 
@@ -3658,6 +3682,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$ExpectedExePath,
         [Parameter(Mandatory=$true)][string]$ExpectedSha256,
+        [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [AllowNull()][string]$CalyxConfigPath
     )
@@ -3672,6 +3697,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
             -CommandLine $target.CommandLine `
             -Name '--allowed-permissions'
         $actualAllowed = Normalize-SynapseAllowedPermissionsArgument -Value $actualAllowedRaw
+        $actualEnableAudio = ([string]$target.CommandLine) -match '(?i)(?:^|\s)--enable-audio(?:\s|$)'
         $actualCalyxConfig = Normalize-SynapseSetupPathForCompare -Path (Get-SynapseCommandLineArgumentValue -CommandLine $target.CommandLine -Name '--calyx-config')
         $actualPath = Normalize-SynapseSetupPathForCompare -Path ([string]$target.ExecutablePath)
         $actualSha256 = '<not-read>'
@@ -3689,8 +3715,9 @@ function Get-SynapseLiveDaemonArgumentDrift {
         $pathDrift = ($actualPath -ine $expectedPath)
         $hashDrift = ($actualSha256 -ine $ExpectedSha256)
         $permissionDrift = ($actualAllowed -ne $expectedAllowed)
+        $audioDrift = ($actualEnableAudio -ne $EnableAudio)
         $calyxConfigDrift = ($actualCalyxConfig -ine $expectedCalyxConfig)
-        if ($pathDrift -or $hashDrift -or $permissionDrift -or $calyxConfigDrift) {
+        if ($pathDrift -or $hashDrift -or $permissionDrift -or $audioDrift -or $calyxConfigDrift) {
             $drifts += [pscustomobject]@{
                 pid = $target.ProcessId
                 expected_executable_path = $expectedPath
@@ -3700,6 +3727,8 @@ function Get-SynapseLiveDaemonArgumentDrift {
                 executable_hash_error = if ($hashError) { $hashError } else { '<none>' }
                 expected_allowed_permissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
                 actual_allowed_permissions = if ([string]::IsNullOrWhiteSpace($actualAllowed)) { '<default-read-only>' } else { $actualAllowed }
+                expected_enable_audio = $EnableAudio
+                actual_enable_audio = $actualEnableAudio
                 expected_calyx_config_path = if ([string]::IsNullOrWhiteSpace($expectedCalyxConfig)) { '<defaults>' } else { $expectedCalyxConfig }
                 actual_calyx_config_path = if ([string]::IsNullOrWhiteSpace($actualCalyxConfig)) { '<defaults>' } else { $actualCalyxConfig }
                 command_line = $target.CommandLine
@@ -3711,6 +3740,7 @@ function Get-SynapseLiveDaemonArgumentDrift {
         HasDrift = ($drifts.Count -gt 0)
         TargetCount = $targets.Count
         DesiredAllowedPermissions = if ([string]::IsNullOrWhiteSpace($expectedAllowed)) { '<default-read-only>' } else { $expectedAllowed }
+        DesiredEnableAudio = $EnableAudio
         DesiredCalyxConfigPath = if ([string]::IsNullOrWhiteSpace($expectedCalyxConfig)) { '<defaults>' } else { $expectedCalyxConfig }
         Drifts = $drifts
     }
@@ -8344,6 +8374,7 @@ function Test-SynapseCandidateDaemon {
         [Parameter(Mandatory=$true)][string]$ProfilesDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$LogDir,
+        [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [AllowNull()][string]$CalyxConfigPath,
         [AllowNull()][string]$ReplacementReservationId = $null
@@ -8393,6 +8424,9 @@ function Test-SynapseCandidateDaemon {
             $candidateArgs = @('--mode','http','--bind',$candidateBind,'--db',$candidateDb,'--profile-dir',$ProfilesDir,'--calyx-vault-dir',$candidateCalyxVault,'--log-level','info')
             if (-not [string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
                 $candidateArgs += @('--calyx-config', $CalyxConfigPath)
+            }
+            if ($EnableAudio) {
+                $candidateArgs += '--enable-audio'
             }
             $allowedPermissionsArgument = Normalize-SynapseAllowedPermissionsArgument -Value $AllowedPermissions
             if (-not [string]::IsNullOrWhiteSpace($allowedPermissionsArgument)) {
@@ -8456,6 +8490,13 @@ function Test-SynapseCandidateDaemon {
         $healthPid = [int]$health.pid
         if ($healthPid -ne [int]$candidate.Id) {
             Die "SYNAPSE_CANDIDATE_PID_MISMATCH expected_pid=$($candidate.Id) health_pid=$healthPid bind=$candidateBind remediation=health came from an unexpected process; refusing handoff"
+        }
+        if ($EnableAudio) {
+            $audioHealth = $health.subsystems.audio
+            if ($null -eq $audioHealth -or [string]$audioHealth.status -eq 'disabled' -or $audioHealth.stt_model_available -ne $true) {
+                $audioReadback = if ($null -eq $audioHealth) { '<missing>' } else { $audioHealth | ConvertTo-Json -Depth 8 -Compress }
+                Die "SYNAPSE_CANDIDATE_AUDIO_CONTRACT_FAILED pid=$healthPid bind=$candidateBind audio=$audioReadback remediation=verify --enable-audio reached the candidate, READ_AUDIO is granted, and the pinned Whisper/ORT Extensions artifacts are packaged before replacing the live daemon"
+            }
         }
         if ($health.ok -ne $true) {
             $subsystemStatuses = @()
@@ -11248,6 +11289,7 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$TokenPath,
         [Parameter(Mandatory=$true)][string]$MaintenanceLockPath,
+        [bool]$EnableAudio,
         [AllowNull()][string]$AllowedPermissions,
         [AllowNull()][string]$CalyxConfigPath
     )
@@ -11302,7 +11344,8 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         'MaintenanceLockPath',
         'ExpectedCalyxConfigPath',
         'DaemonArgumentText',
-        'ExpectedAllowedPermissions'
+        'ExpectedAllowedPermissions',
+        'ExpectedEnableAudio'
     )
     $actualAssignments = @{}
     $assignmentPattern = '^\$(?<name>[A-Za-z][A-Za-z0-9]*)\s*=\s*''(?<value>(?:''''|[^''])*)''\s*$'
@@ -11331,8 +11374,9 @@ function Assert-SynapseLiveDaemonAdoptionIdentity {
         SupervisorEvents = $supervisorEventsPath
         MaintenanceLockPath = $MaintenanceLockPath
         ExpectedCalyxConfigPath = $expectedCalyxConfig
-        DaemonArgumentText = Get-SynapseDaemonArgumentText -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath
+        DaemonArgumentText = Get-SynapseDaemonArgumentText -Bind $Bind -DbPath $DbPath -ProfilesDir $ProfilesDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath
         ExpectedAllowedPermissions = $expectedAllowed
+        ExpectedEnableAudio = [string]$EnableAudio
     }
     $assignmentDrift = [System.Collections.Generic.List[string]]::new()
     foreach ($name in $requiredAssignments) {
@@ -12400,7 +12444,7 @@ $candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $inst
 $candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
 Info "Candidate ONNX Runtime bundle verified files=$candidateRuntimeSummary"
 $replacementReservationId = Get-SynapseCandidateReplacementReservationId -Bind $Bind -Token $token
-$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ReplacementReservationId $replacementReservationId
+$candidatePreflight = Test-SynapseCandidateDaemon -CandidateExePath $installSourcePath -ProfilesDir $candidateProfilesDir -TokenPath $TokenPath -LogDir $LogDir -EnableAudio $EnableAudio -AllowedPermissions $AllowedPermissions -CalyxConfigPath $CalyxConfigPath -ReplacementReservationId $replacementReservationId
 if ($candidatePreflight.Sha256 -ne $installSourceHash) {
     Die "SYNAPSE_CANDIDATE_HASH_MISMATCH expected_sha256=$installSourceHash actual_sha256=$($candidatePreflight.Sha256) path=$installSourcePath remediation=candidate preflight observed different bytes; refusing handoff"
 }
@@ -12422,6 +12466,7 @@ if ($SkipBuild) {
             -DbPath $DbPath `
             -ExpectedExePath $ExePath `
             -ExpectedSha256 $installSourceHash `
+            -EnableAudio $EnableAudio `
             -AllowedPermissions $AllowedPermissions `
             -CalyxConfigPath $CalyxConfigPath
         if ($liveDaemonArgumentDrift.HasDrift) {
@@ -12803,6 +12848,7 @@ if (-not $liveDaemonHandoffRequired) {
         -LogDir $LogDir `
         -TokenPath $TokenPath `
         -MaintenanceLockPath $MaintenanceLockPath `
+        -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
         -CalyxConfigPath $CalyxConfigPath
     Info ("SYNAPSE_LIVE_DAEMON_ADOPTION_VERIFIED task={0} task_state={1} task_definition_sha256={2} hidden_launcher_sha256={3} supervisor_sha256={4} supervisor_pid={5} daemon_pid={6} supervisor_state={7} daemon_arguments=[{8}] remediation=none; setup preserved the exact running task/supervisor/daemon instead of re-registering live restart authority" -f `
@@ -12833,6 +12879,7 @@ if (-not $liveDaemonHandoffRequired) {
         -LogDir $LogDir `
         -TokenPath $TokenPath `
         -MaintenanceLockPath $MaintenanceLockPath `
+        -EnableAudio $EnableAudio `
         -AllowedPermissions $AllowedPermissions `
         -CalyxConfigPath $CalyxConfigPath
 
@@ -13026,6 +13073,7 @@ if (-not $ok) {
                 -LogDir $LogDir `
                 -TokenPath $TokenPath `
                 -MaintenanceLockPath $MaintenanceLockPath `
+                -EnableAudio $EnableAudio `
                 -AllowedPermissions $AllowedPermissions `
                 -CalyxConfigPath $CalyxConfigPath
             Info "Manual install-health rollback probe restored normal daemon launcher before rollback stop path=$hiddenLauncher"
@@ -13063,6 +13111,7 @@ if (-not $ok) {
                 -LogDir $LogDir `
                 -TokenPath $TokenPath `
                 -MaintenanceLockPath $MaintenanceLockPath `
+                -EnableAudio $EnableAudio `
                 -AllowedPermissions $AllowedPermissions `
                 -CalyxConfigPath $CalyxConfigPath
             Info "Manual install-health rollback probe restored normal daemon launcher before rollback start path=$hiddenLauncher"
