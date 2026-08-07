@@ -520,6 +520,7 @@ impl SynapseService {
         }
         match lease::try_acquire(session_id, lease::ttl_from_ms(remaining_ms)) {
             LeaseOutcome::Acquired(status) | LeaseOutcome::Renewed(status) => {
+                crate::m2::foreground_fence::disarm("foreground_input_lease_continuity_restored");
                 if let Err(error) = self.persist_session_lease(session_id, &status) {
                     let released = lease::release_if_owner(session_id);
                     tracing::error!(

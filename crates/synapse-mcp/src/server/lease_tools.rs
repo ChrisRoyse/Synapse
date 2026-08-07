@@ -844,6 +844,10 @@ fn acquire_lease_for_session(
     let ttl = lease::ttl_from_ms(ttl_ms);
     match lease::try_acquire(session_id, ttl) {
         LeaseOutcome::Acquired(status) => {
+            // A lease owner change invalidates any process-global destination
+            // armed by the prior owner. The new owner must bind/focus its own
+            // exact target before raw input can dispatch (#1830).
+            crate::m2::foreground_fence::disarm("foreground_input_lease_acquired_by_new_owner");
             tracing::info!(
                 code = "INPUT_LEASE_ACQUIRED",
                 session_id = %session_id,
@@ -905,6 +909,7 @@ fn acquire_lease_for_session(
 fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, ErrorData> {
     match lease::release(session_id) {
         Ok(status) => {
+            crate::m2::foreground_fence::disarm("foreground_input_lease_released");
             tracing::info!(
                 code = "INPUT_LEASE_RELEASED",
                 session_id = %session_id,
@@ -923,6 +928,9 @@ fn release_lease_for_session(session_id: &str) -> Result<ControlLeaseResponse, E
             // caller still audits it. Erroring here trained callers to swallow
             // release errors, which masked the one case that matters below.
             LeaseError::NotHeld { holder: None, .. } => {
+                crate::m2::foreground_fence::disarm(
+                    "foreground_input_lease_release_confirmed_not_held",
+                );
                 tracing::info!(
                     code = "INPUT_LEASE_RELEASE_NOOP",
                     session_id = %session_id,
@@ -946,6 +954,7 @@ fn handoff_lease_for_session(
 ) -> Result<synapse_action::LeaseHandoff, ErrorData> {
     match lease::handoff(from_session_id, to_session_id, lease::ttl_from_ms(ttl_ms)) {
         Ok(handoff) => {
+            crate::m2::foreground_fence::disarm("foreground_input_lease_handed_off");
             tracing::info!(
                 code = "INPUT_LEASE_HANDED_OFF",
                 from_session_id,

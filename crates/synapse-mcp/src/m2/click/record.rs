@@ -16,6 +16,7 @@ pub(super) async fn execute_actor_actions(
     let action_count = actions.len();
     for (action_index, action) in actions.into_iter().enumerate() {
         boundary.ensure("immediately_before_click_actor_action")?;
+        crate::m2::foreground_fence::ensure("immediately_before_click_actor_global_input")?;
         handle
             .execute(action)
             .await

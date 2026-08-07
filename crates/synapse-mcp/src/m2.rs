@@ -968,6 +968,7 @@ pub(crate) fn acquire_foreground_input_lease_with_ttl(
     }
     match lease::try_acquire(session_id, lease::ttl_from_ms(ttl_ms)) {
         LeaseOutcome::Acquired(status) => {
+            foreground_fence::disarm("foreground_input_lease_action_acquired_by_new_owner");
             let boundary_result = ensure_operator_panic_action_admission(
                 tool,
                 "immediately_after_lease_acquire",

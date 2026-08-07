@@ -13,16 +13,18 @@
 //! long since taken the foreground back. The typed string and an Enter went to
 //! a terminal at a shell prompt.
 //!
-//! The fence closes that hole structurally. [`arm`] records the window a
-//! verified activation actually put in the foreground; every foreground-tier
-//! dispatch then calls [`ensure`], which re-reads `GetForegroundWindow()` and
-//! refuses with `ACTION_FOREGROUND_LOST` when the destination is not the armed
-//! window — naming the window that *did* hold the foreground, so a near-miss is
-//! attributable after the fact instead of silent.
+//! The fence closes that hole structurally. [`arm`] records an exact target
+//! identity, either from a verified activation or from an agent-owned session
+//! target that must already be foreground before raw input is allowed. Every
+//! foreground-tier dispatch then calls [`ensure`], which re-reads
+//! `GetForegroundWindow()` and refuses with `ACTION_FOREGROUND_LOST` when the
+//! destination is not the armed window — naming the window that *did* hold the
+//! foreground, so a near-miss is attributable after the fact instead of
+//! silent.
 //!
-//! Fail-closed direction matters: an unarmed fence permits dispatch (no
-//! activation was ever claimed, so there is no expectation to violate), but an
-//! armed fence that cannot read the foreground refuses. Never the reverse.
+//! Fail-closed direction matters: unarmed, lease-lost, and unreadable states
+//! all refuse before delivery. Raw global input without an exact destination
+//! is not a capability; it is input to whichever human window wins the race.
 
 use std::sync::{Mutex, OnceLock};
 
@@ -31,6 +33,7 @@ use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 const SOURCE_OF_TRUTH: &str = "GetForegroundWindow() read immediately before input dispatch";
+const UNARMED_DETAIL_CODE: &str = "M2_FOREGROUND_FENCE_UNARMED";
 
 /// The window a verified foreground activation left in the foreground.
 #[derive(Debug, Clone)]
@@ -53,11 +56,11 @@ fn guard() -> std::sync::MutexGuard<'static, Option<ArmedForeground>> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Arms the fence with the window a foreground activation verifiably reached.
+/// Arms the fence with a fully resolved top-level window identity.
 ///
-/// Called only after `act_focus_window`'s separate `GetForegroundWindow()`
-/// readback has confirmed the move, so the armed value is observed reality,
-/// never the requested target.
+/// Callers either provide a verified `GetForegroundWindow()` readback or use
+/// [`arm_expected_target`] to resolve an agent-owned target without activating
+/// it. In both cases the stored identity comes from live Win32 state.
 pub(crate) fn arm(armed: ArmedForeground) {
     tracing::info!(
         code = "M2_FOREGROUND_FENCE_ARMED",
@@ -69,6 +72,82 @@ pub(crate) fn arm(armed: ArmedForeground) {
         "foreground delivery fence armed to the verified foreground window"
     );
     *guard() = Some(armed);
+}
+
+/// Arms an exact agent-owned target without activating it.
+///
+/// Background UIA/CDP/PostMessage tiers do not consult the fence and remain
+/// fully concurrent. If routing reaches global input, [`ensure`] requires this
+/// exact root HWND to already be the real foreground; it never activates the
+/// target or falls back to the human foreground.
+pub(crate) fn arm_expected_target(
+    hwnd: i64,
+    armed_by: &'static str,
+) -> Result<ArmedForeground, ErrorData> {
+    #[cfg(windows)]
+    {
+        let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
+            ErrorData::new(
+                ErrorCode(-32099),
+                format!(
+                    "foreground target binding refused: target hwnd 0x{hwnd:x} could not be normalized to a live top-level window: {error}"
+                ),
+                Some(json!({
+                    "code": error_codes::ACTION_TARGET_INVALID,
+                    "detail_code": "M2_FOREGROUND_TARGET_ROOT_INVALID",
+                    "refused_before_delivery": true,
+                    "target_hwnd": hwnd,
+                    "source_of_truth": "IsWindow + GetAncestor(GA_ROOT) before foreground dispatch",
+                    "readback_error_code": error.code(),
+                    "readback_error": error.to_string(),
+                    "remediation": "bind a live agent-owned window target and retry; never route raw input to an invalid or stale HWND",
+                })),
+            )
+        })?;
+        let context = synapse_a11y::foreground_context(root_hwnd).map_err(|error| {
+            ErrorData::new(
+                ErrorCode(-32099),
+                format!(
+                    "foreground target binding refused: exact target identity for root hwnd 0x{root_hwnd:x} could not be read: {error}"
+                ),
+                Some(json!({
+                    "code": error_codes::ACTION_TARGET_INVALID,
+                    "detail_code": "M2_FOREGROUND_TARGET_IDENTITY_UNREADABLE",
+                    "refused_before_delivery": true,
+                    "requested_hwnd": hwnd,
+                    "target_root_hwnd": root_hwnd,
+                    "source_of_truth": "GetWindowThreadProcessId + process/window identity before foreground dispatch",
+                    "readback_error_code": error.code(),
+                    "readback_error": error.to_string(),
+                    "remediation": "bind a live agent-owned window target and retry; never route raw input to an unverified window identity",
+                })),
+            )
+        })?;
+        let armed = ArmedForeground {
+            hwnd: context.hwnd,
+            pid: context.pid,
+            process_name: context.process_name,
+            window_title: context.window_title,
+            armed_by,
+        };
+        arm(armed.clone());
+        Ok(armed)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd, armed_by);
+        Err(ErrorData::new(
+            ErrorCode(-32099),
+            "foreground target binding requires Windows GetForegroundWindow identity",
+            Some(json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "detail_code": "M2_FOREGROUND_TARGET_BINDING_UNAVAILABLE",
+                "refused_before_delivery": true,
+                "source_of_truth": "Windows foreground target identity",
+                "remediation": "use a supported background target route on this platform",
+            })),
+        ))
+    }
 }
 
 /// Clears the fence when the foreground claim is given up.
@@ -100,7 +179,35 @@ pub(crate) fn armed() -> Option<ArmedForeground> {
 /// step was stopped, matching the operator-panic boundary convention.
 pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
     let Some(expected) = armed() else {
-        return Ok(());
+        #[cfg(windows)]
+        let actual = synapse_a11y::current_foreground_context()
+            .ok()
+            .map(|context| foreground_context_json(&context))
+            .unwrap_or(Value::Null);
+        #[cfg(not(windows))]
+        let actual = Value::Null;
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_LOST,
+            detail_code = UNARMED_DETAIL_CODE,
+            stage,
+            "refused global input because no exact destination was armed"
+        );
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "foreground input refused at {stage}: no exact target window is armed, so global input has no verified destination"
+            ),
+            Some(json!({
+                "code": error_codes::ACTION_FOREGROUND_LOST,
+                "detail_code": UNARMED_DETAIL_CODE,
+                "refused_before_delivery": true,
+                "stage": stage,
+                "expected": Value::Null,
+                "actual": actual,
+                "source_of_truth": SOURCE_OF_TRUTH,
+                "resolution": "bind an agent-owned session target and use act operation=foreground, or explicitly focus_window under the input lease before calling a raw foreground primitive",
+            })),
+        ));
     };
     // The fence's validity is exactly the input lease's validity: a released
     // or expired lease ends the foreground claim, and foreground dispatch is
@@ -109,7 +216,29 @@ pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
     // without needing every release path to remember to call `disarm`.
     if !synapse_action::lease::status().held {
         disarm("foreground_input_lease_not_held");
-        return Ok(());
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+            stage,
+            expected_hwnd = expected.hwnd,
+            "refused global input because the foreground input lease is no longer held"
+        );
+        return Err(ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "foreground input refused at {stage}: the input lease is not held, so target hwnd 0x{:x} has no delivery authority",
+                expected.hwnd
+            ),
+            Some(json!({
+                "code": error_codes::ACTION_FOREGROUND_LEASE_NOT_HELD,
+                "detail_code": "M2_FOREGROUND_FENCE_LEASE_NOT_HELD",
+                "refused_before_delivery": true,
+                "stage": stage,
+                "expected": fence_window_json(&expected),
+                "actual_lease": synapse_action::lease::status(),
+                "source_of_truth": "synapse_action::lease status read immediately before input dispatch",
+                "resolution": "acquire the foreground input lease for this session, re-bind or re-focus the exact target, then retry",
+            })),
+        ));
     }
     #[cfg(windows)]
     {
@@ -200,7 +329,6 @@ pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
     }
 }
 
-#[cfg(windows)]
 fn fence_window_json(armed: &ArmedForeground) -> Value {
     json!({
         "hwnd": armed.hwnd,
@@ -208,5 +336,15 @@ fn fence_window_json(armed: &ArmedForeground) -> Value {
         "process_name": armed.process_name,
         "window_title": armed.window_title,
         "armed_by": armed.armed_by,
+    })
+}
+
+#[cfg(windows)]
+fn foreground_context_json(context: &synapse_core::ForegroundContext) -> Value {
+    json!({
+        "hwnd": context.hwnd,
+        "pid": context.pid,
+        "process_name": context.process_name,
+        "window_title": context.window_title,
     })
 }

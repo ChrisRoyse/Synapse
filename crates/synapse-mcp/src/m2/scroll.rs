@@ -649,6 +649,7 @@ async fn execute_scroll_actions(
     let last_index = actions.len().saturating_sub(1);
     for (index, action) in actions.into_iter().enumerate() {
         boundary.ensure("immediately_before_foreground_scroll_dispatch")?;
+        super::foreground_fence::ensure("immediately_before_foreground_scroll_dispatch")?;
         handle
             .execute(action)
             .await

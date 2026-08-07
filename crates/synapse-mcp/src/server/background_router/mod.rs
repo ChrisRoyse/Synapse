@@ -59,7 +59,7 @@ const TARGET_ACT_STATUS_ERROR: &str = "error";
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
-const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "call act operation=foreground with the same action payload and a non-empty reason; the facade acquires the foreground input lease, temporarily sets break_glass, runs target_act, restores the prior profile, and releases the lease";
+const TARGET_ACT_FOREGROUND_ROUTE_REMEDIATION: &str = "when raw foreground is truly required, explicitly focus the exact agent-owned session target, then call act operation=foreground with the same action payload and a non-empty reason; the facade binds that exact target, acquires the foreground input lease, temporarily sets break_glass, refuses if the real foreground differs, restores the prior profile, and releases the lease";
 const ACT_FOREGROUND_CLEANUP_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id> row + synapse_action::lease and persisted MCP session lease row";
 const ACT_FOREGROUND_CLEANUP_FAILED_DETAIL_CODE: &str =
     "ACT_FOREGROUND_CLEANUP_POSTCONDITION_FAILED";
@@ -3285,15 +3285,25 @@ impl SynapseService {
                     None,
                 ));
             }
-            Some(
-                self.target_act_authority_locked(
-                    Parameters(params.action),
-                    request_context.clone(),
-                    Some(operator_panic_epoch_at_entry),
-                    Some(session_id.clone()),
-                )
-                .await,
-            )
+            // Bind the facade to this session's exact owned target without
+            // activating it. Background tiers remain free to act on the bound
+            // target; any eventual SendInput/cursor tier must separately prove
+            // that this exact root HWND is already the real foreground. Keep a
+            // binding failure in `action_result` so profile/lease cleanup still
+            // runs after authority mutations (#1830).
+            crate::m2::foreground_fence::disarm("act_foreground_before_target_binding");
+            Some(match arm_act_foreground_session_target(self, &session_id) {
+                Ok(()) => {
+                    self.target_act_authority_locked(
+                        Parameters(params.action),
+                        request_context.clone(),
+                        Some(operator_panic_epoch_at_entry),
+                        Some(session_id.clone()),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            })
         } else {
             None
         };
@@ -8407,6 +8417,50 @@ fn target_act_optional_session_target_window_hwnd(
     };
     let target = service.session_target(Some(&session_id))?;
     Ok(target_act_target_window_hwnd(target.as_ref()))
+}
+
+fn arm_act_foreground_session_target(
+    service: &SynapseService,
+    session_id: &str,
+) -> Result<(), ErrorData> {
+    let target = service.session_target(Some(session_id))?.ok_or_else(|| {
+        ErrorData::new(
+            ErrorCode(-32099),
+            "act operation=foreground requires an exact agent-owned session target; refusing implicit use of the human OS foreground",
+            Some(json!({
+                "code": error_codes::TARGET_NOT_SET,
+                "detail_code": "ACT_FOREGROUND_SESSION_TARGET_REQUIRED",
+                "refused_before_delivery": true,
+                "tool": "act",
+                "operation": "foreground",
+                "session_id": session_id,
+                "source_of_truth": "CF_SESSIONS session target row + in-process session target registry",
+                "remediation": "set or spawn an agent-owned window/CDP target for this MCP session, then retry; never use the human OS foreground as an implicit fallback",
+            })),
+        )
+    })?;
+    let target_hwnd = target_act_target_window_hwnd(Some(&target)).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_TARGET_INVALID,
+            "act operation=foreground session target has no physical root window HWND",
+        )
+    })?;
+    let armed = crate::m2::foreground_fence::arm_expected_target(
+        target_hwnd,
+        "act_foreground_session_target",
+    )?;
+    tracing::info!(
+        code = "ACT_FOREGROUND_EXACT_TARGET_BOUND",
+        session_id,
+        requested_target_hwnd = target_hwnd,
+        target_root_hwnd = armed.hwnd,
+        target_pid = armed.pid,
+        target_process = %armed.process_name,
+        target_title = %armed.window_title,
+        source_of_truth = "live session target + IsWindow/GetAncestor/window identity readback",
+        "foreground facade bound to an exact agent-owned target without activation"
+    );
+    Ok(())
 }
 
 const fn target_act_target_window_hwnd(target: Option<&SessionTarget>) -> Option<i64> {

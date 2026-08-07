@@ -21,6 +21,12 @@ pub(in crate::m2::press) async fn execute_live_press_sequence(
             release_pressed_keys(&handle, &pressed, backend).await;
             return Err(error);
         }
+        if let Err(error) =
+            crate::m2::foreground_fence::ensure("immediately_before_live_press_key_down")
+        {
+            release_pressed_keys(&handle, &pressed, backend).await;
+            return Err(error);
+        }
         if let Err(error) = handle
             .execute(Action::KeyDown {
                 key: key.clone(),

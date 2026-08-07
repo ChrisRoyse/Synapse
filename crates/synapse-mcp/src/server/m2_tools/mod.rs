@@ -519,6 +519,19 @@ impl SynapseService {
         } else {
             None
         };
+        if let (Some(expected_hwnd), Some(before)) = (
+            visual_delta_target_window_hwnd,
+            before_text_signature.as_ref(),
+        ) && let Err(error) = ensure_act_type_signature_matches_expected_target(
+            expected_hwnd,
+            &before.signature,
+            "before_foreground_type_dispatch",
+            true,
+        ) {
+            let result: Result<ActTypeResponse, ErrorData> = Err(error);
+            self.audit_action_result_for_request("act_type", &result, &request_context)?;
+            return result.map(Json);
+        }
         let before_visual_signature =
             if act_type_should_capture_visual_signature(&params, visual_delta_target_window_hwnd) {
                 match self
@@ -554,6 +567,7 @@ impl SynapseService {
                     &emitted,
                     browser_url_policy.as_ref(),
                     session_id.as_deref(),
+                    visual_delta_target_window_hwnd,
                 )
                 .await
             {
@@ -3182,6 +3196,10 @@ impl SynapseService {
                 expected, target,
             ));
         }
+        crate::m2::foreground_fence::arm_expected_target(
+            target.root_hwnd,
+            "act_type_foreground_fallback_target",
+        )?;
         Ok(())
     }
 
@@ -3208,6 +3226,9 @@ impl SynapseService {
         ];
         for action in actions {
             boundary.ensure("immediately_before_act_type_foreground_fallback_click")?;
+            crate::m2::foreground_fence::ensure(
+                "immediately_before_act_type_foreground_fallback_click",
+            )?;
             handle
                 .execute(action)
                 .await
@@ -3339,6 +3360,10 @@ impl SynapseService {
 
         let _lease_guard =
             acquire_tool_foreground_input_lease(self, "act_set_field_text", request_context)?;
+        crate::m2::foreground_fence::arm_expected_target(
+            target.root_hwnd,
+            "act_set_field_text_foreground_target",
+        )?;
 
         // Actionability before the coordinate click (the Playwright `fill`
         // discipline): scroll an off-viewport target into view, re-read its
@@ -3425,6 +3450,9 @@ impl SynapseService {
         ];
         for action in click_actions {
             boundary.ensure("immediately_before_set_field_text_foreground_click")?;
+            crate::m2::foreground_fence::ensure(
+                "immediately_before_set_field_text_foreground_click",
+            )?;
             handle.execute(action).await.map_err(|error| {
                 set_field_text_foreground_error(
                     &target,
@@ -3454,6 +3482,7 @@ impl SynapseService {
 
         let select_all = crate::m2::select_all_chord_action(60, Backend::Auto)?;
         boundary.ensure("immediately_before_set_field_text_select_all")?;
+        crate::m2::foreground_fence::ensure("immediately_before_set_field_text_select_all")?;
         handle.execute(select_all).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -3481,6 +3510,7 @@ impl SynapseService {
             )
         };
         boundary.ensure("immediately_before_set_field_text_replacement_input")?;
+        crate::m2::foreground_fence::ensure("immediately_before_set_field_text_replacement_input")?;
         handle.execute(replace_action).await.map_err(|error| {
             set_field_text_foreground_error(
                 &target,
@@ -3915,6 +3945,7 @@ impl SynapseService {
         emitted: &str,
         browser_url_policy: Option<&ActTypeBrowserUrlPolicy>,
         session_id: Option<&str>,
+        expected_target_window_hwnd: Option<i64>,
     ) -> Result<ActTypeResponse, ErrorData> {
         let started = Instant::now();
         let timeout = Duration::from_millis(u64::from(verify_timeout_ms));
@@ -3939,6 +3970,14 @@ impl SynapseService {
                     session_id,
                 )
                 .await?;
+            if let Some(expected_hwnd) = expected_target_window_hwnd {
+                ensure_act_type_signature_matches_expected_target(
+                    expected_hwnd,
+                    &after.signature,
+                    "after_foreground_type_dispatch",
+                    false,
+                )?;
+            }
             let before_hash = verify_hash_json(&before.signature)?;
             let after_hash = verify_hash_json(&after.signature)?;
             let result = if let Some(policy) = browser_url_policy {
@@ -3986,6 +4025,14 @@ impl SynapseService {
             Ok(after) => after,
             Err(error) => return Err(last_error.unwrap_or(error)),
         };
+        if let Some(expected_hwnd) = expected_target_window_hwnd {
+            ensure_act_type_signature_matches_expected_target(
+                expected_hwnd,
+                &after.signature,
+                "final_after_foreground_type_dispatch",
+                false,
+            )?;
+        }
         let before_hash = verify_hash_json(&before.signature)?;
         let after_hash = verify_hash_json(&after.signature)?;
         if let Some(policy) = browser_url_policy {
@@ -4882,7 +4929,25 @@ fn act_type_visual_delta_target_window(
             "conflicting_postconditions",
         ));
     }
-    Ok(Some(hwnd))
+    let root_hwnd = synapse_a11y::top_level_root_hwnd(hwnd).map_err(|error| {
+        ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "act_type verify_target_window_hwnd 0x{hwnd:x} is not a live target window: {error}"
+            ),
+            Some(json!({
+                "code": error_codes::ACTION_TARGET_INVALID,
+                "detail_code": "ACT_TYPE_VERIFY_TARGET_WINDOW_INVALID",
+                "refused_before_delivery": true,
+                "target_hwnd": hwnd,
+                "source_of_truth": "IsWindow + GetAncestor(GA_ROOT) before foreground typing",
+                "readback_error_code": error.code(),
+                "readback_error": error.to_string(),
+                "remediation": "bind a live agent-owned window target and retry",
+            })),
+        )
+    })?;
+    Ok(Some(root_hwnd))
 }
 
 fn act_type_requires_foreground_route(
@@ -5938,6 +6003,54 @@ fn act_type_foreground_identity_changed(
     before.foreground_hwnd != after.foreground_hwnd
         || before.foreground_pid != after.foreground_pid
         || before.foreground_process != after.foreground_process
+}
+
+/// Proves that a global focused-text readback belongs to the exact window the
+/// caller bound for delivery. A delta in some unrelated human-foreground edit
+/// control is never evidence that the target changed (#1830).
+fn ensure_act_type_signature_matches_expected_target(
+    expected_root_hwnd: i64,
+    signature: &ActTypeTextSignature,
+    stage: &'static str,
+    refused_before_delivery: bool,
+) -> Result<(), ErrorData> {
+    if signature.foreground_hwnd == expected_root_hwnd {
+        return Ok(());
+    }
+    tracing::error!(
+        code = error_codes::ACTION_FOREGROUND_LOST,
+        detail_code = "ACT_TYPE_TEXT_READBACK_TARGET_MISMATCH",
+        stage,
+        expected_root_hwnd,
+        actual_foreground_hwnd = signature.foreground_hwnd,
+        actual_foreground_pid = signature.foreground_pid,
+        actual_foreground_process = %signature.foreground_process,
+        refused_before_delivery,
+        "act_type focused-text readback belongs to a different foreground window than the exact bound target"
+    );
+    Err(ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_type target verification failed at {stage}: focused-text readback came from hwnd 0x{:x} ({}), not exact target root hwnd 0x{expected_root_hwnd:x}",
+            signature.foreground_hwnd, signature.foreground_process
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_FOREGROUND_LOST,
+            "detail_code": "ACT_TYPE_TEXT_READBACK_TARGET_MISMATCH",
+            "refused_before_delivery": refused_before_delivery,
+            "stage": stage,
+            "expected_target_root_hwnd": expected_root_hwnd,
+            "actual_foreground": {
+                "hwnd": signature.foreground_hwnd,
+                "pid": signature.foreground_pid,
+                "process_name": &signature.foreground_process,
+                "window_title_sha256": &signature.foreground_title_sha256,
+            },
+            "readback": signature,
+            "source_of_truth": "GetForegroundWindow identity attached to the focused UIA/CDP/OCR text readback",
+            "remediation": "use a background target-scoped UIA/CDP route, or explicitly focus the exact bound target under the input lease before retrying raw foreground typing",
+        })),
+    ))
 }
 
 fn act_type_text_terminal_failure(

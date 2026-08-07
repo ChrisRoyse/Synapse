@@ -884,6 +884,14 @@ async fn execute_with_modifiers(
                     .await;
             return Err(error);
         }
+        if let Err(error) =
+            super::foreground_fence::ensure("immediately_before_stroke_modifier_key_down")
+        {
+            let _release_result =
+                release_pressed_modifiers(handle, &pressed, backend, "foreground_fence_cleanup")
+                    .await;
+            return Err(error);
+        }
         if let Err(error) = handle
             .execute(Action::KeyDown {
                 key: key.clone(),
@@ -902,6 +910,13 @@ async fn execute_with_modifiers(
     if let Err(error) = boundary.ensure("immediately_before_foreground_stroke_dispatch") {
         let _release_result =
             release_pressed_modifiers(handle, &pressed, backend, "operator_panic_cleanup").await;
+        return Err(error);
+    }
+    if let Err(error) =
+        super::foreground_fence::ensure("immediately_before_foreground_stroke_dispatch")
+    {
+        let _release_result =
+            release_pressed_modifiers(handle, &pressed, backend, "foreground_fence_cleanup").await;
         return Err(error);
     }
     let stroke_result = handle.execute(stroke_action).await;
