@@ -920,13 +920,46 @@ fn canonical_spawn_terminal_event(
         }
         match canonical {
             Some(existing) if existing.outcome != outcome => {
-                return Err(StorageError::ReadFailed {
-                    cf_name: cf::CF_AGENT_EVENTS.to_owned(),
-                    detail: format!(
-                        "agent end-state anchor scan found conflicting terminal outcomes for spawn {spawn_id}: {} vs {outcome}",
-                        existing.outcome
-                    ),
-                });
+                // #2072 ask 2/4 (the end-state-scan site): two different
+                // terminal outcomes recorded for one spawn is a WRITER
+                // disagreement, not corruption — the same classification the
+                // anchor-batch path adopted. Bailing here (the old behaviour,
+                // an untyped `ReadFailed` with the cause buried in a string)
+                // meant a contested spawn could never be anchored at all: a
+                // permanent, invisible latch. The declared rule, stated out
+                // loud like the batch path's keep-first: the EARLIEST observed
+                // terminal outcome is canonical — a terminal state does not
+                // change, so a later disagreeing observation is the suspect
+                // one — matching the earliest-wins ordering the non-conflict
+                // arms below already apply. The conflict is preserved as
+                // evidence, not resolved silently: one typed record per
+                // conflicting observation, naming the spawn and both sides
+                // exactly, consumed the same way as
+                // CALYX_GROUNDING_ANCHOR_BATCH_CONFLICT — by a reader, while
+                // the physical rows (both of them) stay on disk for the
+                // census.
+                tracing::error!(
+                    code = "AGENT_EVENT_TERMINAL_OUTCOME_CONFLICT",
+                    spawn_id,
+                    canonical_outcome = existing.outcome,
+                    canonical_observed_ts_ns = existing.observed_ts_ns,
+                    conflicting_outcome = outcome,
+                    conflicting_observed_ts_ns = record.ts_ns,
+                    conflicting_event_key = %synapse_storage::constellations::hex_encode(&key),
+                    cf_name = cf::CF_AGENT_EVENTS,
+                    rule = "earliest_terminal_observation_wins",
+                    "spawn has conflicting terminal outcomes; the earliest observation stays canonical and this later disagreeing observation is recorded, not adopted — reconcile the disagreeing writers"
+                );
+                if record.ts_ns < existing.observed_ts_ns {
+                    // The disagreeing observation is actually the EARLIER one
+                    // (scan order is not time order): the declared rule makes
+                    // it canonical, and the record above still names both
+                    // sides.
+                    canonical = Some(SpawnTerminalObservation {
+                        outcome,
+                        observed_ts_ns: record.ts_ns,
+                    });
+                }
             }
             Some(existing) if existing.observed_ts_ns <= record.ts_ns => {}
             _ => {

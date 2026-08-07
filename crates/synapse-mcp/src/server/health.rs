@@ -1427,7 +1427,17 @@ impl SynapseService {
     fn assist_next_action_health(&self) -> SubsystemHealth {
         let db = match self.m3_state.try_lock() {
             Ok(state) => state.db.clone(),
-            Err(error) => return state_lock_unavailable_health("M3", error),
+            // #2087: a busy M3 lock is contention, not failure — the
+            // composition half is process-static behind its own lock and is
+            // still published, typed `busy` (never `health.ok`-fatal). A
+            // POISONED lock keeps failing closed as `error`: that is a panic
+            // somewhere under M3, not an in-flight borrow.
+            Err(error @ std::sync::TryLockError::Poisoned(_)) => {
+                return state_lock_unavailable_health("M3", error);
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return crate::m3::suggestions::next_action_health_m3_lock_busy();
+            }
         };
         crate::m3::suggestions::next_action_health(db.as_ref())
     }
@@ -2611,11 +2621,27 @@ impl SynapseService {
                 // that names an unregistered detector guarantees every
                 // pixel-bearing observe hard-errors, and a deploy gate reading
                 // only the rollup must see that.
+                //
+                // #2086, decided: `not_configured` rolls up `ok` EVEN WHEN
+                // `mode_admits_detection=true`. "Admits" means the mode allows
+                // detection-bearing observes, not that the deployment requires
+                // them — requiring a detector is a configuration statement, and
+                // making its absence red would hold `health.ok` false forever
+                // on every host whose operator chose not to wire one. The
+                // contract that keeps this honest: detection-bearing observes
+                // refuse loudly with `DETECTION_MODEL_NOT_LOADED` (#2074,
+                // live-verified), the nested `perception_detection` field stays
+                // truthful, and the arm below names the absence in the rollup
+                // detail instead of folding it into a generic "initialized".
                 let (status, prefix) = match (&bundle, detection.status.as_str()) {
                     (Err(_), _) => ("error", "perception detector backend probe failed"),
                     (Ok(_), "misconfigured") => (
                         "misconfigured",
                         "perception runtime initialized, but the configured detector cannot load and every detection-bearing observe will fail",
+                    ),
+                    (Ok(_), "not_configured") => (
+                        "ok",
+                        "perception runtime initialized; no detector configured (capability absent by operator choice — detection-bearing observes refuse with DETECTION_MODEL_NOT_LOADED)",
                     ),
                     (Ok(_), _) => ("ok", "perception runtime initialized"),
                 };

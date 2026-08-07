@@ -1717,6 +1717,29 @@ fn record_next_action_composition_error(error: &ErrorData) {
     });
 }
 
+/// The composition half of [`next_action_health`] alone, for probes that could
+/// not reach the `Db` handle (#2087).
+///
+/// The composition state is process-static and guarded by its own lock, so an
+/// M3 state-lock miss is no reason to discard it. Status is `busy` — the
+/// artifact readback was skipped because the M3 lock was held by in-flight
+/// work, which is contention, not failure; the 21 typed composition fields are
+/// still published so the last outcome/refusal stays visible through the miss.
+#[must_use]
+pub fn next_action_health_m3_lock_busy() -> SubsystemHealth {
+    let mut health = next_action_health(None);
+    // `None` above set `disabled` / "vault is not open", which is not what
+    // happened here — the vault is open, this probe just could not borrow it.
+    health.status = "busy".to_owned();
+    health.detail = Some(
+        "M3 state lock is held by in-flight work; the frozen-artifact readback was skipped for \
+         this probe (composition state above is current) — retry the health call for the full \
+         reading"
+            .to_owned(),
+    );
+    health
+}
+
 /// Reports whether the assist surface can currently compose a next action.
 ///
 /// Read-only by construction: it point-reads the artifact pointer row and the
@@ -1745,11 +1768,19 @@ pub fn next_action_health(db: Option<&Arc<Db>>) -> SubsystemHealth {
             consecutive_refusals: state.consecutive_refusals,
         },
         Err(std::sync::TryLockError::WouldBlock) => {
+            // #2087: a busy composition lock means a composition pass is
+            // running at this instant — activity, not failure. Typing it
+            // `error` made a contended probe `health.ok`-fatal and
+            // indistinguishable from the composer being broken. `busy` is
+            // truthful: this probe declined to wait, the next one will read a
+            // newer state. Poisoned (below) stays `error` — that is a panic
+            // inside the composer, not contention.
             return SubsystemHealth {
-                status: "error".to_owned(),
+                status: "busy".to_owned(),
                 detail: Some(
-                    "next-action composition state lock is busy; health is fail-closed and does \
-                     not wait behind a composition pass"
+                    "next-action composition state lock is held by an in-flight composition \
+                     pass; this probe does not wait behind it — retry the health call for the \
+                     settled reading"
                         .to_owned(),
                 ),
                 ..SubsystemHealth::default()
