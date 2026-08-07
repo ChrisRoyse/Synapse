@@ -205,6 +205,17 @@ pub const STORAGE_ORPHAN_SLOT_GC_IN_PROGRESS: &str = "STORAGE_ORPHAN_SLOT_GC_IN_
 /// itself is the #1875 condition arriving quietly.
 pub const HYGIENE_VAULT_VERIFY_FAILED: &str = "SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED";
 
+/// Scheduled vault verification could not run to completion (#2059).
+///
+/// Raised when a scan was refused by a resource budget — an aggregate
+/// materialization ceiling, an allocation refusal, an SST page-source ceiling —
+/// while every integrity predicate that *was* evaluated held. The vault is
+/// unverified, which is a real deficiency and stays fail-closed, but it is not
+/// the corruption alarm and must never carry the restore-from-backup
+/// remediation. Conflating the two is how the alarm that must be believed gets
+/// trained out of an operator.
+pub const HYGIENE_VAULT_VERIFY_UNVERIFIABLE: &str = "SYNAPSE_HYGIENE_VAULT_VERIFY_UNVERIFIABLE";
+
 // === Episodes (derived activity spans, issues #846/#847) ===
 pub const EPISODE_NOT_FOUND: &str = "EPISODE_NOT_FOUND";
 

@@ -76,6 +76,15 @@ pub struct SynapseCalyxVerifyReport {
     pub wal_bytes_present: u64,
     pub first_cx_id: Option<String>,
     pub failure_reasons: Vec<String>,
+    /// A resource budget refused the read-back scan before it reached a verdict.
+    ///
+    /// This is an *indeterminate* outcome, not damage: `success` is still false,
+    /// but nothing here is evidence that the vault is bad (#2059).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unverifiable_reason: Option<String>,
+    /// `CALYX_*` code of the refusal recorded in `unverifiable_reason`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unverifiable_code: Option<String>,
 }
 
 impl SynapseCalyxVerifyReport {
@@ -92,7 +101,24 @@ impl SynapseCalyxVerifyReport {
             wal_bytes_present: report.wal_bytes_present,
             first_cx_id: report.first_cx_id.clone(),
             failure_reasons: report.failure_reasons(),
+            // Populated only when the refusal is the *only* finding, so the
+            // predicate below can never soften a report that also carries
+            // integrity evidence.
+            unverifiable_reason: report
+                .unverifiable_only()
+                .then(|| report.unverifiable.clone())
+                .flatten(),
+            unverifiable_code: report
+                .unverifiable_only()
+                .then(|| report.unverifiable_code.clone())
+                .flatten(),
         }
+    }
+
+    /// True when the read-back proved nothing bad and simply could not finish.
+    #[must_use]
+    pub const fn unverifiable_only(&self) -> bool {
+        self.unverifiable_reason.is_some()
     }
 }
 

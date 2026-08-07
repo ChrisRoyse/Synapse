@@ -577,6 +577,13 @@ impl SynapseService {
         let mut subsystems = BTreeMap::new();
         subsystems.insert("storage".to_owned(), self.storage_health());
         subsystems.insert("calyx_vault".to_owned(), self.calyx_vault_health());
+        // The scheduled physical verification of that vault, as its own reading
+        // (#2059). `calyx_vault` reports what the vault *is*; this reports
+        // whether anything has proven it intact, and when.
+        subsystems.insert(
+            "vault_verify".to_owned(),
+            crate::server::operational_facades::hygiene::health_subsystem(),
+        );
         subsystems.insert(
             "oracle_readiness".to_owned(),
             self.oracle_readiness_health(),

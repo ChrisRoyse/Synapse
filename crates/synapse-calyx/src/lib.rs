@@ -72,15 +72,19 @@ use calyx_forge::{
     HostGpuReservationStore,
 };
 use calyx_ledger::{ActorId, EntryKind, LedgerEntry, SubjectId, VerifyResult};
+pub use calyx_registry::{
+    CALYX_DYNAMIC_PANEL_GENERATION_FLOOR, CALYX_PANEL_GENERATION_UNCLAIMED,
+    PanelGenerationAllocation, PanelGenerationAllocatorReadback, PanelGenerationClaim,
+    PanelGenerationSupersession, VaultTemporalPanelRegistration,
+    VaultTemporalPanelRegistrationWrite,
+};
 use calyx_registry::{
     CALYX_NO_ACTIVE_PANEL, Registry, VaultPanelState, VaultPanelWrite,
-    allocate_vault_panel_generation, list_vault_temporal_panels, load_vault_panel_state,
-    persist_vault_panel_state, read_vault_panel_generation_allocator, read_vault_temporal_panel,
+    allocate_vault_panel_generation, ensure_vault_panel_generation_claimed,
+    list_vault_temporal_panels, load_vault_panel_state, persist_vault_panel_state,
+    read_vault_panel_generation_allocator, read_vault_temporal_panel,
     register_vault_temporal_panel, reserve_vault_panel_generations,
-};
-pub use calyx_registry::{
-    PanelGenerationAllocation, PanelGenerationAllocatorReadback, VaultTemporalPanelRegistration,
-    VaultTemporalPanelRegistrationWrite,
+    supersede_vault_panel_generations,
 };
 // Re-exported so a caller can hand a non-active panel contract to
 // `find_similar_in_panel` / `rebuild_search_indexes_for_panel` (#1668) without
@@ -1595,7 +1599,87 @@ pub struct SynapseCalyxVaultVerifyReport {
     pub chain: SynapseCalyxLedgerVerifyReport,
 }
 
+/// What one scheduled vault verification actually established (#2059).
+///
+/// Three outcomes, not two. Before this existed, "the scan was refused by a
+/// resource budget" and "the hash chain is broken" were the same non-green
+/// verdict wearing the same restore-from-backup remediation, so the alarm that
+/// must be believed fired routinely on a vault that was provably intact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxVaultVerifyVerdict {
+    /// Every checked surface verified.
+    Verified,
+    /// No integrity evidence failed, and at least one scan could not run to
+    /// completion. The vault is unverified — not damaged.
+    Unverifiable,
+    /// Integrity evidence failed. This is the corruption alarm.
+    Corrupt,
+}
+
+impl SynapseCalyxVaultVerifyVerdict {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Verified => "verified",
+            Self::Unverifiable => "unverifiable",
+            Self::Corrupt => "corrupt",
+        }
+    }
+}
+
 impl SynapseCalyxVaultVerifyReport {
+    /// Classifies the verdict from the evidence, fail-closed on integrity.
+    ///
+    /// `Corrupt` wins over `Unverifiable` whenever any integrity predicate is
+    /// false, because a vault can be both damaged and too large for one of its
+    /// scans to finish, and the damage is what an operator must act on.
+    #[must_use]
+    pub const fn verdict(&self) -> SynapseCalyxVaultVerifyVerdict {
+        if self.green() {
+            return SynapseCalyxVaultVerifyVerdict::Verified;
+        }
+        let integrity_failed = !self.chain.intact
+            || !self.chain.raw_commitments_intact
+            || !self.lineage_present
+            || (!self.restore.success && !self.restore.unverifiable_only());
+        if integrity_failed {
+            return SynapseCalyxVaultVerifyVerdict::Corrupt;
+        }
+        SynapseCalyxVaultVerifyVerdict::Unverifiable
+    }
+
+    /// Names every scan that was refused rather than answered.
+    #[must_use]
+    pub fn unverifiable_reasons(&self) -> Vec<String> {
+        self.restore
+            .unverifiable_reason
+            .iter()
+            .map(|reason| format!("restore_verify: {reason}"))
+            .collect()
+    }
+
+    /// Fraction of the durable ledger the chain re-walk actually covered.
+    ///
+    /// A verdict without its coverage is unreadable: `intact` over 4,096 of
+    /// 1,056,804 entries and `intact` over all of them are different facts.
+    #[must_use]
+    pub fn chain_coverage_fraction(&self) -> f64 {
+        if self.ledger_head_height == 0 {
+            return 1.0;
+        }
+        let verified = self
+            .chain
+            .verified_to_seq
+            .saturating_sub(self.chain.verified_from_seq);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a coverage ratio is reported to four decimals; u64 precision is not meaningful here"
+        )]
+        {
+            (verified as f64 / self.ledger_head_height as f64).clamp(0.0, 1.0)
+        }
+    }
     /// True only when every checked surface verified.
     ///
     /// `covers_full_history` is deliberately **not** part of this predicate, and
@@ -4865,6 +4949,40 @@ impl SynapseCalyxVault {
     ) -> Result<PanelGenerationAllocatorReadback, SynapseCalyxError> {
         read_vault_panel_generation_allocator(&self.vault).map_err(|error| {
             SynapseCalyxError::from_calyx("read native Calyx panel generation allocator", &error)
+        })
+    }
+
+    /// Retires every generation a dynamic panel owns other than the successor
+    /// that just committed (#2062 ask 1).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured conflict when the successor is unowned, owned by a
+    /// different panel, itself retired, or older than a live generation of the
+    /// same panel.
+    pub fn supersede_panel_generations(
+        &self,
+        panel_name: &str,
+        successor: u32,
+    ) -> Result<PanelGenerationSupersession, SynapseCalyxError> {
+        supersede_vault_panel_generations(&self.vault, panel_name, successor).map_err(|error| {
+            SynapseCalyxError::from_calyx("supersede native Calyx panel generations", &error)
+        })
+    }
+
+    /// Fails closed when a generation has no durable ownership claim (#2062
+    /// ask 2).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`calyx_registry::CALYX_PANEL_GENERATION_UNCLAIMED`] when the
+    /// allocator's owners map does not claim `panel_generation`.
+    pub fn ensure_panel_generation_claimed(
+        &self,
+        panel_generation: u32,
+    ) -> Result<PanelGenerationClaim, SynapseCalyxError> {
+        ensure_vault_panel_generation_claimed(&self.vault, panel_generation).map_err(|error| {
+            SynapseCalyxError::from_calyx("verify native Calyx panel generation claim", &error)
         })
     }
 

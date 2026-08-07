@@ -240,6 +240,48 @@ pub struct SubsystemHealth {
     pub storage_gc_last_successful_source_census_base_rows: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_referenced_rows: Option<u64>,
+    /// Verdict of the last scheduled physical vault verification (#2059):
+    /// `verified` | `unverifiable` | `corrupt` | `unreadable`.
+    ///
+    /// Absent until a tick completes in this daemon generation. Before this
+    /// existed the verdict reached only daemon stderr, so an unattended operator
+    /// could not tell a vault that had verified clean from one whose
+    /// verification had never run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_verdict: Option<String>,
+    /// False when `SYNAPSE_VAULT_VERIFY_INTERVAL_SECS=0` disabled the schedule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_scheduled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_interval_secs: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_last_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_last_completed_unix_ms: Option<u64>,
+    /// When the vault last verified *clean*, retained across later non-green
+    /// ticks so a run of refusals cannot hide how stale the last real pass is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_last_verified_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_vault_id: Option<String>,
+    /// `incremental_tail` | `full_chain`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_scan_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_verified_from_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_verified_to_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_ledger_head_height: Option<u64>,
+    /// Fraction of the durable ledger the chain re-walk covered. An `intact`
+    /// verdict over 4,096 of 1,056,804 entries and one over all of them are
+    /// different facts, so the verdict never travels without its coverage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_coverage_fraction: Option<f64>,
+    /// `SYNAPSE_HYGIENE_VAULT_VERIFY_UNVERIFIABLE` or
+    /// `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` — which alarm this verdict is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_verify_reason_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_checkpoint_last_started_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

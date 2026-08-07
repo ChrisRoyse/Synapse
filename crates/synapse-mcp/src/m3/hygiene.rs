@@ -28,7 +28,7 @@ use synapse_storage::{
     timeline as timeline_codec,
 };
 
-use crate::m1::mcp_error;
+use crate::m1::{mcp_error, mcp_error_with_remediation};
 
 use super::{
     M3ToolStub,
@@ -4478,6 +4478,43 @@ pub struct HygieneVaultVerifyResponse {
     pub ledger_entry_count: u64,
     pub wal_bytes_present: u64,
     pub failure_reasons: Vec<String>,
+    /// `verified` | `unverifiable` | `corrupt` (#2059).
+    ///
+    /// `green` alone could not tell an operator whether a non-green verdict
+    /// meant "the vault is damaged" or "a scan was refused before it could
+    /// answer". Those need different actions, so they get different names.
+    pub verdict: String,
+    /// Scans that were refused rather than answered, each naming the budget, the
+    /// scan's need, and its own remediation. Empty unless `verdict` is
+    /// `unverifiable`.
+    pub unverifiable_reasons: Vec<String>,
+    /// Fraction of the durable ledger the chain re-walk covered, 0.0..=1.0.
+    pub chain_coverage_fraction: f64,
+}
+
+/// Typed result of one scheduled vault verification.
+///
+/// The scheduled caller needs the distinction structurally, not by parsing an
+/// error code out of a formatted string, because the whole point is that the two
+/// non-green outcomes are logged and alarmed differently.
+#[derive(Debug)]
+pub enum VaultVerifyOutcome {
+    Verified(Box<HygieneVaultVerifyResponse>),
+    /// No integrity predicate failed; at least one scan was refused.
+    Unverifiable(Box<HygieneVaultVerifyResponse>),
+    /// Integrity evidence failed. This is the restore-from-backup alarm.
+    Corrupt(Box<HygieneVaultVerifyResponse>),
+}
+
+impl VaultVerifyOutcome {
+    #[must_use]
+    pub fn response(&self) -> &HygieneVaultVerifyResponse {
+        match self {
+            Self::Verified(response) | Self::Unverifiable(response) | Self::Corrupt(response) => {
+                response
+            }
+        }
+    }
 }
 
 /// Upper bound on the incremental window, so a "tail" request cannot silently
@@ -4503,9 +4540,14 @@ pub fn required_permissions_anneal_mutation() -> RequiredPermissions {
 ///
 /// Delegates to the existing `verify_vault_restore` and `verify_ledger_chain`
 /// paths — nothing is re-implemented here — and converts a non-green verdict
-/// into `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` naming exactly what failed. A
-/// scheduled verification that returned a cheerful report on a broken vault
-/// would be worse than no verification at all.
+/// into a code naming exactly what failed. A scheduled verification that
+/// returned a cheerful report on a broken vault would be worse than no
+/// verification at all.
+///
+/// The two non-green outcomes carry different codes and different remediations
+/// (#2059): `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` for failed integrity evidence,
+/// `SYNAPSE_HYGIENE_VAULT_VERIFY_UNVERIFIABLE` for a scan a resource budget
+/// refused. Only the first one says restore from backup.
 ///
 /// # Errors
 ///
@@ -4516,6 +4558,66 @@ pub fn run_vault_verify(
     db: &Db,
     params: &HygieneVaultVerifyParams,
 ) -> Result<HygieneVaultVerifyResponse, ErrorData> {
+    match run_vault_verify_typed(db, params)? {
+        VaultVerifyOutcome::Verified(response) => Ok(*response),
+        VaultVerifyOutcome::Unverifiable(response) => Err(mcp_error_with_remediation(
+            error_codes::HYGIENE_VAULT_VERIFY_UNVERIFIABLE,
+            format!(
+                "scheduled vault verification could not run to completion for vault_id={} at {}: \
+                 scan_mode={} verified=[{}..{}) chain_coverage={:.4} chain_intact={} \
+                 raw_commitments_intact={} lineage_present={} refusals=[{}]",
+                response.vault_id,
+                response.vault_dir,
+                response.scan_mode,
+                response.verified_from_seq,
+                response.verified_to_seq,
+                response.chain_coverage_fraction,
+                response.chain_intact,
+                response.raw_commitments_intact,
+                response.lineage_present,
+                response.unverifiable_reasons.join("; ")
+            ),
+            "the vault is unverified, not damaged: every integrity predicate that was evaluated \
+             held. Compact the refusing column family below the scan ceiling, or verify a narrower \
+             window; do NOT restore from backup on this verdict alone",
+        )),
+        VaultVerifyOutcome::Corrupt(response) => Err(mcp_error(
+            error_codes::HYGIENE_VAULT_VERIFY_FAILED,
+            format!(
+                "scheduled vault verification failed for vault_id={} at {}: scan_mode={} \
+                 verified=[{}..{}) restore_success={} chain_intact={} raw_commitments_intact={} \
+                 lineage_present={} reasons=[{}]; remediation=stop writers, preserve the vault \
+                 directory and its lineage journal, and restore from a verified backup before \
+                 trusting any read from this vault",
+                response.vault_id,
+                response.vault_dir,
+                response.scan_mode,
+                response.verified_from_seq,
+                response.verified_to_seq,
+                response.restore_success,
+                response.chain_intact,
+                response.raw_commitments_intact,
+                response.lineage_present,
+                response.failure_reasons.join("; ")
+            ),
+        )),
+    }
+}
+
+/// Verifies the live vault and returns the typed verdict without alarming.
+///
+/// Separated from [`run_vault_verify`] so the scheduled verifier can choose its
+/// own log severity and remediation per verdict. The only `Err` here is a vault
+/// that could not be read at all.
+///
+/// # Errors
+///
+/// Returns a structured error when the vault cannot be read or when the vault
+/// maintenance guard is already held by a backup/erase/compaction pass.
+pub fn run_vault_verify_typed(
+    db: &Db,
+    params: &HygieneVaultVerifyParams,
+) -> Result<VaultVerifyOutcome, ErrorData> {
     let tail_entries = params
         .tail_entries
         .unwrap_or(synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES)
@@ -4523,6 +4625,7 @@ pub fn run_vault_verify(
     let report = db
         .verify_calyx_vault(params.full_chain, tail_entries)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let verdict = report.verdict();
     let response = HygieneVaultVerifyResponse {
         source_of_truth: "live Calyx vault SST/WAL bytes + physical CF_LEDGER hash chain + vault \
                           lineage journal",
@@ -4553,28 +4656,20 @@ pub fn run_vault_verify(
         ledger_entry_count: report.restore.ledger_entry_count,
         wal_bytes_present: report.restore.wal_bytes_present,
         failure_reasons: report.failure_reasons(),
+        verdict: verdict.as_str().to_owned(),
+        unverifiable_reasons: report.unverifiable_reasons(),
+        chain_coverage_fraction: report.chain_coverage_fraction(),
     };
-    if response.green {
-        return Ok(response);
-    }
-    Err(mcp_error(
-        error_codes::HYGIENE_VAULT_VERIFY_FAILED,
-        format!(
-            "scheduled vault verification failed for vault_id={} at {}: scan_mode={} \
-             verified=[{}..{}) restore_success={} chain_intact={} raw_commitments_intact={} \
-             lineage_present={} reasons=[{}]; remediation=stop writers, preserve the vault \
-             directory and its lineage journal, and restore from a verified backup before \
-             trusting any read from this vault",
-            response.vault_id,
-            response.vault_dir,
-            response.scan_mode,
-            response.verified_from_seq,
-            response.verified_to_seq,
-            response.restore_success,
-            response.chain_intact,
-            response.raw_commitments_intact,
-            response.lineage_present,
-            response.failure_reasons.join("; ")
-        ),
-    ))
+    let response = Box::new(response);
+    Ok(match verdict {
+        synapse_calyx::SynapseCalyxVaultVerifyVerdict::Verified => {
+            VaultVerifyOutcome::Verified(response)
+        }
+        synapse_calyx::SynapseCalyxVaultVerifyVerdict::Unverifiable => {
+            VaultVerifyOutcome::Unverifiable(response)
+        }
+        synapse_calyx::SynapseCalyxVaultVerifyVerdict::Corrupt => {
+            VaultVerifyOutcome::Corrupt(response)
+        }
+    })
 }

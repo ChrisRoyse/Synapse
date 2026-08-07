@@ -1,4 +1,7 @@
+use std::sync::{Mutex, OnceLock};
+
 use rmcp::{RoleServer, service::RequestContext};
+use synapse_core::types::SubsystemHealth;
 
 use crate::server::{ErrorData, Json, Parameters, SynapseService};
 
@@ -6,6 +9,151 @@ const VAULT_VERIFY_INTERVAL_ENV: &str = "SYNAPSE_VAULT_VERIFY_INTERVAL_SECS";
 const VAULT_VERIFY_STARTUP_DELAY_ENV: &str = "SYNAPSE_VAULT_VERIFY_STARTUP_DELAY_SECS";
 const DEFAULT_VAULT_VERIFY_INTERVAL_SECS: u64 = 24 * 60 * 60;
 const DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS: u64 = 5 * 60;
+
+/// Last scheduled vault-verification outcome, for `health` (#2059).
+///
+/// The verdict previously existed only as a line in daemon stderr. An alarm that
+/// loud reaching nothing but a human tailing a log file cannot be acted on by an
+/// unattended operator, and its absence was indistinguishable from a pass.
+static LAST_VAULT_VERIFY: OnceLock<Mutex<VaultVerifyState>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct VaultVerifyState {
+    /// `None` until the scheduler decides whether it runs at all.
+    scheduled: Option<bool>,
+    interval_secs: Option<u64>,
+    last_started_unix_ms: Option<u64>,
+    last_completed_unix_ms: Option<u64>,
+    /// When the vault last verified clean. Retained across later ticks so a run
+    /// of refusals cannot hide how long it has been since a real pass.
+    last_verified_unix_ms: Option<u64>,
+    verdict: Option<&'static str>,
+    reason_code: Option<String>,
+    detail: Option<String>,
+    vault_id: Option<String>,
+    scan_mode: Option<String>,
+    verified_from_seq: Option<u64>,
+    verified_to_seq: Option<u64>,
+    ledger_head_height: Option<u64>,
+    coverage_fraction: Option<f64>,
+}
+
+fn vault_verify_state() -> &'static Mutex<VaultVerifyState> {
+    LAST_VAULT_VERIFY.get_or_init(|| Mutex::new(VaultVerifyState::default()))
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0)
+}
+
+fn with_vault_verify_state(update: impl FnOnce(&mut VaultVerifyState)) {
+    match vault_verify_state().lock() {
+        Ok(mut state) => update(&mut state),
+        Err(error) => tracing::error!(
+            code = "VAULT_VERIFY_HEALTH_STATE_POISONED",
+            error = %error,
+            remediation = "inspect daemon logs for a panic inside the scheduled vault verifier; the health readback for vault verification is stale until the daemon restarts",
+            "scheduled vault verification could not record its outcome for health"
+        ),
+    }
+}
+
+/// Reports the last scheduled vault verification as its own health subsystem.
+///
+/// `corrupt` is the only `error` status: it is the one verdict that means the
+/// vault cannot be trusted. `unverifiable` is reported under its own status
+/// rather than as `error`, because a refused scan is a real deficiency but not an
+/// emergency — and firing the red alarm on it every tick is precisely the
+/// cry-wolf failure this subsystem exists to end (#2059).
+pub(crate) fn health_subsystem() -> SubsystemHealth {
+    let state = match vault_verify_state().try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(
+                    "vault verification state lock is busy; health is fail-closed and does not \
+                     wait behind a verification tick"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        }
+        Err(std::sync::TryLockError::Poisoned(_error)) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some("vault verification state lock poisoned".to_owned()),
+                ..SubsystemHealth::default()
+            };
+        }
+    };
+    let status = match (state.scheduled, state.verdict) {
+        (Some(false), _) => "disabled",
+        (_, Some("verified")) => "ok",
+        (_, Some("unverifiable")) => "unverifiable",
+        (_, Some("corrupt")) => "error",
+        (_, Some(_)) => "error",
+        (_, None) => "pending",
+    };
+    let detail = match state.verdict {
+        Some(verdict) => format!(
+            "verdict={verdict} vault_id={} scan_mode={} verified=[{}..{}) head_height={} \
+             coverage_fraction={} last_completed_unix_ms={} last_verified_unix_ms={} \
+             reason_code={} detail={}",
+            state.vault_id.as_deref().unwrap_or("<unknown>"),
+            state.scan_mode.as_deref().unwrap_or("<unknown>"),
+            state
+                .verified_from_seq
+                .map_or_else(|| "<unknown>".to_owned(), |seq| seq.to_string()),
+            state
+                .verified_to_seq
+                .map_or_else(|| "<unknown>".to_owned(), |seq| seq.to_string()),
+            state
+                .ledger_head_height
+                .map_or_else(|| "<unknown>".to_owned(), |height| height.to_string()),
+            state
+                .coverage_fraction
+                .map_or_else(|| "<unknown>".to_owned(), |value| format!("{value:.4}")),
+            state
+                .last_completed_unix_ms
+                .map_or_else(|| "<never>".to_owned(), |at| at.to_string()),
+            state
+                .last_verified_unix_ms
+                .map_or_else(|| "<never>".to_owned(), |at| at.to_string()),
+            state.reason_code.as_deref().unwrap_or("<none>"),
+            state.detail.as_deref().unwrap_or("<none>"),
+        ),
+        None if state.scheduled == Some(false) => format!(
+            "periodic physical vault verification is explicitly disabled by \
+             {VAULT_VERIFY_INTERVAL_ENV}=0; nothing verifies this vault on a schedule"
+        ),
+        None => format!(
+            "scheduled every {} s; no verification tick has completed yet in this daemon \
+             generation, so the vault's physical verdict is unknown",
+            state
+                .interval_secs
+                .map_or_else(|| "<unscheduled>".to_owned(), |secs| secs.to_string()),
+        ),
+    };
+    SubsystemHealth {
+        status: status.to_owned(),
+        detail: Some(detail),
+        vault_verify_verdict: state.verdict.map(str::to_owned),
+        vault_verify_scheduled: state.scheduled,
+        vault_verify_interval_secs: state.interval_secs,
+        vault_verify_last_started_unix_ms: state.last_started_unix_ms,
+        vault_verify_last_completed_unix_ms: state.last_completed_unix_ms,
+        vault_verify_last_verified_unix_ms: state.last_verified_unix_ms,
+        vault_verify_vault_id: state.vault_id.clone(),
+        vault_verify_scan_mode: state.scan_mode.clone(),
+        vault_verify_verified_from_seq: state.verified_from_seq,
+        vault_verify_verified_to_seq: state.verified_to_seq,
+        vault_verify_ledger_head_height: state.ledger_head_height,
+        vault_verify_coverage_fraction: state.coverage_fraction,
+        vault_verify_reason_code: state.reason_code.clone(),
+        ..SubsystemHealth::default()
+    }
+}
 
 use super::{
     HYGIENE_SOT, HYGIENE_TOOL,
@@ -29,6 +177,10 @@ pub(crate) fn spawn_periodic_vault_verifier(
         DEFAULT_VAULT_VERIFY_STARTUP_DELAY_SECS,
     )?;
     if interval_secs == 0 {
+        with_vault_verify_state(|state| {
+            state.scheduled = Some(false);
+            state.interval_secs = Some(0);
+        });
         tracing::warn!(
             code = "VAULT_VERIFY_PERIODIC_DISABLED",
             env = VAULT_VERIFY_INTERVAL_ENV,
@@ -36,6 +188,10 @@ pub(crate) fn spawn_periodic_vault_verifier(
         );
         return Ok(None);
     }
+    with_vault_verify_state(|state| {
+        state.scheduled = Some(true);
+        state.interval_secs = Some(interval_secs);
+    });
     tracing::info!(
         code = "VAULT_VERIFY_PERIODIC_SCHEDULED",
         interval_secs,
@@ -78,9 +234,14 @@ fn strict_seconds_env(name: &'static str, default: u64) -> anyhow::Result<u64> {
 }
 
 async fn run_periodic_vault_verify_once(service: &SynapseService) {
+    with_vault_verify_state(|state| state.last_started_unix_ms = Some(now_unix_ms()));
     let db = match service.m3_storage() {
         Ok(db) => db,
         Err(error) => {
+            record_vault_verify_unreadable(
+                "VAULT_VERIFY_PERIODIC_STORAGE_UNAVAILABLE",
+                &error.message,
+            );
             tracing::error!(
                 code = "VAULT_VERIFY_PERIODIC_STORAGE_UNAVAILABLE",
                 error_code = ?error.code,
@@ -92,37 +253,151 @@ async fn run_periodic_vault_verify_once(service: &SynapseService) {
         }
     };
     let result = tokio::task::spawn_blocking(move || {
-        crate::m3::hygiene::run_vault_verify(
+        crate::m3::hygiene::run_vault_verify_typed(
             &db,
             &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
         )
     })
     .await;
-    match result {
-        Ok(Ok(report)) => tracing::info!(
+    let outcome = match result {
+        Ok(Ok(outcome)) => outcome,
+        // The verification could not be read at all — neither a pass nor a
+        // corruption finding, and reported as neither.
+        Ok(Err(error)) => {
+            record_vault_verify_unreadable("VAULT_VERIFY_PERIODIC_UNREADABLE", &error.message);
+            tracing::error!(
+                code = "VAULT_VERIFY_PERIODIC_UNREADABLE",
+                error_code = ?error.code,
+                error = %error.message,
+                remediation = "repair the reported read failure or release the vault maintenance guard; this tick established nothing about vault integrity",
+                "scheduled physical vault verification could not read the vault"
+            );
+            return;
+        }
+        Err(error) => {
+            record_vault_verify_unreadable("VAULT_VERIFY_PERIODIC_TASK_FAILED", &error.to_string());
+            tracing::error!(
+                code = "VAULT_VERIFY_PERIODIC_TASK_FAILED",
+                error = %error,
+                remediation = "inspect daemon logs and process health; the blocking verification task terminated abnormally",
+                "scheduled physical vault verification task failed"
+            );
+            return;
+        }
+    };
+    record_vault_verify_outcome(&outcome);
+    let report = outcome.response();
+    match &outcome {
+        crate::m3::hygiene::VaultVerifyOutcome::Verified(_) => tracing::info!(
             code = "VAULT_VERIFY_PERIODIC_OK",
             vault_id = %report.vault_id,
+            scan_mode = %report.scan_mode,
             verified_from_seq = report.verified_from_seq,
             verified_to_seq = report.verified_to_seq,
+            chain_coverage_fraction = report.chain_coverage_fraction,
             ledger_head_height = report.ledger_head_height,
             ledger_tip_hash = %report.ledger_tip_hash,
             raw_commitments_intact = report.raw_commitments_intact,
             "scheduled physical vault verification completed"
         ),
-        Ok(Err(error)) => tracing::error!(
+        // Not an integrity alarm, and deliberately not ERROR. Every predicate
+        // that was evaluated held; a resource budget refused the rest. Alarming
+        // red here on every tick is what teaches operators to ignore the alarm
+        // that must be believed (#2059).
+        crate::m3::hygiene::VaultVerifyOutcome::Unverifiable(_) => tracing::warn!(
+            code = "VAULT_VERIFY_PERIODIC_UNVERIFIABLE",
+            vault_id = %report.vault_id,
+            scan_mode = %report.scan_mode,
+            verified_from_seq = report.verified_from_seq,
+            verified_to_seq = report.verified_to_seq,
+            chain_coverage_fraction = report.chain_coverage_fraction,
+            ledger_head_height = report.ledger_head_height,
+            chain_intact = report.chain_intact,
+            raw_commitments_intact = report.raw_commitments_intact,
+            lineage_present = report.lineage_present,
+            refusals = %report.unverifiable_reasons.join("; "),
+            remediation = "the vault is UNVERIFIED, not damaged: compact the refusing column family below the scan ceiling, or verify a narrower window; do NOT restore from backup on this verdict",
+            "scheduled physical vault verification could not run to completion"
+        ),
+        crate::m3::hygiene::VaultVerifyOutcome::Corrupt(_) => tracing::error!(
             code = "VAULT_VERIFY_PERIODIC_FAILED",
-            error_code = ?error.code,
-            error = %error.message,
+            vault_id = %report.vault_id,
+            scan_mode = %report.scan_mode,
+            verified_from_seq = report.verified_from_seq,
+            verified_to_seq = report.verified_to_seq,
+            restore_success = report.restore_success,
+            chain_intact = report.chain_intact,
+            raw_commitments_intact = report.raw_commitments_intact,
+            lineage_present = report.lineage_present,
+            reasons = %report.failure_reasons.join("; "),
             remediation = "stop writers, preserve the vault and lineage journal, and restore from a verified backup before trusting vault reads",
             "scheduled physical vault verification raised an integrity alarm"
         ),
-        Err(error) => tracing::error!(
-            code = "VAULT_VERIFY_PERIODIC_TASK_FAILED",
-            error = %error,
-            remediation = "inspect daemon logs and process health; the blocking verification task terminated abnormally",
-            "scheduled physical vault verification task failed"
-        ),
     }
+}
+
+/// Records a tick that established nothing, so `health` cannot show a stale pass
+/// as if it were current.
+fn record_vault_verify_unreadable(code: &str, detail: &str) {
+    let completed = now_unix_ms();
+    let code = code.to_owned();
+    let detail = detail.to_owned();
+    with_vault_verify_state(move |state| {
+        state.last_completed_unix_ms = Some(completed);
+        state.verdict = Some("unreadable");
+        state.reason_code = Some(code);
+        state.detail = Some(detail);
+        state.coverage_fraction = None;
+    });
+}
+
+fn record_vault_verify_outcome(outcome: &crate::m3::hygiene::VaultVerifyOutcome) {
+    let report = outcome.response();
+    let completed = now_unix_ms();
+    let verdict: &'static str = match outcome {
+        crate::m3::hygiene::VaultVerifyOutcome::Verified(_) => "verified",
+        crate::m3::hygiene::VaultVerifyOutcome::Unverifiable(_) => "unverifiable",
+        crate::m3::hygiene::VaultVerifyOutcome::Corrupt(_) => "corrupt",
+    };
+    let reason_code = match outcome {
+        crate::m3::hygiene::VaultVerifyOutcome::Verified(_) => None,
+        crate::m3::hygiene::VaultVerifyOutcome::Unverifiable(_) => {
+            Some(synapse_core::error_codes::HYGIENE_VAULT_VERIFY_UNVERIFIABLE.to_owned())
+        }
+        crate::m3::hygiene::VaultVerifyOutcome::Corrupt(_) => {
+            Some(synapse_core::error_codes::HYGIENE_VAULT_VERIFY_FAILED.to_owned())
+        }
+    };
+    let detail = match outcome {
+        crate::m3::hygiene::VaultVerifyOutcome::Verified(_) => None,
+        crate::m3::hygiene::VaultVerifyOutcome::Unverifiable(_) => {
+            Some(report.unverifiable_reasons.join("; "))
+        }
+        crate::m3::hygiene::VaultVerifyOutcome::Corrupt(_) => {
+            Some(report.failure_reasons.join("; "))
+        }
+    };
+    let vault_id = report.vault_id.clone();
+    let scan_mode = report.scan_mode.clone();
+    let verified_from_seq = report.verified_from_seq;
+    let verified_to_seq = report.verified_to_seq;
+    let ledger_head_height = report.ledger_head_height;
+    let coverage_fraction = report.chain_coverage_fraction;
+    with_vault_verify_state(move |state| {
+        state.last_completed_unix_ms = Some(completed);
+        state.verdict = Some(verdict);
+        state.reason_code = reason_code;
+        state.detail = detail;
+        state.vault_id = Some(vault_id);
+        state.scan_mode = Some(scan_mode);
+        state.verified_from_seq = Some(verified_from_seq);
+        state.verified_to_seq = Some(verified_to_seq);
+        state.ledger_head_height = Some(ledger_head_height);
+        state.coverage_fraction = Some(coverage_fraction);
+        if verdict == "verified" {
+            state.last_verified_unix_ms = Some(completed);
+        }
+    });
 }
 
 pub(super) async fn handle(
@@ -532,9 +807,11 @@ pub(super) async fn handle(
             Ok(Json(hygiene_response(
                 operation,
                 format!(
-                    "vault_verify green={} scan_mode={} verified=[{}..{}) head_height={} restore_success={} chain_intact={} raw_commitments_intact={} lineage_present={} tip={}",
+                    "vault_verify verdict={} green={} scan_mode={} chain_coverage={:.4} verified=[{}..{}) head_height={} restore_success={} chain_intact={} raw_commitments_intact={} lineage_present={} tip={}",
+                    response.verdict,
                     response.green,
                     response.scan_mode,
+                    response.chain_coverage_fraction,
                     response.verified_from_seq,
                     response.verified_to_seq,
                     response.ledger_head_height,

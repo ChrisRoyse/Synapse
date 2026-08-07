@@ -3,6 +3,28 @@
 //! This verifier is read-only: it never opens a writable vault handle, creates
 //! directories, truncates WAL tails, or replays bytes into the vault. Counts are
 //! measured by scanning SST and WAL bytes directly.
+//!
+//! Every column-family traversal here is **paged** (#2059). The first version
+//! merged each CF into one in-memory map and then re-hashed the chain from a
+//! fully materialized `Vec<LedgerRow>`, so peak retention grew with the vault.
+//! On a production vault (~1M rows) the level merge hit the 1 GiB
+//! `MAX_RANGE_SCAN_BYTES` ceiling from #1809/#1810 and the scan was refused
+//! before it could reach any verdict at all — and a refusal was then reported as
+//! `success=false`, i.e. as corruption. A check that stops working once the data
+//! it protects gets large is not a check.
+//!
+//! Peak retention is now one page of rows plus the WAL overlay, independent of
+//! vault size, so the whole vault is covered on every pass. That is the shape
+//! every mature scrubber takes: ZFS's scrub streams the pool under an explicit
+//! memory limit and issues bounded sorted ranges rather than accumulating the
+//! whole scan (openzfs/zfs#15260), and RocksDB's `VerifyChecksum` /
+//! `VerifyFileChecksums` stream file blocks with readahead under a rate limiter
+//! instead of materializing a database and then checking it.
+//!
+//! When a scan genuinely cannot run — a resource budget refuses it rather than
+//! any integrity evidence failing — that is recorded as `unverifiable`, never as
+//! `error`. "I could not finish looking" and "I looked and it is damaged" are
+//! different findings and must not share a remediation.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
@@ -18,8 +40,7 @@ use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode
 use crate::wal::replay_dir_read_only;
 use calyx_core::{CalyxError, Result};
 use calyx_ledger::{
-    LedgerCfStore, LedgerHeadAnchor, LedgerRow, VerifyResult, decode as decode_ledger_entry,
-    verify_chain,
+    LedgerRow, StreamingChainVerifier, StreamingStart, VerifyResult, decode as decode_ledger_entry,
 };
 use serde::Serialize;
 
@@ -27,6 +48,27 @@ use serde::Serialize;
 pub const CALYX_ASTER_RESTORE_INVALID: &str = "CALYX_ASTER_RESTORE_INVALID";
 
 const OPTIONAL_REBUILDABLE_DIRS: [&str; 3] = ["ann", "kernel", "guard"];
+
+/// Rows materialized per bounded verification page.
+///
+/// Peak retention of a scan is this many decoded rows, not the column family.
+/// The page cursor is re-opened per page against retained lookup indexes, which
+/// costs one file handle plus a binary search per intersecting SST — cheap at a
+/// scheduled cadence, and the price of never refusing to verify.
+const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
+
+/// Scan refusals that mean "this check could not run to completion", never
+/// "this data is bad".
+///
+/// Each of these is a defensive ceiling failing closed before an allocator abort
+/// or an unbounded read. None of them is evidence about vault integrity, so none
+/// of them may reach an operator wearing the corruption remediation.
+const RESOURCE_REFUSAL_CODES: [&str; 4] = [
+    "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+    "CALYX_ASTER_SCAN_ALLOC",
+    "CALYX_ASTER_SST_PAGE_SOURCE_LIMIT_EXCEEDED",
+    "CALYX_ASTER_SST_PAGE_INDEX_MISSING",
+];
 
 type WalOverlay = HashMap<ColumnFamily, Vec<(Vec<u8>, Vec<u8>)>>;
 
@@ -41,7 +83,17 @@ pub struct VerifyRestoreReport {
     pub chain_intact: bool,
     pub wal_bytes_present: u64,
     pub first_cx_id: Option<String>,
+    /// Integrity evidence that failed, or a read that proved the vault bytes
+    /// unusable. Presence here means "this vault is bad".
     pub error: Option<String>,
+    /// A resource budget refused the scan before it could reach a verdict.
+    ///
+    /// Presence here means "this vault is **unverified**", which is a real
+    /// deficiency and keeps [`Self::success`] false — but it is not evidence of
+    /// damage and must never carry a restore-from-backup remediation (#2059).
+    pub unverifiable: Option<String>,
+    /// `CALYX_*` code of the refusal recorded in [`Self::unverifiable`].
+    pub unverifiable_code: Option<String>,
 }
 
 impl VerifyRestoreReport {
@@ -56,6 +108,8 @@ impl VerifyRestoreReport {
             wal_bytes_present: 0,
             first_cx_id: None,
             error: None,
+            unverifiable: None,
+            unverifiable_code: None,
         }
     }
 
@@ -65,14 +119,34 @@ impl VerifyRestoreReport {
     /// population is reported by the counts, but is not a storage-integrity
     /// invariant and must not turn scheduled verification into a permanent
     /// false alarm on fresh installations.
+    ///
+    /// A refused scan is not a pass either: an unverified vault stays non-green.
+    /// What changes is only what the non-green verdict *means* — see
+    /// [`Self::unverifiable_only`].
     pub fn success(&self) -> bool {
-        self.error.is_none() && self.chain_intact && self.wal_bytes_present > 0
+        self.error.is_none()
+            && self.unverifiable.is_none()
+            && self.chain_intact
+            && self.wal_bytes_present > 0
+    }
+
+    /// True when nothing proved the vault bad and the scan simply could not run.
+    ///
+    /// This is the predicate that separates an indeterminate verdict from a
+    /// corruption alarm. It is deliberately conjunctive: any integrity evidence
+    /// in `error` outranks a refusal, because a vault can be both damaged and
+    /// too large to finish scanning, and the damage is what must be reported.
+    pub fn unverifiable_only(&self) -> bool {
+        self.error.is_none() && self.unverifiable.is_some()
     }
 
     /// Names every unmet pass criterion.
     pub fn failure_reasons(&self) -> Vec<String> {
         if let Some(error) = &self.error {
             return vec![error.clone()];
+        }
+        if let Some(reason) = &self.unverifiable {
+            return vec![format!("unverifiable: {reason}")];
         }
         let mut reasons = Vec::new();
         if !self.chain_intact {
@@ -129,83 +203,165 @@ fn verify_restore_inner(
     report.wal_bytes_present = match wal_total_bytes(vault_path) {
         Ok(bytes) => bytes,
         Err(error) => {
-            report.error = Some(error.to_string());
+            record_scan_error(&mut report, &error);
             return Ok(report);
         }
     };
-    let scan = match scan_vault(vault_path, value_crypto) {
+    let overlay = match read_wal_overlay(vault_path, value_crypto) {
+        Ok(overlay) => overlay,
+        Err(error) => {
+            record_scan_error(&mut report, &error);
+            return Ok(report);
+        }
+    };
+
+    let base = match scan_cf_rows(vault_path, ColumnFamily::Base, &overlay, value_crypto) {
         Ok(scan) => scan,
         Err(error) => {
-            report.error = Some(error.to_string());
+            record_scan_error(&mut report, &error);
             return Ok(report);
         }
     };
-    report.constellation_count = scan.constellation_count;
-    report.anchor_count = scan.anchor_count;
-    report.ledger_entry_count = scan.ledger_rows.len() as u64;
-    report.first_cx_id = scan.first_cx_id;
-    if scan.ledger_anchor.is_none()
-        && let Some(head) = scan.ledger_rows.last().map(|row| row.seq.saturating_add(1))
-    {
-        report.error = Some(crate::ledger_head::missing_head_anchor(vault_path, head).to_string());
-        return Ok(report);
+    report.constellation_count = base.row_count;
+    match scan_cf_rows(vault_path, ColumnFamily::Anchors, &overlay, value_crypto) {
+        Ok(scan) => report.anchor_count = scan.row_count,
+        Err(error) => {
+            record_scan_error(&mut report, &error);
+            return Ok(report);
+        }
     }
 
-    let store = RestoredLedgerRows {
-        rows: scan.ledger_rows,
-        anchor: scan.ledger_anchor,
-    };
-    let head = store.rows.last().map_or(0, |row| row.seq.saturating_add(1));
-    match verify_chain(&store, 0..head) {
-        Ok(VerifyResult::Intact { .. }) => match tip_hash(&store.rows) {
-            Ok(hash) => {
-                report.chain_intact = true;
-                report.ledger_tip_hash = hash;
+    if let Some(first) = &base.first_row {
+        match read_back_first_constellation(
+            vault_path,
+            &overlay,
+            value_crypto,
+            &first.key,
+            &first.value,
+        ) {
+            Ok(cx_id) => report.first_cx_id = Some(cx_id),
+            Err(error) => {
+                record_scan_error(&mut report, &error);
+                return Ok(report);
             }
-            Err(error) => report.error = Some(error.to_string()),
-        },
-        Ok(VerifyResult::Broken { at_seq, .. }) => {
+        }
+    }
+
+    let ledger = match verify_ledger_paged(vault_path, &overlay, value_crypto) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            record_scan_error(&mut report, &error);
+            return Ok(report);
+        }
+    };
+    report.ledger_entry_count = ledger.entry_count;
+    match ledger.result {
+        VerifyResult::Intact { .. } => {
+            report.chain_intact = true;
+            report.ledger_tip_hash = ledger.tip_hash;
+        }
+        VerifyResult::Broken { at_seq, .. } => {
             report.error = Some(format!("CALYX_LEDGER_CHAIN_BROKEN at seq={at_seq}"));
         }
-        Ok(VerifyResult::Corrupt { at_seq, reason }) => {
+        VerifyResult::Corrupt { at_seq, reason } => {
             report.error = Some(format!("CALYX_LEDGER_CORRUPT at seq={at_seq}: {reason}"));
         }
-        Err(error) => report.error = Some(error.to_string()),
     }
     Ok(report)
 }
 
-struct VaultScan {
-    constellation_count: u64,
-    anchor_count: u64,
-    first_cx_id: Option<String>,
-    ledger_rows: Vec<LedgerRow>,
-    ledger_anchor: Option<LedgerHeadAnchor>,
+/// Files a scan failure under the finding it actually is.
+///
+/// A resource refusal names the budget, the need, and its own remediation, and
+/// is recorded as indeterminate. Everything else is evidence about the bytes and
+/// stays an error.
+fn record_scan_error(report: &mut VerifyRestoreReport, error: &CalyxError) {
+    if RESOURCE_REFUSAL_CODES.contains(&error.code) {
+        report.unverifiable_code = Some(error.code.to_owned());
+        report.unverifiable = Some(format!("{error}; remediation={}", error.remediation));
+    } else {
+        report.error = Some(error.to_string());
+    }
 }
 
-fn scan_vault(vault: &Path, value_crypto: Option<&SharedVaultContext>) -> Result<VaultScan> {
-    let overlay = read_wal_overlay(vault, value_crypto)?;
-    let base = merged_cf(vault, ColumnFamily::Base, &overlay, value_crypto)?;
-    let anchors = merged_cf(vault, ColumnFamily::Anchors, &overlay, value_crypto)?;
-    let ledger_rows = merged_ledger_rows(vault, &overlay, value_crypto)?;
-    let ledger_anchor = read_head_anchor(vault)?;
-    let first_cx_id = match base.iter().next() {
-        Some((key, value)) => Some(read_back_first_constellation(
-            vault,
-            &overlay,
-            value_crypto,
-            key,
-            value,
-        )?),
-        None => None,
-    };
-    Ok(VaultScan {
-        constellation_count: base.len() as u64,
-        anchor_count: anchors.len() as u64,
-        first_cx_id,
-        ledger_rows,
-        ledger_anchor,
-    })
+#[derive(Default)]
+struct CfScan {
+    row_count: u64,
+    /// Lowest live key in the merged view, retained whole so the first
+    /// constellation can be decoded without a second traversal.
+    first_row: Option<SstEntry>,
+}
+
+fn scan_cf_rows(
+    vault: &Path,
+    cf: ColumnFamily,
+    overlay: &WalOverlay,
+    value_crypto: Option<&SharedVaultContext>,
+) -> Result<CfScan> {
+    let mut scan = CfScan::default();
+    visit_cf_rows(vault, cf, overlay, value_crypto, |entry| {
+        scan.row_count = scan.row_count.saturating_add(1);
+        if scan
+            .first_row
+            .as_ref()
+            .is_none_or(|first| entry.key < first.key)
+        {
+            scan.first_row = Some(entry);
+        }
+        Ok(())
+    })?;
+    Ok(scan)
+}
+
+/// Streams the merged (SST + WAL) live rows of one column family, one bounded
+/// page at a time.
+///
+/// The WAL overlay wins over SST bytes for the same key, exactly as the previous
+/// whole-CF merge did. Tombstoned rows are skipped: the paged reader resolves the
+/// latest visible state, so a deleted row no longer inflates the counts — and the
+/// lowest live key can no longer be a tombstone whose value fails to decode.
+fn visit_cf_rows(
+    vault: &Path,
+    cf: ColumnFamily,
+    overlay: &WalOverlay,
+    value_crypto: Option<&SharedVaultContext>,
+    mut visit: impl FnMut(SstEntry) -> Result<()>,
+) -> Result<()> {
+    let wal_rows = overlay_rows(overlay, cf);
+    let level = cf_level_with_lookup(vault, cf)?;
+    let mut after_key: Option<Vec<u8>> = None;
+    loop {
+        let page =
+            level.range_page_until(&[], None, after_key.as_deref(), VERIFY_SCAN_PAGE_ROWS)?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after_key = Some(last.key.clone());
+        for entry in page {
+            if wal_rows.contains_key(&entry.key) {
+                continue;
+            }
+            visit(open_sst_entry(entry, cf, value_crypto)?)?;
+        }
+    }
+    for (key, value) in wal_rows {
+        visit(SstEntry { key, value })?;
+    }
+    Ok(())
+}
+
+/// Collapses the WAL overlay for one column family to its last-write-wins view.
+///
+/// The overlay is bounded by the WAL, not by the vault, so it is the one part of
+/// the scan that may be held whole.
+fn overlay_rows(overlay: &WalOverlay, cf: ColumnFamily) -> BTreeMap<Vec<u8>, Vec<u8>> {
+    let mut rows = BTreeMap::new();
+    if let Some(wal_rows) = overlay.get(&cf) {
+        for (key, value) in wal_rows {
+            rows.insert(key.clone(), value.clone());
+        }
+    }
+    rows
 }
 
 fn read_wal_overlay(vault: &Path, value_crypto: Option<&SharedVaultContext>) -> Result<WalOverlay> {
@@ -230,29 +386,13 @@ fn read_wal_overlay(vault: &Path, value_crypto: Option<&SharedVaultContext>) -> 
     Ok(overlay)
 }
 
-fn merged_cf(
-    vault: &Path,
-    cf: ColumnFamily,
-    overlay: &WalOverlay,
-    value_crypto: Option<&SharedVaultContext>,
-) -> Result<BTreeMap<Vec<u8>, Vec<u8>>> {
-    let mut rows = BTreeMap::new();
-    for entry in read_cf_ssts(vault, cf, value_crypto)? {
-        rows.insert(entry.key, entry.value);
-    }
-    if let Some(wal_rows) = overlay.get(&cf) {
-        for (key, value) in wal_rows {
-            rows.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(rows)
+/// Opens a column family's SSTs with retained lookup indexes, which is what the
+/// bounded page cursor needs; it refuses to fall back to a whole-file scan.
+fn cf_level_with_lookup(vault: &Path, cf: ColumnFamily) -> Result<SstLevel> {
+    SstLevel::from_oldest_first_with_lookup(cf_sst_paths(vault, cf)?)
 }
 
-fn read_cf_ssts(
-    vault: &Path,
-    cf: ColumnFamily,
-    value_crypto: Option<&SharedVaultContext>,
-) -> Result<Vec<SstEntry>> {
+fn cf_sst_paths(vault: &Path, cf: ColumnFamily) -> Result<Vec<PathBuf>> {
     let dir = vault.join("cf").join(cf.name());
     if !dir.is_dir() {
         return Ok(Vec::new());
@@ -269,46 +409,33 @@ fn read_cf_ssts(
         }
     }
     files.sort();
-    let entries = SstLevel::from_oldest_first(files).iter()?;
-    entries
-        .into_iter()
-        .map(|entry| open_sst_entry(entry, cf, value_crypto))
-        .collect()
+    Ok(files)
 }
 
-fn merged_ledger_rows(
+/// Reads one key from a column family without materializing the family.
+///
+/// The slot-column read-back needs a single row per slot; the previous merged
+/// view built the entire quantized slot CF to answer it.
+fn point_read_cf(
     vault: &Path,
+    cf: ColumnFamily,
     overlay: &WalOverlay,
     value_crypto: Option<&SharedVaultContext>,
-) -> Result<Vec<LedgerRow>> {
-    let mut rows: BTreeMap<u64, Vec<u8>> = BTreeMap::new();
-    for entry in read_cf_ssts(vault, ColumnFamily::Ledger, value_crypto)? {
-        let seq = parse_aster_ledger_seq(&entry.key)?;
-        insert_ledger_bytes(&mut rows, seq, entry.value)?;
+    key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if let Some(rows) = overlay.get(&cf)
+        && let Some((_, value)) = rows.iter().rev().find(|(row_key, _)| row_key == key)
+    {
+        return Ok(Some(value.clone()));
     }
-    if let Some(wal_rows) = overlay.get(&ColumnFamily::Ledger) {
-        for (key, value) in wal_rows {
-            let seq = parse_aster_ledger_seq(key)?;
-            insert_ledger_bytes(&mut rows, seq, value.clone())?;
-        }
-    }
-    Ok(rows
-        .into_iter()
-        .map(|(seq, bytes)| LedgerRow { seq, bytes })
-        .collect())
-}
-
-fn insert_ledger_bytes(rows: &mut BTreeMap<u64, Vec<u8>>, seq: u64, bytes: Vec<u8>) -> Result<()> {
-    if let Some(existing) = rows.get(&seq) {
-        if existing == &bytes {
-            return Ok(());
-        }
-        return Err(CalyxError::ledger_corrupt(format!(
-            "divergent ledger bytes for seq {seq} between SST and WAL"
-        )));
-    }
-    rows.insert(seq, bytes);
-    Ok(())
+    let level = SstLevel::from_oldest_first(cf_sst_paths(vault, cf)?);
+    let Some(value) = level.get(key)? else {
+        return Ok(None);
+    };
+    let Some(context) = value_crypto else {
+        return Ok(Some(value));
+    };
+    Ok(Some(open_value(context, cf, key, &value)?))
 }
 
 fn read_back_first_constellation(
@@ -331,17 +458,16 @@ fn read_back_first_constellation(
             hex(constellation.cx_id.as_bytes())
         )));
     }
+    let wanted = slot_key(constellation.cx_id);
     for slot in constellation.slots.keys() {
-        let slot_rows = merged_cf(vault, ColumnFamily::slot(*slot), overlay, value_crypto)?;
-        let bytes = slot_rows
-            .get(&slot_key(constellation.cx_id))
-            .ok_or_else(|| {
-                CalyxError::aster_corrupt_shard(format!(
-                    "slot {slot} column missing for first constellation {}",
-                    hex(constellation.cx_id.as_bytes())
-                ))
-            })?;
-        decode_slot_vector(bytes)?;
+        let cf = ColumnFamily::slot(*slot);
+        let bytes = point_read_cf(vault, cf, overlay, value_crypto, &wanted)?.ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "slot {slot} column missing for first constellation {}",
+                hex(constellation.cx_id.as_bytes())
+            ))
+        })?;
+        decode_slot_vector(&bytes)?;
     }
     Ok(hex(key))
 }
@@ -360,11 +486,194 @@ fn open_sst_entry(
     })
 }
 
-fn tip_hash(rows: &[LedgerRow]) -> Result<String> {
-    match rows.last() {
-        Some(row) => Ok(hex(&decode_ledger_entry(&row.bytes)?.entry_hash)),
-        None => Ok(hex(&[0u8; 32])),
+struct LedgerVerification {
+    entry_count: u64,
+    result: VerifyResult,
+    tip_hash: String,
+}
+
+/// Re-hashes the provenance chain from the physical Ledger CF without ever
+/// holding it whole.
+///
+/// The Ledger CF key is a big-endian `u64`, so the paged reader yields rows in
+/// ascending sequence — which is exactly the order
+/// [`StreamingChainVerifier`] consumes. That verifier has existed since the
+/// chain was written and had no caller; it is the bounded counterpart to
+/// `verify_chain`, which needs the whole chain in a `Vec` first.
+fn verify_ledger_paged(
+    vault: &Path,
+    overlay: &WalOverlay,
+    value_crypto: Option<&SharedVaultContext>,
+) -> Result<LedgerVerification> {
+    let wal_rows = ledger_overlay_rows(overlay)?;
+    let level = cf_level_with_lookup(vault, ColumnFamily::Ledger)?;
+    let head = physical_ledger_head(&level, &wal_rows)?;
+    let anchor = read_head_anchor(vault)?;
+    if anchor.is_none() && head > 0 {
+        return Err(crate::ledger_head::missing_head_anchor(vault, head));
     }
+    let verifier = match StreamingChainVerifier::start(0..head, anchor, None)? {
+        StreamingStart::Complete(result) => {
+            return Ok(LedgerVerification {
+                entry_count: 0,
+                result,
+                tip_hash: hex(&[0_u8; 32]),
+            });
+        }
+        StreamingStart::Ready(verifier) => verifier,
+    };
+    feed_ledger_rows(&level, &wal_rows, value_crypto, verifier, head)
+}
+
+/// Highest physically present ledger sequence, plus one.
+///
+/// Derived from the bytes rather than from the head anchor on purpose: a chain
+/// whose rows run past its anchored head is exactly the mismatch
+/// [`StreamingChainVerifier::start`] refuses, and taking the head from the
+/// anchor would make that check vacuous.
+fn physical_ledger_head(level: &SstLevel, wal_rows: &BTreeMap<u64, Vec<u8>>) -> Result<u64> {
+    let mut max_seq = wal_rows.keys().next_back().copied();
+    if let Some(entry) = level.predecessor(&[], &u64::MAX.to_be_bytes(), true)? {
+        let seq = parse_aster_ledger_seq(&entry.key)?;
+        max_seq = Some(max_seq.map_or(seq, |current| current.max(seq)));
+    }
+    Ok(max_seq.map_or(0, |seq| seq.saturating_add(1)))
+}
+
+fn ledger_overlay_rows(overlay: &WalOverlay) -> Result<BTreeMap<u64, Vec<u8>>> {
+    let mut rows = BTreeMap::new();
+    let Some(wal_rows) = overlay.get(&ColumnFamily::Ledger) else {
+        return Ok(rows);
+    };
+    for (key, value) in wal_rows {
+        let seq = parse_aster_ledger_seq(key)?;
+        if let Some(existing) = rows.get(&seq) {
+            if existing == value {
+                continue;
+            }
+            return Err(CalyxError::ledger_corrupt(format!(
+                "divergent ledger bytes for seq {seq} between WAL records"
+            )));
+        }
+        rows.insert(seq, value.clone());
+    }
+    Ok(rows)
+}
+
+fn feed_ledger_rows(
+    level: &SstLevel,
+    wal_rows: &BTreeMap<u64, Vec<u8>>,
+    value_crypto: Option<&SharedVaultContext>,
+    mut verifier: StreamingChainVerifier,
+    head: u64,
+) -> Result<LedgerVerification> {
+    let mut wal_iter = wal_rows.iter().peekable();
+    let mut entry_count = 0_u64;
+    let mut last_bytes: Option<Vec<u8>> = None;
+    let mut after_key: Option<Vec<u8>> = None;
+    let mut verdict: Option<VerifyResult> = None;
+    'pages: loop {
+        let page =
+            level.range_page_until(&[], None, after_key.as_deref(), VERIFY_SCAN_PAGE_ROWS)?;
+        let Some(last) = page.last() else {
+            break;
+        };
+        after_key = Some(last.key.clone());
+        for entry in page {
+            let seq = parse_aster_ledger_seq(&entry.key)?;
+            let entry = open_sst_entry(entry, ColumnFamily::Ledger, value_crypto)?;
+            // WAL-only sequences below this SST row come first in chain order.
+            while wal_iter.peek().is_some_and(|(wal_seq, _)| **wal_seq < seq) {
+                let Some((wal_seq, bytes)) = wal_iter.next() else {
+                    break;
+                };
+                if let Some(result) = feed_ledger_row(
+                    &mut verifier,
+                    *wal_seq,
+                    bytes.clone(),
+                    &mut entry_count,
+                    &mut last_bytes,
+                )? {
+                    verdict = Some(result);
+                    break 'pages;
+                }
+            }
+            // The same sequence present in both an SST and the WAL must be
+            // byte-identical; a divergence is corruption, not a merge choice.
+            if let Some((wal_seq, wal_bytes)) = wal_iter.peek()
+                && **wal_seq == seq
+            {
+                if wal_bytes.as_slice() != entry.value.as_slice() {
+                    return Err(CalyxError::ledger_corrupt(format!(
+                        "divergent ledger bytes for seq {seq} between SST and WAL"
+                    )));
+                }
+                wal_iter.next();
+            }
+            if let Some(result) = feed_ledger_row(
+                &mut verifier,
+                seq,
+                entry.value,
+                &mut entry_count,
+                &mut last_bytes,
+            )? {
+                verdict = Some(result);
+                break 'pages;
+            }
+        }
+    }
+    if verdict.is_none() {
+        for (wal_seq, bytes) in wal_iter {
+            if let Some(result) = feed_ledger_row(
+                &mut verifier,
+                *wal_seq,
+                bytes.clone(),
+                &mut entry_count,
+                &mut last_bytes,
+            )? {
+                verdict = Some(result);
+                break;
+            }
+        }
+    }
+    let result = match verdict {
+        Some(result) => result,
+        None => {
+            let stalled_at = verifier.next_seq();
+            verifier.verify_next(None)?.ok_or_else(|| {
+                CalyxError::ledger_chain_broken(format!(
+                    "ledger verification exhausted the physical Ledger CF at seq {stalled_at} \
+                     before reaching head {head}"
+                ))
+            })?
+        }
+    };
+    let tip_hash = match &last_bytes {
+        Some(bytes) => hex(&decode_ledger_entry(bytes)?.entry_hash),
+        None => hex(&[0_u8; 32]),
+    };
+    Ok(LedgerVerification {
+        entry_count,
+        result,
+        tip_hash,
+    })
+}
+
+/// Feeds one row to the streaming verifier, turning a sequence gap into a named
+/// verdict rather than a silently shortened chain.
+fn feed_ledger_row(
+    verifier: &mut StreamingChainVerifier,
+    seq: u64,
+    bytes: Vec<u8>,
+    entry_count: &mut u64,
+    last_bytes: &mut Option<Vec<u8>>,
+) -> Result<Option<VerifyResult>> {
+    if seq != verifier.next_seq() {
+        return verifier.verify_next(None);
+    }
+    *entry_count = entry_count.saturating_add(1);
+    *last_bytes = Some(bytes.clone());
+    verifier.verify_next(Some(LedgerRow { seq, bytes }))
 }
 
 fn wal_total_bytes(vault: &Path) -> Result<u64> {
@@ -390,27 +699,6 @@ fn wal_total_bytes(vault: &Path) -> Result<u64> {
 
 fn read_error(path: &Path, action: &str, detail: &str) -> CalyxError {
     CalyxError::disk_pressure(format!("{action} {}: {detail}", path.display()))
-}
-
-struct RestoredLedgerRows {
-    rows: Vec<LedgerRow>,
-    anchor: Option<LedgerHeadAnchor>,
-}
-
-impl LedgerCfStore for RestoredLedgerRows {
-    fn scan(&self) -> Result<Vec<LedgerRow>> {
-        Ok(self.rows.clone())
-    }
-
-    fn put_new(&mut self, seq: u64, _bytes: &[u8]) -> Result<()> {
-        Err(CalyxError::ledger_append_only_violation(format!(
-            "verify-restore is read-only; rejected append for seq {seq}"
-        )))
-    }
-
-    fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
-        Ok(self.anchor.clone())
-    }
 }
 
 fn restore_invalid(message: impl Into<String>) -> CalyxError {
