@@ -4629,12 +4629,16 @@ pub fn build_action_constellation(
             &action_identity(record),
         )?,
     );
+    let target_text = action_target_text(record);
+    if target_text.is_none() {
+        warn_action_target_absent_on_success(source_key, record);
+    }
     slots.insert(
         ACT_SLOT_TARGET_HASH,
         optional_hash_slot(
             SYN_ACTION_PANEL_NAME,
             "syn.action.target_hash.v1",
-            action_target_text(record).as_deref(),
+            target_text.as_deref(),
             2048,
         )?,
     );
@@ -8235,17 +8239,91 @@ fn action_identity(record: &Value) -> String {
     }
 }
 
+/// Every JSON pointer the action target lane reads, in precedence order.
+///
+/// Shared by [`action_target_text`] and [`warn_action_target_absent_on_success`]
+/// so the projection and the warning that reports its miss cannot name two
+/// different search spaces.
+///
+/// ## The first two are the authoritative persisted paths (#2050)
+///
+/// `synapse-mcp`'s action audit writer (`server::action_audit::
+/// write_action_audit_row_readback`) persists the session's bound target at
+/// exactly two TOP-LEVEL keys of the `CF_ACTION_LOG` row and nowhere else:
+///
+/// * `agent_logical_foreground.target` — `target_claims::target_wire(&target)`,
+///   written by `action_audit_agent_logical_foreground` only on the
+///   `status: "set"` branch (a session that owns a logical foreground target).
+/// * `foreground_lane.target` — the same `target_wire` value, written by
+///   `action_audit_foreground_lane` on its `Ok(Some(target))` branch.
+///
+/// `TargetWire` is `#[serde(tag = "kind", rename_all = "snake_case")]`, so the
+/// persisted value is an object — `{"kind":"window","window_hwnd":<i64>}` or
+/// `{"kind":"cdp","window_hwnd":<i64>,"cdp_target_id":"<id>"}` — which
+/// [`json_value_text`] canonicalizes to its JSON text. That text is the
+/// authoritative identity of the window/tab the action actually drove.
+///
+/// This list previously started at `/target` and searched only
+/// `payload_bounded`/`details` below it. A real action audit row carries none of
+/// those at top level, so **every target-bound success measured as
+/// `AbsentReason::NotApplicable` on `ACT_SLOT_TARGET_HASH`** while some failure
+/// payloads happened to carry `details.target`. The result was a target lane
+/// populated only by bad cases: Ward reported `slot 49 has 0 adjudicated good
+/// exemplar(s)` no matter how many verified target-bound successes were run.
+///
+/// Order is load-bearing. The authoritative session target wins when present;
+/// the historical payload/details paths keep their exact prior meaning for rows
+/// that carry only those; and `/actor/tool` stays last as the pre-existing
+/// last-resort identity rather than a target.
+const ACTION_TARGET_POINTERS: &[&str] = &[
+    "/agent_logical_foreground/target",
+    "/foreground_lane/target",
+    "/target",
+    "/payload_bounded/target",
+    "/details/target",
+    "/details/request/target",
+    "/actor/tool",
+];
+
 fn action_target_text(record: &Value) -> Option<String> {
-    json_pointer_text(
-        record,
-        &[
-            "/target",
-            "/payload_bounded/target",
-            "/details/target",
-            "/details/request/target",
-            "/actor/tool",
-        ],
-    )
+    json_pointer_text(record, ACTION_TARGET_POINTERS)
+}
+
+/// Reports a terminal action SUCCESS whose target no known path carries.
+///
+/// A successful action row is exactly the exemplar the target lane needs to be
+/// calibratable, so one that measures `Absent` is corpus loss, and #2050 is what
+/// silent corpus loss on this lane costs: the shortfall surfaced only as a Ward
+/// refusal with no way to tell "no target was ever bound" from "a target was
+/// bound and the projection could not see it". The two persisted foreground
+/// statuses are logged beside the miss so a reader can separate those cases from
+/// the log line alone.
+fn warn_action_target_absent_on_success(source_key: &[u8], record: &Value) {
+    if json_string(record, &["status", "outcome"]).as_deref() != Some("ok") {
+        return;
+    }
+    tracing::warn!(
+        code = "CALYX_ACTION_TARGET_ABSENT_ON_SUCCESS",
+        panel_name = SYN_ACTION_PANEL_NAME,
+        panel_version = SYN_ACTION_PANEL_VERSION,
+        slot = ACT_SLOT_TARGET_HASH.get(),
+        source_cf = cf::CF_ACTION_LOG,
+        source_key_hex = %hex_encode(source_key),
+        action = %action_identity(record),
+        agent_logical_foreground_status = json_pointer_text(
+            record,
+            &["/agent_logical_foreground/status"]
+        )
+        .unwrap_or_else(|| "<absent>".to_owned()),
+        foreground_lane_status = json_pointer_text(record, &["/foreground_lane/status"])
+            .unwrap_or_else(|| "<absent>".to_owned()),
+        searched_pointers = ACTION_TARGET_POINTERS.join(","),
+        "terminal action success carries no target under any known path; its target-hash slot \
+         measures Absent and the row cannot serve as a good exemplar for target-lane calibration. \
+         Remediation: if the two foreground statuses show a bound session target, the projection \
+         has drifted from the audit writer and ACTION_TARGET_POINTERS must be repaired; if they \
+         show none was bound, bind one with target operation=set before the action"
+    );
 }
 
 fn reflex_latency_ms(record: &StoredReflexAudit) -> Option<u64> {
@@ -8396,6 +8474,10 @@ const fn sensor_status_code(status: &SensorStatus) -> &'static str {
         SensorStatus::Healthy => "healthy",
         SensorStatus::DegradedLatency { .. } => "degraded_latency",
         SensorStatus::DegradedSensorFailed { .. } => "degraded_sensor_failed",
+        // #2054: a producer that was asked for nothing is its own flag token,
+        // so a stored observation never carries `detection:healthy` for a
+        // profile whose detector never ran.
+        SensorStatus::NotConfigured { .. } => "not_configured",
         SensorStatus::Disabled => "disabled",
         SensorStatus::Unavailable => "unavailable",
     }

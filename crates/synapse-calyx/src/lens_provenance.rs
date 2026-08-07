@@ -339,12 +339,39 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
         "syn.action.kind_onehot.v2",
         &["row_kind", "tool", "verb"],
     ),
-    (49, 2020001, "syn.action.target_hash.v1", &["pointer"]),
+    // #2050: `action_target_text` reads the session's bound target from the two
+    // TOP-LEVEL keys the action audit writer actually persists it under, above
+    // the historical payload/details paths. Declared explicitly rather than left
+    // under the bare `pointer` marker, because a projection that reads a field no
+    // declaration names is exactly the unaudited measurement this table exists to
+    // make impossible.
+    (
+        49,
+        2020001,
+        "syn.action.target_hash.v1",
+        &[
+            "agent_logical_foreground.target",
+            "foreground_lane.target",
+            "pointer",
+        ],
+    ),
+    // `action_numeric_record`'s `has_target` component calls the same
+    // `action_target_text`, so the dense record vector reads these fields
+    // transitively and declares them too.
     (
         50,
         2020001,
         "syn.action.record_vector.v1",
-        &["details", "pointer", "seq", "tool", "ts_ns", "verb"],
+        &[
+            "agent_logical_foreground.target",
+            "details",
+            "foreground_lane.target",
+            "pointer",
+            "seq",
+            "tool",
+            "ts_ns",
+            "verb",
+        ],
     ),
     (51, 2020001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
     (52, 2020001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
