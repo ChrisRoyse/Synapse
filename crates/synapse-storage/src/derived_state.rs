@@ -96,6 +96,38 @@ pub const LIFECYCLE_BACKFILL_BATCH_ROWS: usize = 64;
 /// requests.
 pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Wall clock guaranteed to **every** owed coverage target on every tick
+/// (#2061 ask 3).
+///
+/// The tick budget above says how much sweeping happens; this says that it is
+/// shared. Without it, the most-owed target's sweep loop read the *tick's* clock
+/// rather than its own share of it, so target one paged until the whole budget
+/// was gone and the driver's loop over the remaining targets exited on its first
+/// check. The deployed daemon reported `targets_owed=4 targets_attempted=1` on
+/// every pass of two consecutive generations while `syn-process-v1` held 991
+/// uncovered rows and `syn-agent-event-v1` held 32,494, both *exactly* flat: not
+/// blocked by any fault, simply never selected. The rotation existed; the clock
+/// it divided did not.
+///
+/// A slice is a floor and not a quota. The head of the queue still gets the
+/// whole remainder — everyone else's floor is reserved from it, not taken from
+/// it evenly — so the largest backlog keeps the bulk of the tick and the
+/// smallest still advances. The sweep checks its deadline *before* each page, so
+/// any positive slice buys at least one page and no target can be attempted for
+/// zero work.
+pub const PANEL_BACKFILL_TARGET_MIN_SLICE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard stop for the whole panel-backfill phase.
+///
+/// A page is atomic and can overrun the slice that admitted it, so the sum of
+/// the floors plus one overrunning page can exceed [`PANEL_BACKFILL_TICK_BUDGET`].
+/// That is intended: finishing the rotation matters more than the soft budget,
+/// and the five-minute tick has the headroom. This is the bound that keeps
+/// "finishing the rotation" from becoming unbounded if the owed-target set ever
+/// grows large — past it, the remaining targets are **named** as unswept with
+/// their reason rather than silently dropped.
+pub const PANEL_BACKFILL_TICK_HARD_CEILING: std::time::Duration = std::time::Duration::from_mins(3);
+
 /// Exact stranded anchor identities one tick will attempt to re-anchor (#1984).
 ///
 /// A **work** bound, not a time bound, and that is the whole correction. The
@@ -128,6 +160,16 @@ pub const PANEL_ANCHOR_DEBT_TICK_BUDGET: std::time::Duration = std::time::Durati
 /// debt-proportional repair back into a corpus-proportional one. It is measured
 /// and published every tick rather than assumed.
 pub const PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS: u64 = 250;
+
+/// Identities a tick must have attempted before its per-identity cost is
+/// compared against [`PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS`] (#2080 defect 3).
+///
+/// A ceiling on *marginal* cost is meaningless over a sample of one. The
+/// deployed daemon published a "150-500x regression" that was entirely this: the
+/// same fixed per-panel cost, divided by two attempts instead of a thousand as
+/// the debt drained. The advisory now needs a sample before it will speak, and
+/// the fixed cost it used to absorb is measured and published separately.
+pub const PANEL_ANCHOR_DEBT_COST_ADVISORY_MIN_SAMPLE: u64 = 8;
 
 /// Exact identities one panel may hold in durable quarantine (#1984, #2061).
 ///
@@ -189,10 +231,39 @@ pub const KERNEL_REBUILD_MAX_RECORDS: usize = 2_000;
 /// Maximum bisection work items accepted for one panel interval.
 const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
 
+/// Ticks started, ticks that ended with every sub-pass clean, ticks that ended
+/// with at least one sub-pass failure, and ticks that never ran (#2080 ask 1).
+///
+/// **All four count the same physical thing: one maintenance tick.** They used
+/// not to. `attempts` and `success` were per tick while `failure` was
+/// incremented once per *sub-pass* failure, so the deployed daemon published
+/// `attempts=6 success=0 failure=15` — a rollup in which the failure counter ran
+/// at 2.5x the attempt counter it was supposed to be a subset of, and no ratio
+/// computed from the three meant anything. Failure counts and attempt counts
+/// belong to one denominator or they are not comparable; the per-sub-pass layer
+/// is a genuinely different aggregation and is published as one, beside them,
+/// rather than folded into them.
+///
+/// Invariant, checked by construction at the end of every tick:
+/// `attempts == success + failure + skipped + (at most one tick in flight)`.
 static DERIVED_STATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SUCCESS: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_FAILURE: AtomicU64 = AtomicU64::new(0);
 static DERIVED_STATE_SKIPPED: AtomicU64 = AtomicU64::new(0);
+/// Individual sub-pass failures, across every tick. The *diagnostic* layer:
+/// which component broke and how often, which is a different question from how
+/// many ticks failed and must never be reported through the same counter.
+static DERIVED_STATE_SUBPASS_FAILURES: AtomicU64 = AtomicU64::new(0);
+/// Cost and quality advisories published by the maintainer. Visible, never a
+/// failure (#2080 ask 2).
+static DERIVED_STATE_ADVISORIES: AtomicU64 = AtomicU64::new(0);
+
+/// Sub-pass failures whose text one tick's readback carries verbatim.
+///
+/// The evidence is the point, so it is bounded rather than summarised: past this
+/// many the readback names how many more it is not printing instead of dropping
+/// the count.
+const DERIVED_STATE_SUBPASS_EVIDENCE_CAP: usize = 64;
 static LAST_KERNEL_REBUILD_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Storage handle the derived-state pass reads the vault from.
@@ -247,10 +318,25 @@ static WEAVE_WATERMARK_NS: LazyLock<Mutex<BTreeMap<u32, i64>>> =
 /// `health` to read without touching the vault.
 #[derive(Clone, Debug, Default)]
 pub struct DerivedStateReadback {
+    /// Tick-granularity outcome counters. `success + failure + skipped` equals
+    /// `attempts` once the tick in flight completes, and `failure` can never
+    /// exceed `attempts` (#2080 ask 1).
     pub attempts_total: u64,
     pub success_total: u64,
     pub failure_total: u64,
     pub skipped_total: u64,
+    /// Sub-pass-granularity failure counter, published beside the tick counters
+    /// rather than inside them. One tick can hold many of these.
+    pub subpass_failures_total: u64,
+    /// Cost and quality advisories. Loud, and deliberately not failures: their
+    /// remediation is a code change, so they must never gate readiness.
+    pub advisories_total: u64,
+    /// Whether the last **completed** tick failed, and the exact sub-pass
+    /// failures it recorded. This is what `health` reads: a lifetime counter
+    /// cannot say whether the maintainer is broken *now*, and reading `error`
+    /// off one is how a subsystem stayed red across a hundred clean ticks.
+    pub last_tick_failed: Option<bool>,
+    pub last_tick_subpass_failures: Vec<String>,
     pub last_run_unix_ms: Option<u64>,
     pub last_success_unix_ms: Option<u64>,
     /// What the last completed pass decided about the search generation.
@@ -286,6 +372,20 @@ pub struct DerivedStateReadback {
     /// True when the sweep reached the end of its source CF this tick, so the
     /// cursor reset to the start of the CF for the next generation bump.
     pub last_backfill_sweep_complete: Option<bool>,
+    /// Coverage targets owed a sweep, and how many this tick actually swept
+    /// (#2061 ask 3).
+    ///
+    /// These two are equal on a healthy tick, by construction. `targets_owed=4
+    /// targets_attempted=1` on every pass of two consecutive daemon generations
+    /// is what the head-of-queue starvation looked like from the outside, and it
+    /// was invisible in every other field: the tick reported a panel, a page
+    /// count and an elapsed time that all looked like work, because they were —
+    /// for one panel out of four.
+    pub last_backfill_targets_owed: u64,
+    pub last_backfill_targets_attempted: u64,
+    /// Owed targets this tick did **not** sweep, each with the evidenced reason.
+    /// Empty on a healthy tick; never silently non-empty.
+    pub last_backfill_targets_skipped: Vec<String>,
     /// Anchors the coverage sweep carried across a generation bump in passing.
     ///
     /// The sweep always did this and never reported it, so the one number that
@@ -324,14 +424,52 @@ pub struct DerivedStateReadback {
     /// Measured cost of one exact-identity repair this tick. Published rather
     /// than assumed, because it is the number that says whether the repair is
     /// debt-proportional or has quietly become corpus-proportional again.
+    ///
+    /// **Numerator and denominator now describe the same work (#2080 defect
+    /// 3).** This used to be the whole phase's wall clock — every debt-bearing
+    /// panel's durable state read, quarantine prune and cursor write, including
+    /// panels that attempted nothing — divided by the identities actually
+    /// attempted. Those per-panel fixed costs do not scale with identities, so
+    /// as the debt drained from ~1,000 attempts a tick to 2 the same absolute
+    /// cost was divided by a 500x smaller denominator and published as a 500x
+    /// per-identity regression. It is now the sum of the exact-identity repair
+    /// calls only; the fixed costs are `last_anchor_debt_elapsed_ms` minus
+    /// `last_anchor_debt_repair_ms`, and the lineage index build is measured in
+    /// its own right below.
     pub last_anchor_debt_ms_per_identity: Option<u64>,
+    /// Wall clock spent inside the exact-identity repair calls themselves.
+    pub last_anchor_debt_repair_ms: u64,
+    /// Whole-phase wall clock, including every panel's fixed per-tick cost.
     pub last_anchor_debt_elapsed_ms: Option<u64>,
+    /// Debt-bearing panels this tick actually attempted an identity on. The
+    /// denominator the lineage-rebuild count is judged against: the grounded
+    /// anchor lineage is one index per `(source CF, superseded set)`, so one
+    /// build per attempted panel is amortized and more than that is not.
+    pub last_anchor_debt_panels_attempted: u64,
+    /// Grounded-anchor lineage index builds and their cost during this tick's
+    /// anchor-debt phase, measured in the backend rather than inferred from a
+    /// wall-clock ratio (#2080 defect 3).
+    pub last_anchor_debt_lineage_rebuilds: u64,
+    pub last_anchor_debt_lineage_reuses: u64,
+    pub last_anchor_debt_lineage_rebuild_ms: u64,
     /// Last incremental Loom action and physical readback (#1671).
     pub last_weave_actions: BTreeMap<u32, String>,
     pub last_weave_until_ns: BTreeMap<u32, i64>,
     pub last_weave_records: BTreeMap<u32, u64>,
     pub last_weave_xterm_rows: BTreeMap<u32, usize>,
     pub last_weave_graph_rows: BTreeMap<u32, usize>,
+    /// Ingest time this panel's weave has not reached yet, the parts still owed,
+    /// and how many consecutive ticks the backlog has grown (#2085).
+    ///
+    /// `last_weave_until_ns` is the committed **frontier**, not the instant the
+    /// tick aimed at, so these three say whether a partial pass is catching up
+    /// or losing ground. Without them a frozen watermark and a converging one
+    /// read identically from the outside — which is how a panel's derived layer
+    /// stayed pinned to a fixed instant for 44 minutes while the maintainer
+    /// reported work on every tick.
+    pub last_weave_backlog_ns: BTreeMap<u32, i64>,
+    pub last_weave_pending_parts: BTreeMap<u32, usize>,
+    pub last_weave_backlog_growth_ticks: BTreeMap<u32, u32>,
     /// Scheduled post-ingest Reactive drift production and delivery (#1680).
     pub last_reactive_drift_rows: BTreeMap<u32, usize>,
     pub last_reactive_notifications_matched: BTreeMap<u32, u64>,
@@ -359,6 +497,11 @@ pub struct DerivedStateReadback {
     pub last_failure_code: Option<String>,
     pub last_failure_detail: Option<String>,
     pub last_failure_unix_ms: Option<u64>,
+    /// The most recent advisory, on its own channel so it can be loud without
+    /// being counted as, or mistaken for, a failure (#2080 ask 2).
+    pub last_advisory_code: Option<String>,
+    pub last_advisory_detail: Option<String>,
+    pub last_advisory_unix_ms: Option<u64>,
     /// The most recent skip reason, cleared by the next completed pass.
     pub last_skip_code: Option<String>,
     pub last_skip_detail: Option<String>,
@@ -462,6 +605,8 @@ pub fn derived_state_readback() -> DerivedStateReadback {
     readback.success_total = DERIVED_STATE_SUCCESS.load(Ordering::Relaxed);
     readback.failure_total = DERIVED_STATE_FAILURE.load(Ordering::Relaxed);
     readback.skipped_total = DERIVED_STATE_SKIPPED.load(Ordering::Relaxed);
+    readback.subpass_failures_total = DERIVED_STATE_SUBPASS_FAILURES.load(Ordering::Relaxed);
+    readback.advisories_total = DERIVED_STATE_ADVISORIES.load(Ordering::Relaxed);
     readback.refresh_delta_keys_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS;
     readback.min_rebuild_interval_ms = SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS;
     readback
@@ -496,13 +641,22 @@ fn record_skip(code: &'static str, detail: String) {
     guard.last_skip_detail = Some(detail);
 }
 
+/// Records one **sub-pass** failure into the tick's outcome ledger (#2080).
+///
+/// This is the only place a derived-state failure is recorded, and it no longer
+/// touches the tick counters. The tick's verdict is computed once, at the end of
+/// the tick, from the ledger this writes — so `success`, `failure` and the
+/// evidence an operator reads are three views of one set of physical outcomes
+/// rather than three independent tallies that can disagree. They did disagree:
+/// `failure` counted sub-passes, `success` required a whole clean tick, and the
+/// pair published `success=0 failure=15` over `attempts=6`.
 fn record_failure(code: &'static str, detail: String) {
-    DERIVED_STATE_FAILURE.fetch_add(1, Ordering::Relaxed);
+    DERIVED_STATE_SUBPASS_FAILURES.fetch_add(1, Ordering::Relaxed);
     tracing::error!(
         code,
         detail,
-        "unattended derived-state maintenance failed; the derived layer it maintains stays at \
-         whatever state it was already in, and health reports that state"
+        "unattended derived-state maintenance sub-pass failed; the derived layer it maintains stays \
+         at whatever state it was already in, and health reports that state"
     );
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
@@ -510,8 +664,50 @@ fn record_failure(code: &'static str, detail: String) {
     };
     guard.last_run_unix_ms = now_unix_ms();
     guard.last_failure_code = Some(code.to_owned());
-    guard.last_failure_detail = Some(detail);
     guard.last_failure_unix_ms = now_unix_ms();
+    match guard.last_tick_subpass_failures.len() {
+        len if len < DERIVED_STATE_SUBPASS_EVIDENCE_CAP => {
+            let evidence = format!("{code}: {detail}");
+            guard.last_tick_subpass_failures.push(evidence);
+        }
+        len if len == DERIVED_STATE_SUBPASS_EVIDENCE_CAP => {
+            guard.last_tick_subpass_failures.push(format!(
+                "... further sub-pass failures this tick are counted in subpass_failures_total but \
+                 not printed past the {DERIVED_STATE_SUBPASS_EVIDENCE_CAP}-entry evidence cap"
+            ));
+        }
+        _ => {}
+    }
+    guard.last_failure_detail = Some(detail);
+}
+
+/// Records a cost or quality **advisory** — loud, and never a failure (#2080
+/// ask 2).
+///
+/// The distinction is not cosmetic. An advisory says a measurement crossed a
+/// declared engineering ceiling; nothing was left stale, no derived layer is
+/// wrong, and the remediation is a code change rather than an operator action.
+/// Routing one through `record_failure` made
+/// `STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED` — emitted on a tick
+/// that *successfully carried two anchors*, and whose own text said "the
+/// identity work queue is correct" — into `last_failure_code`, a failure count,
+/// and a permanently false `health.ok`. Readiness must never be gated on a
+/// condition no operator can clear.
+fn record_advisory(code: &'static str, detail: String) {
+    DERIVED_STATE_ADVISORIES.fetch_add(1, Ordering::Relaxed);
+    tracing::warn!(
+        code,
+        detail,
+        "unattended derived-state maintenance published a cost advisory; nothing failed and no \
+         derived layer is stale because of it, so it does not gate readiness"
+    );
+    let mut guard = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.last_advisory_code = Some(code.to_owned());
+    guard.last_advisory_detail = Some(detail);
+    guard.last_advisory_unix_ms = now_unix_ms();
 }
 
 /// Runs one unattended derived-state maintenance pass.
@@ -525,6 +721,18 @@ pub(crate) fn run_derived_state_maintenance() {
     // intelligence work and must never be driven from a tagged reflex tick.
     hot_context::assert_cold_calyx("maintenance_derived_state");
     DERIVED_STATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+    {
+        // The tick's outcome ledger starts empty. Every sub-pass failure below
+        // appends to it, and the tick's verdict is read back off it — so the
+        // verdict cannot be reached by a route that does not also leave its
+        // evidence behind.
+        let mut guard = match DERIVED_STATE_LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.last_tick_subpass_failures.clear();
+        guard.last_tick_failed = None;
+    }
     let source = match DERIVED_STATE_SOURCE.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
@@ -868,17 +1076,58 @@ pub(crate) fn run_derived_state_maintenance() {
         record_failure("STORAGE_DERIVED_STATE_KERNEL_REBUILD_FAILED", error);
     }
 
+    // --- One verdict, from one ledger (#2080 ask 1) ---
+    //
+    // The verdict is the tick's, the ledger is the tick's, and both are read
+    // here rather than accumulated in parallel with the counters. A sub-pass
+    // that returned a failure without recording one is a defect in this module,
+    // not a tick to quietly pass: it is named and it fails the tick, which is
+    // also how it lands in the ledger the verdict is then taken from.
+    let ledgered = {
+        let guard = match DERIVED_STATE_LAST.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.last_tick_subpass_failures.len()
+    };
+    if any_failed && ledgered == 0 {
+        record_failure(
+            "STORAGE_DERIVED_STATE_OUTCOME_LEDGER_DIVERGED",
+            "a derived-state sub-pass reported failure to the tick driver but recorded no failure \
+             in the tick's outcome ledger, so the published counters would have described a clean \
+             tick over a sub-pass that did not complete; failing the tick on the driver's report \
+             and naming the divergence"
+                .to_owned(),
+        );
+    }
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     guard.last_run_unix_ms = now_unix_ms();
-    if !any_failed {
+    let tick_failed = !guard.last_tick_subpass_failures.is_empty();
+    guard.last_tick_failed = Some(tick_failed);
+    if tick_failed {
+        DERIVED_STATE_FAILURE.fetch_add(1, Ordering::Relaxed);
+    } else {
         DERIVED_STATE_SUCCESS.fetch_add(1, Ordering::Relaxed);
         guard.last_success_unix_ms = now_unix_ms();
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_TICK_COMPLETED",
+        tick_failed,
+        subpass_failures = guard.last_tick_subpass_failures.len(),
+        attempts_total = DERIVED_STATE_ATTEMPTS.load(Ordering::Relaxed),
+        success_total = DERIVED_STATE_SUCCESS.load(Ordering::Relaxed),
+        failure_total = DERIVED_STATE_FAILURE.load(Ordering::Relaxed),
+        skipped_total = DERIVED_STATE_SKIPPED.load(Ordering::Relaxed),
+        subpass_failures_total = DERIVED_STATE_SUBPASS_FAILURES.load(Ordering::Relaxed),
+        advisories_total = DERIVED_STATE_ADVISORIES.load(Ordering::Relaxed),
+        subpass_failure_codes = ?guard.last_tick_subpass_failures,
+        "completed one unattended derived-state tick and published its outcome at tick granularity"
+    );
 }
 
 fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
@@ -1626,8 +1875,128 @@ fn calyx_time_boundary_ns_now() -> Result<i64, String> {
         .ok_or_else(|| "system time exceeds signed nanosecond range".to_owned())
 }
 
+/// Why one tick stopped weaving before it reached `until_ns` (#2085).
+///
+/// Three stops, deliberately distinguished, because two of them are progress and
+/// one of them is a wall. Collapsing them into "the interval did not finish" is
+/// what turned a bounded backlog into a permanent one.
+#[derive(Debug)]
+enum WeaveStop {
+    /// The tick's wall clock ran out. Everything before the frontier is woven
+    /// and durable; the rest is next tick's work.
+    BudgetExhausted { pending_parts: usize },
+    /// The bisection needed more bounded parts than one tick may hold.
+    MaxParts { pending_parts: usize },
+    /// A single millisecond holds more records than the cap, so no further
+    /// split can separate them. The frontier cannot pass this instant by any
+    /// amount of running — a wall, not a backlog.
+    IndivisibleInterval {
+        part_since: i64,
+        part_until: i64,
+        records_scanned: usize,
+    },
+}
+
+/// One panel's incremental-weave backlog across ticks (#2085).
+///
+/// The convergence question cannot be answered from a single tick: a tick that
+/// wove 30 seconds of backlog is making progress if ingest produced 10 seconds
+/// in the meantime and losing ground if it produced 60. Only the trend answers
+/// it, so the trend is measured and kept.
+#[derive(Clone, Copy, Debug, Default)]
+struct WeaveBacklogTrend {
+    backlog_ns: i64,
+    consecutive_growth: u32,
+}
+
+static WEAVE_BACKLOG_TREND: LazyLock<Mutex<BTreeMap<u32, WeaveBacklogTrend>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+/// Consecutive ticks a panel's weave backlog may grow before the condition is a
+/// named fault rather than an advisory (#2085).
+///
+/// Three, matching every other "this has now happened often enough to be a
+/// property of the work rather than of the moment" threshold in this module. One
+/// tick of growth is an ingest burst; three in a row is a panel that will never
+/// catch up on the budget it has, and an operator has to be told the difference.
+const WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT: u32 = 3;
+
+/// Records the frontier this tick reached and answers whether the panel is
+/// converging on its backlog or losing ground to it.
+///
+/// Returns the backlog trend after this tick.
+fn record_weave_backlog(panel_version: u32, backlog_ns: i64) -> WeaveBacklogTrend {
+    let mut trends = match WEAVE_BACKLOG_TREND.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let entry = trends.entry(panel_version).or_default();
+    entry.consecutive_growth = if backlog_ns > entry.backlog_ns {
+        entry.consecutive_growth.saturating_add(1)
+    } else {
+        0
+    };
+    entry.backlog_ns = backlog_ns;
+    *entry
+}
+
+/// Commits the frontier of contiguously woven time for one panel (#2085).
+///
+/// # Why a frontier and not a completion flag
+///
+/// The interval queue is consumed in strictly ascending time order — a bisection
+/// pushes `[since,mid)` ahead of `[mid,until)`, and both ahead of everything
+/// already queued — so at every moment the parts completed so far cover exactly
+/// `[since_ns, frontier_ns)` with no hole in it. That contiguity is what makes
+/// advancing to a partial frontier safe: the invariant the old code actually
+/// needed was *never advance past an unprocessed suffix*, and it enforced that
+/// with the much stronger *never advance unless the whole interval finished*.
+///
+/// The stronger rule is what diverged. `until_ns` is recomputed to `now()` every
+/// tick while the budget is fixed, so the moment one interval misses the budget
+/// the interval to clear grows by a tick period every tick, forever, and the
+/// bisection makes it worse: a longer interval splits into larger first parts,
+/// which is why the deployed daemon's `completed_parts` decayed 1 → 0 while
+/// `pending_parts` rose 2 → 4 and the watermark sat unmoved for 44 minutes.
+/// Committing the frontier makes every tick start strictly ahead of the last,
+/// which is the difference between a loop that converges and one that cannot.
+fn commit_weave_frontier(
+    panel_version: u32,
+    since_ns: i64,
+    frontier_ns: i64,
+) -> Result<(), String> {
+    if frontier_ns <= since_ns {
+        return Ok(());
+    }
+    let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let watermark = watermarks
+        .get_mut(&panel_version)
+        .ok_or_else(|| format!("panel {panel_version} watermark disappeared before commit"))?;
+    if *watermark != since_ns {
+        return Err(format!(
+            "panel {panel_version} watermark changed concurrently: expected={since_ns} \
+             actual={watermark}; refusing to overwrite a newer owner"
+        ));
+    }
+    *watermark = frontier_ns;
+    Ok(())
+}
+
 /// Weaves every record in one panel's new ingest interval without permitting a
 /// record cap to become data loss.
+///
+/// Bounded by a wall-clock budget, and **convergent** under it (#2085): a tick
+/// that cannot reach `until_ns` commits the frontier it did reach and reports
+/// the remaining backlog, rather than discarding the work and starting the same
+/// growing interval again on the next tick.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one weave pass: interval bisection, the three stop conditions, frontier commit and \
+              convergence classification are a single ordered sequence"
+)]
 fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, String> {
     // Constellation `created_at` is millisecond-granular. Both ends must be
     // aligned to that same grid: a fractional watermark would exclude records
@@ -1660,38 +2029,56 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
     let mut records_woven = 0u64;
     let mut last_xterm_rows = 0usize;
     let mut last_graph_rows = 0usize;
+    // Exclusive end of contiguously woven time. Every completed part is adjacent
+    // to the last, so this is a position the next tick may safely resume from.
+    let mut frontier_ns = since_ns;
+    let mut stop: Option<WeaveStop> = None;
 
     while let Some((part_since, part_until)) = intervals.pop_front() {
         if started.elapsed() >= WEAVE_PANEL_TICK_BUDGET {
-            return Err(format!(
-                "weave budget exhausted after {completed_parts} completed interval part(s); watermark remains at {since_ns} so the entire interval is retried; budget_ms={} pending_parts={}",
-                WEAVE_PANEL_TICK_BUDGET.as_millis(),
-                intervals.len() + 1
-            ));
+            stop = Some(WeaveStop::BudgetExhausted {
+                pending_parts: intervals.len() + 1,
+            });
+            break;
         }
         if completed_parts + intervals.len() >= WEAVE_MAX_INTERVAL_PARTS {
-            return Err(format!(
-                "weave interval required more than {WEAVE_MAX_INTERVAL_PARTS} bounded parts; watermark remains at {since_ns}; narrow the maintenance interval or raise the record cap only after measuring association cost"
-            ));
+            stop = Some(WeaveStop::MaxParts {
+                pending_parts: intervals.len() + 1,
+            });
+            break;
         }
 
         let mut params = synapse_calyx::SynapseCalyxWeaveParams::new(panel_version);
         params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
         params.since_ts_ns = Some(part_since);
         params.until_ts_ns = Some(part_until);
-        let report = db
-            .weave_panel_intelligence(params)
-            .map_err(|error| error.to_string())?;
+        let report = match db.weave_panel_intelligence(params) {
+            Ok(report) => report,
+            Err(error) => {
+                // The parts already woven are durable and contiguous. Discarding
+                // the frontier because a LATER part failed would make every
+                // retry redo them, which is the divergence this function was
+                // repaired for — the failure itself is unchanged and still loud.
+                commit_weave_frontier(panel_version, since_ns, frontier_ns)?;
+                return Err(format!(
+                    "{error}; frontier committed at {frontier_ns} after {completed_parts} \
+                     completed interval part(s), so the retry resumes there rather than at \
+                     {since_ns}"
+                ));
+            }
+        };
 
         if report.records_scanned > WEAVE_INTERVAL_MAX_RECORDS {
             // Calyx timestamps are millisecond-granular. Once the interval is a
             // single millisecond, another split cannot separate its records;
             // refuse instead of advancing past an unprocessed suffix.
             if part_until - part_since <= 1_000_000 {
-                return Err(format!(
-                    "panel {panel_version} contains {} records in the indivisible interval [{part_since},{part_until}), above cap {WEAVE_INTERVAL_MAX_RECORDS}; watermark remains at {since_ns}; increase the cap only with a measured memory/latency budget or add a Base-key cursor",
-                    report.records_scanned
-                ));
+                stop = Some(WeaveStop::IndivisibleInterval {
+                    part_since,
+                    part_until,
+                    records_scanned: report.records_scanned,
+                });
+                break;
             }
             let midpoint = part_since + (part_until - part_since) / 2;
             intervals.push_front((midpoint, part_until));
@@ -1729,27 +2116,58 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
             );
         }
 
+        // #2076: the *agreement* lane, which is the one that actually stalled
+        // this maintainer. The block above reports the kNN lane, whose exclusion
+        // predicate is "the record's whole vector is zero" — structurally never
+        // true on `syn-episode-v1`, so it logged nothing on every pass while the
+        // agreement lane was skipping tens of thousands of lens pairs. Two
+        // lanes, two predicates, two reports.
+        if report.agreement_zero_norm_skips > 0 {
+            let pairs = report
+                .agreement_zero_norm_slot_pairs
+                .iter()
+                .map(|(a, b)| format!("{a}:{b}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            tracing::info!(
+                code = "STORAGE_DERIVED_STATE_WEAVE_AGREEMENT_ZERO_NORM_SKIPS",
+                panel_version,
+                since_ns = part_since,
+                until_ns = part_until,
+                skipped_pairs = report.agreement_zero_norm_skips,
+                affected_records = report.agreement_zero_norm_records,
+                records_woven = report.records_woven,
+                sample_truncated = report.agreement_zero_norm_sample_truncated,
+                slot_pairs = %pairs,
+                "within-record agreement cross-terms whose operand measures to exactly zero have \
+                 no cosine; the named lens pairs were skipped on those records and every other \
+                 pair on the same records still wove"
+            );
+        }
+
         completed_parts += 1;
+        frontier_ns = part_until;
         records_woven = records_woven.saturating_add(report.records_woven as u64);
         last_xterm_rows = report.xterm_cf_rows_after;
         last_graph_rows = report.graph_cf_rows_after;
     }
 
-    {
-        let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let watermark = watermarks
-            .get_mut(&panel_version)
-            .ok_or_else(|| format!("panel {panel_version} watermark disappeared before commit"))?;
-        if *watermark != since_ns {
-            return Err(format!(
-                "panel {panel_version} watermark changed concurrently: expected={since_ns} actual={watermark}; refusing to overwrite a newer owner"
-            ));
-        }
-        *watermark = until_ns;
-    }
+    commit_weave_frontier(panel_version, since_ns, frontier_ns)?;
+    let backlog_ns = until_ns.saturating_sub(frontier_ns);
+    let trend = record_weave_backlog(panel_version, backlog_ns);
+    let action = match &stop {
+        None => "interval_complete",
+        Some(WeaveStop::BudgetExhausted { .. }) => "interval_partial_budget",
+        Some(WeaveStop::MaxParts { .. }) => "interval_partial_max_parts",
+        Some(WeaveStop::IndivisibleInterval { .. }) => "interval_blocked_indivisible",
+    };
+    let pending_parts = match &stop {
+        Some(
+            WeaveStop::BudgetExhausted { pending_parts } | WeaveStop::MaxParts { pending_parts },
+        ) => *pending_parts,
+        Some(WeaveStop::IndivisibleInterval { .. }) => 1,
+        None => 0,
+    };
     {
         let mut readback = match DERIVED_STATE_LAST.lock() {
             Ok(guard) => guard,
@@ -1757,8 +2175,10 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
         };
         readback
             .last_weave_actions
-            .insert(panel_version, "interval_complete".to_owned());
-        readback.last_weave_until_ns.insert(panel_version, until_ns);
+            .insert(panel_version, action.to_owned());
+        readback
+            .last_weave_until_ns
+            .insert(panel_version, frontier_ns);
         readback
             .last_weave_records
             .insert(panel_version, records_woven);
@@ -1768,20 +2188,91 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
         readback
             .last_weave_graph_rows
             .insert(panel_version, last_graph_rows);
+        readback
+            .last_weave_backlog_ns
+            .insert(panel_version, backlog_ns);
+        readback
+            .last_weave_pending_parts
+            .insert(panel_version, pending_parts);
+        readback
+            .last_weave_backlog_growth_ticks
+            .insert(panel_version, trend.consecutive_growth);
     }
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_WEAVE_PASS",
         panel_version,
         since_ns,
         until_ns,
+        frontier_ns,
+        action,
         completed_parts,
+        pending_parts,
+        backlog_ns,
+        backlog_growth_ticks = trend.consecutive_growth,
         records_woven,
         xterm_cf_rows = last_xterm_rows,
         graph_cf_rows = last_graph_rows,
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "readback=physical XTerm/Graph CF counts after every new record in the bounded ingest interval was woven"
+        "readback=physical XTerm/Graph CF counts after every record in the woven prefix of the \
+         bounded ingest interval; the watermark now stands at frontier_ns"
     );
-    Ok(records_woven)
+
+    // --- Classifying the stop: progress, or a wall (#2085) ---
+    //
+    // A partial pass that moved the frontier is *progress under a budget*, and
+    // reporting it as a maintenance failure is what made `success=0` structural:
+    // it was the reason there were never any successes to count, not an
+    // accounting artifact. A pass that moved nothing, or a backlog that has
+    // grown for three consecutive ticks, is the genuinely non-convergent case
+    // and stays a loud failure with the numbers that prove it.
+    match stop {
+        None => Ok(records_woven),
+        Some(WeaveStop::IndivisibleInterval {
+            part_since,
+            part_until,
+            records_scanned,
+        }) => Err(format!(
+            "panel {panel_version} contains {records_scanned} records in the indivisible interval \
+             [{part_since},{part_until}), above cap {WEAVE_INTERVAL_MAX_RECORDS}; the frontier is \
+             committed at {frontier_ns} so the prefix is not re-woven, but no split can separate \
+             this millisecond and the weave cannot pass it; increase the cap only with a measured \
+             memory/latency budget or add a Base-key cursor"
+        )),
+        Some(stop) => {
+            if frontier_ns <= since_ns {
+                return Err(format!(
+                    "panel {panel_version} completed ZERO bounded interval parts within \
+                     budget_ms={} ({stop:?}); the watermark stands at {since_ns} and the backlog \
+                     is {backlog_ns} ns after {} consecutive ticks of growth, so this panel is not \
+                     converging on its own ingest and needs a larger budget, a smaller record cap, \
+                     or a Base-key cursor",
+                    WEAVE_PANEL_TICK_BUDGET.as_millis(),
+                    trend.consecutive_growth,
+                ));
+            }
+            if trend.consecutive_growth >= WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT {
+                return Err(format!(
+                    "panel {panel_version} weave backlog has grown on {} consecutive ticks and now \
+                     stands at {backlog_ns} ns ({stop:?}); the frontier advanced from {since_ns} \
+                     to {frontier_ns} this tick, so the pass is making progress but slower than \
+                     ingest, and the derived association layer for this panel falls further behind \
+                     every tick",
+                    trend.consecutive_growth,
+                ));
+            }
+            record_advisory(
+                "STORAGE_DERIVED_STATE_WEAVE_BACKLOG",
+                format!(
+                    "panel {panel_version} wove {completed_parts} bounded interval part(s) and \
+                     advanced its watermark from {since_ns} to {frontier_ns}, leaving \
+                     {backlog_ns} ns of backlog across {pending_parts} pending part(s) \
+                     ({stop:?}); the next tick resumes at the frontier rather than re-weaving the \
+                     prefix, so this is bounded catch-up work and not a maintenance failure"
+                ),
+            );
+            Ok(records_woven)
+        }
+    }
 }
 
 fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
@@ -2302,6 +2793,11 @@ struct AnchorDebtPass {
     identities_carried: u64,
     anchors_carried: u64,
     inserted_rows: u64,
+    /// Debt-bearing panels this tick attempted at least one identity on.
+    panels_attempted: u64,
+    /// Wall clock inside the exact-identity repair primitive only, excluding
+    /// every per-panel fixed cost (#2080 defect 3).
+    repair_ms: u64,
     panels: Vec<String>,
     passes_completed: Vec<String>,
     quarantined: Vec<String>,
@@ -2363,10 +2859,20 @@ fn drive_anchor_debt_repair(
     let mut pass = AnchorDebtPass::default();
     let targets = report.anchor_debt_targets();
     if targets.is_empty() {
-        publish_anchor_debt_readback(&pass, None, 0, report);
+        publish_anchor_debt_readback(
+            &pass,
+            None,
+            0,
+            crate::backend::AnchorCarryLineageCounters::default(),
+            report,
+        );
         return pass;
     }
     let started = std::time::Instant::now();
+    // Measured across the phase, not inferred from its wall clock: whether the
+    // declared-lineage read is amortized is a question about how many indexes
+    // were built, and only the backend knows that (#2080 defect 3).
+    let lineage_before = crate::backend::anchor_carry_lineage_counters();
     // One shared budget, divided evenly, floor of one: the smallest debt is
     // never crowded out by the largest, and the largest is never starved by the
     // number of panels sharing the tick.
@@ -2538,7 +3044,13 @@ fn drive_anchor_debt_repair(
                 }
             };
 
-            match db.backfill_temporal_metadata(&source_cf, Some(&source_key), None, 1) {
+            let repair_started = std::time::Instant::now();
+            let repair_outcome =
+                db.backfill_temporal_metadata(&source_cf, Some(&source_key), None, 1);
+            pass.repair_ms = pass.repair_ms.saturating_add(
+                u64::try_from(repair_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            );
+            match repair_outcome {
                 Ok(page) => {
                     inserted = inserted.saturating_add(page.inserted_rows);
                     carried_anchors = carried_anchors.saturating_add(page.anchors_carried_forward);
@@ -2735,50 +3247,94 @@ fn drive_anchor_debt_repair(
         pass.identities_carried += carried_rows;
         pass.anchors_carried += carried_anchors;
         pass.inserted_rows += inserted;
+        if attempted > 0 {
+            pass.panels_attempted += 1;
+        }
         remaining_global = remaining_global.saturating_sub(attempted);
     }
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let lineage = crate::backend::anchor_carry_lineage_counters().since(lineage_before);
+    // --- Per-identity cost, measured against the work it actually describes ---
+    //
+    // The numerator is the repair primitive only. The old numerator was the
+    // whole phase, so every panel's durable state read, quarantine prune and
+    // cursor write — costs that exist per panel per tick and not per identity —
+    // were divided by the identity count. That ratio necessarily explodes as a
+    // debt drains: the same absolute phase cost over 1,000 attempts reads 7 ms
+    // and over 2 attempts reads 1,752 ms, which is precisely the "150-500x
+    // regression" #2080 measured. Nothing had regressed; the denominator had
+    // collapsed while the numerator stayed fixed.
     let ms_per_identity =
-        (pass.identities_attempted > 0).then(|| elapsed_ms / pass.identities_attempted.max(1));
-    if let Some(ms_per_identity) = ms_per_identity
-        && ms_per_identity > PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS
+        (pass.identities_attempted > 0).then(|| pass.repair_ms / pass.identities_attempted.max(1));
+    // The lineage index is built once per (source CF, superseded set). One build
+    // per attempted panel is the amortized shape; more than that is the defect
+    // the UNAMORTIZED code names, and it is now decided by counting builds
+    // rather than by reading a wall-clock ratio that cannot tell the two apart.
+    if lineage.builds > pass.panels_attempted
         && !ANCHOR_DEBT_UNAMORTIZED_REPORTED.swap(true, Ordering::Relaxed)
     {
-        // Measured, not assumed. An exact-identity repair reads one source row,
-        // writes one constellation and carries one anchor; a cost far above that
-        // means the declared anchor lineage is being rebuilt per identity rather
-        // than once per sweep, which quietly returns this repair to being
-        // corpus-proportional — the exact defect it was written to remove.
-        record_failure(
+        record_advisory(
             "STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED",
             format!(
-                "exact-identity anchor repair cost {ms_per_identity} ms per identity over {} \
-                 identities, above the declared ceiling {PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS} ms; \
-                 the identity work queue is correct but its primitive is not amortizing the \
-                 declared-lineage read, so a debt-proportional repair is doing \
-                 corpus-proportional work and convergence is far slower than the debt implies; \
-                 remediation=let the exact-key branch of Db::backfill_temporal_metadata reuse the \
-                 cached anchor lineage instead of rebuilding it per row \
-                 (crates/synapse-storage/src/backend.rs, anchor_carry_lineage(source_cf, \
-                 after_physical.is_none()))",
+                "the exact-identity anchor repair built the grounded anchor lineage index {} times \
+                 across {} attempted panels and {} identities ({} ms of index building out of {} \
+                 ms of repair); the index is one per (source CF, superseded generation set), so \
+                 more builds than attempted panels means the primitive is rebuilding it per row \
+                 and a debt-proportional repair is doing corpus-proportional work; \
+                 remediation=widen the CalyxBackend::anchor_carry_lineage cache so interleaved \
+                 source CFs cannot evict one another (crates/synapse-storage/src/backend.rs). \
+                 This is an ADVISORY: every identity this tick attempted was still repaired or \
+                 quarantined with its own evidence, so it does not gate readiness",
+                lineage.builds,
+                pass.panels_attempted,
                 pass.identities_attempted,
+                lineage.build_ms,
+                pass.repair_ms,
+            ),
+        );
+    }
+    // A marginal cost above the ceiling, over a sample large enough for the
+    // per-panel fixed cost not to dominate it. Both guards matter: without the
+    // first this reports index-build time as if it were per-identity time, and
+    // without the second a single-identity tick's fixed cost trips a ceiling
+    // that describes steady-state marginal work.
+    if let Some(ms_per_identity) = ms_per_identity
+        && pass.identities_attempted >= PANEL_ANCHOR_DEBT_COST_ADVISORY_MIN_SAMPLE
+        && pass.repair_ms.saturating_sub(lineage.build_ms) / pass.identities_attempted.max(1)
+            > PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS
+    {
+        record_advisory(
+            "STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_COST_ADVISORY",
+            format!(
+                "exact-identity anchor repair cost {ms_per_identity} ms per identity over {} \
+                 identities ({} ms in the repair primitive, {} ms of it building the lineage \
+                 index), above the declared marginal ceiling \
+                 {PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS} ms; the work queue is correct and every \
+                 identity was still attempted, so this is a cost finding about the primitive and \
+                 not a maintenance failure",
+                pass.identities_attempted, pass.repair_ms, lineage.build_ms,
             ),
         );
     }
 
-    publish_anchor_debt_readback(&pass, ms_per_identity, elapsed_ms, report);
+    publish_anchor_debt_readback(&pass, ms_per_identity, elapsed_ms, lineage, report);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_ANCHOR_DEBT_PASS",
         identities_attempted = pass.identities_attempted,
         identities_carried = pass.identities_carried,
         anchors_carried = pass.anchors_carried,
         inserted_rows = pass.inserted_rows,
+        panels_attempted = pass.panels_attempted,
         quarantined_total = pass.quarantined_total,
         passes_completed = ?pass.passes_completed,
         panels = ?pass.panels,
         unbackfillable_panels = ?report.anchor_debt_unbackfillable_panels,
         ms_per_identity = ?ms_per_identity,
+        repair_ms = pass.repair_ms,
+        lineage_rebuilds = lineage.builds,
+        lineage_reuses = lineage.hits,
+        lineage_rebuild_ms = lineage.build_ms,
         elapsed_ms,
         "re-anchored exactly the source identities the census named as stranded"
     );
@@ -2789,6 +3345,7 @@ fn publish_anchor_debt_readback(
     pass: &AnchorDebtPass,
     ms_per_identity: Option<u64>,
     elapsed_ms: u64,
+    lineage: crate::backend::AnchorCarryLineageCounters,
     report: &crate::panel_coverage::PanelCoverageReport,
 ) {
     let mut guard = match DERIVED_STATE_LAST.lock() {
@@ -2826,6 +3383,11 @@ fn publish_anchor_debt_readback(
         .last_anchor_debt_unbackfillable_panels
         .clone_from(&report.anchor_debt_unbackfillable_panels);
     guard.last_anchor_debt_ms_per_identity = ms_per_identity;
+    guard.last_anchor_debt_repair_ms = pass.repair_ms;
+    guard.last_anchor_debt_panels_attempted = pass.panels_attempted;
+    guard.last_anchor_debt_lineage_rebuilds = lineage.builds;
+    guard.last_anchor_debt_lineage_reuses = lineage.hits;
+    guard.last_anchor_debt_lineage_rebuild_ms = lineage.build_ms;
     guard.last_anchor_debt_elapsed_ms = Some(elapsed_ms);
 }
 
@@ -2995,12 +3557,39 @@ fn drive_coverage_backfill(
     let mut panel_lines: Vec<String> = Vec::new();
     let mut primary: Option<CoveragePrimary> = None;
     let mut targets_attempted = 0_usize;
-    for entry in &ready {
-        if started.elapsed() >= PANEL_BACKFILL_TICK_BUDGET {
-            break;
+    let mut targets_skipped: Vec<String> = Vec::new();
+    let owed = ready.len();
+    for (index, entry) in ready.iter().enumerate() {
+        let elapsed = started.elapsed();
+        if elapsed >= PANEL_BACKFILL_TICK_HARD_CEILING {
+            // Named, with the reason and the position it was reached at. The
+            // only permitted way for `targets_attempted` to fall below
+            // `targets_owed` is an entry in this list.
+            targets_skipped.push(format!(
+                "{}@{} source_cf={} uncovered={:?} reason=tick_hard_ceiling_exhausted \
+                 queue_position={} elapsed_ms={}",
+                entry.target.panel_name,
+                entry.target.panel_version,
+                entry.source_cf,
+                entry.target.uncovered_rows(),
+                index,
+                u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
+            ));
+            continue;
         }
+        // Reserve every target behind this one its floor, and give this one
+        // everything else that is left. The queue is ordered most-owed first,
+        // so the largest backlog keeps the bulk of the tick while the smallest
+        // is guaranteed to run.
+        let behind =
+            u32::try_from(owed.saturating_sub(index).saturating_sub(1)).unwrap_or(u32::MAX);
+        let reserved_for_the_rest = PANEL_BACKFILL_TARGET_MIN_SLICE.saturating_mul(behind);
+        let slice = PANEL_BACKFILL_TICK_BUDGET
+            .saturating_sub(elapsed)
+            .saturating_sub(reserved_for_the_rest)
+            .max(PANEL_BACKFILL_TARGET_MIN_SLICE);
         targets_attempted += 1;
-        let pass = sweep_coverage_target(db, entry, started);
+        let pass = sweep_coverage_target(db, entry, started, slice);
         failed |= pass.failed;
         totals.merge(&pass);
         panel_lines.push(pass.line.clone());
@@ -3029,8 +3618,11 @@ fn drive_coverage_backfill(
         panel = %primary.panel,
         source_cf = %primary.source_cf,
         reason = primary.reason,
-        targets_owed = ready.len(),
+        targets_owed = owed,
         targets_attempted,
+        targets_skipped = ?targets_skipped,
+        target_min_slice_ms =
+            u64::try_from(PANEL_BACKFILL_TARGET_MIN_SLICE.as_millis()).unwrap_or(u64::MAX),
         panels = ?panel_lines,
         blocked_panels = ?blocked_panels,
         pages = totals.pages,
@@ -3058,6 +3650,9 @@ fn drive_coverage_backfill(
         anchors_carried: totals.anchors_carried,
         sweep_complete: Some(primary.sweep_complete),
         elapsed_ms,
+        targets_owed: owed as u64,
+        targets_attempted: targets_attempted as u64,
+        targets_skipped,
         anchor,
     });
 
@@ -3142,7 +3737,12 @@ fn sweep_coverage_target(
     db: &Arc<Db>,
     entry: &CoverageTarget<'_>,
     started: std::time::Instant,
+    slice: std::time::Duration,
 ) -> CoverageTargetPass {
+    // This target's own deadline, not the tick's. Reading the tick's clock here
+    // is what let the head of the queue spend the whole budget and leave
+    // `targets_attempted=1` against `targets_owed=4` (#2061).
+    let deadline = std::time::Instant::now() + slice;
     let target = entry.target;
     let source_cf = entry.source_cf.as_str();
     let reason = target.backfill_reason().unwrap_or("coverage_debt");
@@ -3190,7 +3790,9 @@ fn sweep_coverage_target(
     let mut action = "budget_exhausted";
     let mut page_failure: Option<String> = None;
 
-    while started.elapsed() < PANEL_BACKFILL_TICK_BUDGET {
+    while std::time::Instant::now() < deadline
+        && started.elapsed() < PANEL_BACKFILL_TICK_HARD_CEILING
+    {
         let page = match db.backfill_temporal_metadata(
             source_cf,
             None,
@@ -3331,11 +3933,12 @@ fn sweep_coverage_target(
              inserted={inserted} already_current={already_current} \
              outcome_anchored={outcome_anchored} anchors_carried={anchors_carried} \
              sweep_complete={sweep_complete} sweeps_completed={sweeps_completed} \
-             consecutive_page_failures={consecutive_page_failures}",
+             consecutive_page_failures={consecutive_page_failures} slice_ms={}",
             target.panel_name,
             target.panel_version,
             target.coverage_fraction,
             target.uncovered_rows(),
+            u64::try_from(slice.as_millis()).unwrap_or(u64::MAX),
         ),
     }
 }
@@ -3355,6 +3958,11 @@ struct BackfillReadback<'a> {
     anchors_carried: u64,
     sweep_complete: Option<bool>,
     elapsed_ms: u64,
+    /// Owed vs swept, published so the two can be compared without reading the
+    /// log (#2061 ask 3).
+    targets_owed: u64,
+    targets_attempted: u64,
+    targets_skipped: Vec<String>,
     anchor: &'a AnchorDebtPass,
 }
 
@@ -3373,6 +3981,9 @@ impl<'a> BackfillReadback<'a> {
             anchors_carried: 0,
             sweep_complete: None,
             elapsed_ms: 0,
+            targets_owed: 0,
+            targets_attempted: 0,
+            targets_skipped: Vec::new(),
             anchor,
         }
     }
@@ -3426,6 +4037,11 @@ fn publish_backfill_readback(readback: &BackfillReadback<'_>) {
     );
     guard.last_backfill_elapsed_ms = Some(readback.elapsed_ms);
     guard.last_backfill_sweep_complete = readback.sweep_complete;
+    guard.last_backfill_targets_owed = readback.targets_owed;
+    guard.last_backfill_targets_attempted = readback.targets_attempted;
+    guard
+        .last_backfill_targets_skipped
+        .clone_from(&readback.targets_skipped);
 }
 
 /// Runs both panel repairs for one maintenance tick (#1927 ask 2, #1984, #2061).

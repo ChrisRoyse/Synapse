@@ -1037,33 +1037,48 @@ impl SynapseService {
     fn calyx_derived_state_health() -> SubsystemHealth {
         let readback = synapse_storage::derived_state::derived_state_readback();
         let never_ran = readback.last_run_unix_ms.is_none();
-        let last_failed = readback
-            .last_failure_unix_ms
-            .zip(readback.last_success_unix_ms)
-            .is_some_and(|(failure, success)| failure > success)
-            || (readback.failure_total > 0 && readback.last_success_unix_ms.is_none());
-        let status = if never_ran {
+        // --- The verdict is the last COMPLETED tick's, not a lifetime counter's
+        // (#2080) ---
+        //
+        // `failure_total > 0 && last_success is None` made the first failing tick
+        // of a process a permanent `error` with no path back, on a subsystem
+        // whose whole job is to run again in five minutes. Worse, `failure_total`
+        // counted sub-passes then, so a single broken component made the
+        // condition unreachable-to-clear as well as immediate. The maintainer now
+        // publishes what its last completed tick decided, and that is what is
+        // read: a tick where every sub-pass ran clean clears the subsystem, and a
+        // tick with a failing sub-pass reds it, on the tick — which is what an
+        // operator means by "is it broken now".
+        //
+        // `None` after a run means the only thing that has happened is a *skip*.
+        // That is not `ok`: a maintainer that only ever skips maintains nothing,
+        // and it used to report `ok` because a skip touches no failure counter.
+        let status = match (never_ran, readback.last_tick_failed) {
             // Not yet an error at boot: the first tick is a cadence away. It is
             // reported as `starting` so a maintainer that never arrives is still
             // distinguishable from one that is merely young.
-            "starting"
-        } else if last_failed {
-            "error"
-        } else {
-            "ok"
+            (true, _) => "starting",
+            (false, Some(true)) => "error",
+            (false, Some(false)) => "ok",
+            (false, None) => "error",
         };
         SubsystemHealth {
             status: status.to_owned(),
             detail: Some(format!(
-                "attempts={} success={} failure={} skipped={} last_run_unix_ms={:?} \
+                "attempts={} success={} failure={} skipped={} subpass_failures={} advisories={} \
+                 last_tick_failed={:?} last_tick_subpass_failures={:?} last_run_unix_ms={:?} \
                  last_success_unix_ms={:?} last_search_action={} last_search_reason={} \
                  last_search_elapsed_ms={:?} refresh_delta_keys_threshold={} \
                  min_rebuild_interval_ms={} last_failure_code={} last_failure_detail={} \
-                 last_skip={}",
+                 last_advisory_code={} last_advisory_detail={} last_skip={}",
                 readback.attempts_total,
                 readback.success_total,
                 readback.failure_total,
                 readback.skipped_total,
+                readback.subpass_failures_total,
+                readback.advisories_total,
+                readback.last_tick_failed,
+                readback.last_tick_subpass_failures,
                 readback.last_run_unix_ms,
                 readback.last_success_unix_ms,
                 readback.last_search_action.as_deref().unwrap_or("none"),
@@ -1073,8 +1088,20 @@ impl SynapseService {
                 readback.min_rebuild_interval_ms,
                 readback.last_failure_code.as_deref().unwrap_or("none"),
                 readback.last_failure_detail.as_deref().unwrap_or("none"),
+                readback.last_advisory_code.as_deref().unwrap_or("none"),
+                readback.last_advisory_detail.as_deref().unwrap_or("none"),
                 readback.last_skip_code.as_deref().unwrap_or("none"),
             )),
+            calyx_derived_state_success_total: Some(readback.success_total),
+            calyx_derived_state_skipped_total: Some(readback.skipped_total),
+            calyx_derived_state_subpass_failures_total: Some(readback.subpass_failures_total),
+            calyx_derived_state_advisories_total: Some(readback.advisories_total),
+            calyx_derived_state_last_tick_failed: readback.last_tick_failed,
+            calyx_derived_state_last_tick_subpass_failures: Some(
+                readback.last_tick_subpass_failures.clone(),
+            ),
+            calyx_derived_state_last_advisory_code: readback.last_advisory_code.clone(),
+            calyx_derived_state_last_advisory_detail: readback.last_advisory_detail.clone(),
             calyx_derived_state_last_search_action: readback.last_search_action,
             calyx_derived_state_last_search_reason: readback.last_search_reason,
             calyx_derived_state_last_run_unix_ms: readback.last_run_unix_ms,
@@ -1193,7 +1220,9 @@ impl SynapseService {
                  grounding_deficient_panels={:?} no_outcome_axis_panels={:?}                  anchors_stranded_panels={:?} \
                  records_exceed_source_panels={:?} \
                  backfill={} reason={} panel={} pages={} inserted={} \
-                 anchored={} elapsed_ms={} panels=[{}]",
+                 anchored={} elapsed_ms={} targets_owed={} targets_attempted={} \
+                 targets_skipped={:?} anchor_debt_quarantined={} quarantined_identities={:?} \
+                 panels=[{}]",
                 if reasons.is_empty() {
                     String::new()
                 } else {
@@ -1213,6 +1242,11 @@ impl SynapseService {
                 readback.last_backfill_inserted_rows.unwrap_or(0),
                 readback.last_backfill_outcome_anchored_rows.unwrap_or(0),
                 readback.last_backfill_elapsed_ms.unwrap_or(0),
+                readback.last_backfill_targets_owed,
+                readback.last_backfill_targets_attempted,
+                readback.last_backfill_targets_skipped,
+                readback.last_anchor_debt_quarantined_total,
+                readback.last_anchor_debt_quarantined,
                 report.summary_line(),
             )),
             calyx_panel_coverage_panels: Some(report.panels.len() as u64),
@@ -1243,6 +1277,15 @@ impl SynapseService {
             calyx_panel_backfill_outcome_anchored_rows: readback
                 .last_backfill_outcome_anchored_rows,
             calyx_panel_backfill_elapsed_ms: readback.last_backfill_elapsed_ms,
+            calyx_panel_backfill_targets_owed: Some(readback.last_backfill_targets_owed),
+            calyx_panel_backfill_targets_attempted: Some(readback.last_backfill_targets_attempted),
+            calyx_panel_backfill_targets_skipped: Some(readback.last_backfill_targets_skipped),
+            calyx_panel_anchor_debt_quarantined_total: Some(
+                readback.last_anchor_debt_quarantined_total,
+            ),
+            calyx_panel_anchor_debt_quarantined_identities: Some(
+                readback.last_anchor_debt_quarantined,
+            ),
             ..SubsystemHealth::default()
         }
     }

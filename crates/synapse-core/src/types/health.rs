@@ -678,6 +678,36 @@ pub struct SubsystemHealth {
     pub calyx_derived_state_attempts_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_failure_total: Option<u64>,
+    /// Tick-granularity counters, published together because they only mean
+    /// anything together (#2080 ask 1): `success + failure + skipped` accounts
+    /// for every `attempts`, and `failure` can no longer exceed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_success_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_skipped_total: Option<u64>,
+    /// Sub-pass failures across every tick — the diagnostic layer. Deliberately
+    /// a separate field from `failure_total`: one tick can hold many of these,
+    /// and reporting them through the tick counter is what published
+    /// `failure=15` against `attempts=6`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_subpass_failures_total: Option<u64>,
+    /// Cost and quality advisories. Visible, and never a reason `health.ok` is
+    /// false (#2080 ask 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_advisories_total: Option<u64>,
+    /// Whether the last **completed** tick failed — the fact this subsystem's
+    /// status is computed from, so a clean tick clears it and a lifetime counter
+    /// can never hold it red forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_tick_failed: Option<bool>,
+    /// That tick's sub-pass failures, verbatim, so the rollup can be decomposed
+    /// into the components that actually broke.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_tick_subpass_failures: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_advisory_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_advisory_detail: Option<String>,
     /// The last failure, retained across later successes so a lifetime failure
     /// counter never outlives its own evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -692,6 +722,27 @@ pub struct SubsystemHealth {
     /// The changed-key delta the maintainer measured on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_delta_changed_keys: Option<u64>,
+
+    // --- coverage-backfill rotation and anchor-debt quarantine (#2061) ---
+    /// Coverage targets owed a sweep, and how many the last tick swept. Equal on
+    /// a healthy tick. `owed=4 attempted=1` is what starvation looked like from
+    /// the outside while every other backfill field reported real work — for one
+    /// panel out of four.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_targets_owed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_targets_attempted: Option<u64>,
+    /// Owed targets the last tick did not sweep, each with its reason. Empty on
+    /// a healthy tick; the only permitted way for `attempted` to fall short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_backfill_targets_skipped: Option<Vec<String>>,
+    /// Exact stranded anchor identities quarantined as unrepairable, named in
+    /// full with their reason codes (#2061 ask 2). A refusal that keeps being
+    /// reported is truthful; one that is silently skipped is not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_anchor_debt_quarantined_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_panel_anchor_debt_quarantined_identities: Option<Vec<String>>,
 
     // --- panel lens coverage (issue #1894, ask 2) ---
     // `abundance` computed `blind_spot_records = 1740` on a panel of 1,745

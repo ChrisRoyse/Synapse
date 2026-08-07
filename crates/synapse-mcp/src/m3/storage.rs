@@ -1435,8 +1435,33 @@ pub struct StorageAnchorDebtRepair {
     /// Measured cost of one exact-identity repair. Published rather than
     /// assumed, because it is the number that says whether the repair is still
     /// debt-proportional or has quietly become corpus-proportional again.
+    ///
+    /// **Numerator and denominator describe the same work (#2080 defect 3):**
+    /// `repair_ms / identities_attempted`, where `repair_ms` is time inside the
+    /// exact-identity repair calls only. It used to be the whole phase's wall
+    /// clock — every debt-bearing panel's durable state read, quarantine prune
+    /// and cursor write, costs that exist per panel and not per identity —
+    /// divided by the identities attempted. That ratio necessarily explodes as
+    /// the debt drains, and it did: the same absolute cost read 7 ms over ~1,000
+    /// attempts and 1,752 ms over 2, and was reported as a 500x regression in
+    /// the primitive. Nothing regressed; the denominator collapsed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ms_per_identity: Option<u64>,
+    /// Wall clock inside the repair primitive.
+    pub repair_ms: u64,
+    /// Debt-bearing panels this tick attempted at least one identity on — the
+    /// denominator `lineage_rebuilds` is judged against.
+    pub panels_attempted: u64,
+    /// Grounded-anchor lineage index builds, reuses and build cost during the
+    /// phase, measured in the backend. One build per attempted panel is the
+    /// amortized shape; more than that is the condition
+    /// `STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED` now names, decided
+    /// by counting builds rather than by reading a wall-clock ratio that could
+    /// not tell a per-panel fixed cost from a per-row one.
+    pub lineage_rebuilds: u64,
+    pub lineage_reuses: u64,
+    pub lineage_rebuild_ms: u64,
+    /// Whole-phase wall clock, including every panel's fixed per-tick cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
 }
@@ -3852,6 +3877,11 @@ fn anchor_debt_repair_readback() -> StorageAnchorDebtRepair {
         quarantined_total,
         unbackfillable_panels: readback.last_anchor_debt_unbackfillable_panels,
         ms_per_identity: readback.last_anchor_debt_ms_per_identity,
+        repair_ms: readback.last_anchor_debt_repair_ms,
+        panels_attempted: readback.last_anchor_debt_panels_attempted,
+        lineage_rebuilds: readback.last_anchor_debt_lineage_rebuilds,
+        lineage_reuses: readback.last_anchor_debt_lineage_reuses,
+        lineage_rebuild_ms: readback.last_anchor_debt_lineage_rebuild_ms,
         elapsed_ms: readback.last_anchor_debt_elapsed_ms,
     }
 }

@@ -1114,6 +1114,50 @@ struct AnchorCarryLineageCache {
     by_source_key: Arc<BTreeMap<String, Vec<Anchor>>>,
 }
 
+/// Grounded-anchor-lineage index builds, cache hits, and time spent building
+/// (#2080 defect 3).
+///
+/// Published because the alternative is inference. The anchor-debt repair's
+/// `ms_per_identity` advisory accused this read of "not amortizing" purely from
+/// a wall-clock ratio, and that ratio could not distinguish a lineage index
+/// rebuilt once per row from one rebuilt once per panel and divided by a
+/// collapsing attempt count. These counters answer that question with a
+/// measurement instead: one build per `(source_cf, superseded set)` per pass is
+/// amortized; more than one build per attempted panel is not.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AnchorCarryLineageCounters {
+    pub builds: u64,
+    pub hits: u64,
+    pub build_ms: u64,
+}
+
+static ANCHOR_CARRY_LINEAGE_BUILDS: AtomicU64 = AtomicU64::new(0);
+static ANCHOR_CARRY_LINEAGE_HITS: AtomicU64 = AtomicU64::new(0);
+static ANCHOR_CARRY_LINEAGE_BUILD_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-lifetime lineage cache counters. Callers take a delta across a phase
+/// rather than reading an absolute.
+#[must_use]
+pub fn anchor_carry_lineage_counters() -> AnchorCarryLineageCounters {
+    AnchorCarryLineageCounters {
+        builds: ANCHOR_CARRY_LINEAGE_BUILDS.load(Ordering::Relaxed),
+        hits: ANCHOR_CARRY_LINEAGE_HITS.load(Ordering::Relaxed),
+        build_ms: ANCHOR_CARRY_LINEAGE_BUILD_MS.load(Ordering::Relaxed),
+    }
+}
+
+impl AnchorCarryLineageCounters {
+    /// Work done between an earlier reading and this one.
+    #[must_use]
+    pub const fn since(self, before: Self) -> Self {
+        Self {
+            builds: self.builds.saturating_sub(before.builds),
+            hits: self.hits.saturating_sub(before.hits),
+            build_ms: self.build_ms.saturating_sub(before.build_ms),
+        }
+    }
+}
+
 /// Shared lifecycle owner for the process-local Calyx vault.
 ///
 /// Aster already provides its own fine-grained row/router locks and a durable
@@ -1803,10 +1847,12 @@ impl CalyxBackend {
             if let Some(cache) = guard.as_ref().filter(|cache| {
                 cache.source_cf == source_cf && cache.superseded_versions == superseded
             }) {
+                ANCHOR_CARRY_LINEAGE_HITS.fetch_add(1, Ordering::Relaxed);
                 return Ok(Arc::clone(&cache.by_source_key));
             }
         }
 
+        let build_started = Instant::now();
         let by_source_key = self.with_vault(
             "calyx_anchor_carry_lineage",
             "build grounded anchor lineage from superseded Base rows",
@@ -1826,6 +1872,11 @@ impl CalyxBackend {
                     })
             },
         )?;
+        ANCHOR_CARRY_LINEAGE_BUILDS.fetch_add(1, Ordering::Relaxed);
+        ANCHOR_CARRY_LINEAGE_BUILD_MS.fetch_add(
+            u64::try_from(build_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
         let by_source_key = Arc::new(by_source_key);
         let mut guard = self
             .anchor_carry_lineage
