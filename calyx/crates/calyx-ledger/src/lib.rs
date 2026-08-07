@@ -51,7 +51,7 @@ pub use reproduce::{
     remeasure_slots_with_input_resolver, reproduce, reproduce_payload_bytes, reproduce_verdict,
     reproduce_verdict_with_input_resolver, reproduce_with_input_resolver, rerun_fusion,
 };
-pub use stream_verify::{StreamingChainVerifier, StreamingStart};
+pub use stream_verify::{AnchorDiscipline, StreamingChainVerifier, StreamingStart};
 pub use tombstone::{
     ErasureScope, ErasureTombstone, find_tombstone, is_tombstoned, tombstone_from_entry,
     write_tombstone,

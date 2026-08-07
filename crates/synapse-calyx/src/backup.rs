@@ -333,6 +333,22 @@ pub fn verify_vault_restore(
     Ok(SynapseCalyxVerifyReport::from_aster(&report))
 }
 
+/// Runs the read-only verifier over the LIVE vault (#2059).
+///
+/// Same verification as [`verify_vault_restore`] under the anchored-prefix
+/// discipline: the head anchor is read before the row snapshot and verified
+/// mid-stream at its own height, so appends landing during the pass are the
+/// anchored tip's continuation rather than a false `corrupt` verdict. Restore
+/// and backup verification keep the strict exact-head discipline — a quiescent
+/// vault whose anchor disagrees with its rows IS damaged.
+pub fn verify_vault_restore_live(
+    vault_path: &Path,
+) -> Result<SynapseCalyxVerifyReport, SynapseCalyxError> {
+    let report = calyx_aster::verify_restore::verify_restore_live(vault_path)
+        .map_err(|error| SynapseCalyxError::from_calyx("verify live Calyx vault", &error))?;
+    Ok(SynapseCalyxVerifyReport::from_aster(&report))
+}
+
 /// Enforces vault residency for a backup target: a pinned dataset root refuses an
 /// off-dataset target unless the pin explicitly permits it.
 pub(crate) fn authorize_residency(

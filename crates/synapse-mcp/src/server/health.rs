@@ -2463,9 +2463,19 @@ impl SynapseService {
                             " detection_remediation=\"{remediation}\""
                         ))
                 );
-                let (status, prefix) = match &bundle {
-                    Ok(_) => ("ok", "perception runtime initialized"),
-                    Err(_) => ("error", "perception detector backend probe failed"),
+                // #2069: `misconfigured` degrades the ROLLUP, asymmetrically
+                // with `not_configured`. A profile that requests no detector is
+                // a healthy runtime (capability absent by choice); a profile
+                // that names an unregistered detector guarantees every
+                // pixel-bearing observe hard-errors, and a deploy gate reading
+                // only the rollup must see that.
+                let (status, prefix) = match (&bundle, detection.status.as_str()) {
+                    (Err(_), _) => ("error", "perception detector backend probe failed"),
+                    (Ok(_), "misconfigured") => (
+                        "misconfigured",
+                        "perception runtime initialized, but the configured detector cannot load and every detection-bearing observe will fail",
+                    ),
+                    (Ok(_), _) => ("ok", "perception runtime initialized"),
                 };
                 SubsystemHealth {
                     status: status.to_owned(),

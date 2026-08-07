@@ -40,7 +40,8 @@ use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode
 use crate::wal::replay_dir_read_only;
 use calyx_core::{CalyxError, Result};
 use calyx_ledger::{
-    LedgerRow, StreamingChainVerifier, StreamingStart, VerifyResult, decode as decode_ledger_entry,
+    AnchorDiscipline, LedgerRow, StreamingChainVerifier, StreamingStart, VerifyResult,
+    decode as decode_ledger_entry,
 };
 use serde::Serialize;
 
@@ -161,8 +162,24 @@ impl VerifyRestoreReport {
 }
 
 /// Verifies a restored vault with zero write side effects.
+///
+/// Restore discipline: the vault is quiescent, so the anchored head must equal
+/// the physical head exactly ([`AnchorDiscipline::ExactHead`]).
 pub fn verify_restore(vault_path: &Path) -> Result<VerifyRestoreReport> {
-    verify_restore_inner(vault_path, None)
+    verify_restore_inner(vault_path, None, AnchorDiscipline::ExactHead)
+}
+
+/// Verifies a LIVE vault with zero write side effects (#2059).
+///
+/// Live discipline: rows append continuously, so the anchor is read *before*
+/// the row snapshot and verified mid-stream at its own height
+/// ([`AnchorDiscipline::AnchoredPrefix`]); rows the snapshot holds beyond the
+/// anchored head are chain-verified as the anchored tip's continuation instead
+/// of being declared corruption. Under `ExactHead` a healthy live vault failed
+/// 27 of 30 verifications purely on appends that landed between the row
+/// snapshot and the anchor read.
+pub fn verify_restore_live(vault_path: &Path) -> Result<VerifyRestoreReport> {
+    verify_restore_inner(vault_path, None, AnchorDiscipline::AnchoredPrefix)
 }
 
 /// Verifies an encrypted restored vault with zero write side effects.
@@ -170,12 +187,13 @@ pub fn verify_restore_with_value_crypto(
     vault_path: &Path,
     context: &SharedVaultContext,
 ) -> Result<VerifyRestoreReport> {
-    verify_restore_inner(vault_path, Some(context))
+    verify_restore_inner(vault_path, Some(context), AnchorDiscipline::ExactHead)
 }
 
 fn verify_restore_inner(
     vault_path: &Path,
     value_crypto: Option<&SharedVaultContext>,
+    anchor_discipline: AnchorDiscipline,
 ) -> Result<VerifyRestoreReport> {
     if !vault_path.is_dir() {
         return Err(restore_invalid(format!(
@@ -200,6 +218,19 @@ fn verify_restore_inner(
     }
 
     let mut report = VerifyRestoreReport::empty(vault_path);
+    // #2059: the head anchor is read BEFORE any row snapshot is taken. Under
+    // live appends the anchor can therefore only trail the rows the snapshot
+    // holds, never lead them — which is what makes an anchor ahead of the
+    // physical head unambiguous corruption in both disciplines, and what lets
+    // AnchoredPrefix verify the anchor mid-stream at its own height without
+    // racing writers.
+    let head_anchor = match read_head_anchor(vault_path) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            record_scan_error(&mut report, &error);
+            return Ok(report);
+        }
+    };
     report.wal_bytes_present = match wal_total_bytes(vault_path) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -247,7 +278,13 @@ fn verify_restore_inner(
         }
     }
 
-    let ledger = match verify_ledger_paged(vault_path, &overlay, value_crypto) {
+    let ledger = match verify_ledger_paged(
+        vault_path,
+        &overlay,
+        value_crypto,
+        head_anchor,
+        anchor_discipline,
+    ) {
         Ok(ledger) => ledger,
         Err(error) => {
             record_scan_error(&mut report, &error);
@@ -504,15 +541,16 @@ fn verify_ledger_paged(
     vault: &Path,
     overlay: &WalOverlay,
     value_crypto: Option<&SharedVaultContext>,
+    anchor: Option<calyx_ledger::LedgerHeadAnchor>,
+    discipline: AnchorDiscipline,
 ) -> Result<LedgerVerification> {
     let wal_rows = ledger_overlay_rows(overlay)?;
     let level = cf_level_with_lookup(vault, ColumnFamily::Ledger)?;
     let head = physical_ledger_head(&level, &wal_rows)?;
-    let anchor = read_head_anchor(vault)?;
     if anchor.is_none() && head > 0 {
         return Err(crate::ledger_head::missing_head_anchor(vault, head));
     }
-    let verifier = match StreamingChainVerifier::start(0..head, anchor, None)? {
+    let verifier = match StreamingChainVerifier::start(0..head, anchor, None, discipline)? {
         StreamingStart::Complete(result) => {
             return Ok(LedgerVerification {
                 entry_count: 0,

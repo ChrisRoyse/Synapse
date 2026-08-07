@@ -5852,7 +5852,9 @@ impl SynapseCalyxVault {
         tail_entries: u64,
     ) -> Result<SynapseCalyxVaultVerifyReport, SynapseCalyxError> {
         self.vault
-            .with_maintenance_guard(|| Ok(self.verify_vault_under_guard(full_chain, tail_entries)))
+            .with_maintenance_guard("vault_verify_scan", || {
+                Ok(self.verify_vault_under_guard(full_chain, tail_entries))
+            })
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("acquire Calyx vault maintenance guard", &error)
             })?
@@ -5864,7 +5866,10 @@ impl SynapseCalyxVault {
         tail_entries: u64,
     ) -> Result<SynapseCalyxVaultVerifyReport, SynapseCalyxError> {
         let vault_dir = self.config.vault_dir.clone();
-        let restore = backup::verify_vault_restore(&vault_dir)?;
+        // #2059: the live vault appends continuously, so this path uses the
+        // anchored-prefix discipline; strict exact-head stays reserved for
+        // quiescent restore/backup verification.
+        let restore = backup::verify_vault_restore_live(&vault_dir)?;
         let head_height = calyx_aster::ledger_head::read_head_anchor(&vault_dir)
             .map_err(|error| SynapseCalyxError::from_calyx("read Calyx ledger head", &error))?
             .map_or(0, |anchor| anchor.height);
