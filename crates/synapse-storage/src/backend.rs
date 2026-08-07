@@ -5445,7 +5445,16 @@ impl StorageBackend for CalyxBackend {
             })?
             .carry_superseded_anchors;
         let anchor_lineage = if carry_superseded_anchors {
-            self.anchor_carry_lineage(source_cf, after_physical.is_none())?
+            // Reset the lineage cache only at the head of a PAGED sweep. An
+            // exact-key repair call (#1984's identity-driven anchor-debt queue)
+            // always carries `after_physical=None` because the two are mutually
+            // exclusive, and treating that as "new sweep" rebuilt the full-Base
+            // lineage index once per identity — turning a debt-proportional
+            // repair back into a corpus-proportional one
+            // (STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED). Exact-key
+            // calls reuse the cache; the cache's cf/superseded-version match
+            // still forces a rebuild whenever the panel contract changed.
+            self.anchor_carry_lineage(source_cf, source_key.is_none() && after_physical.is_none())?
         } else {
             Arc::new(BTreeMap::new())
         };

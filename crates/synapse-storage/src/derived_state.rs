@@ -32,8 +32,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::{
     Arc, LazyLock, Mutex, Weak,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
+
+use serde::{Deserialize, Serialize};
 
 use synapse_calyx::{
     SEARCH_GENERATION_MIN_REBUILD_INTERVAL_MS, SEARCH_GENERATION_REFRESH_DELTA_KEYS,
@@ -47,6 +49,7 @@ use crate::cf;
 use crate::constellations::{
     GraphPositionKind, SYN_GRAPHPOS_APP_PANEL_VERSION, SYN_PATH_HIERARCHY_PANEL_VERSION,
 };
+use crate::panel_coverage::StrandedAnchorIdentity;
 use synapse_core::types::{AgentEventKind, AgentEventRecord, TimelineKind, TimelineRecord};
 
 /// How often the derived-state maintainer runs.
@@ -92,6 +95,71 @@ pub const LIFECYCLE_BACKFILL_BATCH_ROWS: usize = 64;
 /// an admission permit, so it can never park a runtime worker serving MCP
 /// requests.
 pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Exact stranded anchor identities one tick will attempt to re-anchor (#1984).
+///
+/// A **work** bound, not a time bound, and that is the whole correction. The
+/// anchor-debt repair used to be a wall-clock-budgeted rescan of the source CF:
+/// on the deployed daemon it spent 60,089 ms over 44 pages, inserted 0 rows, and
+/// left all five stranded panels exactly where they were, tick after tick.
+/// Repair work proportional to the corpus cannot converge on a debt that is four
+/// orders of magnitude smaller.
+///
+/// Sized against the measured debt: the whole vault carried 2,879 stranded
+/// anchors across five panels, so this drains it in three ticks — roughly
+/// fifteen minutes of unattended running — while keeping any single tick's write
+/// volume bounded and predictable.
+pub const PANEL_ANCHOR_DEBT_TICK_IDENTITIES: usize = 1_000;
+
+/// Wall-clock backstop for the identity-driven anchor-debt phase.
+///
+/// Not the thing that bounds the work — [`PANEL_ANCHOR_DEBT_TICK_IDENTITIES`] is
+/// — but the guarantee that one pathological row cannot take the whole tick and
+/// starve the coverage sweep that shares it (#2061).
+pub const PANEL_ANCHOR_DEBT_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Per-identity cost above which the exact-identity repair primitive is not
+/// amortizing its declared-lineage read, reported as a named fault (#1984).
+///
+/// An exact-identity repair is a point read of one source row, one constellation
+/// put, and one anchor carry: single-digit milliseconds once the declared anchor
+/// lineage is read once per sweep rather than once per row. A ratio far above
+/// this ceiling means the lineage is being rebuilt per identity, which turns a
+/// debt-proportional repair back into a corpus-proportional one. It is measured
+/// and published every tick rather than assumed.
+pub const PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS: u64 = 250;
+
+/// Exact identities one panel may hold in durable quarantine (#1984, #2061).
+///
+/// Quarantine is per identity, never per panel and never per tick. Three
+/// unrepairable outcome anchors latched the whole maintainer and denied 208,496
+/// rows of coverage backfill for the life of a process; the fault was the scope
+/// of the refusal, not the refusal. Past this cap the panel's debt is
+/// systematically unrepairable rather than pointwise, which is a different
+/// finding and is reported as one.
+pub const PANEL_ANCHOR_DEBT_QUARANTINE_CAP: usize = 256;
+
+/// Failed exact repair attempts before an identity is quarantined.
+///
+/// More than one because a write shed under disk pressure is not evidence that a
+/// row cannot be repaired. A carry that succeeds but yields no anchor needs no
+/// retries at all — that is proof on the first attempt — and is quarantined
+/// immediately.
+pub const PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS: u32 = 3;
+
+/// Identities repaired between durable cursor writes.
+///
+/// The cursor is what makes progress survive a restart, so it is written often
+/// enough that a crash costs at most this many repeated (idempotent) repairs,
+/// and rarely enough that it is not a write per row.
+const PANEL_ANCHOR_DEBT_CURSOR_PERSIST_EVERY: usize = 32;
+
+/// `CF_KV` key prefix for the durable anchor-debt repair state, one row per
+/// `(panel generation, backfill source)`.
+const PANEL_ANCHOR_DEBT_STATE_KEY_PREFIX: &str = "syn/anchor-debt/v1/";
+
+/// `CF_KV` key prefix for the durable coverage-sweep cursor.
+const PANEL_COVERAGE_CURSOR_KEY_PREFIX: &str = "syn/panel-backfill-cursor/v1/";
 
 /// Maximum records admitted to one unattended Loom pass.
 ///
@@ -209,6 +277,46 @@ pub struct DerivedStateReadback {
     /// True when the sweep reached the end of its source CF this tick, so the
     /// cursor reset to the start of the CF for the next generation bump.
     pub last_backfill_sweep_complete: Option<bool>,
+    /// Anchors the coverage sweep carried across a generation bump in passing.
+    ///
+    /// The sweep always did this and never reported it, so the one number that
+    /// says whether the #1980 carry-forward is working at all was invisible
+    /// while `inserted_rows=0` was read as "nothing happened" (#1984).
+    pub last_backfill_anchors_carried_forward: Option<u64>,
+    /// --- Identity-driven anchor-debt repair (#1984, #2061) ---
+    ///
+    /// What the last tick did about exact stranded anchor identities, reported
+    /// apart from the coverage sweep because the two are different repairs with
+    /// different meters: coverage debt is measured by rows inserted, anchor debt
+    /// by anchors carried. Reading one by the other is how a 60-second pass that
+    /// carried nothing was read as a pass that had nothing to carry.
+    pub last_anchor_debt_action: Option<String>,
+    /// One line per debt-bearing panel: debt, queue position, and what this tick
+    /// did to it. Every panel every tick — never one target per tick (#2061).
+    pub last_anchor_debt_panels: Vec<String>,
+    pub last_anchor_debt_identities_attempted: u64,
+    /// Attempts whose carry-forward wrote at least one anchor. The progress
+    /// meter for anchor debt.
+    pub last_anchor_debt_anchors_carried: u64,
+    pub last_anchor_debt_identities_carried: u64,
+    /// Constellations the exact-identity repair had to materialize because the
+    /// active generation did not hold the row at all.
+    pub last_anchor_debt_inserted_rows: u64,
+    /// Panels whose enumerated identity queue was consumed to the end this tick,
+    /// so the next census measures a complete repair attempt.
+    pub last_anchor_debt_passes_completed: Vec<String>,
+    /// Exact identities proven unrepairable, named in full: an attempt ran
+    /// against the row and the declared lineage yielded no anchor to carry.
+    /// Quarantined per identity so they can never starve another panel.
+    pub last_anchor_debt_quarantined: Vec<String>,
+    pub last_anchor_debt_quarantined_total: u64,
+    /// Panels carrying stranded anchors with no re-measure path at all.
+    pub last_anchor_debt_unbackfillable_panels: Vec<String>,
+    /// Measured cost of one exact-identity repair this tick. Published rather
+    /// than assumed, because it is the number that says whether the repair is
+    /// debt-proportional or has quietly become corpus-proportional again.
+    pub last_anchor_debt_ms_per_identity: Option<u64>,
+    pub last_anchor_debt_elapsed_ms: Option<u64>,
     /// Last incremental Loom action and physical readback (#1671).
     pub last_weave_actions: BTreeMap<u32, String>,
     pub last_weave_until_ns: BTreeMap<u32, i64>,
@@ -1572,42 +1680,746 @@ pub fn run_novelty_relay_once(db: &Arc<Db>) -> Result<DerivedStateReadback, Stri
     Ok(derived_state_readback())
 }
 
-/// Where the last backfill page stopped, so the next tick resumes instead of
-/// re-walking the corpus from the start.
+/// One panel's durable anchor-debt repair state (#1984, #2061).
 ///
-/// Process-local on purpose. A restart resets it to the start of the CF, which
-/// re-examines already-current rows — the cheap path in `backfill_temporal_metadata`,
-/// which recognises them and does not rewrite — rather than skipping rows it has
-/// not proven were measured. Persisting a cursor would trade that self-healing
-/// property for a saved scan, and a cursor that outlives the panel generation it
-/// was taken under is exactly how rows get silently skipped.
-static BACKFILL_CURSOR: LazyLock<Mutex<Option<BackfillCursor>>> =
-    LazyLock::new(|| Mutex::new(None));
-static ANCHOR_DEBT_PROBE: LazyLock<Mutex<Option<AnchorDebtProbe>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-#[derive(Clone, Debug)]
-struct BackfillCursor {
+/// Durable, in `CF_KV`, keyed by `(panel generation, backfill source)`. The
+/// cursor this replaces was process-local, justified as self-healing: a restart
+/// reset it to the head of the CF and re-examined already-current rows rather
+/// than skipping rows it had not proven were measured. That reasoning holds for
+/// a sweep whose pass is short. It does not hold for one whose pass is the whole
+/// corpus — the deployed daemon restarts far more often than a 939,605-row pass
+/// completes, so the pass restarted at the head every time and the stranded rows
+/// were never reached. A checkpoint that does not survive the process silently
+/// unbounds the scan it exists to bound.
+///
+/// Resumability is not the only thing this row carries. It also holds the
+/// per-identity quarantine, and that is what makes refusal safe: an identity an
+/// exact attempt proved unrepairable is excluded by name, so the panel keeps
+/// repairing its other rows and every other panel keeps its own budget. The
+/// refusal that latched the whole maintainer on three outcome anchors was right
+/// about the rows and wrong about the scope (#2061).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct AnchorDebtRepairState {
+    schema: String,
+    issue: u32,
+    panel_name: String,
     panel_version: u32,
     source_cf: String,
-    after_physical: Vec<u8>,
+    /// Exclusive resume position in the census's sorted identity queue. `None`
+    /// means the next pass starts at the head.
+    after_source_cf: Option<String>,
+    after_source_key_hex: Option<String>,
+    /// Identities an exact attempt proved cannot be re-anchored.
+    quarantined: Vec<QuarantinedAnchorIdentity>,
+    passes_completed: u64,
+    identities_attempted_total: u64,
+    anchors_carried_total: u64,
+    updated_at_unix_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug)]
-struct AnchorDebtProbe {
+impl AnchorDebtRepairState {
+    fn new(panel_name: &str, panel_version: u32, source_cf: &str) -> Self {
+        Self {
+            schema: "synapse_anchor_debt_repair_state/v1".to_owned(),
+            issue: 1984,
+            panel_name: panel_name.to_owned(),
+            panel_version,
+            source_cf: source_cf.to_owned(),
+            after_source_cf: None,
+            after_source_key_hex: None,
+            quarantined: Vec::new(),
+            passes_completed: 0,
+            identities_attempted_total: 0,
+            anchors_carried_total: 0,
+            updated_at_unix_ms: None,
+        }
+    }
+
+    fn quarantines(&self, identity: &StrandedAnchorIdentity) -> bool {
+        self.quarantined.iter().any(|entry| {
+            entry.source_cf == identity.source_cf && entry.source_key_hex == identity.source_key_hex
+        })
+    }
+
+    /// True when `identity` sorts at or before the durable resume position, so
+    /// the pass in flight has already attempted it.
+    fn already_passed(&self, identity: &StrandedAnchorIdentity) -> bool {
+        match (
+            self.after_source_cf.as_deref(),
+            self.after_source_key_hex.as_deref(),
+        ) {
+            (Some(source_cf), Some(source_key_hex)) => {
+                (
+                    identity.source_cf.as_str(),
+                    identity.source_key_hex.as_str(),
+                ) <= (source_cf, source_key_hex)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// One exact identity excluded from the work queue, with the evidence (#1984).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct QuarantinedAnchorIdentity {
+    source_cf: String,
+    source_key_hex: String,
+    superseded_panel_version: u32,
+    /// What the attempt proved. Never a guess: every entry here was written
+    /// after a repair ran against this exact row.
+    reason: String,
+    attempts: u32,
+    first_seen_unix_ms: Option<u64>,
+    last_attempt_unix_ms: Option<u64>,
+}
+
+impl QuarantinedAnchorIdentity {
+    fn describe(&self, panel_name: &str, panel_version: u32) -> String {
+        format!(
+            "{panel_name}@{panel_version} source_cf={} source_key_hex={} from_generation={} \
+             attempts={} reason={}",
+            self.source_cf,
+            self.source_key_hex,
+            self.superseded_panel_version,
+            self.attempts,
+            self.reason,
+        )
+    }
+}
+
+/// The durable coverage-sweep cursor, one row per `(panel generation, source)`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CoverageSweepCursor {
+    schema: String,
+    issue: u32,
+    panel_name: String,
     panel_version: u32,
     source_cf: String,
-    stranded_before: usize,
+    /// The opaque exclusive physical Calyx cursor the last page stopped at, hex
+    /// encoded because this row is JSON. Passed back unchanged, never
+    /// interpreted.
+    after_physical_hex: Option<String>,
+    sweeps_completed: u64,
+    updated_at_unix_ms: Option<u64>,
 }
 
-/// Drives `temporal_backfill` pages for the panel most owed one, under
-/// [`PANEL_BACKFILL_TICK_BUDGET`] (#1927 ask 2).
+/// Whether the un-amortized-primitive finding has already been raised in this
+/// process, so it is loud once rather than once per tick.
+static ANCHOR_DEBT_UNAMORTIZED_REPORTED: AtomicBool = AtomicBool::new(false);
+
+fn anchor_debt_state_key(panel_version: u32, source_cf: &str) -> Vec<u8> {
+    format!("{PANEL_ANCHOR_DEBT_STATE_KEY_PREFIX}{panel_version}/{source_cf}").into_bytes()
+}
+
+fn coverage_cursor_key(panel_version: u32, source_cf: &str) -> Vec<u8> {
+    format!("{PANEL_COVERAGE_CURSOR_KEY_PREFIX}{panel_version}/{source_cf}").into_bytes()
+}
+
+/// Reads one durable maintenance row, failing loudly on undecodable bytes.
+///
+/// A decode failure is never treated as "no state". Silently starting from the
+/// head after failing to read a cursor is exactly the restart amnesia this row
+/// exists to remove, and it would do it while looking like a fresh start.
+fn read_durable_maintenance_row<T: serde::de::DeserializeOwned>(
+    db: &Arc<Db>,
+    key: &[u8],
+    label: &str,
+) -> Result<Option<T>, String> {
+    let Some(raw) = db
+        .get_cf(cf::CF_KV, key)
+        .map_err(|error| format!("read durable {label} row: {error}"))?
+    else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(|error| format!("decode durable {label} row: {error}"))
+}
+
+fn write_durable_maintenance_row<T: Serialize>(
+    db: &Arc<Db>,
+    key: Vec<u8>,
+    value: &T,
+    label: &str,
+) -> Result<(), String> {
+    let encoded = serde_json::to_vec(value)
+        .map_err(|error| format!("encode durable {label} row: {error}"))?;
+    db.put_batch_pressure_bypass(cf::CF_KV, [(key, encoded)])
+        .map_err(|error| format!("persist durable {label} row: {error}"))
+}
+
+/// Decodes a census source-key hex back into the authoritative row key.
+///
+/// The census reports identities as hex because that is how Calyx stores source
+/// provenance; the repair needs the bytes. Malformed hex is a corrupt census
+/// row, not a row to skip quietly.
+fn decode_key_hex(hex: &str) -> Result<Vec<u8>, String> {
+    if !hex.len().is_multiple_of(2) {
+        return Err(format!(
+            "key hex has odd length {}; a physical key is whole bytes",
+            hex.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.as_bytes().chunks_exact(2) {
+        let mut byte = 0u8;
+        for digit in pair {
+            let value = char::from(*digit).to_digit(16).ok_or_else(|| {
+                format!(
+                    "key hex contains the non-hex digit {:?}",
+                    char::from(*digit)
+                )
+            })?;
+            byte = byte
+                .checked_mul(16)
+                .and_then(|byte| {
+                    u8::try_from(value)
+                        .ok()
+                        .and_then(|value| byte.checked_add(value))
+                })
+                .ok_or_else(|| "key hex digit is out of byte range".to_owned())?;
+        }
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+/// What one tick's identity-driven anchor-debt phase did.
+#[derive(Debug, Default)]
+struct AnchorDebtPass {
+    identities_attempted: u64,
+    identities_carried: u64,
+    anchors_carried: u64,
+    inserted_rows: u64,
+    panels: Vec<String>,
+    passes_completed: Vec<String>,
+    quarantined: Vec<String>,
+    quarantined_total: u64,
+    failed: bool,
+}
+
+/// Re-anchors exactly the rows the census named as stranded (#1984, #2061).
+///
+/// # Why selection, not scanning
+///
+/// The repair this replaces asked the wrong question. It knew a panel owed 2,120
+/// anchors and had no idea which rows they were, so the only move available was
+/// to re-measure the whole source CF under a wall-clock budget and hope the
+/// stranded rows fell inside it. On the deployed daemon that produced
+/// `budget_exhausted` at 44 pages and 60,089 ms with `inserted_rows=0`, every
+/// tick, while five panels held their debts unchanged. The corpus is 939,605
+/// `Base` rows; the debt was 2,879. Work proportional to the first cannot
+/// converge on the second, at any budget — which is why the answer was never a
+/// larger budget.
+///
+/// The census already computed the exact answer and discarded it behind a count.
+/// It now carries [`crate::panel_coverage::PanelCoverageRow::anchors_stranded_identities`]
+/// — source CF, source key, and the declared superseded generation holding the
+/// anchors — and this drives exactly those rows through the exact-identity path
+/// `backfill_temporal_metadata` already exposes. Repair cost becomes the debt
+/// rather than the corpus, which is the move a visibility map makes for VACUUM:
+/// pay for the dirty pages, not for the table.
+///
+/// # Why every panel, every tick
+///
+/// One target per tick made an unrepairable head-of-queue item a denial of
+/// service: three outcome anchors nothing could re-anchor latched the maintainer
+/// and stopped 208,496 rows of coverage backfill for the life of a process
+/// (#2061; #2030 was the same structure with a different cause). Debt-
+/// proportional repair removes the reason to pick one — every debt-bearing panel
+/// gets a share of one bounded budget, and a panel that cannot progress cannot
+/// take anyone else's.
+///
+/// # Why quarantine is per identity
+///
+/// The refusal this replaces latched a panel on a count comparison, and that
+/// count could only change through something the daemon cannot do unattended, so
+/// it never cleared. Here the evidence is per row and immediate: an attempt that
+/// runs against the exact source row and carries no anchor has *proven* the
+/// declared lineage holds nothing for it. That identity is quarantined by name
+/// with its reason; the panel's other rows, including ones that appear later,
+/// are still repaired.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one repair pass: selection, budget, attempt, quarantine and publication read as one \
+              sequence and splitting them would hide the order the guarantees depend on"
+)]
+fn drive_anchor_debt_repair(
+    db: &Arc<Db>,
+    report: &crate::panel_coverage::PanelCoverageReport,
+    tick_started: std::time::Instant,
+) -> AnchorDebtPass {
+    let mut pass = AnchorDebtPass::default();
+    let targets = report.anchor_debt_targets();
+    if targets.is_empty() {
+        publish_anchor_debt_readback(&pass, None, 0, report);
+        return pass;
+    }
+    let started = std::time::Instant::now();
+    // One shared budget, divided evenly, floor of one: the smallest debt is
+    // never crowded out by the largest, and the largest is never starved by the
+    // number of panels sharing the tick.
+    let per_panel_budget = (PANEL_ANCHOR_DEBT_TICK_IDENTITIES / targets.len()).max(1);
+    let mut remaining_global = PANEL_ANCHOR_DEBT_TICK_IDENTITIES;
+
+    for target in targets {
+        if remaining_global == 0
+            || started.elapsed() >= PANEL_ANCHOR_DEBT_TICK_BUDGET
+            || tick_started.elapsed() >= PANEL_BACKFILL_TICK_BUDGET
+        {
+            break;
+        }
+        let Some(source_cf) = target.backfill_source_cf.clone() else {
+            // `anchor_debt_targets` filtered on this being present, so reaching
+            // here means two predicates disagree — a code defect, not a state.
+            record_failure(
+                "STORAGE_DERIVED_STATE_ANCHOR_DEBT_TARGET_HAS_NO_SOURCE",
+                format!(
+                    "panel {} was selected for anchor-debt repair but declares no \
+                     backfill_source_cf; PanelCoverageRow::anchor_debt_owed and \
+                     PanelCoverageReport::anchor_debt_targets disagree",
+                    target.panel_name
+                ),
+            );
+            pass.failed = true;
+            continue;
+        };
+        let state_key = anchor_debt_state_key(target.panel_version, &source_cf);
+        let mut state = match read_durable_maintenance_row::<AnchorDebtRepairState>(
+            db,
+            &state_key,
+            "anchor-debt repair state",
+        ) {
+            Ok(Some(state)) => state,
+            Ok(None) => {
+                AnchorDebtRepairState::new(&target.panel_name, target.panel_version, &source_cf)
+            }
+            Err(detail) => {
+                // Never fall back to a fresh state on a read failure: that
+                // discards the quarantine and re-attempts rows already proven
+                // unrepairable, while presenting as a clean first pass.
+                record_failure(
+                    "STORAGE_DERIVED_STATE_ANCHOR_DEBT_STATE_UNREADABLE",
+                    format!(
+                        "panel {} anchor-debt repair state at CF_KV key {} is unreadable: \
+                         {detail}; the repair refuses to start a pass it can neither resume nor \
+                         quarantine against",
+                        target.panel_name,
+                        String::from_utf8_lossy(&state_key)
+                    ),
+                );
+                pass.failed = true;
+                continue;
+            }
+        };
+
+        // Prune quarantine entries the census no longer names as stranded. An
+        // identity that left the debt was repaired, or its source row is gone,
+        // or the generation moved — none of which are reasons to keep refusing
+        // it, and a quarantine that only grows is a repair that decays.
+        state.quarantined.retain(|entry| {
+            target.anchors_stranded_identities.iter().any(|identity| {
+                identity.source_cf == entry.source_cf
+                    && identity.source_key_hex == entry.source_key_hex
+            })
+        });
+
+        let queue: Vec<&StrandedAnchorIdentity> = target
+            .anchors_stranded_identities
+            .iter()
+            .filter(|identity| !state.quarantines(identity))
+            .collect();
+        let mut pending: Vec<&StrandedAnchorIdentity> = queue
+            .iter()
+            .copied()
+            .filter(|identity| !state.already_passed(identity))
+            .collect();
+        let mut pass_completed_this_tick = false;
+        if pending.is_empty() && !queue.is_empty() {
+            // The durable cursor sits past everything this census still names,
+            // so the pass covered its whole queue. Record the completion, reset
+            // to the head, and keep working in this tick rather than idling.
+            state.after_source_cf = None;
+            state.after_source_key_hex = None;
+            state.passes_completed = state.passes_completed.saturating_add(1);
+            pass_completed_this_tick = true;
+            pending.clone_from(&queue);
+        }
+
+        let budget = per_panel_budget.min(remaining_global).min(pending.len());
+        let panel_started = std::time::Instant::now();
+        let mut attempted = 0usize;
+        let mut carried_rows = 0u64;
+        let mut carried_anchors = 0u64;
+        let mut inserted = 0u64;
+        let mut newly_quarantined = 0usize;
+        let mut since_persist = 0usize;
+        let mut queue_exhausted = !pending.is_empty();
+
+        for identity in pending.iter().take(budget) {
+            if started.elapsed() >= PANEL_ANCHOR_DEBT_TICK_BUDGET {
+                queue_exhausted = false;
+                break;
+            }
+            if state.quarantined.len() >= PANEL_ANCHOR_DEBT_QUARANTINE_CAP {
+                record_failure(
+                    "STORAGE_DERIVED_STATE_ANCHOR_DEBT_QUARANTINE_FULL",
+                    format!(
+                        "panel {} holds {} quarantined stranded identities, at the declared cap \
+                         {PANEL_ANCHOR_DEBT_QUARANTINE_CAP}; its anchor debt is systematically \
+                         unrepairable rather than pointwise, so the repair stops enqueuing it and \
+                         reports the panel instead of growing an unbounded refusal list",
+                        target.panel_name,
+                        state.quarantined.len(),
+                    ),
+                );
+                pass.failed = true;
+                queue_exhausted = false;
+                break;
+            }
+
+            attempted += 1;
+            since_persist += 1;
+            // The cursor advances past every identity the pass touches,
+            // including one it refuses, so a pathological row can delay a pass
+            // but can never stop it.
+            state.after_source_cf = Some(identity.source_cf.clone());
+            state.after_source_key_hex = Some(identity.source_key_hex.clone());
+
+            let source_key = match decode_key_hex(&identity.source_key_hex) {
+                Ok(key) => key,
+                Err(detail) => {
+                    record_failure(
+                        "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_UNDECODABLE",
+                        format!(
+                            "panel {} stranded identity source_cf={} source_key_hex={} \
+                             from_generation={} does not decode to a physical key: {detail}; the \
+                             census row naming it is corrupt",
+                            target.panel_name,
+                            identity.source_cf,
+                            identity.source_key_hex,
+                            identity.superseded_panel_version,
+                        ),
+                    );
+                    pass.failed = true;
+                    state.quarantined.push(QuarantinedAnchorIdentity {
+                        source_cf: identity.source_cf.clone(),
+                        source_key_hex: identity.source_key_hex.clone(),
+                        superseded_panel_version: identity.superseded_panel_version,
+                        reason: "source_key_hex_undecodable".to_owned(),
+                        attempts: 1,
+                        first_seen_unix_ms: now_unix_ms(),
+                        last_attempt_unix_ms: now_unix_ms(),
+                    });
+                    newly_quarantined += 1;
+                    continue;
+                }
+            };
+
+            match db.backfill_temporal_metadata(&source_cf, Some(&source_key), None, 1) {
+                Ok(page) => {
+                    inserted = inserted.saturating_add(page.inserted_rows);
+                    carried_anchors = carried_anchors.saturating_add(page.anchors_carried_forward);
+                    if page.anchors_carried_forward > 0 {
+                        carried_rows = carried_rows.saturating_add(1);
+                    } else {
+                        // Proof, not suspicion: the exact row was re-measured at
+                        // the active generation and its declared lineage carried
+                        // nothing. Retrying the same bytes cannot change that,
+                        // so this identity is quarantined by name — and only it.
+                        // This is the #2061 population, held to three rows on
+                        // `syn-outcome-v1` instead of a whole maintainer.
+                        record_failure(
+                            "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_UNREPAIRABLE",
+                            format!(
+                                "panel {} stranded identity source_cf={} source_key_hex={} \
+                                 from_generation={} was re-measured at generation {} and its \
+                                 declared anchor lineage carried nothing; quarantining this one \
+                                 identity so the panel's remaining debt and every other panel keep \
+                                 being repaired; inspect that superseded Base row's anchors and \
+                                 their confidence",
+                                target.panel_name,
+                                identity.source_cf,
+                                identity.source_key_hex,
+                                identity.superseded_panel_version,
+                                target.panel_version,
+                            ),
+                        );
+                        pass.failed = true;
+                        state.quarantined.push(QuarantinedAnchorIdentity {
+                            source_cf: identity.source_cf.clone(),
+                            source_key_hex: identity.source_key_hex.clone(),
+                            superseded_panel_version: identity.superseded_panel_version,
+                            reason: "carry_forward_yielded_no_anchor".to_owned(),
+                            attempts: 1,
+                            first_seen_unix_ms: now_unix_ms(),
+                            last_attempt_unix_ms: now_unix_ms(),
+                        });
+                        newly_quarantined += 1;
+                    }
+                }
+                Err(error) => {
+                    // A failed attempt is not proof the row cannot be repaired —
+                    // a write shed under disk pressure is not a lineage fault —
+                    // so it accrues attempts and is quarantined only once it has
+                    // failed often enough to be a property of the row.
+                    let attempts = match state.quarantined.iter_mut().find(|entry| {
+                        entry.source_cf == identity.source_cf
+                            && entry.source_key_hex == identity.source_key_hex
+                    }) {
+                        Some(entry) => {
+                            entry.attempts = entry.attempts.saturating_add(1);
+                            entry.last_attempt_unix_ms = now_unix_ms();
+                            entry.attempts
+                        }
+                        None => 1,
+                    };
+                    record_failure(
+                        "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_FAILED",
+                        format!(
+                            "panel {} exact anchor-debt repair for source_cf={} source_key_hex={} \
+                             from_generation={} failed on attempt {attempts} of \
+                             {PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS}: {error}",
+                            target.panel_name,
+                            identity.source_cf,
+                            identity.source_key_hex,
+                            identity.superseded_panel_version,
+                        ),
+                    );
+                    pass.failed = true;
+                    if attempts >= PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS
+                        && !state.quarantines(identity)
+                    {
+                        state.quarantined.push(QuarantinedAnchorIdentity {
+                            source_cf: identity.source_cf.clone(),
+                            source_key_hex: identity.source_key_hex.clone(),
+                            superseded_panel_version: identity.superseded_panel_version,
+                            reason: format!("repair_failed_after_{attempts}_attempts"),
+                            attempts,
+                            first_seen_unix_ms: now_unix_ms(),
+                            last_attempt_unix_ms: now_unix_ms(),
+                        });
+                        newly_quarantined += 1;
+                    }
+                    // Stop this panel, not the tick: an erroring source is not a
+                    // reason to hammer it, and every other panel still has its
+                    // own budget waiting.
+                    queue_exhausted = false;
+                    break;
+                }
+            }
+
+            if since_persist >= PANEL_ANCHOR_DEBT_CURSOR_PERSIST_EVERY {
+                since_persist = 0;
+                state.updated_at_unix_ms = now_unix_ms();
+                if let Err(detail) = write_durable_maintenance_row(
+                    db,
+                    state_key.clone(),
+                    &state,
+                    "anchor-debt repair state",
+                ) {
+                    record_failure(
+                        "STORAGE_DERIVED_STATE_ANCHOR_DEBT_CURSOR_UNWRITABLE",
+                        format!(
+                            "panel {} anchor-debt resume cursor could not be persisted: {detail}; \
+                             without it a restart repeats work already done and no pass can be \
+                             proven complete",
+                            target.panel_name
+                        ),
+                    );
+                    pass.failed = true;
+                    queue_exhausted = false;
+                    break;
+                }
+            }
+        }
+
+        if queue_exhausted && attempted >= pending.len() {
+            // The whole enumerated queue was attempted, so the next census
+            // measures a complete repair attempt rather than a partial one. A
+            // truncated enumeration never reaches here: calling a pass complete
+            // over a work queue that was silently shortened would report rows as
+            // attempted that were never named.
+            if target.anchors_stranded_identities_truncated {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_ANCHOR_DEBT_QUEUE_TRUNCATED",
+                    panel = %target.panel_name,
+                    panel_version = target.panel_version,
+                    stranded = target.anchors_stranded_on_superseded,
+                    enumerated = target.anchors_stranded_identities.len(),
+                    cap = crate::panel_coverage::SYN_ANCHOR_DEBT_IDENTITY_CAP,
+                    "the census named fewer stranded identities than it counted, so no pass over \
+                     this panel is called complete; the queue drains across censuses instead"
+                );
+            } else {
+                state.after_source_cf = None;
+                state.after_source_key_hex = None;
+                state.passes_completed = state.passes_completed.saturating_add(1);
+                pass_completed_this_tick = true;
+            }
+        }
+        if pass_completed_this_tick {
+            pass.passes_completed.push(format!(
+                "{}@{} pass={} stranded_at_pass_end={}",
+                target.panel_name,
+                target.panel_version,
+                state.passes_completed,
+                target.anchors_stranded_on_superseded,
+            ));
+        }
+        state.identities_attempted_total = state
+            .identities_attempted_total
+            .saturating_add(attempted as u64);
+        state.anchors_carried_total = state.anchors_carried_total.saturating_add(carried_anchors);
+        state.updated_at_unix_ms = now_unix_ms();
+        for entry in &state.quarantined {
+            pass.quarantined
+                .push(entry.describe(&target.panel_name, target.panel_version));
+        }
+        pass.quarantined_total += state.quarantined.len() as u64;
+        if let Err(detail) =
+            write_durable_maintenance_row(db, state_key, &state, "anchor-debt repair state")
+        {
+            record_failure(
+                "STORAGE_DERIVED_STATE_ANCHOR_DEBT_CURSOR_UNWRITABLE",
+                format!(
+                    "panel {} anchor-debt resume cursor could not be persisted: {detail}; without \
+                     it a restart repeats work already done and no pass can be proven complete",
+                    target.panel_name
+                ),
+            );
+            pass.failed = true;
+        }
+
+        let panel_elapsed_ms =
+            u64::try_from(panel_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        pass.panels.push(format!(
+            "{}@{} stranded={} enumerated={} truncated={} attempted={attempted} \
+             carried_rows={carried_rows} carried_anchors={carried_anchors} inserted={inserted} \
+             quarantined={} new_quarantine={newly_quarantined} source_absent={} \
+             source_cf_unmeasured={} elapsed_ms={panel_elapsed_ms}",
+            target.panel_name,
+            target.panel_version,
+            target.anchors_stranded_on_superseded,
+            target.anchors_stranded_identities.len(),
+            target.anchors_stranded_identities_truncated,
+            state.quarantined.len(),
+            target.anchors_stranded_source_absent,
+            target.anchors_stranded_source_cf_unmeasured,
+        ));
+        pass.identities_attempted += attempted as u64;
+        pass.identities_carried += carried_rows;
+        pass.anchors_carried += carried_anchors;
+        pass.inserted_rows += inserted;
+        remaining_global = remaining_global.saturating_sub(attempted);
+    }
+
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let ms_per_identity =
+        (pass.identities_attempted > 0).then(|| elapsed_ms / pass.identities_attempted.max(1));
+    if let Some(ms_per_identity) = ms_per_identity
+        && ms_per_identity > PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS
+        && !ANCHOR_DEBT_UNAMORTIZED_REPORTED.swap(true, Ordering::Relaxed)
+    {
+        // Measured, not assumed. An exact-identity repair reads one source row,
+        // writes one constellation and carries one anchor; a cost far above that
+        // means the declared anchor lineage is being rebuilt per identity rather
+        // than once per sweep, which quietly returns this repair to being
+        // corpus-proportional — the exact defect it was written to remove.
+        record_failure(
+            "STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED",
+            format!(
+                "exact-identity anchor repair cost {ms_per_identity} ms per identity over {} \
+                 identities, above the declared ceiling {PANEL_ANCHOR_DEBT_IDENTITY_MAX_MS} ms; \
+                 the identity work queue is correct but its primitive is not amortizing the \
+                 declared-lineage read, so a debt-proportional repair is doing \
+                 corpus-proportional work and convergence is far slower than the debt implies; \
+                 remediation=let the exact-key branch of Db::backfill_temporal_metadata reuse the \
+                 cached anchor lineage instead of rebuilding it per row \
+                 (crates/synapse-storage/src/backend.rs, anchor_carry_lineage(source_cf, \
+                 after_physical.is_none()))",
+                pass.identities_attempted,
+            ),
+        );
+    }
+
+    publish_anchor_debt_readback(&pass, ms_per_identity, elapsed_ms, report);
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_ANCHOR_DEBT_PASS",
+        identities_attempted = pass.identities_attempted,
+        identities_carried = pass.identities_carried,
+        anchors_carried = pass.anchors_carried,
+        inserted_rows = pass.inserted_rows,
+        quarantined_total = pass.quarantined_total,
+        passes_completed = ?pass.passes_completed,
+        panels = ?pass.panels,
+        unbackfillable_panels = ?report.anchor_debt_unbackfillable_panels,
+        ms_per_identity = ?ms_per_identity,
+        elapsed_ms,
+        "re-anchored exactly the source identities the census named as stranded"
+    );
+    pass
+}
+
+fn publish_anchor_debt_readback(
+    pass: &AnchorDebtPass,
+    ms_per_identity: Option<u64>,
+    elapsed_ms: u64,
+    report: &crate::panel_coverage::PanelCoverageReport,
+) {
+    let mut guard = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.last_anchor_debt_action = Some(
+        if report.anchors_stranded_total == 0 {
+            "none_owed"
+        } else if pass.identities_attempted == 0 {
+            // Debt exists but nothing repairable was left to attempt: every
+            // remaining identity is quarantined or has no re-measure path. A
+            // standing, named condition — never reported as completion.
+            "all_remaining_debt_quarantined_or_unbackfillable"
+        } else if pass.anchors_carried > 0 {
+            "identities_repaired"
+        } else {
+            "identities_attempted_none_carried"
+        }
+        .to_owned(),
+    );
+    guard.last_anchor_debt_panels.clone_from(&pass.panels);
+    guard.last_anchor_debt_identities_attempted = pass.identities_attempted;
+    guard.last_anchor_debt_identities_carried = pass.identities_carried;
+    guard.last_anchor_debt_anchors_carried = pass.anchors_carried;
+    guard.last_anchor_debt_inserted_rows = pass.inserted_rows;
+    guard
+        .last_anchor_debt_passes_completed
+        .clone_from(&pass.passes_completed);
+    guard
+        .last_anchor_debt_quarantined
+        .clone_from(&pass.quarantined);
+    guard.last_anchor_debt_quarantined_total = pass.quarantined_total;
+    guard
+        .last_anchor_debt_unbackfillable_panels
+        .clone_from(&report.anchor_debt_unbackfillable_panels);
+    guard.last_anchor_debt_ms_per_identity = ms_per_identity;
+    guard.last_anchor_debt_elapsed_ms = Some(elapsed_ms);
+}
+
+/// Drives `temporal_backfill` pages for the panel most owed a **coverage**
+/// sweep, under the remainder of [`PANEL_BACKFILL_TICK_BUDGET`] (#1927 ask 2).
 ///
 /// The backfill mechanism already existed and was already correct; nothing drove
 /// it, so a panel could sit at 1.7% coverage indefinitely with `health`
 /// reporting `ok`. This is the driver, and it is shaped exactly like the search
 /// generation half above: measure the state, decide, act within a bounded
 /// budget, publish what happened.
+///
+/// Two things changed with #1984/#2061. It no longer competes with anchor debt
+/// for one target slot — that is a separate, debt-proportional phase now, so
+/// three unrepairable anchors can never again outrank 174,993 uncovered rows.
+/// And its cursor is durable, because a process-local one restarted the sweep at
+/// the head of the CF after every restart and a corpus-length pass never
+/// survived long enough to finish.
 ///
 /// Every exit records a named action. "Nothing was owed" and "the budget ran out
 /// mid-corpus" and "the page failed" are three different outcomes and none of
@@ -1619,13 +2431,19 @@ struct AnchorDebtProbe {
 /// read as a healthy cadence over a repair that is not happening — the same
 /// shape as the `health`-says-ok-while-coverage-is-1.7% failure this whole
 /// issue is about.
-fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) -> bool {
-    let started = std::time::Instant::now();
-    let Some(target) = report.most_owed_backfill() else {
-        let unbackfillable_anchor_debt = report.panels.iter().any(|panel| {
-            panel.anchors_stranded_on_superseded > 0 && panel.backfill_source_cf.is_none()
-        });
-        let action = if unbackfillable_anchor_debt {
+#[allow(
+    clippy::too_many_lines,
+    reason = "one sweep: cursor recovery, paging, cursor persistence and publication are a single \
+              ordered sequence whose correctness depends on that order"
+)]
+fn drive_coverage_backfill(
+    db: &Arc<Db>,
+    report: &crate::panel_coverage::PanelCoverageReport,
+    started: std::time::Instant,
+    anchor: &AnchorDebtPass,
+) -> bool {
+    let Some(target) = report.most_owed_coverage_backfill() else {
+        let action = if !report.anchor_debt_unbackfillable_panels.is_empty() {
             "anchor_debt_unbackfillable"
         } else if report.coverage_deficient_panels.is_empty() {
             "none_owed"
@@ -1635,16 +2453,14 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
             // this whole issue is about.
             "owed_but_unbackfillable"
         };
-        let mut guard = match DERIVED_STATE_LAST.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.last_backfill_action = Some(action.to_owned());
-        guard.last_backfill_reason = None;
-        guard.last_backfill_panel = None;
-        guard.last_backfill_source_cf = None;
-        guard.last_backfill_pages = Some(0);
-        guard.last_backfill_elapsed_ms = Some(0);
+        publish_backfill_readback(&BackfillReadback {
+            action,
+            reason: None,
+            panel: None,
+            source_cf: None,
+            sweep_complete: None,
+            ..BackfillReadback::empty(anchor)
+        });
         // Not a failure: "nothing is owed" and "nothing owed is repairable" are
         // both correct outcomes for this pass. The unrepairable case is a
         // deficiency of the panel catalog, already raised by health, not a
@@ -1652,78 +2468,68 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         return false;
     };
     let Some(source_cf) = target.backfill_source_cf.clone() else {
-        // `most_owed_backfill` already filtered on this being present; reaching
-        // here means the two predicates disagree, which is a code defect worth
-        // shouting about rather than a state worth handling.
+        // `most_owed_coverage_backfill` already filtered on this being present;
+        // reaching here means the two predicates disagree, which is a code
+        // defect worth shouting about rather than a state worth handling.
         record_failure(
             "STORAGE_DERIVED_STATE_BACKFILL_TARGET_HAS_NO_SOURCE",
             format!(
-                "panel {} was selected as most-owed backfill but declares no backfill_source_cf; \
-                 PanelCoverageRow::backfill_owed and PanelCoverageReport::most_owed_backfill \
-                 disagree",
+                "panel {} was selected as most-owed coverage backfill but declares no \
+                 backfill_source_cf; PanelCoverageRow::coverage_backfill_owed and \
+                 PanelCoverageReport::most_owed_coverage_backfill disagree",
                 target.panel_name
             ),
         );
         return true;
     };
-    let backfill_reason = target.backfill_reason().unwrap_or("unknown_debt");
+    let backfill_reason = target.backfill_reason().unwrap_or("coverage_debt");
 
-    // #1984: a completed whole-source sweep is one exact repair attempt. On
-    // the next census, prove it reduced the source-identity debt before ever
-    // starting another sweep. A missing lineage declaration cannot heal by
-    // retrying the same bytes forever, so latch the fault until the measured
-    // debt or panel generation changes.
-    if target.anchors_stranded_on_superseded > 0 {
-        let mut probe = match ANCHOR_DEBT_PROBE.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(previous) = probe.as_ref().filter(|previous| {
-            previous.panel_version == target.panel_version
-                && previous.source_cf == source_cf
-                && target.anchors_stranded_on_superseded >= previous.stranded_before
-        }) {
-            let detail = format!(
-                "panel {} completed a full anchor-debt sweep but exact stranded source identities did not decrease: before={} after={}; refusing an unattended retry until the debt or panel generation changes; inspect superseded_versions and historical Base source metadata",
-                target.panel_name, previous.stranded_before, target.anchors_stranded_on_superseded,
+    let cursor_key = coverage_cursor_key(target.panel_version, &source_cf);
+    let persisted = match read_durable_maintenance_row::<CoverageSweepCursor>(
+        db,
+        &cursor_key,
+        "coverage sweep cursor",
+    ) {
+        Ok(persisted) => persisted,
+        Err(detail) => {
+            // A cursor that cannot be read must not be silently replaced by a
+            // sweep from the head: that is exactly the restart amnesia that kept
+            // a corpus-length pass from ever completing, and it would present as
+            // a clean start.
+            record_failure(
+                "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNREADABLE",
+                format!(
+                    "panel {} coverage sweep cursor at CF_KV key {} is unreadable: {detail}; the \
+                     sweep refuses to restart from the head of {source_cf} on an unproven position",
+                    target.panel_name,
+                    String::from_utf8_lossy(&cursor_key)
+                ),
             );
-            drop(probe);
-            record_failure("STORAGE_DERIVED_STATE_ANCHOR_DEBT_NO_PROGRESS", detail);
-            let mut guard = match DERIVED_STATE_LAST.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.last_backfill_action = Some("anchor_debt_no_progress".to_owned());
-            guard.last_backfill_reason = Some(backfill_reason.to_owned());
-            guard.last_backfill_panel = Some(target.panel_name.clone());
-            guard.last_backfill_source_cf = Some(source_cf);
-            guard.last_backfill_pages = Some(0);
-            guard.last_backfill_elapsed_ms = Some(0);
             return true;
         }
-        if probe.as_ref().is_some_and(|previous| {
-            previous.panel_version != target.panel_version
-                || previous.source_cf != source_cf
-                || target.anchors_stranded_on_superseded < previous.stranded_before
-        }) {
-            *probe = None;
-        }
-    }
-
+    };
     // A cursor taken under a different panel generation or a different CF says
     // nothing about where this sweep should resume, so it is discarded rather
     // than reused.
-    let mut after_physical = {
-        let guard = match BACKFILL_CURSOR.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard
-            .as_ref()
-            .filter(|cursor| {
-                cursor.panel_version == target.panel_version && cursor.source_cf == source_cf
-            })
-            .map(|cursor| cursor.after_physical.clone())
+    let resume_hex = persisted
+        .as_ref()
+        .filter(|persisted| {
+            persisted.panel_version == target.panel_version && persisted.source_cf == source_cf
+        })
+        .and_then(|persisted| persisted.after_physical_hex.clone());
+    let mut after_physical = match resume_hex.as_deref().map(decode_key_hex).transpose() {
+        Ok(after_physical) => after_physical,
+        Err(detail) => {
+            record_failure(
+                "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNREADABLE",
+                format!(
+                    "panel {} coverage sweep cursor holds an undecodable physical position: \
+                     {detail}",
+                    target.panel_name
+                ),
+            );
+            return true;
+        }
     };
 
     let mut pages = 0_u64;
@@ -1731,6 +2537,7 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
     let mut inserted = 0_u64;
     let mut already_current = 0_u64;
     let mut outcome_anchored = 0_u64;
+    let mut anchors_carried = 0_u64;
     let mut sweep_complete = false;
     let mut action = "budget_exhausted";
 
@@ -1763,10 +2570,11 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         inserted += page.inserted_rows;
         already_current += page.already_current_rows;
         outcome_anchored += page.outcome_anchored_rows;
+        anchors_carried += page.anchors_carried_forward;
 
         if page.more {
             match page.resume_after_physical {
-                Some(cursor) => after_physical = Some(cursor),
+                Some(resume) => after_physical = Some(resume),
                 None => {
                     // `more` without a resume cursor would make the next page
                     // restart from the beginning and loop forever.
@@ -1788,36 +2596,42 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         }
     }
 
-    {
-        let mut guard = match BACKFILL_CURSOR.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = if sweep_complete {
-            // The next sweep starts from the head of the CF. That is the correct
-            // posture after a generation bump: the rows re-measured first are
-            // the oldest, which are the ones no live write will ever reach.
+    let sweeps_completed = persisted
+        .as_ref()
+        .map_or(0, |persisted| persisted.sweeps_completed)
+        .saturating_add(u64::from(sweep_complete));
+    let cursor = CoverageSweepCursor {
+        schema: "synapse_panel_coverage_sweep_cursor/v1".to_owned(),
+        issue: 1984,
+        panel_name: target.panel_name.clone(),
+        panel_version: target.panel_version,
+        source_cf: source_cf.clone(),
+        // A completed sweep resets to the head of the CF. That is the correct
+        // posture after a generation bump: the rows re-measured first are the
+        // oldest, which are the ones no live write will ever reach.
+        after_physical_hex: if sweep_complete {
             None
         } else {
-            after_physical.map(|cursor| BackfillCursor {
-                panel_version: target.panel_version,
-                source_cf: source_cf.clone(),
-                after_physical: cursor,
-            })
-        };
+            after_physical
+                .as_deref()
+                .map(crate::constellations::hex_encode)
+        },
+        sweeps_completed,
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    let cursor_persisted =
+        write_durable_maintenance_row(db, cursor_key, &cursor, "coverage sweep cursor");
+    if let Err(detail) = &cursor_persisted {
+        record_failure(
+            "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_UNWRITABLE",
+            format!(
+                "panel {} coverage sweep cursor could not be persisted: {detail}; the next tick \
+                 would restart at the head of {source_cf} and the sweep would never complete",
+                target.panel_name
+            ),
+        );
     }
-
-    if sweep_complete && target.anchors_stranded_on_superseded > 0 {
-        let mut probe = match ANCHOR_DEBT_PROBE.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *probe = Some(AnchorDebtProbe {
-            panel_version: target.panel_version,
-            source_cf: source_cf.clone(),
-            stranded_before: target.anchors_stranded_on_superseded,
-        });
-    }
+    let failed = cursor_persisted.is_err() || matches!(action, "page_failed" | "cursor_absent");
 
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     tracing::info!(
@@ -1834,28 +2648,134 @@ fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCover
         inserted,
         already_current,
         outcome_anchored,
+        anchors_carried,
         sweep_complete,
+        sweeps_completed,
         elapsed_ms,
-        "drove the unattended panel backfill toward the active generation"
+        "drove the unattended panel coverage backfill toward the active generation"
     );
 
+    publish_backfill_readback(&BackfillReadback {
+        action,
+        reason: Some(backfill_reason),
+        panel: Some(target.panel_name.clone()),
+        source_cf: Some(source_cf),
+        pages,
+        examined,
+        inserted,
+        already_current,
+        outcome_anchored,
+        anchors_carried,
+        sweep_complete: Some(sweep_complete),
+        elapsed_ms,
+        anchor,
+    });
+
+    // `page_failed`, `cursor_absent` and an unpersistable cursor are the exits
+    // that already called record_failure; report them so the tick is not also
+    // counted a success.
+    failed
+}
+
+/// The coverage sweep's published outcome, plus the anchor phase sharing its
+/// tick.
+struct BackfillReadback<'a> {
+    action: &'a str,
+    reason: Option<&'a str>,
+    panel: Option<String>,
+    source_cf: Option<String>,
+    pages: u64,
+    examined: u64,
+    inserted: u64,
+    already_current: u64,
+    outcome_anchored: u64,
+    anchors_carried: u64,
+    sweep_complete: Option<bool>,
+    elapsed_ms: u64,
+    anchor: &'a AnchorDebtPass,
+}
+
+impl<'a> BackfillReadback<'a> {
+    const fn empty(anchor: &'a AnchorDebtPass) -> Self {
+        Self {
+            action: "none_owed",
+            reason: None,
+            panel: None,
+            source_cf: None,
+            pages: 0,
+            examined: 0,
+            inserted: 0,
+            already_current: 0,
+            outcome_anchored: 0,
+            anchors_carried: 0,
+            sweep_complete: None,
+            elapsed_ms: 0,
+            anchor,
+        }
+    }
+}
+
+/// Publishes both phases through the one action field `health` already prints.
+///
+/// Compound rather than split, because this readback is where an operator sees
+/// what the maintainer did, and a single-phase string is how a tick that carried
+/// a thousand stranded anchors would still read as `budget_exhausted`.
+fn publish_backfill_readback(readback: &BackfillReadback<'_>) {
     let mut guard = match DERIVED_STATE_LAST.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.last_backfill_action = Some(action.to_owned());
-    guard.last_backfill_reason = Some(backfill_reason.to_owned());
-    guard.last_backfill_panel = Some(target.panel_name.clone());
-    guard.last_backfill_source_cf = Some(source_cf);
-    guard.last_backfill_pages = Some(pages);
-    guard.last_backfill_examined_rows = Some(examined);
-    guard.last_backfill_inserted_rows = Some(inserted);
-    guard.last_backfill_already_current_rows = Some(already_current);
-    guard.last_backfill_outcome_anchored_rows = Some(outcome_anchored);
-    guard.last_backfill_elapsed_ms = Some(elapsed_ms);
-    guard.last_backfill_sweep_complete = Some(sweep_complete);
+    let anchor = readback.anchor;
+    guard.last_backfill_action = Some(format!(
+        "anchor_debt={} coverage={}",
+        if anchor.identities_attempted == 0 {
+            "no_identities_attempted".to_owned()
+        } else {
+            format!(
+                "carried_{}_anchors_over_{}_identities",
+                anchor.anchors_carried, anchor.identities_attempted
+            )
+        },
+        readback.action,
+    ));
+    guard.last_backfill_reason = Some(format!(
+        "anchor_debt_quarantined={} coverage={}",
+        anchor.quarantined_total,
+        readback.reason.unwrap_or("none"),
+    ));
+    guard.last_backfill_panel.clone_from(&readback.panel);
+    guard
+        .last_backfill_source_cf
+        .clone_from(&readback.source_cf);
+    guard.last_backfill_pages = Some(readback.pages);
+    guard.last_backfill_examined_rows = Some(readback.examined);
+    // Both phases insert constellations: the sweep when it reaches an unmeasured
+    // row, the exact-identity repair when the stranded row is missing at the
+    // active generation entirely.
+    guard.last_backfill_inserted_rows =
+        Some(readback.inserted.saturating_add(anchor.inserted_rows));
+    guard.last_backfill_already_current_rows = Some(readback.already_current);
+    guard.last_backfill_outcome_anchored_rows = Some(readback.outcome_anchored);
+    guard.last_backfill_anchors_carried_forward = Some(
+        readback
+            .anchors_carried
+            .saturating_add(anchor.anchors_carried),
+    );
+    guard.last_backfill_elapsed_ms = Some(readback.elapsed_ms);
+    guard.last_backfill_sweep_complete = readback.sweep_complete;
+}
 
-    // `page_failed` and `cursor_absent` are the two exits that already called
-    // record_failure; report them so the tick is not also counted a success.
-    matches!(action, "page_failed" | "cursor_absent")
+/// Runs both panel repairs for one maintenance tick (#1927 ask 2, #1984, #2061).
+///
+/// Order and independence are both load-bearing. Anchor debt runs first because
+/// it is bounded by the debt rather than by the corpus, so it costs a small,
+/// predictable slice of the tick; coverage runs second with the remainder, and
+/// runs *whatever* the anchor phase did. An unrepairable anchor can no longer
+/// return before the coverage sweep is reached, which is the fault that stopped
+/// 208,496 rows of backfill for the life of a process.
+fn drive_panel_backfill(db: &Arc<Db>, report: &crate::panel_coverage::PanelCoverageReport) -> bool {
+    let started = std::time::Instant::now();
+    let anchor = drive_anchor_debt_repair(db, report, started);
+    let coverage_failed = drive_coverage_backfill(db, report, started, &anchor);
+    anchor.failed || coverage_failed
 }

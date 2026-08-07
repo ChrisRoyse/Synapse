@@ -83,6 +83,39 @@
 //! a count that cannot prove regenerability would be exactly the silent
 //! destruction the sacred/regenerable split exists to forbid.
 //!
+//! # Anchor debt is a work queue, not a scan (#1984)
+//!
+//! The census does not only *count* stranded anchors — it names them. Every
+//! stranded row is already identified here by `(source CF, source key, the
+//! superseded generation holding its anchors)`, and
+//! [`PanelCoverageRow::anchors_stranded_identities`] carries that list out
+//! instead of discarding it behind the count.
+//!
+//! The count alone forced the repair to be scan-shaped: "this panel owes 2,120
+//! anchors" says nothing about *which* rows, so the only available repair was to
+//! re-measure the entire source CF under a wall-clock budget and hope the
+//! stranded rows fell inside it. Measured on the deployed daemon 2026-08-06 that
+//! is what happened — 44 pages, 60,089 ms, `inserted_rows=0`, and the five panel
+//! debts unchanged, tick after tick. Work proportional to the corpus (939,605
+//! `Base` rows) cannot converge on a debt of 2,879 rows.
+//!
+//! The identity list is the same thing Postgres' visibility map is to VACUUM: a
+//! record of *where the work is*, so the repair pays for the debt rather than
+//! for the corpus. It is bounded by [`SYN_ANCHOR_DEBT_IDENTITY_CAP`] per panel
+//! and reports [`PanelCoverageRow::anchors_stranded_identities_truncated`] when
+//! it binds, because a silently shortened work queue would be a repair that
+//! reports completion having skipped rows.
+//!
+//! Two neighbouring populations are counted apart and never folded in, because
+//! each has the opposite remedy from actionable debt:
+//!
+//! * [`PanelCoverageRow::anchors_stranded_source_absent`] — the anchor's own
+//!   source row is gone, so no re-measure can rebuild the record it must be
+//!   written against. Sacred superseded history (#2021), never replay debt.
+//! * [`PanelCoverageRow::anchors_stranded_source_cf_unmeasured`] — the census
+//!   did not read that source CF at all, so nothing is known. Unknown is not
+//!   zero, and it is reported as its own number rather than as completion.
+//!
 //! # Fail-visible, not fail-quiet
 //!
 //! A panel version present in the `Base` CF that no catalog entry claims is
@@ -148,6 +181,44 @@ pub struct SupersededGeneration {
 /// this vault while leaving no room for a real backfill debt — the observed
 /// failure was 0.017, not 0.94.
 pub const SYN_PANEL_COVERAGE_FLOOR: f32 = 0.95;
+
+/// Exact stranded anchor identities enumerated per panel per census (#1984).
+///
+/// The census counts every stranded row; this bounds how many it *names*. The
+/// bound exists because the report is held in memory for a whole maintenance
+/// tick and read by `health`, not because a longer queue would be wrong — at
+/// ~80 bytes per hex identity, 4,096 caps one panel's queue at roughly 330 KB.
+///
+/// Sized against the measured debt rather than guessed: the deployed daemon's
+/// worst panel carried 2,120 stranded anchors and the whole vault carried 2,879,
+/// so this holds every real identity with headroom. When it does bind,
+/// [`PanelCoverageRow::anchors_stranded_identities_truncated`] says so and the
+/// repair refuses to call a pass complete — a truncated work queue that reported
+/// completion would be a repair claiming to have finished rows it never saw.
+pub const SYN_ANCHOR_DEBT_IDENTITY_CAP: usize = 4_096;
+
+/// One anchor stranded by a panel-version bump, named exactly (#1984).
+///
+/// All three components are load-bearing for the repair:
+///
+/// * `source_cf` + `source_key_hex` are the authoritative row the active
+///   generation must be re-measured from, which is the precondition Calyx puts
+///   on writing an anchor at all.
+/// * `superseded_panel_version` is the declared generation the anchors are
+///   carried *from*. A record id is a content address over `(input_bytes,
+///   panel_version, vault_salt)`, so the historical `cx_id` cannot be recomputed
+///   from the row's current bytes (#1981/#1982) — the lineage must be declared,
+///   not inferred.
+///
+/// Ordered so a work queue built from it is deterministic across ticks, which is
+/// what makes a resume cursor meaningful.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct StrandedAnchorIdentity {
+    pub source_cf: String,
+    pub source_key_hex: String,
+    /// The newest superseded generation that still holds this row's anchors.
+    pub superseded_panel_version: u32,
+}
 
 /// One panel's coverage and grounding row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -227,6 +298,33 @@ pub struct PanelCoverageRow {
     /// source row. Anchors whose TTL-managed source has expired remain sacred
     /// superseded history, but are not actionable backfill debt.
     pub anchors_stranded_on_superseded: usize,
+    /// The exact rows behind that count, as the repair's work queue (#1984).
+    ///
+    /// Bounded by [`SYN_ANCHOR_DEBT_IDENTITY_CAP`] and sorted, so a driver can
+    /// walk it with a resume cursor and make monotonic progress across ticks
+    /// instead of restarting a corpus-wide scan every time. Empty whenever
+    /// `anchors_stranded_on_superseded` is zero.
+    pub anchors_stranded_identities: Vec<StrandedAnchorIdentity>,
+    /// True when the enumeration above hit the cap, so it names fewer rows than
+    /// the count reports. Never silent: a repair that consumed a truncated queue
+    /// and called the pass complete would have skipped rows nothing recorded.
+    pub anchors_stranded_identities_truncated: bool,
+    /// Grounded superseded identities the active generation does not hold and
+    /// whose own source row is **gone** (#2021).
+    ///
+    /// Not debt and never repairable: an anchor is written against the
+    /// constellation of its source row, and no re-measure rebuilds a row that no
+    /// longer exists. Counting these as debt is what made an exhaustive sweep
+    /// report `backfill_owed=true` forever. Counted here so "irrecoverable" is a
+    /// reported number rather than the invisible difference between two other
+    /// numbers.
+    pub anchors_stranded_source_absent: usize,
+    /// Grounded superseded identities on a source CF the census did not read.
+    ///
+    /// Unknown, not zero. A missing CF census proves nothing about whether those
+    /// anchors are stranded, and manufacturing completion from an absent
+    /// measurement is the failure this whole readback exists to remove.
+    pub anchors_stranded_source_cf_unmeasured: usize,
     /// Grounded superseded records with no source identity. They cannot be
     /// compared across generations and are reported as unknown, never silently
     /// treated as either stranded or carried.
@@ -332,6 +430,39 @@ impl PanelCoverageRow {
     pub fn backfill_owed(&self) -> bool {
         (self.coverage_below_floor || self.anchors_stranded_on_superseded > 0)
             && self.backfill_source_cf.is_some()
+    }
+
+    /// True when this panel's active generation is short of its source CF and a
+    /// re-measure path exists (#1984).
+    ///
+    /// Split out from [`Self::backfill_owed`] because the two debts are repaired
+    /// by different mechanisms and must not share a scheduling slot: coverage
+    /// debt is repaired by a paged sweep whose cost is the corpus, anchor debt
+    /// by a work queue whose cost is the debt. Selecting one target for both is
+    /// what let three unrepairable outcome anchors deny 208,496 rows of coverage
+    /// backfill for the life of a process (#2061).
+    #[must_use]
+    pub const fn coverage_backfill_owed(&self) -> bool {
+        self.coverage_below_floor && self.backfill_source_cf.is_some()
+    }
+
+    /// True when this panel carries exact stranded anchors AND a path exists to
+    /// re-anchor them (#1984).
+    #[must_use]
+    pub const fn anchor_debt_owed(&self) -> bool {
+        self.anchors_stranded_on_superseded > 0 && self.backfill_source_cf.is_some()
+    }
+
+    /// True when this panel carries exact stranded anchors and **no** path
+    /// exists to re-anchor them.
+    ///
+    /// Reported rather than dropped. `syn-graphpos-app-v1` sat at 59 stranded
+    /// anchors with `backfill_source_cf: None` on the deployed daemon: nothing
+    /// can repair it, and reporting that as "nothing owed" is the silent-success
+    /// failure this whole readback exists to remove.
+    #[must_use]
+    pub const fn anchor_debt_unbackfillable(&self) -> bool {
+        self.anchors_stranded_on_superseded > 0 && self.backfill_source_cf.is_none()
     }
 
     /// Why the maintainer must sweep this panel. Coverage and anchor debt are
@@ -478,6 +609,25 @@ pub struct PanelCoverageReport {
     /// holding them, because the remedy — drive the backfill so the carry-
     /// forward runs — needs to know which generation to carry FROM.
     pub anchors_stranded_panels: Vec<String>,
+    /// Panels carrying stranded anchors that **no** re-measure path can repair
+    /// (#1984), named `panel@version` with the count and the generation holding
+    /// them.
+    ///
+    /// A strict subset of [`Self::anchors_stranded_panels`] and the half of it
+    /// the maintainer can do nothing about, so the two are never conflated: a
+    /// repair that reported "nothing owed" because the only owed panel was
+    /// unrepairable would be indistinguishable from a repair that had finished.
+    pub anchor_debt_unbackfillable_panels: Vec<String>,
+    /// Whole-vault stranded anchor total across every panel (#1984). The number
+    /// an unattended repair must drive to zero.
+    pub anchors_stranded_total: usize,
+    /// Stranded anchors whose own source row is gone, so no re-measure can put
+    /// the record back under them (#2021). Sacred history, never repair debt —
+    /// and reported so "irrecoverable" never has to be inferred.
+    pub anchors_stranded_source_absent_total: usize,
+    /// Stranded-anchor candidates on a source CF the census did not read.
+    /// Unknown, and reported as unknown rather than as zero.
+    pub anchors_stranded_source_cf_unmeasured_total: usize,
     /// Panels holding more constellations at the active generation than their
     /// source CF holds rows.
     ///
@@ -523,6 +673,56 @@ impl PanelCoverageReport {
                     u32::MAX - panel.panel_version,
                 )
             })
+    }
+
+    /// The panel most owed a **coverage** sweep, by absolute uncovered rows
+    /// (#1984, #2061).
+    ///
+    /// Anchor debt is deliberately not a tiebreak here. It was, and a panel with
+    /// three unrepairable anchors therefore outranked a panel with 174,993
+    /// uncovered rows on every tick — the maintainer selected the tiny debt,
+    /// refused it, and returned before the large one was ever considered. The
+    /// two debts now have separate schedulers, so this one answers only the
+    /// question it can act on: where does a page of sweeping remove the most
+    /// unmeasured rows.
+    #[must_use]
+    pub fn most_owed_coverage_backfill(&self) -> Option<&PanelCoverageRow> {
+        self.panels
+            .iter()
+            .filter(|panel| panel.coverage_backfill_owed())
+            .max_by_key(|panel| {
+                (
+                    panel.uncovered_rows().unwrap_or(0),
+                    u32::MAX - panel.panel_version,
+                )
+            })
+    }
+
+    /// Every panel owed an anchor-debt repair, largest debt first (#1984).
+    ///
+    /// A list rather than a single target on purpose. One target per tick is
+    /// what made an unrepairable head-of-queue item a denial of service for
+    /// every other panel (#2061, and #2030 before it with a different cause),
+    /// and identity-driven repair costs the debt rather than the corpus — so
+    /// every debt-bearing panel fits in one tick and none has to wait behind
+    /// another.
+    ///
+    /// Ties break on the lower panel version so the order is deterministic
+    /// across ticks, which is what makes a resume cursor meaningful.
+    #[must_use]
+    pub fn anchor_debt_targets(&self) -> Vec<&PanelCoverageRow> {
+        let mut targets: Vec<&PanelCoverageRow> = self
+            .panels
+            .iter()
+            .filter(|panel| panel.anchor_debt_owed())
+            .collect();
+        targets.sort_by_key(|panel| {
+            (
+                std::cmp::Reverse(panel.anchors_stranded_on_superseded),
+                panel.panel_version,
+            )
+        });
+        targets
     }
 
     /// One-line summary for a log or a health detail field.
@@ -639,6 +839,10 @@ pub fn build_panel_coverage_report(
     let mut grounding_deficient_panels = Vec::new();
     let mut no_outcome_axis_panels = Vec::new();
     let mut anchors_stranded_panels: Vec<String> = Vec::new();
+    let mut anchor_debt_unbackfillable_panels: Vec<String> = Vec::new();
+    let mut anchors_stranded_total = 0usize;
+    let mut anchors_stranded_source_absent_total = 0usize;
+    let mut anchors_stranded_source_cf_unmeasured_total = 0usize;
     let mut records_exceed_source_panels = Vec::new();
     let mut orphaned_source_missing_panels = Vec::new();
 
@@ -695,7 +899,14 @@ pub fn build_panel_coverage_report(
             .map(|row| &row.grounded_source_key_hexes)
             .cloned()
             .unwrap_or_default();
-        let mut superseded_grounded_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // #1984: the generation each key's anchors live on is retained, not just
+        // the key. The historical `cx_id` cannot be recomputed from a mutable
+        // row's current bytes (#1981/#1982), so a repair must be told which
+        // declared generation to carry FROM. `superseded_versions` is ordered
+        // newest-superseded first and `or_insert` keeps that first writer, so a
+        // key present on two closed generations names the newest one — the same
+        // choice the carry-forward's lineage index makes per anchor kind.
+        let mut superseded_grounded_keys: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
         let mut anchors_stranding_identity_unknown = 0usize;
         for version in entry.superseded_versions {
             let Some(row) = census.entry(*version) else {
@@ -704,10 +915,12 @@ pub fn build_panel_coverage_report(
             anchors_stranding_identity_unknown = anchors_stranding_identity_unknown
                 .saturating_add(row.grounded_unattributed_records);
             for (source_cf, keys) in &row.grounded_source_key_hexes {
-                superseded_grounded_keys
+                let by_key = superseded_grounded_keys
                     .entry(source_cf.clone())
-                    .or_default()
-                    .extend(keys.iter().cloned());
+                    .or_default();
+                for key in keys {
+                    by_key.entry(key.clone()).or_insert(*version);
+                }
             }
         }
         // #2021: an anchor can be replayed only while its source event exists.
@@ -720,25 +933,49 @@ pub fn build_panel_coverage_report(
         // A missing CF census proves nothing and therefore contributes no
         // actionable debt; the coverage/orphan readbacks remain unknown rather
         // than manufacturing completion from an absent measurement.
-        let anchors_stranded_on_superseded = if entry.carry_superseded_anchors {
-            superseded_grounded_keys
-                .iter()
-                .map(|(source_cf, keys)| {
-                    let active_keys = active_grounded_keys.get(source_cf);
-                    let Some(present_source_keys) = source_cf_keys.get(source_cf) else {
-                        return 0;
+        //
+        // #1984 keeps the surviving identities instead of counting them and
+        // dropping them. Three populations leave this loop, and each has a
+        // different remedy: repairable debt (named), irrecoverable history
+        // (counted), and unmeasured (counted, never treated as zero).
+        let mut anchors_stranded_identities: Vec<StrandedAnchorIdentity> = Vec::new();
+        let mut anchors_stranded_on_superseded = 0usize;
+        let mut anchors_stranded_source_absent = 0usize;
+        let mut anchors_stranded_source_cf_unmeasured = 0usize;
+        if entry.carry_superseded_anchors {
+            for (source_cf, keys) in &superseded_grounded_keys {
+                let active_keys = active_grounded_keys.get(source_cf);
+                let present_source_keys = source_cf_keys.get(source_cf);
+                for (key, superseded_panel_version) in keys {
+                    if active_keys.is_some_and(|active| active.contains(key)) {
+                        // Already carried: the active generation holds this
+                        // source identity grounded. Not debt.
+                        continue;
+                    }
+                    let Some(present_source_keys) = present_source_keys else {
+                        anchors_stranded_source_cf_unmeasured += 1;
+                        continue;
                     };
-                    keys.iter()
-                        .filter(|key| {
-                            present_source_keys.contains(*key)
-                                && active_keys.is_none_or(|active| !active.contains(*key))
-                        })
-                        .count()
-                })
-                .sum()
-        } else {
-            0
-        };
+                    if !present_source_keys.contains(key) {
+                        anchors_stranded_source_absent += 1;
+                        continue;
+                    }
+                    anchors_stranded_on_superseded += 1;
+                    if anchors_stranded_identities.len() < SYN_ANCHOR_DEBT_IDENTITY_CAP {
+                        anchors_stranded_identities.push(StrandedAnchorIdentity {
+                            source_cf: source_cf.clone(),
+                            source_key_hex: key.clone(),
+                            superseded_panel_version: *superseded_panel_version,
+                        });
+                    }
+                }
+            }
+        }
+        let anchors_stranded_identities_truncated =
+            anchors_stranded_on_superseded > anchors_stranded_identities.len();
+        anchors_stranded_total += anchors_stranded_on_superseded;
+        anchors_stranded_source_absent_total += anchors_stranded_source_absent;
+        anchors_stranded_source_cf_unmeasured_total += anchors_stranded_source_cf_unmeasured;
         if anchors_stranded_on_superseded > 0 {
             let from = superseded_versions_present
                 .iter()
@@ -760,6 +997,19 @@ pub fn build_panel_coverage_report(
                 from,
                 superseded_grounded_records,
             ));
+            // #1984: the half of the stranded set nothing can repair is named
+            // here, every tick, rather than only in the branch that runs when no
+            // panel at all is owed. `syn-graphpos-app-v1` carried 59 stranded
+            // anchors with no re-measure path while four repairable panels kept
+            // that branch from ever being reached.
+            if entry.backfill_source_cf.is_none() {
+                anchor_debt_unbackfillable_panels.push(format!(
+                    "{}@{} ({anchors_stranded_on_superseded} anchored record(s) stranded on \
+                     generation(s) {from}; no backfill_source_cf, so no re-measure can re-anchor \
+                     them)",
+                    entry.panel_name, entry.panel_version,
+                ));
+            }
         }
         for generation in &superseded_versions_present {
             if !generation.closed && generation.records > 0 {
@@ -919,6 +1169,10 @@ pub fn build_panel_coverage_report(
             superseded_versions_present,
             superseded_grounded_records,
             anchors_stranded_on_superseded,
+            anchors_stranded_identities,
+            anchors_stranded_identities_truncated,
+            anchors_stranded_source_absent,
+            anchors_stranded_source_cf_unmeasured,
             anchors_stranding_identity_unknown,
             superseded_reclaim_candidates,
             orphaned_records,
@@ -982,6 +1236,10 @@ pub fn build_panel_coverage_report(
         grounding_deficient_panels,
         no_outcome_axis_panels,
         anchors_stranded_panels,
+        anchor_debt_unbackfillable_panels,
+        anchors_stranded_total,
+        anchors_stranded_source_absent_total,
+        anchors_stranded_source_cf_unmeasured_total,
         records_exceed_source_panels,
         measured_at_unix_ms: census.measured_at_unix_ms,
     }

@@ -1190,10 +1190,76 @@ pub struct StoragePanelCoverageResponse {
     /// is a different fault from never having been anchored and has a different
     /// remedy (drive the backfill so the carry-forward runs).
     pub anchors_stranded_panels: Vec<String>,
+    /// **#1984.** The subset of `anchors_stranded_panels` no re-measure path can
+    /// repair. Named every census, not only when nothing else is owed: a
+    /// stranded panel the maintainer cannot fix must never be reported through
+    /// the same silence as a panel with nothing owed.
+    pub anchor_debt_unbackfillable_panels: Vec<String>,
+    /// Stranded anchors across every panel — the number an unattended repair
+    /// must drive to zero (#1984).
+    pub anchors_stranded_total: u64,
+    /// Stranded-anchor candidates whose own source row is gone, so no
+    /// re-measure can put a record back under them (#2021). Sacred history,
+    /// never repair debt.
+    pub anchors_stranded_source_absent_total: u64,
+    /// Stranded-anchor candidates on a source CF the census did not read.
+    /// Unknown, and reported as unknown rather than as zero.
+    pub anchors_stranded_source_cf_unmeasured_total: u64,
+    /// What the unattended maintainer's last tick did about anchor debt
+    /// (#1984, #2061), read from the derived-state readback rather than
+    /// measured here.
+    ///
+    /// Reported beside the census on purpose: the census says how much debt
+    /// exists and this says what was done about it, and FSV needs both readings
+    /// from one call to tell "converging" from "stalled".
+    pub anchor_debt_repair: StorageAnchorDebtRepair,
     /// Panels whose constellations outlive their TTL-expiring source rows.
     pub records_exceed_source_panels: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at_unix_ms: Option<u64>,
+}
+
+/// The last unattended anchor-debt repair tick, as published by the maintainer
+/// (#1984, #2061).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageAnchorDebtRepair {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<String>,
+    /// Exact stranded identities the last tick drove through the re-anchor path.
+    /// Zero while debt is non-zero means every remaining identity is
+    /// quarantined or unbackfillable — never that the debt was cleared.
+    pub identities_attempted: u64,
+    /// Identities whose declared lineage actually carried at least one anchor.
+    /// **The progress meter for anchor debt**: coverage debt is measured in rows
+    /// inserted, anchor debt in anchors carried, and reading one by the other is
+    /// how a 60-second pass that carried nothing read as a pass with nothing to
+    /// carry.
+    pub identities_carried: u64,
+    pub anchors_carried: u64,
+    /// Constellations the exact-identity repair had to materialize because the
+    /// active generation did not hold the stranded row at all.
+    pub inserted_rows: u64,
+    /// One line per debt-bearing panel — every panel, every tick, including its
+    /// queue position. One target per tick is what let three unrepairable
+    /// anchors deny every other panel's backfill (#2061).
+    pub panels: Vec<String>,
+    /// Panels whose whole enumerated identity queue was attempted this tick, so
+    /// the next census measures a complete repair attempt.
+    pub passes_completed: Vec<String>,
+    /// Exact identities proven unrepairable, named in full with the reason an
+    /// attempt against that row established. Quarantined per identity, so they
+    /// can never starve a panel or a tick.
+    pub quarantined_identities: Vec<String>,
+    pub quarantined_total: u64,
+    pub unbackfillable_panels: Vec<String>,
+    /// Measured cost of one exact-identity repair. Published rather than
+    /// assumed, because it is the number that says whether the repair is still
+    /// debt-proportional or has quietly become corpus-proportional again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms_per_identity: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }
 
 /// One superseded panel generation in the `panel_coverage` payload (#1927 ask 3).
@@ -1262,6 +1328,30 @@ pub struct StoragePanelCoverageRow {
     /// Grounded records the superseded generation holds that the active one does
     /// not: anchors orphaned by the version bump (#1980).
     pub anchors_stranded_on_superseded: u64,
+    /// How many of those the census **named**, as the repair's work queue
+    /// (#1984). Equal to `anchors_stranded_on_superseded` unless the enumeration
+    /// hit its cap.
+    pub anchors_stranded_identities_enumerated: u64,
+    /// True when it did hit the cap, so the queue names fewer rows than the
+    /// count. Never silent: no pass over a truncated queue is called complete.
+    pub anchors_stranded_identities_truncated: bool,
+    /// A bounded sample of the exact identities, as
+    /// `source_cf/source_key_hex@from_generation`. The full queue is the
+    /// maintainer's, not this payload's — this is here so an operator can take a
+    /// single identity to `hygiene` or a Base probe without guessing one.
+    pub anchors_stranded_identity_sample: Vec<String>,
+    /// Stranded-anchor candidates whose own source row is gone (#2021). Not debt
+    /// and not repairable: an anchor is written against the constellation of its
+    /// source row, and no re-measure rebuilds a row that no longer exists.
+    pub anchors_stranded_source_absent: u64,
+    /// Stranded-anchor candidates on a source CF the census did not read.
+    /// Unknown, never counted as zero.
+    pub anchors_stranded_source_cf_unmeasured: u64,
+    /// True when this panel has stranded anchors AND a path to re-anchor them.
+    pub anchor_debt_owed: bool,
+    /// True when it has stranded anchors and **no** such path — nothing the
+    /// maintainer runs can repair this panel, and saying so is the point.
+    pub anchor_debt_unbackfillable: bool,
     pub anchors_stranding_identity_unknown: u64,
     /// UPPER BOUND on superseded records this panel could reclaim: ungrounded,
     /// on a closed generation, with a re-measure path, and with the active
@@ -3137,6 +3227,26 @@ pub fn inspect_panel_coverage(
                 .collect(),
             superseded_grounded_records: panel.superseded_grounded_records as u64,
             anchors_stranded_on_superseded: panel.anchors_stranded_on_superseded as u64,
+            anchors_stranded_identities_enumerated: panel.anchors_stranded_identities.len() as u64,
+            anchors_stranded_identities_truncated: panel.anchors_stranded_identities_truncated,
+            anchors_stranded_identity_sample: panel
+                .anchors_stranded_identities
+                .iter()
+                .take(ANCHOR_DEBT_IDENTITY_SAMPLE)
+                .map(|identity| {
+                    format!(
+                        "{}/{}@{}",
+                        identity.source_cf,
+                        identity.source_key_hex,
+                        identity.superseded_panel_version
+                    )
+                })
+                .collect(),
+            anchors_stranded_source_absent: panel.anchors_stranded_source_absent as u64,
+            anchors_stranded_source_cf_unmeasured: panel.anchors_stranded_source_cf_unmeasured
+                as u64,
+            anchor_debt_owed: panel.anchor_debt_owed(),
+            anchor_debt_unbackfillable: panel.anchor_debt_unbackfillable(),
             anchors_stranding_identity_unknown: panel.anchors_stranding_identity_unknown as u64,
             superseded_reclaim_candidates: panel.superseded_reclaim_candidates as u64,
             orphaned_records: panel.orphaned_records as u64,
@@ -3191,9 +3301,64 @@ pub fn inspect_panel_coverage(
         grounding_deficient_panels: report.grounding_deficient_panels.clone(),
         no_outcome_axis_panels: report.no_outcome_axis_panels.clone(),
         anchors_stranded_panels: report.anchors_stranded_panels.clone(),
+        anchor_debt_unbackfillable_panels: report.anchor_debt_unbackfillable_panels.clone(),
+        anchors_stranded_total: report.anchors_stranded_total as u64,
+        anchors_stranded_source_absent_total: report.anchors_stranded_source_absent_total as u64,
+        anchors_stranded_source_cf_unmeasured_total: report
+            .anchors_stranded_source_cf_unmeasured_total
+            as u64,
+        anchor_debt_repair: anchor_debt_repair_readback(),
         records_exceed_source_panels: report.records_exceed_source_panels.clone(),
         measured_at_unix_ms: report.measured_at_unix_ms,
     })
+}
+
+/// Exact stranded identities named per panel in the `panel_coverage` payload.
+///
+/// A sample, and reported as one: the full work queue can hold thousands of
+/// entries and belongs to the maintainer, not to a response an operator reads.
+/// `anchors_stranded_identities_enumerated` carries the true length beside it,
+/// so a reader never has to infer the queue's size from the sample's.
+const ANCHOR_DEBT_IDENTITY_SAMPLE: usize = 8;
+
+/// Identities named in the repair block before it truncates.
+const ANCHOR_DEBT_QUARANTINE_SAMPLE: usize = 32;
+
+/// Reads what the unattended maintainer's last tick did about anchor debt.
+///
+/// Read from the published readback rather than measured: this call already
+/// pays for a whole-`Base` census, and the repair's own counters are the
+/// maintainer's measurement of its own work, not something a reader should
+/// re-derive.
+fn anchor_debt_repair_readback() -> StorageAnchorDebtRepair {
+    let readback = synapse_storage::derived_state::derived_state_readback();
+    let quarantined_total = readback.last_anchor_debt_quarantined_total;
+    let mut quarantined_identities: Vec<String> = readback
+        .last_anchor_debt_quarantined
+        .iter()
+        .take(ANCHOR_DEBT_QUARANTINE_SAMPLE)
+        .cloned()
+        .collect();
+    if readback.last_anchor_debt_quarantined.len() > quarantined_identities.len() {
+        quarantined_identities.push(format!(
+            "... {} further quarantined identities not listed here",
+            readback.last_anchor_debt_quarantined.len() - quarantined_identities.len()
+        ));
+    }
+    StorageAnchorDebtRepair {
+        action: readback.last_anchor_debt_action,
+        identities_attempted: readback.last_anchor_debt_identities_attempted,
+        identities_carried: readback.last_anchor_debt_identities_carried,
+        anchors_carried: readback.last_anchor_debt_anchors_carried,
+        inserted_rows: readback.last_anchor_debt_inserted_rows,
+        panels: readback.last_anchor_debt_panels,
+        passes_completed: readback.last_anchor_debt_passes_completed,
+        quarantined_identities,
+        quarantined_total,
+        unbackfillable_panels: readback.last_anchor_debt_unbackfillable_panels,
+        ms_per_identity: readback.last_anchor_debt_ms_per_identity,
+        elapsed_ms: readback.last_anchor_debt_elapsed_ms,
+    }
 }
 
 pub fn inspect_corpus_histogram(
