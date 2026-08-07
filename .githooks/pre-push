@@ -51,18 +51,147 @@ set -e
 # that changes one of them while touching no Rust at all is exactly the push that
 # most needs checking.
 needs_gate=0
-while read -r _local_ref local_sha _remote_ref remote_sha; do
+zero_oid=0000000000000000000000000000000000000000
+
+# `git push` hands the hook the destination remote's name — or, for a push to a
+# bare URL, that URL — as $1. It is the only handle the hook has on where the
+# advertised remote OIDs came from, so it is what the targeted fetch below asks.
+push_remote=${1:-origin}
+fetch_log=""
+remote_reachable=0
+
+# The empty tree is the correct diff base for a ref the remote does not have yet.
+# `git rev-list --max-parents=0 | tail -1` (what this used to use) names the ROOT
+# COMMIT instead, so `root..local` silently hid every path introduced by the root
+# commit itself, and it picked an arbitrary root when history has more than one.
+empty_tree=$(git hash-object -t tree /dev/null)
+
+# ---------------------------------------------------------------------------
+# Make the advertised remote OID locally inspectable (#2043, #2047)
+# ---------------------------------------------------------------------------
+#
+# git advertises the remote's CURRENT tip on stdin — not the tip this clone's
+# refs/remotes/... last saw. When origin/main advances between our last fetch and
+# this push (a concurrent push, or just a long local build), that OID is simply
+# not in this clone's object database and `git diff <remote>..<local>` dies with
+# "Invalid revision range". The hook then blamed itself — "failed to inspect
+# pushed range" — and blocked, hiding the real story: origin moved, and the push
+# is a non-fast-forward git was about to reject anyway.
+#
+# So: probe first, fetch the exact object second, and only then decide.
+#   * `git cat-file -e <oid>^{commit}` is the cheap existence probe. No network,
+#     and it does not care whether any ref points at the object.
+#   * `git fetch <remote> <oid>` asks for that one object by name. A server only
+#     answers if it sets uploadpack.allowReachableSHA1InWant (or
+#     allowAnySHA1InWant) — GitHub does, many self-hosted remotes do not — which
+#     is why fetching the branch ref that advertised the OID is tried as well.
+#     Neither form names a local destination ref, so neither can move a local
+#     branch: the objects land in FETCH_HEAD plus whatever remote-tracking refs
+#     the remote's configured refspec already covers.
+#   * The fetch reads from /dev/null because this runs inside a `while read`
+#     loop over the hook's stdin; a child that touched stdin would eat the
+#     remaining ref lines.
+#   * GIT_TERMINAL_PROMPT=0 stops a credential prompt from hanging a push behind
+#     a hook the operator cannot see. If auth is what is missing, the classified
+#     error below names the command to run by hand.
+#
+# This adds no bypass: if the object still cannot be obtained, the gate stays
+# closed — it just says what actually happened and how to fix it.
+have_commit() {
+  git cat-file -e "$1^{commit}" 2>/dev/null
+}
+
+try_fetch() {
+  _out=$(GIT_TERMINAL_PROMPT=0 git fetch --quiet --no-tags "$push_remote" "$1" </dev/null 2>&1) && _rc=0 || _rc=$?
+  if [ "$_rc" -eq 0 ]; then
+    remote_reachable=1
+  fi
+  fetch_log="$fetch_log
+            \$ git fetch --no-tags $push_remote $1   [exit $_rc]"
+  if [ -n "$_out" ]; then
+    fetch_log="$fetch_log
+              $_out"
+  fi
+  return "$_rc"
+}
+
+ensure_remote_commit() {
+  _oid=$1
+  _ref=$2
+  if have_commit "$_oid"; then
+    return 0
+  fi
+  fetch_log=""
+  remote_reachable=0
+  echo "pre-push: advertised remote tip $_oid is not in this clone yet — fetching that object."
+  if try_fetch "$_oid" && have_commit "$_oid"; then
+    echo "pre-push: fetched $_oid by object id; range inspection can proceed."
+    return 0
+  fi
+  case "$_ref" in
+    refs/*)
+      if try_fetch "$_ref" && have_commit "$_oid"; then
+        echo "pre-push: fetched $_ref from $push_remote; range inspection can proceed."
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+while read -r _local_ref local_sha remote_ref remote_sha; do
   # Deleted branch (local_sha all zeros) — nothing to check.
   case "$local_sha" in *[!0]*) : ;; *) continue ;; esac
-  if [ "$remote_sha" = "0000000000000000000000000000000000000000" ] || [ -z "$remote_sha" ]; then
-    diff_base=$(git rev-list --max-parents=0 "$local_sha" | tail -1)
-    range="$diff_base..$local_sha"
+  if [ "$remote_sha" = "$zero_oid" ] || [ -z "$remote_sha" ]; then
+    # New ref on the remote: there is no remote side to diff against, so diff
+    # against the empty tree and treat every path on the branch as pushed.
+    range="$empty_tree..$local_sha"
   else
+    if ! ensure_remote_commit "$remote_sha" "$remote_ref"; then
+      remote_branch=${remote_ref#refs/heads/}
+      echo "pre-push: BLOCKED — the remote tip $remote_sha advertised for $remote_ref is not"
+      echo "          in this clone and could not be fetched, so the pushed range cannot be read."
+      if [ "$remote_reachable" -eq 1 ]; then
+        echo "pre-push: classification — $push_remote ANSWERED, but that object is not reachable"
+        echo "          from $remote_ref there either. The advertisement is stale: $remote_branch moved"
+        echo "          again between the ref advertisement and this fetch, or the remote refuses"
+        echo "          unadvertised-object requests (uploadpack.allowReachableSHA1InWant is off)."
+      else
+        echo "pre-push: classification — $push_remote could not be reached at all (network, auth or"
+        echo "          credential-helper failure; this hook never prompts, so a prompt-only"
+        echo "          credential setup lands here). The remote tip therefore stays uninspectable."
+      fi
+      echo "          Either way the push is a NON-FAST-FORWARD relative to the tip git advertised,"
+      echo "          which the remote would reject even if the gates passed. The gate stays closed:"
+      echo "          it will not approve a range it was unable to inspect."
+      echo "pre-push: fetch attempts:$fetch_log"
+      echo "pre-push: remediation — run these, then push again:"
+      echo "            git fetch $push_remote $remote_branch"
+      if git remote | grep -qx -- "$push_remote"; then
+        # A named remote has a remote-tracking ref to integrate against.
+        echo "            git rebase $push_remote/$remote_branch      # or: git merge $push_remote/$remote_branch"
+      else
+        # Pushed to a bare URL: no remote-tracking ref exists, so use FETCH_HEAD.
+        echo "            git rebase FETCH_HEAD      # pushed to a URL, so there is no tracking ref"
+      fi
+      echo "            git push"
+      echo "          Do NOT reach for --no-verify: it skips lint, cargo deny and the lock-graph"
+      echo "          gate as well (#1929/#1930), and it will not make the non-fast-forward land."
+      exit 1
+    fi
+    if ! git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
+      echo "pre-push: NOTE — $remote_ref on $push_remote is at $remote_sha, which is not an"
+      echo "          ancestor of the commit being pushed. Unless you are force-pushing, git will"
+      echo "          reject this as a non-fast-forward once the gates finish. Integrate first:"
+      echo "            git pull --rebase $push_remote ${remote_ref#refs/heads/}"
+    fi
     range="$remote_sha..$local_sha"
   fi
 
   if ! changed_paths=$(git diff --name-only "$range"); then
     echo "pre-push: BLOCKED — failed to inspect pushed range '$range' for changed paths."
+    echo "          Both endpoints are present locally, so this is not the moved-tip case"
+    echo "          (#2043/#2047); the git error above is the real one. Fix it and re-push."
     exit 1
   fi
 
