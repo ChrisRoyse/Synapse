@@ -22,20 +22,21 @@ use super::{
     BrowserWaitForUrlParams, BrowserWaitForUrlResponse, BrowserWaitParams, BrowserWaitResponse,
     CaptureGifParams, CaptureScreenshotFormat, CaptureScreenshotParams, CaptureScreenshotResponse,
     CdpActivateTabParams, CdpActivateTabResponse, CdpActiveElementInfo, CdpBridgeHostReadback,
-    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse, CdpCloseTabParams,
-    CdpCloseTabResponse, CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams,
-    CdpNavigateTabResponse, CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo,
-    CdpPageVitalsInfo, CdpTargetInfoParams, CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage,
-    ElementInspection, ErrorData, FindParams, FindResponse, Health, HealthParams,
-    HiddenDesktopPipFrameParams, HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json,
-    ObserveParams, Parameters, ReadTextParams, ScreenshotOperation, ScreenshotParams,
-    ScreenshotResponse, SessionTarget, SetCaptureTargetParams, SetCaptureTargetResponse,
-    SetPerceptionModeParams, SetPerceptionModeResponse, SetTargetParam, SetTargetParams,
-    SynapseService, TargetResponse, TargetWire, WindowListEntry, WindowListParams,
-    WindowListResponse, empty_input_schema, mcp_error, observe_include, populate_audio_summary,
-    populate_clipboard_summary, populate_detection_from_state, populate_fs_recent,
-    read_text_request_uncached, resolve_read_text_request, set_capture_target_in_state,
-    set_perception_mode_in_state, set_target_input_schema, tool, tool_router,
+    CdpBridgeReloadAckReadback, CdpBridgeReloadParams, CdpBridgeReloadResponse,
+    CdpCloseAcknowledgementFailure, CdpCloseTabParams, CdpCloseTabResponse,
+    CdpLargestContentfulPaintInfo, CdpNavigateAction, CdpNavigateTabParams, CdpNavigateTabResponse,
+    CdpOpenTabParams, CdpOpenTabResponse, CdpPageTextInfo, CdpPageVitalsInfo, CdpTargetInfoParams,
+    CdpTargetInfoResponse, CdpTargetOwner, ConsoleMessage, ElementInspection, ErrorData,
+    FindParams, FindResponse, Health, HealthParams, HiddenDesktopPipFrameParams,
+    HiddenDesktopPipFrameResponse, HiddenDesktopPipStreamStatus, Json, ObserveParams, Parameters,
+    ReadTextParams, ScreenshotOperation, ScreenshotParams, ScreenshotResponse, SessionTarget,
+    SetCaptureTargetParams, SetCaptureTargetResponse, SetPerceptionModeParams,
+    SetPerceptionModeResponse, SetTargetParam, SetTargetParams, SynapseService, TargetResponse,
+    TargetWire, WindowListEntry, WindowListParams, WindowListResponse, empty_input_schema,
+    mcp_error, observe_include, populate_audio_summary, populate_clipboard_summary,
+    populate_detection_from_state, populate_fs_recent, read_text_request_uncached,
+    resolve_read_text_request, set_capture_target_in_state, set_perception_mode_in_state,
+    set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
@@ -7162,6 +7163,7 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
+                    close_acknowledgement_failure: None,
                 });
                 Ok(response)
             }
@@ -7350,6 +7352,7 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: None,
                     closed: false,
+                    close_acknowledgement_failure: None,
                 };
                 Ok(browser_tabs_exact_mutation_response(
                     session_id,
@@ -7409,6 +7412,7 @@ impl SynapseService {
                     opened_cdp_target_id: Some(opened.cdp_target_id.clone()),
                     closed_cdp_target_id: None,
                     closed: false,
+                    close_acknowledgement_failure: None,
                 };
                 Ok(browser_tabs_exact_mutation_response(
                     session_id,
@@ -7482,6 +7486,10 @@ impl SynapseService {
                     opened_cdp_target_id: None,
                     closed_cdp_target_id: Some(target_id),
                     closed: closed.closed,
+                    // #2032: surface a lost/failed closeTab acknowledgement as a
+                    // typed non-fatal detail. `closed` above is the chrome.tabs
+                    // verdict; this names what went wrong on the way back.
+                    close_acknowledgement_failure: closed.close_acknowledgement_failure,
                 };
                 Ok(browser_tabs_exact_mutation_response(
                     session_id,
@@ -11213,16 +11221,115 @@ impl SynapseService {
                         target_count_after: listed.target_count,
                         previous,
                         current,
+                        // The extension DID acknowledge this command: it
+                        // reported the target already absent before touching
+                        // any tab. Nothing about the acknowledgement failed.
+                        close_acknowledgement_failure: None,
                     });
                 }
                 Err(error) => {
-                    return Err(mcp_error(
-                        error.code(),
-                        format!(
-                            "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}",
-                            error.detail()
-                        ),
-                    ));
+                    // #2032: the close verdict is the PHYSICAL outcome, and the
+                    // Source of Truth for that is chrome.tabs — never the
+                    // arrival of the bridge acknowledgement. The extension runs
+                    // chrome.tabs.remove before any awaited readback, so a
+                    // delivered-but-unacknowledged closeTab (caller timeout,
+                    // transport loss, or the extension's own absence-readback
+                    // timing out after the remove already landed) can leave the
+                    // tab physically closed while the daemon sees only an
+                    // error. Adjudicate against chrome.tabs.query first, then
+                    // decide; the acknowledgement failure is reported either
+                    // way, never swallowed.
+                    let listed = crate::chrome_debugger_bridge::list_tabs(
+                            owner.window_hwnd,
+                            owner.chrome_window_id,
+                            None,
+                            None,
+                        )
+                        .await
+                        .map_err(|readback_error| {
+                            mcp_error(
+                                error.code(),
+                                format!(
+                                    "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}; the independent chrome.tabs.query adjudication readback for target {cdp_target_id:?} also failed, so the physical close is UNPROVEN and persisted owner row {owner_key:?} is left visible for retry: readback_error={}",
+                                    error.detail(),
+                                    readback_error.detail()
+                                ),
+                            )
+                        })?;
+                    if listed
+                        .tabs
+                        .iter()
+                        .any(|tab| tab.target_id.eq_ignore_ascii_case(cdp_target_id))
+                    {
+                        return Err(mcp_error(
+                            error.code(),
+                            format!(
+                                "cdp_close_tab Chrome debugger chrome.tabs.remove/readback failed: {}; the independent chrome.tabs.query adjudication readback still returns target {cdp_target_id:?} in window {:#x}, so the tab is still open; leaving persisted owner row {owner_key:?} visible for retry",
+                                error.detail(),
+                                owner.window_hwnd
+                            ),
+                        ));
+                    }
+                    let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
+                        "cdp_close_tab_after_bridge_unacknowledged_absence_readback",
+                    )
+                    .err();
+                    let reconciliation = self.reconcile_closed_cdp_target_ledgers(
+                        session_id,
+                        owner_key,
+                        owner.window_hwnd,
+                        cdp_target_id,
+                    );
+                    let (previous, current, claim_released) = match reconciliation {
+                        Ok(readback) => readback,
+                        Err(reconciliation_error) => {
+                            if let Some(panic_error) = panic_error {
+                                return Err(operator_panic_rollback_failed(
+                                    "cdp_close_tab_after_bridge_unacknowledged_absence_readback",
+                                    panic_error,
+                                    reconciliation_error.message.to_string(),
+                                ));
+                            }
+                            return Err(reconciliation_error);
+                        }
+                    };
+                    if let Some(panic_error) = panic_error {
+                        return Err(panic_error);
+                    }
+                    tracing::error!(
+                        code = "CDP_BACKGROUND_TAB_CLOSED_WITHOUT_BRIDGE_ACKNOWLEDGEMENT",
+                        session_id = %session_id,
+                        hwnd = owner.window_hwnd,
+                        endpoint = %owner.endpoint,
+                        cdp_target_id = %cdp_target_id,
+                        cdp_owner_key = %owner_key,
+                        requested_url = %owner.requested_url,
+                        target_url = %owner.target_url,
+                        owner_created_at_unix_ms = owner.created_at_unix_ms,
+                        target_count_after = listed.target_count,
+                        target_claim_released = claim_released,
+                        close_error_code = %error.code(),
+                        close_error = %error.detail(),
+                        "readback=chrome.tabs.query outcome=target_absent_without_close_acknowledgement"
+                    );
+                    return Ok(CdpCloseTabResponse {
+                        session_id: session_id.to_owned(),
+                        window_hwnd: owner.window_hwnd,
+                        endpoint: owner.endpoint,
+                        cdp_target_id: cdp_target_id.to_owned(),
+                        closed: true,
+                        target_count_before: listed.target_count,
+                        target_count_after: listed.target_count,
+                        previous,
+                        current,
+                        close_acknowledgement_failure: Some(CdpCloseAcknowledgementFailure {
+                            code: error.code().to_owned(),
+                            detail: error.detail().to_owned(),
+                            absence_readback: "chrome.tabs.query via normal Synapse Chrome bridge"
+                                .to_owned(),
+                            target_count_before_unobserved: true,
+                        }),
+                    });
                 }
             };
             let panic_error = super::operator_panic_boundary::ensure_mcp_mutation(
@@ -11277,6 +11384,7 @@ impl SynapseService {
                 target_count_after: closed.target_count_after,
                 previous,
                 current,
+                close_acknowledgement_failure: None,
             });
         }
 
@@ -11340,6 +11448,9 @@ impl SynapseService {
             target_count_after: closed.target_count_after,
             previous,
             current,
+            // Raw-CDP lane: Target.closeTarget already carries its own
+            // present/absent readback, so a failure there is a real failure.
+            close_acknowledgement_failure: None,
         })
     }
 

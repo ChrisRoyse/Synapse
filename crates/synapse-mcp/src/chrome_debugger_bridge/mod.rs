@@ -6927,7 +6927,7 @@ impl ChromeDebuggerBridge {
                             startup_readback = %after
                                 .extension_startup_readback
                                 .as_ref()
-                                .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+                                .map_or_else(|| "missing".to_owned(), ToString::to_string),
                             "replacement Chrome bridge host published healthy durable mutation-gate startup evidence"
                         );
                         return Ok(ChromeBridgeReloadResult {

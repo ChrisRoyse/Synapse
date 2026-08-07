@@ -1257,6 +1257,33 @@ pub struct CdpCloseTabParams {
     pub cdp_target_id: String,
 }
 
+/// Non-fatal detail for a close whose PHYSICAL outcome was proven by an
+/// independent `chrome.tabs.query` readback because the Chrome bridge never
+/// returned a terminal acknowledgement for the `closeTab` command itself
+/// (#2032).
+///
+/// The extension issues `chrome.tabs.remove` before any awaited readback, so a
+/// delivered-but-unacknowledged `closeTab` (caller timeout, transport loss, or
+/// an in-extension absence-readback timeout) can have physically closed the
+/// tab. When that happens the verdict must come from `chrome.tabs` — the Source
+/// of Truth — and the lost acknowledgement must still be reported here, loudly
+/// and exactly, never swallowed and never turned into "close failed".
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpCloseAcknowledgementFailure {
+    /// Exact bridge error code for the failed/lost `closeTab` acknowledgement
+    /// (e.g. `A11Y_CDP_EXTENSION_TIMEOUT`).
+    pub code: String,
+    /// Exact bridge error detail for the failed/lost acknowledgement.
+    pub detail: String,
+    /// The independent readback that proved the physical outcome instead.
+    pub absence_readback: String,
+    /// True when `target_count_before` is NOT an observed value: the
+    /// acknowledgement that would have carried it never arrived, so the field
+    /// repeats the post-close count rather than a measured pre-close count.
+    pub target_count_before_unobserved: bool,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CdpCloseTabResponse {
@@ -1264,6 +1291,9 @@ pub struct CdpCloseTabResponse {
     pub window_hwnd: i64,
     pub endpoint: String,
     pub cdp_target_id: String,
+    /// True when this call issued `closeTab` for the exact target AND an
+    /// independent `chrome.tabs` readback shows the target absent afterwards.
+    /// Derived from the Source of Truth, never from the bridge acknowledgement.
     pub closed: bool,
     pub target_count_before: u32,
     pub target_count_after: u32,
@@ -1271,6 +1301,11 @@ pub struct CdpCloseTabResponse {
     pub previous: Option<TargetWire>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current: Option<TargetWire>,
+    /// Present only when `closed` was decided by the independent
+    /// `chrome.tabs.query` readback because the `closeTab` acknowledgement
+    /// failed or never arrived (#2032).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_acknowledgement_failure: Option<CdpCloseAcknowledgementFailure>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -1434,6 +1469,11 @@ pub struct BrowserTabsMutation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub closed_cdp_target_id: Option<String>,
     pub closed: bool,
+    /// Present only for `operation=close` when `closed` was decided by the
+    /// independent `chrome.tabs.query` readback because the `closeTab`
+    /// acknowledgement failed or never arrived (#2032).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_acknowledgement_failure: Option<CdpCloseAcknowledgementFailure>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
