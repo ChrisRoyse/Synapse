@@ -3117,7 +3117,9 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
 function Get-SynapseChromeDaemonBridgeHealth {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$BearerToken
+        [string]$BearerToken,
+        [ValidateRange(1, 60)]
+        [int]$TimeoutSec = 5
     )
 
     try {
@@ -3125,7 +3127,7 @@ function Get-SynapseChromeDaemonBridgeHealth {
             -Uri 'http://127.0.0.1:7700/health' `
             -Method Get `
             -Headers @{ Authorization = "Bearer $BearerToken" } `
-            -TimeoutSec 5 `
+            -TimeoutSec $TimeoutSec `
             -ErrorAction Stop
         $subsystem = $health.subsystems.chrome_bridge
         if (-not $subsystem) {
@@ -3163,6 +3165,7 @@ function Get-SynapseChromeDaemonBridgeHealth {
             extension_build_id = $buildId
             extension_service_worker_sha256 = $workerSha256
             extension_stale = if ($staleText -eq 'true') { $true } elseif ($staleText -eq 'false') { $false } else { $null }
+            probe_timeout_s = $TimeoutSec
             error = $null
         }
     } catch {
@@ -3177,8 +3180,97 @@ function Get-SynapseChromeDaemonBridgeHealth {
             extension_build_id = $null
             extension_service_worker_sha256 = $null
             extension_stale = $null
+            probe_timeout_s = $TimeoutSec
             error = $_.Exception.Message
         }
+    }
+}
+
+# --- #2031 -----------------------------------------------------------------
+# Bounded startup-probe gate in front of the pre-Chrome daemon health readback.
+#
+# Both daemon-controlled Chrome paths below must read authenticated /health
+# BEFORE they create a maintenance tab, so the replacement bridge host can be
+# diffed against a proven "before" identity. That read used to be a single
+# 5-second request. A daemon that has only just been handed off by setup is
+# already accepting connections while it is still inside cold-start work
+# (Calyx vault/index open, embedded model load, first facade registration), so
+# one unlucky sample timed out and the whole reload failed closed even though
+# an identical read moments later succeeded (#2031).
+#
+# A single short request is a liveness probe. What this path needs is a
+# startup probe: the same check, given an explicitly bounded runway, polled
+# with backoff, and still failing closed at the end with the exact evidence.
+# The runway is carved out of the caller's existing operation deadline so the
+# physical Chrome work that follows keeps its budget; nothing here retries
+# forever, and nothing here proceeds on an unproven daemon.
+function Wait-SynapseChromeDaemonBridgeHealth {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BearerToken,
+        [Parameter(Mandatory = $true)]
+        [datetime]$Deadline,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('before_reload', 'before_load')]
+        [string]$Purpose,
+        [ValidateRange(1, 120)]
+        [int]$BudgetSeconds = 15,
+        [ValidateRange(1, 60)]
+        [int]$ProbeTimeoutSeconds = 5
+    )
+
+    $started = Get-Date
+    $budgetDeadline = $started.AddSeconds($BudgetSeconds)
+    $effectiveDeadline = if ($budgetDeadline -lt $Deadline) { $budgetDeadline } else { $Deadline }
+    $attempt = 0
+    $backoffMs = 250
+    $maxBackoffMs = 2000
+    $last = $null
+    $observedErrors = New-Object System.Collections.Generic.List[string]
+
+    while ($true) {
+        $attempt += 1
+        $last = Get-SynapseChromeDaemonBridgeHealth -BearerToken $BearerToken -TimeoutSec $ProbeTimeoutSeconds
+        if ($last.ok) {
+            break
+        }
+        $lastError = [string]$last.error
+        if (-not $observedErrors.Contains($lastError)) {
+            [void]$observedErrors.Add($lastError)
+        }
+        # A credential rejection is never a startup race: the daemon answered
+        # and refused this token. Waiting cannot repair it, so stop immediately
+        # and let the caller report the physical condition.
+        if ($lastError -match '(?i)\(401\)|\(403\)|Unauthorized|Forbidden') {
+            break
+        }
+        if ((Get-Date) -ge $effectiveDeadline) {
+            break
+        }
+        $remainingMs = [int][Math]::Max(0, ($effectiveDeadline - (Get-Date)).TotalMilliseconds)
+        $sleepMs = [Math]::Min($backoffMs, $remainingMs)
+        if ($sleepMs -gt 0) {
+            Start-Sleep -Milliseconds $sleepMs
+        }
+        $backoffMs = [Math]::Min($maxBackoffMs, $backoffMs * 2)
+    }
+
+    $readiness = [ordered]@{
+        purpose = $Purpose
+        attempts = $attempt
+        elapsed_ms = [int]((Get-Date) - $started).TotalMilliseconds
+        budget_s = $BudgetSeconds
+        probe_timeout_s = $ProbeTimeoutSeconds
+        operation_deadline_utc = $Deadline.ToUniversalTime().ToString('o')
+        effective_deadline_utc = $effectiveDeadline.ToUniversalTime().ToString('o')
+        distinct_errors = @($observedErrors.ToArray())
+        last_error = [string]$last.error
+    }
+    [pscustomobject]@{
+        ok = [bool]$last.ok
+        health = $last
+        error = [string]$last.error
+        readiness = $readiness
     }
 }
 
@@ -3263,9 +3355,15 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $daemonBridgeBefore = $null
     if ($OutputJson) {
-        $daemonBridgeBefore = Get-SynapseChromeDaemonBridgeHealth -BearerToken $bridgeBearerToken
-        if (-not $daemonBridgeBefore.ok) {
-            throw "SYNAPSE_CHROME_BRIDGE_DAEMON_HEALTH_BEFORE_RELOAD_FAILED error=$($daemonBridgeBefore.error) remediation=daemon-controlled UI reload requires authenticated /health before creating a maintenance tab so replacement-host identity can be proven"
+        $daemonBridgeReadiness = Wait-SynapseChromeDaemonBridgeHealth `
+            -BearerToken $bridgeBearerToken `
+            -Deadline $deadline `
+            -Purpose 'before_reload' `
+            -BudgetSeconds ([Math]::Max(5, [Math]::Min(15, [int]($TimeoutSeconds / 3))))
+        $daemonBridgeBefore = $daemonBridgeReadiness.health
+        if (-not $daemonBridgeReadiness.ok) {
+            $readinessDetail = ConvertTo-CompressedJson -Value $daemonBridgeReadiness.readiness -Depth 6
+            throw "SYNAPSE_CHROME_BRIDGE_DAEMON_HEALTH_BEFORE_RELOAD_FAILED error=$($daemonBridgeReadiness.error) readiness=$readinessDetail remediation=daemon-controlled UI reload requires authenticated /health before creating a maintenance tab so replacement-host identity can be proven. The bounded startup-probe runway in readiness above already expired, so this is not a single unlucky sample: read last_error and repair the named daemon condition (cold-start work still holding /health, credential rejection, or a busy chrome_bridge state lock) before retrying browser_debugger reload_bridge"
         }
     }
     $maintenance = Enter-SynapseOwnedChromeMaintenanceTab `
@@ -3448,9 +3546,15 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $daemonBridgeBefore = $null
     if ($OutputJson) {
-        $daemonBridgeBefore = Get-SynapseChromeDaemonBridgeHealth -BearerToken $bridgeBearerToken
-        if (-not $daemonBridgeBefore.ok) {
-            throw "SYNAPSE_CHROME_BRIDGE_DAEMON_HEALTH_BEFORE_LOAD_FAILED error=$($daemonBridgeBefore.error) remediation=daemon-controlled Load unpacked requires authenticated /health before creating a maintenance tab so replacement-host identity can be proven"
+        $daemonBridgeReadiness = Wait-SynapseChromeDaemonBridgeHealth `
+            -BearerToken $bridgeBearerToken `
+            -Deadline $deadline `
+            -Purpose 'before_load' `
+            -BudgetSeconds ([Math]::Max(5, [Math]::Min(15, [int]($TimeoutSeconds / 3))))
+        $daemonBridgeBefore = $daemonBridgeReadiness.health
+        if (-not $daemonBridgeReadiness.ok) {
+            $readinessDetail = ConvertTo-CompressedJson -Value $daemonBridgeReadiness.readiness -Depth 6
+            throw "SYNAPSE_CHROME_BRIDGE_DAEMON_HEALTH_BEFORE_LOAD_FAILED error=$($daemonBridgeReadiness.error) readiness=$readinessDetail remediation=daemon-controlled Load unpacked requires authenticated /health before creating a maintenance tab so replacement-host identity can be proven. The bounded startup-probe runway in readiness above already expired, so this is not a single unlucky sample: read last_error and repair the named daemon condition before retrying"
         }
     }
     $maintenance = Enter-SynapseOwnedChromeMaintenanceTab `

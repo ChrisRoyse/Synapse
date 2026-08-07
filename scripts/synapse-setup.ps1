@@ -267,6 +267,17 @@ $SynapseChromeBridgeDefaultPostStartWaitMs = 30000
 $SynapseChromeBridgeMaintenancePauseGuardMs = 60000
 $SynapseChromeBridgeMaxPostStartWaitMs = $SynapseChromeBridgeMaintenancePauseMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
 $SynapseChromeBridgeMaintenancePostStartWaitMs = $SynapseChromeBridgeMaintenanceResumeProbeAfterMs + $SynapseChromeBridgeReconnectAlarmCushionMs + $SynapseChromeBridgeDefaultPostStartWaitMs
+# #2031: the per-request budget install-synapse-chrome-debugger.ps1 gives its
+# own pre-Chrome authenticated /health readback. Setup must prove the
+# post-handoff daemon answers inside this same budget before it invokes any
+# path that runs that installer, otherwise a still-cold daemon fails the whole
+# reload closed on startup timing alone.
+$SynapseChromeBridgeInstallerHealthProbeTimeoutSec = 5
+$SynapseChromeBridgeReloadReadinessTimeoutMs = 180000
+$SynapseChromeBridgeReloadReadinessSuccessThreshold = 3
+$SynapseChromeBridgeReloadReadinessSuccessSpacingMs = 250
+$SynapseChromeBridgeReloadReadinessMinBackoffMs = 250
+$SynapseChromeBridgeReloadReadinessMaxBackoffMs = 2000
 $SynapseBindFinalDeadOwnerSettleSeconds = 15
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
 $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
@@ -6357,6 +6368,182 @@ function Invoke-SynapseSetupMcpTool {
     }
 }
 
+# --- #2031 -----------------------------------------------------------------
+# Which /health facts the Chrome bridge installer actually depends on.
+#
+# Deliberately NOT included: chrome_bridge status. An absent, stale, or
+# unavailable bridge host is exactly why setup is about to run the reload, so
+# demanding a clean chrome_bridge here would deadlock the repair path. The one
+# chrome_bridge condition that does block the reload is a state lock that
+# health itself refuses to wait behind: while that lock is busy or poisoned
+# the subsystem carries no nested host record, and the installer cannot read
+# the "before" host identity it must diff the replacement host against.
+function Get-SynapseDaemonBridgeReloadUnreadySubsystems {
+    param([Parameter(Mandatory=$true)]$Health)
+
+    $unready = New-Object System.Collections.Generic.List[string]
+    # The daemon-wide readiness contract setup already enforces at install
+    # health (http, facade_contract, public_tool_registry, daemon_lifecycle,
+    # action, daemon_drain, perception, storage). A cold daemon reports e.g.
+    # public_tool_registry=pending_facades here while the public tool surface
+    # is still registering, which is exactly "not ready for traffic yet".
+    $critical = Test-SynapseHealthCriticalSubsystemsReady -Health $Health
+    if (-not $critical.Ok) {
+        [void]$unready.Add("critical_subsystems=[$($critical.Detail)]")
+    }
+    $subsystems = Get-SynapseObjectPropertyValue -Object $Health -Names @('subsystems')
+    if ($null -eq $subsystems) {
+        [void]$unready.Add('subsystems=missing')
+        return $unready.ToArray()
+    }
+    $bridge = Get-SynapseObjectPropertyValue -Object $subsystems -Names @('chrome_bridge')
+    if ($null -eq $bridge) {
+        [void]$unready.Add('chrome_bridge=missing')
+    } else {
+        $bridgeDetail = [string](Get-SynapseObjectPropertyValue -Object $bridge -Names @('detail'))
+        if ($bridgeDetail -match 'chrome_bridge_state_lock_busy') {
+            [void]$unready.Add('chrome_bridge=state_lock_busy')
+        } elseif ($bridgeDetail -match 'chrome_bridge_state_lock_poisoned') {
+            [void]$unready.Add('chrome_bridge=state_lock_poisoned')
+        }
+    }
+    if (@(Get-SynapseObjectPropertyValue -Object $Health -Names @('tool_names')) -notcontains 'browser_debugger') {
+        [void]$unready.Add('tool_surface=browser_debugger_absent')
+    }
+    # Emitted unwrapped so the caller's @() sees an empty collection when the
+    # daemon is ready. A `,`-wrapped return would make an empty result read as
+    # a one-element array and the gate could never pass.
+    return $unready.ToArray()
+}
+
+# --- #2031 -----------------------------------------------------------------
+# Post-handoff daemon readiness gate for every Chrome bridge installer entry.
+#
+# install-synapse-chrome-debugger.ps1 -- run directly by setup for the UI
+# repair path, and spawned by the daemon itself for browser_debugger
+# reload_bridge -- reads authenticated /health with a small fixed per-request
+# budget before it will touch Chrome. A daemon that setup has only just handed
+# off is already accepting connections while it is still finishing cold-start
+# work, so that read timed out and the reload failed closed with
+# SYNAPSE_CHROME_BRIDGE_DAEMON_HEALTH_BEFORE_RELOAD_FAILED even though an
+# independent authenticated /health seconds later succeeded (#2031).
+#
+# "Port is open" and "one /health eventually answered" are liveness facts.
+# This gate is startup-probe shaped in the Kubernetes sense: the same check
+# the consumer performs, given an explicitly bounded runway with a generous
+# failure budget, polled with backoff, and gated on consecutive successes
+# (a successThreshold) so a single lucky sample cannot be mistaken for a
+# settled daemon. It proves the named subsystems the reload depends on, it
+# never sleeps and hopes, it never retries past its deadline, and on expiry it
+# dies naming the exact unready subsystem plus the probe evidence.
+function Assert-SynapseDaemonBridgeReloadReadiness {
+    param(
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)][string]$Reason,
+        [Parameter(Mandatory=$true)][int]$ExpectedDaemonPid,
+        [ValidateRange(0, 900000)][int]$TimeoutMs = 0
+    )
+
+    if ($TimeoutMs -le 0) {
+        $TimeoutMs = $SynapseChromeBridgeReloadReadinessTimeoutMs
+    }
+    $probeTimeoutSec = $SynapseChromeBridgeInstallerHealthProbeTimeoutSec
+    $requiredOk = $SynapseChromeBridgeReloadReadinessSuccessThreshold
+    $startedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $deadlineMs = [int64]$startedMs + [int64]$TimeoutMs
+    $attempt = 0
+    $consecutiveOk = 0
+    $bestConsecutiveOk = 0
+    $slowestOkProbeMs = 0
+    $lastError = $null
+    $lastUnready = @('no_probe_completed')
+    $backoffMs = $SynapseChromeBridgeReloadReadinessMinBackoffMs
+    $readyHealth = $null
+
+    while ($true) {
+        $attempt += 1
+        $probeWatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec $probeTimeoutSec
+        $probeWatch.Stop()
+        $probeMs = [int]$probeWatch.Elapsed.TotalMilliseconds
+        if (-not $healthRead.Ok) {
+            $lastError = [string]$healthRead.Error
+            # A credential rejection is not a startup race: the daemon answered
+            # and refused these bytes. No amount of waiting repairs it.
+            if ($lastError -match '(?i)\(401\)|\(403\)|Unauthorized|Forbidden') {
+                Die "SYNAPSE_CHROME_BRIDGE_RELOAD_READINESS_UNAUTHORIZED bind=$Bind reason=$Reason expected_pid=$ExpectedDaemonPid attempt=$attempt probe_timeout_s=$probeTimeoutSec error=$lastError remediation=the post-handoff daemon answered authenticated /health with a credential rejection, so the Chrome bridge installer can never prove pre-reload host identity with this token; repair the setup bearer token and the daemon that loaded it instead of waiting on startup timing"
+            }
+            $consecutiveOk = 0
+            $lastUnready = @("health_request_failed=$lastError")
+        } else {
+            $health = $healthRead.Health
+            $actualPid = [int]$health.pid
+            if ($ExpectedDaemonPid -gt 0 -and $actualPid -ne $ExpectedDaemonPid) {
+                # Waiting cannot reconcile a different daemon; the identity
+                # setup verified during handoff is gone.
+                Die "SYNAPSE_CHROME_BRIDGE_RELOAD_READINESS_DAEMON_PID_DRIFT bind=$Bind reason=$Reason expected_pid=$ExpectedDaemonPid actual_pid=$actualPid attempt=$attempt elapsed_ms=$([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startedMs) remediation=the daemon serving /health is not the one setup handed off to; do not reload the Chrome bridge against an unverified daemon, re-run setup and inspect the supervisor/scheduled-task restart authority"
+            }
+            $lastError = $null
+            $lastUnready = @(Get-SynapseDaemonBridgeReloadUnreadySubsystems -Health $health)
+            if ($lastUnready.Count -eq 0) {
+                $consecutiveOk += 1
+                $readyHealth = $health
+                if ($probeMs -gt $slowestOkProbeMs) { $slowestOkProbeMs = $probeMs }
+                if ($consecutiveOk -gt $bestConsecutiveOk) { $bestConsecutiveOk = $consecutiveOk }
+                if ($consecutiveOk -ge $requiredOk) {
+                    $elapsedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startedMs
+                    Info ("Daemon proven ready for Chrome bridge installer reason={0} bind={1} pid={2} attempts={3} consecutive_ok={4} probe_timeout_s={5} slowest_ok_probe_ms={6} elapsed_ms={7}" -f `
+                        $Reason, $Bind, $ExpectedDaemonPid, $attempt, $consecutiveOk, $probeTimeoutSec, $slowestOkProbeMs, $elapsedMs)
+                    return [pscustomobject]@{
+                        Health = $readyHealth
+                        Attempts = $attempt
+                        ConsecutiveOk = $consecutiveOk
+                        ProbeTimeoutSec = $probeTimeoutSec
+                        SlowestOkProbeMs = $slowestOkProbeMs
+                        ElapsedMs = $elapsedMs
+                    }
+                }
+            } else {
+                $consecutiveOk = 0
+            }
+        }
+
+        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        if ($nowMs -ge $deadlineMs) {
+            break
+        }
+        # Consecutive samples are spaced, not bursted, so successThreshold
+        # measures a daemon that stays servable rather than one lucky window.
+        $waitMs = if ($consecutiveOk -gt 0) { $SynapseChromeBridgeReloadReadinessSuccessSpacingMs } else { $backoffMs }
+        $remainingMs = [int][Math]::Max(0, [int64]$deadlineMs - [int64]$nowMs)
+        $sleepMs = [Math]::Min([int]$waitMs, $remainingMs)
+        if ($sleepMs -gt 0) {
+            Start-Sleep -Milliseconds $sleepMs
+        }
+        if ($consecutiveOk -eq 0) {
+            $backoffMs = [Math]::Min([int]$SynapseChromeBridgeReloadReadinessMaxBackoffMs, [int]$backoffMs * 2)
+        }
+    }
+
+    $elapsedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startedMs
+    $unreadyText = if ($lastUnready.Count -eq 0) { '<none>' } else { $lastUnready -join ',' }
+    Die ("SYNAPSE_CHROME_BRIDGE_RELOAD_READINESS_TIMEOUT bind={0} reason={1} expected_pid={2} unready_subsystems={3} attempts={4} consecutive_ok={5} best_consecutive_ok={6} required_consecutive_ok={7} probe_timeout_s={8} slowest_ok_probe_ms={9} elapsed_ms={10} timeout_ms={11} last_health_error={12} remediation=setup refuses to invoke the Chrome bridge installer against a daemon that has not proven it answers authenticated /health inside the installer's own {8}s per-request budget with the named subsystems ready. The unready_subsystems field is the exact blocking signal: repair that subsystem (or the cold-start work still holding /health) and rerun setup. Setup never reloads the bridge on an unproven daemon and never widens the installer's probe budget to hide it." -f `
+        $Bind,
+        $Reason,
+        $ExpectedDaemonPid,
+        $unreadyText,
+        $attempt,
+        $consecutiveOk,
+        $bestConsecutiveOk,
+        $requiredOk,
+        $probeTimeoutSec,
+        $slowestOkProbeMs,
+        $elapsedMs,
+        $TimeoutMs,
+        ($(if ([string]::IsNullOrWhiteSpace($lastError)) { '<none>' } else { $lastError })))
+}
+
 function Assert-SynapseChromeBridgeLiveAfterSetup {
     param(
         [Parameter(Mandatory=$true)][string]$Bind,
@@ -6434,6 +6621,14 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 ($(if ([string]::IsNullOrWhiteSpace($lastWaitHealthError)) { '<none>' } else { $lastWaitHealthError })))
         }
         Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
+        # #2031: prove the handed-off daemon is servable on the installer's own
+        # terms before handing control to the installer, so a still-cold daemon
+        # cannot fail a valid handoff on startup timing.
+        [void](Assert-SynapseDaemonBridgeReloadReadiness `
+            -Bind $Bind `
+            -Token $Token `
+            -Reason 'chrome_bridge_ui_repair' `
+            -ExpectedDaemonPid ([int]$currentHealth.pid))
         try {
             $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
                 -InstallerPath $ChromeBridgeInstallerPath `
@@ -6540,6 +6735,15 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     }
 
     Info "WARN: Chrome bridge not clean after daemon start; requesting in-place browser_debugger.reload_bridge through the new live MCP daemon. status=$status detail=$detail"
+    # #2031: reload_bridge makes the daemon spawn the Chrome bridge installer,
+    # which immediately reads authenticated /health back off this same daemon
+    # under a small per-request budget. Prove that budget is already met, and
+    # that the browser_debugger facade is registered, before asking for it.
+    [void](Assert-SynapseDaemonBridgeReloadReadiness `
+        -Bind $Bind `
+        -Token $Token `
+        -Reason 'chrome_bridge_reload_bridge' `
+        -ExpectedDaemonPid ([int]$currentHealth.pid))
     $reloadArgs = [ordered]@{
         operation = 'reload_bridge'
         reload_bridge = [ordered]@{ wait_timeout_ms = 30000 }
