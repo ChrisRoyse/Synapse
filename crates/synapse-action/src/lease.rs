@@ -23,7 +23,10 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{Mutex, MutexGuard, PoisonError},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -171,12 +174,14 @@ impl LeaseError {
     }
 }
 
-/// Process-global daemon state for the input lease: the current holder slot and
-/// the pending expired-cleanup ledger, bundled so a test can swap both together
-/// behind a single thread-local override.
+/// Process-global daemon state for the input lease: the current holder slot,
+/// the pending expired-cleanup ledger, and the in-flight emission heartbeat
+/// budget (#2065), bundled so a test can swap them together behind a single
+/// thread-local override.
 struct LeaseCell {
     slot: Mutex<Option<InputLease>>,
     expired_cleanup: Mutex<BTreeMap<String, LeaseStatus>>,
+    emission_budget: Mutex<Option<EmissionBudget>>,
 }
 
 impl LeaseCell {
@@ -184,6 +189,7 @@ impl LeaseCell {
         Self {
             slot: Mutex::new(None),
             expired_cleanup: Mutex::new(BTreeMap::new()),
+            emission_budget: Mutex::new(None),
         }
     }
 }
@@ -202,6 +208,13 @@ fn lock() -> MutexGuard<'static, Option<InputLease>> {
 fn lock_expired_cleanup() -> MutexGuard<'static, BTreeMap<String, LeaseStatus>> {
     GLOBAL_CELL
         .expired_cleanup
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+fn lock_emission_budget() -> MutexGuard<'static, Option<EmissionBudget>> {
+    GLOBAL_CELL
+        .emission_budget
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
 }
@@ -354,6 +367,160 @@ pub fn renew(session_id: &str, ttl: Option<Duration>) -> Result<LeaseStatus, Lea
             session_id: session_id.to_owned(),
             holder: other.map(|lease| lease.owner_session_id.clone()),
         }),
+    }
+}
+
+/// The in-flight **emission heartbeat budget** (#2065).
+///
+/// A single foreground action can span far more wall-clock time than any sane
+/// default lease TTL: one `act_type` emits one OS `SendInput` per UTF-16 unit
+/// with a sampled inter-keystroke sleep between units, so a 1 000-character
+/// string legitimately runs for a minute or more. Sizing the lease up front from
+/// the *planned* timeline is necessary but not sufficient — the plan is an
+/// estimate, and the real per-emission cost (the `SendInput` itself plus the
+/// per-emission foreground fence readbacks added by #2057) is machine-dependent.
+///
+/// So while an action is emitting, each emission that has already cleared the
+/// fence re-arms the holder's own lease window. This is the standard lease
+/// heartbeat: the TTL bounds *silence*, not total work. Two hard bounds keep the
+/// granted authority finite:
+///
+/// * `owner_session_id` — a heartbeat only ever touches a lease still owned by
+///   the exact session the budget was armed for, and never an operator-panic
+///   lease. It cannot create, revive, or transfer a lease: it runs through the
+///   same lazy-expiry path as [`renew`], so a lapsed or preempted lease stays
+///   gone and the next emission is refused loudly.
+/// * `ceiling` — an absolute instant computed at arm time. No heartbeat can push
+///   expiry past it, so an unbounded or pathological emission timeline still
+///   loses the foreground.
+///
+/// Safety does not rest on the heartbeat being correct: every OS emission is
+/// independently re-validated against the live lease *and* the exact bound
+/// window immediately before it leaves (`crate::foreground_fence`). That is the
+/// resource-side validation Kleppmann's fencing-token argument asks for, which
+/// is what makes progress-gated renewal admissible here.
+#[derive(Clone, Debug)]
+struct EmissionBudget {
+    generation: u64,
+    owner_session_id: Arc<str>,
+    renew_ttl: Duration,
+    ceiling: Instant,
+}
+
+static EMISSION_BUDGET_GENERATION: AtomicU64 = AtomicU64::new(0);
+static EMISSION_BUDGET_RENEWALS: AtomicU64 = AtomicU64::new(0);
+
+/// RAII handle for an armed [`EmissionBudget`]. Dropping it disarms the budget
+/// (and only this generation of it), so the lease returns to plain TTL expiry
+/// the moment the action's emission timeline ends.
+#[derive(Debug)]
+pub struct EmissionBudgetGuard {
+    generation: u64,
+}
+
+impl Drop for EmissionBudgetGuard {
+    fn drop(&mut self) {
+        disarm_emission_budget(self.generation);
+    }
+}
+
+/// Arms the emission heartbeat for `owner_session_id` for the duration of one
+/// action's emission timeline.
+///
+/// `renew_ttl` is the window each gated emission re-arms; `ceiling_from_now` is
+/// the absolute cap measured from this call. Both are clamped into the accepted
+/// lease range, so the ceiling can never exceed [`MAX_LEASE_TTL_MS`].
+#[must_use]
+pub fn arm_emission_budget(
+    owner_session_id: &str,
+    renew_ttl: Duration,
+    ceiling_from_now: Duration,
+) -> EmissionBudgetGuard {
+    let now = Instant::now();
+    let renew_ttl = clamp_ttl(renew_ttl);
+    let ceiling_from_now = clamp_ttl(ceiling_from_now).max(renew_ttl);
+    let generation = EMISSION_BUDGET_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    EMISSION_BUDGET_RENEWALS.store(0, Ordering::SeqCst);
+    {
+        let mut guard = lock_emission_budget();
+        *guard = Some(EmissionBudget {
+            generation,
+            owner_session_id: Arc::from(owner_session_id),
+            renew_ttl,
+            ceiling: now + ceiling_from_now,
+        });
+    }
+    tracing::info!(
+        code = "INPUT_LEASE_EMISSION_BUDGET_ARMED",
+        generation,
+        owner_session_id,
+        renew_ttl_ms = duration_ms(renew_ttl),
+        ceiling_in_ms = duration_ms(ceiling_from_now),
+        "readback=input_lease edge=emission_budget_armed"
+    );
+    EmissionBudgetGuard { generation }
+}
+
+fn clamp_ttl(ttl: Duration) -> Duration {
+    ttl_from_ms(duration_ms(ttl))
+}
+
+fn disarm_emission_budget(generation: u64) {
+    let disarmed = {
+        let mut guard = lock_emission_budget();
+        let matches = guard
+            .as_ref()
+            .is_some_and(|budget| budget.generation == generation);
+        if matches {
+            *guard = None;
+        }
+        matches
+    };
+    if disarmed {
+        tracing::info!(
+            code = "INPUT_LEASE_EMISSION_BUDGET_DISARMED",
+            generation,
+            renewals = EMISSION_BUDGET_RENEWALS.swap(0, Ordering::SeqCst),
+            "readback=input_lease edge=emission_budget_disarmed"
+        );
+    }
+}
+
+/// Re-arms the armed budget owner's lease window after one emission that has
+/// already cleared the foreground fence.
+///
+/// A no-op when no budget is armed, when the ceiling has been reached, when the
+/// lease is unheld/lapsed/preempted, when it belongs to another session, or when
+/// the lease already expires later than the heartbeat would set it to — this
+/// only ever *extends*, never shortens, and never resurrects.
+pub fn heartbeat_emission_budget() {
+    let Some(budget) = lock_emission_budget().clone() else {
+        return;
+    };
+    let now = Instant::now();
+    let remaining_to_ceiling = budget.ceiling.saturating_duration_since(now);
+    if remaining_to_ceiling.is_zero() {
+        return;
+    }
+    let target_ttl = budget.renew_ttl.min(remaining_to_ceiling);
+    let renewed = {
+        let mut guard = lock();
+        let _expired = expire_if_lapsed(&mut guard, now);
+        match guard.as_mut() {
+            Some(lease)
+                if lease.owner_session_id.as_str() == &*budget.owner_session_id
+                    && !lease.is_tagged_operator_panic()
+                    && target_ttl > lease.expires_in(now) =>
+            {
+                lease.renewed_at = now;
+                lease.ttl = target_ttl;
+                true
+            }
+            _ => false,
+        }
+    };
+    if renewed {
+        EMISSION_BUDGET_RENEWALS.fetch_add(1, Ordering::Relaxed);
     }
 }
 

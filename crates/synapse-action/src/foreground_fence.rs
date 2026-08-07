@@ -106,6 +106,19 @@
 //!
 //! Background CDP/UIA/`PostMessage`/hidden-desktop routes never reach these
 //! emission sites, so they remain independent and unfenced, as before.
+//!
+//! # The lease check is a hard per-emission gate, not a grace window (#2065)
+//!
+//! `evaluate` reads `crate::lease::status().held` before *every* emission and
+//! refuses `Delivery` the instant it is false. #2065 — long `act_type` payloads
+//! truncating at ~70 characters — was fixed entirely on the *lease* side (size
+//! the lease from the planned emission timeline at the MCP acquisition site, and
+//! heartbeat it from inside the emission loop within an armed ceiling), and this
+//! module's decision path was deliberately left byte-for-byte unchanged. No
+//! grace period, no "recently held" tolerance, no retry: an expired, released,
+//! or operator-preempted lease still refuses at the exact next boundary, and so
+//! does foreground drift. Any future fix that is tempted to soften this check
+//! is fixing the wrong layer.
 
 use std::sync::{
     Mutex, OnceLock,

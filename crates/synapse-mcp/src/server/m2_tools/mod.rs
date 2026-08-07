@@ -465,9 +465,12 @@ impl SynapseService {
             self.audit_action_result_for_request("act_type", &result, &request_context)?;
             return result.map(Json);
         }
-        let _lease_guard = if requires_foreground_route {
-            match acquire_tool_foreground_input_lease(self, "act_type", &request_context) {
-                Ok(guard) => Some(guard),
+        // The lease must outlive the *planned* emission timeline, and keep being
+        // re-armed while that timeline actually runs; a 5 s default truncated
+        // anything past ~70 characters (#2065).
+        let (_lease_guard, _emission_budget_guard) = if requires_foreground_route {
+            match acquire_act_type_foreground_input_lease(self, &request_context, &params) {
+                Ok((lease_guard, budget_guard)) => (Some(lease_guard), Some(budget_guard)),
                 Err(error) => {
                     let result: Result<ActTypeResponse, ErrorData> = Err(error);
                     self.audit_action_result_for_request("act_type", &result, &request_context)?;
@@ -475,7 +478,7 @@ impl SynapseService {
                 }
             }
         } else {
-            None
+            (None, None)
         };
         let before_text_signature = if let Some(target) = foreground_fallback.as_ref() {
             let mut foreground_params = params.clone();
@@ -2902,6 +2905,182 @@ fn acquire_tool_foreground_input_lease_with_ttl(
 
 fn lease_ttl_for_hold_ms(hold_ms: u32) -> u64 {
     crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
+}
+
+/// Per-UTF-16-unit cost of a foreground type emission *beyond* the sampled
+/// inter-keystroke interval: the `SendInput` itself, the per-emission foreground
+/// fence readbacks (#2057), and OS scheduling slop. The #2065 FSV measured
+/// ~68 ms/unit end to end against a 32 ms mean IKI on that machine, i.e. ~36 ms
+/// of overhead; this rounds up so the planned budget is an over-estimate rather
+/// than an under-estimate. Under-estimating here is not a truncation bug — the
+/// in-loop heartbeat covers estimate error — but the declared budget should still
+/// be honest.
+const ACT_TYPE_EMISSION_UNIT_OVERHEAD_MS: u64 = 50;
+/// Head/tail margin around the emission timeline itself: focus/click settling,
+/// the before/after text-signature readbacks, queue hand-off to the action
+/// emitter, and the postcondition verify, none of which are part of the sampled
+/// keystroke schedule but all of which run under the same lease.
+const ACT_TYPE_EMISSION_SETUP_MARGIN_MS: u64 = 10_000;
+
+/// The planned emission timeline of one `act_type`, used to size its input lease
+/// before a single character is typed (#2065).
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct ActTypeEmissionPlan {
+    unit_total: u64,
+    planned_emission_ms: u64,
+    required_lease_ttl_ms: u64,
+}
+
+/// Sizes the planned emission timeline from the exact schedule the software
+/// backend will replay.
+///
+/// `synapse_action::sample_typing_schedule` is deterministic in
+/// `(text, dynamics)` with no explicit seed, and the backend samples it the same
+/// way in `backend::text_dispatch::text_dispatch_plan`, so the inter-keystroke
+/// sum computed here is the same one the emission loop will sleep through.
+fn act_type_emission_plan(text: &str, dynamics: &KeystrokeDynamics) -> ActTypeEmissionPlan {
+    let mut unit_total = 0_u64;
+    let mut planned_iki_ms = 0_u64;
+    for event in synapse_action::sample_typing_schedule(text, dynamics, None) {
+        planned_iki_ms = planned_iki_ms.saturating_add(u64::from(event.iki_ms_before));
+        // Mirrors `backend::text_dispatch::dispatch_inputs`: newline/carriage
+        // return and tab collapse to one virtual-key emission, everything else
+        // is one emission per UTF-16 unit.
+        unit_total = unit_total.saturating_add(match event.r#char {
+            '\n' | '\r' | '\t' => 1,
+            ch if ch.len_utf16() == 2 => 2,
+            _ => 1,
+        });
+    }
+    let planned_emission_ms = planned_iki_ms
+        .saturating_add(unit_total.saturating_mul(ACT_TYPE_EMISSION_UNIT_OVERHEAD_MS));
+    ActTypeEmissionPlan {
+        unit_total,
+        planned_emission_ms,
+        required_lease_ttl_ms: planned_emission_ms
+            .saturating_add(ACT_TYPE_EMISSION_SETUP_MARGIN_MS),
+    }
+}
+
+/// Acquires the foreground input lease for `act_type`, sized for the planned
+/// emission timeline, and arms the in-flight emission heartbeat (#2065).
+///
+/// Three properties this must hold, all of which the plain
+/// [`acquire_tool_foreground_input_lease`] helper cannot:
+///
+/// * the TTL is derived from how long this specific string will actually take to
+///   emit, not from `DEFAULT_LEASE_TTL_MS`;
+/// * a longer TTL the caller already bought with `act operation=foreground` is
+///   never silently shortened — the effective TTL is the max of the two, and both
+///   numbers are logged;
+/// * a payload whose planned timeline cannot fit inside `MAX_LEASE_TTL_MS` is
+///   refused **before** any character is typed, naming the limit and the plan,
+///   instead of being truncated mid-flight.
+fn acquire_act_type_foreground_input_lease(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    params: &ActTypeParams,
+) -> Result<
+    (
+        crate::m2::ForegroundInputLeaseGuard,
+        synapse_action::lease::EmissionBudgetGuard,
+    ),
+    ErrorData,
+> {
+    let mut plan_params = params.clone();
+    // The chromium foreground fallback still carries `into_element` at this
+    // point and clears it only after the fallback click lands; the emitted text
+    // and dynamics are identical either way.
+    plan_params.into_element = None;
+    let (text, dynamics) = match action_from_type_params(&plan_params)? {
+        Action::TypeText { text, dynamics, .. } => (text, dynamics),
+        other => {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("act_type produced a non-type action while planning its lease: {other:?}"),
+            ));
+        }
+    };
+    let plan = act_type_emission_plan(&text, &dynamics);
+    if plan.required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
+        return Err(act_type_emission_budget_exceeds_max_lease_error(&plan));
+    }
+    let session_id =
+        foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
+    let existing = synapse_action::lease::status();
+    let caller_lease_remaining_ms =
+        if existing.held && existing.owner_session_id.as_deref() == Some(session_id.as_str()) {
+            existing.expires_in_ms.unwrap_or(0)
+        } else {
+            0
+        };
+    let lease_ttl_ms = plan
+        .required_lease_ttl_ms
+        .max(caller_lease_remaining_ms)
+        .min(synapse_action::MAX_LEASE_TTL_MS);
+    tracing::info!(
+        code = "M2_ACT_TYPE_EMISSION_LEASE_SIZED",
+        tool = "act_type",
+        session_id,
+        unit_total = plan.unit_total,
+        planned_emission_ms = plan.planned_emission_ms,
+        required_lease_ttl_ms = plan.required_lease_ttl_ms,
+        caller_lease_remaining_ms,
+        lease_ttl_ms,
+        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        source_of_truth =
+            "synapse_action::sample_typing_schedule over the emitted text and resolved dynamics",
+        "readback=input_lease act_type lease sized from its planned emission timeline; a longer caller TTL is never shortened"
+    );
+    let lease_guard = acquire_tool_foreground_input_lease_with_ttl(
+        service,
+        "act_type",
+        request_context,
+        lease_ttl_ms,
+    )?;
+    let budget_guard = synapse_action::lease::arm_emission_budget(
+        &session_id,
+        Duration::from_millis(lease_ttl_ms),
+        Duration::from_millis(synapse_action::MAX_LEASE_TTL_MS),
+    );
+    Ok((lease_guard, budget_guard))
+}
+
+fn act_type_emission_budget_exceeds_max_lease_error(plan: &ActTypeEmissionPlan) -> ErrorData {
+    let max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS;
+    tracing::warn!(
+        code = error_codes::TOOL_PARAMS_INVALID,
+        tool = "act_type",
+        unit_total = plan.unit_total,
+        planned_emission_ms = plan.planned_emission_ms,
+        required_lease_ttl_ms = plan.required_lease_ttl_ms,
+        max_lease_ttl_ms,
+        "act_type refused before emitting: the planned typing timeline cannot fit inside the maximum foreground input lease"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_type refused before typing anything: emitting this text needs a foreground input lease of {} ms ({} OS emissions, {} ms of planned keystroke timeline plus {} ms of setup/verify margin), but the maximum foreground input lease is {max_lease_ttl_ms} ms. Synapse will not start a sequence it cannot hold the foreground for and would have to abandon part-typed. Split the text into shorter act_type calls, or use faster dynamics (dynamics=burst or a smaller linear_ms_per_char).",
+            plan.required_lease_ttl_ms,
+            plan.unit_total,
+            plan.planned_emission_ms,
+            ACT_TYPE_EMISSION_SETUP_MARGIN_MS,
+        ),
+        Some(json!({
+            "code": error_codes::TOOL_PARAMS_INVALID,
+            "detail_code": "M2_ACT_TYPE_EMISSION_BUDGET_EXCEEDS_MAX_LEASE",
+            "tool": "act_type",
+            "refused_before_delivery": true,
+            "delivery_state": "refused_before_delivery",
+            "planned_emission_units": plan.unit_total,
+            "planned_emission_ms": plan.planned_emission_ms,
+            "setup_margin_ms": ACT_TYPE_EMISSION_SETUP_MARGIN_MS,
+            "required_lease_ttl_ms": plan.required_lease_ttl_ms,
+            "max_lease_ttl_ms": max_lease_ttl_ms,
+            "source_of_truth": "synapse_action::sample_typing_schedule over the emitted text and resolved dynamics",
+            "remediation": "split the text across several act_type calls so each planned timeline fits the maximum foreground input lease, or lower the per-character pacing",
+        })),
+    )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]

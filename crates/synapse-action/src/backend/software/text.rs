@@ -26,6 +26,13 @@ pub(super) fn type_text(text: &str, dynamics: &KeystrokeDynamics) -> Result<(), 
 /// its `SendInput`. The emission position (`unit_index`/`unit_total`) is
 /// threaded down so a refusal names the exact character the sequence stopped
 /// at, and the caller can re-issue only the undelivered remainder (#2057).
+///
+/// Because that timeline routinely outruns any default lease TTL, every unit
+/// that has *already* cleared the fence heartbeats the holder's own input lease
+/// (#2065). The heartbeat is bounded by the budget armed at the MCP layer and
+/// cannot revive a lapsed or preempted lease, so a legitimately long string runs
+/// to completion while a genuinely lost lease still refuses at the very next
+/// emission boundary.
 fn type_text_with_sender(
     text: &str,
     dynamics: &KeystrokeDynamics,
@@ -59,6 +66,11 @@ fn type_text_with_sender(
                     .of(unit_total),
             )?;
             unit_index += 1;
+            // This unit passed the per-emission fence, so the lease was held and
+            // the bound window still owned the foreground at the OS call. Re-arm
+            // that same lease inside its armed ceiling so the *next* unit is not
+            // refused merely because the string is long (#2065).
+            crate::lease::heartbeat_emission_budget();
             thread::yield_now();
             ensure_operator_release_not_requested(
                 release_epoch,
