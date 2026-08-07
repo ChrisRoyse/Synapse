@@ -15,6 +15,23 @@ use serde_json::{Value, json};
 use synapse_core::SubsystemHealth;
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// Boot-time verdict on how the previous run of this vault ended (#2083).
+///
+/// The previous daemon wrote `ended_at_unix_ms` + `ended_reason` into
+/// `daemon-run-current.json` as the last durable act of its graceful exit
+/// (`record_exit_for_state_locked`). Their presence is therefore the
+/// clean-shutdown discriminator, exactly the role `pg_control`'s
+/// `DB_SHUTDOWNED` plays for PostgreSQL and `.kafka_cleanshutdown` plays for
+/// Kafka -- and the same role
+/// [`crate::m4::ShellJobSupervisorMarker::clean_shutdown_at`] plays for the
+/// shell-job store.
+const PREVIOUS_SHUTDOWN_CLEAN: &str = "clean";
+/// A previous run record exists but never recorded an end: the process died
+/// without reaching its graceful-exit finalization.
+const PREVIOUS_SHUTDOWN_DIRTY: &str = "dirty";
+/// No previous run record at all -- a first boot on this vault.
+const PREVIOUS_SHUTDOWN_NONE: &str = "none";
 // These files live inside the vault directory, so their names are owned by
 // `synapse_calyx::vault_runtime`: a vault backup must exclude exactly this set
 // by name (they are the running process's state, never vault data) and the two
@@ -75,6 +92,28 @@ struct RunRecord {
     started_at_unix_ms: u64,
     ended_at_unix_ms: Option<u64>,
     ended_reason: Option<String>,
+    /// How the *previous* run on this vault ended, decided at boot (#2083).
+    ///
+    /// [`PREVIOUS_SHUTDOWN_CLEAN`] / [`PREVIOUS_SHUTDOWN_DIRTY`] /
+    /// [`PREVIOUS_SHUTDOWN_NONE`]. `configure` already appended a
+    /// `previous_run_unclean` exit event for the dirty case, but that evidence
+    /// only existed inside the append-only exit ledger: nothing in the live
+    /// `daemon-run-current.json`, in the boot log, or in `/health` said whether
+    /// this daemon inherited a clean stop or a crash. An operator stopping the
+    /// daemon (`synapse-setup.ps1 -Stop`) and restarting it (`-Start`) needs
+    /// that verdict at the *next* boot to prove the stop was clean, so it is
+    /// carried on the run record itself.
+    ///
+    /// `#[serde(default)]` on all four fields: run records written before this
+    /// change do not carry them and must still deserialize.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_shutdown: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_ended_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_ended_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -539,7 +578,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         exit_events_path: config.db_path.join(EXIT_EVENTS_FILE).display().to_string(),
     };
 
-    let run = RunRecord {
+    let mut run = RunRecord {
         schema_version: SCHEMA_VERSION,
         run_id: format!(
             "{}-{}-{}",
@@ -554,6 +593,10 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         started_at_unix_ms: now_unix_ms(),
         ended_at_unix_ms: None,
         ended_reason: None,
+        previous_shutdown: None,
+        previous_run_id: None,
+        previous_ended_reason: None,
+        previous_ended_at_unix_ms: None,
     };
     let max_segment_bytes = configured_max_segment_bytes();
     let (tool_events, exit_events) = with_lifecycle_ledger_lock(
@@ -600,6 +643,30 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                 )
             })?;
             retire_legacy_tool_last_pointer(Path::new(&paths.tool_last_path));
+
+            // #2083: decide the clean/dirty verdict for the previous run and
+            // carry it on THIS run's record, before that record is written. The
+            // `previous_run_unclean` exit event below is append-only evidence
+            // that only a ledger reader ever sees; the run record is what
+            // `/health`, the boot log, and `synapse-setup.ps1 -Start` read.
+            match previous_run.as_ref() {
+                None => {
+                    run.previous_shutdown = Some(PREVIOUS_SHUTDOWN_NONE.to_owned());
+                }
+                Some(previous) => {
+                    run.previous_run_id = Some(previous.run_id.clone());
+                    run.previous_ended_reason = previous.ended_reason.clone();
+                    run.previous_ended_at_unix_ms = previous.ended_at_unix_ms;
+                    run.previous_shutdown = Some(
+                        if previous.ended_at_unix_ms.is_some() {
+                            PREVIOUS_SHUTDOWN_CLEAN
+                        } else {
+                            PREVIOUS_SHUTDOWN_DIRTY
+                        }
+                        .to_owned(),
+                    );
+                }
+            }
 
             if let Some(previous) = previous_run.as_ref()
                 && previous.ended_at_unix_ms.is_none()
@@ -649,6 +716,22 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             Ok((tool_events, exit_events))
         },
     )?;
+    // Captured before `run` moves into the state: these are the #2083 boot
+    // verdict fields. No default is substituted -- both arms of the match above
+    // set `previous_shutdown`, so a `None` here means the verdict logic itself
+    // was bypassed, and booting without knowing whether the last stop was clean
+    // is exactly the blindness this exists to remove.
+    let previous_shutdown = run.previous_shutdown.clone().ok_or_else(|| {
+        anyhow::anyhow!(
+            "daemon lifecycle configure reached state installation without deciding a previous-shutdown verdict: run_id={} run_current_path={}",
+            run.run_id,
+            paths.run_current_path
+        )
+    })?;
+    let previous_run_id = run.previous_run_id.clone();
+    let previous_ended_reason = run.previous_ended_reason.clone();
+    let previous_ended_at_unix_ms = run.previous_ended_at_unix_ms;
+    let run_id = run.run_id.clone();
     let state = DaemonLifecycleState {
         run,
         paths: paths.clone(),
@@ -671,8 +754,37 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         tool_last_path = %paths.tool_last_path,
         tool_events_path = %paths.tool_events_path,
         exit_events_path = %paths.exit_events_path,
+        previous_shutdown = %previous_shutdown,
         "daemon lifecycle ledger configured"
     );
+    // #2083: one line, emitted on every boot, that answers "was the last stop
+    // clean?" without reading a ledger. `dirty` is a warning because it means a
+    // daemon died without finishing its drain -- storage close, input-lease
+    // release and the graceful exit record all failed to run.
+    if previous_shutdown == PREVIOUS_SHUTDOWN_DIRTY {
+        tracing::warn!(
+            code = "MCP_DAEMON_PREVIOUS_SHUTDOWN",
+            previous_shutdown = %previous_shutdown,
+            previous_run_id = previous_run_id.as_deref().unwrap_or("<none>"),
+            previous_ended_reason = previous_ended_reason.as_deref().unwrap_or("<none>"),
+            previous_ended_at_unix_ms,
+            run_id = %run_id,
+            run_current_path = %paths.run_current_path,
+            exit_events_path = %paths.exit_events_path,
+            "previous daemon run ended without recording a graceful exit; a previous_run_unclean event was appended to the exit ledger"
+        );
+    } else {
+        tracing::info!(
+            code = "MCP_DAEMON_PREVIOUS_SHUTDOWN",
+            previous_shutdown = %previous_shutdown,
+            previous_run_id = previous_run_id.as_deref().unwrap_or("<none>"),
+            previous_ended_reason = previous_ended_reason.as_deref().unwrap_or("<none>"),
+            previous_ended_at_unix_ms,
+            run_id = %run_id,
+            run_current_path = %paths.run_current_path,
+            "previous daemon shutdown verdict decided at boot"
+        );
+    }
     Ok(paths)
 }
 
@@ -2268,8 +2380,17 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         Path::new(&state.paths.exit_events_path),
         state.max_segment_bytes,
     );
+    // #2083: `previous_shutdown` rides on /health so an operator (or the
+    // -Start path) can prove a stop was clean without opening the vault.
+    let previous_shutdown = state
+        .run
+        .previous_shutdown
+        .as_deref()
+        .unwrap_or("unrecorded");
+    let previous_run_id = state.run.previous_run_id.as_deref().unwrap_or("none");
+    let previous_ended_reason = state.run.previous_ended_reason.as_deref().unwrap_or("none");
     format!(
-        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} last_error={}",
+        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} previous_shutdown={} previous_run_id={} previous_ended_reason={} last_error={}",
         state.run.run_id,
         state.run.pid,
         state.paths.run_current_path,
@@ -2279,6 +2400,9 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         state.in_flight.len(),
         tool_ledger,
         exit_ledger,
+        previous_shutdown,
+        previous_run_id,
+        previous_ended_reason,
         last_error
     )
 }
