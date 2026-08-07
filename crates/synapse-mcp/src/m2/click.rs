@@ -987,10 +987,21 @@ pub(super) fn acquire_click_foreground_lease(
         ));
         return Err(attach_click_tier_attempts(error, tier_attempts.clone()));
     }
+    // #2071 non-reducing rule, applied at this out-of-funnel acquisition site
+    // too: an action must never renew a live same-owner lease DOWN below its
+    // remaining TTL. The hold-derived TTL stays the floor; a caller-held longer
+    // lease survives; the ceiling stays hard.
+    let lease_ttl_ms = crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
+        .max(
+            foreground_click_policy
+                .session_id()
+                .map_or(0, synapse_action::lease::owner_remaining_ttl_ms),
+        )
+        .min(synapse_action::MAX_LEASE_TTL_MS);
     match crate::m2::acquire_foreground_input_lease_with_ttl(
         "act_click",
         foreground_click_policy.session_id(),
-        crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms),
+        lease_ttl_ms,
     ) {
         Ok(guard) => Ok(guard),
         Err(error) => {

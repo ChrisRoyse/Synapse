@@ -370,6 +370,31 @@ pub fn renew(session_id: &str, ttl: Option<Duration>) -> Result<LeaseStatus, Lea
     }
 }
 
+/// Remaining TTL, in milliseconds, of a live lease owned by exactly
+/// `session_id` — the caller's own foreground authority, used as the floor no
+/// action acquisition may lower (#2065, generalized in #2071).
+///
+/// Returns `0` when the lease is unheld, owned by another session, or tagged as
+/// an operator-panic preemption. A lapsed lease is expired through the normal
+/// [`expire_if_lapsed`] path *first*, so this can never report authority that a
+/// later emission would not actually get, and an expired owner still lands in
+/// the held-input cleanup ledger exactly as [`status`] would leave it.
+///
+/// This is a pure readback: it never creates, revives, extends or shortens a
+/// lease. Action tiers call it so an acquisition can raise the TTL to fit the
+/// action's own planned emission timeline while never *lowering* the window the
+/// caller already bought with an explicit `lease_acquire`/`foreground` call.
+#[must_use]
+pub fn owner_remaining_ttl_ms(session_id: &str) -> u64 {
+    let now = Instant::now();
+    let mut guard = lock();
+    let _expired = expire_if_lapsed(&mut guard, now);
+    guard
+        .as_ref()
+        .filter(|lease| lease.owner_session_id == session_id && !lease.is_tagged_operator_panic())
+        .map_or(0, |lease| duration_ms(lease.expires_in(now)))
+}
+
 /// The in-flight **emission heartbeat budget** (#2065).
 ///
 /// A single foreground action can span far more wall-clock time than any sane

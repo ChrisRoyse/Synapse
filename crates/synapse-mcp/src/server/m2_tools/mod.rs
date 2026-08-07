@@ -1742,7 +1742,31 @@ impl SynapseService {
             recording.is_some(),
             plan.requires_input_lease(),
         ) {
-            match acquire_tool_foreground_input_lease(self, "act_stroke", &request_context) {
+            // #2071: a stroke is a multi-emission action — one cursor mutation
+            // per planned sample, each re-gated by the #2057 fence — so its
+            // lease is sized from the plan the emitter will replay, not from the
+            // 5 s action default.
+            let stroke_lease_ttl_ms = match act_stroke_planned_lease_ttl_ms(&stroke_details) {
+                Ok(ttl_ms) => ttl_ms,
+                Err(error) => {
+                    let failure_details =
+                        act_stroke_failure_audit_details(&stroke_details, &preflight, &error);
+                    log_act_stroke_failure(&failure_details, &error);
+                    self.audit_action_error_with_details_for_request(
+                        "act_stroke",
+                        &error,
+                        &failure_details,
+                        &request_context,
+                    )?;
+                    return Err(error);
+                }
+            };
+            match acquire_tool_foreground_input_lease_with_ttl(
+                self,
+                "act_stroke",
+                &request_context,
+                stroke_lease_ttl_ms,
+            ) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
                     let failure_details =
@@ -2871,6 +2895,11 @@ fn visual_delta_text_integrity(source_of_truth: &str) -> String {
     format!("verify_delta_visual_readback:{source_of_truth}")
 }
 
+/// Acquires the foreground input lease for a single-shot action at the default
+/// action TTL.
+///
+/// The default is a **floor**, never a clamp: see
+/// [`effective_action_lease_ttl_ms`].
 fn acquire_tool_foreground_input_lease(
     service: &SynapseService,
     tool: &'static str,
@@ -2890,6 +2919,30 @@ fn acquire_tool_foreground_input_lease_with_ttl(
     request_context: &RequestContext<RoleServer>,
     ttl_ms: u64,
 ) -> Result<crate::m2::ForegroundInputLeaseGuard, ErrorData> {
+    acquire_tool_foreground_input_lease_sized(service, tool, request_context, ttl_ms)
+        .map(|(guard, _lease_ttl_ms)| guard)
+}
+
+/// The single foreground-input-lease acquisition funnel for every m2 tool, and
+/// the one place the non-reducing TTL rule (#2065, generalized in #2071) is
+/// applied.
+///
+/// `action_required_ttl_ms` is what *this action* needs: the action default for
+/// a single-shot verb, or the action's own planned emission timeline when it can
+/// compute one (`act_type`, `act_set_field_text`, `act_stroke`, and the
+/// `hold_ms`-sized keyboard verbs). The effective TTL handed to the lease
+/// registry is [`effective_action_lease_ttl_ms`] of that number, so a caller who
+/// bought a longer window with `act operation=lease_acquire` keeps it.
+///
+/// Returns the guard together with the effective TTL, so a caller that also arms
+/// the emission heartbeat budget arms it against the window actually granted
+/// rather than the one it asked for.
+fn acquire_tool_foreground_input_lease_sized(
+    service: &SynapseService,
+    tool: &'static str,
+    request_context: &RequestContext<RoleServer>,
+    action_required_ttl_ms: u64,
+) -> Result<(crate::m2::ForegroundInputLeaseGuard, u64), ErrorData> {
     // `None` here means the stdio transport by construction — an HTTP request
     // without Mcp-Session-Id fails hard upstream. stdio is single-client, so
     // the stable "stdio" owner (the same idiom the m3 layer uses) gives the
@@ -2900,11 +2953,148 @@ fn acquire_tool_foreground_input_lease_with_ttl(
     if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
         return Err(hidden_desktop_foreground_refusal(tool, &hidden_desktop));
     }
-    crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), ttl_ms)
+    let lease_ttl_ms = effective_action_lease_ttl_ms(tool, &session_id, action_required_ttl_ms);
+    let guard =
+        crate::m2::acquire_foreground_input_lease_with_ttl(tool, Some(&session_id), lease_ttl_ms)?;
+    Ok((guard, lease_ttl_ms))
 }
 
+/// Computes the TTL an action lease acquisition may actually install, and logs
+/// the decision.
+///
+/// The rule, from #2065 and generalized to every foreground verb by #2071: an
+/// action lease may be **raised** to fit the action's own planned timeline, but
+/// must never be **lowered** below what the acquiring session's live lease still
+/// has left. Before this, every verb except `act_type` renewed its own caller's
+/// 60 s lease down to `DEFAULT_LEASE_TTL_MS` (5 s) — physically reproduced in
+/// #2071 as `INPUT_LEASE_ACTION_RENEWED tool="act_focus_window" ttl_ms=5000`
+/// immediately after `INPUT_LEASE_ACQUIRED ttl_ms=60000`. After #2057's
+/// per-emission fence that silent shortening aborts any *later* multi-emission
+/// action mid-sequence with `M2_EMISSION_FENCE_LEASE_NOT_HELD`.
+///
+/// The caller floor is read through [`synapse_action::lease::owner_remaining_ttl_ms`],
+/// which expires a lapsed lease first and ignores a lease owned by anyone else
+/// or tagged as an operator-panic preemption — so this can only ever preserve
+/// authority the same session provably still holds, never manufacture it. The
+/// result stays capped at `MAX_LEASE_TTL_MS`; nothing here widens the ceiling,
+/// touches the per-emission fence, or introduces a grace window.
+fn effective_action_lease_ttl_ms(
+    tool: &'static str,
+    session_id: &str,
+    action_required_ttl_ms: u64,
+) -> u64 {
+    let caller_lease_remaining_ms = synapse_action::lease::owner_remaining_ttl_ms(session_id);
+    let lease_ttl_ms = action_required_ttl_ms
+        .max(caller_lease_remaining_ms)
+        .min(synapse_action::MAX_LEASE_TTL_MS);
+    let reason = if caller_lease_remaining_ms > action_required_ttl_ms {
+        "caller_lease_remaining_preserved"
+    } else if action_required_ttl_ms > synapse_action::DEFAULT_LEASE_TTL_MS {
+        "action_planned_timeline"
+    } else {
+        "action_default_floor"
+    };
+    tracing::info!(
+        code = "INPUT_LEASE_ACTION_TTL_SIZED",
+        tool,
+        session_id,
+        action_required_ttl_ms,
+        caller_lease_remaining_ms,
+        lease_ttl_ms,
+        ttl_ms_before = caller_lease_remaining_ms,
+        ttl_ms_after = lease_ttl_ms,
+        reduced_caller_ttl = lease_ttl_ms < caller_lease_remaining_ms,
+        reason,
+        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        "readback=input_lease action lease TTL sized; a live same-owner lease is never shortened"
+    );
+    lease_ttl_ms
+}
+
+/// Sizes the keyboard verbs (`act_press`, `act_keymap`) from their declared
+/// hold: `DEFAULT_LEASE_TTL_MS` as a floor, raised by `hold_ms` plus the
+/// foreground-restore stability window. The caller's own live TTL is applied on
+/// top of this by [`effective_action_lease_ttl_ms`], so the hold-derived number
+/// is a floor too, never a clamp (#2071).
 fn lease_ttl_for_hold_ms(hold_ms: u32) -> u64 {
     crate::m2::foreground_input_lease_ttl_for_hold_ms(hold_ms)
+}
+
+/// Per-sample cost of a stroke emission beyond the planned sample timeline: the
+/// cursor mutation itself plus the per-emission foreground fence readbacks
+/// (#2057). Deliberately an over-estimate — unlike `act_type` the mouse emission
+/// loop has no in-flight heartbeat, so the up-front number is the only budget.
+const ACT_STROKE_EMISSION_SAMPLE_OVERHEAD_MS: u64 = 1;
+/// Head/tail margin around a stroke's sample timeline: button press/release,
+/// modifier settle, the delta-signature readbacks and the postcondition verify,
+/// all of which run under the same lease.
+const ACT_STROKE_SETUP_MARGIN_MS: u64 = 10_000;
+
+/// Sizes the `act_stroke` foreground input lease from the stroke plan Synapse
+/// already validated and audited (#2071).
+///
+/// The source of truth is the same `StrokePlan` the emitter replays, read from
+/// the audited request details (`plan.duration_ms` = the planned sample
+/// timeline, `plan.point_stream_count` = the number of gated cursor emissions).
+/// A drag whose path takes 20 s used to run under a 5 s lease and, after the
+/// #2057 per-emission fence, would refuse part-way through with
+/// `M2_EMISSION_FENCE_LEASE_NOT_HELD`.
+///
+/// Fails loud rather than guessing: this is only ever called on the leased
+/// (non-CDP-aim) route, where the plan is always present, so a missing or
+/// non-finite planned duration is an internal invariant violation, not a case to
+/// fall back on. `MAX_STROKE_DURATION_MS` (60 000) and `MAX_STROKE_SAMPLES`
+/// (60 001) bound the result at ~130 s, well inside `MAX_LEASE_TTL_MS`; the
+/// explicit over-max refusal exists so raising those caps can never turn into a
+/// silently truncated lease.
+fn act_stroke_planned_lease_ttl_ms(stroke_details: &Value) -> Result<u64, ErrorData> {
+    let planned = &stroke_details["plan"];
+    let planned_duration_ms = planned["duration_ms"]
+        .as_f64()
+        .filter(|duration| duration.is_finite() && *duration >= 0.0)
+        .ok_or_else(|| act_stroke_plan_field_unusable_error("a finite duration_ms", planned))?;
+    let point_stream_count = planned["point_stream_count"]
+        .as_u64()
+        .ok_or_else(|| act_stroke_plan_field_unusable_error("a point_stream_count", planned))?;
+    let planned_emission_ms = (planned_duration_ms.ceil() as u64)
+        .saturating_add(point_stream_count.saturating_mul(ACT_STROKE_EMISSION_SAMPLE_OVERHEAD_MS));
+    let required_lease_ttl_ms = planned_emission_ms
+        .saturating_add(ACT_STROKE_SETUP_MARGIN_MS)
+        .max(synapse_action::DEFAULT_LEASE_TTL_MS);
+    if required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_stroke refused before emitting: this path needs a foreground input lease of {required_lease_ttl_ms} ms ({point_stream_count} gated cursor emissions over {planned_duration_ms:.0} ms of planned motion plus {ACT_STROKE_SETUP_MARGIN_MS} ms of setup/verify margin), but the maximum foreground input lease is {} ms. Split the stroke into shorter segments or raise its speed.",
+                synapse_action::MAX_LEASE_TTL_MS
+            ),
+        ));
+    }
+    tracing::info!(
+        code = "M2_ACT_STROKE_EMISSION_LEASE_SIZED",
+        tool = "act_stroke",
+        point_stream_count,
+        planned_duration_ms,
+        planned_emission_ms,
+        required_lease_ttl_ms,
+        max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
+        source_of_truth = "validated act_stroke plan (duration_ms, point_stream_count)",
+        "readback=input_lease act_stroke lease sized from its planned sample timeline"
+    );
+    Ok(required_lease_ttl_ms)
+}
+
+/// The leased stroke route always runs on a validated plan, so a plan field the
+/// lease sizing needs but cannot read is an internal invariant violation. It
+/// fails the action loudly instead of quietly falling back to a default TTL that
+/// would abort the stroke mid-path at the #2057 fence.
+fn act_stroke_plan_field_unusable_error(field: &'static str, planned: &Value) -> ErrorData {
+    mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!(
+            "act_stroke internal error: the validated stroke plan carried no {field}, so its foreground input lease cannot be sized from the planned motion timeline; plan={planned}"
+        ),
+    )
 }
 
 /// Per-UTF-16-unit cost of a foreground type emission *beyond* the sampled
@@ -2965,14 +3155,15 @@ fn act_type_emission_plan(text: &str, dynamics: &KeystrokeDynamics) -> ActTypeEm
 /// Acquires the foreground input lease for `act_type`, sized for the planned
 /// emission timeline, and arms the in-flight emission heartbeat (#2065).
 ///
-/// Three properties this must hold, all of which the plain
-/// [`acquire_tool_foreground_input_lease`] helper cannot:
+/// Three properties this must hold:
 ///
 /// * the TTL is derived from how long this specific string will actually take to
 ///   emit, not from `DEFAULT_LEASE_TTL_MS`;
 /// * a longer TTL the caller already bought with `act operation=foreground` is
 ///   never silently shortened — the effective TTL is the max of the two, and both
-///   numbers are logged;
+///   numbers are logged. Since #2071 that rule lives in
+///   [`effective_action_lease_ttl_ms`] and applies to every foreground verb; this
+///   site adds the typing-specific plan numbers to the audit trail;
 /// * a payload whose planned timeline cannot fit inside `MAX_LEASE_TTL_MS` is
 ///   refused **before** any character is typed, naming the limit and the plan,
 ///   instead of being truncated mid-flight.
@@ -3007,17 +3198,7 @@ fn acquire_act_type_foreground_input_lease(
     }
     let session_id =
         foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
-    let existing = synapse_action::lease::status();
-    let caller_lease_remaining_ms =
-        if existing.held && existing.owner_session_id.as_deref() == Some(session_id.as_str()) {
-            existing.expires_in_ms.unwrap_or(0)
-        } else {
-            0
-        };
-    let lease_ttl_ms = plan
-        .required_lease_ttl_ms
-        .max(caller_lease_remaining_ms)
-        .min(synapse_action::MAX_LEASE_TTL_MS);
+    let caller_lease_remaining_ms = synapse_action::lease::owner_remaining_ttl_ms(&session_id);
     tracing::info!(
         code = "M2_ACT_TYPE_EMISSION_LEASE_SIZED",
         tool = "act_type",
@@ -3026,17 +3207,23 @@ fn acquire_act_type_foreground_input_lease(
         planned_emission_ms = plan.planned_emission_ms,
         required_lease_ttl_ms = plan.required_lease_ttl_ms,
         caller_lease_remaining_ms,
-        lease_ttl_ms,
+        lease_ttl_ms = plan
+            .required_lease_ttl_ms
+            .max(caller_lease_remaining_ms)
+            .min(synapse_action::MAX_LEASE_TTL_MS),
         max_lease_ttl_ms = synapse_action::MAX_LEASE_TTL_MS,
         source_of_truth =
             "synapse_action::sample_typing_schedule over the emitted text and resolved dynamics",
         "readback=input_lease act_type lease sized from its planned emission timeline; a longer caller TTL is never shortened"
     );
-    let lease_guard = acquire_tool_foreground_input_lease_with_ttl(
+    // The funnel applies the same non-reducing rule and returns the window it
+    // actually installed, so the heartbeat budget is armed against the granted
+    // TTL rather than the requested one.
+    let (lease_guard, lease_ttl_ms) = acquire_tool_foreground_input_lease_sized(
         service,
         "act_type",
         request_context,
-        lease_ttl_ms,
+        plan.required_lease_ttl_ms,
     )?;
     let budget_guard = synapse_action::lease::arm_emission_budget(
         &session_id,
@@ -4028,8 +4215,42 @@ impl SynapseService {
             )
         })?;
 
-        let _lease_guard =
-            acquire_tool_foreground_input_lease(self, "act_set_field_text", request_context)?;
+        // #2071: the Chromium foreground tier types the whole replacement under
+        // this one lease — one gated `SendInput` per UTF-16 unit — so it is sized
+        // from the same deterministic schedule `act_type` plans with, and arms
+        // the same in-flight emission heartbeat (#2065): the software text
+        // backend heartbeats every unit that has already cleared the fence.
+        let replacement_dynamics = KeystrokeDynamics::Natural {
+            params: KeystrokeNaturalParams::FAST,
+        };
+        let replacement_plan = act_type_emission_plan(&params.text, &replacement_dynamics);
+        if replacement_plan.required_lease_ttl_ms > synapse_action::MAX_LEASE_TTL_MS {
+            return Err(set_field_text_foreground_error(
+                &target,
+                error_codes::TOOL_PARAMS_INVALID,
+                "emission_budget_exceeds_max_lease",
+                format!(
+                    "act_set_field_text refused before typing anything: replacing this field needs a foreground input lease of {} ms ({} OS emissions, {} ms of planned keystroke timeline), but the maximum foreground input lease is {} ms. Split the replacement across shorter calls.",
+                    replacement_plan.required_lease_ttl_ms,
+                    replacement_plan.unit_total,
+                    replacement_plan.planned_emission_ms,
+                    synapse_action::MAX_LEASE_TTL_MS
+                ),
+            ));
+        }
+        let lease_session_id =
+            foreground_lease_session_id(request_context)?.unwrap_or_else(|| "stdio".to_owned());
+        let (_lease_guard, lease_ttl_ms) = acquire_tool_foreground_input_lease_sized(
+            self,
+            "act_set_field_text",
+            request_context,
+            replacement_plan.required_lease_ttl_ms,
+        )?;
+        let _emission_budget_guard = synapse_action::lease::arm_emission_budget(
+            &lease_session_id,
+            Duration::from_millis(lease_ttl_ms),
+            Duration::from_millis(synapse_action::MAX_LEASE_TTL_MS),
+        );
         crate::m2::foreground_fence::arm_expected_target(
             target.root_hwnd,
             "act_set_field_text_foreground_target",
@@ -4172,9 +4393,8 @@ impl SynapseService {
                 crate::m2::METHOD_FOREGROUND_REPLACE,
                 Action::TypeText {
                     text: params.text.clone(),
-                    dynamics: KeystrokeDynamics::Natural {
-                        params: KeystrokeNaturalParams::FAST,
-                    },
+                    // Exactly the dynamics the lease above was sized from.
+                    dynamics: replacement_dynamics,
                     backend: Backend::Auto,
                 },
             )
