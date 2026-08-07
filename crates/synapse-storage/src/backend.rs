@@ -193,6 +193,21 @@ pub struct CalyxVaultInspect {
     pub payload_bytes: u64,
     pub stored_value_bytes: u64,
     pub total_logical_bytes: u64,
+    /// Pages the bounded-hold census actually read (#2041).
+    pub census_pages: u64,
+    /// Candidate rows requested per page.
+    pub census_page_rows: u64,
+    /// Committed sequence serving the census's first page.
+    pub census_snapshot_seq_first: u64,
+    /// Committed sequence serving the census's last page.
+    pub census_snapshot_seq_last: u64,
+    /// Whether every page was served by the same committed sequence.
+    ///
+    /// True means the totals below describe one instant, exactly as the
+    /// single-acquisition scan this replaced always did. False means a commit
+    /// landed mid-census and the totals describe an interval — reported rather
+    /// than silently presented as an instant.
+    pub census_atomic: bool,
     pub collections: BTreeMap<String, CalyxVaultCollectionInspect>,
 }
 
@@ -3717,16 +3732,34 @@ impl StorageBackend for CalyxBackend {
         self.pressure.probe_readback()
     }
 
+    /// Logical bytes per column family, folded with **bounded** row-guard holds.
+    ///
+    /// Identical arithmetic to the materialising version it replaces — the same
+    /// decoded logical key plus payload of the same live rows — but the rows are
+    /// summed page by page and never all held at once, and the MVCC row-table
+    /// read guard is released between pages (#2041). The previous shape took one
+    /// guard acquisition per column family and held it for the whole family;
+    /// with `storage inspect` also calling `cf_row_counts` and `scan_cf_tail`
+    /// that was 51 unbounded holds of the lock every vault write needs.
     fn cf_sizes(&self) -> StorageResult<BTreeMap<String, u64>> {
-        let mut sizes = BTreeMap::new();
-        for cf_name in cf::ALL_COLUMN_FAMILIES {
-            let mut bytes = 0_u64;
-            for (key, value) in self.read_all_rows(cf_name)? {
-                bytes = bytes.saturating_add(key.len() as u64);
-                bytes = bytes.saturating_add(value.len() as u64);
-            }
-            sizes.insert(cf_name.to_owned(), bytes);
-        }
+        let mut sizes: BTreeMap<String, u64> = cf::ALL_COLUMN_FAMILIES
+            .iter()
+            .map(|cf_name| ((*cf_name).to_owned(), 0_u64))
+            .collect();
+        self.with_vault(
+            "<calyx-vault>",
+            "sum logical Calyx namespace bytes with bounded row-guard holds",
+            false,
+            |vault| {
+                sweep_every_calyx_namespace(vault, "cf_sizes", |cf_name, key, payload| {
+                    let entry = sizes.entry(cf_name.to_owned()).or_insert(0);
+                    *entry = entry
+                        .saturating_add(key.len() as u64)
+                        .saturating_add(payload.len() as u64);
+                    Ok(())
+                })
+            },
+        )?;
         emit_storage_cf_bytes(&sizes);
         Ok(sizes)
     }
@@ -3736,14 +3769,30 @@ impl StorageBackend for CalyxBackend {
         Ok((sizes, Vec::new()))
     }
 
+    /// Live rows per column family, counted with **bounded** row-guard holds.
+    ///
+    /// The count is the same set of rows the materialising version counted —
+    /// same decode, same expiry filter, same strictly-increasing-key assertion —
+    /// but nothing is retained beyond the counter, so a 200,000-row family costs
+    /// one `u64` instead of a vector of its whole contents, and the row-table
+    /// read guard is released every 256 candidates (#2041).
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>> {
-        let mut counts = BTreeMap::new();
-        for cf_name in cf::ALL_COLUMN_FAMILIES {
-            counts.insert(
-                cf_name.to_owned(),
-                self.read_all_rows(cf_name)?.len() as u64,
-            );
-        }
+        let mut counts: BTreeMap<String, u64> = cf::ALL_COLUMN_FAMILIES
+            .iter()
+            .map(|cf_name| ((*cf_name).to_owned(), 0_u64))
+            .collect();
+        self.with_vault(
+            "<calyx-vault>",
+            "count live Calyx namespace rows with bounded row-guard holds",
+            false,
+            |vault| {
+                sweep_every_calyx_namespace(vault, "cf_row_counts", |cf_name, _key, _payload| {
+                    let entry = counts.entry(cf_name.to_owned()).or_insert(0);
+                    *entry = entry.saturating_add(1);
+                    Ok(())
+                })
+            },
+        )?;
         Ok(counts)
     }
 
@@ -7041,15 +7090,40 @@ impl StorageBackend for CalyxBackend {
         self.vault.release_coherent_scan(lease)
     }
 
+    /// The last `max_rows` live rows of one column family, in ascending logical
+    /// key order, read with **bounded** row-guard holds.
+    ///
+    /// `storage inspect` asks for three sample rows per family. The materialising
+    /// version answered that by folding the entire family into a vector under one
+    /// row-table read guard and then discarding all but the last three — on the
+    /// live vault, up to 200,000 rows read and thrown away per family, 17 times,
+    /// under the lock every vault write must take exclusively (#2041).
+    ///
+    /// The sweep keeps a ring of exactly `max_rows` rows instead. The result is
+    /// byte-identical because the sweep visits the same live rows in the same
+    /// strictly-increasing logical key order the unpaged reader asserted.
     fn scan_cf_tail(&self, cf_name: &str, max_rows: usize) -> StorageResult<Vec<RawRow>> {
         if max_rows == 0 {
             return Ok(Vec::new());
         }
-        let mut rows = self.read_all_rows(cf_name)?;
-        if rows.len() > max_rows {
-            rows.drain(0..rows.len() - max_rows);
-        }
-        Ok(rows)
+        let mut tail: std::collections::VecDeque<RawRow> =
+            std::collections::VecDeque::with_capacity(max_rows);
+        self.with_vault(
+            cf_name,
+            "read the tail of a Calyx namespace with bounded row-guard holds",
+            false,
+            |vault| {
+                sweep_calyx_namespace_live_rows(vault, cf_name, "scan_cf_tail", |key, payload| {
+                    if tail.len() == max_rows {
+                        tail.pop_front();
+                    }
+                    tail.push_back((key.to_vec(), payload.to_vec()));
+                    Ok(())
+                })
+                .map(|_sweep| ())
+            },
+        )?;
+        Ok(tail.into())
     }
 
     fn compact_cf(&self, cf_name: &str) -> StorageResult<()> {
@@ -7400,24 +7474,106 @@ fn inspect_calyx_vault_with_schema(
     let inspected_at_unix_ms = vault
         .clock_now_ms()
         .map_err(|source| calyx_read_failed("<calyx-vault>", "read Calyx vault clock", &source))?;
-    let rows = vault
-        .scan_kv_range_latest(&prefix_range(&[CALYX_KV_DISC]))
-        .map_err(|source| {
-            calyx_read_failed(
-                "<calyx-vault>",
-                "scan physical Calyx KV collections",
-                &source,
-            )
-        })?;
-    let mut collections: BTreeMap<String, CalyxVaultCollectionInspect> = BTreeMap::new();
-    let mut totals = CalyxVaultTotals::default();
-    for (full_key, stored_value) in rows {
-        let key = decode_calyx_key_parts(&full_key).map_err(|detail| StorageError::ReadFailed {
+    let mut census = CalyxVaultCensus::default();
+    // Paged rather than materialised (#2041). The whole-vault census is the
+    // single largest hold in `storage inspect`: one `scan_kv_range_latest` over
+    // every collection, 1,025,928 live rows on the production vault, folded
+    // under one acquisition of the MVCC row-table read guard that every vault
+    // write must take exclusively. Nothing about the fold needs a single atomic
+    // view — it is a sum — so the guard is released every page and the window
+    // the census actually observed is reported instead of assumed.
+    let sweep = sweep_kv_range_pages(
+        vault,
+        "<calyx-vault>",
+        "calyx_vault_inspect",
+        &prefix_range(&[CALYX_KV_DISC]),
+        |full_key, stored_value| census.add_row(full_key, stored_value, inspected_at_unix_ms),
+    )?;
+    let CalyxVaultCensus {
+        collections,
+        totals,
+    } = census;
+    // One `info` record per whole-vault census, because the per-page sweep record
+    // above is `debug` and the daemon runs at `info`: without this the single
+    // largest read in `storage inspect` would leave no attributable trace at the
+    // level the daemon actually logs at, which is the state #2041 had to
+    // reconstruct from `CALYX_ASTER_ROW_READ_GUARD_SLOW` counts.
+    tracing::info!(
+        code = "STORAGE_CALYX_VAULT_CENSUS_DONE",
+        site = "calyx_vault_inspect",
+        pages = sweep.pages,
+        page_rows = CALYX_INSPECT_SWEEP_PAGE_ROWS,
+        rows_visited = sweep.rows_visited,
+        rows_examined = sweep.rows_examined,
+        collections = collections.len(),
+        snapshot_seq_first = sweep.snapshot_seq_first,
+        snapshot_seq_last = sweep.snapshot_seq_last,
+        atomic = sweep.atomic(),
+        "counted every physical Calyx KV collection with bounded row-table read-guard holds"
+    );
+    if !sweep.atomic() {
+        // Never presented as an instant when it is not one. The unpaged census
+        // was one atomic view by construction; this one is only atomic when no
+        // commit landed mid-sweep, and the caller is told which it got rather
+        // than left to assume (#2041).
+        tracing::warn!(
+            code = "STORAGE_CALYX_INSPECT_CENSUS_INTERVAL",
+            site = "calyx_vault_inspect",
+            pages = sweep.pages,
+            rows_visited = sweep.rows_visited,
+            snapshot_seq_first = sweep.snapshot_seq_first,
+            snapshot_seq_last = sweep.snapshot_seq_last,
+            "the whole-vault census observed an interval rather than one instant; a commit landed between its first and last page"
+        );
+    }
+    Ok(CalyxVaultInspect {
+        schema_version,
+        vault_id: vault.vault_id_string(),
+        latest_seq: vault.latest_seq_value(),
+        inspected_at_unix_ms,
+        collection_count: collections.len() as u64,
+        raw_row_count: totals.raw_row_count,
+        live_row_count: totals.live_row_count,
+        expired_row_count: totals.expired_row_count,
+        user_key_bytes: totals.user_key_bytes,
+        payload_bytes: totals.payload_bytes,
+        stored_value_bytes: totals.stored_value_bytes,
+        total_logical_bytes: totals.total_logical_bytes,
+        census_pages: sweep.pages as u64,
+        census_page_rows: CALYX_INSPECT_SWEEP_PAGE_ROWS as u64,
+        census_snapshot_seq_first: sweep.snapshot_seq_first,
+        census_snapshot_seq_last: sweep.snapshot_seq_last,
+        census_atomic: sweep.atomic(),
+        collections,
+    })
+}
+
+/// The whole-vault inspection fold, accumulated one page at a time (#2041).
+///
+/// Extracted from `inspect_calyx_vault_with_schema` so the per-row accounting is
+/// a named operation rather than a closure body: the sweep hands it rows in
+/// bounded batches now, and the accounting is identical whether it arrives as
+/// one materialised vector or as 4,008 pages of 256.
+#[derive(Default)]
+struct CalyxVaultCensus {
+    collections: BTreeMap<String, CalyxVaultCollectionInspect>,
+    totals: CalyxVaultTotals,
+}
+
+impl CalyxVaultCensus {
+    fn add_row(
+        &mut self,
+        full_key: &[u8],
+        stored_value: &[u8],
+        inspected_at_unix_ms: u64,
+    ) -> StorageResult<()> {
+        let key = decode_calyx_key_parts(full_key).map_err(|detail| StorageError::ReadFailed {
             cf_name: "<calyx-vault>".to_owned(),
             detail,
         })?;
         let collection_name = calyx_collection_report_name(key.collection_id, key.namespace);
-        let entry = collections
+        let entry = self
+            .collections
             .entry(collection_name.clone())
             .or_insert_with(|| CalyxVaultCollectionInspect {
                 collection_name,
@@ -7434,7 +7590,7 @@ fn inspect_calyx_vault_with_schema(
                 expires_at_ms_histogram: BTreeMap::new(),
             });
         let envelope =
-            decode_calyx_value_raw(&stored_value).map_err(|detail| StorageError::ReadFailed {
+            decode_calyx_value_raw(stored_value).map_err(|detail| StorageError::ReadFailed {
                 cf_name: entry
                     .cf_name
                     .clone()
@@ -7472,23 +7628,9 @@ fn inspect_calyx_vault_with_schema(
             .expires_at_ms_histogram
             .entry(bucket.to_owned())
             .or_insert(0) += 1;
-        totals.add(expired, user_key_bytes, payload_bytes, stored_value_bytes)?;
+        self.totals
+            .add(expired, user_key_bytes, payload_bytes, stored_value_bytes)
     }
-    Ok(CalyxVaultInspect {
-        schema_version,
-        vault_id: vault.vault_id_string(),
-        latest_seq: vault.latest_seq_value(),
-        inspected_at_unix_ms,
-        collection_count: collections.len() as u64,
-        raw_row_count: totals.raw_row_count,
-        live_row_count: totals.live_row_count,
-        expired_row_count: totals.expired_row_count,
-        user_key_bytes: totals.user_key_bytes,
-        payload_bytes: totals.payload_bytes,
-        stored_value_bytes: totals.stored_value_bytes,
-        total_logical_bytes: totals.total_logical_bytes,
-        collections,
-    })
 }
 
 #[derive(Default)]
@@ -8915,6 +9057,252 @@ fn ensure_calyx_ordered_key_migration(vault: &SynapseCalyxVault, path: &Path) ->
 
 fn decode_schema_version(bytes: &[u8]) -> Option<u32> {
     <[u8; 4]>::try_from(bytes).ok().map(u32::from_be_bytes)
+}
+
+/// Rows per page for every bounded-hold inspection sweep (#2041).
+///
+/// Deliberately the same value `synapse_calyx` swept for
+/// [`synapse_calyx::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS`] rather than a second,
+/// independently-guessed constant: that sweep measured the worst single
+/// row-table read-guard hold against `ROW_READ_GUARD_WARN_US` (25,000 us) at
+/// six page sizes on the real vault and found 256 lands the worst hold at 16%
+/// of budget, with a budget cliff between 2,048 and 4,096. Two constants would
+/// drift apart and one of them would silently be the wrong side of that cliff.
+const CALYX_INSPECT_SWEEP_PAGE_ROWS: usize = synapse_calyx::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS;
+
+/// Provenance of one bounded-hold sweep over an ordered Calyx KV range (#2041).
+///
+/// A sweep trades one long atomic view for many short ones, so the window it
+/// observed is a property of the result and is reported rather than assumed.
+/// `snapshot_seq_first == snapshot_seq_last` ([`Self::atomic`]) means no commit
+/// landed between the first and last page, and only then is the fold's output
+/// an exact census of one instant; otherwise it is a census over an interval.
+///
+/// This mirrors [`synapse_calyx::SynapseCalyxCfWalk`] exactly, and exists
+/// separately only because these sweeps are *range*-scoped: all 17 Synapse
+/// column families share the one physical `Kv` family and are distinguished by
+/// an ordered namespace prefix, so a whole-family walk would read 17x the vault
+/// to answer one family's question.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct CalyxKvSweep {
+    pages: usize,
+    rows_examined: usize,
+    rows_visited: usize,
+    snapshot_seq_first: u64,
+    snapshot_seq_last: u64,
+}
+
+impl CalyxKvSweep {
+    /// Whether every page was served by the same committed sequence.
+    const fn atomic(&self) -> bool {
+        self.pages > 0 && self.snapshot_seq_first == self.snapshot_seq_last
+    }
+
+    const fn merge(&mut self, other: Self) {
+        if self.pages == 0 {
+            self.snapshot_seq_first = other.snapshot_seq_first;
+        }
+        if other.pages > 0 {
+            self.snapshot_seq_last = other.snapshot_seq_last;
+        }
+        self.pages = self.pages.saturating_add(other.pages);
+        self.rows_examined = self.rows_examined.saturating_add(other.rows_examined);
+        self.rows_visited = self.rows_visited.saturating_add(other.rows_visited);
+    }
+}
+
+/// Folds one ordered Calyx KV range page by page, releasing the vault's
+/// row-table read guard between pages (#2041).
+///
+/// **This is the whole of #2041.** `scan_kv_range_latest` answers the same
+/// question under a *single* acquisition of the MVCC row-table read guard held
+/// for as long as it takes to merge and materialise the entire range — and that
+/// guard is the one every vault write must take exclusively, so a diagnostic
+/// read of a 1,025,928-row vault stalled unrelated MCP work for seconds. The
+/// live daemon recorded 184 `CALYX_ASTER_ROW_READ_GUARD_SLOW` events, every one
+/// of them `site="scan_cf_range_latest"`, holds commonly 27-57 ms, against a
+/// 25 ms budget.
+///
+/// Paging does not make the work smaller; it makes the *hold* bounded by a
+/// constant instead of by the size of the range. The cost is ~27% more total
+/// CPU re-merging each page's candidates, and a window that moves: the fold now
+/// describes an interval unless [`CalyxKvSweep::atomic`] holds, which is why
+/// that flag is returned rather than swallowed.
+///
+/// # Errors
+///
+/// Fails closed when a page reports more candidates without a resume cursor, or
+/// returns a cursor that does not advance — both would re-read the same page
+/// forever — and propagates the visitor's own error verbatim.
+fn sweep_kv_range_pages<V>(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    site: &'static str,
+    range: &KeyRange,
+    mut visit: V,
+) -> StorageResult<CalyxKvSweep>
+where
+    V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
+{
+    let started = Instant::now();
+    let mut cursor: Option<Vec<u8>> = None;
+    let mut sweep = CalyxKvSweep::default();
+    loop {
+        let page = vault
+            .scan_kv_range_page_latest(range, cursor.as_deref(), CALYX_INSPECT_SWEEP_PAGE_ROWS)
+            .map_err(|source| {
+                calyx_read_failed(cf_name, "scan bounded-hold Calyx KV inspection page", &source)
+            })?;
+        if sweep.pages == 0 {
+            sweep.snapshot_seq_first = page.snapshot_seq;
+        }
+        sweep.snapshot_seq_last = page.snapshot_seq;
+        sweep.pages = sweep.pages.saturating_add(1);
+        sweep.rows_examined = sweep.rows_examined.saturating_add(page.examined_rows);
+        for (key, value) in &page.rows {
+            sweep.rows_visited = sweep.rows_visited.saturating_add(1);
+            visit(key, value)?;
+        }
+        if !page.more {
+            break;
+        }
+        let Some(resume) = page.resume_after else {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_INSPECT_SWEEP_CURSOR_MISSING: page {} of the {site} sweep reported more candidates but returned no resume cursor, so the sweep cannot advance; remediation=repair the range pager so a page reporting `more` always carries `resume_after`",
+                    sweep.pages
+                ),
+            });
+        };
+        if cursor
+            .as_deref()
+            .is_some_and(|previous| resume.as_slice() <= previous)
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_INSPECT_SWEEP_CURSOR_STALLED: page {} of the {site} sweep returned a resume cursor that does not advance past the previous one, so the sweep would re-read the same page forever; remediation=repair the range pager so `resume_after` is strictly greater than the exclusive `after_key` it was given",
+                    sweep.pages
+                ),
+            });
+        }
+        cursor = Some(resume);
+    }
+    tracing::debug!(
+        code = "STORAGE_CALYX_BOUNDED_SWEEP",
+        site,
+        cf = cf_name,
+        pages = sweep.pages,
+        page_rows = CALYX_INSPECT_SWEEP_PAGE_ROWS,
+        rows_visited = sweep.rows_visited,
+        rows_examined = sweep.rows_examined,
+        elapsed_ms = started.elapsed().as_millis(),
+        snapshot_seq_first = sweep.snapshot_seq_first,
+        snapshot_seq_last = sweep.snapshot_seq_last,
+        atomic = sweep.atomic(),
+        "folded an ordered Calyx KV range page by page, releasing the row-table read guard between pages"
+    );
+    Ok(sweep)
+}
+
+/// [`sweep_kv_range_pages`] over one logical column family's ordered namespace,
+/// decoding each row exactly as [`read_rows_from_vault_range_filtered`] does and
+/// handing the visitor only the live (non-expired) rows.
+///
+/// The strictly-increasing logical-key check is carried across page boundaries
+/// rather than dropped: the unpaged reader asserted it over the materialised
+/// vector, and losing that assertion is exactly how a paged rewrite silently
+/// stops detecting a duplicate or corrupt namespace-one key.
+fn sweep_calyx_namespace_live_rows<V>(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    site: &'static str,
+    mut visit: V,
+) -> StorageResult<CalyxKvSweep>
+where
+    V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
+{
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let now_ms = vault
+        .clock_now_ms()
+        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
+    let mut previous: Option<Vec<u8>> = None;
+    sweep_kv_range_pages(vault, cf_name, site, &range, |key, value| {
+        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, key)?;
+        let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_READ_FAILED,
+                cf = cf_name,
+                detail,
+                "Calyx storage backend rejected malformed KV retention envelope"
+            );
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail,
+            }
+        })?;
+        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+            return Ok(());
+        }
+        if previous
+            .as_deref()
+            .is_some_and(|earlier| user_key.as_slice() <= earlier)
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: "CALYX_ORDERED_KEY_RANGE_OUT_OF_ORDER: physical ordered namespace did not decode into strictly increasing logical keys; remediation=inspect duplicate/corrupt namespace-one keys before retrying"
+                    .to_owned(),
+            });
+        }
+        visit(&user_key, envelope.payload)?;
+        previous = Some(user_key);
+        Ok(())
+    })
+}
+
+/// One bounded-hold pass over every Synapse column family, reported as a whole.
+///
+/// The per-family sweep is already `debug`; this is the one `info` record a
+/// multi-family diagnostic emits, so a future contention report can attribute a
+/// whole `storage inspect` to a call site without reconstructing it from 17
+/// separate lines.
+fn sweep_every_calyx_namespace<V>(
+    vault: &impl CalyxVaultKvRead,
+    site: &'static str,
+    mut visit: V,
+) -> StorageResult<()>
+where
+    V: FnMut(&'static str, &[u8], &[u8]) -> StorageResult<()>,
+{
+    let started = Instant::now();
+    let mut total = CalyxKvSweep::default();
+    let mut interval_families = 0_usize;
+    for cf_name in cf::ALL_COLUMN_FAMILIES {
+        let sweep = sweep_calyx_namespace_live_rows(vault, cf_name, site, |key, payload| {
+            visit(cf_name, key, payload)
+        })?;
+        if !sweep.atomic() {
+            interval_families = interval_families.saturating_add(1);
+        }
+        total.merge(sweep);
+    }
+    tracing::info!(
+        code = "STORAGE_CALYX_INSPECT_SWEEP_DONE",
+        site,
+        column_families = cf::ALL_COLUMN_FAMILIES.len(),
+        pages = total.pages,
+        page_rows = CALYX_INSPECT_SWEEP_PAGE_ROWS,
+        rows_visited = total.rows_visited,
+        rows_examined = total.rows_examined,
+        elapsed_ms = started.elapsed().as_millis(),
+        snapshot_seq_first = total.snapshot_seq_first,
+        snapshot_seq_last = total.snapshot_seq_last,
+        interval_families,
+        "swept every Synapse column family with bounded row-table read-guard holds"
+    );
+    Ok(())
 }
 
 fn read_all_rows_from_vault(

@@ -968,6 +968,25 @@ pub struct StorageCalyxVaultInspect {
     pub payload_bytes: u64,
     pub stored_value_bytes: u64,
     pub total_logical_bytes: u64,
+    /// Pages the bounded-hold census actually read (#2041).
+    ///
+    /// The census is folded page by page so the MVCC row-table read guard —
+    /// the one every vault write must take exclusively — is released between
+    /// pages instead of held for the whole vault.
+    pub census_pages: u64,
+    /// Candidate rows requested per census page.
+    pub census_page_rows: u64,
+    /// Committed sequence serving the census's first page.
+    pub census_snapshot_seq_first: u64,
+    /// Committed sequence serving the census's last page.
+    pub census_snapshot_seq_last: u64,
+    /// Whether every census page was served by the same committed sequence.
+    ///
+    /// True means the totals describe one instant. False means a commit landed
+    /// mid-census and they describe the interval between the two sequences
+    /// above; the daemon log carries a matching
+    /// `STORAGE_CALYX_INSPECT_CENSUS_INTERVAL` record.
+    pub census_atomic: bool,
     pub collections: BTreeMap<String, StorageCalyxVaultCollectionInspect>,
 }
 
@@ -4986,6 +5005,11 @@ fn storage_calyx_vault_inspect(report: BackendCalyxVaultInspect) -> StorageCalyx
         payload_bytes: report.payload_bytes,
         stored_value_bytes: report.stored_value_bytes,
         total_logical_bytes: report.total_logical_bytes,
+        census_pages: report.census_pages,
+        census_page_rows: report.census_page_rows,
+        census_snapshot_seq_first: report.census_snapshot_seq_first,
+        census_snapshot_seq_last: report.census_snapshot_seq_last,
+        census_atomic: report.census_atomic,
         collections: report
             .collections
             .into_iter()

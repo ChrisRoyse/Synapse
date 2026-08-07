@@ -116,7 +116,33 @@ pub(super) async fn handle(
                     "repair storage/reflex initialization and retry storage operation=inspect",
                 )
             })?;
-            let response = crate::m3::storage::inspect_storage(&db, &spec).map_err(|error| {
+            // Inspection sweeps every column family three times (bytes, row
+            // counts, tail samples) plus the whole vault once. Even with the
+            // bounded row-guard holds of #2041 that is seconds of strictly
+            // blocking CPU/IO, and running it inline parked a Tokio runtime
+            // worker for the whole call — which is why two adjacent wired
+            // `health` calls measured 5.339 s and 6.191 s while direct `/health`
+            // reads on the same daemon generation stayed at 442-518 ms. Offload
+            // it exactly like every other scan-bound storage operation in this
+            // file.
+            let response = tokio::task::spawn_blocking(move || {
+                crate::m3::storage::inspect_storage(&db, &spec)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "storage_inspect",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("storage inspection blocking task failed to join: {error}"),
+                    ),
+                    "inspect daemon logs for STORAGE_CALYX_INSPECT_SWEEP_DONE records; the inspection task terminated abnormally",
+                )
+            })?
+            .map_err(|error| {
                 facade_delegate_error(
                     STORAGE_TOOL,
                     operation.as_str(),
