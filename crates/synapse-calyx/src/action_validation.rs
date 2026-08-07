@@ -23,7 +23,14 @@ pub(crate) const ACTION_DOMAIN: &str = "synapse.action";
 /// evidence with a rerun remediation instead of a false pass.
 pub(crate) const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v2/synapse.action";
 pub(crate) const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
-pub(crate) const ACTION_PANEL_VERSION: u32 = 2_020_001;
+/// Must track `SYN_ACTION_PANEL_VERSION` in
+/// `synapse-storage/src/constellations.rs` (no dependency edge exists in this
+/// direction, so the value is duplicated by hand). A mismatch fails loud
+/// (`SYNAPSE_CALYX_ACTION_VALIDATION_PANEL_MISMATCH`) rather than reading
+/// evidence measured under a different frozen slot layout: bumped 2_020_001 ->
+/// 2_050_001 with #2050's dense target lens, which deliberately re-arms
+/// readiness — held-out evidence must be re-measured on the new generation.
+pub(crate) const ACTION_PANEL_VERSION: u32 = 2_050_001;
 const MIN_ACTION_RECORDS: usize = 50;
 pub(crate) const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;

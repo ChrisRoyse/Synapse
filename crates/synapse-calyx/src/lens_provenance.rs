@@ -333,9 +333,16 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "usage",
         ],
     ),
+    // The action panel's slots move to generation 2050001 (#2050) together. The
+    // version column is load-bearing, not documentary: `syn_anchor_source_
+    // provenance` filters this table by `version == panel_version`, so a slot
+    // left on the superseded generation is invisible to the leakage check for
+    // the live panel — a silent pass, which is the failure mode this whole
+    // module exists to remove. The table names the ACTIVE generation of each
+    // panel, exactly as the timeline rows name 1963001 and not 1900001.
     (
         48,
-        2020001,
+        2050001,
         "syn.action.kind_onehot.v2",
         &["row_kind", "tool", "verb"],
     ),
@@ -347,7 +354,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // make impossible.
     (
         49,
-        2020001,
+        2050001,
         "syn.action.target_hash.v1",
         &[
             "agent_logical_foreground.target",
@@ -360,7 +367,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // transitively and declares them too.
     (
         50,
-        2020001,
+        2050001,
         "syn.action.record_vector.v1",
         &[
             "agent_logical_foreground.target",
@@ -373,8 +380,31 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
-    (51, 2020001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
-    (52, 2020001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
+    (51, 2050001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
+    (52, 2050001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
+    // #2050's dense target-identity lane. It resolves the target through the
+    // SAME `ACTION_TARGET_POINTERS` precedence slot 49 uses and then decomposes
+    // the resolved value per field, so its declared source set is identical to
+    // slot 49's — no wider, and deliberately no narrower.
+    //
+    // What matters most here is what is NOT listed. This lane reads no
+    // `status`, no `error_code`, and nothing from `foreground_lane` except the
+    // bound target itself, so it cannot carry the adjudicated action outcome
+    // that Ward calibrates against. The slot-86 finding (#1958) was a status
+    // one-hot serving as a steering feature; a target-identity lane that reads
+    // an outcome field would be the same defect wearing a dense encoding, and
+    // this declaration is what makes that structurally checkable rather than a
+    // claim in a comment.
+    (
+        117,
+        2050001,
+        "syn.action.target_vector.v1",
+        &[
+            "agent_logical_foreground.target",
+            "foreground_lane.target",
+            "pointer",
+        ],
+    ),
     (53, 1965004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
     (54, 1965004, "syn.reflex.outcome_onehot.v1", &["status"]),
     (55, 1965004, "syn.reflex.latency_ms_log1p.v1", &["details"]),

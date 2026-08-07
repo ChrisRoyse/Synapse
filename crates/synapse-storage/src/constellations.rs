@@ -120,10 +120,37 @@ pub const SYN_AGENT_TRANSCRIPT_PANEL_VERSION_PRE_1904: u32 = 1_665_002;
 // would be reinterpreted under the new meaning. The `_1776` generation is the
 // first that writes into the panel's own block.
 pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
-/// #2020 separates the canonical native Reward axis from the legacy
-/// `label:reward` bridge write. A panel generation is the immutable meaning of
-/// its rows, so repairing an anchor-kind contract requires a new generation.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_020_001;
+/// #2050 adds [`ACT_SLOT_TARGET_VECTOR`], the panel's first **dense,
+/// similarity-bearing** representation of the action's target identity.
+///
+/// A new lens is a new generation, for the reason the episode and
+/// agent-transcript constants above already record: a `panel_version` names one
+/// immutable slot layout, and every row written under it was measured with
+/// exactly that set of frozen lens ids. Adding slot 117 to `2020001` would make
+/// one version mean two different slot maps.
+///
+/// ## Why the generation was unavoidable here, and not a matter of taste
+///
+/// `2020001`'s only target lane is [`ACT_SLOT_TARGET_HASH`], a `syn_hash` — a
+/// deliberately **sparse** one-cell whole-value hash. Ward scores exclusively
+/// dense vectors (`calyx_ward::validate_calibration_slots` admits only dense
+/// `Active` slots, `synapse_calyx::ward::guard_dense_vector` discards every
+/// `SlotVector::Sparse`, and the enforced score is `dense_cosine`), so slot 49
+/// reports zero usable exemplars on every calibration forever. Measured live on
+/// 2026-08-07, excluding it did not help: dry calibrations of slots 48, 50, 51
+/// and 52 each failed closed with `CALYX_GUARD_PROVISIONAL` at worst bad score
+/// 1.0 and tau 1.0000001, because a kind one-hot, a record summary and two
+/// clock cycles are identical between a success and a failure of the same
+/// action. No slot of `2020001` can carry a target-identity guard.
+///
+/// A sparse guard metric in Ward was considered and rejected: even under a
+/// Jaccard/Dice metric a one-cell whole-value hash has cosine exactly `{0, 1}`,
+/// so it is not similarity-bearing under *any* metric, and changing Ward's
+/// score function would silently redefine every already-certified conformal FAR
+/// bound and the `calyx-search` guarded reader that consumes the same profile.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_050_001;
+/// The generation #2050 superseded — the layout with no dense target lane.
+pub const SYN_ACTION_PANEL_VERSION_PRE_2050: u32 = 2_020_001;
 pub const SYN_ACTION_PANEL_VERSION_PRE_2020: u32 = 2_006_001;
 pub const SYN_ACTION_PANEL_VERSION_PRE_2006: u32 = 1_965_003;
 pub const SYN_ACTION_PANEL_VERSION_PRE_1965: u32 = 1_776_001;
@@ -480,6 +507,71 @@ const AT_SLOT_TEXT_FULL_BM25: SlotId = SlotId::new(109);
 /// before changing this; do not adjust it by intuition.
 const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 
+/// Dimension of `syn.action.target_vector.v1` (#2050).
+///
+/// The lens is `syn_record_vector_unit_fields`, which is exactly the **signed
+/// feature-hashing** construction of Weinberger et al., *Feature Hashing for
+/// Large Scale Multitask Learning* (ICML 2009): each named feature is placed by
+/// `hash(path) mod dim` and signed by a second hash of the same digest, which
+/// makes the hashed inner product an unbiased estimate of the true one with
+/// variance `O(1/dim)`. So `dim` is a noise budget, not a vocabulary size, and
+/// the quantity that has to be sized against it is the number of features one
+/// target emits — not the number of distinct targets the vault will ever see.
+///
+/// [`action_target_features`] emits at most `1` kind + `1` shape +
+/// [`ACT_TARGET_MAX_FIELDS`] exact-value features + [`ACT_TARGET_MAX_COMPONENTS`]
+/// component features = 50. At `dim = 256` the expected number of colliding
+/// pairs is `50^2 / (2 * 256) ~= 4.9`, and a collision merges two already-signed
+/// unit-scale components rather than losing a feature. Doubling to 512 would
+/// halve that at twice the durable cost per row on a TTL-managed CF; halving to
+/// 128 would roughly double it. 256 is the smallest power of two that keeps the
+/// hashing noise (`O(1/sqrt(dim)) ~= 0.06` on a unit-normalized cosine) an order
+/// of magnitude below the separation this lane is calibrated on.
+///
+/// Frozen: this value is part of the lens id `syn_record_vector_unit_fields:256`
+/// and therefore of the panel contract every stored vector was measured under.
+/// Changing it is a panel version bump and a full re-measure, never an edit.
+const ACT_TARGET_VECTOR_DIM: u32 = 256;
+/// Weight of a whole-field exact-value feature. The identity carrier: two rows
+/// naming the same value for the same field share this feature exactly.
+const ACT_TARGET_EXACT_WEIGHT: f64 = 1.0;
+/// Weight of the target-kind feature (`window` / `cdp` / `scalar`).
+const ACT_TARGET_KIND_WEIGHT: f64 = 0.5;
+/// Weight of the field-set shape feature, which separates a window target from
+/// a CDP target even when neither shares a field value.
+const ACT_TARGET_SHAPE_WEIGHT: f64 = 0.5;
+/// Total L2 mass a single field's path/URL components may contribute.
+///
+/// Split as `mass / sqrt(k)` over `k` components, so the components of one field
+/// carry exactly `mass` of squared magnitude regardless of how many there are —
+/// a long path cannot outweigh a short one, which is the failure
+/// `syn_record_vector_unit_fields` exists to refuse.
+///
+/// Component granularity is deliberate and is the one place this encoding
+/// departs from the record-linkage literature. Bloom-filter PPRL (Schnell,
+/// Bachteler & Reiher, *Privacy-preserving record linkage using Bloom filters*,
+/// BMC MIDM 2009) hashes character q-grams so that near-miss spellings still
+/// score. Character trigrams over this corpus would be actively harmful: a
+/// window target is an opaque `HWND` integer and a CDP target id is a random
+/// 32-hex string, whose trigrams overlap by chance, and the known-bad corpus is
+/// built from unique nonexistent executables that all share `C:\`, `\Users\`
+/// and `.exe`. That would put a similarity floor under every bad case, which is
+/// exactly the inseparability that made `2020001` uncalibratable. Splitting on
+/// path/URL separators instead keeps the field-level graded similarity the
+/// literature is after at the granularity that actually carries identity here.
+const ACT_TARGET_COMPONENT_MASS: f64 = 0.5;
+/// Cap on whole-field exact-value features per target. A target object with
+/// more fields than this is refused rather than silently truncated: dropping
+/// fields would make two different targets measure identically.
+const ACT_TARGET_MAX_FIELDS: usize = 16;
+/// Cap on component features per target, over all fields.
+const ACT_TARGET_MAX_COMPONENTS: usize = 32;
+/// Characters that separate the identity components of a path, URL or
+/// qualified name. Frozen: part of the lens's measured meaning.
+const ACT_TARGET_COMPONENT_SEPARATORS: &[char] = &[
+    '/', '\\', '.', ':', '?', '&', '=', '#', ' ', '\t', ',', ';', '|', '"', '\'',
+];
+
 // Slot ids are GLOBAL, not panel-local (#1776).
 //
 // Calyx persists every measured vector in a physical `cf/slot_<id>` column
@@ -503,6 +595,13 @@ const ACT_SLOT_RECORD_VECTOR: SlotId = SlotId::new(50);
 // Slot 50 is reserved for the magnitude-weighted vector retired by #1965.
 const ACT_SLOT_HOUR_CYCLIC: SlotId = SlotId::new(51);
 const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(52);
+/// The dense, similarity-bearing target-identity lane (#2050).
+///
+/// The action panel's first block `48..=52` is contiguous and full, and 53
+/// belongs to the reflex panel, so this lens takes an id in the panel's
+/// **second** block — the same move #1900/#1921/#1964 made for the timeline,
+/// agent-transcript and episode panels.
+const ACT_SLOT_TARGET_VECTOR: SlotId = SlotId::new(117);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -662,6 +761,16 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         panel: SYN_ACTION_PANEL_NAME,
         first: 48,
         last: 52,
+    },
+    // The action panel's second block (#2050). Holds `ACT_SLOT_TARGET_VECTOR`
+    // (117); 118..=120 are unallocated headroom inside this panel's own range,
+    // so the next action lens needs no third block. `48..=52` could not be
+    // extended because 53 belongs to the reflex panel and a block is contiguous
+    // by construction.
+    PanelSlotBlock {
+        panel: SYN_ACTION_PANEL_NAME,
+        first: 117,
+        last: 120,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2111,6 +2220,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (ACT_SLOT_RECORD_VECTOR, "syn.action.record_vector.v1"),
     (ACT_SLOT_HOUR_CYCLIC, "syn.action.hour_cyclic.v1"),
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
+    (ACT_SLOT_TARGET_VECTOR, "syn.action.target_vector.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2525,12 +2635,22 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: true,
             source_ttl_managed: true,
             // #2020/#2021: 2020001 replaced over-broad action adjudication.
+            //
+            // #2050 keeps this `false`. The generation adds a slot rather than
+            // changing adjudication, so an anchor written under 2020001 still
+            // *means* the same thing — but the rows it sits on were measured
+            // without slot 117, and carrying the anchor forward without the
+            // vector would hand Ward good exemplars that cannot be scored on
+            // the very lane the generation exists to calibrate. Re-measuring
+            // the source CF is the supported path, and it re-derives the anchor
+            // from the same row.
             carry_superseded_anchors: false,
             superseded_versions: &[
                 1_666_001,
                 SYN_ACTION_PANEL_VERSION_PRE_1965,
                 SYN_ACTION_PANEL_VERSION_PRE_2006,
                 SYN_ACTION_PANEL_VERSION_PRE_2020,
+                SYN_ACTION_PANEL_VERSION_PRE_2050,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -4641,6 +4761,10 @@ pub fn build_action_constellation(
             target_text.as_deref(),
             2048,
         )?,
+    );
+    slots.insert(
+        ACT_SLOT_TARGET_VECTOR,
+        action_target_vector_slot(source_key, record)?,
     );
     slots.insert(
         ACT_SLOT_RECORD_VECTOR,
@@ -7256,6 +7380,21 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
             panel_version,
             registry,
         )?,
+        // #2050's dense target-identity lane. Declared beside the `syn_hash`
+        // lane rather than replacing it: slot 49 stays the exact-match lane
+        // (one value, one cell, no false positives beyond a bucket collision),
+        // and 117 is the graded lane Ward can actually score.
+        syn_content_slot(
+            ACT_SLOT_TARGET_VECTOR,
+            "syn.action.target_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.action.target_vector.v1",
+                Modality::Structured,
+                ACT_TARGET_VECTOR_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
     ])
 }
 
@@ -8287,6 +8426,219 @@ const ACTION_TARGET_POINTERS: &[&str] = &[
 
 fn action_target_text(record: &Value) -> Option<String> {
     json_pointer_text(record, ACTION_TARGET_POINTERS)
+}
+
+/// The resolved target **value**, under the same precedence
+/// [`action_target_text`] uses.
+///
+/// Slot 49 hashes the canonicalized text of this value; slot 117 needs the
+/// value itself, because a structured target's identity is per field and the
+/// text form has already flattened that structure away.
+fn action_target_value(record: &Value) -> Option<&Value> {
+    ACTION_TARGET_POINTERS
+        .iter()
+        .find_map(|pointer| record.pointer(pointer))
+        .filter(|value| !value.is_null())
+}
+
+/// A short, collision-resistant name for one feature *value*.
+///
+/// The hashed thing is the **feature name**, never the vector cell, so this only
+/// has to make two different values name two different features. 16 hex chars
+/// (64 bits) does that with room to spare, and keeps the JSON key — and the
+/// bytes `syn_record_vector_unit_fields` content-addresses — bounded regardless
+/// of how long a window title or URL is.
+fn action_target_feature_digest(value: &str) -> String {
+    let mut digest = sha256_hex(value.as_bytes());
+    digest.truncate(16);
+    digest
+}
+
+/// Splits one field value into the identity components a partial match should
+/// score on. Empty components are dropped; the whole value is never emitted
+/// here, because the exact-value feature already carries it.
+fn action_target_components(value: &str) -> Vec<String> {
+    value
+        .split(ACT_TARGET_COMPONENT_SEPARATORS)
+        .filter_map(non_empty)
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// Builds the flat `feature name -> weight` record slot 117 measures.
+///
+/// ## What makes this similarity-bearing where `syn_hash` is not
+///
+/// `syn.action.target_hash.v1` content-addresses the **whole** target value into
+/// one sparse cell, so its similarity is the indicator `same value / different
+/// value` — it cannot say that two actions drove the same window in different
+/// tabs, or the same executable under a different argument, and it is not a
+/// dense vector, so Ward cannot read it at all.
+///
+/// This decomposes the same target into overlapping named features and lets
+/// `syn_record_vector_unit_fields` project them into a fixed dense space. Cosine
+/// between two targets is then the (unbiased, see [`ACT_TARGET_VECTOR_DIM`])
+/// normalized overlap of their feature sets:
+///
+/// * identical target                       -> 1.0
+/// * same kind and shape, different values  -> the kind/shape mass only
+/// * shared path or URL components          -> graded by how much they share
+/// * unrelated targets                      -> ~0
+///
+/// which is the separable good-vs-bad geometry Ward needs and `2020001` could
+/// not produce on any slot.
+///
+/// ## What it deliberately does not read
+///
+/// Only the target. Not `status.outcome`, not `error_code`, not the
+/// foreground-lane claim status — nothing that is, or is downstream of, the
+/// adjudicated outcome. This is the slot-86 exclusion doctrine applied at
+/// construction time rather than at calibration time: a lane that carries the
+/// label cannot be a feature for steering, and the cheapest way to guarantee
+/// that is for the lens to be a pure function of the target identity.
+///
+/// # Errors
+///
+/// Returns a measurement error when a present target yields no encodable
+/// feature, or carries more than [`ACT_TARGET_MAX_FIELDS`] fields. Both are
+/// refused loudly rather than measured as a degenerate or truncated vector: a
+/// silently-dropped target is exactly the corpus loss #2050 was opened for.
+fn action_target_features(target: &Value) -> StorageResult<serde_json::Map<String, Value>> {
+    let mut features = serde_json::Map::new();
+    let mut components_emitted = 0_usize;
+    let mut insert_components = |field: &str, value: &str, features: &mut serde_json::Map<_, _>| {
+        let components = action_target_components(value);
+        if components.is_empty() || components_emitted >= ACT_TARGET_MAX_COMPONENTS {
+            return;
+        }
+        let budget = ACT_TARGET_MAX_COMPONENTS - components_emitted;
+        let taken = components.len().min(budget);
+        // `mass / sqrt(k)` over k components: the field's components carry
+        // exactly `mass^2` of squared magnitude however many there are, so a
+        // long path cannot outweigh a short one.
+        let weight = ACT_TARGET_COMPONENT_MASS / (taken as f64).sqrt();
+        for component in components.into_iter().take(taken) {
+            let key = format!("c|{field}|{}", action_target_feature_digest(&component));
+            features.insert(key, json!(weight));
+        }
+        components_emitted += taken;
+    };
+
+    match target {
+        Value::Object(map) => {
+            if map.len() > ACT_TARGET_MAX_FIELDS {
+                return Err(measurement_error(
+                    "action target vector",
+                    format!(
+                        "target object carries {} fields, more than the frozen maximum {ACT_TARGET_MAX_FIELDS}; \
+                         truncating it would make two different targets measure identically, so it is refused. \
+                         Remediation: the action audit writer has changed the persisted target shape — widen \
+                         ACT_TARGET_MAX_FIELDS under a NEW action panel generation and re-measure",
+                        map.len()
+                    ),
+                ));
+            }
+            let mut shape = String::new();
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                shape.push_str(key);
+                shape.push('\u{1f}');
+                let Some(text) = map.get(key).and_then(json_value_text) else {
+                    continue;
+                };
+                let Some(text) = non_empty(&text) else {
+                    continue;
+                };
+                features.insert(
+                    format!("f|{key}|{}", action_target_feature_digest(text)),
+                    json!(ACT_TARGET_EXACT_WEIGHT),
+                );
+                if key == "kind" {
+                    features.insert(
+                        format!("k|{}", action_target_feature_digest(text)),
+                        json!(ACT_TARGET_KIND_WEIGHT),
+                    );
+                } else {
+                    insert_components(key, text, &mut features);
+                }
+            }
+            features.insert(
+                format!("sh|{}", action_target_feature_digest(&shape)),
+                json!(ACT_TARGET_SHAPE_WEIGHT),
+            );
+        }
+        other => {
+            // A scalar or array target (the historical `/details/target` and
+            // `/actor/tool` paths). It has no field structure, so it is one
+            // unnamed field with its own shape.
+            let text = json_value_text(other)
+                .and_then(|text| non_empty(&text).map(str::to_owned))
+                .ok_or_else(|| {
+                    measurement_error(
+                        "action target vector",
+                        format!(
+                            "target value {} canonicalizes to empty text and carries no encodable identity",
+                            value_kind(other)
+                        ),
+                    )
+                })?;
+            features.insert(
+                format!("f|$|{}", action_target_feature_digest(&text)),
+                json!(ACT_TARGET_EXACT_WEIGHT),
+            );
+            features.insert(
+                format!("k|{}", action_target_feature_digest(value_kind(other))),
+                json!(ACT_TARGET_KIND_WEIGHT),
+            );
+            insert_components("$", &text, &mut features);
+            features.insert(
+                format!("sh|{}", action_target_feature_digest("$\u{1f}")),
+                json!(ACT_TARGET_SHAPE_WEIGHT),
+            );
+        }
+    }
+
+    if features.is_empty() {
+        return Err(measurement_error(
+            "action target vector",
+            "a present action target produced no encodable feature; refusing to measure an empty \
+             target vector, which would place an unencodable target at the origin and make it \
+             indistinguishable from every other unencodable one",
+        ));
+    }
+    Ok(features)
+}
+
+/// Measures [`ACT_SLOT_TARGET_VECTOR`] for one action row.
+///
+/// `Absent(NotApplicable)` when the row bound no target at all — the same
+/// answer slot 49 gives, and a true statement about a row that drove nothing.
+/// Every other failure is loud.
+fn action_target_vector_slot(source_key: &[u8], record: &Value) -> StorageResult<SlotVector> {
+    let Some(target) = action_target_value(record) else {
+        return Ok(absent(AbsentReason::NotApplicable));
+    };
+    let features = action_target_features(target).map_err(|error| {
+        measurement_error(
+            "action target vector",
+            format!(
+                "source_cf={} source_key_hex={} action={}: {error}",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                action_identity(record)
+            ),
+        )
+    })?;
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.target_vector.v1",
+            Modality::Structured,
+            ACT_TARGET_VECTOR_DIM,
+        ),
+        &Value::Object(features),
+    )
 }
 
 /// Reports a terminal action SUCCESS whose target no known path carries.
