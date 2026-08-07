@@ -641,6 +641,47 @@ impl SynapseService {
         ) {
             return audit_target_claim_denial(self, "act_set_value", error, &request_context);
         }
+        // #2056: a target on a session-owned hidden desktop is unreachable from
+        // the daemon's desktop, so resolve the owning desktop's worker route
+        // before any daemon-desktop HWND probe (including the foreground guard,
+        // whose GetAncestor/IsWindow readback cannot see that HWND).
+        let hidden_desktop_route = {
+            let hidden_desktop_names = match self.session_owned_desktop_names(&request_context) {
+                Ok(names) => names,
+                Err(error) => {
+                    let result: Result<ActSetValueResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request(
+                        "act_set_value",
+                        &result,
+                        &request_context,
+                    )?;
+                    return result.map(Json);
+                }
+            };
+            match crate::m2::resolve_hidden_desktop_value_route(
+                "act_set_value",
+                &params.element_id,
+                &hidden_desktop_names,
+            ) {
+                Ok(route) => route,
+                Err(error) => {
+                    let result: Result<ActSetValueResponse, ErrorData> = Err(error);
+                    self.audit_action_result_for_request(
+                        "act_set_value",
+                        &result,
+                        &request_context,
+                    )?;
+                    return result.map(Json);
+                }
+            }
+        };
+        if let Some(route) = hidden_desktop_route {
+            let result = self
+                .act_set_value_hidden_desktop_guarded(params, route, boundary)
+                .await;
+            self.audit_action_result_for_request("act_set_value", &result, &request_context)?;
+            return result.map(Json);
+        }
         let foreground_guard = match act_set_value_target_foreground_guard(&params.element_id) {
             Ok(guard) => guard,
             Err(error) => {
@@ -825,7 +866,15 @@ impl SynapseService {
             boundary,
         )
         .await?;
-        let route = match crate::m2::set_field_text_route(element_id) {
+        // #2056: session-owned hidden desktops own their windows exclusively —
+        // the daemon's own desktop cannot resolve, validate, or message those
+        // HWNDs — so the owning desktop's worker is resolved before any
+        // daemon-desktop routing probe runs.
+        let hidden_desktop_names = self.session_owned_desktop_names(request_context)?;
+        let route = match crate::m2::set_field_text_route_with_hidden_desktops(
+            element_id,
+            &hidden_desktop_names,
+        ) {
             Ok(route) => route,
             Err(error) => {
                 return Err(error);
@@ -835,6 +884,7 @@ impl SynapseService {
             code = "M2_ACT_SET_FIELD_TEXT_ROUTE_RESOLVED",
             element_id = %element_id,
             resolution_phase,
+            hidden_desktop_count = hidden_desktop_names.len(),
             "readback=act_set_field_text route resolved"
         );
         match route {
@@ -876,7 +926,74 @@ impl SynapseService {
                 })
                 .await
             }
+            crate::m2::SetFieldTextRoute::HiddenDesktopBackground(hidden_route) => {
+                let foreground_guard =
+                    hidden_desktop_target_foreground_guard("act_set_field_text", element_id)?;
+                self.act_set_field_text_guarded_with(params, foreground_guard, move |params| {
+                    Box::pin(crate::m2::act_set_field_text_hidden_desktop(
+                        params,
+                        hidden_route,
+                        boundary,
+                    ))
+                })
+                .await
+            }
         }
+    }
+
+    /// #2056 `act_set_value` hidden-desktop route, wrapped in the same
+    /// visible-foreground before/after guard the daemon-desktop background
+    /// tiers use, so the audit row proves the human foreground was untouched.
+    async fn act_set_value_hidden_desktop_guarded(
+        &self,
+        params: crate::m2::ActSetValueParams,
+        route: crate::m2::HiddenDesktopValueRoute,
+        boundary: OperatorPanicActionBoundary,
+    ) -> Result<ActSetValueResponse, ErrorData> {
+        let foreground_guard =
+            hidden_desktop_target_foreground_guard("act_set_value", &params.element_id)?;
+        let foreground_before = self
+            .current_audit_foreground()
+            .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
+        let result =
+            crate::m2::act_set_value_hidden_desktop_with_boundary(params, route, boundary).await;
+        let action_source_of_truth = background_result_source_of_truth(
+            &result,
+            |response| response.source_of_truth.as_str(),
+            "act_set_value.hidden_desktop_worker_tier",
+        );
+        match self.current_audit_foreground() {
+            Ok(foreground_after) => background_result_with_foreground_guard(
+                "act_set_value",
+                &action_source_of_truth,
+                foreground_guard,
+                &foreground_before,
+                &foreground_after,
+                result,
+            ),
+            Err(error) => background_result_with_foreground_read_error(
+                result,
+                act_set_value_foreground_read_error("after", &action_source_of_truth, &error),
+            ),
+        }
+    }
+
+    /// #2056: names of the hidden Win32 desktops this MCP session owns, as
+    /// recorded by the session process/desktop lease registry. Empty when the
+    /// request carries no MCP session or the session owns no desktop.
+    fn session_owned_desktop_names(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Vec<String>, ErrorData> {
+        let Some(session_id) =
+            super::context::mcp_session_id_from_request_context(request_context)?
+        else {
+            return Ok(Vec::new());
+        };
+        Ok(self
+            .session_hidden_desktop_readback(&session_id)?
+            .map(|readback| readback.desktop_names)
+            .unwrap_or_default())
     }
 
     fn act_set_field_text_resolve_params(
@@ -3269,6 +3386,32 @@ impl SynapseService {
     {
         let element_id = crate::m2::required_element_id(params)?;
         let foreground_guard = act_set_value_target_foreground_guard(element_id)?;
+        self.act_set_field_text_guarded_with(params, foreground_guard, run)
+            .await
+    }
+
+    /// Same visible-foreground guard, with the target guard supplied by the
+    /// caller. #2056 hidden-desktop targets cannot be normalized to a top-level
+    /// root from the daemon's desktop, but the human's visible foreground must
+    /// still be proven unchanged across the action.
+    async fn act_set_field_text_guarded_with<'params, Run>(
+        &self,
+        params: &'params crate::m2::ActSetFieldTextParams,
+        foreground_guard: BackgroundTargetForegroundGuard,
+        run: Run,
+    ) -> Result<crate::m2::ActSetFieldTextResponse, ErrorData>
+    where
+        Run: FnOnce(
+            &'params crate::m2::ActSetFieldTextParams,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<crate::m2::ActSetFieldTextResponse, ErrorData>,
+                    > + Send
+                    + 'params,
+            >,
+        >,
+    {
         let foreground_before = self
             .current_audit_foreground()
             .map_err(|error| act_set_value_foreground_read_error("before", "unknown", &error))?;
@@ -6365,6 +6508,7 @@ fn set_field_text_password_response(
         before_sha256: signature(before_len),
         after_sha256: signature(after_len),
         changed,
+        desktop_route: None,
         postcondition: ActPostcondition {
             status: "verified_state".to_owned(),
             observed_delta: Some(changed),
@@ -7090,6 +7234,34 @@ impl BackgroundTargetForegroundGuard {
     fn contains(self, hwnd: i64) -> bool {
         hwnd == self.element_hwnd || hwnd == self.root_hwnd
     }
+}
+
+/// #2056: visible-foreground guard for a target on a session-owned hidden
+/// desktop. `GetAncestor(GA_ROOT)`/`IsWindow` cannot normalize a hidden-desktop
+/// HWND from the daemon's desktop, so the element HWND stands for the whole
+/// target here. The guard's job is unchanged: prove the human's visible
+/// foreground did not become this target across the action. A window on a
+/// non-input desktop can never be the visible foreground, so a trip here is a
+/// hard invariant violation, not a routine refusal.
+fn hidden_desktop_target_foreground_guard(
+    tool: &'static str,
+    element_id: &ElementId,
+) -> Result<BackgroundTargetForegroundGuard, ErrorData> {
+    let hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{tool} element id {element_id} could not be parsed for the hidden-desktop foreground guard: {error}"
+                ),
+            )
+        })?
+        .hwnd;
+    Ok(BackgroundTargetForegroundGuard {
+        element_hwnd: hwnd,
+        root_hwnd: hwnd,
+    })
 }
 
 fn act_set_value_target_foreground_guard(

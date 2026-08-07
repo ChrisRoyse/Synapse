@@ -231,6 +231,8 @@ struct Cli {
     #[arg(long, hide = true)]
     desktop_worker_bgra: Option<PathBuf>,
     #[arg(long, hide = true)]
+    desktop_worker_request: Option<PathBuf>,
+    #[arg(long, hide = true)]
     detection_worker_request: Option<PathBuf>,
     #[arg(long, hide = true)]
     detection_worker_response: Option<PathBuf>,
@@ -434,6 +436,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             depth: cli.desktop_worker_depth,
             json_path: cli.desktop_worker_json.clone(),
             bgra_path: cli.desktop_worker_bgra.clone(),
+            request_path: cli.desktop_worker_request.clone(),
         })?;
         drop(telemetry_guard);
         return Ok(code);

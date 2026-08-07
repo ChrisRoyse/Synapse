@@ -6,7 +6,7 @@ use std::{
 
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use synapse_core::{AccessibleSubtree, ForegroundContext, Rect, error_codes};
+use synapse_core::{AccessibleSubtree, ElementId, ForegroundContext, Rect, error_codes};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -14,6 +14,14 @@ pub(crate) enum DesktopWorkerOp {
     Context,
     Snapshot,
     Capture,
+    /// #2056 background ACTION route: read one element's value/state on the
+    /// session-owned desktop, without mutating it.
+    #[value(name = "element-value")]
+    ElementValue,
+    /// #2056 background ACTION route: perform the supported UIA `ValuePattern`
+    /// / Win32 `WM_SETTEXT` mutation on the session-owned desktop.
+    #[value(name = "set-element-value")]
+    SetElementValue,
 }
 
 impl DesktopWorkerOp {
@@ -22,7 +30,16 @@ impl DesktopWorkerOp {
             Self::Context => "context",
             Self::Snapshot => "snapshot",
             Self::Capture => "capture",
+            Self::ElementValue => "element-value",
+            Self::SetElementValue => "set-element-value",
         }
+    }
+
+    /// Action ops carry their element id (and replacement text) in a temp
+    /// request file instead of the command line, so field contents never land
+    /// in the OS process table.
+    const fn requires_request_file(self) -> bool {
+        matches!(self, Self::ElementValue | Self::SetElementValue)
     }
 }
 
@@ -35,6 +52,16 @@ pub(crate) struct DesktopWorkerCli {
     pub depth: Option<u32>,
     pub json_path: Option<PathBuf>,
     pub bgra_path: Option<PathBuf>,
+    pub request_path: Option<PathBuf>,
+}
+
+/// Request body for the #2056 hidden-desktop ACTION ops.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HiddenDesktopActionRequest {
+    pub element_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -81,6 +108,14 @@ enum WorkerPayload {
         height: u32,
         capture_backend: String,
         bgra_bytes: u64,
+    },
+    ElementValue {
+        element_id: String,
+        readback: synapse_a11y::ElementValueReadback,
+    },
+    SetElementValue {
+        element_id: String,
+        readback: synapse_a11y::ElementValueSetReadback,
     },
 }
 
@@ -156,7 +191,109 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
                 bgra_bytes: captured.bitmap.bytes.len() as u64,
             })
         }
+        DesktopWorkerOp::ElementValue => {
+            let request = worker_action_request(args)?;
+            worker_action_window_live(hwnd)?;
+            let element_id = worker_action_element_id(&request, hwnd)?;
+            let readback = synapse_a11y::element_value(&element_id)
+                .map_err(|error| worker_error(error.code(), error.to_string()))?;
+            Ok(WorkerPayload::ElementValue {
+                element_id: element_id.to_string(),
+                readback,
+            })
+        }
+        DesktopWorkerOp::SetElementValue => {
+            let request = worker_action_request(args)?;
+            worker_action_window_live(hwnd)?;
+            let element_id = worker_action_element_id(&request, hwnd)?;
+            let text = request.text.as_deref().ok_or_else(|| {
+                worker_param_error("set-element-value request is missing replacement text")
+            })?;
+            let readback = synapse_a11y::set_element_value(&element_id, text)
+                .map_err(|error| worker_error(error.code(), error.to_string()))?;
+            Ok(WorkerPayload::SetElementValue {
+                element_id: element_id.to_string(),
+                readback,
+            })
+        }
     }
+}
+
+/// Desktop-membership oracle for the #2056 action route. A thread only reaches
+/// windows on its own desktop, so a live `IsWindow` readback here is the proof
+/// that this worker's desktop is the one that physically owns the HWND. The
+/// daemon treats `TARGET_WINDOW_NOT_FOUND` as "not this desktop" and probes the
+/// next session-owned desktop.
+#[cfg(windows)]
+fn worker_action_window_live(hwnd: i64) -> Result<(), WorkerEnvelope> {
+    synapse_capture::validate_hwnd(hwnd).map_err(|error| {
+        worker_error(
+            error_codes::TARGET_WINDOW_NOT_FOUND,
+            format!(
+                "hidden desktop action target hwnd {hwnd:#x} is not a live window on this worker's desktop: {error}"
+            ),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn worker_action_request(
+    args: &DesktopWorkerCli,
+) -> Result<HiddenDesktopActionRequest, WorkerEnvelope> {
+    let path = args
+        .request_path
+        .as_ref()
+        .ok_or_else(|| worker_param_error("missing_request_path"))?;
+    let bytes = fs::read(path).map_err(|error| {
+        worker_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "desktop worker action request readback failed for {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    serde_json::from_slice(&bytes).map_err(|error| {
+        worker_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "desktop worker action request decode failed for {}: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+#[cfg(windows)]
+fn worker_action_element_id(
+    request: &HiddenDesktopActionRequest,
+    hwnd: i64,
+) -> Result<ElementId, WorkerEnvelope> {
+    let element_id = ElementId::parse(&request.element_id).map_err(|error| {
+        worker_error(
+            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+            format!(
+                "desktop worker action element id {:?} is malformed: {error}",
+                request.element_id
+            ),
+        )
+    })?;
+    let parts = element_id.parts().map_err(|error| {
+        worker_error(
+            error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+            format!("desktop worker action element id {element_id} could not be split: {error}"),
+        )
+    })?;
+    if parts.hwnd != hwnd {
+        return Err(worker_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "desktop worker action element id {element_id} carries hwnd {:#x}, but the dispatched worker hwnd is {hwnd:#x}",
+                parts.hwnd
+            ),
+        ));
+    }
+    Ok(element_id)
 }
 
 #[cfg(windows)]
@@ -405,7 +542,7 @@ pub(crate) fn hidden_desktop_window_capture(
     client_region: bool,
 ) -> Result<HiddenDesktopCapture, rmcp::ErrorData> {
     crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new(true)?;
+    let mut temp = WorkerTempPaths::new_for_op(DesktopWorkerOp::Capture)?;
     let result = (|| {
         let payload = run_worker_with_paths(
             desktop_name,
@@ -491,6 +628,132 @@ pub(crate) fn hidden_desktop_window_capture(
     ))
 }
 
+/// #2056: reads one element's value/state through a worker attached to the
+/// session-owned desktop `desktop_name`. This is both the independent
+/// before/after Source-of-Truth readback and the desktop-membership probe for
+/// the background action route.
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_element_value(
+    desktop_name: &str,
+    element_id: &ElementId,
+) -> Result<synapse_a11y::ElementValueReadback, rmcp::ErrorData> {
+    let hwnd = hidden_desktop_action_hwnd(element_id)?;
+    match run_action_worker(
+        desktop_name,
+        DesktopWorkerOp::ElementValue,
+        hwnd,
+        &HiddenDesktopActionRequest {
+            element_id: element_id.to_string(),
+            text: None,
+        },
+    )? {
+        WorkerPayload::ElementValue { readback, .. } => Ok(readback),
+        payload => Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected element value payload: {payload:?}"),
+        )),
+    }
+}
+
+/// #2056: performs the supported UIA `ValuePattern.SetValue` / Win32
+/// `WM_SETTEXT` mutation on the session-owned desktop that physically owns the
+/// target HWND. No desktop switch, no foreground activation, no raw input.
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_set_element_value(
+    desktop_name: &str,
+    element_id: &ElementId,
+    text: &str,
+) -> Result<synapse_a11y::ElementValueSetReadback, rmcp::ErrorData> {
+    let hwnd = hidden_desktop_action_hwnd(element_id)?;
+    match run_action_worker(
+        desktop_name,
+        DesktopWorkerOp::SetElementValue,
+        hwnd,
+        &HiddenDesktopActionRequest {
+            element_id: element_id.to_string(),
+            text: Some(text.to_owned()),
+        },
+    )? {
+        WorkerPayload::SetElementValue { readback, .. } => Ok(readback),
+        payload => Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected set element value payload: {payload:?}"),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_element_value(
+    _desktop_name: &str,
+    _element_id: &ElementId,
+) -> Result<synapse_a11y::ElementValueReadback, rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop workers are only supported on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_set_element_value(
+    _desktop_name: &str,
+    _element_id: &ElementId,
+    _text: &str,
+) -> Result<synapse_a11y::ElementValueSetReadback, rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop workers are only supported on Windows",
+    ))
+}
+
+#[cfg(windows)]
+fn hidden_desktop_action_hwnd(element_id: &ElementId) -> Result<i64, rmcp::ErrorData> {
+    let hwnd = element_id
+        .parts()
+        .map_err(|error| {
+            crate::m1::mcp_error(
+                error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                format!("hidden desktop action element id {element_id} is malformed: {error}"),
+            )
+        })?
+        .hwnd;
+    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)
+}
+
+#[cfg(windows)]
+fn run_action_worker(
+    desktop_name: &str,
+    op: DesktopWorkerOp,
+    hwnd: i64,
+    request: &HiddenDesktopActionRequest,
+) -> Result<WorkerPayload, rmcp::ErrorData> {
+    let mut temp = WorkerTempPaths::new_for_op(op)?;
+    let result = (|| {
+        let request_path = temp.request_path.as_ref().ok_or_else(|| {
+            crate::m1::mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "desktop worker action request temp path was not allocated",
+            )
+        })?;
+        let encoded = serde_json::to_vec(request).map_err(|error| {
+            crate::m1::mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("desktop worker action request encode failed: {error}"),
+            )
+        })?;
+        fs::write(request_path, &encoded).map_err(|error| {
+            crate::m1::mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "desktop worker action request write failed for {}: {error}",
+                    request_path.display()
+                ),
+            )
+        })?;
+        run_worker_with_paths(desktop_name, op, hwnd, None, false, None, &temp)
+    })();
+    finish_worker_temp_cleanup(result, &mut temp)
+}
+
 #[cfg(windows)]
 fn run_worker(
     desktop_name: &str,
@@ -501,7 +764,7 @@ fn run_worker(
     depth: Option<u32>,
 ) -> Result<WorkerPayload, rmcp::ErrorData> {
     crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", hwnd)?;
-    let mut temp = WorkerTempPaths::new(matches!(op, DesktopWorkerOp::Capture))?;
+    let mut temp = WorkerTempPaths::new_for_op(op)?;
     let result = run_worker_with_paths(desktop_name, op, hwnd, region, client_region, depth, &temp);
     finish_worker_temp_cleanup(result, &mut temp)
 }
@@ -1740,6 +2003,10 @@ fn launch_worker_process(
         args.push("--desktop-worker-bgra".to_owned());
         args.push(bgra_path.to_string_lossy().into_owned());
     }
+    if let Some(request_path) = temp.request_path.as_ref() {
+        args.push("--desktop-worker-request".to_owned());
+        args.push(request_path.to_string_lossy().into_owned());
+    }
     let command_line = args
         .iter()
         .map(|arg| quote_windows_arg(arg))
@@ -1969,12 +2236,20 @@ fn wide_null(value: &str) -> Vec<u16> {
 struct WorkerTempPaths {
     json_path: PathBuf,
     bgra_path: Option<PathBuf>,
+    request_path: Option<PathBuf>,
     cleaned: bool,
 }
 
 #[cfg(windows)]
 impl WorkerTempPaths {
-    fn new(include_bgra: bool) -> Result<Self, rmcp::ErrorData> {
+    fn new_for_op(op: DesktopWorkerOp) -> Result<Self, rmcp::ErrorData> {
+        Self::new(
+            matches!(op, DesktopWorkerOp::Capture),
+            op.requires_request_file(),
+        )
+    }
+
+    fn new(include_bgra: bool, include_request: bool) -> Result<Self, rmcp::ErrorData> {
         let dir = std::env::temp_dir().join("synapse-desktop-worker");
         fs::create_dir_all(&dir).map_err(|error| {
             crate::m1::mcp_error(
@@ -1989,6 +2264,7 @@ impl WorkerTempPaths {
         Ok(Self {
             json_path: dir.join(format!("{id}.json")),
             bgra_path: include_bgra.then(|| dir.join(format!("{id}.bgra"))),
+            request_path: include_request.then(|| dir.join(format!("{id}.request.json"))),
             cleaned: false,
         })
     }
@@ -1997,6 +2273,7 @@ impl WorkerTempPaths {
         let mut failures = Vec::new();
         for (kind, path) in std::iter::once(("json", &self.json_path))
             .chain(self.bgra_path.as_ref().map(|path| ("bgra", path)))
+            .chain(self.request_path.as_ref().map(|path| ("request", path)))
         {
             match fs::remove_file(path) {
                 Ok(()) => {}
@@ -2081,6 +2358,11 @@ fn finish_worker_temp_cleanup<T>(
 fn worker_code_static(code: &str) -> &'static str {
     match code {
         error_codes::ACTION_TARGET_INVALID => error_codes::ACTION_TARGET_INVALID,
+        error_codes::ACTION_ELEMENT_NOT_RESOLVED => error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+        error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED => {
+            error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
+        }
+        error_codes::A11Y_ELEMENT_STALE => error_codes::A11Y_ELEMENT_STALE,
         error_codes::A11Y_NOT_AVAILABLE => error_codes::A11Y_NOT_AVAILABLE,
         error_codes::A11Y_NO_FOREGROUND => error_codes::A11Y_NO_FOREGROUND,
         error_codes::A11Y_UIA_WORKER_TIMEOUT => error_codes::A11Y_UIA_WORKER_TIMEOUT,

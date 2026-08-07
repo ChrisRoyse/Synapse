@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod focus_window;
 pub(crate) mod foreground_fence;
+pub(crate) mod hidden_desktop;
 mod pad;
 pub(crate) mod postcondition;
 pub(crate) mod press;
@@ -55,6 +56,7 @@ pub use focus_window::{
     ActFocusWindowParams, ActFocusWindowResponse, act_focus_window_request_details,
     act_focus_window_target_hwnd,
 };
+pub(crate) use hidden_desktop::{HiddenDesktopValueRoute, resolve_hidden_desktop_value_route};
 pub(crate) use pad::act_pad_with_handle_and_boundary;
 pub use pad::{ActPadParams, ActPadResponse};
 pub use postcondition::default_verify_timeout_ms;
@@ -79,12 +81,14 @@ pub use set_field_text::{
 };
 pub(crate) use set_field_text::{
     METHOD_FOREGROUND_CLEAR, METHOD_FOREGROUND_REPLACE, SOURCE_UIA_PASSWORD_LENGTH,
-    SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_native,
-    finish_replace_response, params_with_resolved_element, required_element_id,
-    set_field_text_route, validate_set_field_text_params,
+    SOURCE_UIA_VALUE, SetFieldTextRoute, TIER_FOREGROUND_KEYS, act_set_field_text_hidden_desktop,
+    act_set_field_text_native, finish_replace_response, params_with_resolved_element,
+    required_element_id, set_field_text_route_with_hidden_desktops, validate_set_field_text_params,
 };
-pub(crate) use set_value::act_set_value_with_boundary;
 pub use set_value::{ActSetValueParams, ActSetValueResponse, act_set_value_request_details};
+pub(crate) use set_value::{
+    act_set_value_hidden_desktop_with_boundary, act_set_value_with_boundary,
+};
 pub use stroke::{
     ActStrokeParams, ActStrokeResponse, act_stroke_error_details, act_stroke_request_details,
     act_stroke_validation_failure_details, validate_act_stroke_params,

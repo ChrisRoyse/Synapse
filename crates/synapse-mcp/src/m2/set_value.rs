@@ -21,6 +21,10 @@ const TEXT_INTEGRITY_UIA_PASSWORD_LENGTH: &str = "uia_value_pattern_password_len
 const TEXT_INTEGRITY_NATIVE_TEXT_MESSAGE: &str = "win32_wm_settext_readback";
 const TEXT_INTEGRITY_NATIVE_PASSWORD_LENGTH: &str = "win32_wm_settext_password_length_readback";
 const BACKEND_ROUTER_NATIVE_EDIT_OR_UIA: &str = "native_edit_wm_settext_then_uia_value_pattern";
+/// #2056: the same native tiers, executed inside a worker process attached to
+/// the session-owned hidden desktop that physically owns the target HWND.
+const BACKEND_ROUTER_HIDDEN_DESKTOP_WORKER: &str =
+    "session_owned_hidden_desktop_worker_wm_settext_then_uia_value_pattern";
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -49,6 +53,11 @@ pub struct ActSetValueResponse {
     pub changed: bool,
     pub target_text_integrity: String,
     pub target_readback_required: bool,
+    /// #2056: exact worker route when the target window lives on a
+    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
+    /// Absent for ordinary daemon-desktop background tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_route: Option<String>,
     pub postcondition: ActPostcondition,
     pub elapsed_ms: u32,
 }
@@ -159,6 +168,7 @@ pub(crate) async fn act_set_value_with_boundary(
         changed,
         target_text_integrity: target_text_integrity.to_owned(),
         target_readback_required: false,
+        desktop_route: None,
         postcondition: postcondition_verified_state(
             source_of_truth,
             before_sha256,
@@ -172,6 +182,179 @@ pub(crate) async fn act_set_value_with_boundary(
         ),
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
+}
+
+/// #2056 background ACTION route for a target window that lives on a
+/// session-owned hidden desktop.
+///
+/// Every UIA/Win32 step runs inside a worker process attached to that exact
+/// desktop; the daemon never touches the target from its own desktop, never
+/// activates or switches desktops, and never falls back to the human
+/// foreground. `route.before` is the Source-of-Truth read the route resolution
+/// already took on that desktop; the mutation and the after-read each run in
+/// their own worker process, so the verification read is independent of the
+/// process that performed the mutation.
+pub(crate) async fn act_set_value_hidden_desktop_with_boundary(
+    params: ActSetValueParams,
+    route: super::hidden_desktop::HiddenDesktopValueRoute,
+    boundary: super::OperatorPanicActionBoundary,
+) -> Result<ActSetValueResponse, ErrorData> {
+    let started = Instant::now();
+    validate_set_value_params(&params)?;
+    let requested_len = char_count(&params.text)?;
+    let requested_sha256 = text_signature(&params.text);
+
+    let before = route.before.clone();
+    let before_sha256 = text_signature(&before.value);
+    let before_len = char_count(&before.value)?;
+
+    boundary.ensure("immediately_before_hidden_desktop_set_element_value")?;
+    let set_readback = crate::desktop_worker::hidden_desktop_set_element_value(
+        &route.desktop_name,
+        &params.element_id,
+        &params.text,
+    )
+    .map_err(|error| hidden_desktop_stage_error(&params, &route, "set_value", error))?;
+
+    tokio::time::sleep(Duration::from_millis(u64::from(params.verify_timeout_ms))).await;
+    // Separate worker process: fresh desktop connection, fresh COM/UIA client,
+    // fresh element resolution. The mutation cannot be its own witness.
+    let after = crate::desktop_worker::hidden_desktop_element_value(
+        &route.desktop_name,
+        &params.element_id,
+    )
+    .map_err(|error| hidden_desktop_stage_error(&params, &route, "after_value_read", error))?;
+    let after_sha256 = text_signature(&after.value);
+    let after_len = char_count(&after.value)?;
+    let changed = !value_readbacks_equivalent(&before, &after);
+    let source_of_truth = set_source_of_truth(&set_readback);
+    let target_text_integrity = set_text_integrity(&set_readback);
+    let backend_tier_used = route.backend_tier_used(&set_readback.method);
+    let route_label = route.route_label();
+
+    if !after_matches_requested(&after, &set_readback, &params.text) {
+        tracing::error!(
+            code = error_codes::ACTION_POSTCONDITION_FAILED,
+            tool = TOOL,
+            element_id = %params.element_id,
+            desktop_route = route_label.as_str(),
+            backend_tier_used = backend_tier_used.as_str(),
+            required_foreground = false,
+            source_of_truth,
+            method = %set_readback.method,
+            before_sha256,
+            after_sha256,
+            requested_sha256,
+            before_len,
+            after_len,
+            requested_len,
+            "act_set_value hidden-desktop worker set returned, but the separate on-desktop readback did not equal requested text"
+        );
+        return Err(postcondition_failed_set_value_error(
+            &params,
+            &before,
+            &after,
+            &set_readback,
+            "separate hidden-desktop worker readback did not equal requested text after set_value",
+        ));
+    }
+
+    tracing::info!(
+        code = "M2_ACT_SET_VALUE_HIDDEN_DESKTOP_READBACK",
+        element_id = %params.element_id,
+        desktop_route = route_label.as_str(),
+        backend_tier_used = backend_tier_used.as_str(),
+        required_foreground = false,
+        method = %set_readback.method,
+        before_len,
+        after_len,
+        requested_len,
+        changed,
+        source_of_truth,
+        "readback=act_set_value route={route_label} method={} before_len={before_len} after_len={after_len} requested_len={requested_len} changed={changed}",
+        set_readback.method
+    );
+
+    Ok(ActSetValueResponse {
+        ok: true,
+        backend_tier_used,
+        required_foreground: false,
+        method: set_readback.method,
+        source_of_truth: source_of_truth.to_owned(),
+        requested_len,
+        before_len,
+        after_len,
+        requested_sha256,
+        before_sha256: before_sha256.clone(),
+        after_sha256: after_sha256.clone(),
+        changed,
+        target_text_integrity: target_text_integrity.to_owned(),
+        target_readback_required: false,
+        desktop_route: Some(route_label.clone()),
+        postcondition: postcondition_verified_state(
+            source_of_truth,
+            before_sha256,
+            after_sha256,
+            changed,
+            if changed {
+                format!(
+                    "separate readback on session-owned desktop {route_label} equals requested text after set_value"
+                )
+            } else {
+                format!(
+                    "separate readback on session-owned desktop {route_label} already equaled requested text"
+                )
+            },
+        ),
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    })
+}
+
+/// Re-frames a hidden-desktop worker failure with the exact route, stage, and
+/// element so the refusal is never mistaken for a daemon-desktop failure.
+fn hidden_desktop_stage_error(
+    params: &ActSetValueParams,
+    route: &super::hidden_desktop::HiddenDesktopValueRoute,
+    stage: &'static str,
+    error: ErrorData,
+) -> ErrorData {
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let route_label = route.route_label();
+    tracing::error!(
+        code = code.as_str(),
+        tool = TOOL,
+        element_id = %params.element_id,
+        desktop_route = route_label.as_str(),
+        stage,
+        required_foreground = false,
+        detail = %error.message,
+        "act_set_value hidden-desktop worker stage failed"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{TOOL} hidden-desktop {stage} failed for element {} on session-owned desktop {}: {}",
+            params.element_id, route.desktop_name, error.message
+        ),
+        Some(json!({
+            "code": code,
+            "tool": TOOL,
+            "operation": stage,
+            "desktop_route": route_label,
+            "desktop_name": route.desktop_name,
+            "element_id": params.element_id.to_string(),
+            "required_foreground": false,
+            "backend_router": BACKEND_ROUTER_HIDDEN_DESKTOP_WORKER,
+            "source_of_truth": [SOURCE_NATIVE_TEXT, SOURCE_UIA_VALUE],
+            "worker_error": error.data,
+        })),
+    )
 }
 
 pub fn act_set_value_request_details(params: &ActSetValueParams) -> Value {

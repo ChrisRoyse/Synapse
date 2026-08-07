@@ -105,6 +105,10 @@ pub struct ActSetFieldTextResponse {
     pub before_sha256: String,
     pub after_sha256: String,
     pub changed: bool,
+    /// #2056: exact worker route when the target window lives on a
+    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_route: Option<String>,
     pub postcondition: ActPostcondition,
     pub elapsed_ms: u32,
 }
@@ -123,6 +127,9 @@ pub(crate) enum SetFieldTextRoute {
     },
     /// Anything else: `act_set_value` background tiers.
     NativeBackground,
+    /// #2056: the target window lives on a session-owned hidden desktop, so the
+    /// native tiers must run inside that desktop's worker.
+    HiddenDesktopBackground(super::hidden_desktop::HiddenDesktopValueRoute),
 }
 
 pub(crate) fn validate_set_field_text_params(
@@ -239,6 +246,41 @@ pub(crate) fn set_field_text_route(
     _element_id: &ElementId,
 ) -> Result<SetFieldTextRoute, ErrorData> {
     Ok(SetFieldTextRoute::NativeBackground)
+}
+
+/// #2056 routing entry point. Ordering is deliberate and fail-loud:
+///
+/// 1. A CDP web element id is desktop-agnostic (the transport is a socket), so
+///    it keeps the background CDP tier regardless of which desktop the browser
+///    window sits on.
+/// 2. Otherwise, if a session-owned hidden desktop physically owns the target
+///    HWND, the native tiers must run inside that desktop's worker. Resolution
+///    itself fails loud on a stale hidden HWND or an unsupported pattern.
+/// 3. Otherwise, the ordinary daemon-desktop routing applies.
+#[cfg(windows)]
+pub(crate) fn set_field_text_route_with_hidden_desktops(
+    element_id: &ElementId,
+    hidden_desktop_names: &[String],
+) -> Result<SetFieldTextRoute, ErrorData> {
+    if let Some(backend_node_id) = synapse_a11y::cdp_backend_from_element_id(element_id) {
+        return Ok(SetFieldTextRoute::Web { backend_node_id });
+    }
+    if let Some(route) = super::hidden_desktop::resolve_hidden_desktop_value_route(
+        TOOL,
+        element_id,
+        hidden_desktop_names,
+    )? {
+        return Ok(SetFieldTextRoute::HiddenDesktopBackground(route));
+    }
+    set_field_text_route(element_id)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn set_field_text_route_with_hidden_desktops(
+    element_id: &ElementId,
+    _hidden_desktop_names: &[String],
+) -> Result<SetFieldTextRoute, ErrorData> {
+    set_field_text_route(element_id)
 }
 
 /// Same predicate `act_type` uses to refuse Chromium UIA `ValuePattern`
@@ -400,6 +442,56 @@ pub(crate) async fn act_set_field_text_native(
         before_sha256: response.before_sha256,
         after_sha256: response.after_sha256,
         changed: response.changed,
+        desktop_route: response.desktop_route,
+        postcondition,
+        elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+    })
+}
+
+/// #2056 native tier for a target on a session-owned hidden desktop: delegates
+/// to the `act_set_value` hidden-desktop worker route (`ValuePattern.SetValue`
+/// / `WM_SETTEXT` performed on that exact desktop, then an independent
+/// on-desktop readback) and re-shapes the verified result into the
+/// `act_set_field_text` wire response. `required_foreground` stays false — this
+/// route never activates a desktop, never takes the human foreground, and never
+/// emits raw input.
+pub(crate) async fn act_set_field_text_hidden_desktop(
+    params: &ActSetFieldTextParams,
+    route: super::hidden_desktop::HiddenDesktopValueRoute,
+    boundary: super::OperatorPanicActionBoundary,
+) -> Result<ActSetFieldTextResponse, ErrorData> {
+    let started = std::time::Instant::now();
+    let response = super::set_value::act_set_value_hidden_desktop_with_boundary(
+        ActSetValueParams {
+            element_id: required_element_id(params)?.clone(),
+            text: params.text.clone(),
+            verify_timeout_ms: params.verify_timeout_ms,
+        },
+        route,
+        boundary,
+    )
+    .await?;
+    let postcondition = ActPostcondition {
+        detail: response
+            .postcondition
+            .detail
+            .map(|detail| format!("{TOOL} hidden-desktop tier: {detail}")),
+        ..response.postcondition
+    };
+    Ok(ActSetFieldTextResponse {
+        ok: response.ok,
+        method: response.method,
+        backend_tier_used: response.backend_tier_used,
+        required_foreground: response.required_foreground,
+        source_of_truth: response.source_of_truth,
+        requested_len: response.requested_len,
+        before_len: response.before_len,
+        after_len: response.after_len,
+        requested_sha256: response.requested_sha256,
+        before_sha256: response.before_sha256,
+        after_sha256: response.after_sha256,
+        changed: response.changed,
+        desktop_route: response.desktop_route,
         postcondition,
         elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
     })
@@ -495,6 +587,7 @@ pub(crate) fn finish_replace_response(
         before_sha256: before_sha256.clone(),
         after_sha256: after_sha256.clone(),
         changed,
+        desktop_route: None,
         postcondition: ActPostcondition {
             status: "verified_state".to_owned(),
             observed_delta: Some(changed),
