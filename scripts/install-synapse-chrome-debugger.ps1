@@ -2135,6 +2135,31 @@ function Invoke-SynapseChromeAddressBarNavigation {
         throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target after ordinary, attached-thread, and Alt-unlock foreground attempts; setup refuses to send browser navigation keys to an unverified foreground window"
     }
 
+    $foregroundWindow = Get-SynapseChromeWindowByHwnd `
+        -Hwnd $Window.hwnd `
+        -ChromeUserDataRoot $ChromeUserDataRoot
+    if (-not $foregroundWindow) {
+        throw "SYNAPSE_CHROME_NAVIGATION_WINDOW_LOST_AFTER_FOREGROUND hwnd=$($Window.hwnd) expected_pid=$($Window.pid) purpose=$Purpose remediation=the exact Chrome window disappeared after foreground acquisition; setup refuses navigation in another window"
+    }
+    if (
+        [int]$foregroundWindow.pid -ne [int]$Window.pid -or
+        $foregroundWindow.chrome_profile_eligible -ne $true -or
+        [string]$foregroundWindow.chrome_user_data_dir_normalized -cne [string]$Window.chrome_user_data_dir_normalized
+    ) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            purpose = $Purpose
+            expected_hwnd = $Window.hwnd
+            expected_pid = $Window.pid
+            expected_user_data_dir = $Window.chrome_user_data_dir_normalized
+            actual_hwnd = $foregroundWindow.hwnd
+            actual_pid = $foregroundWindow.pid
+            actual_user_data_dir = $foregroundWindow.chrome_user_data_dir_normalized
+            actual_profile_eligible = $foregroundWindow.chrome_profile_eligible
+            actual_profile_match_reason = $foregroundWindow.chrome_profile_match_reason
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_NAVIGATION_WINDOW_IDENTITY_CHANGED_AFTER_FOREGROUND detail=$detail remediation=the foreground HWND must still belong to the exact eligible Chrome PID and user-data root selected before navigation"
+    }
+    $Window = $foregroundWindow
     $addressBar = Find-SynapseAutomationElementByName `
         -Root $Window.element `
         -Name 'Address and search bar' `
@@ -2148,17 +2173,7 @@ function Invoke-SynapseChromeAddressBarNavigation {
             foreground_acquired = $foregroundAcquired
             navigation_before = $before
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_ADDRESS_BAR_NOT_FOUND detail=$detail remediation=the selected Chrome window did not expose its address edit through UI Automation; setup refuses to send unverified keyboard shortcuts"
-    }
-
-    $clipboardSnapshot = $null
-    $clipboardHadData = $false
-    try {
-        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
-        $clipboardSnapshot = [System.Windows.Forms.Clipboard]::GetDataObject()
-        $clipboardHadData = ($null -ne $clipboardSnapshot)
-    } catch {
-        throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_SNAPSHOT_FAILED purpose=$Purpose chrome_window_hwnd=$($Window.hwnd) chrome_window_pid=$($Window.pid) error=$($_.Exception.Message) remediation=setup refuses to overwrite clipboard state it cannot snapshot and restore"
+        throw "SYNAPSE_CHROME_NAVIGATION_ADDRESS_BAR_NOT_FOUND detail=$detail remediation=the selected Chrome window did not expose its address edit through UI Automation; setup refuses navigation without an exact element target"
     }
 
     try {
@@ -2166,24 +2181,32 @@ function Invoke-SynapseChromeAddressBarNavigation {
         if ($valuePattern.Current.IsReadOnly) {
             throw 'address_bar_value_pattern_read_only'
         }
+        # ValuePattern targets this exact UIA element. Global Ctrl+A/Ctrl+V and
+        # clipboard mutation let concurrent operator typing redirect the URL
+        # even though foreground ownership had just been verified (#2035).
+        # Set the value locally, then read it back before committing navigation.
+        $valuePattern.SetValue($Url)
+        $fieldValueAfterSet = [string]$valuePattern.Current.Value
+        if ($fieldValueAfterSet.Trim().TrimEnd('/') -ine $Url.Trim().TrimEnd('/')) {
+            throw "address_bar_value_readback_mismatch_after_set actual=$fieldValueAfterSet expected=$Url"
+        }
         $addressBar.SetFocus()
-        Start-Sleep -Milliseconds 100
         if (-not $addressBar.Current.HasKeyboardFocus) {
             throw 'address_bar_keyboard_focus_not_observed'
         }
-        # Windows can transiently deny OpenClipboard while another application
-        # owns it. Use the framework's bounded retry overload; exhaustion still
-        # fails closed and preserves the exact exception for remediation.
-        [System.Windows.Forms.Clipboard]::SetDataObject($Url, $true, 10, 100)
-        Start-Sleep -Milliseconds 100
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x41))
-        Start-Sleep -Milliseconds 100
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x56))
-        Start-Sleep -Milliseconds 150
-        $fieldValue = [string]$valuePattern.Current.Value
-        if ($fieldValue.Trim().TrimEnd('/') -ine $Url.Trim().TrimEnd('/')) {
-            throw "address_bar_value_readback_mismatch actual=$fieldValue expected=$Url"
+        $foregroundAtCommit = Read-SynapseForegroundWindow
+        $fieldValueAtCommit = [string]$valuePattern.Current.Value
+        if (
+            [int64]$foregroundAtCommit.hwnd -ne [int64]$Window.hwnd -or
+            [int]$foregroundAtCommit.pid -ne [int]$Window.pid -or
+            -not $addressBar.Current.HasKeyboardFocus -or
+            $fieldValueAtCommit.Trim().TrimEnd('/') -ine $Url.Trim().TrimEnd('/')
+        ) {
+            throw "address_bar_commit_identity_changed foreground_hwnd=$($foregroundAtCommit.hwnd) foreground_pid=$($foregroundAtCommit.pid) keyboard_focus=$($addressBar.Current.HasKeyboardFocus) actual_value=$fieldValueAtCommit expected_value=$Url"
         }
+        # Chrome's omnibox exposes ValuePattern and TextPattern, but no
+        # InvokePattern. Enter is the only global input left in this flow; it is
+        # emitted only after the exact HWND/PID/focus/value boundary readback.
         Send-SynapseNativeKeyTap -VirtualKey 0x0D
     } catch {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
@@ -2195,52 +2218,7 @@ function Invoke-SynapseChromeAddressBarNavigation {
             navigation_before = $before
             error = $_.Exception.Message
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_KEY_INPUT_FAILED detail=$detail remediation=Chrome navigation input failed after foreground readback; inspect clipboard and keyboard-input availability before retrying setup"
-    } finally {
-        try {
-            if ($clipboardHadData) {
-                [System.Windows.Forms.Clipboard]::SetDataObject($clipboardSnapshot, $true, 10, 100)
-            } else {
-                $clipboardCleared = $false
-                $clipboardClearError = $null
-                for ($attempt = 1; $attempt -le 10; $attempt++) {
-                    try {
-                        [System.Windows.Forms.Clipboard]::Clear()
-                        $clipboardCleared = $true
-                        break
-                    } catch {
-                        $clipboardClearError = $_.Exception.Message
-                        if ($attempt -lt 10) {
-                            Start-Sleep -Milliseconds 100
-                        }
-                    }
-                }
-                if (-not $clipboardCleared) {
-                    throw "clipboard_clear_retry_exhausted attempts=10 last_error=$clipboardClearError"
-                }
-            }
-        } catch {
-            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
-                purpose = $Purpose
-                target_url = $Url
-                chrome_window_hwnd = $Window.hwnd
-                chrome_window_pid = $Window.pid
-                clipboard_had_data = $clipboardHadData
-                error = $_.Exception.Message
-            }) -Depth 8
-            throw "SYNAPSE_CHROME_NAVIGATION_CLIPBOARD_RESTORE_FAILED detail=$detail remediation=setup changed the clipboard for exact Chrome address-bar navigation but could not restore the prior complete data object"
-        }
-    }
-    if ($failed.Count -gt 0) {
-        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
-            stable_root = $StableRoot
-            current_extension_dir = $CurrentExtensionDir
-            referenced_paths = @($referencedPaths)
-            preserved_dirs = @($preserved)
-            removed_dirs = @($removed)
-            failed_dirs = @($failed)
-        }) -Depth 10
-        throw "SYNAPSE_CHROME_STALE_BUILD_CLEANUP_FAILED detail=$detail remediation=inspect only the named versioned build directories; cleanup refuses to report success while any deletion target is ambiguous or remains on disk"
+        throw "SYNAPSE_CHROME_NAVIGATION_EXACT_UIA_INPUT_FAILED detail=$detail remediation=the exact Chrome omnibox must expose a writable ValuePattern, retain the requested value, retain keyboard focus, and remain in the exact foreground HWND/PID through the navigation commit boundary"
     }
 
     # Chrome normalises what the omnibox displays for internal pages: navigating to
@@ -2297,11 +2275,11 @@ function Invoke-SynapseChromeAddressBarNavigation {
             navigation_before = $before
             navigation_after = $latest
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_NOT_CONFIRMED detail=$detail remediation=Chrome did not visibly reach the requested internal page after verified foreground keyboard navigation; compare observed_address against accepted_addresses and observed_title against expected_title_pattern; setup refuses to search extension controls on a stale page"
+        throw "SYNAPSE_CHROME_NAVIGATION_NOT_CONFIRMED detail=$detail remediation=Chrome did not visibly reach the requested internal page after exact UIA value assignment and verified commit; compare observed_address against accepted_addresses and observed_title against expected_title_pattern; setup refuses to search extension controls on a stale page"
     }
 
     [pscustomobject]@{
-        method = 'foreground_uia_focus_ctrl_a_clipboard_enter_exact_readback'
+        method = 'foreground_uia_value_set_enter_exact_readback'
         purpose = $Purpose
         target_url = $Url
         expected_title_pattern = $ExpectedTitlePattern
@@ -2323,19 +2301,6 @@ function Send-SynapseNativeKeyDown {
 function Send-SynapseNativeKeyUp {
     param([byte]$VirtualKey)
     [SynapseChromeBridgeAutoInstall.Win32]::keybd_event($VirtualKey, 0, 2, [UIntPtr]::Zero)
-}
-
-function Send-SynapseNativeKeyChord {
-    param([byte[]]$VirtualKeys)
-    foreach ($key in $VirtualKeys) {
-        Send-SynapseNativeKeyDown -VirtualKey $key
-        Start-Sleep -Milliseconds 25
-    }
-    [array]::Reverse($VirtualKeys)
-    foreach ($key in $VirtualKeys) {
-        Start-Sleep -Milliseconds 25
-        Send-SynapseNativeKeyUp -VirtualKey $key
-    }
 }
 
 function Send-SynapseNativeKeyTap {
@@ -2402,10 +2367,12 @@ function Find-SynapseChromeFolderDialog {
 function Get-SynapseChromeWindowByHwnd {
     param(
         [Parameter(Mandatory = $true)]
-        [int64]$Hwnd
+        [int64]$Hwnd,
+        [AllowNull()]
+        [string]$ChromeUserDataRoot
     )
 
-    @(Get-SynapseChromeTopLevelWindows | Where-Object { $_.hwnd -eq $Hwnd } | Select-Object -First 1)[0]
+    @(Get-SynapseChromeTopLevelWindows -ChromeUserDataRoot $ChromeUserDataRoot | Where-Object { $_.hwnd -eq $Hwnd } | Select-Object -First 1)[0]
 }
 
 function Read-SynapseChromeExtensionDetailsUiState {
@@ -2614,7 +2581,6 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
     }
 
     $chromeWindow = @($eligibleWindows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
-    $tabStripBefore = Read-SynapseChromeTabStripState -Window $chromeWindow
     $foregroundDeadline = (Get-Date).AddSeconds(5)
     if ($foregroundDeadline -gt $Deadline) {
         $foregroundDeadline = $Deadline
@@ -2626,14 +2592,75 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
             chrome_window_hwnd = $chromeWindow.hwnd
             chrome_window_pid = $chromeWindow.pid
             foreground_acquisition = $foreground
-            tab_strip_before = $tabStripBefore
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_TAB_CREATE_FOREGROUND_FAILED detail=$detail remediation=Windows did not grant verified foreground ownership for the exact new-tab keyboard action"
+        throw "SYNAPSE_CHROME_MAINTENANCE_TAB_CREATE_FOREGROUND_FAILED detail=$detail remediation=Windows did not grant verified foreground ownership needed to realize and read the exact Chrome UIA tab strip before New Tab invocation"
     }
 
-    Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x54))
+    # UIA elements are provider-backed snapshots, not durable window handles.
+    # The failed Chrome 150 setup captured the element while its HWND was in the
+    # background and observed zero TabContainerImpl descendants; a later fresh
+    # element for that same physical HWND exposed exactly one container and all
+    # 16 tabs. Reading that snapshot before foreground acquisition therefore
+    # aborted bridge repair before setup created any tab (#2035).
+    # Reacquire the element from the exact HWND only after foreground ownership
+    # is physically read back, then pin both process and profile identity before
+    # taking the pre-mutation tab-strip SoT snapshot.
+    $foregroundWindow = Get-SynapseChromeWindowByHwnd `
+        -Hwnd $chromeWindow.hwnd `
+        -ChromeUserDataRoot $ChromeUserDataRoot
+    if (-not $foregroundWindow) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_WINDOW_LOST_AFTER_FOREGROUND hwnd=$($chromeWindow.hwnd) expected_pid=$($chromeWindow.pid) remediation=the exact Chrome window disappeared after foreground acquisition; setup refuses to create a tab in another window"
+    }
+    if ([int]$foregroundWindow.pid -ne [int]$chromeWindow.pid -or
+        $foregroundWindow.chrome_profile_eligible -ne $true -or
+        [string]$foregroundWindow.chrome_user_data_dir_normalized -cne [string]$chromeWindow.chrome_user_data_dir_normalized) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            expected_hwnd = $chromeWindow.hwnd
+            expected_pid = $chromeWindow.pid
+            expected_user_data_dir = $chromeWindow.chrome_user_data_dir_normalized
+            actual_hwnd = $foregroundWindow.hwnd
+            actual_pid = $foregroundWindow.pid
+            actual_user_data_dir = $foregroundWindow.chrome_user_data_dir_normalized
+            actual_profile_eligible = $foregroundWindow.chrome_profile_eligible
+            actual_profile_match_reason = $foregroundWindow.chrome_profile_match_reason
+            foreground_acquisition = $foreground
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_WINDOW_IDENTITY_CHANGED_AFTER_FOREGROUND detail=$detail remediation=the foreground HWND no longer belongs to the exact eligible Chrome profile selected before acquisition; setup refuses cross-profile tab creation"
+    }
+    $chromeWindow = $foregroundWindow
+    $tabStripBefore = Read-SynapseChromeTabStripState -Window $chromeWindow
+
+    $newTabCondition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'TabStripControlButton'
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            'New Tab'
+        )
+    )
+    $newTabButtons = $chromeWindow.element.FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        $newTabCondition
+    )
+    if ($newTabButtons.Count -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_NEW_TAB_BUTTON_NOT_UNIQUE hwnd=$($chromeWindow.hwnd) pid=$($chromeWindow.pid) match_count=$($newTabButtons.Count) remediation=the exact eligible Chrome HWND must expose one UIA Button named New Tab with class TabStripControlButton"
+    }
+    try {
+        $newTabPattern = $newTabButtons[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $newTabPattern.Invoke()
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_NEW_TAB_INVOKE_FAILED hwnd=$($chromeWindow.hwnd) pid=$($chromeWindow.pid) error=$($_.Exception.Message) remediation=repair the exact Chrome New Tab button InvokePattern; setup does not use global Ctrl+T"
+    }
     $createdWindow = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-        $current = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+        $current = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $chromeWindow.hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
         if (-not $current) {
             return $null
         }
@@ -2655,7 +2682,9 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         return $null
     }
     if (-not $createdWindow) {
-        $latest = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+        $latest = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $chromeWindow.hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
         $latestTabs = if ($latest) { Read-SynapseChromeTabStripState -Window $latest } else { $null }
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             maintenance_tab_token = $MaintenanceTabToken
@@ -2664,7 +2693,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
             tab_strip_before = $tabStripBefore
             tab_strip_after = $latestTabs
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_TAB_CREATE_NOT_CONFIRMED detail=$detail remediation=Ctrl+T did not produce exactly one new tab in the selected Chrome HWND; setup refuses to repurpose an existing operator tab"
+        throw "SYNAPSE_CHROME_MAINTENANCE_TAB_CREATE_NOT_CONFIRMED detail=$detail remediation=the exact UIA New Tab invocation did not produce exactly one new runtime identity in the selected Chrome HWND; setup refuses to repurpose an existing operator tab"
     }
     if (-not $createdWindow.owned_tab_selected) {
         $tabItemCondition = [System.Windows.Automation.PropertyCondition]::new(
@@ -2688,7 +2717,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
             }
         }
         if ($matches.Count -ne 1) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_CREATED_TAB_ELEMENT_NOT_UNIQUE hwnd=$($chromeWindow.hwnd) owned_runtime_id=$($createdWindow.owned_tab_runtime_id) match_count=$($matches.Count) remediation=the exact browser tab created by Ctrl+T must remain uniquely selectable"
+            throw "SYNAPSE_CHROME_MAINTENANCE_CREATED_TAB_ELEMENT_NOT_UNIQUE hwnd=$($chromeWindow.hwnd) owned_runtime_id=$($createdWindow.owned_tab_runtime_id) match_count=$($matches.Count) remediation=the exact browser tab created by UIA New Tab invocation must remain uniquely selectable"
         }
         try {
             $selection = $matches[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
@@ -2697,7 +2726,9 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
             throw "SYNAPSE_CHROME_MAINTENANCE_CREATED_TAB_SELECT_FAILED hwnd=$($chromeWindow.hwnd) owned_runtime_id=$($createdWindow.owned_tab_runtime_id) error=$($_.Exception.Message) remediation=repair exact UIA browser-tab selection before maintenance navigation"
         }
         $selectedCreated = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-            $current = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+            $current = Get-SynapseChromeWindowByHwnd `
+                -Hwnd $chromeWindow.hwnd `
+                -ChromeUserDataRoot $ChromeUserDataRoot
             if (-not $current) {
                 return $null
             }
@@ -2712,45 +2743,49 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
             return $null
         }
         if (-not $selectedCreated) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_CREATED_TAB_SELECT_NOT_CONFIRMED hwnd=$($chromeWindow.hwnd) owned_runtime_id=$($createdWindow.owned_tab_runtime_id) remediation=the exact browser tab created by Ctrl+T was not independently observed selected before navigation"
+            throw "SYNAPSE_CHROME_MAINTENANCE_CREATED_TAB_SELECT_NOT_CONFIRMED hwnd=$($chromeWindow.hwnd) owned_runtime_id=$($createdWindow.owned_tab_runtime_id) remediation=the exact browser tab created by UIA New Tab invocation was not independently observed selected before navigation"
         }
         $createdWindow.tab_strip = $selectedCreated
         $createdWindow.owned_tab_selected = $true
-        $createdWindow.window = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
+        $createdWindow.window = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $chromeWindow.hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
     }
 
-    try {
-        $markerNavigation = Invoke-SynapseChromeAddressBarNavigation `
-            -Window $createdWindow.window `
-            -ChromeUserDataRoot $ChromeUserDataRoot `
-            -Url $MaintenanceMarkerUrl `
-            -ExpectedTitlePattern ("^" + [regex]::Escape($MaintenanceMarkerTitle) + "( - Google Chrome)?$") `
-            -Deadline $Deadline `
-            -Purpose 'owned_bridge_maintenance_marker'
-    } catch {
-        $createError = $_.Exception.Message
-        $foregroundAgain = Wait-SynapseChromeForegroundAcquisition -Window $createdWindow.window -Deadline $Deadline
-        if (-not $foregroundAgain.acquired) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_MARKER_FAILED_AND_TAB_CLEANUP_UNAVAILABLE create_error=$createError hwnd=$($chromeWindow.hwnd) foreground_acquired=false remediation=close only the visibly new blank tab in the named HWND after verifying it is the operation-created tab, then repair foreground acquisition"
-        }
-        Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x57))
-        $rollback = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-            $current = Get-SynapseChromeWindowByHwnd -Hwnd $chromeWindow.hwnd
-            if (-not $current) {
-                return $null
-            }
-            $tabs = Read-SynapseChromeTabStripState -Window $current
-            if ($tabs.count -eq $tabStripBefore.count) {
-                return $tabs
-            }
-            return $null
-        }
-        if (-not $rollback) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_MARKER_FAILED_AND_TAB_CLEANUP_FAILED create_error=$createError hwnd=$($chromeWindow.hwnd) expected_tab_count=$($tabStripBefore.count) remediation=inspect the exact named Chrome HWND; setup could not prove removal of its newly-created blank tab"
-        }
-        throw "SYNAPSE_CHROME_MAINTENANCE_MARKER_FAILED create_error=$createError cleanup=verified_tab_count_restored hwnd=$($chromeWindow.hwnd)"
+    $lease = [pscustomobject]@{
+        token = $MaintenanceTabToken
+        ownership_source = 'verified_uia_new_tab_marker'
+        owned_tab_runtime_id = [string]$createdWindow.owned_tab_runtime_id
+        chrome_tab_id = $null
+        chrome_window_id = $null
+        chrome_window_hwnd = [int64]$createdWindow.window.hwnd
+        chrome_window_pid = [int]$createdWindow.window.pid
+        marker_url = $MaintenanceMarkerUrl
+        marker_title = $MaintenanceMarkerTitle
+        marker_navigation = $null
+        tab_strip_before_create = $tabStripBefore
+        tab_strip_after_marker = $null
+        expected_tab_count_after_cleanup = $tabStripBefore.count
+        created_via_ui = $true
     }
+    # Publish ownership before navigation so every later failure, including
+    # concurrent address-bar input, is cleaned by exact UIA runtime identity.
+    $script:SynapseChromeMaintenanceTabLease = $lease
 
+    $markerNavigation = Invoke-SynapseChromeAddressBarNavigation `
+        -Window $createdWindow.window `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -Url $MaintenanceMarkerUrl `
+        -ExpectedTitlePattern ("^" + [regex]::Escape($MaintenanceMarkerTitle) + "( - Google Chrome)?$") `
+        -Deadline $Deadline `
+        -Purpose 'owned_bridge_maintenance_marker'
+
+    $createdWindow.window = Get-SynapseChromeWindowByHwnd `
+        -Hwnd $chromeWindow.hwnd `
+        -ChromeUserDataRoot $ChromeUserDataRoot
+    if (-not $createdWindow.window) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_WINDOW_LOST_AFTER_MARKER hwnd=$($chromeWindow.hwnd) pid=$($chromeWindow.pid) owned_runtime_id=$($lease.owned_tab_runtime_id) remediation=the exact Chrome window disappeared after marker navigation; cleanup retains the published runtime-id lease"
+    }
     $tabStripAfterMarker = Read-SynapseChromeTabStripState -Window $createdWindow.window
     $beforeRuntimeIds = @($tabStripBefore.tabs | ForEach-Object { [string]$_.runtime_id })
     $createdTabRows = @($tabStripAfterMarker.tabs | Where-Object {
@@ -2771,25 +2806,8 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         }) -Depth 12
         throw "SYNAPSE_CHROME_MAINTENANCE_MARKER_TAB_IDENTITY_AMBIGUOUS detail=$detail remediation=the new marker tab must be the one exact newly-created and selected UIA runtime identity"
     }
-    $lease = [pscustomobject]@{
-        token = $MaintenanceTabToken
-        ownership_source = 'verified_foreground_ctrl_t_marker'
-        owned_tab_runtime_id = [string]$createdTabRows[0].runtime_id
-        chrome_tab_id = $null
-        chrome_window_id = $null
-        chrome_window_hwnd = [int64]$createdWindow.window.hwnd
-        chrome_window_pid = [int]$createdWindow.window.pid
-        marker_url = $MaintenanceMarkerUrl
-        marker_title = $MaintenanceMarkerTitle
-        marker_navigation = $markerNavigation
-        tab_strip_before_create = $tabStripBefore
-        tab_strip_after_marker = $tabStripAfterMarker
-        expected_tab_count_after_cleanup = $tabStripBefore.count
-        created_via_ui = $true
-    }
-    # Publish ownership before any later postcondition can fail so the top-level
-    # failure path always has the exact marker/HWND needed for cleanup.
-    $script:SynapseChromeMaintenanceTabLease = $lease
+    $lease.marker_navigation = $markerNavigation
+    $lease.tab_strip_after_marker = $tabStripAfterMarker
     [pscustomobject]@{
         window = $createdWindow.window
         lease = $lease
@@ -2806,7 +2824,9 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         [datetime]$Deadline
     )
 
-    $window = Get-SynapseChromeWindowByHwnd -Hwnd $Lease.chrome_window_hwnd
+    $window = Get-SynapseChromeWindowByHwnd `
+        -Hwnd $Lease.chrome_window_hwnd `
+        -ChromeUserDataRoot $ChromeUserDataRoot
     if (-not $window) {
         throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_WINDOW_MISSING hwnd=$($Lease.chrome_window_hwnd) pid=$($Lease.chrome_window_pid) token=$($Lease.token) remediation=read chrome.tabs by the exact ownership token before deciding whether the tab was already removed"
     }
@@ -2854,7 +2874,9 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
             throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_SELECT_FAILED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId token=$($Lease.token) error=$($_.Exception.Message) remediation=repair Chrome UI Automation tab selection before cleanup"
         }
         $selectedOwned = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-            $current = Get-SynapseChromeWindowByHwnd -Hwnd $window.hwnd
+            $current = Get-SynapseChromeWindowByHwnd `
+                -Hwnd $window.hwnd `
+                -ChromeUserDataRoot $ChromeUserDataRoot
             if (-not $current) {
                 return $null
             }
@@ -2868,7 +2890,9 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         if (-not $selectedOwned) {
             throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_SELECT_NOT_CONFIRMED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId token=$($Lease.token) remediation=the exact operation-created tab was not independently observed selected"
         }
-        $window = Get-SynapseChromeWindowByHwnd -Hwnd $Lease.chrome_window_hwnd
+        $window = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $Lease.chrome_window_hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
     }
     $navigationBefore = Read-SynapseChromeNavigationState -Hwnd $window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
     $addressBefore = ([string]$navigationBefore.address_bar_value).Trim().TrimEnd('/')
@@ -2880,7 +2904,7 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
     # erased from the omnibox by the very navigation the operation performs. The
     # durable identity is the UIA runtime id of the exact tab this operation
     # created, which is already what selection is verified against above. Refusing
-    # Ctrl+W against a tab we cannot prove we own stays correct and unchanged;
+    # Refusing any close against a tab we cannot prove we own stays correct;
     # this only stops a correctly-owned tab being disowned by URL normalisation.
     # Read the strip again here rather than reusing the pre-selection snapshot, so
     # the selected identity is the one that exists at the moment of the check.
@@ -2899,15 +2923,60 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
             expected_runtime_id = [string]$Lease.owned_tab_runtime_id
             selected_runtime_ids = @($selectedTabs | ForEach-Object { [string]$_.runtime_id })
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is neither the active exact marker/token tab nor the exact UIA runtime identity this operation created; setup refuses Ctrl+W against an operator tab"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is neither the active exact marker/token tab nor the exact UIA runtime identity this operation created; setup refuses any close against an operator tab"
     }
-    $foreground = Wait-SynapseChromeForegroundAcquisition -Window $window -Deadline $Deadline
-    if (-not $foreground.acquired) {
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_FOREGROUND_FAILED hwnd=$($window.hwnd) token=$($Lease.token) remediation=repair foreground acquisition; setup refuses to send Ctrl+W without exact HWND foreground readback"
+    # Close the exact owned UIA tab element directly. Ctrl+W depends on the
+    # global foreground at the instant the key arrives, so concurrent operator
+    # input can redirect it even after a correct foreground readback. The
+    # TabCloseButton is a descendant of the runtime-id-pinned tab and exposes an
+    # InvokePattern; using it makes the destructive target local and immutable
+    # at the invocation boundary.
+    $tabItemCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::TabItem
+    )
+    $ownedElementsAtClose = @()
+    foreach ($item in $window.element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $tabItemCondition)) {
+        $runtimeId = '<unavailable>'
+        try {
+            $runtimeId = (@($item.GetRuntimeId()) -join '.')
+        } catch {
+            $runtimeId = "<error:$($_.Exception.Message)>"
+        }
+        if ($runtimeId -ceq $ownedRuntimeId) {
+            $ownedElementsAtClose += $item
+        }
     }
-    Send-SynapseNativeKeyChord -VirtualKeys ([byte[]](0x11, 0x57))
+    if ($ownedElementsAtClose.Count -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_CLOSE_TARGET_NOT_UNIQUE hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId match_count=$($ownedElementsAtClose.Count) token=$($Lease.token) remediation=the exact operation-created UIA tab must remain uniquely present at the close boundary"
+    }
+    $closeButtonCondition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Button
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'TabCloseButton'
+        )
+    )
+    $closeButtons = $ownedElementsAtClose[0].FindAll(
+        [System.Windows.Automation.TreeScope]::Descendants,
+        $closeButtonCondition
+    )
+    if ($closeButtons.Count -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_CLOSE_BUTTON_NOT_UNIQUE hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId match_count=$($closeButtons.Count) token=$($Lease.token) remediation=the exact selected operation-created tab must expose one TabCloseButton before cleanup mutates Chrome"
+    }
+    try {
+        $closePattern = $closeButtons[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $closePattern.Invoke()
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_CLOSE_INVOKE_FAILED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId token=$($Lease.token) error=$($_.Exception.Message) remediation=repair the exact Chrome TabCloseButton InvokePattern before retrying cleanup"
+    }
     $after = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-        $current = Get-SynapseChromeWindowByHwnd -Hwnd $window.hwnd
+        $current = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $window.hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
         if (-not $current) {
             return $null
         }
@@ -2922,21 +2991,25 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
                 [string]$_.runtime_id -ceq [string]$Lease.owned_tab_runtime_id
             }
         ).Count -gt 0
-        if (
-            $tabs.count -eq [int]$Lease.expected_tab_count_after_cleanup -and
-            -not $ownedRuntimeStillPresent -and
-            $address -cne $markerAddress -and
-            $address -notmatch $tokenPattern
-        ) {
+        $baselineRuntimeIds = @($Lease.tab_strip_before_create.tabs | ForEach-Object { [string]$_.runtime_id })
+        $currentRuntimeIds = @($tabs.tabs | ForEach-Object { [string]$_.runtime_id })
+        $missingBaselineRuntimeIds = @($baselineRuntimeIds | Where-Object { $_ -notin $currentRuntimeIds })
+        if (-not $ownedRuntimeStillPresent -and $missingBaselineRuntimeIds.Count -eq 0) {
             return [pscustomobject]@{
                 tab_strip = $tabs
                 navigation = $navigation
+                missing_baseline_runtime_ids = @()
+                concurrent_runtime_ids = @($currentRuntimeIds | Where-Object {
+                    $_ -notin $baselineRuntimeIds -and $_ -cne [string]$Lease.owned_tab_runtime_id
+                })
             }
         }
         return $null
     }
     if (-not $after) {
-        $latest = Get-SynapseChromeWindowByHwnd -Hwnd $window.hwnd
+        $latest = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $window.hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
         $latestTabs = if ($latest) { Read-SynapseChromeTabStripState -Window $latest } else { $null }
         $latestNavigation = if ($latest) { Read-SynapseChromeNavigationState -Hwnd $latest.hwnd -ChromeUserDataRoot $ChromeUserDataRoot } else { $null }
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
@@ -2945,7 +3018,7 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
             tabs_after = $latestTabs
             navigation_after = $latestNavigation
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_NOT_CONFIRMED detail=$detail remediation=the exact operation-created tab did not become absent by independent tab-strip/address readback"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_NOT_CONFIRMED detail=$detail remediation=the exact operation-created runtime id must be absent and every pre-operation tab runtime id must remain present; concurrent tabs are retained and reported, never closed"
     }
     $selectionRestore = [pscustomobject]@{
         attempted = $false
@@ -3026,7 +3099,7 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         attempted = $true
         closed = $true
         absent_verified = $true
-        method = 'exact_active_token_tab_ctrl_w'
+        method = 'exact_uia_runtime_id_tab_close_button_invoke'
         token = $Lease.token
         owned_tab_runtime_id = $Lease.owned_tab_runtime_id
         chrome_tab_id = $Lease.chrome_tab_id
@@ -3036,6 +3109,7 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         tabs_after = $after.tab_strip
         navigation_before = $navigationBefore
         navigation_after = $after.navigation
+        concurrent_runtime_ids = @($after.concurrent_runtime_ids)
         prior_selection_restore = $selectionRestore
     }
 }
@@ -3580,7 +3654,7 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
         [string]$cleanupLease.token -cne $MaintenanceTabToken -or
         [string]$cleanupLease.marker_url -cne $MaintenanceMarkerUrl -or
         [string]$cleanupLease.marker_title -cne $MaintenanceMarkerTitle -or
-        [string]$cleanupLease.ownership_source -cne 'verified_foreground_ctrl_t_marker' -or
+        [string]$cleanupLease.ownership_source -cne 'verified_uia_new_tab_marker' -or
         [string]::IsNullOrWhiteSpace([string]$cleanupLease.owned_tab_runtime_id) -or
         $cleanupLease.created_via_ui -ne $true -or
         [int64]$cleanupLease.chrome_window_hwnd -le 0 -or
