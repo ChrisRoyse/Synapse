@@ -76,6 +76,28 @@ impl VersionedCfStore {
             .collect())
     }
 
+    /// Merges the MVCC overlay's visible rows over the router's rows, in
+    /// bounded pages that release the row read guard between them (#2060).
+    ///
+    /// The single hold this replaces was the largest guard hold ever observed
+    /// on the deployed daemon: **757 ms** at `scan_cf_at_overlay`, three
+    /// quarters of a second during which every commit in the process was
+    /// blocked waiting for the write guard it needs exclusively. #1973 had
+    /// already narrowed the *rows visited* by seeking the range instead of
+    /// filtering the family; a whole-family `scan_cf_at` has no range to seek,
+    /// so the only remaining lever is the length of the critical section.
+    ///
+    /// **Paging does not change the merged result.** Each key's contribution —
+    /// insert its visible value, or remove a key the overlay tombstones — is
+    /// independent of every other key's and is applied exactly once, because
+    /// row-table entries are only ever created, never removed, so the key order
+    /// this cursor walks is stable. A commit landing between pages allocates a
+    /// sequence above `snapshot.seq()`, so `visible_value_state` reports it as
+    /// not-yet-visible wherever the cursor meets it; a reclaim landing between
+    /// pages keeps each chain's newest version at or below the safe point,
+    /// which is clamped to the oldest live lease, so the version visible at
+    /// this pinned sequence is never the one dropped. The lease is re-checked
+    /// per page so a fold that outlived its pin fails closed.
     pub(super) fn overlay_table_rows(
         &self,
         site: RowGuardSite,
@@ -83,23 +105,41 @@ impl VersionedCfStore {
         cf: ColumnFamily,
         range: Option<&KeyRange>,
         rows: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+        clock: &dyn Clock,
     ) -> Result<()> {
-        let table = self.read_rows(site, cf);
-        let Some(cf_rows) = table.get(&cf) else {
-            return Ok(());
-        };
-        for (key, versions) in overlay_range(cf_rows, cf, range)? {
-            match visible_value_state(versions, snapshot.seq()) {
-                Some(VisibleValue::Live(value)) => {
-                    rows.insert(key.clone(), value);
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            self.ensure_snapshot_live(snapshot, clock)?;
+            let mut page_end: Option<Vec<u8>> = None;
+            {
+                let table = self.read_rows(site, cf);
+                let Some(cf_rows) = table.get(&cf) else {
+                    return Ok(());
+                };
+                let mut examined = 0_usize;
+                for (key, versions) in overlay_page(cf_rows, cf, range, cursor.as_deref())? {
+                    match visible_value_state(versions, snapshot.seq()) {
+                        Some(VisibleValue::Live(value)) => {
+                            rows.insert(key.clone(), value);
+                        }
+                        Some(VisibleValue::Tombstone) => {
+                            rows.remove(key);
+                        }
+                        None => {}
+                    }
+                    examined += 1;
+                    if examined == ROW_GUARD_FOLD_PAGE_ROWS {
+                        page_end = Some(key.clone());
+                        break;
+                    }
                 }
-                Some(VisibleValue::Tombstone) => {
-                    rows.remove(key);
-                }
-                None => {}
             }
+            // A page that ended before the limit exhausted the requested range.
+            let Some(page_end) = page_end else {
+                return Ok(());
+            };
+            cursor = Some(page_end);
         }
-        Ok(())
     }
 
     pub(super) fn overlay_table_keys(
@@ -203,4 +243,46 @@ pub(super) fn overlay_range<'a>(
         None => Bound::Unbounded,
     };
     Ok(cf_rows.range::<[u8], _>((Bound::Included(range.start.as_slice()), end)))
+}
+
+/// [`overlay_range`] resumed after an exclusive cursor, for folds that release
+/// the row read guard between pages (#2060).
+///
+/// The upper bound and the inversion check are `overlay_range`'s, unchanged —
+/// the cursor only raises the lower bound, and it raises it to a key the
+/// previous page already visited, so the two together yield each key in the
+/// requested range exactly once and in order.
+///
+/// # Errors
+///
+/// Fails closed on an inverted range, exactly as [`overlay_range`] does.
+pub(super) fn overlay_page<'a>(
+    cf_rows: &'a BTreeMap<Vec<u8>, VersionChain>,
+    cf: ColumnFamily,
+    range: Option<&KeyRange>,
+    after: Option<&[u8]>,
+) -> Result<std::collections::btree_map::Range<'a, Vec<u8>, VersionChain>> {
+    let Some(after) = after else {
+        return overlay_range(cf_rows, cf, range);
+    };
+    let end = match range {
+        Some(range) => match range.end.as_deref() {
+            Some(end) if end < range.start.as_slice() => {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_OVERLAY_RANGE_INVERTED",
+                    message: format!(
+                        "overlay range read of {} requires end >= start; start={} end={}",
+                        cf.name(),
+                        super::hex_prefix(&range.start),
+                        super::hex_prefix(end)
+                    ),
+                    remediation: "supply an ordered KeyRange; an inverted range is a caller bug, not an empty column family",
+                });
+            }
+            Some(end) => Bound::Excluded(end),
+            None => Bound::Unbounded,
+        },
+        None => Bound::Unbounded,
+    };
+    Ok(cf_rows.range::<[u8], _>((Bound::Excluded(after), end)))
 }

@@ -205,6 +205,23 @@ const EXCLUSIVE_ROUTER_RECLAIM_WARN_MS: u64 = 250;
 /// synchronous work.
 pub const LATEST_CF_RANGE_PAGE_MAX_ROWS: usize = 65_536;
 
+/// Row-table entries one **maintenance fold** examines per acquisition of the
+/// row read guard (#2060).
+///
+/// This is not a result limit — every fold that uses it still visits the whole
+/// family — it is the length of the critical section. The guard it bounds is
+/// the one every commit must take exclusively, so a fold that holds it across a
+/// million-row family stalls every writer in the process for as long as the
+/// fold runs: the deployed daemon measured 757 ms on `scan_cf_at_overlay`,
+/// 539 ms on `changed_base_keys_after_at_for_panel`, and 117 ms on
+/// `changed_keys_after_at`, against a 25 ms budget.
+///
+/// 256 rather than a fresh guess: it is the page size #2041 swept against
+/// [`ROW_READ_GUARD_WARN_US`] at six sizes on the real vault, which landed the
+/// worst hold at 16% of budget with a budget cliff between 2,048 and 4,096.
+/// Reusing the swept value keeps one measured number instead of two that drift.
+pub const ROW_GUARD_FOLD_PAGE_ROWS: usize = 256;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct VersionedValue {
     seq: Seq,

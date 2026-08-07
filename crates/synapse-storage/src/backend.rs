@@ -11289,17 +11289,54 @@ struct CalyxRetentionLiveEntry {
     user_key: Vec<u8>,
     live_bytes: u64,
     written_at_ms: u64,
+    /// Digest of the exact stored bytes this entry's eviction decision was
+    /// taken from (#2060). See [`calyx_gc_row_digest`].
+    value_digest: u64,
+}
+
+/// One row the retention sweep proposes to delete, carrying the evidence its
+/// decision was taken from (#2060).
+///
+/// The sweep no longer reads the whole namespace under one row-guard hold, so
+/// the rows it decided from were observed at a succession of committed
+/// sequences rather than at one instant. A proposal is therefore not authority
+/// to delete on its own: it is re-checked against the row's *current* bytes
+/// under a short point-read guard before the tombstone is written, and a row
+/// whose bytes changed since the page that proposed it is retained.
+#[derive(Debug)]
+struct CalyxGcEvictionCandidate {
+    full_key: Vec<u8>,
+    value_digest: u64,
+}
+
+/// What re-checking eviction proposals against current bytes decided (#2060).
+///
+/// Reported rather than swallowed: a non-zero `superseded_rows` is the exact
+/// evidence that paging the sweep widened the observe-to-delete window enough
+/// to matter, and a non-zero `vanished_rows` means another writer deleted the
+/// row first.
+#[derive(Clone, Copy, Debug, Default)]
+struct CalyxGcEvictionRevalidation {
+    checked: u64,
+    superseded: u64,
+    vanished: u64,
 }
 
 #[derive(Debug)]
 struct CalyxRetentionState {
     live_entries: Vec<CalyxRetentionLiveEntry>,
+    /// Expired rows the sweep proposed, before the pre-delete re-check.
+    expired_candidates: Vec<CalyxGcEvictionCandidate>,
     tombstones: Vec<SynapseCalyxCfWrite>,
     before_live_bytes: u64,
     expired_rows: u64,
     /// Rows GC declined to consider because a live derived constellation still
     /// points at them (#1882). Neither evicted nor counted toward the caps.
     retained_referenced_rows: u64,
+    /// Provenance of the paged sweep the state was folded from (#2060).
+    sweep: CalyxKvSweep,
+    /// Outcome of re-checking every eviction proposal (#2060).
+    revalidation: CalyxGcEvictionRevalidation,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -11978,7 +12015,7 @@ fn run_calyx_gc_budget(
         CalyxGcUnit::Rows => before_live_rows,
     };
     let hard_cap_reached = log_calyx_gc_hard_cap_if_reached(budget, before_value);
-    let cap_outcome = apply_calyx_gc_cap_eviction(budget, &mut state, before_value)?;
+    let cap_outcome = apply_calyx_gc_cap_eviction(vault, now_ms, budget, &mut state, before_value)?;
     let evicted_rows = state
         .expired_rows
         .checked_add(cap_outcome.cap_evicted_rows)
@@ -12018,7 +12055,21 @@ fn run_calyx_gc_budget(
     })
 }
 
+/// Drains the oldest-written live rows until the family is back under its soft
+/// cap, re-checking each row against its current bytes before proposing its
+/// tombstone (#2060).
+///
+/// The drain order and the caps are unchanged. What changed is that
+/// `live_entries` now comes from a paged sweep rather than one wide-guard scan,
+/// so an entry may describe bytes that have since been replaced. A superseded
+/// entry is **skipped without being charged against the cap** — it is not
+/// evicted, so its bytes were never freed, so subtracting them would leave the
+/// loop believing it had reached the soft cap when it had not. Skipping keeps
+/// draining down the age order until the cap is genuinely met, which is exactly
+/// the behaviour the unpaged shape had.
 fn apply_calyx_gc_cap_eviction(
+    vault: &SynapseCalyxVault,
+    now_ms: u64,
     budget: CalyxGcBudget,
     state: &mut CalyxRetentionState,
     before_value: u64,
@@ -12051,10 +12102,25 @@ fn apply_calyx_gc_cap_eviction(
             .cmp(&right.written_at_ms)
             .then_with(|| left.user_key.cmp(&right.user_key))
     });
-    for entry in state.live_entries.drain(..) {
+    let entries = std::mem::take(&mut state.live_entries);
+    for entry in entries {
         if outcome.after_value <= budget.soft_cap {
             break;
         }
+        let candidate = CalyxGcEvictionCandidate {
+            full_key: entry.full_key,
+            value_digest: entry.value_digest,
+        };
+        let Some(tombstone) = confirm_calyx_gc_eviction(
+            vault,
+            budget.cf_name,
+            now_ms,
+            &candidate,
+            &mut state.revalidation,
+        )?
+        else {
+            continue;
+        };
         let removed_value = match budget.unit {
             CalyxGcUnit::Bytes => entry.live_bytes,
             CalyxGcUnit::Rows => 1,
@@ -12069,11 +12135,7 @@ fn apply_calyx_gc_cap_eviction(
                 ),
             )
         })?;
-        state.tombstones.push(SynapseCalyxCfWrite::new(
-            ColumnFamily::Kv,
-            entry.full_key,
-            tombstone_value(),
-        ));
+        state.tombstones.push(tombstone);
         outcome.cap_evicted_rows = outcome.cap_evicted_rows.saturating_add(1);
     }
 
@@ -12128,6 +12190,8 @@ fn emit_calyx_gc_report(
         || cap_outcome.cap_evicted_rows > 0
         || cap_outcome.eviction_skipped_reason.is_some()
         || hard_cap_reached
+        || state.revalidation.superseded > 0
+        || state.revalidation.vanished > 0
     {
         tracing::info!(
             code = "STORAGE_CALYX_GC_COMPLETED",
@@ -12141,6 +12205,19 @@ fn emit_calyx_gc_report(
             hard_cap = budget.hard_cap,
             hard_cap_reached,
             eviction_skipped_reason = cap_outcome.eviction_skipped_reason.unwrap_or("none"),
+            // Provenance of the paged sweep the decisions were folded from, and
+            // what the pre-delete re-check changed about them (#2060). Reported
+            // rather than assumed: `sweep_atomic=false` means the retention
+            // census describes an interval, not an instant, and the re-check is
+            // what makes deleting from such a census safe.
+            sweep_pages = state.sweep.pages,
+            sweep_rows_visited = state.sweep.rows_visited,
+            sweep_snapshot_seq_first = state.sweep.snapshot_seq_first,
+            sweep_snapshot_seq_last = state.sweep.snapshot_seq_last,
+            sweep_atomic = state.sweep.atomic(),
+            revalidated_rows = state.revalidation.checked,
+            revalidation_superseded_rows = state.revalidation.superseded,
+            revalidation_vanished_rows = state.revalidation.vanished,
             "Calyx storage GC report completed"
         );
     }
@@ -12170,6 +12247,34 @@ fn emit_calyx_gc_eviction_metric(
     );
 }
 
+/// Folds one column family's ordered Calyx KV namespace into its retention
+/// state **page by page**, releasing the vault-wide row-table read guard
+/// between pages (#2060).
+///
+/// This was the GC eviction phase's `scan_cf_range_latest`: one acquisition of
+/// the shared MVCC row-table read guard held across the merge and
+/// materialisation of an entire namespace. On the live vault that measured
+/// 189/191/297 ms holds against a 25 ms budget and took the site's worst-ever
+/// hold to 303 ms — and because every commit must take that same guard
+/// exclusively, each of those holds stalled every writer in the daemon for as
+/// long as it ran. #2041 had already proved the remedy on the same corpus:
+/// [`sweep_kv_range_pages`] answers the identical question at ~137 us mean per
+/// hold with zero over-budget holds.
+///
+/// **What paging costs, and how eviction stays correct.** A paged fold observes
+/// a succession of committed sequences instead of one, so a row can be
+/// rewritten after the page that read it and before the tombstone that deletes
+/// it. The proposal is therefore separated from the delete: every candidate is
+/// re-checked against the row's *current* bytes under a short point-read guard
+/// immediately before its tombstone is written
+/// ([`confirm_calyx_gc_eviction`]), and a row whose bytes changed is retained
+/// for the next tick rather than deleted on stale evidence. Retention is the
+/// safe direction — a row kept one interval too long is recoverable, a row
+/// deleted on a stale view is not.
+///
+/// The sweep's own window is returned in [`CalyxRetentionState::sweep`] rather
+/// than presented as an instant, exactly as #2041 required of the inspect
+/// census.
 fn collect_calyx_retention_state(
     vault: &SynapseCalyxVault,
     cf_name: &str,
@@ -12179,82 +12284,225 @@ fn collect_calyx_retention_state(
     referenced: Option<&BTreeSet<Vec<u8>>>,
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
-    let rows = vault
-        .scan_cf_range_latest(ColumnFamily::Kv, &range)
-        .map_err(|source| {
-            calyx_write_failed(
-                cf_name,
-                "scan Calyx KV namespace for retention enforcement",
-                &source,
-            )
-        })?;
     let mut state = CalyxRetentionState {
         live_entries: Vec::new(),
+        expired_candidates: Vec::new(),
         tombstones: Vec::new(),
         before_live_bytes: 0,
         expired_rows: 0,
         retained_referenced_rows: 0,
+        sweep: CalyxKvSweep::default(),
+        revalidation: CalyxGcEvictionRevalidation::default(),
     };
-    for (full_key, value) in rows {
-        let user_key = decode_calyx_user_key(collection_id, &full_key).map_err(|detail| {
-            calyx_write_failed_detail(
-                cf_name,
-                format!("decode Calyx retention scan key: {detail}"),
-            )
-        })?;
-        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
-            tracing::error!(
-                code = error_codes::STORAGE_WRITE_FAILED,
-                cf = cf_name,
-                detail,
-                "Calyx storage backend rejected malformed KV retention envelope during enforcement"
-            );
-            calyx_write_failed_detail(
-                cf_name,
-                format!("decode Calyx retention envelope: {detail}"),
-            )
-        })?;
-        // #1882: a source row a live derived constellation still points at is
-        // not garbage, however old it is. Deleting it destroys the only copy of
-        // the input bytes that row's CxId addresses, so re-derive, lazy
-        // backfill and derivation audit all become impossible with no error at
-        // the moment of loss. Retained rows are excluded from cap eviction too,
-        // and counted so the retention is reported rather than silent.
-        let referenced_by_derived = referenced.is_some_and(|keys| keys.contains(&user_key));
-        if referenced_by_derived {
-            state.retained_referenced_rows = state.retained_referenced_rows.saturating_add(1);
-            continue;
-        }
-        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-            if !protected {
-                state.tombstones.push(SynapseCalyxCfWrite::new(
-                    ColumnFamily::Kv,
-                    full_key,
-                    tombstone_value(),
-                ));
-                state.expired_rows = state.expired_rows.saturating_add(1);
+    let sweep = sweep_kv_range_pages(
+        vault,
+        cf_name,
+        CALYX_GC_RETENTION_SWEEP_SITE,
+        &range,
+        |full_key, value| {
+            let user_key = decode_calyx_user_key(collection_id, full_key).map_err(|detail| {
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!("decode Calyx retention scan key: {detail}"),
+                )
+            })?;
+            let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+                tracing::error!(
+                    code = error_codes::STORAGE_WRITE_FAILED,
+                    cf = cf_name,
+                    detail,
+                    "Calyx storage backend rejected malformed KV retention envelope during enforcement"
+                );
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!("decode Calyx retention envelope: {detail}"),
+                )
+            })?;
+            // #1882: a source row a live derived constellation still points at
+            // is not garbage, however old it is. Deleting it destroys the only
+            // copy of the input bytes that row's CxId addresses, so re-derive,
+            // lazy backfill and derivation audit all become impossible with no
+            // error at the moment of loss. Retained rows are excluded from cap
+            // eviction too, and counted so the retention is reported rather
+            // than silent.
+            let referenced_by_derived = referenced.is_some_and(|keys| keys.contains(&user_key));
+            if referenced_by_derived {
+                state.retained_referenced_rows = state.retained_referenced_rows.saturating_add(1);
+                return Ok(());
             }
-            continue;
-        }
-        let live_bytes = calyx_live_row_bytes(cf_name, &user_key, envelope.payload)?;
-        state.before_live_bytes =
-            state
-                .before_live_bytes
-                .checked_add(live_bytes)
-                .ok_or_else(|| {
-                    calyx_write_failed_detail(
-                        cf_name,
-                        format!("Calyx retention live-byte accounting overflow in {cf_name}"),
-                    )
-                })?;
-        state.live_entries.push(CalyxRetentionLiveEntry {
-            full_key,
-            user_key,
-            live_bytes,
-            written_at_ms: envelope.written_at_ms,
-        });
-    }
+            if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+                if !protected {
+                    state.expired_candidates.push(CalyxGcEvictionCandidate {
+                        full_key: full_key.to_vec(),
+                        value_digest: calyx_gc_row_digest(value),
+                    });
+                }
+                return Ok(());
+            }
+            let live_bytes = calyx_live_row_bytes(cf_name, &user_key, envelope.payload)?;
+            state.before_live_bytes =
+                state
+                    .before_live_bytes
+                    .checked_add(live_bytes)
+                    .ok_or_else(|| {
+                        calyx_write_failed_detail(
+                            cf_name,
+                            format!("Calyx retention live-byte accounting overflow in {cf_name}"),
+                        )
+                    })?;
+            state.live_entries.push(CalyxRetentionLiveEntry {
+                full_key: full_key.to_vec(),
+                user_key,
+                live_bytes,
+                written_at_ms: envelope.written_at_ms,
+                value_digest: calyx_gc_row_digest(value),
+            });
+            Ok(())
+        },
+    )?;
+    state.sweep = sweep;
+    confirm_calyx_gc_expired_evictions(vault, cf_name, now_ms, &mut state)?;
     Ok(state)
+}
+
+/// `site` label for the GC eviction phase's paged namespace fold.
+///
+/// This names the *sweep*, in `STORAGE_CALYX_BOUNDED_SWEEP` and in any
+/// cursor-failure error, so a fold reported there is attributable to the GC
+/// tick rather than to a diagnostic an operator ran — the two have completely
+/// different remedies, which is the same reason #1973 split
+/// `scan_cf_at_overlay` out of the shared overlay site.
+///
+/// It is deliberately **not** a new `calyx_row_guard_sites` entry. The guard
+/// this fold now takes is `scan_cf_range_page_latest`'s, and the whole claim of
+/// this change is that GC's holds have moved onto that already-measured,
+/// already-in-budget site. Minting a private census name would hide exactly the
+/// number the fix has to be judged on: `scan_cf_range_latest` losing GC's holds
+/// while `scan_cf_range_page_latest` gains them, with `over_budget_holds` still
+/// zero.
+const CALYX_GC_RETENTION_SWEEP_SITE: &str = "calyx_gc_retention_namespace";
+
+/// Digest of the exact stored bytes an eviction decision was taken from
+/// (#2060).
+///
+/// FNV-1a over the whole retention envelope — version byte, expiry, write
+/// timestamp and payload — rather than a field comparison, because the v1
+/// envelope carries no `written_at_ms` at all (it decodes as 0), so comparing
+/// timestamps would silently fail to notice a rewrite of any v1 row. Written
+/// here rather than pulled from a hash crate because this value never leaves
+/// the process, is never persisted, and is compared only against another
+/// digest taken by this same function moments earlier.
+fn calyx_gc_row_digest(value: &[u8]) -> u64 {
+    const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut digest = FNV_OFFSET_BASIS;
+    for byte in value {
+        digest ^= u64::from(*byte);
+        digest = digest.wrapping_mul(FNV_PRIME);
+    }
+    digest
+}
+
+/// Re-checks one eviction proposal against the row's **current** bytes under a
+/// short point-read guard, and returns the tombstone only if they still match
+/// (#2060).
+///
+/// This is what makes a paged retention sweep safe to delete from. The proposal
+/// was formed from bytes read on some page, at some committed sequence; between
+/// then and now any writer may have replaced the row. Writing the tombstone
+/// anyway would destroy a value GC never examined — a value that may not be
+/// expired, may be referenced, and is certainly not the one the eviction rule
+/// was evaluated against.
+///
+/// A point read takes the row guard for a single key lookup, which is the
+/// `read_latest` site — already measured well inside budget — so the re-check
+/// preserves the bounded-hold property the paging exists to establish.
+///
+/// Fails closed on an undecodable current envelope: a row whose stored bytes no
+/// longer decode is a corruption finding, not a licence to delete it.
+fn confirm_calyx_gc_eviction(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    now_ms: u64,
+    candidate: &CalyxGcEvictionCandidate,
+    revalidation: &mut CalyxGcEvictionRevalidation,
+) -> StorageResult<Option<SynapseCalyxCfWrite>> {
+    revalidation.checked = revalidation.checked.saturating_add(1);
+    let current = vault
+        .read_cf_latest(ColumnFamily::Kv, &candidate.full_key)
+        .map_err(|source| {
+            calyx_write_failed(
+                cf_name,
+                "re-read a Calyx GC eviction candidate before writing its tombstone",
+                &source,
+            )
+        })?;
+    let Some(current) = current else {
+        revalidation.vanished = revalidation.vanished.saturating_add(1);
+        tracing::debug!(
+            code = "STORAGE_CALYX_GC_EVICTION_CANDIDATE_VANISHED",
+            cf = cf_name,
+            key_hex = hex_prefix_for_log(&candidate.full_key),
+            "a Calyx GC eviction candidate was already gone at the pre-delete re-check; no \
+             tombstone written"
+        );
+        return Ok(None);
+    };
+    // Decoded, not merely digested: an undecodable current row must be reported
+    // as the corruption it is rather than counted as a benign supersede.
+    decode_calyx_value_raw(&current).map_err(|detail| {
+        tracing::error!(
+            code = error_codes::STORAGE_WRITE_FAILED,
+            cf = cf_name,
+            detail,
+            "Calyx storage backend rejected a malformed KV retention envelope while re-checking a \
+             GC eviction candidate"
+        );
+        calyx_write_failed_detail(
+            cf_name,
+            format!("decode Calyx retention envelope at the GC pre-delete re-check: {detail}"),
+        )
+    })?;
+    if calyx_gc_row_digest(&current) != candidate.value_digest {
+        revalidation.superseded = revalidation.superseded.saturating_add(1);
+        tracing::warn!(
+            code = "STORAGE_CALYX_GC_EVICTION_CANDIDATE_SUPERSEDED",
+            cf = cf_name,
+            key_hex = hex_prefix_for_log(&candidate.full_key),
+            now_ms,
+            "a Calyx GC eviction candidate was rewritten between the page that proposed it and \
+             its pre-delete re-check; the row is retained for the next tick rather than deleted \
+             on a stale view"
+        );
+        return Ok(None);
+    }
+    Ok(Some(SynapseCalyxCfWrite::new(
+        ColumnFamily::Kv,
+        candidate.full_key.clone(),
+        tombstone_value(),
+    )))
+}
+
+/// Confirms every expired-row proposal and turns the survivors into tombstones.
+///
+/// `expired_rows` is incremented only for confirmed deletes, so the GC report
+/// counts rows this tick actually tombstoned rather than rows it proposed.
+fn confirm_calyx_gc_expired_evictions(
+    vault: &SynapseCalyxVault,
+    cf_name: &str,
+    now_ms: u64,
+    state: &mut CalyxRetentionState,
+) -> StorageResult<()> {
+    let candidates = std::mem::take(&mut state.expired_candidates);
+    for candidate in &candidates {
+        if let Some(tombstone) =
+            confirm_calyx_gc_eviction(vault, cf_name, now_ms, candidate, &mut state.revalidation)?
+        {
+            state.tombstones.push(tombstone);
+            state.expired_rows = state.expired_rows.saturating_add(1);
+        }
+    }
+    Ok(())
 }
 
 fn calyx_retention_default_for_write(cf_name: &str) -> StorageResult<RetentionDefault> {

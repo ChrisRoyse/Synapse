@@ -307,7 +307,14 @@ impl VersionedCfStore {
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.ensure_snapshot_live(snapshot, clock)?;
         let mut rows = self.router_latest_rows(snapshot, cf, None)?;
-        self.overlay_table_rows(RowGuardSite::ScanCfAtOverlay, snapshot, cf, None, &mut rows)?;
+        self.overlay_table_rows(
+            RowGuardSite::ScanCfAtOverlay,
+            snapshot,
+            cf,
+            None,
+            &mut rows,
+            clock,
+        )?;
         for key in rows.keys() {
             self.ensure_unbarriered(cf, key)?;
         }
@@ -345,19 +352,66 @@ impl VersionedCfStore {
                 self.changed_key_history_floor
             )));
         }
-        let table = self.read_rows(RowGuardSite::ChangedKeysAfterAt, cf);
-        let keys = table
-            .get(&cf)
-            .into_iter()
-            .flat_map(|rows| rows.iter())
-            .filter(|(_, versions)| {
-                versions
-                    .iter()
-                    .any(|version| version.seq > after_exclusive && version.seq <= snapshot.seq())
-            })
-            .map(|(key, _)| key.clone())
-            .collect::<Vec<_>>();
-        drop(table);
+        // Folded in bounded pages, releasing the row read guard between them
+        // (#2060). The single hold this replaces was `O(family)` — 117 ms over
+        // a 1,039,273-row `Base` on the deployed daemon, 17 of its 20 lifetime
+        // holds over the 25 ms budget — and every commit in the process waits
+        // on that guard.
+        //
+        // Paging is exact here, not an approximation, for three reasons that
+        // hold together:
+        //
+        // 1. **The cursor cannot skip a key.** Row-table entries are only ever
+        //    created (`entry(key).or_default()`); nothing removes a key, not
+        //    even snapshot GC, which trims version chains in place. So the key
+        //    order this cursor walks is append-only and stable.
+        // 2. **A concurrent commit cannot enter the answer.** It allocates a
+        //    sequence above `snapshot.seq()`, and the predicate admits only
+        //    versions at or below it. Keys created after the pin therefore fold
+        //    to "unchanged" wherever the cursor happens to meet them.
+        // 3. **A concurrent reclaim cannot remove the answer.** GC keeps each
+        //    chain's newest version at or below the safe point, and the safe
+        //    point is clamped to the oldest live lease — this snapshot's
+        //    included. A version it does drop is strictly older than the one it
+        //    keeps, so if any dropped version satisfied `seq > after_exclusive`
+        //    the retained boundary version satisfies it too. No key can leave
+        //    the delta by being compacted.
+        //
+        // The lease is re-checked on every page rather than once at entry: it
+        // is what makes 2 and 3 true, so a fold that outlived it must fail
+        // closed instead of reading a view whose versions have started being
+        // reclaimed.
+        let mut keys = Vec::new();
+        let mut cursor: Option<Vec<u8>> = None;
+        loop {
+            self.ensure_snapshot_live(snapshot, clock)?;
+            let mut page_end: Option<Vec<u8>> = None;
+            {
+                let table = self.read_rows(RowGuardSite::ChangedKeysAfterAt, cf);
+                let Some(cf_rows) = table.get(&cf) else {
+                    break;
+                };
+                let lower = cursor.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
+                let mut examined = 0_usize;
+                for (key, versions) in cf_rows.range::<[u8], _>((lower, Bound::Unbounded)) {
+                    if versions.iter().any(|version| {
+                        version.seq > after_exclusive && version.seq <= snapshot.seq()
+                    }) {
+                        keys.push(key.clone());
+                    }
+                    examined += 1;
+                    if examined == ROW_GUARD_FOLD_PAGE_ROWS {
+                        page_end = Some(key.clone());
+                        break;
+                    }
+                }
+            }
+            // A page that ended before the limit reached the end of the family.
+            let Some(page_end) = page_end else {
+                break;
+            };
+            cursor = Some(page_end);
+        }
         for key in &keys {
             self.ensure_unbarriered(cf, key)?;
         }
@@ -398,26 +452,46 @@ impl VersionedCfStore {
         let keys =
             self.changed_keys_after_at(snapshot, ColumnFamily::Base, after_exclusive, clock)?;
         let scanned = keys.len();
-        let table = self.read_rows(
-            RowGuardSite::ChangedBaseKeysAfterAtForPanel,
-            ColumnFamily::Base,
-        );
         let mut scoped = Vec::new();
         let mut other_panels = 0_usize;
         let mut unattributed = 0_usize;
-        for key in keys {
-            match visible_base_panels_in_chain(&table, &key, snapshot.seq())? {
-                ChainPanels::Panels(panels) if panels.contains(&panel_version) => {
-                    scoped.push(key);
-                }
-                ChainPanels::Panels(_) => other_panels += 1,
-                ChainPanels::Unattributable => {
-                    unattributed += 1;
-                    scoped.push(key);
+        // Attribution runs in bounded chunks under short guard holds (#2060).
+        // It is the more expensive of the two halves — every changed key's
+        // whole visible chain is decoded through `decode_header` — and on the
+        // deployed daemon it held the guard for 539 ms, over budget on 100% of
+        // its lifetime invocations, stalling every commit for half a second.
+        //
+        // Attribution is per key and order-independent, so splitting it across
+        // holds cannot change any key's outcome. What a chunk boundary does
+        // admit is a snapshot-GC reclaim landing between chunks and trimming a
+        // superseded version out of a not-yet-attributed chain. That is the
+        // condition this function already names and already answers
+        // conservatively: a chain with no attributable visible version is
+        // `Unattributable` and is returned *with* the panel's keys, because
+        // masking a key the generation never held is a no-op while dropping one
+        // it did hold would serve a deleted row. Reclaim is not excluded by the
+        // unpaged shape either — it runs on its own tick, before the fold as
+        // readily as between its chunks — so the guarantee here is unchanged,
+        // and the lease is re-checked per chunk so an expired pin fails closed.
+        for chunk in keys.chunks(ROW_GUARD_FOLD_PAGE_ROWS) {
+            self.ensure_snapshot_live(snapshot, clock)?;
+            let table = self.read_rows(
+                RowGuardSite::ChangedBaseKeysAfterAtForPanel,
+                ColumnFamily::Base,
+            );
+            for key in chunk {
+                match visible_base_panels_in_chain(&table, key, snapshot.seq())? {
+                    ChainPanels::Panels(panels) if panels.contains(&panel_version) => {
+                        scoped.push(key.clone());
+                    }
+                    ChainPanels::Panels(_) => other_panels += 1,
+                    ChainPanels::Unattributable => {
+                        unattributed += 1;
+                        scoped.push(key.clone());
+                    }
                 }
             }
         }
-        drop(table);
         Ok(PanelScopedChangedKeys {
             panel_version,
             scanned,
@@ -444,6 +518,7 @@ impl VersionedCfStore {
             cf,
             Some(range),
             &mut rows,
+            clock,
         )?;
         for key in rows.keys() {
             self.ensure_unbarriered(cf, key)?;
