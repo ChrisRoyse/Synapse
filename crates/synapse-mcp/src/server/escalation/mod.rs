@@ -170,6 +170,17 @@ const WEBHOOK_RETRY_MAX_BACKOFF_MS: u64 = DEFAULT_ACK_WINDOW_MS;
 const WORKER_TICK_MS: u64 = 1_000;
 const TIER0_REMOVAL_RETRY_BASE_MS: u64 = 60_000;
 const TIER0_REMOVAL_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
+/// Consecutive physical removal failures after which the Tier-0 removal ladder
+/// stops and the row is durably abandoned (#2073).
+///
+/// The ladder is 60s doubling to a 60min cap, so ten attempts span roughly five
+/// hours — long enough to outlast every transient Action Center condition the
+/// retry loop exists for (#1762/#1803 both converged within a few attempts),
+/// and far short of the ~3 days Windows retains the physical row. Beyond it a
+/// retry is not recovery, it is an unbounded durable-revision + WinRT-scan loop
+/// against a permanent failure, so the row is escalated to a loud terminal
+/// state instead of churning silently forever.
+const TIER0_REMOVAL_MAX_ATTEMPTS: u32 = 10;
 const ACK_REVISION_MAX_ATTEMPTS: usize = 16;
 const DELETE_REVISION_MAX_ATTEMPTS: usize = 16;
 const AMBIENT_SILENT_TIMEOUT_SUPPRESSED: &str = "ambient_unprobeable_silent_timeout";
@@ -705,6 +716,21 @@ pub(crate) enum Tier0ToastDelivery {
         last_checked_at_unix_ms: u64,
         next_retry_at_unix_ms: u64,
         failed_at_unix_ms: u64,
+    },
+    /// The removal ladder hit `TIER0_REMOVAL_MAX_ATTEMPTS` consecutive physical
+    /// failures and was stopped (#2073). Terminal and deliberately loud: the row
+    /// stops consuming durable revisions and WinRT history scans, and reports
+    /// itself as `removal_abandoned` with the exact tag, group and last error so
+    /// an operator can see which Action Center row is stuck and why. The
+    /// physical row is left to Windows' own retention expiry.
+    RemovalAbandoned {
+        tag: String,
+        removal: ToastRemovalOutcome,
+        attempt_count: u32,
+        reason: String,
+        last_checked_at_unix_ms: u64,
+        failed_at_unix_ms: u64,
+        abandoned_at_unix_ms: u64,
     },
     /// Action Center removal separately read back zero matching Tag+Group rows.
     Removed {
@@ -2889,6 +2915,7 @@ fn tier0_delivery_tag(delivery: &Tier0ToastDelivery) -> Option<&str> {
         | Tier0ToastDelivery::PreShowCollision { tag, .. }
         | Tier0ToastDelivery::Failed { tag, .. }
         | Tier0ToastDelivery::RemovalFailed { tag, .. }
+        | Tier0ToastDelivery::RemovalAbandoned { tag, .. }
         | Tier0ToastDelivery::Removed { tag, .. } => Some(tag),
         Tier0ToastDelivery::LegacyUnclassified
         | Tier0ToastDelivery::NotRequested
@@ -2990,10 +3017,12 @@ fn tier0_readback_contract_valid(
     match readback.history_count {
         0 => true,
         1 => {
-            let payload_matches = item
-                .tier0_payload_sha256
-                .as_ref()
-                .is_some_and(|expected| readback.payload_sha256s.first() == Some(expected));
+            let payload_matches = item.tier0_payload_sha256.as_ref().is_some_and(|expected| {
+                // A payload-dropped row (`None`, #2073) carries no digest
+                // and therefore never satisfies the payload contract.
+                readback.payload_sha256s.first().and_then(Option::as_deref)
+                    == Some(expected.as_str())
+            });
             let expected_expiration = match tier0_group_for_exact_tag(item, expected_tag) {
                 Some(SYNAPSE_ESCALATION_TOAST_GROUP) => Some(item.expires_at_unix_ms),
                 Some(SYNAPSE_TOAST_GROUP) => None,
@@ -3022,10 +3051,15 @@ fn tier0_readback_identity_shape_valid(
         || readback.present != (history_count > 0)
         || readback.payload_sha256s.len() != history_count
         || readback.expiration_unix_ms.len() != history_count
+        // A `None` digest is a real physical shape: Windows kept the row and
+        // dropped its payload (#2073). Rejecting it here would turn shape
+        // validation into a second permanent wall (STORAGE_CORRUPTED) for
+        // exactly the rows the removal path now has to make progress on. A
+        // digest that IS present must still be canonical.
         || readback
             .payload_sha256s
             .iter()
-            .any(|digest| !is_canonical_sha256(digest))
+            .any(|digest| digest.as_ref().is_some_and(|digest| !is_canonical_sha256(digest)))
     {
         return false;
     }
@@ -3202,6 +3236,39 @@ fn validate_tier0_delivery(item: &EscalationItem) -> Result<(), ErrorData> {
                 && *next_retry_at_unix_ms
                     == last_checked_at_unix_ms
                         .saturating_add(tier0_removal_retry_delay_ms(*attempt_count))
+        }
+        Tier0ToastDelivery::RemovalAbandoned {
+            tag,
+            removal,
+            attempt_count,
+            reason,
+            last_checked_at_unix_ms,
+            failed_at_unix_ms,
+            abandoned_at_unix_ms,
+        } => {
+            // Identical physical-failure shape to RemovalFailed — abandonment
+            // never invents a disposition, it only stops the ladder — plus the
+            // cap being provably reached and a non-empty operator-facing reason.
+            item.status != EscalationStatus::Pending
+                && tier0_removal_payload_binding_valid(item, tag)
+                && tier0_removal_identity_valid(item, tag, removal)
+                && !removal.removed
+                && !removal.already_absent
+                && removal.after_count != Some(0)
+                && !removal.status.is_empty()
+                && removal
+                    .error_code
+                    .as_deref()
+                    .is_some_and(|code| !code.is_empty())
+                && removal
+                    .error_message
+                    .as_deref()
+                    .is_some_and(|message| !message.is_empty())
+                && item.tier0_toast_removed.as_ref() == Some(removal)
+                && *attempt_count >= TIER0_REMOVAL_MAX_ATTEMPTS
+                && !reason.is_empty()
+                && *last_checked_at_unix_ms >= *failed_at_unix_ms
+                && *abandoned_at_unix_ms >= *last_checked_at_unix_ms
         }
         Tier0ToastDelivery::Removed { tag, removal, .. } => {
             let disposition_valid = if removal.removed {
@@ -10855,6 +10922,23 @@ async fn remove_tier0_if_terminal(
         migrate_tier0_payload_v1_if_present(db, item, item_revision_sha256).await?;
         return Ok(false);
     }
+    // The removal ladder is terminal once abandoned (#2073): no further durable
+    // revisions, no further WinRT history scans for this row.
+    if matches!(
+        item.tier0_delivery,
+        Tier0ToastDelivery::RemovalAbandoned { .. }
+    ) {
+        return Ok(false);
+    }
+    if let Tier0ToastDelivery::RemovalFailed { attempt_count, .. } = &item.tier0_delivery
+        && *attempt_count >= TIER0_REMOVAL_MAX_ATTEMPTS
+    {
+        // Checked before the backoff gate so the cap converts on the very next
+        // sweep rather than waiting out one more scheduled retry it will never
+        // perform.
+        abandon_tier0_removal(db, item, item_revision_sha256)?;
+        return Ok(false);
+    }
     if let Tier0ToastDelivery::RemovalFailed {
         next_retry_at_unix_ms,
         ..
@@ -11262,10 +11346,14 @@ async fn remove_tier0_if_terminal(
         let delivery_proof_promoted = outcome.removed && outcome.before_count == Some(1);
         if delivery_proof_promoted {
             // The removal API only reports `removed` after a separate
-            // pre-mutation history read proved exactly one row with the bound
-            // payload (and reserved-group expiration, when applicable). That
-            // physical proof is stronger than the legacy compatibility bit and
-            // must survive the terminal removal transition.
+            // pre-mutation history read proved exactly one row under an
+            // identity it verified: the bound payload (and reserved-group
+            // expiration, when applicable), or — when Windows has dropped the
+            // row's payload entirely (#2073) — the reserved `et1` Tag+Group
+            // +AUMID, which only this escalation's own `ToastNotifier.Show`
+            // could have put in Action Center. Either way the row's presence is
+            // physical delivery proof, stronger than the legacy compatibility
+            // bit, and must survive the terminal removal transition.
             updated.tier0_fired = true;
         }
         updated.tier0_toast_removed = Some(outcome.clone());
@@ -11386,10 +11474,152 @@ async fn remove_tier0_if_terminal(
     ))
 }
 
+/// Stop a Tier-0 removal ladder that has failed `TIER0_REMOVAL_MAX_ATTEMPTS`
+/// times in a row and record why, once and durably (#2073).
+///
+/// This is the bounded, visible end of the retry loop: it never claims the
+/// physical toast is gone (the last real `ToastRemovalOutcome` is carried
+/// forward verbatim), it names the escalation, tag, group and last physical
+/// error, and it leaves the row queryable as `removal_abandoned` so an operator
+/// can see exactly which Action Center row Windows will not let the daemon
+/// remove.
+fn abandon_tier0_removal(
+    db: &Db,
+    item: &mut EscalationItem,
+    item_revision_sha256: &mut [u8; 32],
+) -> Result<(), ErrorData> {
+    for revision_attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
+        let current = read_item_revisioned(db, &item.escalation_id)?.ok_or_else(|| {
+            mcp_error(
+                error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "Tier-0 removal abandonment lost escalation item {}",
+                    item.escalation_id
+                ),
+            )
+        })?;
+        let ladder = match &current.item.tier0_delivery {
+            Tier0ToastDelivery::RemovalFailed {
+                tag,
+                removal,
+                attempt_count,
+                last_checked_at_unix_ms,
+                failed_at_unix_ms,
+                ..
+            } if *attempt_count >= TIER0_REMOVAL_MAX_ATTEMPTS => (
+                tag.clone(),
+                removal.clone(),
+                *attempt_count,
+                *last_checked_at_unix_ms,
+                *failed_at_unix_ms,
+            ),
+            // Another sweep already advanced this row (converged to Removed,
+            // was abandoned, or is still under the cap). Nothing to escalate.
+            _ => {
+                *item = current.item;
+                *item_revision_sha256 = current.revision_sha256;
+                return Ok(());
+            }
+        };
+        let (tag, removal, attempt_count, last_checked_at_unix_ms, failed_at_unix_ms) = ladder;
+        let reason = format!(
+            "Tier-0 Action Center removal failed {attempt_count} consecutive times (cap {TIER0_REMOVAL_MAX_ATTEMPTS}); last physical error {}: {}",
+            removal.error_code.as_deref().unwrap_or("<none>"),
+            removal.error_message.as_deref().unwrap_or("<none>")
+        );
+        let abandoned_at = unix_time_ms_now()
+            .max(current.item.updated_at_unix_ms)
+            .max(last_checked_at_unix_ms);
+        let removal_snapshot = removal.clone();
+        let mut updated = current.item;
+        updated.tier0_delivery = Tier0ToastDelivery::RemovalAbandoned {
+            tag,
+            removal,
+            attempt_count,
+            reason: reason.clone(),
+            last_checked_at_unix_ms,
+            failed_at_unix_ms,
+            abandoned_at_unix_ms: abandoned_at,
+        };
+        updated.updated_at_unix_ms = abandoned_at;
+        match write_item_and_audit_if_revision(
+            db,
+            &updated,
+            "tier0_toast_removal_abandoned",
+            json!({
+                "toast_removal": &removal_snapshot,
+                "attempt_count": attempt_count,
+                "max_attempts": TIER0_REMOVAL_MAX_ATTEMPTS,
+                "reason": &reason,
+                "source_of_truth": "Windows Action Center history",
+            }),
+            current.revision_sha256,
+        )? {
+            ItemWriteOutcome::Applied { committed_seq, .. } => {
+                let readback = read_item_revisioned(db, &item.escalation_id)?.ok_or_else(|| {
+                    mcp_error(
+                        error_codes::STORAGE_READ_FAILED,
+                        format!(
+                            "Tier-0 removal abandonment item {} disappeared after committed_seq={committed_seq}",
+                            item.escalation_id
+                        ),
+                    )
+                })?;
+                if readback.item.tier0_delivery != updated.tier0_delivery {
+                    return Err(mcp_error(
+                        error_codes::STORAGE_CORRUPTED,
+                        format!(
+                            "Tier-0 removal abandonment readback differed: escalation_id={} expected={:?} actual={:?} committed_seq={committed_seq}",
+                            item.escalation_id,
+                            updated.tier0_delivery,
+                            readback.item.tier0_delivery
+                        ),
+                    ));
+                }
+                *item = readback.item;
+                *item_revision_sha256 = readback.revision_sha256;
+                tracing::error!(
+                    code = "ESCALATION_TIER0_TOAST_REMOVAL_ABANDONED",
+                    escalation_id = %item.escalation_id,
+                    tag = %removal_snapshot.tag,
+                    group = %removal_snapshot.group,
+                    aumid = %removal_snapshot.aumid,
+                    attempt_count,
+                    max_attempts = TIER0_REMOVAL_MAX_ATTEMPTS,
+                    status = %removal_snapshot.status,
+                    error_code = removal_snapshot.error_code.as_deref().unwrap_or(""),
+                    error_message = removal_snapshot.error_message.as_deref().unwrap_or(""),
+                    committed_seq,
+                    remediation = "the obsolete toast stays visible until Windows' own Action Center retention expires it; remove it manually with ToastNotificationManager.History.Remove(tag, group, aumid) if it must go sooner",
+                    "readback=CF_KV Action Center Tier-0 removal retries are capped and this row is terminally abandoned; it will not consume further durable revisions or history scans"
+                );
+                return Ok(());
+            }
+            ItemWriteOutcome::Conflict { observed_seq, .. } => tracing::info!(
+                code = "ESCALATION_TIER0_REMOVAL_ABANDON_REVISION_RETRY",
+                escalation_id = %item.escalation_id,
+                revision_attempt,
+                observed_seq,
+                "Tier-0 removal abandonment raced an item mutation; rereading"
+            ),
+        }
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            "Tier-0 removal abandonment for {} could not acquire a stable item revision after {ACK_REVISION_MAX_ATTEMPTS} attempts",
+            item.escalation_id
+        ),
+    ))
+}
+
+/// Rows whose Tier-0 toast is still physically present after a failed removal —
+/// including the terminally abandoned ones, whose removal did in fact fail and
+/// must keep showing up in the sweep report rather than disappearing from it.
 fn tier0_removal_failed(item: &EscalationItem) -> bool {
     matches!(
         item.tier0_delivery,
-        Tier0ToastDelivery::RemovalFailed { .. }
+        Tier0ToastDelivery::RemovalFailed { .. } | Tier0ToastDelivery::RemovalAbandoned { .. }
     )
 }
 
@@ -11816,6 +12046,7 @@ fn classify_tier0_pre_show_collision_locked(
             | Tier0ToastDelivery::VerifiedDismissed { .. }
             | Tier0ToastDelivery::Failed { .. }
             | Tier0ToastDelivery::RemovalFailed { .. }
+            | Tier0ToastDelivery::RemovalAbandoned { .. }
             | Tier0ToastDelivery::Removed { .. }
             | Tier0ToastDelivery::Suppressed { .. } => return Ok(false),
         }
@@ -11864,7 +12095,10 @@ fn classify_tier0_pre_show_collision_locked(
             None => false,
         };
         let physical_contract_matches = history_readback.history_count == 1
-            && history_readback.payload_sha256s.first().map(String::as_str)
+            && history_readback
+                .payload_sha256s
+                .first()
+                .and_then(Option::as_deref)
                 == Some(prepared_payload.payload_sha256.as_str())
             && expiration_contract_matches;
         if physical_contract_matches {
@@ -12094,6 +12328,7 @@ fn claim_tier0_toast_locked(
             | Tier0ToastDelivery::PreShowCollision { .. }
             | Tier0ToastDelivery::Failed { .. }
             | Tier0ToastDelivery::RemovalFailed { .. }
+            | Tier0ToastDelivery::RemovalAbandoned { .. }
             | Tier0ToastDelivery::Removed { .. }
             | Tier0ToastDelivery::Suppressed { .. } => {
                 return Ok(Tier0ToastClaim::NoAction);
@@ -12938,6 +13173,7 @@ fn classify_tier0_history_locked(
             Tier0ToastDelivery::NotRequested
             | Tier0ToastDelivery::KnownUnsent { .. }
             | Tier0ToastDelivery::RemovalFailed { .. }
+            | Tier0ToastDelivery::RemovalAbandoned { .. }
             | Tier0ToastDelivery::Removed { .. }
             | Tier0ToastDelivery::Suppressed { .. } => return Ok(None),
         };
@@ -12964,7 +13200,7 @@ fn classify_tier0_history_locked(
             })?;
         let payload_matches = readback.present
             && readback.history_count == 1
-            && readback.payload_sha256s.first().map(String::as_str)
+            && readback.payload_sha256s.first().and_then(Option::as_deref)
                 == Some(expected_payload_sha256.as_str());
         let classified_at = checked_unix_time_ms("Tier-0 physical classification boundary")?
             .max(now_unix_ms)
@@ -13222,6 +13458,7 @@ async fn drive_tier0_delivery(
         | Tier0ToastDelivery::PreShowCollision { .. }
         | Tier0ToastDelivery::Failed { .. }
         | Tier0ToastDelivery::RemovalFailed { .. }
+        | Tier0ToastDelivery::RemovalAbandoned { .. }
         | Tier0ToastDelivery::Removed { .. }
         | Tier0ToastDelivery::Suppressed { .. } => return Ok(Tier0ProcessOutcome::NoAction),
         Tier0ToastDelivery::LegacyUnclassified

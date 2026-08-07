@@ -155,8 +155,10 @@ pub(crate) struct ToastHistoryReadback {
     pub group: String,
     pub history_count: u32,
     pub present: bool,
-    /// Exact payload digests for every matching Tag+Group row, in history order.
-    pub payload_sha256s: Vec<String>,
+    /// Exact payload digests for every matching Tag+Group row, in history
+    /// order. `None` means Windows kept the row but dropped its payload, so no
+    /// digest exists to compare (#2073); it never satisfies a payload contract.
+    pub payload_sha256s: Vec<Option<String>>,
     /// Expiration for each matching row, in the same history order.
     #[serde(default)]
     pub expiration_unix_ms: Vec<Option<u64>>,
@@ -338,10 +340,44 @@ struct ToastOutcome {
     notification_setting: String,
 }
 
+/// What Windows was able to report about one matching Tag+Group Action Center
+/// row's payload.
+///
+/// Windows does not guarantee that `ToastNotification.Content` is rehydrated
+/// for rows returned by `ToastNotificationHistory.GetHistory*`. Rows pushed past
+/// the per-app Action Center capacity keep their Tag/Group entry while their
+/// stored payload is dropped, and `Content().GetXml()` then throws
+/// `XML_E_MISSINGROOT` (real-host evidence, #2073: 80 of ~500 burst escalation
+/// rows, permanent per row across retries). Modeling that explicitly keeps the
+/// distinction between "Windows told us the payload and it is not ours"
+/// (fail closed, always) and "Windows cannot tell us the payload at all"
+/// (identity must then rest on Tag+Group+AUMID alone).
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum HistoryPayload {
+    /// Windows returned the toast XML; this is its exact identity digest.
+    Digest(String),
+    /// Windows retained the Tag+Group row but has dropped its payload.
+    Dropped {
+        /// The exact HRESULT that classified the row as payload-dropped.
+        hresult: i32,
+        /// The full WinRT error text, preserved for the removal audit trail.
+        detail: String,
+    },
+}
+
+impl HistoryPayload {
+    fn digest(&self) -> Option<&str> {
+        match self {
+            Self::Digest(digest) => Some(digest.as_str()),
+            Self::Dropped { .. } => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct HistoryInspection {
     count: u32,
-    payload_sha256s: Vec<String>,
+    payloads: Vec<HistoryPayload>,
     expiration_unix_ms: Vec<Option<u64>>,
 }
 
@@ -713,13 +749,13 @@ fn is_escalation_toast_tag(tag: &str) -> bool {
 mod windows_toast {
     use super::{
         CorrectedExpiration, HISTORY_VERIFY_POLL_MS, HISTORY_VERIFY_TIMEOUT_MS, HistoryInspection,
-        MAX_FROZEN_TOAST_XML_BYTES, NotifyFailure, NotifyHumanParams, PreparedToastPayload,
-        SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP, SYNAPSE_NOTIFY_DISPLAY_NAME,
-        TOAST_PAYLOAD_SCHEMA_VERSION, TOAST_RENDERER_VERSION_CURRENT, TOAST_RENDERER_VERSION_V1,
-        ToastAction, ToastActivationCallback, ToastCleanupReport, ToastOutcome,
-        ToastPreShowAuthorizer, ToastRemovalOutcome, error_codes, is_escalation_toast_tag,
-        platform_corrected_expiration, toast_intent_digest, toast_payload_digest,
-        toast_xml_with_actions,
+        HistoryPayload, MAX_FROZEN_TOAST_XML_BYTES, NotifyFailure, NotifyHumanParams,
+        PreparedToastPayload, SYNAPSE_AUMID, SYNAPSE_ESCALATION_TOAST_GROUP,
+        SYNAPSE_NOTIFY_DISPLAY_NAME, TOAST_PAYLOAD_SCHEMA_VERSION, TOAST_RENDERER_VERSION_CURRENT,
+        TOAST_RENDERER_VERSION_V1, ToastAction, ToastActivationCallback, ToastCleanupReport,
+        ToastOutcome, ToastPreShowAuthorizer, ToastRemovalOutcome, error_codes,
+        is_escalation_toast_tag, platform_corrected_expiration, toast_intent_digest,
+        toast_payload_digest, toast_xml_with_actions,
     };
     use std::{
         collections::{BTreeSet, VecDeque},
@@ -758,6 +794,15 @@ mod windows_toast {
     #[allow(clippy::cast_possible_wrap)]
     const E_POINTER_HRESULT: windows::core::HRESULT =
         windows::core::HRESULT(0x8000_4003_u32 as i32);
+    /// `XML_E_MISSINGROOT` — "XML document must have a top level element".
+    /// `Windows.Data.Xml.Dom.XmlDocument` is backed by MSXML6, whose parse
+    /// errors occupy the `0xC00CExxx` range; this specific code is raised when
+    /// a document with no root element is serialized. It is the exact code the
+    /// #2073 real-host repro produced from `Content().GetXml()` for every
+    /// Action Center row whose payload Windows had dropped.
+    #[allow(clippy::cast_possible_wrap)]
+    const XML_E_MISSINGROOT_HRESULT: windows::core::HRESULT =
+        windows::core::HRESULT(0xC00C_E558_u32 as i32);
     const UNIX_EPOCH_OFFSET_MS: u64 = 11_644_473_600_000;
     const HUNDRED_NS_PER_MS: u64 = 10_000;
 
@@ -1478,7 +1523,7 @@ mod windows_toast {
                 format!("Action Center history Size() failed: {error}"),
             )
         })?;
-        let mut payload_sha256s = Vec::new();
+        let mut payloads = Vec::new();
         let mut expiration_unix_ms = Vec::new();
         for index in 0..size {
             let toast = toasts.GetAt(index).map_err(|error| {
@@ -1509,31 +1554,79 @@ mod windows_toast {
                         )
                     })?;
             if toast_tag == tag && toast_group == group {
-                let payload = toast
+                let payload = match toast
                     .Content()
                     .and_then(|document| document.GetXml())
                     .map(|xml| xml.to_string_lossy())
-                    .map_err(|error| {
-                        NotifyFailure::new(
+                {
+                    Ok(payload) => {
+                        let suppress_popup = toast.SuppressPopup().map_err(|error| {
+                            NotifyFailure::new(
+                                error_codes::NOTIFY_SHOW_FAILED,
+                                format!(
+                                    "Action Center history SuppressPopup() failed for tag={tag} group={group} at index {index}: {error}"
+                                ),
+                            )
+                        })?;
+                        HistoryPayload::Digest(toast_payload_digest(&payload, suppress_popup))
+                    }
+                    // Windows kept the Tag+Group row but dropped its payload
+                    // (#2073). This is a permanent property of the row, not a
+                    // transient read error, so failing the whole inspection
+                    // closed would make the row un-removable forever. Classify
+                    // it instead; every payload contract below treats a dropped
+                    // payload as "no digest", which can never satisfy a match.
+                    Err(error) if is_payload_dropped_hresult(error.code()) => {
+                        HistoryPayload::Dropped {
+                            hresult: error.code().0,
+                            detail: error.to_string(),
+                        }
+                    }
+                    // Any other Content()/GetXml() failure is not the known
+                    // payload-dropped class and keeps failing closed.
+                    Err(error) => {
+                        return Err(NotifyFailure::new(
                             error_codes::NOTIFY_SHOW_FAILED,
                             format!(
                                 "Action Center history Content().GetXml() failed for tag={tag} group={group} at index {index}: {error}"
                             ),
-                        )
-                    })?;
-                let suppress_popup = toast.SuppressPopup().map_err(|error| {
-                    NotifyFailure::new(
-                        error_codes::NOTIFY_SHOW_FAILED,
-                        format!(
-                            "Action Center history SuppressPopup() failed for tag={tag} group={group} at index {index}: {error}"
-                        ),
-                    )
-                })?;
-                payload_sha256s.push(toast_payload_digest(&payload, suppress_popup));
-                expiration_unix_ms.push(read_expiration_unix_ms(&toast, tag, group, index)?);
+                        ));
+                    }
+                };
+                let expiration = match &payload {
+                    HistoryPayload::Digest(_) => {
+                        read_expiration_unix_ms(&toast, tag, group, index)?
+                    }
+                    // The payload store for this row is already proven
+                    // unreadable; a secondary property read from the same
+                    // dropped record is not a second identity wall. Record the
+                    // expiration when Windows still has it and downgrade it to
+                    // "absent" when it does not. Identity for a dropped row
+                    // never rests on the expiration (see remove_toast_blocking).
+                    HistoryPayload::Dropped { hresult, .. } => {
+                        match read_expiration_unix_ms(&toast, tag, group, index) {
+                            Ok(expiration) => expiration,
+                            Err(error) => {
+                                tracing::warn!(
+                                    code = "NOTIFY_HISTORY_PAYLOAD_DROPPED_EXPIRATION_UNREADABLE",
+                                    tag,
+                                    group,
+                                    index,
+                                    payload_hresult = format!("0x{:08X}", *hresult as u32),
+                                    error_code = error.code,
+                                    error_message = %error.message,
+                                    "readback=Action Center a payload-dropped row also refused its ExpirationTime; treating the expiration as absent without weakening Tag+Group identity"
+                                );
+                                None
+                            }
+                        }
+                    }
+                };
+                payloads.push(payload);
+                expiration_unix_ms.push(expiration);
             }
         }
-        let count = u32::try_from(payload_sha256s.len()).map_err(|error| {
+        let count = u32::try_from(payloads.len()).map_err(|error| {
             NotifyFailure::new(
                 error_codes::NOTIFY_DELIVERY_UNVERIFIED,
                 format!(
@@ -1543,9 +1636,33 @@ mod windows_toast {
         })?;
         Ok(HistoryInspection {
             count,
-            payload_sha256s,
+            payloads,
             expiration_unix_ms,
         })
+    }
+
+    /// The exact HRESULT class that means "Windows kept this Action Center row
+    /// but can no longer produce its payload".
+    ///
+    /// Deliberately narrow — only codes whose meaning is *the document is not
+    /// there*, never codes that mean *the document is there and is wrong*:
+    ///
+    /// * `XML_E_MISSINGROOT` (`0xC00CE558`) — MSXML6, which backs
+    ///   `Windows.Data.Xml.Dom.XmlDocument`, raises this when asked to
+    ///   serialize a document with no top-level element. That is exactly an
+    ///   empty rehydrated `ToastNotification.Content`, and it is the code
+    ///   observed live for all 80 affected rows in #2073.
+    /// * `E_POINTER` (`0x80004003`) — `Content()` handing back a null
+    ///   `XmlDocument`. windows-rs maps a null out-parameter to `E_POINTER`;
+    ///   this file already relies on that same convention for a null
+    ///   `ExpirationTime` reference in `read_expiration_unix_ms`.
+    ///
+    /// Every other MSXML `XML_E_*` code describes a *parse* fault over content
+    /// that does exist (bad tag, bad encoding, unexpected token). Those would
+    /// mean Windows is holding a payload we cannot account for, which must keep
+    /// failing closed, so they are intentionally excluded.
+    fn is_payload_dropped_hresult(hresult: windows::core::HRESULT) -> bool {
+        hresult == XML_E_MISSINGROOT_HRESULT || hresult == E_POINTER_HRESULT
     }
 
     fn removal_failure(
@@ -1780,10 +1897,7 @@ mod windows_toast {
             };
         }
 
-        if before.count != 1
-            || before.payload_sha256s.len() != 1
-            || before.expiration_unix_ms.len() != 1
-        {
+        if before.count != 1 || before.payloads.len() != 1 || before.expiration_unix_ms.len() != 1 {
             return removal_precondition_failure(
                 tag,
                 group,
@@ -1791,22 +1905,102 @@ mod windows_toast {
                 format!(
                     "refusing ambiguous toast removal: expected exactly one Action Center row for tag={tag} group={group}; count={} payload_rows={} expiration_rows={}",
                     before.count,
-                    before.payload_sha256s.len(),
+                    before.payloads.len(),
                     before.expiration_unix_ms.len()
                 ),
             );
         }
+        // A payload-dropped row is handled before the digest contract: there is
+        // no digest to compare, so the only question is whether Tag+Group+AUMID
+        // alone is a sufficient identity proof for *this* removal (#2073).
+        if let HistoryPayload::Dropped { hresult, detail } = &before.payloads[0] {
+            // The reserved escalation namespace is the one place where it is:
+            // `et1-<128-bit hex>` tags are minted only by
+            // `escalation_toast_tag`, a domain-separated SHA-256 of the durable
+            // escalation id, and this call removes the tag the daemon just
+            // recomputed from its own durable item — never a tag read out of
+            // Action Center. Combined with the reserved group and the Synapse
+            // AUMID, a matching row cannot belong to anyone else. This is the
+            // same identity basis the reserved-orphan cleanup path already
+            // accepts without any payload digest.
+            if group != SYNAPSE_ESCALATION_TOAST_GROUP || !is_escalation_toast_tag(tag) {
+                return removal_precondition_failure(
+                    tag,
+                    group,
+                    before.count,
+                    format!(
+                        "refusing toast removal because Windows dropped the row payload outside the reserved escalation identity namespace: tag={tag} group={group} hresult=0x{:08X} detail={detail}",
+                        *hresult as u32
+                    ),
+                );
+            }
+            // An unbound removal (no durable digest and not a reserved-orphan
+            // sweep) is refused for every row regardless of payload state; let
+            // the contract match below say so rather than logging a removal
+            // that will not happen.
+            if expected_payload_sha256.is_none() && !allow_reserved_orphan {
+                return removal_precondition_failure(
+                    tag,
+                    group,
+                    before.count,
+                    format!(
+                        "refusing unbound toast removal for tag={tag} group={group}; an exact durable payload digest is required (row payload dropped by Windows: hresult=0x{:08X})",
+                        *hresult as u32
+                    ),
+                );
+            }
+            let expiration_corroborated =
+                match (expected_expiration_unix_ms, before.expiration_unix_ms[0]) {
+                    (Some(expected), Some(stored)) => match arrival_lower_bound_unix_ms {
+                        Some(arrival_lower_bound_unix_ms) => platform_corrected_expiration(
+                            expected,
+                            stored,
+                            arrival_lower_bound_unix_ms,
+                            current_unix_ms_for_cap_bound(),
+                        )
+                        .is_some(),
+                        None => stored == expected,
+                    },
+                    _ => false,
+                };
+            tracing::warn!(
+                code = "NOTIFY_REMOVAL_PAYLOAD_DROPPED_TAG_MATCH",
+                tag,
+                group,
+                aumid = SYNAPSE_AUMID,
+                hresult = format!("0x{:08X}", *hresult as u32),
+                detail = %detail,
+                identity_basis = "reserved et1 Tag+Group+AUMID minted by escalation_toast_tag (domain-separated SHA-256 of the durable escalation id)",
+                expected_payload_sha256 = expected_payload_sha256.unwrap_or(""),
+                expected_expiration_unix_ms,
+                stored_expiration_unix_ms = before.expiration_unix_ms[0],
+                expiration_corroborated,
+                before_count = before.count,
+                "readback=Action Center Windows dropped this row's payload, so the reserved Tag+Group+AUMID match is the identity proof; proceeding with removal instead of failing closed forever (#2073)"
+            );
+        }
         match expected_payload_sha256 {
-            Some(expected) if before.payload_sha256s[0] != expected => {
+            // Payload-dropped rows were already adjudicated above; `digest()`
+            // yields `None` for them, which must never be read as a match.
+            Some(expected)
+                if before.payloads[0]
+                    .digest()
+                    .is_some_and(|actual| actual != expected) =>
+            {
                 return removal_precondition_failure(
                     tag,
                     group,
                     before.count,
                     format!(
                         "refusing toast removal because the physical payload is not the durable escalation payload: tag={tag} group={group} expected_sha256={expected} actual_sha256={}",
-                        before.payload_sha256s[0]
+                        before.payloads[0].digest().unwrap_or("<dropped>")
                     ),
                 );
+            }
+            Some(_) if before.payloads[0].digest().is_none() => {
+                // Identity already proven by the reserved Tag+Group+AUMID match
+                // above; the expiration contract cannot be a second permanent
+                // wall for a row whose whole record Windows has dropped.
             }
             Some(_) => {
                 // Reconcile the physical expiration against the Windows Action
@@ -2218,7 +2412,7 @@ mod windows_toast {
         operation: &str,
     ) -> Result<(), NotifyFailure> {
         if inspection.count != 1
-            || inspection.payload_sha256s.len() != 1
+            || inspection.payloads.len() != 1
             || inspection.expiration_unix_ms.len() != 1
         {
             return Err(NotifyFailure::new(
@@ -2226,17 +2420,28 @@ mod windows_toast {
                 format!(
                     "{operation} requires exactly one Action Center row for tag={tag} group={group}; found count={} payload_rows={} expiration_rows={}",
                     inspection.count,
-                    inspection.payload_sha256s.len(),
+                    inspection.payloads.len(),
                     inspection.expiration_unix_ms.len()
                 ),
             ));
         }
-        if inspection.payload_sha256s[0] != expected_payload_sha256 {
+        // Verification (delivery proof, dedupe reuse, mismatch quarantine) is
+        // strictly stronger than removal: it must positively identify the
+        // payload, so a row whose payload Windows dropped can never satisfy it
+        // and keeps failing closed here (#2073 relaxes removal only).
+        let HistoryPayload::Digest(actual_payload_sha256) = &inspection.payloads[0] else {
             return Err(NotifyFailure::new(
                 error_codes::NOTIFY_DELIVERY_UNVERIFIED,
                 format!(
-                    "{operation} found a payload mismatch for tag={tag} group={group}; expected_sha256={expected_payload_sha256}, actual_sha256={}",
-                    inspection.payload_sha256s[0]
+                    "{operation} cannot prove the payload for tag={tag} group={group}; Windows retained the row but dropped its payload (expected_sha256={expected_payload_sha256})"
+                ),
+            ));
+        };
+        if actual_payload_sha256 != expected_payload_sha256 {
+            return Err(NotifyFailure::new(
+                error_codes::NOTIFY_DELIVERY_UNVERIFIED,
+                format!(
+                    "{operation} found a payload mismatch for tag={tag} group={group}; expected_sha256={expected_payload_sha256}, actual_sha256={actual_payload_sha256}"
                 ),
             ));
         }
@@ -2872,7 +3077,11 @@ async fn inspect_internal_toast_in_group(
         group: group.to_owned(),
         history_count: inspection.count,
         present: inspection.count > 0,
-        payload_sha256s: inspection.payload_sha256s,
+        payload_sha256s: inspection
+            .payloads
+            .iter()
+            .map(|payload| payload.digest().map(str::to_owned))
+            .collect(),
         expiration_unix_ms: inspection.expiration_unix_ms,
     };
     tracing::info!(
