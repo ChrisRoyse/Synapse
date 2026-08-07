@@ -800,6 +800,49 @@ pub struct PanelCoverageReport {
     /// red on `syn-action-v1` and `syn-process-v1`, and a permanently-red field
     /// is a broken instrument.
     pub records_exceed_source_panels: Vec<String>,
+    /// Catalog lineage entries the generation allocator attributes to a
+    /// **different** panel (#2093).
+    ///
+    /// Two authorities describe who wrote a generation: `builtin_panel_catalog`,
+    /// a compile-time constant a human edits, and the allocator's owners map, a
+    /// durable row the reserving panel wrote when the generation was its active
+    /// one. They can only disagree by a declaration error, and when they do the
+    /// census believes the catalog — so the error is silent everywhere it
+    /// matters. `syn-graphpos-app-v1` carried `syn-agent-event-v1`'s retired
+    /// `1_665_001` for four months and 59 replayable anchors were reported
+    /// unrepairable the whole time, because the panel they had been reassigned
+    /// to declares no re-measure path.
+    ///
+    /// **Empty is the healthy state**, and empty is also what a vault too young
+    /// to hold the generation reports: an absent owner claim is not evidence.
+    pub catalog_lineage_misattributed: Vec<String>,
+    /// Generations the allocator holds live — owned, and with no recorded
+    /// successor (#2081 ask 4).
+    pub allocator_live_count: usize,
+    /// Of those, the ones the physical `Base` census can see, i.e. that hold at
+    /// least one row.
+    ///
+    /// Always below [`Self::allocator_live_count`], and that gap is **not** by
+    /// itself a finding: every catalog generation is reserved at vault open so
+    /// no writer can name an unowned one, and the three derived-snapshot panels
+    /// never write at their reserved base at all. The actionable half of the gap
+    /// is [`Self::allocator_live_dynamic_without_records`].
+    pub census_live_count: usize,
+    /// The actionable half of that gap: **dynamic** live owner claims with no
+    /// `Base` row behind them, bounded by [`SYN_OWNED_GENERATION_NAME_CAP`].
+    ///
+    /// A successful derived publish always commits at least one constellation,
+    /// so a live dynamic claim the census cannot see never published — it is one
+    /// permanently consumed owner row out of a bounded `MAX_OWNERS = 10_000`,
+    /// minted by the pre-#2081 ordering that allocated before the spectral pass
+    /// that fails. Empty on a vault whose publishes have all either committed or
+    /// failed before allocating.
+    ///
+    /// Reported and never auto-retired — see the derivation comment in
+    /// `build_panel_coverage_report` for why a zero-row reading cannot
+    /// distinguish a failed publish from one that has allocated and not yet
+    /// committed.
+    pub allocator_live_dynamic_without_records: Vec<String>,
     pub measured_at_unix_ms: Option<u64>,
 }
 
@@ -1037,7 +1080,7 @@ pub fn build_panel_coverage_report(
     let mut records_exceed_source_panels = Vec::new();
     let mut orphaned_source_missing_panels = Vec::new();
 
-    for entry in catalog {
+    for entry in &catalog {
         claimed_versions.push(entry.panel_version);
         claimed_versions.extend_from_slice(entry.superseded_versions);
 
@@ -1459,6 +1502,115 @@ pub fn build_panel_coverage_report(
             }
         }
     }
+    // --- The catalog's lineage, checked against the allocator (#2093) ---
+    //
+    // Every generation a catalog entry declares — its active one and every
+    // entry in its lineage — was reserved `builtin:<panel_name>` by
+    // `ensure_builtin_panel_generation_reservations` at the time it *was* the
+    // active one. That reservation is durable and is never rewritten, so the
+    // allocator remembers which panel actually wrote each generation long after
+    // the catalog constant moved on. A catalog entry claiming a generation the
+    // allocator attributes to a different panel is therefore a provable
+    // mis-declaration, not a judgement call.
+    //
+    // This is the check nothing performed. #1983 moved `syn-agent-event-v1` off
+    // `1_665_001` and appended that generation to `syn-graphpos-app-v1`'s
+    // lineage — the entry above it in the same file — and for four months the
+    // census believed it: 16,650 agent-event rows counted as a graph panel's
+    // superseded history, 59 replayable anchors reported as permanently
+    // unrepairable because the panel they had been reassigned to has no
+    // re-measure path, and `panel_coverage=error` pinning `health.ok=false`
+    // with no action an operator could take (#2093).
+    //
+    // Silent when the allocator has no claim: a generation retired before this
+    // vault existed was never reserved here, and absence of evidence is
+    // reported as nothing rather than as a finding.
+    let mut catalog_lineage_misattributed: Vec<String> = Vec::new();
+    for entry in &catalog {
+        for (role, version) in std::iter::once(("active", entry.panel_version)).chain(
+            entry
+                .superseded_versions
+                .iter()
+                .map(|version| ("superseded", *version)),
+        ) {
+            let Some((owner_kind, owner_panel)) = ownership.claim(version) else {
+                continue;
+            };
+            if owner_panel == entry.panel_name {
+                continue;
+            }
+            catalog_lineage_misattributed.push(format!(
+                "{}@{version} declared as this panel's {role} generation, but the allocator owns \
+                 it as {}:{owner_panel} holding {} record(s); one of the two declarations is wrong \
+                 and the allocator's is the one that was written by the panel that wrote the rows",
+                entry.panel_name,
+                owner_kind.as_str(),
+                census.entry(version).map_or(0, |row| row.records),
+            ));
+        }
+    }
+
+    // --- Allocator-live vs census-live (#2081 ask 4) ---
+    //
+    // A generation with an owner row and no `Base` rows produces no census
+    // entry, so every surface downstream of the census is blind to it. The two
+    // totals are published side by side because neither alone can express that,
+    // and their difference has **two** populations in it that must not be
+    // conflated:
+    //
+    // * `builtin:` reservations that have not been written to. Expected and
+    //   permanent. `ensure_builtin_panel_generation_reservations` claims every
+    //   catalog generation at vault open precisely so no writer can name an
+    //   unowned one, and the three derived-snapshot panels never write at their
+    //   reserved base at all. Measured on a fresh vault: 14 of these before a
+    //   single row exists. Treating them as a finding would make the field
+    //   permanently red, which is a broken instrument rather than a signal.
+    // * `dynamic:` claims with no rows. **This is #2081's population** — one
+    //   permanently consumed owner row per publish whose compute failed after
+    //   allocating, out of a bounded `MAX_OWNERS = 10_000`. A successful publish
+    //   always commits at least one constellation, so a live dynamic claim with
+    //   no `Base` row behind it did not publish.
+    //
+    // Only the second is named and only the second raises anything.
+    //
+    // Reported, never retired. Retirement would need `supersede_panel_
+    // generations`, whose refusal to retire a generation ABOVE the successor is
+    // the guard that stops a race with a publish in flight — and an orphan
+    // minted after the last successful publish is above it by construction. A
+    // census reading zero rows also cannot distinguish "this publish failed"
+    // from "this publish has allocated and has not committed its batch yet", so
+    // acting on it would mark a live publish's rows reclaimable the instant they
+    // land. See #2081 ask 3.
+    let census_live_generations: BTreeSet<u32> = census
+        .entries
+        .iter()
+        .map(|row| row.panel_version)
+        .filter(|version| !ownership.retired.contains_key(version))
+        .collect();
+    let allocator_live_generations: BTreeSet<u32> = ownership
+        .owners
+        .keys()
+        .copied()
+        .filter(|version| !ownership.retired.contains_key(version))
+        .collect();
+    let allocator_live_dynamic_without_records: Vec<String> = allocator_live_generations
+        .iter()
+        .filter(|version| !census_live_generations.contains(version))
+        .filter(|version| matches!(ownership.claim(**version), Some((OwnerKind::Dynamic, _))))
+        .take(SYN_OWNED_GENERATION_NAME_CAP)
+        .map(|version| {
+            format!(
+                "{version} owned by {}",
+                ownership
+                    .owners
+                    .get(version)
+                    .map_or("<unreadable owner claim>", String::as_str)
+            )
+        })
+        .collect();
+    let allocator_live_count = allocator_live_generations.len();
+    let census_live_count = census_live_generations.len();
+
     let owned_dynamic_generations: Vec<OwnedGenerationRollup> = rollups.into_values().collect();
     let dynamic_panels_multi_live: Vec<String> = owned_dynamic_generations
         .iter()
@@ -1507,6 +1659,10 @@ pub fn build_panel_coverage_report(
         anchors_stranded_source_absent_total,
         anchors_stranded_source_cf_unmeasured_total,
         records_exceed_source_panels,
+        catalog_lineage_misattributed,
+        allocator_live_count,
+        census_live_count,
+        allocator_live_dynamic_without_records,
         measured_at_unix_ms: census.measured_at_unix_ms,
     }
 }

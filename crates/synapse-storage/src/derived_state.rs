@@ -617,8 +617,15 @@ pub fn derived_state_readback() -> DerivedStateReadback {
 ///
 /// This is the operator/FSV seam for proving a scheduled pass without changing
 /// its production interval or constructing a second implementation.
+///
+/// The tick's verdict is deliberately not returned twice. It is
+/// [`DerivedStateReadback::last_tick_failed`] and
+/// [`DerivedStateReadback::last_tick_subpass_failures`] on the value below, and
+/// the `Err` that [`run_derived_state_maintenance`] hands the maintenance task
+/// is derived from those same two fields — one ledger, two renderings of it.
+/// A caller that needs the task's exact return value calls the pass directly.
 pub fn run_derived_state_maintenance_once() -> DerivedStateReadback {
-    run_derived_state_maintenance();
+    let _ = run_derived_state_maintenance();
     derived_state_readback()
 }
 
@@ -710,13 +717,57 @@ fn record_advisory(code: &'static str, detail: String) {
     guard.last_advisory_unix_ms = now_unix_ms();
 }
 
-/// Runs one unattended derived-state maintenance pass.
+/// Runs one unattended derived-state maintenance pass and returns **the tick's
+/// own outcome** (#2088).
 ///
 /// The two halves are independent on purpose: a search-generation rebuild that
 /// fails must not stop lens coverage from being measured and reported, because
 /// they answer different questions and an operator needs both. Each half records
 /// its own failure.
-pub(crate) fn run_derived_state_maintenance() {
+///
+/// # Why this returns a `Result` at all
+///
+/// It did not, and the maintenance task's `GcRunner` therefore could not fail:
+/// `run_once` closed over a `()` and returned `Ok(GcReport::default())`
+/// unconditionally, so `STORAGE_MAINTENANCE_COMPLETED operation=
+/// "storage_derived_state" is_ok=…` was structurally `true` on every tick
+/// including the ones that failed. An operator grepping that log for a broken
+/// maintainer would have found nothing, forever, however broken it was. The
+/// verdict already existed after #2080 — it just stopped at the module boundary.
+///
+/// # Errors
+///
+/// Returns [`StorageError::WriteFailed`](crate::StorageError::WriteFailed)
+/// naming this tick's sub-pass failure codes when the tick's outcome ledger is
+/// non-empty. The error is **derived from** that ledger rather than recorded
+/// beside it, so it cannot double-count: a sub-pass failure is counted once, by
+/// [`record_failure`], and this is the same fact crossing a boundary.
+///
+/// A recorded *skip* — no storage handle registered — is `Ok`. Nothing was
+/// attempted, nothing is stale, and there is no fault to report.
+///
+/// # The retry decision, stated (#2088 ask 2)
+///
+/// **A failed derived-state tick is not retried inside its tick.** The chosen
+/// error variant carries `STORAGE_WRITE_FAILED`, which `gc::gc_failure_kind`
+/// classifies `Terminal` — `retryable_gc_failure_kind` therefore returns `None`
+/// and `gc::spawn_runner` breaks on the first attempt. That is a decision, and
+/// the reasons are structural rather than stylistic:
+///
+/// * This tick is not one operation. It is ~15 independent sub-passes, and a
+///   retry re-runs the ~14 that succeeded — including a search-generation
+///   rebuild and a coverage sweep with a 60-second budget and a 3-minute hard
+///   ceiling. That is a second full tick, not a retry of the failed work.
+/// * Each sub-pass already isolates its own failure and leaves the layer it
+///   maintains at its previous state. The five-minute cadence is the retry, and
+///   it retries from a fresh coherent snapshot rather than the stale lease the
+///   failing attempt held.
+/// * The retry path exists for *contention* — Calyx backpressure and the shared
+///   native maintenance lock — and both of those are already handled inside the
+///   individual sub-passes that touch the vault. A sub-pass failure that
+///   reaches here is a measurement or an invariant that did not hold, which
+///   another immediate attempt cannot change.
+pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     // Hot-path boundary (#1686): every one of these reads is off-runtime
     // intelligence work and must never be driven from a tagged reflex tick.
     hot_context::assert_cold_calyx("maintenance_derived_state");
@@ -744,7 +795,7 @@ pub(crate) fn run_derived_state_maintenance() {
              synapse_storage::derived_state::register_derived_state_source when storage opens"
                 .to_owned(),
         );
-        return;
+        return Ok(());
     };
 
     let mut any_failed = false;
@@ -1001,6 +1052,48 @@ pub(crate) fn run_derived_state_maintenance() {
                 );
                 any_failed |= sweep_unretired_derived_generations(&db, &report);
             }
+            // #2093. Two authorities disagree about who wrote a generation, and
+            // only one of them was written by the panel that wrote the rows.
+            // This is a sub-pass failure rather than a warning: the catalog is a
+            // compile-time constant, so nothing at runtime can clear it, and
+            // while it stands every anchor-debt and reclaim decision about those
+            // rows is being taken against the wrong panel's declarations.
+            if !report.catalog_lineage_misattributed.is_empty() {
+                any_failed = true;
+                record_failure(
+                    "STORAGE_DERIVED_STATE_CATALOG_LINEAGE_MISATTRIBUTED",
+                    format!(
+                        "builtin_panel_catalog declares generations the Registry CF allocator \
+                         attributes to a different panel: {:?}; the allocator's claim was written \
+                         by the panel that reserved the generation while it was active, so the \
+                         catalog constant is the wrong one and must be corrected in \
+                         crates/synapse-storage/src/constellations.rs",
+                        report.catalog_lineage_misattributed
+                    ),
+                );
+            }
+            // #2081 ask 4. A live owner row with no Base row behind it is
+            // invisible to every census-derived surface, so this divergence is
+            // the only place it can appear at all. Raised on the *dynamic* half
+            // only: `builtin:` reservations without rows are the designed steady
+            // state of a young vault and of every derived-snapshot panel, and a
+            // warning that fires on those would be permanently on.
+            if !report.allocator_live_dynamic_without_records.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_ALLOCATOR_CENSUS_LIVE_DIVERGED",
+                    allocator_live_count = report.allocator_live_count,
+                    census_live_count = report.census_live_count,
+                    live_dynamic_without_records =
+                        ?report.allocator_live_dynamic_without_records,
+                    "the generation allocator holds live DYNAMIC owner claims that the physical \
+                     Base census cannot see; a successful derived publish always commits at least \
+                     one constellation, so each of these named a generation that never published \
+                     and each permanently consumes one of the allocator's bounded owner slots. \
+                     They are reported and never auto-retired: a zero-row reading cannot \
+                     distinguish a publish that failed from one that has allocated and not yet \
+                     committed its batch"
+                );
+            }
             if !report.reserved_generations_absent_from_catalog.is_empty() {
                 tracing::warn!(
                     code = "STORAGE_DERIVED_STATE_RESERVED_GENERATION_UNDECLARED",
@@ -1128,6 +1221,25 @@ pub(crate) fn run_derived_state_maintenance() {
         subpass_failure_codes = ?guard.last_tick_subpass_failures,
         "completed one unattended derived-state tick and published its outcome at tick granularity"
     );
+    // The maintenance task's return value, taken from the same ledger the log
+    // line above was taken from (#2088). Not a second recording of anything:
+    // every sub-pass failure named here was counted exactly once, by
+    // `record_failure`, before this line could observe it.
+    if tick_failed {
+        return Err(crate::StorageError::WriteFailed {
+            cf_name: "storage_derived_state".to_owned(),
+            detail: format!(
+                "STORAGE_DERIVED_STATE_TICK_FAILED: {} sub-pass(es) of this derived-state \
+                 maintenance tick did not complete, so the derived layers they maintain are at \
+                 whatever state they were already in: {:?}. This tick is not retried in place — \
+                 see run_derived_state_maintenance's retry decision — and the next five-minute \
+                 tick reattempts every sub-pass from a fresh coherent snapshot",
+                guard.last_tick_subpass_failures.len(),
+                guard.last_tick_subpass_failures,
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
@@ -1136,6 +1248,7 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
     let mut previous = None::<String>;
     let mut counts = BTreeMap::<(String, String), u64>::new();
     let mut hierarchy_paths = std::collections::BTreeSet::<String>::new();
+    let mut app_yield = GraphLaneYield::new(APP_FOCUS_LANE);
     loop {
         let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
             Ok(page) => page,
@@ -1172,13 +1285,20 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
             if record.kind != TimelineKind::FocusChange {
                 continue;
             }
+            app_yield.observe_row();
             let Some(app) = record.app.filter(|value| !value.trim().is_empty()) else {
+                app_yield.observe_skip("focus_row_has_no_app");
                 continue;
             };
-            if let Some(from) = previous.replace(app.clone())
-                && from != app
-            {
-                *counts.entry((from, app)).or_default() += 1;
+            if let Some(from) = previous.replace(app.clone()) {
+                if from == app {
+                    app_yield.observe_skip("focus_row_repeats_previous_app");
+                } else {
+                    app_yield.observe_edge();
+                    *counts.entry((from, app)).or_default() += 1;
+                }
+            } else {
+                app_yield.observe_skip("first_focus_row_has_no_predecessor");
             }
         }
         if !page.more {
@@ -1186,6 +1306,7 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
         }
     }
     db.release_coherent_scan(&mut lease)?;
+    app_yield.report(source_seq);
     drive_path_hierarchy(
         db,
         source_seq,
@@ -1551,6 +1672,7 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
     let source_seq = lease.snapshot_seq;
     let read_at_unix_ms = lease.read_at_unix_ms;
     let mut counts = BTreeMap::<(String, String), u64>::new();
+    let mut agent_yield = GraphLaneYield::new(AGENT_SPAWN_LANE);
     loop {
         let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
             Ok(page) => page,
@@ -1572,7 +1694,9 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
                     });
                 }
             };
+            agent_yield.observe_row();
             if record.kind != AgentEventKind::SpawnRequested {
+                agent_yield.observe_skip("event_is_not_spawn_requested");
                 continue;
             }
             let parent_session_id = record
@@ -1583,11 +1707,14 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
                 .or(record.session_id)
                 .or(record.attributes.conversation_id);
             let (Some(session_id), Some(spawn_id)) = (parent_session_id, record.spawn_id) else {
+                agent_yield.observe_skip("spawn_event_lacks_session_or_spawn_id");
                 continue;
             };
             if session_id.trim().is_empty() || spawn_id.trim().is_empty() {
+                agent_yield.observe_skip("spawn_event_session_or_spawn_id_blank");
                 continue;
             }
+            agent_yield.observe_edge();
             *counts
                 .entry((
                     format!("agent-session:{session_id}"),
@@ -1600,7 +1727,8 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
         }
     }
     db.release_coherent_scan(&mut lease)?;
-    let (process_source_seq, process_read_at_unix_ms) =
+    agent_yield.report(source_seq);
+    let (process_source_seq, process_read_at_unix_ms, process_yield) =
         collect_process_parent_edges(db, &mut counts)?;
     let source_seq = source_seq.max(process_source_seq);
     let read_at_unix_ms = read_at_unix_ms.max(process_read_at_unix_ms);
@@ -1640,19 +1768,133 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
         graph_row_count = readback.graph_row_count,
         committed_seq = readback.committed_seq,
         lifecycle_sha256 = readback.lifecycle_sha256,
+        // Per-lane attribution of the fused edge set (#2089): a published
+        // snapshot must say which of its lanes actually paid for it.
+        agent_lane_rows_examined = agent_yield.rows_examined,
+        agent_lane_edges_derived = agent_yield.edges_derived,
+        process_lane_rows_examined = process_yield.rows_examined,
+        process_lane_edges_derived = process_yield.edges_derived,
+        process_lane_skips = %process_yield.skip_summary(),
         "scheduled process and agent-spawn graph snapshot was atomically published and physically read back"
     );
     Ok(())
 }
 
+/// Lane names used by [`GraphLaneYield`]. They are stable strings: an operator
+/// greps `lane=` to find which half of a fused graph panel went quiet.
+const APP_FOCUS_LANE: &str = "app_focus_transitions";
+const AGENT_SPAWN_LANE: &str = "agent_spawn_edges";
+const PROCESS_PARENT_LANE: &str = "process_parent_edges";
+
+/// Per-lane edge accounting for one graph build (#2089).
+///
+/// A graph panel is fed by more than one lane, and its published snapshot is a
+/// single fused edge set. That fusion is exactly what let the process lane of
+/// `syn-graphpos-process-v1` contribute **zero** edges for 1085 source rows
+/// while the panel kept publishing normally on the agent-spawn lane's edges
+/// alone: "this lane contributed nothing" and "this lane contributed normally"
+/// produced identical logs. This type makes a lane's yield a first-class,
+/// reported number, and [`GraphLaneYield::report`] raises a warning whenever a
+/// lane examines rows and derives no edges from any of them.
+#[derive(Clone, Debug)]
+struct GraphLaneYield {
+    lane: &'static str,
+    rows_examined: u64,
+    edges_derived: u64,
+    /// Exact reason vocabulary for every row that did not become an edge, so a
+    /// zero-yield lane says *why* it is zero rather than only that it is.
+    skips: BTreeMap<&'static str, u64>,
+}
+
+impl GraphLaneYield {
+    const fn new(lane: &'static str) -> Self {
+        Self {
+            lane,
+            rows_examined: 0,
+            edges_derived: 0,
+            skips: BTreeMap::new(),
+        }
+    }
+
+    const fn observe_row(&mut self) {
+        self.rows_examined += 1;
+    }
+
+    const fn observe_edge(&mut self) {
+        self.edges_derived += 1;
+    }
+
+    fn observe_skip(&mut self, reason: &'static str) {
+        *self.skips.entry(reason).or_default() += 1;
+    }
+
+    fn skip_summary(&self) -> String {
+        if self.skips.is_empty() {
+            return "none".to_owned();
+        }
+        self.skips
+            .iter()
+            .map(|(reason, count)| format!("{reason}={count}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Emit the lane's yield. A lane that examined rows and derived no edges is
+    /// a defect until proven otherwise, so it is a warning, not a debug line.
+    fn report(&self, source_seq: u64) {
+        if self.rows_examined == 0 {
+            tracing::debug!(
+                code = "STORAGE_DERIVED_STATE_GRAPH_LANE_SOURCE_EMPTY",
+                lane = self.lane,
+                source_seq,
+                "graph lane has no source rows to derive edges from"
+            );
+            return;
+        }
+        if self.edges_derived == 0 {
+            tracing::warn!(
+                code = "STORAGE_DERIVED_STATE_GRAPH_LANE_CONTRIBUTED_NO_EDGES",
+                lane = self.lane,
+                source_seq,
+                rows_examined = self.rows_examined,
+                edges_derived = 0_u64,
+                skips = %self.skip_summary(),
+                "graph lane examined source rows and derived zero edges; the panel fed by this \
+                 lane is publishing without it, and any measurement attributed to this lane is \
+                 absent rather than empty"
+            );
+            return;
+        }
+        tracing::debug!(
+            code = "STORAGE_DERIVED_STATE_GRAPH_LANE_YIELD",
+            lane = self.lane,
+            source_seq,
+            rows_examined = self.rows_examined,
+            edges_derived = self.edges_derived,
+            skips = %self.skip_summary(),
+            "graph lane derived edges from its source rows"
+        );
+    }
+}
+
+/// What one `CF_PROCESS_HISTORY` row contributes to the process lane.
+#[derive(Clone, Copy, Debug)]
+enum ProcessEdgeDecision {
+    /// `(parent_pid, pid)`.
+    Edge(u64, u64),
+    /// The row carries no trustworthy edge, for this exact reason.
+    Skip(&'static str),
+}
+
 fn collect_process_parent_edges(
     db: &Db,
     counts: &mut BTreeMap<(String, String), u64>,
-) -> crate::StorageResult<(u64, u64)> {
+) -> crate::StorageResult<(u64, u64, GraphLaneYield)> {
     let mut lease =
         db.pin_cf_physical_scan(cf::CF_PROCESS_HISTORY, crate::COHERENT_SCAN_MAX_AGE_MS)?;
     let source_seq = lease.snapshot_seq;
     let read_at_unix_ms = lease.read_at_unix_ms;
+    let mut yield_report = GraphLaneYield::new(PROCESS_PARENT_LANE);
     loop {
         let page = match db.scan_cf_physical_page_coherent(&mut lease, 1_000) {
             Ok(page) => page,
@@ -1682,19 +1924,25 @@ fn collect_process_parent_edges(
                         .to_owned(),
                 });
             };
-            let edge = match process_parent_edge(object, &key) {
-                Ok(edge) => edge,
+            yield_report.observe_row();
+            let decision = match process_parent_edge(object, &key) {
+                Ok(decision) => decision,
                 Err(error) => {
                     let _ = db.release_coherent_scan(&mut lease);
                     return Err(error);
                 }
             };
-            let Some((parent_pid, pid)) = edge else {
+            let ProcessEdgeDecision::Edge(parent_pid, pid) = decision else {
+                if let ProcessEdgeDecision::Skip(reason) = decision {
+                    yield_report.observe_skip(reason);
+                }
                 continue;
             };
             if pid == 0 || parent_pid == 0 || pid == parent_pid {
+                yield_report.observe_skip("degenerate_pid_pair");
                 continue;
             }
+            yield_report.observe_edge();
             *counts
                 .entry((format!("process:{parent_pid}"), format!("process:{pid}")))
                 .or_default() += 1;
@@ -1704,25 +1952,119 @@ fn collect_process_parent_edges(
         }
     }
     db.release_coherent_scan(&mut lease)?;
-    Ok((source_seq, read_at_unix_ms))
+    yield_report.report(source_seq);
+    Ok((source_seq, read_at_unix_ms, yield_report))
 }
 
+/// The process lane's edge-derivation input contract (#2089).
+///
+/// A parent pid on its own is not evidence of parentage. Windows frees a pid for
+/// reuse once the process object is gone, so a child's recorded parent pid may
+/// name an unrelated process that started later
+/// (`devblogs.microsoft.com/oldnewthing/20150403-00`). The observation written
+/// by the launcher therefore carries the creation times of both processes, and
+/// this reader re-checks the guard rather than trusting the writer:
+///
+/// * `parentage.state` must be `parent_verified`;
+/// * the parent's creation time must be at or before the child's;
+/// * the flat `parent_pid` the graph keys on must equal the observed parent pid.
+///
+/// Rows that carry a bare parent pid with no guard evidence are refused, not
+/// used: an unguarded pid is indistinguishable from a recycled one, and a
+/// fabricated edge is worse than a missing one. Every refusal returns an exact
+/// reason that the lane's yield report counts and prints.
 fn process_parent_edge(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &[u8],
-) -> crate::StorageResult<Option<(u64, u64)>> {
-    let pid = exact_json_u64(object.get("pid"), "pid", key)?;
-    let parent_pid = exact_json_u64(
-        object
-            .get("parent_pid")
-            .or_else(|| object.get("ppid"))
-            .or_else(|| object.get("inherited_from_pid")),
-        "parent_pid|ppid|inherited_from_pid",
+) -> crate::StorageResult<ProcessEdgeDecision> {
+    let Some(pid) = exact_json_u64(object.get("pid"), "pid", key)? else {
+        return Ok(ProcessEdgeDecision::Skip("row_has_no_pid"));
+    };
+    let flat_parent_pid = exact_json_u64(object.get("parent_pid"), "parent_pid", key)?;
+    let Some(parentage) = object.get("parentage") else {
+        let legacy_claim = flat_parent_pid.is_some()
+            || object.contains_key("ppid")
+            || object.contains_key("inherited_from_pid");
+        return Ok(ProcessEdgeDecision::Skip(if legacy_claim {
+            "parent_pid_without_reuse_guard_evidence"
+        } else {
+            "row_carries_no_parentage_observation"
+        }));
+    };
+    let Some(parentage) = parentage.as_object() else {
+        return Err(crate::StorageError::BackendInvalidConfig {
+            value: format!("{key:02x?}"),
+            detail: "CF_PROCESS_HISTORY parentage field is not a JSON object".to_owned(),
+        });
+    };
+    let state = parentage.get("state").and_then(serde_json::Value::as_str);
+    match state {
+        Some("parent_verified") => {}
+        Some("parent_pid_recycled") => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_parent_pid_recycled"));
+        }
+        Some("parent_identity_unavailable") => {
+            return Ok(ProcessEdgeDecision::Skip(
+                "parentage_parent_identity_unavailable",
+            ));
+        }
+        Some("no_parent_recorded") => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_no_parent_recorded"));
+        }
+        Some("child_absent") => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_child_absent"));
+        }
+        Some("snapshot_unavailable") => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_snapshot_unavailable"));
+        }
+        Some("platform_unsupported") => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_platform_unsupported"));
+        }
+        Some(_) => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_state_unrecognized"));
+        }
+        None => {
+            return Ok(ProcessEdgeDecision::Skip("parentage_state_absent"));
+        }
+    }
+    let observed_parent_pid = exact_json_u64(
+        parentage.get("parent_pid_observed"),
+        "parentage.parent_pid_observed",
         key,
     )?;
-    Ok(pid
-        .zip(parent_pid)
-        .map(|(pid, parent_pid)| (parent_pid, pid)))
+    let parent_start = exact_json_u64(
+        parentage.get("parent_start_time_100ns"),
+        "parentage.parent_start_time_100ns",
+        key,
+    )?;
+    let child_start = exact_json_u64(
+        parentage.get("child_start_time_100ns"),
+        "parentage.child_start_time_100ns",
+        key,
+    )?;
+    let (Some(observed_parent_pid), Some(parent_start), Some(child_start)) =
+        (observed_parent_pid, parent_start, child_start)
+    else {
+        return Ok(ProcessEdgeDecision::Skip(
+            "parentage_verified_without_reuse_guard_fields",
+        ));
+    };
+    if parent_start > child_start {
+        return Ok(ProcessEdgeDecision::Skip(
+            "parentage_start_time_guard_violated",
+        ));
+    }
+    let Some(flat_parent_pid) = flat_parent_pid else {
+        return Ok(ProcessEdgeDecision::Skip(
+            "parentage_verified_without_flat_parent_pid",
+        ));
+    };
+    if flat_parent_pid != observed_parent_pid {
+        return Ok(ProcessEdgeDecision::Skip(
+            "parent_pid_disagrees_with_parentage_evidence",
+        ));
+    }
+    Ok(ProcessEdgeDecision::Edge(flat_parent_pid, pid))
 }
 
 fn exact_json_u64(

@@ -1364,6 +1364,26 @@ pub struct StoragePanelCoverageResponse {
     pub anchor_debt_repair: StorageAnchorDebtRepair,
     /// Panels whose constellations outlive their TTL-expiring source rows.
     pub records_exceed_source_panels: Vec<String>,
+    /// **#2093.** Catalog lineage entries the generation allocator attributes to
+    /// a different panel. The catalog is a compile-time constant and the
+    /// allocator's claim was written by the panel that reserved the generation
+    /// while it was active, so a disagreement is a declaration error in the
+    /// catalog rather than a runtime state. Empty is the healthy reading, and
+    /// non-empty is what `syn-graphpos-app-v1` carrying `syn-agent-event-v1`'s
+    /// retired `1665001` looked like for four months.
+    pub catalog_lineage_misattributed: Vec<String>,
+    /// **#2081 ask 4.** Generations the allocator holds live, and how many of
+    /// them the physical `Base` census can see.
+    ///
+    /// The first is always the larger — every catalog generation is reserved at
+    /// vault open whether or not anything has been written at it — so the gap is
+    /// not a finding by itself. `allocator_live_dynamic_without_records` is.
+    pub allocator_live_count: u64,
+    pub census_live_count: u64,
+    /// Dynamic owner claims with no `Base` row behind them: generations a
+    /// publish allocated and never committed, each permanently consuming one of
+    /// the allocator's bounded owner slots (#2081 ask 4).
+    pub allocator_live_dynamic_without_records: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_at_unix_ms: Option<u64>,
 }
@@ -3829,6 +3849,12 @@ pub fn inspect_panel_coverage(
             as u64,
         anchor_debt_repair: anchor_debt_repair_readback(),
         records_exceed_source_panels: report.records_exceed_source_panels.clone(),
+        catalog_lineage_misattributed: report.catalog_lineage_misattributed.clone(),
+        allocator_live_count: report.allocator_live_count as u64,
+        census_live_count: report.census_live_count as u64,
+        allocator_live_dynamic_without_records: report
+            .allocator_live_dynamic_without_records
+            .clone(),
         measured_at_unix_ms: report.measured_at_unix_ms,
     })
 }

@@ -2405,10 +2405,21 @@ fn ensure_base_write_generation_claimed(
 /// which is the other half of the same invariant.
 ///
 /// Superseded versions are deliberately NOT reserved: nothing writes to them,
-/// and one of them (`SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983`, carried in
-/// `syn-graphpos-app-v1`'s lineage) is a *different* panel's retired
-/// generation, so reserving lineage entries by owning panel would manufacture
-/// an ownership conflict out of a correct declaration.
+/// so an ownership claim would guard nothing. Their claims already exist for
+/// every generation that was once active — this function reserved it back when
+/// it was — which is what makes the census's lineage cross-check possible
+/// (#2093).
+///
+/// This comment used to end differently. It named
+/// `SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983` as an example of a lineage entry
+/// that is "a *different* panel's retired generation", carried in
+/// `syn-graphpos-app-v1`'s lineage, and called that "a correct declaration". It
+/// was not: `1_665_001` was `syn-agent-event-v1`'s own generation, misfiled onto
+/// the graph panel by #1983, and the allocator on any vault old enough to hold
+/// it says so — it owns that generation as `builtin:syn-agent-event-v1`. The
+/// anomaly was visible here first and was explained away rather than checked
+/// against the authority sitting one call below. `build_panel_coverage_report`
+/// now performs that check every census instead of leaving it to a reader.
 fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> StorageResult<()> {
     let mut reservations: Vec<(String, u32)> = Vec::new();
     for entry in constellations::builtin_panel_catalog() {
@@ -2558,8 +2569,21 @@ impl pressure::PressureMaintenance for CalyxPressureMaintenance {
 struct CalyxDerivedStateRunner;
 
 impl gc::GcRunner for CalyxDerivedStateRunner {
+    /// Returns the tick's real outcome, so `STORAGE_MAINTENANCE_COMPLETED
+    /// operation="storage_derived_state" is_ok=…` is a measurement (#2088).
+    ///
+    /// This used to discard a `()` and return `Ok(gc::GcReport::default())`
+    /// unconditionally, which made `is_ok` a tautology and left the maintenance
+    /// log and the retry classification dead for this one task while `storage_gc`
+    /// and `storage_checkpoint` used both.
+    ///
+    /// The report stays empty, and is now *honestly* empty: a derived-state tick
+    /// evicts no rows and takes no deletion decision, so it has no CF reports and
+    /// no source census. `gc::mark_gc_tick_completed` no longer manufactures
+    /// zeroed `last_successful_*` CF aggregates from a report that carries none
+    /// (#2088 ask 3) — the same discipline `source_census` already had.
     fn run_once(&self) -> StorageResult<gc::GcReport> {
-        crate::derived_state::run_derived_state_maintenance();
+        crate::derived_state::run_derived_state_maintenance()?;
         Ok(gc::GcReport::default())
     }
 }

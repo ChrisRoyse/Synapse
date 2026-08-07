@@ -526,23 +526,32 @@ fn mark_gc_tick_completed(
             failure_kind.is_some_and(|kind| kind.is_retryable() && attempts >= kind.max_attempts());
         if let Ok(report) = result {
             readback.last_successful_unix_ms = readback.last_completed_unix_ms;
-            readback.last_successful_cf_readback_count =
-                Some(u64::try_from(report.cf_reports.len()).unwrap_or(u64::MAX));
-            readback.last_successful_total_examined_rows = Some(
-                report
-                    .cf_reports
-                    .iter()
-                    .map(|cf| cf.examined_rows)
-                    .fold(0_u64, u64::saturating_add),
-            );
-            readback.last_successful_total_evicted_rows = Some(report.total_evicted_rows());
-            readback.last_successful_after_value_sum = Some(
-                report
-                    .cf_reports
-                    .iter()
-                    .map(|cf| cf.after_value)
-                    .fold(0_u64, u64::saturating_add),
-            );
+            // Only when this pass actually reported on column families (#2088
+            // ask 3). `storage_checkpoint` and `storage_derived_state` sweep no
+            // CF and evict no row, so a zeroed set of aggregates here would be
+            // indistinguishable from a GC pass that examined a corpus and found
+            // nothing — a report describing nothing, published as a measurement.
+            // Left untouched instead, exactly as `source_census` below already
+            // is, so whatever a real pass last measured stays readable.
+            if !report.cf_reports.is_empty() {
+                readback.last_successful_cf_readback_count =
+                    Some(u64::try_from(report.cf_reports.len()).unwrap_or(u64::MAX));
+                readback.last_successful_total_examined_rows = Some(
+                    report
+                        .cf_reports
+                        .iter()
+                        .map(|cf| cf.examined_rows)
+                        .fold(0_u64, u64::saturating_add),
+                );
+                readback.last_successful_total_evicted_rows = Some(report.total_evicted_rows());
+                readback.last_successful_after_value_sum = Some(
+                    report
+                        .cf_reports
+                        .iter()
+                        .map(|cf| cf.after_value)
+                        .fold(0_u64, u64::saturating_add),
+                );
+            }
             // Left untouched when this pass carried no census, so the last real
             // census a GC pass ran is still readable after a checkpoint or
             // derived-state tick reports through the same readback (#2058).
@@ -602,6 +611,29 @@ impl GcFailureKind {
             Self::Terminal => GC_TERMINAL_ERROR,
         }
     }
+}
+
+/// How the maintenance tick loop will treat one failure: the classification it
+/// publishes, whether it retries in place, and how many attempts it allows.
+///
+/// This is the same verdict [`mark_gc_tick_completed`] writes into
+/// [`GcTaskReadback::last_error_classification`], exposed so an operator — or a
+/// manual FSV — can ask it of an error without waiting five minutes for a tick
+/// to publish one. It reads the error's own `code()` and nothing else, so the
+/// answer it gives is the answer the loop gives.
+///
+/// Load-bearing for #2088 ask 2: `storage_derived_state` now returns real
+/// errors, and the decision that a failed derived-state tick is **not** retried
+/// in place is expressed by the error variant it returns rather than by the
+/// absence of an error. This is where that decision is observable.
+#[must_use]
+pub fn maintenance_failure_classification(error: &StorageError) -> (&'static str, bool, u32) {
+    let kind = gc_failure_kind(error);
+    (
+        kind.retrying_classification(),
+        kind.is_retryable(),
+        kind.max_attempts(),
+    )
 }
 
 fn gc_failure_kind(error: &StorageError) -> GcFailureKind {

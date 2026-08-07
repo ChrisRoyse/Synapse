@@ -2764,6 +2764,23 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             superseded_versions: &[1_667_001],
             backfill_source_cf: None,
         },
+        // --- derived-snapshot panels: the declared version is a RESERVATION ---
+        //
+        // #2093. `panel_version` here is the family's reserved *base* generation
+        // and by construction holds **zero** `Base` rows. A derived snapshot is
+        // published under a generation the vault-global allocator mints
+        // (`publish_graph_position_snapshot` -> `allocate_panel_generation`), and
+        // #2062 floored dynamic allocation at
+        // `CALYX_DYNAMIC_PANEL_GENERATION_FLOOR = 3_000_000_000` — far above any
+        // `issue * 1000 + n` built-in constant. So no publish can ever write at
+        // `1_685_00x`, and `active_version_records = 0` on these three rows is
+        // the permanent, correct reading of a reservation, not an empty panel.
+        //
+        // Their live rows are attributed through
+        // `PanelCoverageReport::owned_dynamic_generations`, which is where the
+        // record counts, the live/retired split and the #2062 retirement ledger
+        // for these publishers actually are. Reading `records=0` on this row as
+        // "the publisher produced nothing" is the misreading #2093 was filed on.
         PanelCatalogEntry {
             panel_name: SYN_GRAPHPOS_APP_PANEL_NAME,
             panel_version: SYN_GRAPHPOS_APP_PANEL_VERSION,
@@ -2771,7 +2788,17 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: false,
             source_ttl_managed: false,
             carry_superseded_anchors: true,
-            superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983],
+            // #2093: empty, and it must stay empty. `cd78ac90` (#1983) bumped
+            // `syn-agent-event-v1` off `1_665_001` and appended that retired
+            // generation to *this* entry instead of the agent-event entry
+            // immediately below it in the same file. The census then attributed
+            // 16,650 agent-event rows — 166 of them grounded — to a graph panel
+            // declared `backfill_source_cf: None`, so 59 replayable anchors were
+            // reported permanently `anchor_debt_unbackfillable` and
+            // `panel_coverage` held `health.ok = false` with no reachable repair.
+            // The generation now sits on the panel that wrote it, which has both
+            // a re-measure path and `carry_superseded_anchors`.
+            superseded_versions: &[],
             backfill_source_cf: None,
         },
         PanelCatalogEntry {
@@ -2815,7 +2842,15 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
             outcome_bearing: true,
             source_ttl_managed: false,
             carry_superseded_anchors: true,
-            superseded_versions: &[SYN_AGENT_EVENT_PANEL_VERSION_PRE_1965],
+            // Newest-superseded first, and complete (#2093). `PRE_1983` —
+            // `1_665_001`, the generation #1665 created and #1983 retired — was
+            // missing here and misfiled onto `syn-graphpos-app-v1` above. The
+            // shape now mirrors `syn-agent-transcript-v1`, whose analogous
+            // `PRE_1983` landed on the right entry in the same commit.
+            superseded_versions: &[
+                SYN_AGENT_EVENT_PANEL_VERSION_PRE_1965,
+                SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983,
+            ],
             backfill_source_cf: Some(cf::CF_AGENT_EVENTS),
         },
         PanelCatalogEntry {
