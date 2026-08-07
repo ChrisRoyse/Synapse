@@ -166,7 +166,11 @@ impl VigemBackendInner {
             ButtonAction::Press => {
                 let mut report = report_for_pad(state, pad);
                 push_unique(&mut report.buttons, button);
-                self.send_report(pad, &report, EmissionSite::delivery("pad_button_press_down"))?;
+                self.send_report(
+                    pad,
+                    &report,
+                    EmissionSite::delivery("pad_button_press_down"),
+                )?;
                 apply_pad_button(state, pad, button, ButtonAction::Down);
                 if hold_ms > 0 {
                     std::thread::sleep(Duration::from_millis(u64::from(hold_ms)));

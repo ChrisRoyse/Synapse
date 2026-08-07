@@ -26,8 +26,7 @@ use crate::action_validation::{
     MIN_HELD_OUT_RECORDS,
 };
 use crate::{
-    SynapseCalyxActionValidationEvidence, SynapseCalyxCfWrite, SynapseCalyxError,
-    SynapseCalyxVault,
+    SynapseCalyxActionValidationEvidence, SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault,
 };
 
 const ACTION_DOMAIN: &str = "synapse.action";
@@ -464,10 +463,16 @@ impl SynapseCalyxVault {
                 "guard_training_successes",
                 evidence.guard_training_successes,
             ),
-            ("guard_held_out_successes", evidence.guard_held_out_successes),
+            (
+                "guard_held_out_successes",
+                evidence.guard_held_out_successes,
+            ),
             ("regression_evaluated", evidence.regression_evaluated),
         ];
-        if let Some((name, value)) = floors.iter().find(|(_, value)| *value < MIN_HELD_OUT_RECORDS) {
+        if let Some((name, value)) = floors
+            .iter()
+            .find(|(_, value)| *value < MIN_HELD_OUT_RECORDS)
+        {
             return Err(refuse(
                 log,
                 "evidence_complete",
@@ -776,8 +781,10 @@ fn derive_action_tiers(
         evidence.goodhart.passed,
         evidence.goodhart.violations.len()
     );
-    let goodhart_expected =
-        format!("passed=true violations=0 in_region_frac>={}", calyx_oracle::GOODHART_THRESHOLD);
+    let goodhart_expected = format!(
+        "passed=true violations=0 in_region_frac>={}",
+        calyx_oracle::GOODHART_THRESHOLD
+    );
     if goodhart_passed {
         admit(
             log,

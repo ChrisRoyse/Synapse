@@ -149,7 +149,10 @@ pub(super) fn mouse_drag(
     duration_ms: u32,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
-    send_absolute_mouse_move(from, EmissionSite::delivery("drag_origin_absolute_mouse_move"))?;
+    send_absolute_mouse_move(
+        from,
+        EmissionSite::delivery("drag_origin_absolute_mouse_move"),
+    )?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
     let drag_result = mouse_move_curve(from, to, curve, duration_ms)
         .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));

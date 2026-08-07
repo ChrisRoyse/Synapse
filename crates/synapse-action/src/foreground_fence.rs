@@ -117,8 +117,7 @@ use serde_json::{Value, json};
 use crate::ActionError;
 
 /// Human-readable provenance of every fence decision.
-pub const SOURCE_OF_TRUTH: &str =
-    "GetForegroundWindow + IsWindow + GetWindowThreadProcessId + GetClassNameW read immediately before the OS emission call";
+pub const SOURCE_OF_TRUTH: &str = "GetForegroundWindow + IsWindow + GetWindowThreadProcessId + GetClassNameW read immediately before the OS emission call";
 
 /// The exact window that global input is currently bound to.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -9151,7 +9151,11 @@ where
         let page = vault
             .scan_kv_range_page_latest(range, cursor.as_deref(), CALYX_INSPECT_SWEEP_PAGE_ROWS)
             .map_err(|source| {
-                calyx_read_failed(cf_name, "scan bounded-hold Calyx KV inspection page", &source)
+                calyx_read_failed(
+                    cf_name,
+                    "scan bounded-hold Calyx KV inspection page",
+                    &source,
+                )
             })?;
         if sweep.pages == 0 {
             sweep.snapshot_seq_first = page.snapshot_seq;

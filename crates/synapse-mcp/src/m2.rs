@@ -1242,10 +1242,7 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
         ActionError::ForegroundEmissionRefused { detail, drift } => {
             let mut data = drift.to_json();
             if let Value::Object(map) = &mut data {
-                map.insert(
-                    "code".to_owned(),
-                    Value::String(error.code().to_owned()),
-                );
+                map.insert("code".to_owned(), Value::String(error.code().to_owned()));
                 map.insert("detail".to_owned(), Value::String(detail.clone()));
                 map.insert(
                     "resolution".to_owned(),
