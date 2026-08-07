@@ -164,6 +164,8 @@ The assembler produces a `synapse_core::Observation` (fields populated here):
 
 `ObservationInput::new` defaults: `a11y_status` and `capture_status` = `Unavailable`; `detection_status` and `audio_status` = `Disabled`.
 
+`SensorStatus::NotConfigured { reason_code, detail }` (#2054): the producer stage ran but did no work because the active configuration asked for none. `detection_status` takes it whenever the perception mode admits detection (`PixelOnly`/`Hybrid`) but the active profile declares no `[detection].model_id` or `max_detections=0`, with `reason_code = DETECTION_NOT_CONFIGURED`. `Healthy` on `detection_status` therefore means exactly one thing: a model completed inference for this observation, and `sensor_latency_ms["detection"]` is present. `NotConfigured` is not an available sensor for `ensure_any_sensor_available`, and it is not `sensor_source_unavailable` for reality audits.
+
 ---
 
 ## 3. OCR (`ocr.rs`)

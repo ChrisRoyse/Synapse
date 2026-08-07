@@ -465,6 +465,22 @@ pub enum SensorStatus {
     DegradedSensorFailed {
         reason_code: String,
     },
+    /// The producer stage was reached and completed, but performed no work
+    /// because the active configuration never asked it to (#2054).
+    ///
+    /// This exists so `Healthy` can mean exactly one thing: this sensor
+    /// produced a reading for this observation. It is distinct from `Disabled`
+    /// (the perception mode switched the producer off outright) and from
+    /// `Unavailable` (the producer was wanted but could not be reached).
+    /// Conflating "no inference was requested" with "inference completed" let
+    /// a health/FSV reader claim neural perception ran when it never did.
+    ///
+    /// `reason_code` is machine-readable; `detail` names the exact
+    /// configuration that would turn the producer on.
+    NotConfigured {
+        reason_code: String,
+        detail: String,
+    },
     Disabled,
     #[default]
     Unavailable,

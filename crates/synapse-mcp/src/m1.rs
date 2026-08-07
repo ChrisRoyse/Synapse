@@ -1,6 +1,6 @@
 mod detection;
 pub(crate) use detection::{
-    detection_health_readback, run_detection_worker_from_cli,
+    detection_bundle_readback, run_detection_worker_from_cli,
     run_detection_worker_from_process_args,
 };
 mod ocr;
@@ -23,8 +23,8 @@ use synapse_core::{
 };
 use synapse_perception::{ObservationInput, ObserveInclude, parse_perception_mode};
 
-pub use detection::populate_detection_from_state;
 use detection::{DetectionRuntime, DetectionRuntimeConfig, default_detection_config};
+pub use detection::{detection_inference_gate, populate_detection_from_state};
 #[cfg(windows)]
 pub use ocr::ocr_result_from_web_bitmap;
 pub use ocr::{
@@ -56,6 +56,15 @@ pub struct M1State {
     pub perception_mode: PerceptionMode,
     pub manual_perception_mode: Option<PerceptionMode>,
     pub detection_config: DetectionRuntimeConfig,
+    /// Where `detection_config` came from and when it took effect (#2054).
+    ///
+    /// Health has to answer "since when has detection been off", and the only
+    /// honest answer is the moment this config was installed: either daemon
+    /// start with the built-in default (no detector), or the profile apply
+    /// that replaced it. Recorded here rather than inferred so the health
+    /// payload never dates a configuration it cannot prove.
+    pub detection_config_source: String,
+    pub detection_config_applied_unix_ms: u64,
     pub detection_runtime: Option<DetectionRuntime>,
     pub synthetic: Option<ObservationInput>,
     pub force_no_perception: bool,
@@ -90,6 +99,8 @@ impl M1State {
             perception_mode: PerceptionMode::Auto,
             manual_perception_mode: None,
             detection_config: default_detection_config(),
+            detection_config_source: "daemon_default:no_profile_applied".to_owned(),
+            detection_config_applied_unix_ms: unix_ms_now(),
             detection_runtime: Some(DetectionRuntime::default()),
             synthetic,
             force_no_perception,
@@ -4747,7 +4758,14 @@ pub fn apply_profile_runtime_config_in_state(
     if state.manual_perception_mode.is_none() {
         state.perception_mode = profile.mode;
     }
-    state.detection_config = detection_config_from_profile(&profile.detection);
+    let detection_config = detection_config_from_profile(&profile.detection);
+    if detection_config != state.detection_config
+        || state.detection_config_source == "daemon_default:no_profile_applied"
+    {
+        state.detection_config_applied_unix_ms = unix_ms_now();
+    }
+    state.detection_config_source = format!("profile:{}", profile.id);
+    state.detection_config = detection_config;
 
     let mut config = state.capture_config.clone();
     config.min_update_interval_ms = u64::from(
@@ -4799,6 +4817,19 @@ pub fn set_perception_mode_in_state(
 
 fn detection_config_from_profile(profile: &ProfileDetection) -> DetectionRuntimeConfig {
     DetectionRuntimeConfig::from_profile(profile)
+}
+
+/// Wall-clock milliseconds since the Unix epoch, for stamping when a runtime
+/// configuration took effect. A host clock before the epoch is not a reason to
+/// fail perception, so it stamps 0 rather than panicking.
+fn unix_ms_now() -> u64 {
+    u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
 }
 
 pub fn mcp_error(code: &'static str, message: impl Into<String>) -> ErrorData {

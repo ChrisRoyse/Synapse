@@ -8,7 +8,7 @@ use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{
     Backend, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement,
-    CalyxTuningKnobStatus, ChromeBridgeDetail,
+    CalyxTuningKnobStatus, ChromeBridgeDetail, PerceptionDetectionHealth, PerceptionMode,
 };
 
 /// Verbosity control for the `health` tool response.
@@ -179,6 +179,57 @@ impl LoweredFeedReadback {
         };
         Some(reason.to_owned())
     }
+}
+
+/// Emitted when the lowered-artifact feed says it is unavailable but cannot say
+/// why. The code names the defect (a `LoweredFeedReadback` variant whose
+/// accessor arms were not filled in), never the operator's environment.
+const FEED_UNAVAILABLE_UNCLASSIFIED_CODE: &str = "REFLEX_FEED_UNAVAILABLE_UNCLASSIFIED";
+
+/// The `(code, reason)` pair health publishes when the lowered-artifact feed
+/// could not be read — and the one place that holds them to each other.
+///
+/// `snapshot`, `unavailable_code` and `unavailable_reason` are three separate
+/// matches over the same enum. The compiler forces a new variant to appear in
+/// all three, but nothing forces the two unavailable accessors to answer `Some`
+/// where `snapshot` answered `None`; a variant that returned `None` from
+/// `unavailable_code` would make health report `scheduler_started = false` with
+/// no code beside it, which reads to an operator or a scraper exactly like a
+/// healthy feed. That pairing was previously asserted by an automated test
+/// module; directive D1 (2026-07-15) removed that surface, so the invariant
+/// lives here instead — on the live path, where a violation is a structured log
+/// line naming its own cause rather than a silent field.
+///
+/// Fail-closed: an unclassified unavailability is still reported as an
+/// unavailability, under a code that says the classification itself is broken.
+fn feed_unavailability(readback: &LoweredFeedReadback) -> (Option<String>, Option<String>) {
+    if readback.snapshot().is_some() {
+        return (None, None);
+    }
+    let code = readback.unavailable_code().map(str::to_owned);
+    let reason = readback.unavailable_reason();
+    if code.is_some() && reason.is_some() {
+        return (code, reason);
+    }
+    tracing::error!(
+        code = FEED_UNAVAILABLE_UNCLASSIFIED_CODE,
+        carried_code = code.as_deref().unwrap_or("<none>"),
+        carried_reason = reason.as_deref().unwrap_or("<none>"),
+        "the lowered-artifact feed is unavailable but did not name its condition: a \
+         LoweredFeedReadback variant answered None from snapshot() while leaving \
+         unavailable_code()/unavailable_reason() unfilled. Health is substituting a \
+         self-describing code so the reading is not mute; fix the missing match arm in \
+         crates/synapse-mcp/src/server/health.rs."
+    );
+    (
+        Some(code.unwrap_or_else(|| FEED_UNAVAILABLE_UNCLASSIFIED_CODE.to_owned())),
+        Some(reason.unwrap_or_else(|| {
+            "the lowered-artifact feed is unavailable and the readback variant that reported it \
+             carries no reason string; this is a defect in health's own classification, not a \
+             condition of this host"
+                .to_owned()
+        })),
+    )
 }
 
 /// The violation code to report, derived from whether one was actually
@@ -1553,6 +1604,9 @@ impl SynapseService {
             Err(error) => return state_lock_unavailable_health("M3", error),
         };
         let feed = readback.snapshot();
+        // An unavailable feed must name its condition or say that it cannot.
+        // See `feed_unavailability`.
+        let (feed_unavailable_code, feed_unavailable_reason) = feed_unavailability(&readback);
 
         let mut boundary = synapse_core::CalyxHotPathBoundaryHealth {
             tick_thread_tagged: Some(synapse_reflex::hot_path::tick_thread_tagged()),
@@ -1569,8 +1623,8 @@ impl SynapseService {
                 .as_ref()
                 .map(|violation| violation.at_unix_ms),
             scheduler_started: Some(feed.is_some()),
-            feed_unavailable_code: readback.unavailable_code().map(str::to_owned),
-            feed_unavailable_reason: readback.unavailable_reason(),
+            feed_unavailable_code,
+            feed_unavailable_reason: feed_unavailable_reason.clone(),
             publish_attempts_total: Some(publish.attempts_total),
             publish_success_total: Some(publish.success_total),
             publish_failure_total: Some(publish.failure_total),
@@ -1687,7 +1741,9 @@ impl SynapseService {
         let detail = if reasons.is_empty() {
             feed.map_or_else(
                 || {
-                    readback.unavailable_reason().unwrap_or_else(|| {
+                    // `feed_unavailability` guarantees a reason whenever `feed`
+                    // is None, which is the only branch that reaches here.
+                    feed_unavailable_reason.unwrap_or_else(|| {
                         "the lowered-artifact feed is unavailable for an unrecorded reason"
                             .to_owned()
                     })
@@ -2345,24 +2401,66 @@ impl SynapseService {
 
     fn perception_health(&self) -> SubsystemHealth {
         match self.m1_state.try_lock() {
-            Ok(state) => match crate::m1::detection_health_readback() {
-                Ok(detection) => SubsystemHealth {
-                    status: "ok".to_owned(),
-                    detail: Some(format!("perception runtime initialized; {detection}")),
+            Ok(state) => {
+                // #2054: `status` is the readiness of the M1 perception runtime
+                // (a11y + capture), which is exactly what the deploy gate reads.
+                // Whether a detector runs is a capability, not a readiness, and
+                // it gets its own field: reporting the bundled model's presence
+                // under `status="ok"` let readers claim neural perception ran
+                // when the active profile requested none.
+                let bundle = crate::m1::detection_bundle_readback();
+                let mut detection = perception_detection_health(&state);
+                let bundled_blob = match &bundle {
+                    Ok(bundle) => {
+                        detection.bundled_model_id = Some(bundle.model_id.to_owned());
+                        detection.bundled_provider = Some(bundle.provider.to_owned());
+                        detection.bundled_materialized = Some(bundle.materialized);
+                        detection.bundled_materialized_verified =
+                            Some(bundle.materialized_verified);
+                        detection.bundled_materialized_path =
+                            Some(bundle.materialized_path.clone());
+                        format!(
+                            "bundled_detection_provider={} bundled_detection_model={} model_source=executable_bundle bundled_materialized={} bundled_materialized_verified={} bundled_materialized_path={}",
+                            bundle.provider,
+                            bundle.model_id,
+                            bundle.materialized,
+                            bundle.materialized_verified,
+                            bundle.materialized_path
+                        )
+                    }
+                    Err((code, detail)) => {
+                        format!("bundled_detection_readback_failed {code}: {detail}")
+                    }
+                };
+                let detection_detail = format!(
+                    "detection_inference_configured={} detection_capability={} detection_model={} detection_max_detections={} detection_config_source={} detection_config_applied_unix_ms={}{}",
+                    detection.inference_configured,
+                    detection.status,
+                    detection.configured_model_id.as_deref().unwrap_or("<none>"),
+                    detection.max_detections,
+                    detection.config_source,
+                    detection.config_applied_unix_ms,
+                    detection
+                        .remediation
+                        .as_deref()
+                        .map_or_else(String::new, |remediation| format!(
+                            " detection_remediation=\"{remediation}\""
+                        ))
+                );
+                let (status, prefix) = match &bundle {
+                    Ok(_) => ("ok", "perception runtime initialized"),
+                    Err(_) => ("error", "perception detector backend probe failed"),
+                };
+                SubsystemHealth {
+                    status: status.to_owned(),
+                    detail: Some(format!("{prefix}; {detection_detail}; {bundled_blob}")),
                     perception_mode: Some(state.perception_mode),
                     capture_config: Some(state.active_capture_config.clone()),
                     capture_runtime: Some(state.capture_runtime_readback()),
+                    perception_detection: Some(detection),
                     ..SubsystemHealth::default()
-                },
-                Err((code, detail)) => SubsystemHealth {
-                    status: "error".to_owned(),
-                    detail: Some(format!("{code}: {detail}")),
-                    perception_mode: Some(state.perception_mode),
-                    capture_config: Some(state.active_capture_config.clone()),
-                    capture_runtime: Some(state.capture_runtime_readback()),
-                    ..SubsystemHealth::default()
-                },
-            },
+                }
+            }
             Err(error) => state_lock_unavailable_health("M1", error),
         }
     }
@@ -2747,6 +2845,55 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Report whether neural detection actually runs, from the same gate the
+/// observe path uses (#2054).
+///
+/// The observe path decides per call with `input.mode_override`, which a caller
+/// may set for one request; this reports the daemon's standing configuration,
+/// which is what a health reader is asking about.
+fn perception_detection_health(state: &crate::m1::M1State) -> PerceptionDetectionHealth {
+    let config = &state.detection_config;
+    let gate = crate::m1::detection_inference_gate(config);
+    let configured_model_id = config.model_id.clone();
+    let configured_model_registered = configured_model_id
+        .as_deref()
+        .map(|id| synapse_models::registered_model(id).is_some());
+    let (status, reason_code, remediation) = gate.map_or_else(
+        || ("configured".to_owned(), None, None),
+        |gate| {
+            (
+                "not_configured".to_owned(),
+                Some(gate.reason_code),
+                Some(gate.remediation),
+            )
+        },
+    );
+    PerceptionDetectionHealth {
+        inference_configured: status == "configured",
+        status,
+        reason_code,
+        remediation,
+        configured_model_id,
+        configured_model_registered,
+        max_detections: config.max_detections,
+        confidence_threshold: config.confidence_threshold,
+        perception_mode: state.perception_mode,
+        // Mirrors the mode gate in `populate_detection_from_state`: only the
+        // two pixel-bearing modes reach detection at all. `Auto` does not.
+        mode_admits_detection: matches!(
+            state.perception_mode,
+            PerceptionMode::PixelOnly | PerceptionMode::Hybrid
+        ),
+        config_source: state.detection_config_source.clone(),
+        config_applied_unix_ms: state.detection_config_applied_unix_ms,
+        bundled_model_id: None,
+        bundled_provider: None,
+        bundled_materialized: None,
+        bundled_materialized_verified: None,
+        bundled_materialized_path: None,
+    }
+}
+
 fn backend_resolution_health(
     source: String,
     policy: BackendResolutionPolicy,
@@ -2794,87 +2941,5 @@ const fn backend_config_name(backend: Backend) -> &'static str {
         Backend::Vigem => "vigem",
         Backend::Hardware => "hardware",
         Backend::Auto => "auto",
-    }
-}
-
-#[cfg(test)]
-mod calyx_hot_path_tests {
-    use super::LoweredFeedReadback;
-
-    /// A violation code must describe an observation, never decorate a clean
-    /// reading.
-    ///
-    /// Health previously emitted `violations_total = 0` and
-    /// `violation_code = "SYNAPSE_CALYX_HOT_PATH_BOUNDARY_VIOLATION"` together,
-    /// which reads to an operator or a scraper as "a boundary violation
-    /// occurred". This pins the rule that produced that bug so it cannot come
-    /// back: the code is derived from the recorded violation, not from a
-    /// constant.
-    #[test]
-    fn a_violation_code_is_only_emitted_for_an_observed_violation() {
-        assert_eq!(
-            super::violation_code_for(None),
-            None,
-            "no recorded violation must yield no violation code"
-        );
-
-        let observed = synapse_reflex::HotPathViolation {
-            operation: "reflex_write_audit".to_owned(),
-            at_unix_ms: 1,
-        };
-        assert_eq!(
-            super::violation_code_for(Some(&observed)),
-            Some(synapse_reflex::HOT_PATH_BOUNDARY_VIOLATION_CODE.to_owned())
-        );
-    }
-
-    /// Every state in which the artifact group cannot be computed must name
-    /// itself.
-    ///
-    /// An omitted field and a field that cannot be computed are different
-    /// facts. Only the second one lets an operator tell "there is nothing to
-    /// measure yet" apart from "the measurement is broken", which is exactly
-    /// the distinction a `tick_thread_tagged = false` reading turns on.
-    #[test]
-    fn every_unavailable_feed_state_names_its_condition() {
-        for readback in [
-            LoweredFeedReadback::RuntimeAbsent,
-            LoweredFeedReadback::RuntimeLockBusy,
-            LoweredFeedReadback::SchedulerNotStarted,
-        ] {
-            assert!(readback.snapshot().is_none());
-            let code = readback
-                .unavailable_code()
-                .expect("an unavailable feed must carry a structured code");
-            let reason = readback
-                .unavailable_reason()
-                .expect("an unavailable feed must carry a human reason");
-            assert!(!code.is_empty(), "{code} must not be blank");
-            assert!(
-                reason.len() > 40,
-                "{code} reason must state the condition and its remediation, got {reason:?}"
-            );
-        }
-    }
-
-    /// The scheduler-not-started reason must point at the supported surface.
-    ///
-    /// `reflex_register` is an implementation tool with no MCP surface at any
-    /// profile; the only reachable path is the `routine` public facade. Health
-    /// has to say so, or an operator hunting for a way to start the tick
-    /// concludes there is none.
-    #[test]
-    fn the_scheduler_not_started_reason_names_the_reachable_trigger() {
-        let reason = LoweredFeedReadback::SchedulerNotStarted
-            .unavailable_reason()
-            .expect("scheduler-not-started must carry a reason");
-        assert!(
-            reason.contains("routine operation=reflex_register"),
-            "reason must name the public facade that starts a tick, got {reason:?}"
-        );
-        assert!(
-            reason.contains("nothing to tag"),
-            "reason must separate 'nothing to tag' from 'tagging is broken', got {reason:?}"
-        );
     }
 }

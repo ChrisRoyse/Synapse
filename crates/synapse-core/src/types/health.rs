@@ -795,6 +795,10 @@ pub struct SubsystemHealth {
     pub capture_config: Option<ObservationCaptureConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capture_runtime: Option<CaptureRuntimeReadback>,
+    /// Whether neural detection actually runs (#2054). `None` for every
+    /// subsystem except `perception`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perception_detection: Option<PerceptionDetectionHealth>,
     /// Structured `chrome_bridge` verdict. `None` for every subsystem except
     /// `chrome_bridge`; the MCP health builder populates it so the bridge
     /// readiness is machine-readable instead of a single concatenated
@@ -820,6 +824,75 @@ pub struct SubsystemHealth {
     /// readable on demand.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_writer: Option<UsageWriterHealth>,
+}
+
+/// Whether neural detection actually runs on this daemon right now (#2054).
+///
+/// The perception subsystem used to report `status="ok"` with a
+/// `detection_model=...` blob describing the detector the *executable bundles*,
+/// regardless of whether the active profile asked for any inference. A profile
+/// with no `[detection]` section performed no model inference at all and was
+/// indistinguishable from one whose detector runs on every observe.
+///
+/// Capability is therefore reported separately from subsystem readiness, the
+/// same split inference servers draw between "server ready" and "model ready":
+/// `perception.status` stays the readiness of the M1 runtime, and this struct
+/// is the only authority on whether a detector runs. It is a typed field rather
+/// than prose in `detail` because compact health responses (the default) drop
+/// `detail` entirely, and a capability that is only visible in `detail=full` is
+/// not visible on demand.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PerceptionDetectionHealth {
+    /// True only when the active profile names a detector *and* allows more
+    /// than zero detections, i.e. an observe in a pixel-bearing perception mode
+    /// runs real model inference. False means no inference happens, ever, until
+    /// the configuration changes.
+    pub inference_configured: bool,
+    /// `configured` | `not_configured`. Deliberately never `ok`/`healthy`: the
+    /// word this field exists to stop being reused is the one that hid the gap.
+    pub status: String,
+    /// Machine-readable cause, present exactly when `inference_configured` is
+    /// false. `DETECTION_NOT_CONFIGURED` for a profile that asks for no detector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+    /// The exact configuration change that would turn inference on, present
+    /// exactly when `inference_configured` is false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+    /// Detector id the active profile names, `None` when it names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_model_id: Option<String>,
+    /// True when `configured_model_id` resolves in the model registry. `None`
+    /// when the profile names no model. `Some(false)` is a fail-loud
+    /// misconfiguration: every observe in a pixel-bearing mode will error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_model_registered: Option<bool>,
+    pub max_detections: u32,
+    pub confidence_threshold: f32,
+    /// Perception mode in force. Detection inference is only reached in
+    /// `PixelOnly` and `Hybrid`; the other modes disable the producer outright.
+    pub perception_mode: PerceptionMode,
+    /// True when `perception_mode` admits detection at all.
+    pub mode_admits_detection: bool,
+    /// Where the effective detection configuration came from
+    /// (`daemon_default:no_profile_applied` or `profile:<id>`).
+    pub config_source: String,
+    /// When that configuration took effect — the honest answer to "since when
+    /// has detection been off". Daemon start for the built-in default.
+    pub config_applied_unix_ms: u64,
+    /// Detector the executable bundles, which is what *could* be loaded. Named
+    /// `bundled_` throughout because it is not evidence that anything runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_materialized: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_materialized_verified: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundled_materialized_path: Option<String>,
 }
 
 /// Grounded-usage writer state (#1936).

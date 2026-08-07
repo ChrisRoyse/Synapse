@@ -50,6 +50,67 @@ impl Default for DetectionRuntimeConfig {
     }
 }
 
+/// Why the detection stage will perform no model inference (#2054).
+///
+/// Carried onto `diagnostics.detection_status` as
+/// `SensorStatus::NotConfigured` and into `health.subsystems.perception`, so
+/// both surfaces name the same cause with the same remediation instead of
+/// holding two independent opinions about whether a detector runs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectionNotConfigured {
+    pub reason_code: String,
+    pub detail: String,
+    pub remediation: String,
+}
+
+/// Decides whether the configured detector would actually run inference.
+///
+/// Pure over [`DetectionRuntimeConfig`]: `None` means an observe in a
+/// pixel-bearing perception mode performs real model inference, `Some` names
+/// every reason it performs none. Both the observe path and the `health` tool
+/// call this, so a health reader and an observation can never disagree.
+#[must_use]
+pub fn detection_inference_gate(config: &DetectionRuntimeConfig) -> Option<DetectionNotConfigured> {
+    let mut causes = Vec::new();
+    if config.model_id.is_none() {
+        causes.push("the active profile declares no [detection].model_id");
+    }
+    if config.max_detections == 0 {
+        causes.push("the active profile declares [detection].max_detections=0");
+    }
+    if causes.is_empty() {
+        return None;
+    }
+    let remediation = format!(
+        "set [detection].model_id to a registered detector ({}) and [detection].max_detections>0 in the active profile, then re-apply the profile",
+        registered_detection_model_ids().join(" | ")
+    );
+    Some(DetectionNotConfigured {
+        reason_code: error_codes::DETECTION_NOT_CONFIGURED.to_owned(),
+        detail: format!(
+            "no detector inference ran: {}; effective detection config model_id={} max_detections={} confidence_threshold={}",
+            causes.join(" and "),
+            config.model_id.as_deref().unwrap_or("<none>"),
+            config.max_detections,
+            config.confidence_threshold
+        ),
+        remediation,
+    })
+}
+
+/// Registered detector ids an operator may name in `[detection].model_id`.
+///
+/// Read from the model registry rather than hard-coded so the remediation text
+/// can never advertise an id the daemon would reject.
+#[must_use]
+pub fn registered_detection_model_ids() -> Vec<&'static str> {
+    synapse_models::REGISTERED_MODELS
+        .iter()
+        .filter(|model| !model.class_map.is_empty())
+        .map(|model| model.id)
+        .collect()
+}
+
 #[derive(Debug, Default)]
 pub struct DetectionRuntime {
     tracker: EntityTracker,
@@ -290,7 +351,23 @@ fn selected_detection_backend() -> Result<ModelBackend, (String, String)> {
     }
 }
 
-pub(crate) fn detection_health_readback() -> Result<String, (String, String)> {
+/// Materialization state of the detector the executable bundles.
+///
+/// #2054: this describes what the daemon *could* load, not what the active
+/// profile asks it to run. The two were reported as one `detection_model=...`
+/// blob, which read as proof that a detector runs on every observe. Every
+/// field here is now named `bundled_*` on the wire and paired with the active
+/// profile's [`detection_inference_gate`] verdict.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectionBundleReadback {
+    pub provider: &'static str,
+    pub model_id: &'static str,
+    pub materialized: bool,
+    pub materialized_verified: bool,
+    pub materialized_path: String,
+}
+
+pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (String, String)> {
     let backend = selected_detection_backend()?;
     let model = if backend == ModelBackend::Cpu {
         lightweight_cpu_detection_model()
@@ -302,18 +379,17 @@ pub(crate) fn detection_health_readback() -> Result<String, (String, String)> {
     let materialized = descriptor.path.exists();
     let materialized_verified =
         materialized && sha256_file(&descriptor.path).ok().as_deref() == Some(expected.as_str());
-    Ok(format!(
-        "detection_provider={} detection_model={} model_source=executable_bundle materialized={} materialized_verified={} materialized_path={}",
-        match backend {
+    Ok(DetectionBundleReadback {
+        provider: match backend {
             ModelBackend::Cuda => "cuda",
             ModelBackend::Cpu => "cpu",
             ModelBackend::DirectMl => "directml",
         },
-        model.id,
+        model_id: model.id,
         materialized,
         materialized_verified,
-        descriptor.path.display()
-    ))
+        materialized_path: descriptor.path.display().to_string(),
+    })
 }
 
 #[cfg(windows)]
@@ -553,8 +629,27 @@ pub fn populate_detection_from_state(
     // GPU inference is profile-opt-in. A numeric default must never silently
     // load the default ORT model for an ordinary productivity profile: the
     // profile must name the exact model whose resource envelope was reviewed.
-    if config.model_id.is_none() || config.max_detections == 0 {
-        input.detection_status = SensorStatus::Healthy;
+    //
+    // #2054: opting out is legitimate, but it is not health. This branch used
+    // to report `SensorStatus::Healthy` without loading a model, capturing a
+    // frame, or running a single inference, which made a profile whose
+    // detector never runs indistinguishable from one whose detector completed
+    // inference. The status now names the exact cause, and no `detection`
+    // latency is recorded because no detection work was timed.
+    if let Some(not_configured) = detection_inference_gate(config) {
+        tracing::warn!(
+            code = error_codes::DETECTION_NOT_CONFIGURED,
+            mode = ?mode,
+            model_id = ?config.model_id,
+            max_detections = config.max_detections,
+            confidence_threshold = config.confidence_threshold,
+            remediation = %not_configured.remediation,
+            "detection stage ran no model inference: the active profile configures no detector"
+        );
+        input.detection_status = SensorStatus::NotConfigured {
+            reason_code: not_configured.reason_code,
+            detail: format!("{}; {}", not_configured.detail, not_configured.remediation),
+        };
         return Ok(());
     }
 

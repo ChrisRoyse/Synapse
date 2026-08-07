@@ -43,6 +43,14 @@ pub const A11Y_TARGET_WINDOW_MINIMIZED_UIA_UNAVAILABLE: &str =
 pub const DETECTION_MODEL_NOT_LOADED: &str = "DETECTION_MODEL_NOT_LOADED";
 pub const DETECTION_MODEL_INFER_FAILED: &str = "DETECTION_MODEL_INFER_FAILED";
 pub const DETECTION_NO_FRAME: &str = "DETECTION_NO_FRAME";
+/// The active profile asks for no detector inference at all (#2054).
+///
+/// Not a tool error: detection is profile-opt-in, so a profile with no
+/// `[detection]` model is a legitimate configuration. It is the `reason_code`
+/// carried by `SensorStatus::NotConfigured` on `diagnostics.detection_status`,
+/// and the `reason_code` of `health.subsystems.perception.perception_detection`,
+/// so neither surface can report a detector that never ran as `healthy`/`ok`.
+pub const DETECTION_NOT_CONFIGURED: &str = "DETECTION_NOT_CONFIGURED";
 pub const OCR_NO_TEXT: &str = "OCR_NO_TEXT";
 pub const OCR_BACKEND_UNAVAILABLE: &str = "OCR_BACKEND_UNAVAILABLE";
 /// Bound-tab OCR refused because the window renders a different tab (#1823).

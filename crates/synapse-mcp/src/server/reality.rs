@@ -3266,6 +3266,11 @@ fn sensor_status_name(status: &synapse_core::SensorStatus) -> String {
     match status {
         synapse_core::SensorStatus::Healthy => "healthy".to_owned(),
         synapse_core::SensorStatus::DegradedLatency { .. } => "degraded_latency".to_owned(),
+        // #2054: a producer that ran no work is named, not folded into
+        // "healthy". The reason code rides along so a reality reader sees why.
+        synapse_core::SensorStatus::NotConfigured { reason_code, .. } => {
+            format!("not_configured:{reason_code}")
+        }
         synapse_core::SensorStatus::DegradedSensorFailed { reason_code } => {
             format!("degraded_sensor_failed:{reason_code}")
         }
