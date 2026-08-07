@@ -261,7 +261,7 @@ fn default_qwen3_dtype() -> String {
 }
 
 pub const fn default_qwen3_max_tokens() -> usize {
-    crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS
+    crate::runtime::common::DEFAULT_QWEN3_MAX_TOKENS
 }
 
 fn is_default_qwen3_max_tokens(value: &usize) -> bool {

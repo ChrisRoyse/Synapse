@@ -1,26 +1,40 @@
-use std::fs::{self, File};
+#[cfg(feature = "embedding-runtimes")]
+use std::fs;
+use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "embedding-runtimes")]
+use std::path::PathBuf;
 
 use calyx_core::{CalyxError, Modality, Result, SlotShape};
+#[cfg(feature = "embedding-runtimes")]
 use serde_json::Value;
 
+#[cfg(feature = "embedding-runtimes")]
 mod fastembed_contract;
 
+#[cfg(feature = "embedding-runtimes")]
 use fastembed_contract::{
     fastembed_bgem3_contract, fastembed_reranker_contract, fastembed_sparse_contract,
 };
 
+#[cfg(feature = "embedding-runtimes")]
+use crate::Qwen3ModelFiles;
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
+#[cfg(feature = "embedding-runtimes")]
 use crate::runtime::candle::{self, CandlePoolingPolicy, CandlePrecision};
+#[cfg(feature = "embedding-runtimes")]
 use crate::runtime::common::DEFAULT_MAX_TOKENS;
+#[cfg(feature = "embedding-runtimes")]
 use crate::runtime::onnx::{custom_contract_corpus_hash, custom_pooling_from_config};
-use crate::{
-    AlgorithmicEncoder, AlgorithmicLens, LensRuntime, LensSpec, MultimodalAdapterLens,
-    Qwen3ModelFiles,
-};
+use crate::{AlgorithmicEncoder, AlgorithmicLens, LensRuntime, LensSpec, MultimodalAdapterLens};
 
+#[cfg(not(feature = "embedding-runtimes"))]
+use super::embedding_runtime_not_compiled;
+
+#[cfg(feature = "embedding-runtimes")]
 const DEFAULT_COLBERT_ONNX: &str = "onnx/model_fp16.onnx";
+#[cfg(feature = "embedding-runtimes")]
 const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
 const STATIC_LOOKUP_MAGIC: &[u8; 8] = b"CXLKUP1\0";
 const STATIC_LOOKUP_HEADER_LEN: usize = 24;
@@ -36,28 +50,35 @@ pub fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensCo
         LensRuntime::Algorithmic { kind } => algorithmic_contract(spec, kind),
         LensRuntime::TeiHttp { endpoint } => tei_contract(spec, endpoint),
         LensRuntime::ExternalCmd { cmd, args } => external_contract(spec, cmd, args),
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::CandleLocal {
             model_id,
             files,
             dtype,
             pooling,
         } => candle_contract(spec, model_id, files, dtype, pooling),
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::Onnx { model_id, files } => onnx_contract(spec, model_id, files),
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::OnnxColbert { model_id, files } => {
             onnx_colbert_contract(spec, model_id, files)
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedSparse { model_id, files } => {
             fastembed_sparse_contract(spec, model_id, files)
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedBgem3 {
             model_id,
             files,
             output,
             engine,
         } => fastembed_bgem3_contract(spec, model_id, files, *output, *engine),
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedReranker { model_id, files } => {
             fastembed_reranker_contract(spec, model_id, files)
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedQwen3 {
             model_id,
             files,
@@ -72,6 +93,14 @@ pub fn derive_runtime_contract_from_spec(spec: &LensSpec) -> Result<FrozenLensCo
         LensRuntime::MultimodalAdapter { .. } => {
             Ok(MultimodalAdapterLens::from_lens_spec(spec)?.contract())
         }
+        #[cfg(not(feature = "embedding-runtimes"))]
+        LensRuntime::CandleLocal { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedQwen3 { .. } => Err(embedding_runtime_not_compiled(spec)),
     }
 }
 
@@ -364,6 +393,7 @@ fn external_contract(spec: &LensSpec, cmd: &str, args: &[String]) -> Result<Froz
     ))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn candle_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -405,6 +435,7 @@ fn candle_contract(
     ))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<FrozenLensContract> {
     let [_model, _tokenizer, config, ..] = files else {
         return Err(lens_config_invalid(
@@ -431,6 +462,7 @@ fn onnx_contract(spec: &LensSpec, model_id: &str, files: &[PathBuf]) -> Result<F
     ))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn onnx_colbert_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -460,6 +492,7 @@ fn onnx_colbert_contract(
     ))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn qwen3_contract(
     spec: &LensSpec,
     model_id: &str,
@@ -577,6 +610,7 @@ fn static_lookup_header(path: &Path) -> Result<(u32, &'static str)> {
     Ok((dim, dtype))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn dense_hidden_size(path: &Path, label: &str) -> Result<u32> {
     let value = read_json(path, label)?;
     let hidden = value
@@ -586,6 +620,7 @@ fn dense_hidden_size(path: &Path, label: &str) -> Result<u32> {
     u32::try_from(hidden).map_err(|_| CalyxError::lens_dim_mismatch("hidden_size exceeds u32"))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn read_json(path: &Path, label: &str) -> Result<Value> {
     let bytes = fs::read(path).map_err(|err| {
         lens_config_invalid(format!(
@@ -597,6 +632,7 @@ fn read_json(path: &Path, label: &str) -> Result<Value> {
         .map_err(|err| lens_config_invalid(format!("parse {label} config failed: {err}")))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn qwen3_model_id(raw: &str) -> Result<String> {
     match normalized(raw).as_str() {
         "qwen/qwen3-embedding-0.6b" | "qwen3-embedding-0.6b" | "qwen3-0.6b" => {
@@ -639,6 +675,7 @@ pub(super) fn ensure_file(label: &str, path: &Path) -> Result<()> {
     )))
 }
 
+#[cfg(feature = "embedding-runtimes")]
 fn normalized(raw: &str) -> String {
     raw.trim().to_ascii_lowercase()
 }

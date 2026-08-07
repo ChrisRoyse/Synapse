@@ -4,6 +4,9 @@
 /// (`candle-cuda` feature). Exported for build-info capability readback
 /// (#1130): deploy gates assert this resolved value, not a feature spelling.
 pub const CANDLE_CUDA_COMPILED: bool = cfg!(feature = "candle-cuda");
+/// True when local Candle, ONNX, FastEmbed, Qwen3, and static-lookup
+/// execution was compiled into this registry build.
+pub const EMBEDDING_RUNTIMES_COMPILED: bool = cfg!(feature = "embedding-runtimes");
 
 pub mod backfill;
 pub mod commission;
@@ -87,8 +90,8 @@ pub use persistence::{
     set_vault_registry_batch_limits,
 };
 pub use persistence_contracts::{
-    RegistryContractAudit, RegistryContractDiff, RegistryContractFieldDiff,
-    RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
+    CALYX_LENS_RUNTIME_NOT_COMPILED, RegistryContractAudit, RegistryContractDiff,
+    RegistryContractFieldDiff, RegistryContractRepairChange, VaultRegistryContractRepairAllWrite,
     VaultRegistryContractRepairWrite, algorithmic_encoder, audit_registry_snapshot_contracts,
     audit_vault_registry_contracts, derive_runtime_contract_from_spec,
     lens_spec_with_frozen_contract, repair_vault_registry_contracts_from_specs,
@@ -121,20 +124,22 @@ pub use runtime::algorithmic::{
     BYTE_FEATURES_CUDA_MIN_INPUT_BYTES, DenseCosineGrading, SPARSE_KEYWORDS_CUDA_MIN_TOKENS,
     TOKEN_HASH_CUDA_MIN_WORDS,
 };
+#[cfg(feature = "embedding-runtimes")]
 pub use runtime::candle::{
     CandleDevicePolicy, CandleFileSpec, CandleLens, CandleModelFiles, CandlePoolingPolicy,
     CandlePrecision, DEFAULT_CANDLE_MODEL,
 };
+pub use runtime::common::DEFAULT_QWEN3_MAX_TOKENS;
 pub use runtime::external_cmd::ExternalCmdLens;
+#[cfg(feature = "embedding-runtimes")]
 pub use runtime::onnx::{
     DEFAULT_ANSWERAI_COLBERT_MODEL, FastembedBgem3Lens, FastembedRerankerLens, FastembedSparseLens,
     OnnxColbertFileSpec, OnnxColbertLens, OnnxFileSpec, OnnxLens, OnnxModelFiles,
     OnnxProviderPolicy, OnnxShapeBucketBudget, PoolingPolicy, onnx_shape_bucket_budget,
 };
-pub use runtime::qwen3::{
-    DEFAULT_QWEN3_MAX_TOKENS, DEFAULT_QWEN3_MODEL, FastembedQwen3Lens, Qwen3FileSpec,
-    Qwen3ModelFiles,
-};
+#[cfg(feature = "embedding-runtimes")]
+pub use runtime::qwen3::{DEFAULT_QWEN3_MODEL, FastembedQwen3Lens, Qwen3FileSpec, Qwen3ModelFiles};
+#[cfg(feature = "embedding-runtimes")]
 pub use runtime::static_lookup::{
     StaticLookupDType, StaticLookupFileSpec, StaticLookupFiles, StaticLookupLens,
 };

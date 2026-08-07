@@ -12,7 +12,6 @@ use crate::runtime::common::{normalize_unit, text_from_input};
 use crate::spec::{LensRuntime, LensSpec};
 
 mod arena;
-mod batch_scope;
 mod colbert;
 mod colbert_files;
 mod colbert_tokens;
@@ -30,8 +29,7 @@ mod session;
 mod special;
 mod windows_cuda_dlls;
 
-pub(in crate::runtime::onnx) use batch_scope::scoped_max_batch;
-pub(crate) use batch_scope::with_runtime_batch_limit;
+pub(in crate::runtime::onnx) use crate::runtime::batch_scope::scoped_max_batch;
 pub use colbert::{DEFAULT_ANSWERAI_COLBERT_MODEL, OnnxColbertFileSpec, OnnxColbertLens};
 pub(crate) use custom::{
     contract_corpus_hash as custom_contract_corpus_hash,

@@ -1,16 +1,23 @@
+#[cfg(feature = "embedding-runtimes")]
 use std::env;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
-use calyx_core::{CalyxError, Input, Lens, Result};
+use calyx_core::{CalyxError, Result};
+#[cfg(feature = "embedding-runtimes")]
+use calyx_core::{Input, Lens};
 
 use crate::frozen::LengthDelimitedSha256;
+#[cfg(feature = "embedding-runtimes")]
 use crate::lens::ensure_input_modality;
 
+#[cfg(feature = "embedding-runtimes")]
 pub const DEFAULT_MAX_TOKENS: usize = 512;
+pub const DEFAULT_QWEN3_MAX_TOKENS: usize = 32_768;
 const STREAM_HASH_BUFFER_BYTES: usize = 1024 * 1024;
 
+#[cfg(feature = "embedding-runtimes")]
 pub fn default_hf_cache_root() -> PathBuf {
     if let Some(path) = env::var_os("HF_HOME") {
         return PathBuf::from(path);
@@ -21,6 +28,7 @@ pub fn default_hf_cache_root() -> PathBuf {
     PathBuf::from(".hf-cache")
 }
 
+#[cfg(feature = "embedding-runtimes")]
 pub fn fastembed_cache_root(default_cache: &Path) -> PathBuf {
     env::var_os("HF_HOME")
         .map(PathBuf::from)
@@ -69,6 +77,7 @@ fn hash_file_into(
     }
 }
 
+#[cfg(feature = "embedding-runtimes")]
 pub fn text_from_input<'a>(lens: &dyn Lens, input: &'a Input) -> Result<&'a str> {
     ensure_input_modality(lens, input)?;
     std::str::from_utf8(&input.bytes).map_err(|err| {

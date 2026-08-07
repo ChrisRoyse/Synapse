@@ -1,7 +1,7 @@
 use super::*;
 use crate::drift::{CALYX_LENS_RUNTIME_DRIFT, DriftDecision, PROCESS_RUNTIME_GOLDEN_TOLERANCE};
 use crate::lens::process_runtime_requires_golden;
-use crate::runtime::onnx;
+use crate::runtime::batch_scope;
 use crate::runtime_limit::runtime_uses_scoped_batch_limit;
 
 #[derive(Clone)]
@@ -128,8 +128,9 @@ fn measure_loaded_snapshot_lens_batch_with_stats(
     let measure_start = Instant::now();
     let mut vectors = Vec::with_capacity(inputs.len());
     if !inputs.is_empty() && scoped_runtime_limit {
-        vectors =
-            onnx::with_runtime_batch_limit(runtime_batch_limit, || runtime.measure_batch(inputs))?;
+        vectors = batch_scope::with_runtime_batch_limit(runtime_batch_limit, || {
+            runtime.measure_batch(inputs)
+        })?;
     } else if !inputs.is_empty() {
         for chunk in inputs.chunks(effective_chunk_size) {
             let chunk_vectors = runtime.measure_batch(chunk)?;

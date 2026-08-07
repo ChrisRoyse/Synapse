@@ -683,6 +683,10 @@ pub struct SubsystemHealth {
     pub calyx_math_backend_requested: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_cuda_compiled: Option<bool>,
+    /// Whether the running daemon contains calyx-registry's optional local
+    /// embedding execution stack. Synapse deliberately reports `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_registry_embedding_runtimes_compiled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_device_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

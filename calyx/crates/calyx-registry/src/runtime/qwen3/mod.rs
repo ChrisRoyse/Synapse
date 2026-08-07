@@ -16,7 +16,7 @@ pub use files::Qwen3ModelFiles;
 use load::{dense_batch, qwen3_model_id, read_config, read_model, read_tokenizer};
 
 pub const DEFAULT_QWEN3_MODEL: &str = "Qwen/Qwen3-Embedding-0.6B";
-pub const DEFAULT_QWEN3_MAX_TOKENS: usize = 32_768;
+pub use crate::runtime::common::DEFAULT_QWEN3_MAX_TOKENS;
 
 const OPTIONAL_QWEN3_FILES: &[&str] = &[
     "tokenizer_config.json",

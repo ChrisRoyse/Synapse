@@ -5,7 +5,7 @@ use calyx_core::{Asymmetry, CalyxError, Result};
 
 use crate::frozen::{NormPolicy, sha256_digest};
 use crate::runtime::adapters::{allow_noncommercial_from_env, ensure_license_allowed};
-use crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS;
+use crate::runtime::common::DEFAULT_QWEN3_MAX_TOKENS;
 use crate::spec::{Bgem3Engine, FastembedBgem3Output, LensRuntime, LensSpec};
 
 use super::algorithmic_manifest::{

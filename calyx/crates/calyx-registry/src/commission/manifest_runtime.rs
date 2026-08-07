@@ -4,7 +4,7 @@ use calyx_core::{CalyxError, Result};
 
 use super::algorithmic_manifest::algorithmic_kind;
 use super::manifest::{LensForgeManifest, VerifiedFile, modality_token};
-use crate::runtime::qwen3::DEFAULT_QWEN3_MAX_TOKENS;
+use crate::runtime::common::DEFAULT_QWEN3_MAX_TOKENS;
 use crate::spec::{Bgem3Engine, FastembedBgem3Output, LensRuntime};
 
 pub(super) fn runtime_from_manifest(

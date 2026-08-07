@@ -27,6 +27,33 @@ use crate::{LensSpec, RegistryLensSnapshot};
 const REGISTRY_CONTRACT_DRIFT: &str = "CALYX_REGISTRY_CONTRACT_DRIFT";
 const REGISTRY_CONTRACT_REPAIR_INVALID: &str = "CALYX_REGISTRY_CONTRACT_REPAIR_INVALID";
 const REGISTRY_CONTRACT_REMEDIATION: &str = "run `calyx panel registry-repair --vault <vault> --slot <slot>` after inspecting the emitted registry diff";
+pub const CALYX_LENS_RUNTIME_NOT_COMPILED: &str = "CALYX_LENS_RUNTIME_NOT_COMPILED";
+
+#[cfg(not(feature = "embedding-runtimes"))]
+fn embedding_runtime_not_compiled(spec: &LensSpec) -> CalyxError {
+    let runtime = match &spec.runtime {
+        crate::LensRuntime::CandleLocal { .. } => "candle-local",
+        crate::LensRuntime::Onnx { .. } => "onnx",
+        crate::LensRuntime::OnnxColbert { .. } => "onnx-colbert",
+        crate::LensRuntime::FastembedSparse { .. } => "fastembed-sparse",
+        crate::LensRuntime::FastembedBgem3 { .. } => "fastembed-bgem3",
+        crate::LensRuntime::FastembedReranker { .. } => "fastembed-reranker",
+        crate::LensRuntime::FastembedQwen3 { .. } => "fastembed-qwen3",
+        crate::LensRuntime::StaticLookup { .. } => "static-lookup",
+        crate::LensRuntime::Algorithmic { .. }
+        | crate::LensRuntime::TeiHttp { .. }
+        | crate::LensRuntime::ExternalCmd { .. }
+        | crate::LensRuntime::MultimodalAdapter { .. } => "non-embedding",
+    };
+    CalyxError {
+        code: CALYX_LENS_RUNTIME_NOT_COMPILED,
+        message: format!(
+            "persisted lens {} requires the {runtime} embedding runtime, but this calyx-registry build does not contain embedding runtimes",
+            spec.name
+        ),
+        remediation: "rebuild calyx-registry with feature `embedding-runtimes`, or register an algorithmic, TEI HTTP, external-command, or multimodal-adapter runtime",
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegistryContractAudit {

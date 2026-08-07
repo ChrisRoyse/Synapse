@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use calyx_core::{CalyxError, Input, LensId, Result, SlotVector};
 
 use crate::Registry;
-use crate::runtime::onnx;
+use crate::runtime::batch_scope;
 use crate::spec::LensRuntime;
 
 pub fn measure_registry_batch_with_runtime_limit(
@@ -18,7 +18,7 @@ pub fn measure_registry_batch_with_runtime_limit(
         ));
     }
     if runtime_uses_scoped_batch_limit(registry.lens_spec(lens_id)) {
-        return onnx::with_runtime_batch_limit(runtime_batch_limit, || {
+        return batch_scope::with_runtime_batch_limit(runtime_batch_limit, || {
             registry.measure_batch(lens_id, inputs)
         });
     }

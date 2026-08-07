@@ -4,10 +4,17 @@ use calyx_core::{CalyxError, Lens, Result, SlotShape};
 
 use crate::frozen::{FrozenLensContract, LensDType, NormPolicy, sha256_digest};
 use crate::{
-    AlgorithmicEncoder, AlgorithmicLens, CandleLens, ExternalCmdLens, FastembedBgem3Lens,
-    FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens, LensRuntime, LensSpec,
-    MultimodalAdapterLens, OnnxColbertLens, OnnxLens, StaticLookupLens, TeiHttpLens,
+    AlgorithmicEncoder, AlgorithmicLens, ExternalCmdLens, LensRuntime, LensSpec,
+    MultimodalAdapterLens, TeiHttpLens,
 };
+#[cfg(feature = "embedding-runtimes")]
+use crate::{
+    CandleLens, FastembedBgem3Lens, FastembedQwen3Lens, FastembedRerankerLens, FastembedSparseLens,
+    OnnxColbertLens, OnnxLens, StaticLookupLens,
+};
+
+#[cfg(not(feature = "embedding-runtimes"))]
+use super::embedding_runtime_not_compiled;
 
 pub(crate) fn load_runtime_lens_from_spec(
     spec: &LensSpec,
@@ -54,41 +61,49 @@ pub(crate) fn load_runtime_lens_from_spec(
             );
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::CandleLocal { .. } => {
             let lens = CandleLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::Onnx { .. } => {
             let lens = OnnxLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::OnnxColbert { .. } => {
             let lens = OnnxColbertLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedSparse { .. } => {
             let lens = FastembedSparseLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedBgem3 { .. } => {
             let lens = FastembedBgem3Lens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedReranker { .. } => {
             let lens = FastembedRerankerLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::FastembedQwen3 { .. } => {
             let lens = FastembedQwen3Lens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(feature = "embedding-runtimes")]
         LensRuntime::StaticLookup { .. } => {
             let lens = StaticLookupLens::from_lens_spec(spec)?;
             let contract = lens.contract().clone();
@@ -99,6 +114,15 @@ pub(crate) fn load_runtime_lens_from_spec(
             let contract = lens.contract();
             Ok((Arc::new(lens), contract))
         }
+        #[cfg(not(feature = "embedding-runtimes"))]
+        LensRuntime::CandleLocal { .. }
+        | LensRuntime::Onnx { .. }
+        | LensRuntime::OnnxColbert { .. }
+        | LensRuntime::FastembedSparse { .. }
+        | LensRuntime::FastembedBgem3 { .. }
+        | LensRuntime::FastembedReranker { .. }
+        | LensRuntime::FastembedQwen3 { .. }
+        | LensRuntime::StaticLookup { .. } => Err(embedding_runtime_not_compiled(spec)),
     }
 }
 
