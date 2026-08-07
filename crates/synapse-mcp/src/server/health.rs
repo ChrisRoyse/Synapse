@@ -2617,17 +2617,23 @@ impl SynapseService {
                         },
                     );
                     let search_tools = self.m4_config.shell_search_tool_readback();
+                    // #2082 finding E: the synthetic-hold watchdog's bound
+                    // selection (30 s vs 300 s track) and tracked-hold state are
+                    // otherwise unobservable without tripping the watchdog.
+                    let watchdog =
+                        synapse_action::synthetic_input::synthetic_hold_watchdog_status().label();
                     SubsystemHealth {
                         status: if emitter_available { "ok" } else { "error" }.to_owned(),
                         detail: Some(format!(
-                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {} {}",
+                            "emitter_available={} recording_enabled={} operator_hotkey={} allow_shell_patterns={} allow_launch_patterns={} {} {} {}",
                             emitter_available,
                             state.recording_enabled(),
                             operator_hotkey,
                             allow_shell,
                             allow_launch,
                             lease_detail,
-                            search_tools
+                            search_tools,
+                            watchdog
                         )),
                         backend_resolution: Some(backend_resolution_health(source, policy)),
                         run_shell_inline_await_limit_ms: Some(

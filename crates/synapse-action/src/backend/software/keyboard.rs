@@ -31,7 +31,12 @@ pub(super) fn press_key(key: &Key, hold_ms: u32, state: &mut EmitState) -> Resul
     let _interrupted = sleep_ms(hold_ms);
     // `?` here would leave the key down; the guard's `Drop` is what makes the
     // early return safe, and it stays armed until the release provably lands.
-    emit_key(&mut enigo, key, Direction::Release)?;
+    // The refusal code goes to the guard first so its `Drop` log distinguishes a
+    // fence refusal from a plain unwind (#2082 finding B1).
+    if let Err(error) = emit_key(&mut enigo, key, Direction::Release) {
+        strand.note_release_failure(error.code());
+        return Err(error);
+    }
     strand.disarm();
     state.release_key(key);
     recovery::clear_held_key(key)?;
@@ -129,10 +134,14 @@ pub(super) fn key_chord(
                     first_error = Some(error);
                 }
             }
-            Err(error) if first_error.is_none() => {
-                first_error = Some(error);
+            Err(error) => {
+                if let Some(strand) = strands.get_mut(index) {
+                    strand.note_release_failure(error.code());
+                }
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
             }
-            Err(_error) => {}
         }
     }
     // Any key whose release errored above is still armed and is released by

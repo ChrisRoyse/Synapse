@@ -151,8 +151,14 @@ pub(super) fn mouse_button(
             state.apply_mouse_button(button, ButtonAction::Down);
             let _interrupted = sleep_ms(hold_ms);
             // `?` here would leave the button down; `strand` is what makes the
-            // early return and any unwind between press and release safe.
-            send_mouse_button_event(button, ButtonAction::Up)?;
+            // early return and any unwind between press and release safe. The
+            // refusal code is handed to the guard first so its `Drop` log names
+            // *why* it had to fire (a tripped foreground fence reads as
+            // `ACTION_FOREGROUND_LOST`) rather than just that it did.
+            if let Err(error) = send_mouse_button_event(button, ButtonAction::Up) {
+                strand.note_release_failure(error.code());
+                return Err(error);
+            }
             strand.disarm();
             state.apply_mouse_button(button, ButtonAction::Up);
             recovery::clear_held_button(button)?;
@@ -182,8 +188,9 @@ pub(super) fn mouse_drag(
     let drag_result = mouse_move_curve(from, to, curve, duration_ms)
         .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));
     let release_result = mouse_button(button, ButtonAction::Up, 0, state);
-    if release_result.is_ok() {
-        strand.disarm();
+    match &release_result {
+        Ok(()) => strand.disarm(),
+        Err(error) => strand.note_release_failure(error.code()),
     }
     match (drag_result, release_result) {
         (Ok(()), Ok(())) => Ok(()),
@@ -250,10 +257,11 @@ pub(super) fn mouse_stroke(
     let stream_result = emit_stroke_stream(&plan.samples, &context);
     if let Err(error) = stream_result {
         let release_result = button.map(|button| mouse_button(button, ButtonAction::Up, 0, state));
-        if matches!(release_result, None | Some(Ok(())))
-            && let Some(strand) = strand.as_mut()
-        {
-            strand.disarm();
+        if let Some(strand) = strand.as_mut() {
+            match release_result.as_ref() {
+                None | Some(Ok(())) => strand.disarm(),
+                Some(Err(release_error)) => strand.note_release_failure(release_error.code()),
+            }
         }
         if let Some(Err(release_error)) = release_result {
             let sample_index =
@@ -275,10 +283,11 @@ pub(super) fn mouse_stroke(
     }
 
     let final_release = button.map(|button| mouse_button(button, ButtonAction::Up, 0, state));
-    if matches!(final_release, None | Some(Ok(())))
-        && let Some(strand) = strand.as_mut()
-    {
-        strand.disarm();
+    if let Some(strand) = strand.as_mut() {
+        match final_release.as_ref() {
+            None | Some(Ok(())) => strand.disarm(),
+            Some(Err(release_error)) => strand.note_release_failure(release_error.code()),
+        }
     }
     // A failed release leaves the guard armed: dropping it here emits the raw
     // button-up and logs at ERROR rather than returning with the button down.

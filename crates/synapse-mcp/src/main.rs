@@ -551,9 +551,19 @@ async fn run() -> anyhow::Result<ExitCode> {
     // what it found down so an inherited strand is visible rather than silently
     // cleared. It runs before either transport can accept a request, and covers
     // stdio and HTTP alike because it sits above the mode dispatch.
+    //
+    // Scope, after #2082 finding A1: this is the **full virtual-key-space**
+    // sweep, not the modifier-only one. The process-local strand mirror is empty
+    // at this point by construction — the strand, if any, belongs to a process
+    // that is already dead — so `GetAsyncKeyState` across `0x08..=0xfe` is the
+    // only evidence that can exist here. The narrower sweep let a stranded
+    // `VK_F13` survive boot while still logging `..._SWEEP_CLEAN`.
     let _startup_sweep = synapse_action::release_all_synthetic_input_on_startup();
     // #2082 fix 4 — the watchdog. A dedicated OS thread, not a tokio task, so it
     // still runs when the runtime or the emitter actor is the thing that wedged.
+    // Its `SYNTHETIC_INPUT_WATCHDOG_STARTED` line now also records which of the
+    // two hold bounds is in force and what both tracks are, so the 30 s vs 300 s
+    // selection is auditable from the log alone (#2082 finding E).
     let _watchdog_started = synapse_action::spawn_synthetic_input_watchdog();
 
     match cli.mode {

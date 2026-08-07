@@ -55,11 +55,21 @@ pub async fn release_all_with_handles(
     // running it after a *successful* actor release would only be redundant —
     // running it after a failed one is the difference between the operator
     // getting their keyboard back and not.
+    //
+    // Scope is deliberately the **bounded** sweep, not the startup full scan
+    // (#2082 finding A1). `release_all` runs in the process that owns the strand
+    // mirror, so the mirror already names every non-modifier key this process
+    // pressed; a full `GetAsyncKeyState` scan would add only keys this process
+    // never pressed, i.e. keys the human is physically holding right now. This
+    // tool is called routinely between sessions, not just by a desperate
+    // operator, so it must not synthesize key-ups for the human's own typing.
+    // The log says which scope ran so the verdict cannot be over-read.
     if let Err(error) = execute_result {
         let sweep = synapse_action::release_all_synthetic_input();
         tracing::error!(
             code = "M2_RELEASE_ALL_ACTOR_FAILED_RAW_SWEEP_RAN",
             detail = ?error,
+            sweep_scope = "bounded_modifiers_buttons_and_process_mirror",
             modifiers_found_down = %sweep.modifiers_found_down_labels(),
             buttons_found_down = %sweep.buttons_found_down_labels(),
             tracked_strands_released = sweep.tracked_strands_released,

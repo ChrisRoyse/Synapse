@@ -21,6 +21,26 @@ static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 /// raw, allocation-free, lock-free `SendInput` release sweep
 /// ([`crate::synthetic_input::release_all_synthetic_input_on_panic`]).
 ///
+/// # Why the panic sweep stays bounded (#2082 finding A1)
+///
+/// The startup sweep was widened to scan the whole virtual-key space, because at
+/// boot the process-local strand mirror is empty and `GetAsyncKeyState` is the
+/// only evidence that can exist. The panic hook is the opposite case and keeps
+/// the bounded sweep, for two structural reasons:
+///
+/// * it runs **inside the process that owns the mirror**, which is authoritative
+///   for every key this process pressed — including non-modifiers, which is
+///   exactly why `key_down` hands its entry to the mirror. A full scan would add
+///   only keys this process never pressed, i.e. keys the **operator** is
+///   physically holding, and this hook is the one most likely to run while a
+///   human is mid-keystroke;
+/// * it may run on a thread that panicked *because* it exhausted its stack. The
+///   bounded sweep's frame is one fixed `[INPUT; 82]` and a handful of
+///   `GetAsyncKeyState` calls; a full-space release would add ~250 syscalls and
+///   a second staging buffer to a path whose entire contract is "the cheapest
+///   thing that is still complete". A panic hook that itself faults releases
+///   nothing at all.
+///
 /// The pre-existing `RELEASE_ALL_HANDLE` round trip runs *after* that, and is
 /// now explicitly the second line of defence rather than the first: it is a
 /// bounded channel send into a tokio actor, so it is a best effort that fails

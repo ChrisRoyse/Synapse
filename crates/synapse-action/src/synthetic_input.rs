@@ -65,7 +65,37 @@
 //! *call* the fence — a panic hook must not take a lock — but it preserves the
 //! semantics exactly: a fence refusal must still release, and now so must a
 //! panic.
+//!
+//! # Two sources of truth, deliberately kept apart
+//!
+//! The sweep reads two different things and must never conflate them:
+//!
+//! * **The mirror** ([`STRAND_TOKENS`], [`BUTTON_SINCE_MS`]) is *"what **this
+//!   process** pressed and has not yet released"*. It is **authoritative**: it
+//!   names the exact OS emission form (`wVk` / scancode / UTF-16 unit) of every
+//!   press this process made, which is the only way to synthesize a release of
+//!   the same shape. It is also, by construction, **empty at process start** —
+//!   it cannot describe a strand left behind by a *previous* generation.
+//! * **`GetAsyncKeyState`** is *"what is **physically down** right now"*. It is
+//!   **evidence only**: it cannot say who pressed the key, and it cannot
+//!   distinguish inherited synthetic state from a key the human is physically
+//!   holding at this instant.
+//!
+//! That asymmetry sets the scope of each sweep:
+//!
+//! * The **panic** sweep runs *inside the process that owns the mirror*, so the
+//!   mirror already names every non-modifier key this process could have
+//!   stranded. Widening its evidence to the whole VK space would add only keys
+//!   this process never pressed — i.e. keys the operator is holding — so it
+//!   stays [bounded](win32::sweep).
+//! * The **startup** sweep runs when the mirror is empty and the strand, if any,
+//!   belongs to a dead process. Its only possible evidence is
+//!   `GetAsyncKeyState`, so it scans the [whole virtual-key
+//!   space](win32::sweep_full) (#2082 finding A1: a stranded `VK_F13` survived
+//!   the old modifier-only boot sweep while a stranded `XBUTTON2` was correctly
+//!   released, and the log still said `..._SWEEP_CLEAN`).
 
+use std::fmt::Write as _;
 use std::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
@@ -105,6 +135,8 @@ static BUTTON_SINCE_MS: [AtomicU64; BUTTON_SLOTS] = [const { AtomicU64::new(0) }
 static STRAND_OVERFLOWS: AtomicU64 = AtomicU64::new(0);
 
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
+/// Cumulative count of strands the watchdog has force-released this generation.
+static WATCHDOG_FORCE_RELEASES: AtomicU64 = AtomicU64::new(0);
 
 fn epoch() -> Instant {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
@@ -342,6 +374,23 @@ pub struct SyntheticReleaseReport {
     pub emission_failures: usize,
     /// Whether the lone-Alt/Win dummy-key mask was injected.
     pub masked_lone_modifier_tap: bool,
+    /// Whether the full virtual-key-space scan ran (startup only).
+    ///
+    /// When `false`, a `..._SWEEP_CLEAN` verdict means only "no modifier and no
+    /// mouse button was down"; it is **not** a statement about the rest of the
+    /// keyboard. When `true`, the verdict covers every scannable virtual key.
+    pub scanned_full_virtual_key_space: bool,
+    /// Bit `n` set means virtual key `n` read down during the full scan.
+    ///
+    /// A 256-bit map rather than a `Vec`, so the report stays `Copy` and the
+    /// whole sweep stays allocation-free.
+    pub scanned_keys_found_down: VirtualKeyBitmap,
+    /// Population count of [`Self::scanned_keys_found_down`].
+    pub scanned_keys_found_down_count: usize,
+    /// Key-ups emitted by the full scan (one per key found down — unlike the
+    /// modifier sweep, the scan is *conditional*, so it never touches a key the
+    /// OS did not report as physically held).
+    pub scanned_key_releases_emitted: usize,
 }
 
 impl SyntheticReleaseReport {
@@ -352,7 +401,9 @@ impl SyntheticReleaseReport {
     /// silently cleared.
     #[must_use]
     pub const fn found_anything_down(&self) -> bool {
-        self.modifiers_found_down != 0 || self.buttons_found_down != 0
+        self.modifiers_found_down != 0
+            || self.buttons_found_down != 0
+            || self.scanned_keys_found_down_count != 0
     }
 
     /// Comma-separated names of the modifiers found down.
@@ -365,6 +416,34 @@ impl SyntheticReleaseReport {
                     out.push(',');
                 }
                 out.push_str(label);
+            }
+        }
+        out
+    }
+
+    /// Comma-separated `name(0xNN)` list of the virtual keys the full scan found
+    /// down, in ascending virtual-key order.
+    ///
+    /// Allocates, so it is called only from the logging path *after* the release
+    /// has already been emitted — never from inside a sweep.
+    #[must_use]
+    pub fn scanned_keys_found_down_labels(&self) -> String {
+        let mut out = String::new();
+        for vkey in SCAN_FIRST_VKEY..=SCAN_LAST_VKEY {
+            if !virtual_key_bit(&self.scanned_keys_found_down, vkey) {
+                continue;
+            }
+            if !out.is_empty() {
+                out.push(',');
+            }
+            match virtual_key_label(vkey) {
+                Some(name) => {
+                    out.push_str(name);
+                    let _ = write!(out, "(0x{vkey:02x})");
+                }
+                None => {
+                    let _ = write!(out, "vk(0x{vkey:02x})");
+                }
             }
         }
         out
@@ -413,6 +492,162 @@ pub const MODIFIER_SWEEP: [(u16, &str); 11] = [
 #[cfg_attr(not(windows), allow(dead_code))]
 const DUMMY_MASK_VKEY: u16 = 0xff;
 
+/// A 256-bit set of virtual keys, one bit per code.
+///
+/// Fixed size and `Copy`, so [`SyntheticReleaseReport`] can carry the full scan
+/// result without allocating.
+pub type VirtualKeyBitmap = [u64; 4];
+
+/// First virtual key the startup scan reads: `VK_BACK`.
+///
+/// Everything below it is either a mouse button (`VK_LBUTTON` `0x01` ..
+/// `VK_XBUTTON2` `0x06`, released by the button half of the sweep and *not* a
+/// keyboard key) or undefined (`0x00`, `0x07`).
+const SCAN_FIRST_VKEY: u16 = 0x08;
+
+/// Last virtual key the startup scan reads: `VK_OEM_CLEAR`.
+///
+/// `0xff` is excluded because it is not a key: Microsoft documents it as
+/// reserved, and this module already uses it as [`DUMMY_MASK_VKEY`].
+const SCAN_LAST_VKEY: u16 = 0xfe;
+
+/// Virtual keys the startup scan must **not** read or release.
+///
+/// The scan is otherwise `SCAN_FIRST_VKEY..=SCAN_LAST_VKEY` and is
+/// *conditional*: it emits a key-up only for a code `GetAsyncKeyState` reports
+/// physically down. Two independent reasons put a code on this list.
+///
+/// ## 1. It is not a key — reading or releasing it is meaningless or harmful
+///
+/// * `0x15..=0x1a` (`VK_KANA`/`VK_HANGUL`, `VK_IME_ON`, `VK_JUNJA`, `VK_FINAL`,
+///   `VK_HANJA`/`VK_KANJI`, `VK_IME_OFF`) and `0x1c..=0x1f` (`VK_CONVERT`,
+///   `VK_NONCONVERT`, `VK_ACCEPT`, `VK_MODECHANGE`) are **IME state-machine
+///   inputs**, not keys that can latch the keyboard down. Injecting a key-up
+///   for one clears no strand and pokes a live IME.
+/// * `0xe5` `VK_PROCESSKEY` is the sentinel an IME sets on a message it has
+///   already consumed; there is no physical key behind it.
+/// * `0xe7` `VK_PACKET` is the marker `KEYEVENTF_UNICODE` uses to carry a UTF-16
+///   unit in `wScan`. Synthesizing a bare `VK_PACKET` key-up with `wScan = 0`
+///   would inject a NUL **character** into the foreground window — the sweep
+///   would become the thing that types.
+/// * `0x5f` `VK_SLEEP` is a power-management key. No stranded-down failure mode
+///   exists for it (the system acts on the down transition), so the sweep has
+///   nothing to gain and a suspend to lose.
+///
+/// ## 2. Microsoft documents it as reserved / unassigned
+///
+/// `0x0a..=0x0b`, `0x0e..=0x0f`, `0x3a..=0x40`, `0x5e`, `0x88..=0x8f`,
+/// `0x97..=0x9f`, `0xb8..=0xb9`, `0xc1..=0xda`, `0xe0`, `0xe8`. No layout maps
+/// them, so no press can have set them and no key-up can clear anything.
+///
+/// ## Deliberately **not** excluded
+///
+/// * `0x14` `VK_CAPITAL`, `0x90` `VK_NUMLOCK`, `0x91` `VK_SCROLL` — the toggle
+///   flips on the **down** transition, so a synthesized key-up cannot change the
+///   toggle state, and a physically held toggle key is a real strand.
+/// * The OEM block (`0xdb..=0xe4`, `0xe6`, `0xe9..=0xf5`) — these are real
+///   printable/OEM keys on many layouts; a stranded `[` is a real strand.
+/// * Media / browser / volume keys (`0xa6..=0xb7`, `0xfa`) — their action fires
+///   on the down transition, so a key-up is inert.
+///
+/// The modifier codes are excluded here only because [`MODIFIER_SWEEP`] already
+/// releases every one of them **unconditionally** in the same sweep; scanning
+/// them again would emit a duplicate key-up and would bypass the lone-Alt/Win
+/// dummy-key mask.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn excluded_from_startup_scan(vkey: u16) -> bool {
+    matches!(
+        vkey,
+        // Not a key at all, or unsafe to synthesize a key-up for.
+        0x15..=0x1a | 0x1c..=0x1f | 0x5f | 0xe5 | 0xe7
+        // Documented reserved / unassigned.
+        | 0x0a..=0x0b | 0x0e..=0x0f | 0x3a..=0x40 | 0x5e | 0x88..=0x8f
+        | 0x97..=0x9f | 0xb8..=0xb9 | 0xc1..=0xda | 0xe0 | 0xe8
+    ) || is_modifier_sweep_vkey(vkey)
+}
+
+/// Whether [`MODIFIER_SWEEP`] already covers `vkey` unconditionally.
+fn is_modifier_sweep_vkey(vkey: u16) -> bool {
+    MODIFIER_SWEEP
+        .iter()
+        .any(|(modifier, _label)| *modifier == vkey)
+}
+
+fn virtual_key_bit(map: &VirtualKeyBitmap, vkey: u16) -> bool {
+    let index = usize::from(vkey >> 6);
+    let bit = u32::from(vkey & 0x3f);
+    map.get(index)
+        .is_some_and(|word| word & (1_u64 << bit) != 0)
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn set_virtual_key_bit(map: &mut VirtualKeyBitmap, vkey: u16) {
+    let index = usize::from(vkey >> 6);
+    let bit = u32::from(vkey & 0x3f);
+    if let Some(word) = map.get_mut(index) {
+        *word |= 1_u64 << bit;
+    }
+}
+
+/// Human-readable name for the virtual keys a strand report is likely to name.
+///
+/// Unknown codes are logged as their hex value rather than guessed at: a wrong
+/// name in an operator-safety log is worse than a raw code.
+const fn virtual_key_label(vkey: u16) -> Option<&'static str> {
+    Some(match vkey {
+        0x08 => "backspace",
+        0x09 => "tab",
+        0x0c => "clear",
+        0x0d => "enter",
+        0x13 => "pause",
+        0x14 => "capslock",
+        0x1b => "escape",
+        0x20 => "space",
+        0x21 => "pageup",
+        0x22 => "pagedown",
+        0x23 => "end",
+        0x24 => "home",
+        0x25 => "left",
+        0x26 => "up",
+        0x27 => "right",
+        0x28 => "down",
+        0x2c => "printscreen",
+        0x2d => "insert",
+        0x2e => "delete",
+        0x30..=0x39 => "digit",
+        0x41..=0x5a => "letter",
+        0x5d => "apps",
+        0x60..=0x69 => "numpad_digit",
+        0x6a => "numpad_multiply",
+        0x6b => "numpad_add",
+        0x6d => "numpad_subtract",
+        0x6e => "numpad_decimal",
+        0x6f => "numpad_divide",
+        0x70 => "f1",
+        0x71 => "f2",
+        0x72 => "f3",
+        0x73 => "f4",
+        0x74 => "f5",
+        0x75 => "f6",
+        0x76 => "f7",
+        0x77 => "f8",
+        0x78 => "f9",
+        0x79 => "f10",
+        0x7a => "f11",
+        0x7b => "f12",
+        0x7c => "f13",
+        0x7d => "f14",
+        0x7e => "f15",
+        0x7f => "f16",
+        0x80..=0x87 => "f17_f24",
+        0x90 => "numlock",
+        0x91 => "scrolllock",
+        0xa6..=0xb7 => "browser_media_volume",
+        0xdb..=0xe4 | 0xe6 | 0xe9..=0xf5 => "oem",
+        _ => return None,
+    })
+}
+
 #[cfg(windows)]
 mod win32 {
     use std::mem;
@@ -427,9 +662,10 @@ mod win32 {
 
     use super::{
         BUTTON_SINCE_MS, BUTTON_SLOTS, DUMMY_MASK_VKEY, MODIFIER_SWEEP, MouseButton,
-        STRAND_SINCE_MS, STRAND_SLOTS, STRAND_TOKENS, SyntheticReleaseReport, TAG_SCANCODE,
-        TAG_UNICODE, TAG_VIRTUAL_KEY, TOKEN_EMPTY, button_from_index, button_index, token_tag,
-        token_value,
+        SCAN_FIRST_VKEY, SCAN_LAST_VKEY, STRAND_SINCE_MS, STRAND_SLOTS, STRAND_TOKENS,
+        SyntheticReleaseReport, TAG_SCANCODE, TAG_UNICODE, TAG_VIRTUAL_KEY, TOKEN_EMPTY,
+        VirtualKeyBitmap, button_from_index, button_index, excluded_from_startup_scan,
+        set_virtual_key_bit, token_tag, token_value, virtual_key_bit,
     };
 
     const XBUTTON1_DATA: u32 = 0x0001;
@@ -631,6 +867,76 @@ mod win32 {
         }
         report
     }
+
+    /// How many scan releases are staged before a flush.
+    ///
+    /// Bounded on purpose: the scan can find any number of keys down, but the
+    /// stack frame that carries them must stay a fixed, small size. Each chunk
+    /// is an independent batch of key-ups, and key-ups are order-independent and
+    /// idempotent, so splitting the emission changes nothing observable.
+    const SCAN_FLUSH_CHUNK: usize = 32;
+
+    /// Reads `GetAsyncKeyState` across the whole scannable virtual-key space.
+    ///
+    /// Evidence only — nothing is emitted here — so the caller can take one
+    /// consistent snapshot *before* any release lands.
+    fn scan_virtual_key_space() -> (VirtualKeyBitmap, usize) {
+        let mut found: VirtualKeyBitmap = [0; 4];
+        let mut count = 0_usize;
+        for vkey in SCAN_FIRST_VKEY..=SCAN_LAST_VKEY {
+            if excluded_from_startup_scan(vkey) {
+                continue;
+            }
+            if is_down(vkey) {
+                set_virtual_key_bit(&mut found, vkey);
+                count += 1;
+            }
+        }
+        (found, count)
+    }
+
+    /// Emits one key-up per virtual key the scan found down, in chunks.
+    fn release_scanned_keys(report: &mut SyntheticReleaseReport) {
+        let mut batch: [INPUT; SCAN_FLUSH_CHUNK] =
+            [const { key_input(0, 0, KEYEVENTF_KEYUP) }; SCAN_FLUSH_CHUNK];
+        let mut len = 0_usize;
+        for vkey in SCAN_FIRST_VKEY..=SCAN_LAST_VKEY {
+            if !virtual_key_bit(&report.scanned_keys_found_down, vkey) {
+                continue;
+            }
+            batch[len] = key_input(vkey, 0, KEYEVENTF_KEYUP);
+            len += 1;
+            report.scanned_key_releases_emitted += 1;
+            if len == SCAN_FLUSH_CHUNK {
+                if !send_release_batch(&batch[..len]) {
+                    report.emission_failures += 1;
+                }
+                len = 0;
+            }
+        }
+        if len > 0 && !send_release_batch(&batch[..len]) {
+            report.emission_failures += 1;
+        }
+    }
+
+    /// The bounded sweep **plus** a full virtual-key-space scan (#2082 A1).
+    ///
+    /// Order is deliberate: the scan's `GetAsyncKeyState` evidence is collected
+    /// first, before [`sweep`] emits anything, so what the log reports as "found
+    /// down" is one coherent snapshot of the moment the daemon booted rather
+    /// than a reading taken partway through its own release batch.
+    ///
+    /// Only the startup path calls this. It carries its own stack frame and its
+    /// own batch buffer, so the panic path's cost and frame size are unchanged.
+    pub(super) fn sweep_full() -> SyntheticReleaseReport {
+        let (scanned_keys_found_down, scanned_keys_found_down_count) = scan_virtual_key_space();
+        let mut report = sweep();
+        report.scanned_full_virtual_key_space = true;
+        report.scanned_keys_found_down = scanned_keys_found_down;
+        report.scanned_keys_found_down_count = scanned_keys_found_down_count;
+        release_scanned_keys(&mut report);
+        report
+    }
 }
 
 #[cfg(not(windows))]
@@ -646,6 +952,10 @@ mod win32 {
     }
 
     pub(super) fn sweep() -> SyntheticReleaseReport {
+        SyntheticReleaseReport::default()
+    }
+
+    pub(super) fn sweep_full() -> SyntheticReleaseReport {
         SyntheticReleaseReport::default()
     }
 }
@@ -684,6 +994,38 @@ pub fn release_all_synthetic_input() -> SyntheticReleaseReport {
     win32::sweep()
 }
 
+/// [`release_all_synthetic_input`] widened to the **whole virtual-key space**.
+///
+/// Adds one conditional `GetAsyncKeyState` read per scannable virtual key and a
+/// key-up for each one found physically down. Use this where the process-local
+/// mirror cannot possibly describe the strand — i.e. at daemon startup, where
+/// the strand belongs to a previous generation.
+///
+/// # Why this is not the panic path
+///
+/// Two reasons, both structural rather than stylistic:
+///
+/// 1. **It would add nothing correct.** The panic hook runs inside the process
+///    that owns [`STRAND_TOKENS`], and that mirror is authoritative for every
+///    key this process pressed — including non-modifiers, which is exactly why
+///    `key_down` hands its entry to the mirror. Everything the wider scan would
+///    add is a key this process never pressed, i.e. a key the **operator** is
+///    physically holding. Releasing those is a regression, not a fix, and the
+///    panic path is the one most likely to run while a human is mid-keystroke.
+/// 2. **It would widen a frame that must stay minimal.** The panic hook may run
+///    on any thread, including one that panicked *because* it ran out of stack.
+///    A full-space release needs ~250 additional `GetAsyncKeyState` syscalls and
+///    a release buffer to stage them; the bounded sweep's frame is a single
+///    fixed `[INPUT; 82]`. A panic hook that itself faults releases nothing at
+///    all, so the cheapest sweep that is still complete is the correct one.
+///
+/// The startup path has neither constraint: it runs on the main thread, on a
+/// healthy process, before either transport can accept a request.
+#[must_use]
+pub fn release_all_synthetic_input_full_scan() -> SyntheticReleaseReport {
+    win32::sweep_full()
+}
+
 /// Startup sweep (#2082 fix 2): release unconditionally on daemon boot and log
 /// exactly what was found still down.
 ///
@@ -691,13 +1033,32 @@ pub fn release_all_synthetic_input() -> SyntheticReleaseReport {
 /// the previous generation stranded, and `SendInput` state does not die with the
 /// process. The evidence is `GetAsyncKeyState` at entry — the exact readback
 /// Microsoft's `SendInput` remarks point at for this problem.
+///
+/// # Scope: the whole virtual-key space (#2082 finding A1)
+///
+/// This path runs [`release_all_synthetic_input_full_scan`], not the bounded
+/// sweep. At startup the process-local mirror is empty by construction, so the
+/// only evidence that exists is `GetAsyncKeyState` — and reading it for the 11
+/// modifiers and 5 mouse buttons alone left a stranded `VK_F13` down through
+/// boot while the log said `..._SWEEP_CLEAN`. `CLEAN` now means the scan covered
+/// every scannable virtual key and found none of them down.
+///
+/// A key the **operator** happens to be physically holding at the instant of
+/// boot also reads down and will get a key-up. That is the documented lesser
+/// evil this whole module is built on (see the module header): the worst case is
+/// one interrupted auto-repeat, against a strand that survives every reboot of
+/// the daemon.
 pub fn release_all_synthetic_input_on_startup() -> SyntheticReleaseReport {
-    let report = release_all_synthetic_input();
+    let report = release_all_synthetic_input_full_scan();
     if report.found_anything_down() {
         tracing::warn!(
             code = "SYNTHETIC_INPUT_STARTUP_STRAND_RELEASED",
             modifiers_found_down = %report.modifiers_found_down_labels(),
             buttons_found_down = %report.buttons_found_down_labels(),
+            scanned_keys_found_down = %report.scanned_keys_found_down_labels(),
+            scanned_keys_found_down_count = report.scanned_keys_found_down_count,
+            scanned_key_releases_emitted = report.scanned_key_releases_emitted,
+            scanned_full_virtual_key_space = report.scanned_full_virtual_key_space,
             tracked_strands_released = report.tracked_strands_released,
             modifier_releases_emitted = report.modifier_releases_emitted,
             button_releases_emitted = report.button_releases_emitted,
@@ -709,11 +1070,15 @@ pub fn release_all_synthetic_input_on_startup() -> SyntheticReleaseReport {
     } else {
         tracing::info!(
             code = "SYNTHETIC_INPUT_STARTUP_SWEEP_CLEAN",
+            scanned_full_virtual_key_space = report.scanned_full_virtual_key_space,
+            scan_first_vkey = SCAN_FIRST_VKEY,
+            scan_last_vkey = SCAN_LAST_VKEY,
             modifier_releases_emitted = report.modifier_releases_emitted,
             button_releases_emitted = report.button_releases_emitted,
+            scanned_key_releases_emitted = report.scanned_key_releases_emitted,
             emission_failures = report.emission_failures,
             source_of_truth = "GetAsyncKeyState read before the startup SendInput release sweep",
-            "readback=synthetic_input edge=startup no synthetic input was down; the unconditional release sweep ran anyway"
+            "readback=synthetic_input edge=startup no modifier, no mouse button and no scanned virtual key was down; the unconditional modifier/button release sweep ran anyway"
         );
     }
     if report.emission_failures > 0 {
@@ -753,6 +1118,25 @@ pub fn release_all_synthetic_input_on_panic() -> SyntheticReleaseReport {
 // RAII guards
 // -----------------------------------------------------------------------------
 
+/// Why a guard is being dropped while still armed (#2082 finding B1).
+///
+/// `act_stroke` is not on the public tool facade, so the drag/stroke guards
+/// cannot be driven black-box through their own verb. Making the guard narrate
+/// itself — armed, disarmed, and *why* it dropped armed — is what lets an FSV
+/// prove the RAII path fired from the daemon log alone, from whatever public
+/// verb does reach it.
+fn guard_exit_reason(release_refusal_code: Option<&'static str>) -> &'static str {
+    if release_refusal_code.is_some() {
+        // The normal release was attempted and the emission layer said no —
+        // a tripped foreground fence is the case #2057 cares about.
+        "release_refused"
+    } else if std::thread::panicking() {
+        "unwind"
+    } else {
+        "scope_exit_without_release"
+    }
+}
+
 /// RAII guard for one synthetic key that is currently down.
 ///
 /// Armed immediately *before* the press leaves, so a panic in the emission
@@ -765,6 +1149,7 @@ pub fn release_all_synthetic_input_on_panic() -> SyntheticReleaseReport {
 pub struct HeldKeyStrand {
     token: u32,
     stage: &'static str,
+    release_refusal_code: Option<&'static str>,
 }
 
 impl HeldKeyStrand {
@@ -776,28 +1161,78 @@ impl HeldKeyStrand {
     pub fn arm(key: &Key, stage: &'static str) -> Self {
         let token = key_strand_token(key).unwrap_or(TOKEN_EMPTY);
         register_key_strand(token);
-        Self { token, stage }
+        Self::log_armed(token, stage, false);
+        Self {
+            token,
+            stage,
+            release_refusal_code: None,
+        }
     }
 
     /// Adopts an already-mirrored key so a scoped body is unwind-safe.
     #[must_use]
-    pub const fn adopt(token: u32, stage: &'static str) -> Self {
-        Self { token, stage }
+    pub fn adopt(token: u32, stage: &'static str) -> Self {
+        Self::log_armed(token, stage, true);
+        Self {
+            token,
+            stage,
+            release_refusal_code: None,
+        }
+    }
+
+    fn log_armed(token: u32, stage: &'static str, adopted: bool) {
+        if token == TOKEN_EMPTY {
+            return;
+        }
+        tracing::info!(
+            code = "SYNTHETIC_INPUT_GUARD_ARMED",
+            kind = "key",
+            stage,
+            token,
+            adopted,
+            "a synthetic key press is now under a Drop obligation; every exit from this scope emits the matching key-up"
+        );
+    }
+
+    /// Records that the *normal* release path refused or failed, so the guard's
+    /// `Drop` can say which of the three exits it is taking.
+    pub const fn note_release_failure(&mut self, code: &'static str) {
+        self.release_refusal_code = Some(code);
     }
 
     /// The matching release has left the OS; stop guarding.
     pub fn disarm(&mut self) {
         if self.token != TOKEN_EMPTY {
-            clear_key_strand(self.token);
+            let token = self.token;
+            clear_key_strand(token);
             self.token = TOKEN_EMPTY;
+            tracing::info!(
+                code = "SYNTHETIC_INPUT_GUARD_DISARMED",
+                kind = "key",
+                stage = self.stage,
+                token,
+                reason = "released",
+                "the matching key-up left the OS; the Drop obligation is discharged"
+            );
         }
     }
 
     /// Stops guarding but **keeps** the mirror entry, because the press is
     /// meant to outlive this scope (`act_key_down` released by a later
     /// `act_key_up`). The panic sweep, startup sweep and watchdog still see it.
-    pub const fn disarm_without_clearing_mirror(&mut self) {
-        self.token = TOKEN_EMPTY;
+    pub fn disarm_without_clearing_mirror(&mut self) {
+        if self.token != TOKEN_EMPTY {
+            let token = self.token;
+            self.token = TOKEN_EMPTY;
+            tracing::info!(
+                code = "SYNTHETIC_INPUT_GUARD_DISARMED",
+                kind = "key",
+                stage = self.stage,
+                token,
+                reason = "handed_to_mirror",
+                "the press is meant to outlive this scope; the strand mirror, not this guard, now carries the release obligation"
+            );
+        }
     }
 }
 
@@ -832,15 +1267,19 @@ impl Drop for HeldKeyStrand {
             return;
         }
         let token = self.token;
+        let reason = guard_exit_reason(self.release_refusal_code);
         let released = release_token_now(token);
         clear_key_strand(token);
         self.token = TOKEN_EMPTY;
         if released {
             tracing::error!(
                 code = "SYNTHETIC_INPUT_GUARD_RELEASED",
+                kind = "key",
                 stage = self.stage,
                 token,
-                "a synthetic key press left its scope without a matching release (error or unwind); the RAII guard emitted the key-up"
+                reason,
+                release_refusal_code = self.release_refusal_code,
+                "a synthetic key press left its scope without a matching release; the RAII guard emitted the key-up"
             );
         } else {
             tracing::error!(
@@ -848,6 +1287,8 @@ impl Drop for HeldKeyStrand {
                 phase = "key_guard_drop",
                 stage = self.stage,
                 token,
+                reason,
+                release_refusal_code = self.release_refusal_code,
                 "the RAII key-up could not be inserted even after retry; the key may still be down system-wide"
             );
         }
@@ -862,6 +1303,7 @@ impl Drop for HeldKeyStrand {
 pub struct HeldButtonStrand {
     button: Option<MouseButton>,
     stage: &'static str,
+    release_refusal_code: Option<&'static str>,
 }
 
 impl HeldButtonStrand {
@@ -869,33 +1311,76 @@ impl HeldButtonStrand {
     #[must_use]
     pub fn arm(button: MouseButton, stage: &'static str) -> Self {
         register_button_strand(button);
+        Self::log_armed(button, stage, false);
         Self {
             button: Some(button),
             stage,
+            release_refusal_code: None,
         }
     }
 
     /// Adopts an already-mirrored button so a scoped body is unwind-safe.
     #[must_use]
-    pub const fn adopt(button: MouseButton, stage: &'static str) -> Self {
+    pub fn adopt(button: MouseButton, stage: &'static str) -> Self {
+        Self::log_armed(button, stage, true);
         Self {
             button: Some(button),
             stage,
+            release_refusal_code: None,
         }
+    }
+
+    fn log_armed(button: MouseButton, stage: &'static str, adopted: bool) {
+        tracing::info!(
+            code = "SYNTHETIC_INPUT_GUARD_ARMED",
+            kind = "button",
+            stage,
+            button = button_label(button),
+            adopted,
+            "a synthetic mouse button is now under a Drop obligation; every exit from this scope emits the matching button-up"
+        );
+    }
+
+    /// Records that the *normal* release path refused or failed, so the guard's
+    /// `Drop` can say which of the three exits it is taking.
+    ///
+    /// The drag/stroke callers pass the [`crate::ActionError`] code of the failed
+    /// button-up, which is how a foreground-fence refusal
+    /// (`ACTION_FOREGROUND_LOST`) becomes distinguishable in the log from a plain
+    /// unwind.
+    pub const fn note_release_failure(&mut self, code: &'static str) {
+        self.release_refusal_code = Some(code);
     }
 
     /// The matching release has left the OS; stop guarding.
     pub fn disarm(&mut self) {
         if let Some(button) = self.button.take() {
             clear_button_strand(button);
+            tracing::info!(
+                code = "SYNTHETIC_INPUT_GUARD_DISARMED",
+                kind = "button",
+                stage = self.stage,
+                button = button_label(button),
+                reason = "released",
+                "the matching button-up left the OS; the Drop obligation is discharged"
+            );
         }
     }
 
     /// Stops guarding but **keeps** the mirror entry, because the press is meant
     /// to outlive this scope (`act_mouse_button action=down` released by a later
     /// `action=up`). The panic sweep, startup sweep and watchdog still see it.
-    pub const fn disarm_without_clearing_mirror(&mut self) {
-        self.button = None;
+    pub fn disarm_without_clearing_mirror(&mut self) {
+        if let Some(button) = self.button.take() {
+            tracing::info!(
+                code = "SYNTHETIC_INPUT_GUARD_DISARMED",
+                kind = "button",
+                stage = self.stage,
+                button = button_label(button),
+                reason = "handed_to_mirror",
+                "the press is meant to outlive this scope; the strand mirror, not this guard, now carries the release obligation"
+            );
+        }
     }
 }
 
@@ -904,14 +1389,18 @@ impl Drop for HeldButtonStrand {
         let Some(button) = self.button.take() else {
             return;
         };
+        let reason = guard_exit_reason(self.release_refusal_code);
         let released = release_button_now(button);
         clear_button_strand(button);
         if released {
             tracing::error!(
                 code = "SYNTHETIC_INPUT_GUARD_RELEASED",
+                kind = "button",
                 stage = self.stage,
                 button = button_label(button),
-                "a synthetic mouse press left its scope without a matching release (error or unwind); the RAII guard emitted the button-up"
+                reason,
+                release_refusal_code = self.release_refusal_code,
+                "a synthetic mouse press left its scope without a matching release; the RAII guard emitted the button-up"
             );
         } else {
             tracing::error!(
@@ -919,6 +1408,8 @@ impl Drop for HeldButtonStrand {
                 phase = "button_guard_drop",
                 stage = self.stage,
                 button = button_label(button),
+                reason,
+                release_refusal_code = self.release_refusal_code,
                 "the RAII button-up could not be inserted even after retry; the button may still be down system-wide"
             );
         }
@@ -931,6 +1422,144 @@ impl Drop for HeldButtonStrand {
 
 /// How often the watchdog thread re-reads the strand mirror.
 const WATCHDOG_TICK_MS: u64 = 1_000;
+
+/// Externally readable state of the synthetic-input watchdog (#2082 finding E).
+///
+/// The FSV that tried to prove the watchdog fires could not: there is no
+/// `act_key_down` verb, and every hold reachable from the public surface arms an
+/// emission budget, which moves the bound from the 30 s no-budget track to the
+/// 300 s budget track. Nothing in the daemon said which track was in force, so
+/// the untestable branch was also unobservable. This makes both the **bound** and
+/// the **tracked hold state** readable without any new action verb, so a future
+/// FSV can assert the selection rule directly instead of trying to trip it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SyntheticHoldWatchdogStatus {
+    /// Whether the watchdog thread is running in this process.
+    pub started: bool,
+    /// Watchdog poll interval.
+    pub tick_ms: u64,
+    /// Capacity of the strand mirror.
+    pub strand_slots: usize,
+    /// The bound in force **right now**, i.e. what a hold would be measured
+    /// against if the watchdog ticked at this instant.
+    pub bound_ms: u64,
+    /// Which of the two tracks [`Self::bound_ms`] came from.
+    pub emission_budget_armed: bool,
+    /// The no-budget track: `HELD_KEY_MAX_DURATION_MS` + grace.
+    pub no_budget_bound_ms: u64,
+    /// The budget-armed track: `MAX_LEASE_TTL_MS` + grace.
+    pub budget_armed_bound_ms: u64,
+    /// Mirrored key strands currently held.
+    pub tracked_key_holds: usize,
+    /// Mirrored mouse buttons currently held.
+    pub tracked_button_holds: usize,
+    /// Age of the oldest tracked hold, in milliseconds; `0` when nothing is held.
+    pub longest_hold_ms: u64,
+    /// Presses that could not be mirrored because the mirror was full.
+    pub strand_mirror_overflows: u64,
+    /// Strands this generation's watchdog has force-released.
+    pub force_releases: u64,
+}
+
+impl SyntheticHoldWatchdogStatus {
+    /// Which of the two bound tracks is currently selected.
+    #[must_use]
+    pub const fn bound_track(&self) -> &'static str {
+        if self.emission_budget_armed {
+            "emission_budget"
+        } else {
+            "held_key_max_duration"
+        }
+    }
+
+    /// A flat `key=value` rendering for the `action` health subsystem's `detail`
+    /// string, which is already a space-separated `key=value` blob.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!(
+            "synthetic_watchdog_started={} synthetic_watchdog_tick_ms={} \
+             synthetic_hold_bound_ms={} synthetic_hold_bound_track={} \
+             synthetic_hold_bound_no_budget_ms={} synthetic_hold_bound_budget_armed_ms={} \
+             synthetic_holds_tracked_keys={} synthetic_holds_tracked_buttons={} \
+             synthetic_hold_longest_ms={} synthetic_strand_mirror_overflows={} \
+             synthetic_watchdog_force_releases={}",
+            self.started,
+            self.tick_ms,
+            self.bound_ms,
+            self.bound_track(),
+            self.no_budget_bound_ms,
+            self.budget_armed_bound_ms,
+            self.tracked_key_holds,
+            self.tracked_button_holds,
+            self.longest_hold_ms,
+            self.strand_mirror_overflows,
+            self.force_releases,
+        )
+    }
+}
+
+/// Reads the watchdog's configured bound and its current tracked-hold state.
+///
+/// Side-effect free: it loads the same atomics the watchdog reads, so calling it
+/// from a health probe cannot perturb what it reports. The bound-selection rule
+/// is [`crate::lease::synthetic_hold_watchdog_bound_ms`]'s — it is reproduced
+/// here only so both tracks and the choice between them can be reported in one
+/// consistent reading.
+#[must_use]
+pub fn synthetic_hold_watchdog_status() -> SyntheticHoldWatchdogStatus {
+    let now = now_ms();
+    let mut tracked_key_holds = 0_usize;
+    let mut tracked_button_holds = 0_usize;
+    let mut oldest = 0_u64;
+
+    for (cell, since_cell) in STRAND_TOKENS.iter().zip(STRAND_SINCE_MS.iter()) {
+        let since = since_cell.load(Ordering::Acquire);
+        if cell.load(Ordering::Acquire) == TOKEN_EMPTY || since == 0 {
+            continue;
+        }
+        tracked_key_holds += 1;
+        oldest = oldest.max(now.saturating_sub(since));
+    }
+    for since_cell in &BUTTON_SINCE_MS {
+        let since = since_cell.load(Ordering::Acquire);
+        if since == 0 {
+            continue;
+        }
+        tracked_button_holds += 1;
+        oldest = oldest.max(now.saturating_sub(since));
+    }
+
+    let no_budget_bound_ms = crate::emitter::HELD_KEY_MAX_DURATION_MS
+        .saturating_add(crate::lease::SYNTHETIC_HOLD_WATCHDOG_GRACE_MS);
+    let budget_armed_bound_ms = crate::lease::MAX_LEASE_TTL_MS
+        .saturating_add(crate::lease::SYNTHETIC_HOLD_WATCHDOG_GRACE_MS);
+    // Read the budget exactly once and derive `bound_ms` from that same reading
+    // rather than calling `synthetic_hold_watchdog_bound_ms()` separately: two
+    // acquisitions could straddle an arm/disarm and publish a `bound_ms` that
+    // contradicts the `emission_budget_armed` printed beside it. It also halves
+    // this probe's traffic on a process-global lock.
+    let emission_budget_armed = crate::lease::emission_budget_armed();
+    let bound_ms = if emission_budget_armed {
+        budget_armed_bound_ms
+    } else {
+        no_budget_bound_ms
+    };
+
+    SyntheticHoldWatchdogStatus {
+        started: WATCHDOG_STARTED.load(Ordering::SeqCst),
+        tick_ms: WATCHDOG_TICK_MS,
+        strand_slots: STRAND_SLOTS,
+        bound_ms,
+        emission_budget_armed,
+        no_budget_bound_ms,
+        budget_armed_bound_ms,
+        tracked_key_holds,
+        tracked_button_holds,
+        longest_hold_ms: oldest,
+        strand_mirror_overflows: STRAND_OVERFLOWS.load(Ordering::Relaxed),
+        force_releases: WATCHDOG_FORCE_RELEASES.load(Ordering::Relaxed),
+    }
+}
 
 /// Releases any strand held longer than the current planned-emission bound.
 ///
@@ -962,6 +1591,7 @@ pub fn watchdog_tick() -> usize {
         since_cell.store(0, Ordering::Release);
         let emitted = release_token_now(token);
         released += 1;
+        WATCHDOG_FORCE_RELEASES.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             code = "SYNTHETIC_INPUT_WATCHDOG_RELEASED",
             kind = "key",
@@ -1005,6 +1635,7 @@ pub fn watchdog_tick() -> usize {
         }
         let emitted = release_button_now(button);
         released += 1;
+        WATCHDOG_FORCE_RELEASES.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             code = "SYNTHETIC_INPUT_WATCHDOG_RELEASED",
             kind = "button",
@@ -1111,10 +1742,21 @@ pub fn spawn_synthetic_input_watchdog() -> bool {
         });
     match spawned {
         Ok(_handle) => {
+            // The bound is not a constant — it is selected per tick from whether
+            // an emission budget is armed. Logging both tracks and the one in
+            // force at boot is what makes the 30 s vs 300 s selection auditable
+            // from the daemon log alone (#2082 finding E).
+            let status = synthetic_hold_watchdog_status();
             tracing::info!(
                 code = "SYNTHETIC_INPUT_WATCHDOG_STARTED",
                 tick_ms = WATCHDOG_TICK_MS,
                 strand_slots = STRAND_SLOTS,
+                bound_ms_at_start = status.bound_ms,
+                bound_track_at_start = status.bound_track(),
+                no_budget_bound_ms = status.no_budget_bound_ms,
+                budget_armed_bound_ms = status.budget_armed_bound_ms,
+                emission_budget_armed_at_start = status.emission_budget_armed,
+                bound_selection = "no emission budget armed -> HELD_KEY_MAX_DURATION_MS + grace; budget armed -> MAX_LEASE_TTL_MS + grace",
                 "synthetic-input watchdog thread started; synthetic input held past the planned-emission budget is force-released"
             );
             true
