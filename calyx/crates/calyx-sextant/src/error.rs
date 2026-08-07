@@ -32,6 +32,16 @@ pub const CALYX_SEXTANT_GPU_PARITY_UNAVAILABLE: &str = "CALYX_SEXTANT_GPU_PARITY
 pub const CALYX_SEXTANT_POSTINGS_CORRUPT: &str = "CALYX_SEXTANT_POSTINGS_CORRUPT";
 pub const CALYX_SEXTANT_POSTINGS_NOT_SORTED: &str = "CALYX_SEXTANT_POSTINGS_NOT_SORTED";
 pub const CALYX_SEXTANT_PROVENANCE_MISSING: &str = "CALYX_SEXTANT_PROVENANCE_MISSING";
+/// A hash-verified ledger entry of a recognised shape positively does not name
+/// the constellation whose Base row points at it (#2084). The ledger row is
+/// intact — this is a provenance-stamping fault, never vault corruption.
+pub const CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED: &str =
+    "CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED";
+/// A hash-verified ledger entry carries a `(kind, subject)` shape that the
+/// provenance coverage table does not declare (#2084). Fail closed naming the
+/// shape rather than guess at its membership or call an intact row corrupt.
+pub const CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED: &str =
+    "CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED";
 pub const CALYX_SEXTANT_RECURRENCE_READ_ERROR: &str = "CALYX_SEXTANT_RECURRENCE_READ_ERROR";
 pub const CALYX_SEXTANT_CX_MISSING: &str = "CALYX_SEXTANT_CX_MISSING";
 pub const CALYX_SEXTANT_CONSENSUS_INSUFFICIENT_LENSES: &str =
@@ -107,6 +117,12 @@ pub fn sextant_error(code: &'static str, message: impl Into<String>) -> CalyxErr
         CALYX_SEXTANT_POSTINGS_NOT_SORTED => "sort postings by increasing document id",
         CALYX_SEXTANT_PROVENANCE_MISSING => {
             "attach the stored constellation before requiring provenance"
+        }
+        CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED => {
+            "re-stamp this constellation's Base provenance from the ledger entry that actually commits it; the entry hash matched, so the ledger is intact and must not be restored"
+        }
+        CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED => {
+            "declare this (entry kind, subject) shape in the calyx-search provenance coverage table and state how it names its constellations; the entry hash matched, so the ledger is intact and must not be restored"
         }
         CALYX_SEXTANT_RECURRENCE_READ_ERROR => {
             "repair the recurrence frequency scalar or recurrence CF rows"

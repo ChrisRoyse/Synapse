@@ -3980,6 +3980,7 @@ dependencies = [
  "calyx-aster",
  "calyx-core",
  "calyx-forge",
+ "calyx-ledger",
  "calyx-lenses",
  "calyx-loom",
  "calyx-mincut",

@@ -64,6 +64,7 @@ pub(super) fn search(
             err.message
         ))
     })?;
+    require_multi_kind(entry, slot)?;
     if entry.require_token_dim(slot)? != *token_dim {
         return Err(stale(format!(
             "persistent multi slot {slot} token_dim {} != query token_dim {token_dim}; reingest/backfill the vault",
@@ -94,6 +95,24 @@ pub(super) fn search(
     } else {
         let index = read_json(vault_dir, entry, manifest_base_seq, slot)?;
         Ok(ranked(top_k(score(&index, query_tokens, candidates), k)))
+    }
+}
+
+/// Refuses any manifest entry kind this lane cannot read, by name.
+///
+/// The dispatch above selects between the binary sidecar, the segmented
+/// sidecar, and the legacy JSON index. Without this gate the final `else` was a
+/// silent catch-all: an entry of any other kind routed to the JSON reader, so a
+/// shape this lane does not understand produced either a confusing artifact
+/// error or, worse, a ranking from the wrong index. Mirrors
+/// `sparse::require_sparse_kind` and the manifest-decode gate in
+/// `persisted::generation` (#2084 sibling sweep).
+fn require_multi_kind(entry: &SearchIndexEntry, slot: SlotId) -> CliResult {
+    match entry.kind.as_str() {
+        "multi_maxsim" | "multi_maxsim_segments" => Ok(()),
+        other => Err(stale(format!(
+            "persistent slot {slot} index kind {other} is not a supported multi-vector index; rebuild the vault search indexes"
+        ))),
     }
 }
 

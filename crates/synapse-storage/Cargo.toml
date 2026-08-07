@@ -51,6 +51,11 @@ calyx-assay = { workspace = true }
 # calyx-loom         loom_agreement_kernel_fsv measures the weave cosine against
 #                    the scalar loop it replaced (#1917).
 calyx-loom = { workspace = true }
+# calyx-ledger       provenance_coverage_shapes_fsv mints one ledger entry of
+#                    every declared (kind, subject) shape so the search
+#                    provenance coverage table is exercised shape by shape
+#                    against the real writers rather than described (#2084).
+calyx-ledger = { workspace = true }
 # tracing-subscriber the instruments that must read the engine's own structured
 #                    log as evidence rather than infer it from return values
 #                    (#1936). The daemon installs its own subscriber.

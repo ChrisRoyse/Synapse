@@ -8,7 +8,9 @@ use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, LedgerRef};
 use calyx_ledger::{EntryKind, LedgerEntry, SubjectId, decode};
 use calyx_sextant::{
-    CALYX_SEXTANT_PROVENANCE_MISSING, FreshnessTag, Hit, ProvenanceSource, sextant_error,
+    CALYX_SEXTANT_PROVENANCE_MISSING, CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
+    CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED, FreshnessTag, Hit, ProvenanceSource,
+    sextant_error,
 };
 use serde_json::Value;
 
@@ -106,7 +108,7 @@ pub(crate) fn attach_verified_provenance(
             let verifier = ledger
                 .as_mut()
                 .expect("pending hits imply an opened ledger verifier");
-            hit.provenance = verifier.require_ref(hit.cx_id, cx.provenance.clone())?;
+            hit.provenance = verifier.require_ref(hit.cx_id, cx.provenance.clone(), trace)?;
             ledger_memo_insert(&vault_key, hit.cx_id, &cx.provenance);
         }
         hit.provenance_source = ProvenanceSource::Stored;
@@ -212,9 +214,16 @@ impl TargetedLedgerVerifier {
         })
     }
 
-    fn require_ref(&mut self, cx_id: CxId, expected: LedgerRef) -> CliResult<LedgerRef> {
+    fn require_ref(
+        &mut self,
+        cx_id: CxId,
+        expected: LedgerRef,
+        trace: &mut crate::engine_trace::SearchTracer<'_>,
+    ) -> CliResult<LedgerRef> {
         let entry = self.entry(cx_id, expected.seq)?;
         let entry_hash = entry.entry_hash;
+        let entry_kind = entry.kind;
+        let subject = SubjectShape::of(&entry.subject);
         if entry.entry_hash != expected.hash {
             return Err(CalyxError::ledger_corrupt(format!(
                 "search hit {cx_id} ledger seq {} hash does not match Base provenance",
@@ -222,12 +231,44 @@ impl TargetedLedgerVerifier {
             ))
             .into());
         }
-        if !entry_covers_cx(entry, cx_id)? {
-            return Err(CalyxError::ledger_corrupt(format!(
-                "search hit {cx_id} ledger seq {} subject mismatch",
-                expected.seq
-            ))
-            .into());
+        // Past this point the ledger row is byte-for-byte the one Base recorded,
+        // so nothing below may report corruption on the strength of coverage
+        // alone (#2084). Coverage answers a different question — does this entry
+        // attest THIS constellation — and its negatives are provenance faults,
+        // not vault damage.
+        match entry_coverage(entry, cx_id)? {
+            Coverage::Subject | Coverage::PayloadList => {}
+            Coverage::BatchScope => {
+                // The entry is a declared batch attestation that does not
+                // enumerate its members, so coverage rests on the entry-hash and
+                // chain-link binding above rather than on an identity carried in
+                // the entry. Say so in the trace instead of silently presenting
+                // it as a subject-verified hit.
+                trace.emit_detail(
+                    "provenance.ledger_coverage.batch_scoped",
+                    None,
+                    None,
+                    Some(format!(
+                        "cx={cx_id} seq={} kind={entry_kind} subject={}",
+                        expected.seq,
+                        subject.tag()
+                    )),
+                );
+            }
+            Coverage::NotCovered => {
+                return Err(sextant_error(
+                    CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED,
+                    format!(
+                        "search hit {cx_id} ledger seq {} carries the {entry_kind}/{} shape, whose \
+                         subject names a different constellation and whose payload does not list \
+                         this one; the entry hash matches the stored Base provenance, so the \
+                         ledger row is intact",
+                        expected.seq,
+                        subject.tag()
+                    ),
+                )
+                .into());
+            }
         }
         self.require_chain_link(cx_id, expected.seq, entry_hash)?;
         Ok(expected)
@@ -301,33 +342,257 @@ fn missing_provenance(message: impl Into<String>) -> CalyxError {
     sextant_error(CALYX_SEXTANT_PROVENANCE_MISSING, message)
 }
 
-fn entry_covers_cx(entry: &LedgerEntry, cx_id: CxId) -> CliResult<bool> {
-    if entry.subject == SubjectId::Cx(cx_id) {
-        return Ok(true);
-    }
-    if entry.kind != EntryKind::Ingest {
-        return Ok(false);
-    }
-    batch_ingest_payload_contains_cx(entry, cx_id)
+/// The `SubjectId` variant, stripped of its identity payload so the coverage
+/// table can dispatch on shape.
+///
+/// The conversion is an exhaustive `match` on purpose: a subject variant added
+/// to `calyx-ledger` fails this build instead of silently collapsing into an
+/// existing arm.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SubjectShape {
+    Cx,
+    Lens,
+    Kernel,
+    Guard,
+    Query,
 }
 
-fn batch_ingest_payload_contains_cx(entry: &LedgerEntry, cx_id: CxId) -> CliResult<bool> {
+impl SubjectShape {
+    fn of(subject: &SubjectId) -> Self {
+        match subject {
+            SubjectId::Cx(_) => Self::Cx,
+            SubjectId::Lens(_) => Self::Lens,
+            SubjectId::Kernel(_) => Self::Kernel,
+            SubjectId::Guard(_) => Self::Guard,
+            SubjectId::Query(_) => Self::Query,
+        }
+    }
+
+    /// Stable label carried in evidence so a refusal names the shape it saw.
+    fn tag(self) -> &'static str {
+        match self {
+            Self::Cx => "cx",
+            Self::Lens => "lens",
+            Self::Kernel => "kernel",
+            Self::Guard => "guard",
+            Self::Query => "query",
+        }
+    }
+}
+
+/// How one declared ledger-entry shape names the constellations it covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoverageRule {
+    /// The entry covers exactly the constellation named by its `Cx` subject, so
+    /// a `Cx` subject naming a different constellation is a decided negative.
+    SubjectCx,
+    /// A batch entry that enumerates its members in the payload under `cx_id`.
+    /// A payload that cannot be read as that shape is malformed — a genuine
+    /// corruption signal, not a negative.
+    EnumeratedCxList,
+    /// A declared batch entry that stamps one `LedgerRef` onto every Base row it
+    /// commits without naming any of them in the entry. Membership is not
+    /// decidable from the entry; the Base row's binding to it is established by
+    /// the entry-hash and chain-link checks that run before coverage.
+    BatchScoped,
+    /// No writer in this workspace stamps a Base row's provenance with this
+    /// shape. Fail closed naming the shape rather than guess at its membership.
+    Unregistered,
+}
+
+/// The declared coverage rule for one `(EntryKind, SubjectShape)` shape.
+///
+/// #2084: coverage recognition used to be two hard-coded special cases — a `Cx`
+/// subject naming the hit, or an `Ingest` entry whose payload listed it — and
+/// every other legitimately minted shape fell through to a bare `false`, which
+/// the caller reported as `CALYX_LEDGER_CORRUPT` with a "restore from restic"
+/// remediation, on rows whose entry hash had just matched their Base provenance
+/// byte for byte. The concrete shape that tripped it is the multi-constellation
+/// grounding anchor batch (`Grounding` / `Query`), which stamps one entry onto
+/// every constellation in the batch.
+///
+/// Recognition is now this declared table, and both matches below are exhaustive
+/// — over `EntryKind` and over `SubjectShape` — so a kind or subject variant
+/// added to `calyx-ledger` breaks this build rather than degrading into a false
+/// corruption verdict at query time. Each arm cites the writer that mints it.
+fn coverage_rule(kind: EntryKind, subject: SubjectShape) -> CoverageRule {
+    match kind {
+        // Single ingest stamps `Cx(cx)` (calyx-aster vault/store.rs,
+        // vault/dedup_commit.rs, vault/ledger_append.rs
+        // `stage_raw_ingest_ledger_locked`) and is decided by the subject.
+        // Batch ingest names only the FIRST accepted constellation as subject
+        // and enumerates the whole batch in the payload `cx_id` array
+        // (calyx-aster vault/batch_ingest.rs `batch_payload`), so a `Cx` subject
+        // that is not ours must enumerate. Every other subject variant is an
+        // opaque batch marker minted by a caller supplying its own subject and
+        // payload: the derived snapshot publication
+        // (`Query(operation_id)`, synapse-calyx panel_lifecycle.rs), the
+        // cross-model transaction (`Query(batch digest)`, calyx-aster
+        // txn/cross_model.rs), the precondition-gated ingest
+        // (`Guard(vault_id)`, calyx-aster vault/ingest_precondition.rs) and the
+        // KV/document/relational/timeseries/blob layer commits. None of those
+        // enumerate their members.
+        EntryKind::Ingest => match subject {
+            SubjectShape::Cx => CoverageRule::EnumeratedCxList,
+            SubjectShape::Lens
+            | SubjectShape::Kernel
+            | SubjectShape::Guard
+            | SubjectShape::Query => CoverageRule::BatchScoped,
+        },
+        // The single-anchor grounding writer stamps `Cx(cx)` (synapse-calyx
+        // `put_grounding_anchors`). The multi-constellation writer stamps ONE
+        // `Query(b"synapse.grounding_anchor.multi.v1")` entry onto every
+        // constellation in the batch (synapse-calyx
+        // `put_grounding_anchors_for_many` -> calyx-aster
+        // vault/ledger_anchor_batch.rs `multi_cx_anchor_rows_with_ledger_ref`)
+        // and its payload lists hashed source-row keys, never cx ids. That is
+        // the shape #2084 reported as vault corruption.
+        EntryKind::Grounding => match subject {
+            SubjectShape::Cx => CoverageRule::SubjectCx,
+            SubjectShape::Query => CoverageRule::BatchScoped,
+            SubjectShape::Lens | SubjectShape::Kernel | SubjectShape::Guard => {
+                CoverageRule::Unregistered
+            }
+        },
+        // Single-subject rewrites of one stored constellation:
+        //   Migrate  — retained-input-pointer and temporal-metadata backfills
+        //              (calyx-aster vault/input_pointer.rs, vault/temporal_metadata.rs)
+        //   Guard    — reactive trigger persistence and Ward verdicts
+        //              (calyx-loom reactive/durable.rs, calyx-ward ledger.rs)
+        //   Admin    — GC orphan Base repair (calyx-aster gc/orphan_reconciler)
+        //   Erase    — per-constellation tombstones (calyx-aster erase.rs)
+        // Each names its constellation in the subject and never covers a second
+        // one, so a different `Cx` subject is a decided negative. Their non-`Cx`
+        // forms (vault-wide erase `Guard(scope digest)`, residency/retention
+        // `Guard(..)`, reproduce and checkpoint `Query(..)`, subscription
+        // `Guard(..)`) commit no Base rows at all.
+        EntryKind::Migrate | EntryKind::Guard | EntryKind::Admin | EntryKind::Erase => {
+            match subject {
+                SubjectShape::Cx => CoverageRule::SubjectCx,
+                SubjectShape::Lens
+                | SubjectShape::Kernel
+                | SubjectShape::Guard
+                | SubjectShape::Query => CoverageRule::Unregistered,
+            }
+        }
+        // Kinds with no Base-stamping writer in the workspace. Measure, Score,
+        // Admission and AgentForecast have no writer at all; Assay, Kernel,
+        // Answer, Anneal, Policy and BatchCommitment write evidence rows
+        // (Registry/Graph/AnnealReport/checkpoint cohorts) and never rewrite a
+        // Base row's provenance. A `Cx` subject naming the hit is still accepted
+        // before this table is consulted, so reaching here means the entry
+        // neither names the hit nor belongs to a declared batch shape.
+        EntryKind::Measure
+        | EntryKind::Assay
+        | EntryKind::Kernel
+        | EntryKind::Answer
+        | EntryKind::Anneal
+        | EntryKind::Admission
+        | EntryKind::AgentForecast
+        | EntryKind::Policy
+        | EntryKind::Score
+        | EntryKind::BatchCommitment => match subject {
+            SubjectShape::Cx
+            | SubjectShape::Lens
+            | SubjectShape::Kernel
+            | SubjectShape::Guard
+            | SubjectShape::Query => CoverageRule::Unregistered,
+        },
+    }
+}
+
+/// The decided relationship between one ledger entry and one constellation.
+///
+/// Separating these from "the entry is unreadable" is the whole point of #2084:
+/// only a malformed entry is a corruption signal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Coverage {
+    /// The entry's `Cx` subject names this constellation.
+    Subject,
+    /// The entry's payload member list names this constellation.
+    PayloadList,
+    /// A declared batch shape whose membership the entry does not enumerate.
+    BatchScope,
+    /// A recognised shape that positively does not cover this constellation.
+    NotCovered,
+}
+
+fn entry_coverage(entry: &LedgerEntry, cx_id: CxId) -> CliResult<Coverage> {
+    if entry.subject == SubjectId::Cx(cx_id) {
+        return Ok(Coverage::Subject);
+    }
+    let subject = SubjectShape::of(&entry.subject);
+    match coverage_rule(entry.kind, subject) {
+        CoverageRule::SubjectCx => Ok(Coverage::NotCovered),
+        CoverageRule::EnumeratedCxList => {
+            if payload_names_cx(entry, cx_id)? {
+                Ok(Coverage::PayloadList)
+            } else {
+                Ok(Coverage::NotCovered)
+            }
+        }
+        CoverageRule::BatchScoped => Ok(Coverage::BatchScope),
+        CoverageRule::Unregistered => Err(sextant_error(
+            CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
+            format!(
+                "search hit {cx_id} ledger seq {} carries the {}/{} shape, which no declared \
+                 writer stamps onto a Base row's provenance; the entry hash matches the stored \
+                 Base provenance, so the ledger row itself is intact",
+                entry.seq,
+                entry.kind,
+                subject.tag()
+            ),
+        )
+        .into()),
+    }
+}
+
+/// Reads the `cx_id` member declaration of an enumerating batch entry.
+///
+/// Both observed conventions are accepted: the single-constellation writers
+/// carry `cx_id` as a string, batch ingest carries it as an array. Anything else
+/// is a malformed entry of a shape declared to enumerate — the one condition in
+/// this file that is genuinely a ledger-content defect, so it keeps the loud
+/// corruption verdict and its restore remediation.
+fn payload_names_cx(entry: &LedgerEntry, cx_id: CxId) -> CliResult<bool> {
     let payload = serde_json::from_slice::<Value>(&entry.payload).map_err(|error| {
         CalyxError::ledger_corrupt(format!(
-            "ingest ledger seq {} subject mismatch and payload is invalid JSON: {error}",
-            entry.seq
+            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
+             its payload is not valid JSON: {error}",
+            entry.seq, entry.kind
         ))
     })?;
-    let ids = payload
-        .get("cx_id")
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            CalyxError::ledger_corrupt(format!(
-                "ingest ledger seq {} subject mismatch and payload missing cx_id array",
-                entry.seq
-            ))
-        })?;
-    Ok(ids
-        .iter()
-        .any(|value| value.as_str() == Some(&cx_id.to_string())))
+    let members = payload.get("cx_id").ok_or_else(|| {
+        CalyxError::ledger_corrupt(format!(
+            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
+             its payload carries no cx_id member declaration",
+            entry.seq, entry.kind
+        ))
+    })?;
+    let target = cx_id.to_string();
+    match members {
+        Value::String(single) => Ok(single == &target),
+        Value::Array(ids) => Ok(ids
+            .iter()
+            .any(|value| value.as_str() == Some(target.as_str()))),
+        other => Err(CalyxError::ledger_corrupt(format!(
+            "ledger seq {} carries the {} shape, but its payload cx_id member declaration is \
+             neither a constellation id nor a list of them ({})",
+            entry.seq,
+            entry.kind,
+            json_type_name(other)
+        ))
+        .into()),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
