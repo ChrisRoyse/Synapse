@@ -14,6 +14,7 @@ pub mod humanize;
 pub mod invoke;
 pub mod lease;
 pub mod path;
+pub mod process_parentage;
 pub mod rate_limit;
 pub mod recovery;
 pub mod safety;
@@ -85,6 +86,9 @@ pub use lease::{
 pub use path::{
     ArcLengthPath, DEFAULT_ARCLEN_LUT_SEGMENTS, PathError, PathResult, SpatialPath, path_length,
     path_point_at, path_point_at_arclen, sample_path, sample_path_arclen,
+};
+pub use process_parentage::{
+    PROCESS_PARENTAGE_SCHEMA_VERSION, ParentageState, ProcessParentage, capture_process_parentage,
 };
 pub use rate_limit::{
     SOFTWARE_RATE_LIMIT_PER_S, TokenBucket, TokenBucketSnapshot, VIGEM_RATE_LIMIT_PER_S,

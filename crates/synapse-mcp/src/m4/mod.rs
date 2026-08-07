@@ -1768,12 +1768,47 @@ pub fn launch_process_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
     .into_bytes()
 }
 
+/// Build the `CF_PROCESS_HISTORY` row for one `act_launch`.
+///
+/// Parentage (#2089) is observed here rather than assumed. Before this, launch
+/// rows recorded the launched `pid` and nothing about who launched it, so the
+/// `syn-graphpos-process-v1` process lane had no source for a single
+/// parent/child edge. The row now carries:
+///
+/// * `parentage` — the full observation, always, including every state in which
+///   parentage could **not** be established, with the exact reason. Absence is
+///   never silent.
+/// * `parent_pid` — present only when the observation is edge-bearing (the
+///   kernel named a parent, that pid's current occupant was created at or before
+///   the child, and both creation times came from one snapshot). A recycled pid
+///   therefore cannot fabricate an edge, because the flat field the graph reads
+///   is simply not written.
 pub fn launch_process_history_row(
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
 ) -> Result<Vec<u8>, ErrorData> {
     let launched_at_unix_ms = launched_at_unix_ms(&response.launched_at)?;
-    let row = json!({
+    let parentage = synapse_action::capture_process_parentage(response.pid);
+    let parent_pid = parentage.edge_parent_pid();
+    if parent_pid.is_none() {
+        tracing::warn!(
+            code = "ACTION_LAUNCH_PARENTAGE_UNPROVEN",
+            pid = response.pid,
+            state = parentage.state.as_str(),
+            parent_pid_observed = parentage.parent_pid_observed,
+            reason = parentage.unavailable_reason.as_deref().unwrap_or("none"),
+            "act_launch recorded a process history row whose parentage could not be proven; the \
+             process graph will not derive a parent edge from it"
+        );
+    }
+    let parentage = serde_json::to_value(&parentage).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_launch process history parentage encode failed: {error}"),
+        )
+    })?;
+    let mut row = json!({
+        "parentage": parentage,
         "schema_version": 1,
         "row_kind": "process_start",
         "tool": "act_launch",
@@ -1806,6 +1841,19 @@ pub fn launch_process_history_row(
         "desktop": params.desktop,
         "desktop_readback": response.desktop,
     });
+    // Written only when the observation is edge-bearing, and written as an
+    // integer when it is. The key is absent rather than `null` for an unproven
+    // parentage so the graph reader's "is this field present" question has one
+    // unambiguous answer.
+    if let Some(parent_pid) = parent_pid {
+        let Some(object) = row.as_object_mut() else {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "act_launch process history row was not a JSON object",
+            ));
+        };
+        object.insert("parent_pid".to_owned(), json!(parent_pid));
+    }
     encode_json(&row).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
