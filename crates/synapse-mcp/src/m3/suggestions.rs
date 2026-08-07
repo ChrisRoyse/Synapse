@@ -23,7 +23,7 @@
 //! restart re-derives every cap and dedup decision from the persisted rows.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use chrono::{Local, TimeZone, Timelike};
 use rmcp::{ErrorData, schemars::JsonSchema};
@@ -33,7 +33,7 @@ use sha2::{Digest, Sha256};
 use synapse_core::error_codes;
 use synapse_core::intent::IntentCandidate;
 use synapse_core::types::{
-    EpisodeRecord, RoutineFeedbackOutcome, RoutineGranularity, RoutineLifecycle,
+    EpisodeRecord, RoutineFeedbackOutcome, RoutineGranularity, RoutineLifecycle, SubsystemHealth,
 };
 use synapse_core::{SCHEMA_VERSION, StoredEvent};
 use synapse_storage::{
@@ -1521,9 +1521,28 @@ fn compose_next_actions_from_calyx(
     Ok((report, candidates))
 }
 
+/// Produces next-action candidates for one tick, recording what the pass did
+/// where `health` can read it (#2068 clause 5).
+///
+/// The recording is the whole point of the wrapper: the composition report
+/// otherwise reaches only the caller of `suggestion_tick`, so an operator could
+/// learn whether assist can compose only by asking it to compose.
+fn next_action_candidates(
+    db: &Arc<Db>,
+    now: u64,
+    params: &SuggestionTickParams,
+) -> Result<(NextActionCompositionReport, Vec<NextActionCandidate>), ErrorData> {
+    let outcome = compose_next_action_candidates(db, now, params);
+    match &outcome {
+        Ok((report, _candidates)) => record_next_action_composition(report),
+        Err(error) => record_next_action_composition_error(error),
+    }
+    outcome
+}
+
 /// Produces next-action candidates for one tick, preferring the frozen artifact
 /// so the common path issues no live Calyx call at all.
-fn next_action_candidates(
+fn compose_next_action_candidates(
     db: &Arc<Db>,
     now: u64,
     params: &SuggestionTickParams,
@@ -1570,6 +1589,319 @@ fn next_action_candidates(
         return Ok((report, Vec::new()));
     }
     compose_next_actions_from_calyx(db, now, params, staleness_bound_secs)
+}
+
+// === Next-action readiness as a health subsystem (#2068 clause 5) ===
+//
+// Composition state that never leaves the tick response is state an unattended
+// operator cannot act on. #2076 is the exact case this exists for: the composer
+// refuses every live pass with `ASSIST_NEXT_ACTION_NO_HOP_EVIDENCE` while a
+// frozen artifact keeps answering inside its staleness bound, so from outside
+// the surface looks merely quiet. The refusal is retained here independently of
+// the last outcome precisely so a serving artifact cannot hide it.
+//
+// Durable truth is still `CF_KV`: the artifact half of this reading is a
+// point-read of `assist_next_action/v1/current` and its frozen row on every
+// health call, never a cached copy. Only the *composition* half — which pass
+// last ran and what it decided — is daemon-generation memory, because there is
+// no durable record of a refusal to read (a refusal by construction writes
+// nothing).
+
+/// Truncation bound on the refusal detail carried into `health`, so one verbose
+/// Calyx refusal cannot dominate the health payload.
+const NEXT_ACTION_HEALTH_DETAIL_MAX: usize = 512;
+
+/// Last next-action composition outcome, for `health` (#2068 clause 5).
+static LAST_NEXT_ACTION_COMPOSITION: OnceLock<Mutex<NextActionCompositionState>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct NextActionCompositionState {
+    /// `disabled` | `frozen_artifact` | `calyx_kernel_graph` | `refused` | `error`.
+    outcome: Option<String>,
+    at_unix_ms: Option<u64>,
+    grounded: Option<bool>,
+    candidates: Option<u32>,
+    /// When live Calyx composition last actually succeeded. Retained across
+    /// later refusals so a refusal streak cannot hide how old the last real
+    /// composition is.
+    last_composed_unix_ms: Option<u64>,
+    /// Retained across later successes for the same reason in the other
+    /// direction.
+    refusal_code: Option<String>,
+    refusal_detail: Option<String>,
+    refusal_at_unix_ms: Option<u64>,
+    /// Passes that refused or errored since the last live composition.
+    consecutive_refusals: u32,
+}
+
+fn next_action_composition_state() -> &'static Mutex<NextActionCompositionState> {
+    LAST_NEXT_ACTION_COMPOSITION.get_or_init(|| Mutex::new(NextActionCompositionState::default()))
+}
+
+fn with_next_action_composition_state(update: impl FnOnce(&mut NextActionCompositionState)) {
+    match next_action_composition_state().lock() {
+        Ok(mut state) => update(&mut state),
+        Err(error) => tracing::error!(
+            code = "ASSIST_NEXT_ACTION_HEALTH_STATE_POISONED",
+            error = %error,
+            remediation = "inspect daemon logs for a panic inside the next-action composer; the health readback for assist next-action composition is stale until the daemon restarts",
+            "next-action composition could not record its outcome for health"
+        ),
+    }
+}
+
+fn next_action_health_detail(detail: &str) -> String {
+    if detail.len() <= NEXT_ACTION_HEALTH_DETAIL_MAX {
+        return detail.to_owned();
+    }
+    let mut end = NEXT_ACTION_HEALTH_DETAIL_MAX;
+    while end > 0 && !detail.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} […truncated]", &detail[..end])
+}
+
+fn record_next_action_composition(report: &NextActionCompositionReport) {
+    let at_unix_ms = now_ts_ns() / 1_000_000;
+    with_next_action_composition_state(|state| {
+        state.outcome = Some(report.outcome.clone());
+        state.at_unix_ms = Some(at_unix_ms);
+        state.grounded = Some(report.grounded);
+        state.candidates = Some(report.candidates);
+        match report.outcome.as_str() {
+            "refused" => {
+                state.refusal_code = report.refusal_code.clone();
+                state.refusal_detail = report
+                    .refusal_detail
+                    .as_deref()
+                    .map(next_action_health_detail);
+                state.refusal_at_unix_ms = Some(at_unix_ms);
+                state.consecutive_refusals = state.consecutive_refusals.saturating_add(1);
+            }
+            "calyx_kernel_graph" => {
+                state.last_composed_unix_ms = Some(at_unix_ms);
+                state.consecutive_refusals = 0;
+            }
+            // `frozen_artifact` served without composing and `disabled` never
+            // tried: neither is evidence about the composer, so neither clears a
+            // refusal streak nor extends it.
+            _ => {}
+        }
+    });
+}
+
+/// Records a composition pass that failed hard rather than refusing honestly.
+///
+/// An error is not a refusal — it is not the honesty gate declining for want of
+/// evidence — but it has the same consequence for the operator (nothing can be
+/// composed), so it extends the same streak under its own `error` outcome.
+fn record_next_action_composition_error(error: &ErrorData) {
+    let at_unix_ms = now_ts_ns() / 1_000_000;
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or("ASSIST_NEXT_ACTION_COMPOSITION_FAILED")
+        .to_owned();
+    let detail = next_action_health_detail(error.message.as_ref());
+    with_next_action_composition_state(|state| {
+        state.outcome = Some("error".to_owned());
+        state.at_unix_ms = Some(at_unix_ms);
+        state.grounded = Some(false);
+        state.candidates = Some(0);
+        state.refusal_code = Some(code.clone());
+        state.refusal_detail = Some(detail.clone());
+        state.refusal_at_unix_ms = Some(at_unix_ms);
+        state.consecutive_refusals = state.consecutive_refusals.saturating_add(1);
+    });
+}
+
+/// Reports whether the assist surface can currently compose a next action.
+///
+/// Read-only by construction: it point-reads the artifact pointer row and the
+/// frozen row it names, and never measures, composes, or publishes. A health
+/// call that could trigger composition would be a health call that changes the
+/// thing it reports.
+///
+/// `error` is reserved for the two states that mean the surface is broken
+/// rather than merely quiet: a `CF_KV` read that fails or returns a torn/dangling
+/// artifact, and a hard composition failure that left no artifact behind. An
+/// absent artifact because nothing has ever composed is `pending`, and a
+/// present-but-stale artifact is its own `stale` state — neither is a fault.
+#[must_use]
+pub fn next_action_health(db: Option<&Arc<Db>>) -> SubsystemHealth {
+    let staleness_bound_secs = next_action_staleness_secs();
+    let state = match next_action_composition_state().try_lock() {
+        Ok(state) => NextActionCompositionState {
+            outcome: state.outcome.clone(),
+            at_unix_ms: state.at_unix_ms,
+            grounded: state.grounded,
+            candidates: state.candidates,
+            last_composed_unix_ms: state.last_composed_unix_ms,
+            refusal_code: state.refusal_code.clone(),
+            refusal_detail: state.refusal_detail.clone(),
+            refusal_at_unix_ms: state.refusal_at_unix_ms,
+            consecutive_refusals: state.consecutive_refusals,
+        },
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(
+                    "next-action composition state lock is busy; health is fail-closed and does \
+                     not wait behind a composition pass"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        }
+        Err(std::sync::TryLockError::Poisoned(_error)) => {
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(
+                    "next-action composition state lock poisoned by a panic inside the composer"
+                        .to_owned(),
+                ),
+                ..SubsystemHealth::default()
+            };
+        }
+    };
+
+    // Every reading carries the composition half, including the failure
+    // readings below: a refusal that is invisible whenever the artifact read
+    // also fails would be hidden by exactly the condition it explains.
+    let mut health = SubsystemHealth {
+        assist_next_action_staleness_bound_secs: Some(staleness_bound_secs),
+        assist_next_action_last_composition_outcome: state.outcome.clone(),
+        assist_next_action_last_composition_unix_ms: state.at_unix_ms,
+        assist_next_action_last_composition_grounded: state.grounded,
+        assist_next_action_last_composition_candidates: state.candidates,
+        assist_next_action_last_composed_unix_ms: state.last_composed_unix_ms,
+        assist_next_action_last_refusal_code: state.refusal_code.clone(),
+        assist_next_action_last_refusal_detail: state.refusal_detail.clone(),
+        assist_next_action_last_refusal_unix_ms: state.refusal_at_unix_ms,
+        assist_next_action_consecutive_refusals: Some(state.consecutive_refusals),
+        ..SubsystemHealth::default()
+    };
+
+    let Some(db) = db else {
+        health.status = "disabled".to_owned();
+        health.detail = Some(
+            "the vault is not open, so the frozen next-action artifact has no source of truth"
+                .to_owned(),
+        );
+        return health;
+    };
+    let artifact = match load_next_action_artifact(db) {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            health.status = "error".to_owned();
+            health.assist_next_action_artifact_present = Some(false);
+            health.detail = Some(format!(
+                "reading {NEXT_ACTION_CURRENT_KEY} from CF_KV failed closed: {}",
+                next_action_health_detail(error.message.as_ref())
+            ));
+            return health;
+        }
+    };
+
+    let composer_blocked = state.consecutive_refusals > 0;
+    let refusal_suffix = if composer_blocked {
+        format!(
+            " last_refusal={} after {} consecutive non-composing passes: {}",
+            state.refusal_code.as_deref().unwrap_or("<unnamed>"),
+            state.consecutive_refusals,
+            state.refusal_detail.as_deref().unwrap_or("<none>"),
+        )
+    } else {
+        String::new()
+    };
+
+    let Some(artifact) = artifact else {
+        health.assist_next_action_artifact_present = Some(false);
+        let (status, detail) = match state.outcome.as_deref() {
+            None => (
+                "pending",
+                format!(
+                    "no frozen next-action artifact exists at {NEXT_ACTION_CURRENT_KEY} and no \
+                     composition pass has run in this daemon generation, so assist has not yet \
+                     had the chance to compose; run assist operation=suggestion_tick with \
+                     include_next_actions"
+                ),
+            ),
+            Some("error") => (
+                "error",
+                format!(
+                    "no frozen next-action artifact exists and the last composition pass failed \
+                     hard, so assist cannot compose:{refusal_suffix}"
+                ),
+            ),
+            Some(_) if composer_blocked => (
+                "refused",
+                format!(
+                    "no frozen next-action artifact exists and the composer is refusing on the \
+                     honesty gate, so assist correctly composes nothing:{refusal_suffix}"
+                ),
+            ),
+            Some(outcome) => (
+                "pending",
+                format!(
+                    "no frozen next-action artifact exists; the last composition pass was \
+                     outcome={outcome}, which published nothing"
+                ),
+            ),
+        };
+        health.status = status.to_owned();
+        health.detail = Some(detail);
+        return health;
+    };
+
+    let age_secs = now_ts_ns().saturating_sub(artifact.produced_ts_ns) / 1_000_000_000;
+    let stale = age_secs > staleness_bound_secs;
+    health.assist_next_action_artifact_present = Some(true);
+    health.assist_next_action_artifact_sha256 = Some(artifact.content_sha256.clone());
+    health.assist_next_action_artifact_built_at_unix_ms = Some(artifact.produced_ts_ns / 1_000_000);
+    health.assist_next_action_artifact_age_secs = Some(age_secs);
+    health.assist_next_action_artifact_stale = Some(stale);
+    health.assist_next_action_artifact_candidates =
+        Some(u32::try_from(artifact.candidates.len()).unwrap_or(u32::MAX));
+    health.assist_next_action_artifact_kernel_id = Some(artifact.kernel_id.clone());
+    health.assist_next_action_artifact_panel_name = Some(artifact.panel_name.clone());
+    health.assist_next_action_artifact_panel_version = Some(artifact.panel_version);
+    health.assist_next_action_artifact_content_slot = Some(artifact.content_slot);
+    health.assist_next_action_artifact_recall_ratio = Some(artifact.recall_ratio);
+    health.assist_next_action_artifact_min_recall_ratio = Some(artifact.min_recall_ratio);
+
+    let status = match (stale, composer_blocked) {
+        // Present, inside its bound, and nothing is refusing underneath it.
+        (false, false) => "ok",
+        // Serving, but only because the frozen artifact has not expired yet:
+        // the composer that would replace it is not producing (#2076).
+        (false, true) => "degraded",
+        // Past the bound, so the next non-dry tick recomposes rather than
+        // serving it. Visible in its own right, and not a fault.
+        (true, _) => "stale",
+    };
+    health.status = status.to_owned();
+    health.detail = Some(format!(
+        "frozen artifact {} built {} s ago (bound {staleness_bound_secs} s, stale={stale}) with {} \
+         candidates from kernel {} over {}@{} slot {} at recall {:.4} vs gate {:.4}; last \
+         composition outcome={}{refusal_suffix}",
+        artifact.content_sha256,
+        age_secs,
+        artifact.candidates.len(),
+        artifact.kernel_id,
+        artifact.panel_name,
+        artifact.panel_version,
+        artifact.content_slot,
+        artifact.recall_ratio,
+        artifact.min_recall_ratio,
+        state
+            .outcome
+            .as_deref()
+            .unwrap_or("<none in this generation>"),
+    ));
+    health
 }
 
 fn build_next_action_suggestion(

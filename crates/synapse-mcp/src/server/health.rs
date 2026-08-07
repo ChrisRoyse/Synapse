@@ -588,6 +588,13 @@ impl SynapseService {
             "oracle_readiness".to_owned(),
             self.oracle_readiness_health(),
         );
+        // Whether the assist surface can compose a next action right now
+        // (#2068 clause 5). Read-only: it point-reads the frozen artifact
+        // pointer, and never asks the composer to run.
+        subsystems.insert(
+            "assist_next_action".to_owned(),
+            self.assist_next_action_health(),
+        );
         subsystems.insert("calyx_hot_path".to_owned(), self.calyx_hot_path_health());
         subsystems.insert(
             "calyx_search_generation".to_owned(),
@@ -674,6 +681,18 @@ impl SynapseService {
     /// closed were all invisible until an operator called `find` and read the
     /// error. An absent or unusable generation is an `error` here, because the
     /// capability every recall path needs is unavailable.
+    ///
+    /// **#2075.** "The generation" was the active panel's, and reporting one
+    /// generation's health as search's health is the same lying-rollup shape
+    /// one level down. `find` accepts an explicit `panel_version` for every
+    /// version with a code-declared slot contract, and on the live vault three
+    /// of those — the outcome-bearing episode, agent-transcript and mcp-usage
+    /// corpora — had no persisted generation at all, so every fused query
+    /// naming them hard-errored while this subsystem reported `ok`. The
+    /// declared-queryable set is now measured against the built set, and every
+    /// generation's own state is published in
+    /// `calyx_search_generation_panels` rather than summarised into a verdict
+    /// that can hide it.
     fn calyx_search_generation_health(&self) -> SubsystemHealth {
         let status = match self.m3_state.try_lock() {
             Ok(state) => state.calyx_search_generation_status(),
@@ -818,6 +837,17 @@ impl SynapseService {
                 .filter(|entry| entry.keys_to_bound() == Some(0))
                 .count() as u64
         });
+        // #2075: every count above measures generations that EXIST. A
+        // generation that was never built has no directory, so a disk census
+        // cannot see it — which is how the three outcome-bearing corpora came
+        // to have no search index at all while this subsystem reported `ok`
+        // from the active panel's healthy generation, and `find
+        // panel_version=…` hard-errored SYNAPSE_CALYX_FIND_INDEX_STALE on every
+        // one of them. The comparison that answers "can fused recall serve" is
+        // the declared-queryable set against the built set, and this is it.
+        let unbuilt_declared: Vec<u32> = sweep.map_or_else(Vec::new, |sweep| {
+            sweep.unbuilt_declared_queryable_panel_versions()
+        });
         // The three sweep conditions are NOT the same severity, and collapsing
         // them was wrong (measured on the live daemon: one stranded generation
         // pinned `health.ok=false` permanently).
@@ -834,9 +864,28 @@ impl SynapseService {
         //              cleared by the daemon, which is exactly the flag-fatigue
         //              #1914 fixed for the pre-first-tick case. It is `degraded`,
         //              reported in its own field with its named action.
+        //
+        //   declared-queryable but unbuilt — a panel the tool contract says a
+        //              caller may query has no persisted generation, so every
+        //              fused find naming it is failing closed right now. It is
+        //              `degraded` rather than `error` for one reason only: the
+        //              sweep now enrolls these panels for an initial build, so
+        //              the condition clears itself on the next tick and an
+        //              `error` here would be an alarm for work already
+        //              scheduled. It can never be `ok` (#2075) — that is the
+        //              whole defect.
+        //
+        // The two `degraded` causes share an arm because they share a verdict,
+        // not because they are the same condition: which one fired is in
+        // `calyx_search_generations_unbuilt_declared_queryable_panel_versions`
+        // / `..._unmaintainable` and in the remediation below. The unbuilt test
+        // is first in the disjunction and deliberately NOT gated on
+        // `state == "built"`: the active generation's state says nothing about
+        // a panel that has no generation at all, and letting it gate this is
+        // the substitution that caused the bug.
         let health_status = if sweep_failed > 0 || sweep_lagging > 0 {
             "error"
-        } else if state == "built" && sweep_unmaintainable > 0 {
+        } else if !unbuilt_declared.is_empty() || (state == "built" && sweep_unmaintainable > 0) {
             "degraded"
         } else if state == "built" {
             "ok"
@@ -845,7 +894,23 @@ impl SynapseService {
         } else {
             "error"
         };
-        let remediation_for_field = remediation.clone();
+        // The remediation must explain the status that is actually being
+        // reported. A `degraded` caused by an unbuilt declared-queryable panel
+        // carrying the active generation's "none; …" remediation would be the
+        // same self-contradicting payload the state/remediation pairing above
+        // exists to prevent (#2075).
+        let remediation_for_field = if unbuilt_declared.is_empty() {
+            remediation.clone()
+        } else {
+            format!(
+                "panel version(s) {unbuilt_declared:?} are declared queryable but have no \
+                 persisted search generation, so every fused find naming one fails closed with \
+                 SYNAPSE_CALYX_FIND_INDEX_STALE; the unattended sweep enrolls them for an initial \
+                 build, so wait one derived-state tick, or force one now with storage \
+                 operation=search_rebuild expected_panel_version=<version>. The active \
+                 generation's own state is unaffected: {remediation}"
+            )
+        };
         let slot_summary = if status.slots.is_empty() {
             "none".to_owned()
         } else {
@@ -893,6 +958,26 @@ impl SynapseService {
             calyx_search_generations_detail: sweep
                 .map(synapse_storage::search_sweep::SearchGenerationSweep::summary_line),
             calyx_search_generations_swept_at_unix_ms: derived_state.last_search_sweep_unix_ms,
+            calyx_search_generations_declared_queryable: sweep
+                .map(|sweep| sweep.declared_queryable_panel_versions.len() as u64),
+            calyx_search_generations_unbuilt_declared_queryable: sweep
+                .map(|_| unbuilt_declared.len() as u64),
+            calyx_search_generations_unbuilt_declared_queryable_panel_versions: sweep
+                .map(|_| unbuilt_declared.clone()),
+            calyx_search_generation_panels: sweep.map(|sweep| {
+                sweep
+                    .generations
+                    .iter()
+                    .map(|entry| synapse_core::types::CalyxSearchGenerationPanel {
+                        panel_version: entry.panel_version,
+                        is_active_panel: entry.is_active_panel,
+                        is_declared_queryable: entry.is_declared_queryable,
+                        manifest_present: entry.manifest_present(),
+                        disposition: entry.disposition.as_str().to_owned(),
+                        keys_to_bound: entry.keys_to_bound(),
+                    })
+                    .collect()
+            }),
             status: health_status.to_owned(),
             detail: Some(format!(
                 "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} seq_lag={:?} delta_changed_keys={:?} delta_measured_at_unix_ms={:?}                  delta_composition={} max_reconciled_delta_keys={} rows_covered={:?}                  dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
@@ -1288,6 +1373,20 @@ impl SynapseService {
                 ..SubsystemHealth::default()
             },
         }
+    }
+
+    /// Whether the assist surface can currently compose a next action (#2068
+    /// clause 5).
+    ///
+    /// The `Arc<Db>` is cloned out and the M3 lock released **before** the
+    /// point-read, so a health call never holds the state lock across storage
+    /// I/O — the readback itself is two `CF_KV` point-reads and no composition.
+    fn assist_next_action_health(&self) -> SubsystemHealth {
+        let db = match self.m3_state.try_lock() {
+            Ok(state) => state.db.clone(),
+            Err(error) => return state_lock_unavailable_health("M3", error),
+        };
+        crate::m3::suggestions::next_action_health(db.as_ref())
     }
 
     fn calyx_vault_health(&self) -> SubsystemHealth {

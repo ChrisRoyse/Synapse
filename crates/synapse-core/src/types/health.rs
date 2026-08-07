@@ -116,6 +116,39 @@ pub struct CalyxRowGuardSiteStatus {
     pub starved_holds: u64,
 }
 
+/// One panel generation's state on the last search-generation sweep (#2075).
+///
+/// Reported per panel because the defect this closes was a rollup: the
+/// `calyx_search_generation` subsystem measured exactly one generation — the
+/// vault's active panel — and published its verdict as the verdict for search.
+/// A panel whose generation had never been built was not "unhealthy" in that
+/// measurement; it was absent from it, which read as `ok`.
+///
+/// Every field here is carried out of the sweep the daemon already ran. Nothing
+/// in this struct re-measures a corpus, so publishing per-panel truth costs a
+/// `health` call nothing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxSearchGenerationPanel {
+    pub panel_version: u32,
+    /// Whether the vault manifest publishes this generation as active.
+    pub is_active_panel: bool,
+    /// Whether a fused query may name this version in `panel_version`. A
+    /// missing manifest matters here and nowhere else: an index nobody can ask
+    /// for is an absence, an index the tool contract promises is a defect.
+    pub is_declared_queryable: bool,
+    /// Whether a persisted manifest exists for this generation — the exact file
+    /// a fused query opens, and therefore whether recall can serve it at all.
+    pub manifest_present: bool,
+    /// `maintained` | `unmaintainable_no_contract` |
+    /// `retirable_superseded_generation` | `failed`.
+    pub disposition: String,
+    /// Changed keys this generation can still absorb before its queries fail
+    /// closed. `None` when unmeasured, which is never the same as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys_to_bound: Option<u64>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubsystemHealth {
@@ -282,6 +315,90 @@ pub struct SubsystemHealth {
     /// `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` — which alarm this verdict is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_verify_reason_code: Option<String>,
+    // --- Assist next-action readiness (#2068 clause 5) ---
+    //
+    // Whether the assist surface can compose a next action right now was
+    // previously observable only by calling `assist operation=suggestion_tick`
+    // and reading the response — i.e. by triggering the very work being
+    // diagnosed. An operator reading `/health` could not distinguish an assist
+    // surface that had never composed from one whose composer refuses on every
+    // tick for want of upstream evidence (#2076): both look identical from
+    // outside, because both produce no suggestions.
+    //
+    // These fields are filled by a read-only point-read of the `CF_KV`
+    // `assist_next_action/v1/current` pointer and its content-addressed frozen
+    // row. Health never composes.
+    /// True when `CF_KV assist_next_action/v1/current` resolves to a frozen
+    /// artifact whose content fingerprint verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_present: Option<bool>,
+    /// `content_sha256` of the current frozen artifact — the fingerprint the
+    /// tick response reports, so a `/health` reading and a tick response can be
+    /// compared for identity rather than for plausibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_sha256: Option<String>,
+    /// When the current artifact was composed (`produced_ts_ns`, milliseconds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_built_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_age_secs: Option<u64>,
+    /// `SYNAPSE_ASSIST_NEXT_ACTION_STALENESS_SECS`. Always present, even with no
+    /// artifact, so the age never travels without the bound it is judged against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_staleness_bound_secs: Option<u64>,
+    /// `age_secs > staleness_bound_secs`: the artifact still answers, but the
+    /// next non-dry tick will recompose rather than serve it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_stale: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_candidates: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_kernel_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_panel_name: Option<String>,
+    /// The Calyx panel version the artifact was composed over — the source
+    /// sequence, so an artifact can be told to be behind the live panel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_panel_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_content_slot: Option<u32>,
+    /// The kernel recall achieved, and the gate it had to clear. A grounded
+    /// artifact never travels without the gate that admitted it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_recall_ratio: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_artifact_min_recall_ratio: Option<f64>,
+    /// Outcome of the last composition pass in this daemon generation:
+    /// `disabled` | `frozen_artifact` | `calyx_kernel_graph` | `refused` |
+    /// `error`. Absent until one runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_composition_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_composition_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_composition_grounded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_composition_candidates: Option<u32>,
+    /// When live Calyx composition last actually succeeded, retained across
+    /// later refusals so a refusal streak cannot hide how old the last real
+    /// composition is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_composed_unix_ms: Option<u64>,
+    /// The exact refusal code of the last non-composing pass, e.g.
+    /// `ASSIST_NEXT_ACTION_NO_HOP_EVIDENCE`. Retained across later
+    /// `frozen_artifact` passes: a frozen artifact serving inside its staleness
+    /// bound must not hide that live composition is refusing underneath it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_refusal_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_refusal_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_last_refusal_unix_ms: Option<u64>,
+    /// Composition passes that have refused or errored since the last success.
+    /// This is what makes a *persistent* upstream refusal legible as persistent
+    /// rather than as one unlucky tick.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assist_next_action_consecutive_refusals: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_checkpoint_last_started_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -506,6 +623,39 @@ pub struct SubsystemHealth {
     pub calyx_search_generations_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generations_swept_at_unix_ms: Option<u64>,
+
+    // --- the declared-queryable set (issue #2075) ---
+    // Every field above measures generations that EXIST. None of them could
+    // report a generation that was never built, because a generation with no
+    // directory on disk is invisible to a disk census — so the three
+    // outcome-bearing corpora sat with no search index at all while this
+    // subsystem reported `ok` from the active panel's healthy generation, and
+    // `find panel_version=…` hard-errored with SYNAPSE_CALYX_FIND_INDEX_STALE
+    // on every one of them. These fields report the set a caller may query
+    // against the set that is actually built, which is the only comparison that
+    // answers "can fused recall serve".
+    /// Live panel generations a caller may name in `panel_version` on a fused
+    /// query — the versions with a code-declared slot contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_declared_queryable: Option<u64>,
+    /// Declared-queryable generations with **no persisted manifest**. Any value
+    /// above zero means fused find is failing closed for that many panels right
+    /// now, so this subsystem may not report `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_unbuilt_declared_queryable: Option<u64>,
+    /// The exact panel versions behind the count above, so remediation needs no
+    /// log dive and no second measurement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generations_unbuilt_declared_queryable_panel_versions: Option<Vec<u32>>,
+    /// Per-panel generation state for every generation the last sweep
+    /// considered.
+    ///
+    /// The scalar counts above answer "how many"; only this answers "which one,
+    /// and can it serve". A rollup was what let a missing manifest read as `ok`
+    /// in the first place, so the per-panel facts are published rather than
+    /// summarised away.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_search_generation_panels: Option<Vec<CalyxSearchGenerationPanel>>,
 
     // --- unattended derived-state maintenance (issues #1891, #1894) ---
     // The generation above is only ever `built` because something keeps it that
