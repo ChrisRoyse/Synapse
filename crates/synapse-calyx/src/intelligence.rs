@@ -272,6 +272,34 @@ pub struct SynapseCalyxWeaveReport {
     /// within-record cross-terms; only the geometric lane excludes them.
     #[serde(default)]
     pub knn_zero_norm_exclusions: Vec<SynapseCalyxKnnZeroNormExclusion>,
+    /// Within-record **agreement** cross-terms skipped because one operand had
+    /// no direction, on the same principle as `knn_zero_norm_exclusions` but on
+    /// the other lane (#2076).
+    ///
+    /// This is the lane that actually stalls this vault, and it needed its own
+    /// field rather than reusing the kNN one. The kNN lane excludes a *record*
+    /// whose whole concatenated vector is zero, which on `syn-episode-v1` never
+    /// happens — the text and identity lenses are always non-zero — so
+    /// `knn_zero_norm_exclusions` reads empty on every pass. The agreement lane
+    /// skips a *lens pair* on one record, and on a 4000-record read of the live
+    /// episode panel that fired 42,963 times over 3,955 records. Reporting only
+    /// the kNN lane therefore said "no zero-norm anywhere" about a corpus that
+    /// is 88% zero-norm on slot 16 alone.
+    #[serde(default)]
+    pub agreement_zero_norm_skips: usize,
+    /// Records that contributed at least one agreement skip.
+    #[serde(default)]
+    pub agreement_zero_norm_records: usize,
+    /// Distinct `(slot_a, slot_b)` lens pairs seen in the recorded sample,
+    /// ordered. Drawn from Loom's capped ledger, so it names the pairs without
+    /// promising completeness — see `agreement_zero_norm_sample_truncated`.
+    #[serde(default)]
+    pub agreement_zero_norm_slot_pairs: Vec<(u16, u16)>,
+    /// Whether Loom's skip ledger hit [`calyx_loom::MAX_RECORDED_ZERO_NORM_SKIPS`],
+    /// so `agreement_zero_norm_slot_pairs` is a sample and not the full set.
+    /// Never silent: `agreement_zero_norm_skips` stays an exact count either way.
+    #[serde(default)]
+    pub agreement_zero_norm_sample_truncated: bool,
     pub xterm_cf_rows_after: usize,
     pub graph_cf_rows_after: usize,
     /// Effective half-open time window applied to `Base` rows, echoed back.
@@ -348,6 +376,7 @@ impl SynapseCalyxVault {
         // interaction lazy (0.0 < floor) and only agreement is eager.
         let gate = StaticPairGainGate { gain_bits: 0.0 };
         let mut records_woven = 0usize;
+        let mut agreement_zero_norm_records = 0usize;
         let mut lens_ids: BTreeSet<SlotId> = BTreeSet::new();
         let mut measured_slot_instances = 0usize;
         for record in &corpus.records {
@@ -375,13 +404,33 @@ impl SynapseCalyxVault {
                     entry.action = MaterializationAction::LazyCache;
                 }
             }
+            let skips_before = store.zero_norm_agreement_skip_total();
             store
                 .materialize_plan(params.panel_version, record.cx_id, &record.slots, &plan)
                 .map_err(|error| {
                     loom_math_error("materialize within-record cross-terms", &error)
                 })?;
+            if store.zero_norm_agreement_skip_total() > skips_before {
+                agreement_zero_norm_records += 1;
+            }
             records_woven += 1;
         }
+
+        // #2076: lift Loom's agreement-lane skip ledger onto the report so the
+        // unattended maintainer can name the lens pairs it could not score.
+        // Without this the only zero-norm field on the report is the kNN one,
+        // which is structurally empty on this panel, and the log truthfully
+        // reported nothing about a corpus that is overwhelmingly zero-norm.
+        let agreement_zero_norm_skips = store.zero_norm_agreement_skip_total();
+        let agreement_zero_norm_sample_truncated =
+            agreement_zero_norm_skips > store.zero_norm_agreement_skips().len();
+        let agreement_zero_norm_slot_pairs = store
+            .zero_norm_agreement_skips()
+            .iter()
+            .map(|skip| (skip.a.slot_id.get(), skip.b.slot_id.get()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
 
         let cross_terms_materialized = store.xterm_count();
         let xterm_rows = store
@@ -466,6 +515,10 @@ impl SynapseCalyxVault {
             agreement_edges_persisted: agreement_edges.len(),
             between_record_edges_persisted: between_record_edges.len(),
             knn_zero_norm_exclusions,
+            agreement_zero_norm_skips,
+            agreement_zero_norm_records,
+            agreement_zero_norm_slot_pairs,
+            agreement_zero_norm_sample_truncated,
             xterm_cf_rows_after,
             graph_cf_rows_after,
             since_ts_ns: params.since_ts_ns,

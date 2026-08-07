@@ -137,8 +137,16 @@ impl SpectralError {
     }
 }
 
-/// Eigenvector centrality over `I + A`, computed **one connected component at a
-/// time** (#2076).
+/// Eigenvector centrality by shifted power iteration, computed **one connected
+/// component at a time** and shifted by **each component's own spectral scale**
+/// (#2076, #2081).
+///
+/// Two independent properties of this vault's graphs each defeat the textbook
+/// `A + I` global iteration, and each is addressed at its own root: the
+/// component decomposition below, and the scale-commensurate shift documented
+/// on [`SymmetricSparseGraph::component_perron`]. Neither changes the value
+/// computed — a shift and a positive scaling of a symmetric block leave every
+/// eigenvector fixed — only whether a finite iteration budget can reach it.
 ///
 /// # Why per component, and not one global power iteration
 ///
@@ -146,25 +154,29 @@ impl SpectralError {
 /// irreducible non-negative matrix, i.e. a connected graph. A disconnected
 /// graph's adjacency is reducible: its spectrum is the union of its components'
 /// spectra, so the dominant eigenvalue generally has multiplicity greater than
-/// one and the dominant eigenspace is a plane rather than a line. Two things
-/// then go wrong at once, and this function used to suffer both:
+/// one and the dominant eigenspace is a plane rather than a line.
 ///
-/// - **It cannot converge on a real budget.** Power iteration's per-step
-///   contraction is `lambda_2 / lambda_1`, which on a disconnected graph is the
-///   ratio between the two largest *component* Perron roots. Nothing bounds
-///   that away from 1. On this vault's last published `syn-graphpos-process-v1`
-///   snapshot — 746 nodes over 378 transitions, so **at least 368 connected
-///   components**, most of them a single parent→child or session→spawn dyad —
-///   the top roots are near-ties, and the fixed 256-iteration cap expired on
-///   every attempt, six times out of six, stranding a generation each tick.
-/// - **The answer would be wrong even if it converged.** The limit is the
-///   projection of the start vector onto the dominant eigenspace, so which of
-///   the infinitely many dominant eigenvectors comes back is decided by
-///   round-off. NetworkX documents exactly this and now refuses disconnected
-///   graphs outright in its dense solver for that reason
-///   (networkx/networkx#6888, networkx/networkx#7549); its iterative solver
-///   uses the same `A + I` shift this one does, for the same
-///   negative-eigenvalue reason, and still raises rather than guess.
+/// **The answer is then not well defined.** The limit of the iteration is the
+/// projection of the start vector onto the dominant eigenspace, so which of the
+/// infinitely many dominant eigenvectors comes back is decided by round-off, and
+/// every component but the widest one is driven towards zero regardless of its
+/// internal structure — a "centrality" that reports nothing about 63 of this
+/// vault's 64 components. NetworkX documents exactly this and now refuses
+/// disconnected graphs outright in its dense solver for that reason
+/// (networkx/networkx#6888, networkx/networkx#7549); its iterative solver uses
+/// the same `A + I` shift this one does, for the same negative-eigenvalue
+/// reason, and raises rather than guess.
+///
+/// Note what reducibility on its own does **not** explain, because the
+/// distinction is what sent #2081's first diagnosis to the wrong remedy. This
+/// block is symmetric, and for a symmetric matrix a *tie* among dominant
+/// eigenvalues does not stop the successive-iterate residual from decaying: the
+/// iterate still converges, to a fixed member of the dominant eigenspace, at the
+/// rate set by the next *distinct* eigenvalue. Reducibility corrupts the answer;
+/// it does not by itself exhaust the budget. What exhausts the budget is the
+/// scale mismatch documented on
+/// [`SymmetricSparseGraph::component_perron`], which reducibility then
+/// multiplies across every component at once.
 ///
 /// Restricted to one component the adjacency block *is* irreducible, the Perron
 /// root is simple and strictly positive, and the iteration converges at the
@@ -174,8 +186,9 @@ impl SpectralError {
 /// its radius before [`ranked_scores`] normalizes globally. On a connected
 /// graph there is exactly one component, the single scale factor divides out in
 /// that normalization, and the returned scores are identical to the pre-#2076
-/// result — which is why `syn-graphpos-app-v1` (111 nodes over 676 transitions,
-/// average degree 12.2, and converging on every tick today) is unaffected.
+/// result — which is why `syn-graphpos-app-v1` (measured live at 113 nodes over
+/// 682 transitions, one component, and converging within 32 iterations both
+/// before and after this change) is unaffected.
 ///
 /// # Errors
 ///
@@ -422,30 +435,98 @@ impl SymmetricSparseGraph {
         components
     }
 
-    /// `(I + A_c) v` for one component, in component-local index order.
+    /// `(I + A_c / scale) v` for one component, in component-local index order.
     ///
     /// `local_of` maps a global node index to its position in `nodes`; entries
     /// outside the component are never read, because no edge leaves it.
-    fn component_mat_vec(&self, nodes: &[usize], local_of: &[usize], vector: &[f32]) -> Vec<f32> {
+    fn component_mat_vec(
+        &self,
+        nodes: &[usize],
+        local_of: &[usize],
+        scale: f32,
+        vector: &[f32],
+    ) -> Vec<f32> {
+        let inverse_scale = scale.recip();
         nodes
             .par_iter()
             .enumerate()
             .map(|(local_index, global_index)| {
-                self.adjacency[*global_index]
-                    .iter()
-                    .fold(vector[local_index], |acc, (col_index, weight)| {
-                        acc + weight * vector[local_of[*col_index]]
-                    })
+                self.adjacency[*global_index].iter().fold(
+                    vector[local_index],
+                    |acc, (col_index, weight)| {
+                        acc + weight * inverse_scale * vector[local_of[*col_index]]
+                    },
+                )
             })
             .collect()
     }
 
-    /// Shifted power iteration restricted to one connected component.
+    /// The component's Gershgorin bound on its own adjacency spectral radius:
+    /// the largest weighted degree among its nodes.
+    ///
+    /// For a symmetric non-negative block, `rho(A_c) <= max_i sum_j |A_ij|`,
+    /// and no edge leaves a connected component, so a node's full stored degree
+    /// *is* its within-component row sum. This is the scale the shift is
+    /// measured against; see [`Self::component_perron`] for why that matters.
+    fn component_scale(&self, nodes: &[usize]) -> f32 {
+        nodes
+            .iter()
+            .map(|global_index| self.degree[*global_index])
+            .fold(0.0_f32, f32::max)
+    }
+
+    /// Shifted power iteration restricted to one connected component, on
+    /// `I + A_c / scale_c` where `scale_c` is the component's own Gershgorin
+    /// radius bound (#2081).
+    ///
+    /// # Why the block is restricted to one component
     ///
     /// Within a component the block is irreducible, so Perron–Frobenius makes
     /// the dominant eigenvalue simple and its eigenvector strictly positive —
     /// the two guarantees the global iteration forfeits on a disconnected
-    /// graph, and the reason this converges where that could not.
+    /// graph.
+    ///
+    /// # Why the shift is `scale_c`, and not the fixed `1` it used to be
+    ///
+    /// Shifting a symmetric non-negative block by *any* positive multiple of
+    /// the identity leaves every eigenvector untouched and moves the Perron
+    /// root to the top of the spectrum by modulus, which is the only thing the
+    /// shift is for: it defeats the bipartite case `lambda_min = -lambda_1`,
+    /// where an unshifted iteration oscillates forever. NetworkX adopted `A + I`
+    /// for exactly that reason and says in the same breath that *"adding other
+    /// multiples of the identity to A will also work, but A+I is cheap to
+    /// implement and sufficient"* (networkx/networkx#1704). The unstated premise
+    /// is that `A` is an **unweighted** adjacency, where every non-zero entry is
+    /// `1`, so `rho(A) >= 1` and a shift of `1` is commensurate with the
+    /// spectrum it is shifting.
+    ///
+    /// That premise does not hold here. [`crate::build_transition_graph`]
+    /// rescales every edge weight to `count / max_pair_count`, so a single
+    /// heavily-observed transition pair anywhere in the graph divides every
+    /// *other* edge weight — and hence every other component's spectral radius —
+    /// by an arbitrary data-dependent factor. Against a fixed shift of `1` the
+    /// contraction ratio of a depth-1 star then degrades to
+    /// `1 / (1 + sqrt(k) / max_pair_count)`, which tends to 1. The graph's
+    /// *shape* is unchanged and so is the centrality it defines; only the
+    /// solver's ability to reach it decays. Measured on the frozen
+    /// `max_iter = 256`, `tol = 1e-6` budget, an 8-leaf star sharing a graph with
+    /// one dyad observed 256 times needed more than 256 iterations and refused
+    /// with `CALYX_SPECTRAL_NOT_CONVERGED` — a refusal caused entirely by the
+    /// units of an unrelated edge. The live app lane already runs at
+    /// `max_pair_count = 2533` and a minimum edge weight of `3.9e-4`.
+    ///
+    /// Taking the shift to be the block's own Gershgorin bound
+    /// `scale_c = max_i sum_j |A_ij| >= rho(A_c)` makes the contraction ratio
+    /// `(scale_c + lambda_2) / (scale_c + lambda_1)`, which is invariant under
+    /// any global rescaling of the weights: it depends on the component's shape
+    /// alone. Equivalently, and as implemented, the block is divided by
+    /// `scale_c` first — putting its spectrum in `[-1, 1]` — and then shifted by
+    /// the same cheap `1`.
+    ///
+    /// The returned pair is mathematically identical either way: a shift and a
+    /// positive scaling of a symmetric matrix change no eigenvector, and the
+    /// radius is recovered by undoing both. Only the number of iterations
+    /// needed to reach it changes.
     fn component_perron(
         &self,
         nodes: &[usize],
@@ -453,19 +534,32 @@ impl SymmetricSparseGraph {
         tol: f32,
     ) -> std::result::Result<ComponentSpectrum, ComponentDivergence> {
         let size = nodes.len();
+        let scale = self.component_scale(nodes);
+        let unit = vec![1.0 / (size as f32).sqrt(); size];
+        if !scale.is_finite() || scale <= 0.0 {
+            // An edgeless component: `A_c` is the zero block, every vector is an
+            // eigenvector, and the radius is exactly zero. There is nothing to
+            // iterate towards and no scale to divide by, so answer in closed
+            // form rather than dividing by zero to rediscover it.
+            return Ok(ComponentSpectrum {
+                vector: unit,
+                radius: 0.0,
+            });
+        }
         let mut local_of = vec![0_usize; self.len()];
         for (local_index, global_index) in nodes.iter().copied().enumerate() {
             local_of[global_index] = local_index;
         }
-        let mut current = vec![1.0 / (size as f32).sqrt(); size];
+        let mut current = unit;
         let mut residual = f32::INFINITY;
         for step in 1..=max_iter {
-            let mut next = self.component_mat_vec(nodes, &local_of, &current);
+            let mut next = self.component_mat_vec(nodes, &local_of, scale, &current);
             let norm = next.iter().map(|value| value * value).sum::<f32>().sqrt();
             if !norm.is_finite() || norm <= EIGEN_EPS {
-                // `I + A_c` has a unit diagonal and non-negative off-diagonal
-                // entries, so a non-negative unit input cannot map to zero; a
-                // zero norm here is a corrupt weight, not a spectral property.
+                // `I + A_c / scale` has a unit diagonal and non-negative
+                // off-diagonal entries, so a non-negative unit input cannot map
+                // to zero; a zero norm here is a corrupt weight, not a spectral
+                // property.
                 return Err(ComponentDivergence {
                     iterations: step,
                     residual: f32::INFINITY,
@@ -479,27 +573,31 @@ impl SymmetricSparseGraph {
             current = next;
             if residual < tol {
                 return Ok(ComponentSpectrum {
-                    // The shift is exactly 1, so the unshifted radius is the
-                    // shifted Rayleigh quotient minus 1.
-                    radius: (rayleigh(
-                        &self.component_mat_vec(nodes, &local_of, &current),
-                        &current,
-                    ) - 1.0)
-                        .max(0.0),
+                    radius: self.component_radius(nodes, &local_of, scale, &current),
                     vector: current,
                 });
             }
         }
-        let radius = (rayleigh(
-            &self.component_mat_vec(nodes, &local_of, &current),
-            &current,
-        ) - 1.0)
-            .max(0.0);
+        let radius = self.component_radius(nodes, &local_of, scale, &current);
         Err(ComponentDivergence {
             iterations: max_iter,
             residual,
             radius,
         })
+    }
+
+    /// Undoes the shift and the scaling to recover the component's adjacency
+    /// spectral radius from a unit iterate: the iteration runs on
+    /// `I + A_c / scale`, so `rho = (rayleigh - 1) * scale`.
+    fn component_radius(
+        &self,
+        nodes: &[usize],
+        local_of: &[usize],
+        scale: f32,
+        vector: &[f32],
+    ) -> f32 {
+        let product = self.component_mat_vec(nodes, local_of, scale, vector);
+        ((rayleigh(&product, vector) - 1.0) * scale).max(0.0)
     }
 
     fn shifted_laplacian_mat_vec(&self, vector: &[f32], shift: f32) -> Vec<f32> {
