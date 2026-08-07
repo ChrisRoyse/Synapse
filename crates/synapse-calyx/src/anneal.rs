@@ -256,9 +256,11 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("read Anneal resource budget", &error)
             })?;
-        let appender =
-            LedgerAppender::open(AsterAnnealLedgerStore::new(&self.vault), clock.clone())
-                .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
+        let appender = LedgerAppender::open(
+            AsterAnnealLedgerStore::with_index(&self.vault, &self.anneal_ledger_index),
+            clock.clone(),
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
         let ledger = AnnealLedger::new(appender, ActorId::Service("synapse-anneal".to_owned()))
             .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger actor", &error))?;
         let recent_changes = ledger
@@ -934,8 +936,11 @@ impl SynapseCalyxVault {
         >,
         SynapseCalyxError,
     > {
-        let appender = LedgerAppender::open(AsterAnnealLedgerStore::new(&self.vault), clock)
-            .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
+        let appender = LedgerAppender::open(
+            AsterAnnealLedgerStore::with_index(&self.vault, &self.anneal_ledger_index),
+            clock,
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
         AnnealLedger::new(appender, ActorId::Service("synapse-anneal".to_owned()))
             .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger actor", &error))
     }

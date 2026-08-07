@@ -1225,7 +1225,22 @@ impl SynapseService {
 
     fn calyx_vault_health(&self) -> SubsystemHealth {
         let status = match self.m3_state.try_lock() {
-            Ok(state) => state.calyx_vault_status(),
+            Ok(state) => match state.calyx_vault_status() {
+                Ok(status) => status,
+                Err(error) => {
+                    return SubsystemHealth {
+                        status: "error".to_owned(),
+                        detail: Some(format!(
+                            "live Calyx vault status read failed closed: code={} source_code={} error={} remediation={}",
+                            error.code,
+                            error.source_code.unwrap_or("none"),
+                            error.message,
+                            error.remediation
+                        )),
+                        ..SubsystemHealth::default()
+                    };
+                }
+            },
             Err(error) => return state_lock_unavailable_health("M3", error),
         };
         let health_status = if !status.enabled {

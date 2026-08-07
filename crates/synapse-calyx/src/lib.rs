@@ -2594,6 +2594,7 @@ impl SynapseCalyxVaultOpenMode {
 pub struct SynapseCalyxVault {
     config: SynapseCalyxConfig,
     vault: AsterVault<SynapseCalyxClock>,
+    anneal_ledger_index: std::sync::Mutex<calyx_anneal::AsterAnnealLedgerIndex>,
     lock: VaultLockGuard,
     math_runtime: SynapseCalyxMathRuntime,
     open_mode: SynapseCalyxVaultOpenMode,
@@ -3294,6 +3295,7 @@ impl SynapseCalyxVault {
         let opened = Self {
             config,
             vault,
+            anneal_ledger_index: Default::default(),
             lock,
             math_runtime,
             open_mode,
@@ -6559,6 +6561,7 @@ impl SynapseCalyxVault {
         let Self {
             config,
             vault,
+            anneal_ledger_index: _,
             lock,
             math_runtime,
             open_mode: _,

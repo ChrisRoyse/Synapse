@@ -116,7 +116,7 @@ pub use learn::{
 };
 pub use ledger_anneal::{
     ANNEAL_LEDGER_PAYLOAD_TAG, AnnealFaultLedgerDetails, AnnealLedger, AnnealLedgerAction,
-    AnnealLedgerEntry, AnnealLedgerReadback, AsterAnnealLedgerStore,
+    AnnealLedgerEntry, AnnealLedgerReadback, AsterAnnealLedgerIndex, AsterAnnealLedgerStore,
     CALYX_ANNEAL_LEDGER_INVALID_ENTRY, CALYX_ASTER_CF_UNAVAILABLE, CALYX_LEDGER_ENTRY_TOO_LARGE,
     MAX_ANNEAL_LEDGER_PAYLOAD_BYTES, decode_anneal_ledger_payload,
 };

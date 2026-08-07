@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 
-use calyx_aster::cf::{ColumnFamily, KeyRange, ledger_key};
+use calyx_aster::cf::{ColumnFamily, KeyRange, ledger_key, ledger_range};
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, LedgerRef, Result};
 use calyx_ledger::{
-    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerRow, SubjectId,
+    ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerHeadAnchor, LedgerRow,
+    SubjectId, decode,
 };
 use serde::{Deserialize, Serialize};
 
@@ -183,29 +185,11 @@ where
     }
 
     pub fn read_recent_with_refs(&self, n: usize) -> Result<Vec<AnnealLedgerReadback>> {
-        if n == usize::MAX {
-            return self.scan_anneal_entries();
-        }
-        let mut limit = n.max(1);
-        loop {
-            let ledger_entries = self.appender.scan_recent_entries(limit)?;
-            let saw_all_rows = ledger_entries.len() < limit;
-            let mut anneal_entries = ledger_entries
-                .into_iter()
-                .filter(|entry| entry.kind == EntryKind::Anneal)
-                .map(decode_readback)
-                .collect::<Result<Vec<_>>>()?;
-            if anneal_entries.len() >= n || saw_all_rows {
-                if n < anneal_entries.len() {
-                    anneal_entries.drain(0..anneal_entries.len() - n);
-                }
-                return Ok(anneal_entries);
-            }
-            limit = limit.saturating_mul(2);
-            if limit == usize::MAX {
-                return self.scan_anneal_entries();
-            }
-        }
+        self.appender
+            .scan_recent_entries_by_kind(EntryKind::Anneal, n)?
+            .into_iter()
+            .map(decode_readback)
+            .collect()
     }
 
     pub fn find_by_change_id(&self, id: ChangeId) -> Result<Option<AnnealLedgerEntry>> {
@@ -246,15 +230,173 @@ where
     C: Clock,
 {
     vault: &'a AsterVault<C>,
+    index: Option<&'a Mutex<AsterAnnealLedgerIndex>>,
 }
+
+/// Process-local delta index for exact kind-selective Anneal ledger reads.
+///
+/// The first read establishes a checked baseline from every physical Ledger
+/// row. Later reads page only the ordered suffix after `indexed_through`, so an
+/// absent Anneal kind remains an exact result without rescanning the mixed
+/// ledger on every status request.
+#[derive(Debug, Default)]
+pub struct AsterAnnealLedgerIndex {
+    initialized: bool,
+    indexed_through: Option<u64>,
+    anneal_sequences: Vec<u64>,
+}
+
+const ANNEAL_LEDGER_INDEX_PAGE_ROWS: usize = 4_096;
 
 impl<'a, C> AsterAnnealLedgerStore<'a, C>
 where
     C: Clock,
 {
     pub const fn new(vault: &'a AsterVault<C>) -> Self {
-        Self { vault }
+        Self { vault, index: None }
     }
+
+    pub const fn with_index(
+        vault: &'a AsterVault<C>,
+        index: &'a Mutex<AsterAnnealLedgerIndex>,
+    ) -> Self {
+        Self {
+            vault,
+            index: Some(index),
+        }
+    }
+}
+
+impl AsterAnnealLedgerIndex {
+    fn refresh<C>(&mut self, vault: &AsterVault<C>) -> Result<u64>
+    where
+        C: Clock,
+    {
+        let snapshot = vault.latest_seq();
+        if !self.initialized {
+            let (anneal_sequences, indexed_through) =
+                scan_anneal_sequence_range(vault, snapshot, &KeyRange::all(), 0)?;
+            self.anneal_sequences = anneal_sequences;
+            self.indexed_through = indexed_through;
+            self.initialized = true;
+            return Ok(snapshot);
+        }
+
+        let greatest = vault.predecessor_cf_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            &ledger_key(0),
+            &ledger_key(u64::MAX),
+        )?;
+        let Some((greatest_key, _)) = greatest else {
+            if self.indexed_through.is_some() {
+                return Err(CalyxError::ledger_chain_broken(
+                    "Anneal ledger delta index previously observed rows but the Ledger is now empty",
+                ));
+            }
+            return Ok(snapshot);
+        };
+        let greatest_seq = parse_aster_ledger_seq(&greatest_key)?;
+        if self
+            .indexed_through
+            .is_some_and(|indexed| greatest_seq < indexed)
+        {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "Anneal ledger delta index regressed: indexed_through={} physical_greatest={greatest_seq}",
+                self.indexed_through.expect("checked as some")
+            )));
+        }
+        let first = match self.indexed_through {
+            Some(indexed) => match indexed.checked_add(1) {
+                Some(first) => first,
+                None if greatest_seq == u64::MAX => return Ok(snapshot),
+                None => {
+                    return Err(CalyxError::ledger_chain_broken(format!(
+                        "Anneal ledger delta index cannot advance after sequence {indexed}, but the physical greatest sequence is {greatest_seq}"
+                    )));
+                }
+            },
+            None => 0,
+        };
+        if first <= greatest_seq {
+            let range = greatest_seq.checked_add(1).map_or_else(
+                || KeyRange {
+                    start: ledger_key(first),
+                    end: None,
+                },
+                |end| ledger_range(first, end),
+            );
+            let (new_anneal, indexed_through) =
+                scan_anneal_sequence_range(vault, snapshot, &range, first)?;
+            if indexed_through != Some(greatest_seq) {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "Anneal ledger delta index stopped before the physical head: first={first} expected_greatest={greatest_seq} indexed_through={indexed_through:?}"
+                )));
+            }
+            self.anneal_sequences.extend(new_anneal);
+            self.indexed_through = indexed_through;
+        }
+        Ok(snapshot)
+    }
+
+    fn recent_sequences(&self, n: usize) -> &[u64] {
+        if n == usize::MAX || n >= self.anneal_sequences.len() {
+            return &self.anneal_sequences;
+        }
+        &self.anneal_sequences[self.anneal_sequences.len() - n..]
+    }
+}
+
+fn scan_anneal_sequence_range<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    range: &KeyRange,
+    first_expected: u64,
+) -> Result<(Vec<u64>, Option<u64>)>
+where
+    C: Clock,
+{
+    let mut anneal_sequences = Vec::new();
+    let mut after_key = None;
+    let mut last_seen = None;
+    loop {
+        let page = vault.scan_cf_range_page_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            range,
+            after_key.as_deref(),
+            ANNEAL_LEDGER_INDEX_PAGE_ROWS,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        for (key, bytes) in &page {
+            let seq = parse_aster_ledger_seq(key)?;
+            let expected =
+                last_seen.map_or(first_expected, |previous: u64| previous.saturating_add(1));
+            if seq != expected {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "Anneal ledger delta index found a sequence gap: expected={expected} found={seq}"
+                )));
+            }
+            let entry = decode(bytes)?;
+            if entry.seq != seq {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "Anneal ledger delta index physical key {seq} does not match encoded seq {}",
+                    entry.seq
+                )));
+            }
+            if entry.kind == EntryKind::Anneal {
+                anneal_sequences.push(seq);
+            }
+            last_seen = Some(seq);
+        }
+        after_key = page.last().map(|(key, _)| key.clone());
+        if page.len() < ANNEAL_LEDGER_INDEX_PAGE_ROWS {
+            break;
+        }
+    }
+    Ok((anneal_sequences, last_seen))
 }
 
 impl<C> LedgerCfStore for AsterAnnealLedgerStore<'_, C>
@@ -281,42 +423,111 @@ where
     }
 
     fn scan_recent(&self, n: usize) -> Result<Vec<LedgerRow>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
         if n == usize::MAX {
             return self.scan();
         }
         let snapshot = self.vault.latest_seq();
-        let keys =
-            self.vault
-                .scan_cf_range_keys_at(snapshot, ColumnFamily::Ledger, &KeyRange::all())?;
-        let Some(max_seq) = keys
-            .iter()
-            .map(|key| parse_aster_ledger_seq(key))
-            .collect::<Result<Vec<_>>>()?
-            .into_iter()
-            .max()
+        let Some((max_key, max_bytes)) = self.vault.predecessor_cf_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            &ledger_key(0),
+            &ledger_key(u64::MAX),
+        )?
         else {
             return Ok(Vec::new());
         };
-        let mut rows = Vec::with_capacity(n.min(max_seq as usize + 1));
+        let max_seq = parse_aster_ledger_seq(&max_key)?;
+        let available = usize::try_from(max_seq.saturating_add(1)).unwrap_or(usize::MAX);
+        let mut rows = Vec::with_capacity(n.min(available));
+        rows.push(LedgerRow {
+            seq: max_seq,
+            bytes: max_bytes,
+        });
         let mut seq = max_seq;
-        loop {
+        while rows.len() < n && seq != 0 {
+            seq -= 1;
             let key = ledger_key(seq);
             if let Some(bytes) = self
                 .vault
                 .read_cf_at(snapshot, ColumnFamily::Ledger, &key)?
             {
                 rows.push(LedgerRow { seq, bytes });
-                if rows.len() == n {
-                    break;
-                }
             }
-            if seq == 0 {
-                break;
-            }
-            seq -= 1;
         }
         rows.reverse();
         Ok(rows)
+    }
+
+    fn scan_recent_by_kind(&self, kind: EntryKind, n: usize) -> Result<Vec<LedgerRow>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(index) = self.index.filter(|_| kind == EntryKind::Anneal) else {
+            let mut rows = self
+                .scan()?
+                .into_iter()
+                .filter_map(|row| match decode(&row.bytes) {
+                    Ok(entry) if entry.kind == kind => Some(Ok(row)),
+                    Ok(_) => None,
+                    Err(error) => Some(Err(error)),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if n < rows.len() {
+                rows.drain(0..rows.len() - n);
+            }
+            return Ok(rows);
+        };
+        let (snapshot, sequences) = {
+            let mut index = index.lock().map_err(|_| {
+                CalyxError::ledger_corrupt(
+                    "Anneal ledger delta index lock is poisoned; restart the process and inspect the preceding panic",
+                )
+            })?;
+            let snapshot = index.refresh(self.vault)?;
+            (snapshot, index.recent_sequences(n).to_vec())
+        };
+        sequences
+            .into_iter()
+            .map(|seq| {
+                let bytes = self
+                    .vault
+                    .read_cf_at(snapshot, ColumnFamily::Ledger, &ledger_key(seq))?
+                    .ok_or_else(|| {
+                        CalyxError::ledger_chain_broken(format!(
+                            "Anneal ledger delta index points at missing physical seq {seq}"
+                        ))
+                    })?;
+                let entry = decode(&bytes)?;
+                if entry.seq != seq || entry.kind != EntryKind::Anneal {
+                    return Err(CalyxError::ledger_corrupt(format!(
+                        "Anneal ledger delta index points at seq {seq} encoded as seq {} kind {:?}",
+                        entry.seq, entry.kind
+                    )));
+                }
+                Ok(LedgerRow { seq, bytes })
+            })
+            .collect()
+    }
+
+    fn read_seq(&self, seq: u64) -> Result<Option<LedgerRow>> {
+        self.vault
+            .read_cf_at(
+                self.vault.latest_seq(),
+                ColumnFamily::Ledger,
+                &ledger_key(seq),
+            )
+            .map(|bytes| bytes.map(|bytes| LedgerRow { seq, bytes }))
+    }
+
+    fn head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
+        self.vault.verified_ledger_head_anchor()
+    }
+
+    fn put_head_anchor(&mut self, anchor: &LedgerHeadAnchor) -> Result<()> {
+        self.vault.validate_committed_ledger_head_anchor(anchor)
     }
 
     fn put_new(&mut self, seq: u64, bytes: &[u8]) -> Result<()> {

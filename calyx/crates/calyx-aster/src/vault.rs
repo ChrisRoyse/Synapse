@@ -975,7 +975,14 @@ where
     /// no-hook row commit. `commit_rows_locked` already advanced the durable
     /// sidecar while holding the process and cross-process commit boundary, so
     /// this callback must never perform a second, unlocked sidecar write.
-    pub(super) fn validate_committed_ledger_head_anchor(
+    /// Validates that an appender's requested head is already represented by
+    /// the committed Ledger row and the durable head projection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a reconciliation-required error when the row, encoded entry,
+    /// or durable head projection does not prove the requested head.
+    pub fn validate_committed_ledger_head_anchor(
         &self,
         requested: &LedgerHeadAnchor,
     ) -> Result<()> {
@@ -985,6 +992,56 @@ where
             Ok(()) => Ok(()),
             Err(error) => Err(self.committed_ledger_head_validation_error(requested, error)),
         }
+    }
+
+    /// Reads the durable Ledger head and verifies its exact physical tip row.
+    ///
+    /// A durable vault with Ledger rows but no head projection fails closed;
+    /// callers must not recover an append position from an unverified latest
+    /// row. In-memory vaults return `None`, which preserves the ledger
+    /// contract's complete-chain recovery path for non-durable stores.
+    ///
+    /// # Errors
+    ///
+    /// Returns a Ledger integrity error when the projection is absent,
+    /// malformed, or disagrees with its committed tip row.
+    pub fn verified_ledger_head_anchor(&self) -> Result<Option<LedgerHeadAnchor>> {
+        self.with_durable_commit_lock(|| {
+            let Some(durable) = &self.durable else {
+                return Ok(None);
+            };
+            let anchor = crate::ledger_head::read_head_anchor(durable.root())?;
+            if let Some(anchor) = anchor {
+                self.validate_ledger_head_tip_row_locked(&anchor, "durable Ledger head")?;
+                return Ok(Some(anchor));
+            }
+
+            let greatest = self.predecessor_cf_at(
+                self.latest_seq(),
+                ColumnFamily::Ledger,
+                &crate::cf::ledger_key(0),
+                &crate::cf::ledger_key(u64::MAX),
+            )?;
+            let Some((key, _)) = greatest else {
+                return Ok(None);
+            };
+            let key: [u8; 8] = key.try_into().map_err(|key: Vec<u8>| {
+                CalyxError::ledger_corrupt(format!(
+                    "greatest durable Ledger key has {} bytes, expected 8",
+                    key.len()
+                ))
+            })?;
+            let seq = u64::from_be_bytes(key);
+            let height = seq.checked_add(1).ok_or_else(|| {
+                CalyxError::ledger_chain_broken(
+                    "durable Ledger contains sequence u64::MAX and its head height cannot be represented",
+                )
+            })?;
+            Err(crate::ledger_head::missing_head_anchor(
+                durable.root(),
+                height,
+            ))
+        })
     }
 
     pub(super) fn validate_committed_ledger_head_anchor_locked(

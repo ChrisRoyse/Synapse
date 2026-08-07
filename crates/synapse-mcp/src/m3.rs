@@ -1122,12 +1122,16 @@ impl M3State {
         }
     }
 
-    #[must_use]
-    pub fn calyx_vault_status(&self) -> synapse_calyx::SynapseCalyxVaultStatus {
-        self.db
-            .as_ref()
-            .and_then(|db| db.calyx_vault_status().ok())
-            .unwrap_or_else(|| self.calyx_vault_status.clone())
+    pub fn calyx_vault_status(
+        &self,
+    ) -> std::result::Result<synapse_calyx::SynapseCalyxVaultStatus, synapse_calyx::SynapseCalyxError>
+    {
+        let Some(db) = self.db.as_ref() else {
+            return Ok(self.calyx_vault_status.clone());
+        };
+        db.calyx_vault_status().map_err(|error| {
+            storage_owned_calyx_error("read live Calyx vault status for health", &error)
+        })
     }
 
     pub fn oracle_readiness(&self) -> Option<Result<Option<serde_json::Value>, String>> {

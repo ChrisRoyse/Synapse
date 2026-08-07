@@ -141,6 +141,30 @@ pub trait LedgerCfStore {
         Ok(rows)
     }
 
+    /// Returns at most the newest `n` rows of `kind`, sorted by sequence number.
+    ///
+    /// The default performs one complete scan. Ordered stores with a derived
+    /// kind index should override this so a sparse or absent kind does not turn
+    /// a recent-history read into repeated full-ledger scans.
+    fn scan_recent_by_kind(&self, kind: EntryKind, n: usize) -> Result<Vec<LedgerRow>> {
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut rows = self
+            .scan()?
+            .into_iter()
+            .filter_map(|row| match decode(&row.bytes) {
+                Ok(entry) if entry.kind == kind => Some(Ok(row)),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if n < rows.len() {
+            rows.drain(0..rows.len() - n);
+        }
+        Ok(rows)
+    }
+
     /// Reads one ledger row by sequence number.
     ///
     /// The default full-scans [`scan`](Self::scan). Override this for any store
@@ -364,9 +388,13 @@ where
             .collect()
     }
 
-    pub fn scan_recent_entries(&self, n: usize) -> Result<Vec<LedgerEntry>> {
+    pub fn scan_recent_entries_by_kind(
+        &self,
+        kind: EntryKind,
+        n: usize,
+    ) -> Result<Vec<LedgerEntry>> {
         self.store
-            .scan_recent(n)?
+            .scan_recent_by_kind(kind, n)?
             .into_iter()
             .map(|row| decode(&row.bytes))
             .collect()
