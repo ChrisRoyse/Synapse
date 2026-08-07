@@ -49,7 +49,8 @@ use super::permissions::{Permission, RequiredPermissions, required};
 use super::plan::{PlanBackend, PlanDocument, PlanStep, Postcondition};
 use super::plan_execution::PlanExecutionRecord;
 use super::routines::{
-    RoutineFeedbackParams, feedback_suppressed, load_state_row, record_routine_feedback,
+    RoutineFeedbackParams, feedback_cooldown_secs, feedback_suppressed, load_state_row,
+    record_routine_feedback,
 };
 
 /// `CF_KV` key prefix for suggestion rows.
@@ -2062,6 +2063,49 @@ pub struct SuggestionOutcomeAnchorReport {
     /// derived state, so a re-segmented day legitimately removes a row — that is
     /// reported here, never silently dropped.
     pub missing_evidence_rows: Vec<String>,
+    /// Present ONLY when this call completed a known-incomplete terminal write
+    /// (see [`SuggestionAnchorRepairReport`]). Absent on every healthy path, so
+    /// a caller can tell a normal replay from a repaired one without parsing
+    /// log text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_repair: Option<SuggestionAnchorRepairReport>,
+}
+
+/// Evidence that a torn terminal resolution was COMPLETED, not papered over.
+///
+/// A suggestion row that is already `accepted`/`declined` while the physical
+/// Anchors CF holds zero matching anchors is the durable footprint of a write
+/// that this module itself began and failed to finish (the pre-#2068 decline
+/// path flipped the row before grounding it, and a crash between the two writes
+/// can still produce it). The row is then unreachable by every transition:
+/// `suggestion_accept` refuses it as not-live and `suggestion_decline` takes the
+/// replay lane, which demands the anchor that was never written.
+///
+/// Finishing that write is completion, not a fallback: the anchor is
+/// re-derived deterministically from the PERSISTED row (including its original
+/// `resolved_ts_ns`), so it is byte-identical to the anchor the interrupted call
+/// would have written; the repair is announced in the response and in the
+/// daemon record with its own code; and the post-repair rescan still has to
+/// return exactly one match or the call fails loud exactly as before. Nothing is
+/// inferred, defaulted, or swallowed — the only alternative is a row that errors
+/// forever.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SuggestionAnchorRepairReport {
+    /// Always `SUGGESTION_ANCHOR_REPAIR_COMPLETED`; matches the daemon record.
+    pub code: String,
+    /// Why the repair was admissible, in full.
+    pub reason: String,
+    /// Anchors of this exact kind+value found BEFORE the repair. Only `0`
+    /// admits a repair — a count above 1 is ambiguity, never incompleteness.
+    pub matching_anchors_before: u64,
+    /// Anchors of any kind on the constellation before the repair.
+    pub anchors_on_constellation_before: u64,
+    /// Provenance-ledger sequence/hash of the completing write. Present because
+    /// a repair really does write, which is exactly what distinguishes it from
+    /// an ordinary replay.
+    pub ledger_seq: Option<u64>,
+    pub ledger_hash: Option<String>,
 }
 
 fn suggestion_decision_label(status: SuggestionStatus) -> Option<&'static str> {
@@ -2102,6 +2146,23 @@ fn rescan_anchor_matches(
     Ok((total, exact))
 }
 
+/// How the physical Anchors CF renders a LABELLED anchor kind.
+///
+/// `grounding::enum_anchor` takes the bare kind (`synapse:suggestion_outcome`)
+/// and the storage layer stores it as `AnchorKind::Label(kind)`, which reads
+/// back as `label:<kind>` (`synapse-storage/src/backend.rs`,
+/// `anchor_kind_label`). Every readback in this module therefore has to compare
+/// against the RENDERED form; comparing the bare kind can never match, so the
+/// exactly-one-match self-check silently finds nothing and every accept/decline
+/// fails after it has already mutated the row (#2068 defect 2). The identical
+/// trap is called out in
+/// `synapse-storage/examples/transcript_outcome_anchor_fsv.rs` — this helper
+/// exists so the rendering is derived in exactly one place here, never
+/// re-spelled at a call site.
+fn rendered_anchor_kind(anchor_kind: &str) -> String {
+    format!("label:{anchor_kind}")
+}
+
 /// An anchor matches only when the kind, the value TYPE, and the value all
 /// agree. Matching on the text alone would let an unrelated free-text anchor
 /// masquerade as the operator's enum decision.
@@ -2110,7 +2171,7 @@ fn anchor_row_matches(
     anchor_kind: &str,
     decision: &str,
 ) -> bool {
-    row.kind == anchor_kind
+    row.kind == rendered_anchor_kind(anchor_kind)
         && row.value.value_type == "enum"
         && row.value.text_value.as_deref() == Some(decision)
 }
@@ -2175,8 +2236,10 @@ fn anchor_suggestion_outcome(
         return Err(mcp_error(
             error_codes::STORAGE_CORRUPTED,
             format!(
-                "SUGGESTION_OUTCOME_ANCHOR_READBACK_MISMATCH for {}: independent Anchors CF scan of cx_id {} found {readback_exact_match_count} anchors of kind {SUGGESTION_OUTCOME_ANCHOR_KIND}={decision}, expected exactly 1",
-                record.suggestion_id, offer.cx_id
+                "SUGGESTION_OUTCOME_ANCHOR_READBACK_MISMATCH for {}: independent Anchors CF scan of cx_id {} found {readback_exact_match_count} anchors of physical kind {}={decision} (bare kind {SUGGESTION_OUTCOME_ANCHOR_KIND}), expected exactly 1",
+                record.suggestion_id,
+                offer.cx_id,
+                rendered_anchor_kind(SUGGESTION_OUTCOME_ANCHOR_KIND)
             ),
         ));
     }
@@ -2303,12 +2366,99 @@ fn anchor_suggestion_outcome(
         readback_exact_match_count,
         evidence_anchors,
         missing_evidence_rows,
+        anchor_repair: None,
     })
+}
+
+/// Daemon-record and response code announcing a completed torn terminal write.
+const SUGGESTION_ANCHOR_REPAIR_CODE: &str = "SUGGESTION_ANCHOR_REPAIR_COMPLETED";
+
+/// Completes the grounding of a terminal suggestion row whose outcome anchor is
+/// physically absent — the durable footprint of a resolution that flipped the
+/// row and then failed before it could stamp the anchor (#2068 defect 3).
+///
+/// Admissible only when the rescan found EXACTLY ZERO matching anchors: that is
+/// incompleteness. Any other count is ambiguity and is refused above. The
+/// completing write re-derives the anchor from the persisted row alone — same
+/// kind, same enum value, same `observed_at` (from the row's original
+/// `resolved_ts_ns`) — so it is content-identical to the anchor the interrupted
+/// call would have written, and a repair that somehow does not land still fails
+/// loud through `anchor_suggestion_outcome`'s own exactly-one-match self-check.
+fn repair_missing_outcome_anchor(
+    db: &Arc<Db>,
+    suggestion_key: &[u8],
+    suggestion_value: &[u8],
+    record: &SuggestionRecord,
+    decision: &str,
+    scan: &synapse_storage::CalyxAnchorScanReport,
+) -> Result<SuggestionOutcomeAnchorReport, ErrorData> {
+    let Some(resolved_ts_ns) = record.resolved_ts_ns else {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ANCHOR_REPAIR_REFUSED for {}: the row is {decision} but carries no resolved_ts_ns, so the anchor's observed_at cannot be re-derived from the persisted row; this is not a merely-incomplete write and must not be repaired",
+                record.suggestion_id
+            ),
+        ));
+    };
+    tracing::warn!(
+        code = "SUGGESTION_ANCHOR_REPAIR_STARTED",
+        suggestion_id = %record.suggestion_id,
+        routine_id = %record.routine_id,
+        source = ?record.source,
+        decision,
+        resolved_ts_ns,
+        cx_id = %scan.cx_id,
+        anchors_on_constellation = scan.anchors.len(),
+        "terminal suggestion row has no matching outcome anchor; completing the interrupted grounding write"
+    );
+    let anchors_on_constellation_before = scan.anchors.len() as u64;
+    let scanned_cx_id = scan.cx_id.clone();
+    let mut report = anchor_suggestion_outcome(db, suggestion_key, suggestion_value, record)?;
+    if report.cx_id != scanned_cx_id {
+        return Err(mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_ANCHOR_REPAIR_CONSTELLATION_DRIFTED for {}: the scan that found the missing anchor read cx_id {scanned_cx_id}, the completing write landed on cx_id {}; the repair did not land on the row it was diagnosed from",
+                record.suggestion_id, report.cx_id
+            ),
+        ));
+    }
+    let reason = format!(
+        "row {} was already {decision} (resolved_ts_ns={resolved_ts_ns}) while the physical Anchors CF held 0 anchors of kind {} on cx_id {scanned_cx_id}: a terminal write that flipped the durable status and failed before grounding it. The missing anchor was re-derived from the persisted row and written; it is byte-identical to the one the interrupted call would have stamped, and the post-write independent rescan returned exactly 1 match.",
+        record.suggestion_id,
+        rendered_anchor_kind(SUGGESTION_OUTCOME_ANCHOR_KIND)
+    );
+    tracing::warn!(
+        code = SUGGESTION_ANCHOR_REPAIR_CODE,
+        suggestion_id = %record.suggestion_id,
+        routine_id = %record.routine_id,
+        decision,
+        cx_id = %report.cx_id,
+        ledger_seq = report.ledger_seq.unwrap_or_default(),
+        readback_exact_match_count = report.readback_exact_match_count,
+        evidence_anchors = report.evidence_anchors.len(),
+        "completed a torn terminal suggestion write; the decision and its grounding agree again"
+    );
+    report.anchor_repair = Some(SuggestionAnchorRepairReport {
+        code: SUGGESTION_ANCHOR_REPAIR_CODE.to_owned(),
+        reason,
+        matching_anchors_before: 0,
+        anchors_on_constellation_before,
+        ledger_seq: report.ledger_seq,
+        ledger_hash: report.ledger_hash.clone(),
+    });
+    Ok(report)
 }
 
 /// Rebuilds the anchor report for an ALREADY-anchored decision by reading the
 /// physical Anchors CF only. Used on an idempotent replay, where re-running the
 /// side effect is exactly what must not happen.
+///
+/// One exception, and it is not a fallback: when the row is terminal and the
+/// physical Anchors CF holds ZERO matching anchors, the terminal write is
+/// provably incomplete (see [`SuggestionAnchorRepairReport`]) and this lane
+/// completes it idempotently instead of erroring forever.
 fn read_suggestion_outcome_anchor(
     db: &Arc<Db>,
     suggestion_key: &[u8],
@@ -2340,12 +2490,27 @@ fn read_suggestion_outcome_anchor(
         .iter()
         .filter(|row| anchor_row_matches(row, SUGGESTION_OUTCOME_ANCHOR_KIND, decision))
         .count() as u64;
+    if exact == 0 {
+        // Torn terminal write: the row carries the decision, the grounding was
+        // never stamped. Complete it — see `SuggestionAnchorRepairReport` for
+        // why this is completion and not a fallback.
+        return repair_missing_outcome_anchor(
+            db,
+            suggestion_key,
+            suggestion_value,
+            record,
+            decision,
+            &scan,
+        );
+    }
     if exact != 1 {
         return Err(mcp_error(
             error_codes::STORAGE_CORRUPTED,
             format!(
-                "SUGGESTION_ANCHOR_REPLAY_MISSING for {}: the row is already {decision} but the physical Anchors CF holds {exact} anchors of kind {SUGGESTION_OUTCOME_ANCHOR_KIND}={decision} on cx_id {}; the durable decision and its grounding disagree",
-                record.suggestion_id, scan.cx_id
+                "SUGGESTION_ANCHOR_REPLAY_AMBIGUOUS for {}: the row is already {decision} but the physical Anchors CF holds {exact} anchors of physical kind {}={decision} on cx_id {}; exactly one is required and more than one is ambiguity, not an incomplete write — this is NOT repairable and needs an operator",
+                record.suggestion_id,
+                rendered_anchor_kind(SUGGESTION_OUTCOME_ANCHOR_KIND),
+                scan.cx_id
             ),
         ));
     }
@@ -2422,6 +2587,7 @@ fn read_suggestion_outcome_anchor(
         readback_exact_match_count: exact,
         evidence_anchors,
         missing_evidence_rows,
+        anchor_repair: None,
     })
 }
 
@@ -2449,17 +2615,32 @@ pub fn accept_suggestion_for_execution(
             ),
         ));
     }
+    if dry_run {
+        // A dry run mutates nothing, so it must not DESCRIBE a mutation. The
+        // record is returned exactly as it is persisted — still `live`, no
+        // `resolved_ts_ns`, no `proposed_plan_ref`, no resolution note — and the
+        // dry-run intent is carried by the execution record's own `dry_run`
+        // flag and the absent `outcome_anchor`. Stamping a would-be resolution
+        // here made the response claim a state storage never held (#2068).
+        tracing::info!(
+            code = "SUGGESTION_ACCEPT_DRY_RUN",
+            suggestion_id = %record.suggestion_id,
+            routine_id = %record.routine_id,
+            source = ?record.source,
+            status = ?record.status,
+            would_be_plan_ref = plan_ref,
+            would_be_execution_id = execution_id,
+            "suggestion_accept dry run: no CF_KV write, no #856 feedback, no outcome anchor; the returned row is the unresolved persisted row"
+        );
+        return Ok((record, None));
+    }
+    let live_record = record.clone();
     record.status = SuggestionStatus::Accepted;
     record.proposed_plan_ref = Some(plan_ref.to_owned());
     record.resolved_ts_ns = Some(now_ns);
-    record.resolution_note = Some(if dry_run {
-        format!("dry-run accepted by suggestion_accept; execution_id={execution_id}")
-    } else {
-        format!("accepted by suggestion_accept; execution_id={execution_id}")
-    });
-    if dry_run {
-        return Ok((record, None));
-    }
+    record.resolution_note = Some(format!(
+        "accepted by suggestion_accept; execution_id={execution_id}"
+    ));
     if !db.pressure_permits_write(cf::CF_KV) {
         return Err(mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
@@ -2470,8 +2651,77 @@ pub fn accept_suggestion_for_execution(
         ));
     }
     let (key, value) = write_suggestion(db, &record)?;
-    let anchor = anchor_suggestion_outcome(db, &key, &value, &record)?;
+    // The status flip is only half of one logical decision: the grounding anchor
+    // is the other half, and the anchor can only be written against the value
+    // that is actually in `CF_KV`. So the flip goes first and any failure after
+    // it is compensated — the row goes back to `Live` and the offer stays
+    // retryable, instead of being left accepted-without-grounding, which no
+    // transition can reach (#2068 defect 3).
+    let anchor = match anchor_suggestion_outcome(db, &key, &value, &record) {
+        Ok(anchor) => anchor,
+        Err(error) => {
+            return Err(roll_back_suggestion_resolution(
+                db,
+                &live_record,
+                "suggestion_accept",
+                error,
+            ));
+        }
+    };
     Ok((record, Some(anchor)))
+}
+
+/// Compensates a durable status flip whose decision could not be completed.
+///
+/// The `CF_KV` suggestion row and the Calyx anchor cannot be written in one
+/// batch — the anchor is content-addressed by the PERSISTED row value, so the
+/// row must exist first. That makes the flip a compensable step, not an atomic
+/// one, and the compensation is what keeps the invariant the FSV actually needs:
+/// **a suggestion is never terminal without its grounding**. On failure the
+/// original `Live` record is rewritten, and `write_suggestion` read-back-verifies
+/// the persisted row equals it byte-for-byte, so "the row is provably back in
+/// `Live`" is a proof, not a claim.
+///
+/// The original failure is returned with its structured code intact, extended
+/// with the rollback evidence. If the rollback itself fails the error escalates
+/// to `STORAGE_CORRUPTED` naming both failures — that, and only that, is a state
+/// an operator must resolve.
+fn roll_back_suggestion_resolution(
+    db: &Arc<Db>,
+    live_record: &SuggestionRecord,
+    tool: &str,
+    failure: ErrorData,
+) -> ErrorData {
+    match write_suggestion(db, live_record) {
+        Ok((key, _value)) => {
+            let key_text = String::from_utf8_lossy(&key).into_owned();
+            tracing::warn!(
+                code = "SUGGESTION_RESOLUTION_ROLLED_BACK",
+                tool,
+                suggestion_id = %live_record.suggestion_id,
+                routine_id = %live_record.routine_id,
+                source = ?live_record.source,
+                persisted_row_key = %key_text,
+                failure = %failure.message,
+                "the durable status flip was rolled back to Live after the decision failed to complete; the offer is retryable and was never left terminal without its grounding"
+            );
+            ErrorData::new(
+                failure.code,
+                format!(
+                    "{}; the {tool} status flip on CF_KV {key_text} was ROLLED BACK: suggestion {} is status=live with resolved_ts_ns=null and resolution_note=null again (read-your-write verified), so this call left no durable trace and can be retried",
+                    failure.message, live_record.suggestion_id
+                ),
+                failure.data,
+            )
+        }
+        Err(rollback_error) => mcp_error(
+            error_codes::STORAGE_CORRUPTED,
+            format!(
+                "SUGGESTION_RESOLUTION_ROLLBACK_FAILED for {}: {tool} could not complete the decision AND could not restore the live row. Original failure: {}. Rollback failure: {}. The row may be terminal without its grounding; the next call on this id takes the anchor-repair lane ({SUGGESTION_ANCHOR_REPAIR_CODE}), which completes the missing grounding write from the persisted row",
+                live_record.suggestion_id, failure.message, rollback_error.message
+            ),
+        ),
+    }
 }
 
 // === suggestion_decline: exact, grounded, idempotent dismissal (#2046) ===
@@ -2520,9 +2770,17 @@ pub struct SuggestionDeclineResponse {
     pub resolution_note: String,
     pub persisted_row_key: String,
     pub persisted_row_sha256: String,
-    /// True only when this call recorded new #856 routine feedback. A replay
-    /// records none — one dismissal must not escalate the cooldown twice.
+    /// True only when this call wrote new #856 feedback into
+    /// `CF_ROUTINE_STATE`. A replay records none — one dismissal must not
+    /// escalate the cooldown twice — and neither does a synthetic-namespace
+    /// suggestion, which has no `CF_ROUTINE_STATE` row at all: read
+    /// [`SuggestionDeclineResponse::feedback_store`] with this flag, never this
+    /// flag alone.
     pub feedback_recorded: bool,
+    /// Which durable store holds this suggestion's decline signal, named
+    /// explicitly so `feedback_recorded=false` is never ambiguous. See
+    /// [`FeedbackStore`].
+    pub feedback_store: String,
     pub anchor: SuggestionOutcomeAnchorReport,
 }
 
@@ -2652,6 +2910,7 @@ pub fn decline_suggestion(
             persisted_row_sha256: sha256_hex(&value),
             replay: true,
             feedback_recorded: false,
+            feedback_store: feedback_store_for(&persisted.routine_id).label().to_owned(),
             anchor,
             suggestion: persisted,
         });
@@ -2682,23 +2941,45 @@ pub fn decline_suggestion(
         ));
     }
     let now = params.now_ts_ns.unwrap_or_else(now_ts_ns);
+    let live_record = existing.clone();
     let mut record = existing;
     record.status = SuggestionStatus::Declined;
     record.resolved_ts_ns = Some(now);
     record.resolution_note = Some(expected_note.clone());
     let (key, value) = write_suggestion(db, &record)?;
 
+    // Everything after the flip is compensated: the anchor must be written
+    // against the value that is now in `CF_KV`, so the flip cannot go last, and
+    // the previous code left the row `Declined` with no grounding whenever a
+    // later step failed — a state no transition could leave (#2068 defect 3).
+    // Now any failure here rolls the row back to `Live`, proven by read-back.
+    //
     // #856 feedback: an EXPLICIT dismissal is a distinct, strong negative
     // signal — never conflated with the soft `ignored_timeout`/`abandoned`
     // outcomes the tick already records — so it escalates the decline cooldown.
-    record_terminal_feedback(
-        db,
-        &record.routine_id,
-        RoutineFeedbackOutcome::Declined,
-        now,
-        &expected_note,
-    )?;
-    let anchor = anchor_suggestion_outcome(db, &key, &value, &record)?;
+    // Which store holds that cooldown depends on the id namespace, and for a
+    // synthetic id it is this very row (see `record_terminal_feedback`).
+    let completed = anchor_suggestion_outcome(db, &key, &value, &record).and_then(|anchor| {
+        let feedback_recorded = record_terminal_feedback(
+            db,
+            &record.routine_id,
+            RoutineFeedbackOutcome::Declined,
+            now,
+            &expected_note,
+        )?;
+        Ok((anchor, feedback_recorded))
+    });
+    let (anchor, feedback_recorded) = match completed {
+        Ok(completed) => completed,
+        Err(error) => {
+            return Err(roll_back_suggestion_resolution(
+                db,
+                &live_record,
+                "suggestion_decline",
+                error,
+            ));
+        }
+    };
 
     tracing::info!(
         code = "SUGGESTION_DECLINED",
@@ -2709,7 +2990,8 @@ pub fn decline_suggestion(
         cx_id = %anchor.cx_id,
         ledger_seq = anchor.ledger_seq.unwrap_or_default(),
         evidence_anchors = anchor.evidence_anchors.len(),
-        "suggestion dismissed by exact id, feedback recorded, and grounded as a Calyx anchor"
+        feedback_recorded,
+        "suggestion dismissed by exact id, grounded as a Calyx anchor, and its decline cooldown recorded"
     );
 
     Ok(SuggestionDeclineResponse {
@@ -2721,12 +3003,17 @@ pub fn decline_suggestion(
         persisted_row_key: String::from_utf8_lossy(&key).into_owned(),
         persisted_row_sha256: sha256_hex(&value),
         replay: false,
-        feedback_recorded: true,
+        feedback_recorded,
+        feedback_store: feedback_store_for(&record.routine_id).label().to_owned(),
         anchor,
         suggestion: record,
     })
 }
 
+/// #856 feedback for an executed acceptance. Namespace-dispatched exactly like
+/// every other terminal outcome, so accepting an `assist1-`/`next1-` suggestion
+/// no longer dies against the `CF_ROUTINE_STATE` encoder AFTER the row has been
+/// flipped and anchored.
 pub fn record_suggestion_execution_feedback(
     db: &Arc<Db>,
     routine_id: &str,
@@ -2734,7 +3021,7 @@ pub fn record_suggestion_execution_feedback(
     now_ns: u64,
     note: &str,
 ) -> Result<(), ErrorData> {
-    record_terminal_feedback(db, routine_id, outcome, now_ns, note)
+    record_terminal_feedback(db, routine_id, outcome, now_ns, note).map(|_| ())
 }
 
 fn validate_suggestion_id(tool: &str, suggestion_id: &str) -> Result<(), ErrorData> {
@@ -2766,20 +3053,96 @@ fn validate_suggestion_id(tool: &str, suggestion_id: &str) -> Result<(), ErrorDa
     Ok(())
 }
 
+/// Which durable store owns the #856 feedback and decline cooldown for a
+/// suggestion, decided by its `routine_id` namespace (#2068 defect 1).
+///
+/// `CF_ROUTINE_STATE` is keyed by the mined-routine encoder — `rt1-` + 16
+/// lowercase hex, enforced in `synapse-storage::routines::routine_state_key` —
+/// so it physically cannot hold state for the synthetic per-offer ids this
+/// module mints for sources that have no mined routine behind them
+/// (`assist1-…` for an assist opportunity, `next1-…` for a kernel/graph-composed
+/// next action). Routing those through the routine-state machinery is what made
+/// every composed next action abort the whole tick and every synthetic decline
+/// tear its row.
+///
+/// The answer is NOT to drop the cooldown: #856's decline cooldown is what stops
+/// a dismissed offer being re-proposed on the next tick. It is to use the store
+/// that actually owns these ids — the durable `CF_KV suggestion/v1` rows, which
+/// this module already treats as its only source of truth ("a daemon restart
+/// re-derives every cap and dedup decision from the persisted rows"). A
+/// synthetic offer's terminal row IS its feedback event: `Declined`/`Expired`
+/// escalate, `Accepted` resets, `Abandoned` is provenance only — the same
+/// mapping `record_routine_feedback` applies, over the same
+/// `feedback_cooldown_secs` curve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FeedbackStore {
+    /// Mined routines (`rt1-` + 16 hex): the `CF_ROUTINE_STATE` row.
+    RoutineState,
+    /// Synthetic per-offer ids (`assist1-`, `next1-`): the `CF_KV
+    /// suggestion/v1` rows themselves.
+    SuggestionRows,
+}
+
+impl FeedbackStore {
+    /// Stable, greppable name reported to callers.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::RoutineState => "cf_routine_state",
+            Self::SuggestionRows => "cf_kv_suggestion_rows",
+        }
+    }
+}
+
+/// Pure namespace dispatch: the store is a structural fact of how the id was
+/// minted, never configuration.
+fn feedback_store_for(routine_id: &str) -> FeedbackStore {
+    if routine_id.starts_with(ASSIST_ROUTINE_PREFIX)
+        || routine_id.starts_with(NEXT_ACTION_ROUTINE_PREFIX)
+    {
+        FeedbackStore::SuggestionRows
+    } else {
+        // Anything else is claimed to be a mined routine id. It is NOT assumed
+        // valid: the `CF_ROUTINE_STATE` encoder still rejects a malformed id,
+        // loudly, which is the correct outcome for an id that is neither.
+        FeedbackStore::RoutineState
+    }
+}
+
+/// Records one terminal suggestion outcome as #856 feedback, in the store that
+/// owns this id namespace. Returns whether a `CF_ROUTINE_STATE` row was written.
+///
+/// For a synthetic id nothing is written here and that is not a swallowed
+/// failure: the caller has already persisted (or is about to persist) the
+/// terminal `CF_KV` row that IS the feedback record for that namespace, and
+/// `synthetic_feedback_suppressed` reads exactly those rows to compute the same
+/// escalating cooldown. The skip is announced with its own daemon record so it
+/// can never be mistaken for a missing signal.
 fn record_terminal_feedback(
     db: &Arc<Db>,
     routine_id: &str,
     outcome: RoutineFeedbackOutcome,
     now_ns: u64,
     note: &str,
-) -> Result<(), ErrorData> {
+) -> Result<bool, ErrorData> {
+    if feedback_store_for(routine_id) == FeedbackStore::SuggestionRows {
+        tracing::info!(
+            code = "SUGGESTION_FEEDBACK_RECORDED_ON_SUGGESTION_ROW",
+            routine_id,
+            outcome = ?outcome,
+            now_ns,
+            note,
+            feedback_store = FeedbackStore::SuggestionRows.label(),
+            "synthetic suggestion id has no CF_ROUTINE_STATE row; the terminal CF_KV suggestion/v1 row is this outcome's durable feedback record and drives its decline cooldown"
+        );
+        return Ok(false);
+    }
     let params = RoutineFeedbackParams {
         routine_id: routine_id.to_owned(),
         outcome,
         note: Some(note.to_owned()),
         now_ts_ns: Some(now_ns),
     };
-    record_routine_feedback(db, &params, SUGGESTION_ACTOR).map(|_| ())
+    record_routine_feedback(db, &params, SUGGESTION_ACTOR).map(|_| true)
 }
 
 /// One engine pass: expire timed-out suggestions, abandon ones whose routine
@@ -2842,15 +3205,19 @@ pub fn suggestion_tick(
             record.resolution_note = Some("timed out unanswered".to_owned());
             if !params.dry_run {
                 write_suggestion(db, record)?;
-                if record.source == SuggestionSource::RoutineIntent {
-                    record_terminal_feedback(
-                        db,
-                        &record.routine_id,
-                        RoutineFeedbackOutcome::IgnoredTimeout,
-                        now,
-                        "suggestion expired (timeout)",
-                    )?;
-                }
+                // Namespace-dispatched: a mined routine escalates its
+                // `CF_ROUTINE_STATE` cooldown, a synthetic offer's cooldown is
+                // this very `Expired` row. The old `RoutineIntent`-only guard
+                // was the correct FIX for the crash but recorded the skip
+                // nowhere; `record_terminal_feedback` now names the store it
+                // used in the daemon record.
+                record_terminal_feedback(
+                    db,
+                    &record.routine_id,
+                    RoutineFeedbackOutcome::IgnoredTimeout,
+                    now,
+                    "suggestion expired (timeout)",
+                )?;
             }
             expired.push(record.suggestion_id.clone());
         } else if record.source == SuggestionSource::RoutineIntent
@@ -2883,7 +3250,7 @@ pub fn suggestion_tick(
     let mut decisions = Vec::new();
     let now_minute = local_minute_of_day(now);
     for candidate in &intent.candidates {
-        let suppressed = is_routine_suppressed(db, &candidate.routine_id, now)?;
+        let suppressed = candidate_suppressed(db, &suggestions, &candidate.routine_id, now)?;
         let outcome = gate_decision(
             &candidate.routine_id,
             candidate.confidence,
@@ -2919,11 +3286,17 @@ pub fn suggestion_tick(
     }
 
     for candidate in &assist_candidates {
+        // Synthetic `assist1-` id: its decline cooldown lives in the durable
+        // suggestion rows, not `CF_ROUTINE_STATE`. Before #2068 this lane simply
+        // passed `false` — a dismissed assist offer had no cooldown at all
+        // beyond the per-routine window — because the only suppression helper
+        // available would have crashed on the id.
+        let suppressed = synthetic_feedback_suppressed(&suggestions, &candidate.routine_id, now);
         let outcome = gate_decision(
             &candidate.routine_id,
             candidate.confidence,
             RoutineLifecycle::Confirmed,
-            false,
+            suppressed,
             now,
             now_minute,
             &live,
@@ -2953,7 +3326,10 @@ pub fn suggestion_tick(
     }
 
     for candidate in &next_actions {
-        let suppressed = is_routine_suppressed(db, &candidate.routine_id, now)?;
+        // Synthetic `next1-` id: same store as the assist lane. Passing this to
+        // `is_routine_suppressed` is what made every composed candidate abort
+        // the whole tick with `ROUTINE_KEY_INVALID` (#2068 defect 1).
+        let suppressed = synthetic_feedback_suppressed(&suggestions, &candidate.routine_id, now);
         let outcome = gate_decision(
             &candidate.routine_id,
             candidate.confidence,
@@ -3130,11 +3506,114 @@ pub fn assist_plan_for_suggestion(
     })
 }
 
+/// #856 suppression for a MINED routine, from its `CF_ROUTINE_STATE` row.
+///
+/// Refuses a synthetic id up front instead of letting it reach the
+/// `CF_ROUTINE_STATE` encoder: that encoder's `ROUTINE_KEY_INVALID` was raised
+/// as a storage-write failure and aborted the entire `suggestion_tick`,
+/// including the lanes that had nothing to do with the offending candidate
+/// (#2068 defect 1). A synthetic id arriving here is a routing bug in this
+/// module, so it fails loud as an internal error rather than being coerced.
 fn is_routine_suppressed(db: &Arc<Db>, routine_id: &str, now: u64) -> Result<bool, ErrorData> {
+    if feedback_store_for(routine_id) != FeedbackStore::RoutineState {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "SUGGESTION_SUPPRESSION_NAMESPACE_MISMATCH: routine_id {routine_id} is a synthetic per-offer id whose feedback lives in {}, not CF_ROUTINE_STATE; its cooldown must be read with synthetic_feedback_suppressed",
+                FeedbackStore::SuggestionRows.label()
+            ),
+        ));
+    }
     Ok(match load_state_row(db, routine_id)? {
         Some(state) => feedback_suppressed(&state, now),
         None => false,
     })
+}
+
+/// #856 decline cooldown for a synthetic per-offer id, derived from the durable
+/// `CF_KV suggestion/v1` rows that ARE its feedback record.
+///
+/// Mirrors `record_routine_feedback` exactly, over the same
+/// `feedback_cooldown_secs` curve: walking the routine's terminal rows newest
+/// first, `Accepted` ends the streak (recovery), `Declined` and `Expired` (the
+/// row-level form of `ignored_timeout`) each extend it, `Abandoned` is
+/// provenance and neither extends nor resets. The cooldown then runs from the
+/// most recent escalating outcome. `Live` rows are not outcomes and are skipped.
+///
+/// This is a derivation, not a cache: it reads the same persisted rows the
+/// engine already loaded for its caps, so a daemon restart re-derives the
+/// identical decision — the property the module header promises.
+fn synthetic_feedback_suppressed(
+    suggestions: &[(Vec<u8>, SuggestionRecord)],
+    routine_id: &str,
+    now: u64,
+) -> bool {
+    let mut outcomes: Vec<(u64, SuggestionStatus)> = suggestions
+        .iter()
+        .map(|(_key, record)| record)
+        .filter(|record| record.routine_id == routine_id)
+        .filter_map(|record| {
+            let resolved_ts_ns = record.resolved_ts_ns?;
+            match record.status {
+                SuggestionStatus::Accepted
+                | SuggestionStatus::Declined
+                | SuggestionStatus::Expired
+                | SuggestionStatus::Abandoned => Some((resolved_ts_ns, record.status)),
+                SuggestionStatus::Live => None,
+            }
+        })
+        .collect();
+    // Newest first. Ties are broken by a fixed rank so the walk is total and
+    // order-independent, and so a same-instant `Accepted` cannot truncate a
+    // streak it did not follow: escalating outcomes are visited first.
+    const fn tie_rank(status: SuggestionStatus) -> u8 {
+        match status {
+            SuggestionStatus::Declined | SuggestionStatus::Expired => 0,
+            SuggestionStatus::Abandoned => 1,
+            SuggestionStatus::Accepted | SuggestionStatus::Live => 2,
+        }
+    }
+    outcomes.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| tie_rank(left.1).cmp(&tie_rank(right.1)))
+    });
+
+    let mut consecutive: u32 = 0;
+    let mut streak_started_ts_ns = None;
+    for (resolved_ts_ns, status) in outcomes {
+        match status {
+            SuggestionStatus::Accepted => break,
+            SuggestionStatus::Declined | SuggestionStatus::Expired => {
+                consecutive = consecutive.saturating_add(1);
+                if streak_started_ts_ns.is_none() {
+                    streak_started_ts_ns = Some(resolved_ts_ns);
+                }
+            }
+            SuggestionStatus::Abandoned | SuggestionStatus::Live => {}
+        }
+    }
+    let Some(latest_ts_ns) = streak_started_ts_ns else {
+        return false;
+    };
+    let cooldown_ns = feedback_cooldown_secs(consecutive).saturating_mul(1_000_000_000);
+    now < latest_ts_ns.saturating_add(cooldown_ns)
+}
+
+/// Suppression for one candidate, routed by the store that owns its id space.
+fn candidate_suppressed(
+    db: &Arc<Db>,
+    suggestions: &[(Vec<u8>, SuggestionRecord)],
+    routine_id: &str,
+    now: u64,
+) -> Result<bool, ErrorData> {
+    match feedback_store_for(routine_id) {
+        FeedbackStore::RoutineState => is_routine_suppressed(db, routine_id, now),
+        FeedbackStore::SuggestionRows => {
+            Ok(synthetic_feedback_suppressed(suggestions, routine_id, now))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
