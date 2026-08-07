@@ -27,7 +27,9 @@ mod math;
 pub mod olap;
 mod readiness;
 pub mod timeseries;
-pub use readiness::SynapseCalyxReadinessSnapshot;
+pub use readiness::{
+    SynapseCalyxReadinessEvidence, SynapseCalyxReadinessPredicate, SynapseCalyxReadinessSnapshot,
+};
 pub mod panel_lifecycle;
 pub mod vault_runtime;
 pub mod ward;
@@ -2618,17 +2620,12 @@ impl SynapseCalyxReadOnlyVault {
         self.scan_cf_latest(ColumnFamily::Collections)
     }
 
-    /// Opens an existing vault with only the native Reactive outbox selected.
-    pub fn open_existing_reactive_only(
-        config: SynapseCalyxConfig,
-    ) -> Result<Self, SynapseCalyxError> {
-        Self::open_existing_with_cfs(config, Some(vec![ColumnFamily::Reactive]))
-    }
-
-    /// Reads all visible native Reactive outbox rows from the read-only handle.
-    pub fn scan_reactive_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
-        self.scan_cf_latest(ColumnFamily::Reactive)
-    }
+    // `open_existing_reactive_only` / `scan_reactive_latest` were removed with
+    // the `reactive_region_fsv` bin target in #2045. They were two-line wrappers
+    // over `open_existing_with_cfs(.., [ColumnFamily::Reactive])` and
+    // `scan_cf_latest(ColumnFamily::Reactive)`, and that bin was their only
+    // caller anywhere in either workspace — so they were public API reachable
+    // from nothing that ships. Call the two general methods directly.
 
     /// Reads content-addressed tuning artifacts for physical Anneal verification.
     pub fn scan_anneal_tuning_artifacts_latest(

@@ -14,16 +14,25 @@ use sha2::{Digest as _, Sha256};
 use crate::{SynapseCalyxError, SynapseCalyxVault, SynapseCalyxWalkStep};
 
 pub(crate) const ACTION_DOMAIN: &str = "synapse.action";
-pub(crate) const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v1/synapse.action";
-const ACTION_PANEL_VERSION: u32 = 2_020_001;
+/// Physical `AnnealReport` row holding the held-out action validation report.
+///
+/// `v2` because the evidence now binds the exact Ward profile revision it was
+/// scored against (`guard_profile_sha256`). A `v1` row cannot answer "was the
+/// Goodhart boundary recalibrated after this was measured", so it is not
+/// upgraded in place: it is simply not read, and readiness reports absent
+/// evidence with a rerun remediation instead of a false pass.
+pub(crate) const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v2/synapse.action";
+pub(crate) const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
+pub(crate) const ACTION_PANEL_VERSION: u32 = 2_020_001;
 const MIN_ACTION_RECORDS: usize = 50;
-const MIN_HELD_OUT_RECORDS: usize = 10;
+pub(crate) const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
 const MAX_HELD_OUT_RECORDS: usize = 200;
 const MAX_GUARD_TRAINING_RECORDS: usize = 1_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxActionValidationEvidence {
+    pub schema_version: u32,
     pub domain: String,
     pub panel_version: u32,
     pub measured_at_seq: u64,
@@ -33,6 +42,11 @@ pub struct SynapseCalyxActionValidationEvidence {
     pub held_out_sha256: String,
     pub guard_training_successes: usize,
     pub guard_held_out_successes: usize,
+    /// SHA-256 of the exact `Guard` CF profile bytes the Goodhart holdout was
+    /// scored against. Readiness refuses evidence whose boundary has since been
+    /// recalibrated, because an in-region fraction only means anything relative
+    /// to the profile that produced it.
+    pub guard_profile_sha256: String,
     pub regression_evaluated: usize,
     pub mistake_count: usize,
     pub goodhart: GoodhartReport,
@@ -89,12 +103,13 @@ impl SynapseCalyxVault {
         let (training, held_out) = observations.split_at(split);
         let corpus_hash = action_corpus_hash(&observations);
         let held_out_hash = action_corpus_hash(held_out);
-        let (goodhart, guard_training_successes, guard_held_out_successes) =
+        let (goodhart, guard_training_successes, guard_held_out_successes, guard_profile_sha256) =
             self.action_goodhart_report(panel_version, training, held_out)?;
         let (mistakes, regression_evaluated, mistake_count) =
             action_mistake_report(training, held_out, &observations)?;
 
         let draft = SynapseCalyxActionValidationEvidence {
+            schema_version: ACTION_VALIDATION_SCHEMA_VERSION,
             domain: ACTION_DOMAIN.to_owned(),
             panel_version,
             measured_at_seq,
@@ -104,6 +119,7 @@ impl SynapseCalyxVault {
             held_out_sha256: held_out_hash.clone(),
             guard_training_successes,
             guard_held_out_successes,
+            guard_profile_sha256: guard_profile_sha256.clone(),
             regression_evaluated,
             mistake_count,
             goodhart,
@@ -112,12 +128,14 @@ impl SynapseCalyxVault {
             ledger_hash: String::new(),
         };
         let payload = serde_json::to_vec(&serde_json::json!({
+            "schema_version": ACTION_VALIDATION_SCHEMA_VERSION,
             "panel_version": panel_version,
             "measured_at_seq": measured_at_seq,
             "action_record_count": observations.len(),
             "action_corpus_sha256": corpus_hash,
             "held_out_count": held_out_count,
             "held_out_sha256": held_out_hash,
+            "guard_profile_sha256": guard_profile_sha256,
             "goodhart_passed": draft.goodhart.passed,
             "mistakes_passed": draft.mistakes.passed,
             "mistake_count": mistake_count,
@@ -189,10 +207,24 @@ impl SynapseCalyxVault {
     pub fn read_action_validation(
         &self,
     ) -> Result<Option<SynapseCalyxActionValidationEvidence>, SynapseCalyxError> {
-        let Some(bytes) = self.read_cf_latest(ColumnFamily::AnnealReport, ACTION_VALIDATION_KEY)?
+        Ok(self
+            .read_action_validation_revisioned()?
+            .map(|(evidence, _)| evidence))
+    }
+
+    /// Reads the evidence together with the SHA-256 revision of the exact
+    /// physical row it came from, so a readiness snapshot can name the row it
+    /// measured and an operator can independently confirm the same row.
+    pub(crate) fn read_action_validation_revisioned(
+        &self,
+    ) -> Result<Option<(SynapseCalyxActionValidationEvidence, String)>, SynapseCalyxError> {
+        let Some(row) =
+            self.read_cf_latest_revisioned(ColumnFamily::AnnealReport, ACTION_VALIDATION_KEY)?
         else {
             return Ok(None);
         };
+        let bytes = row.value;
+        let row_revision_sha256 = hex(&row.revision_sha256);
         let stored: StoredActionValidation = serde_json::from_slice(&bytes).map_err(|error| {
             validation_error(
                 "SYNAPSE_CALYX_ACTION_VALIDATION_CORRUPT",
@@ -213,7 +245,7 @@ impl SynapseCalyxVault {
                 "quarantine the tampered AnnealReport row and rerun oracle_validate",
             ));
         }
-        Ok(Some(stored.evidence))
+        Ok(Some((stored.evidence, row_revision_sha256)))
     }
 
     pub(crate) fn current_action_corpus_binding(
@@ -221,6 +253,19 @@ impl SynapseCalyxVault {
     ) -> Result<(usize, String), SynapseCalyxError> {
         let observations = self.action_observations()?;
         Ok((observations.len(), action_corpus_hash(&observations)))
+    }
+
+    /// Digests the action panel's live Ward profile row exactly as validation
+    /// digested it, so readiness can prove the Goodhart boundary has not moved
+    /// since the held-out report was scored. `None` means the profile row is
+    /// physically absent.
+    pub(crate) fn current_guard_profile_sha256(
+        &self,
+        panel_version: u32,
+    ) -> Result<Option<String>, SynapseCalyxError> {
+        Ok(self
+            .read_cf_latest(ColumnFamily::Guard, &guard_profile_key(panel_version))?
+            .map(|bytes| hex(&Sha256::digest(&bytes))))
     }
 
     fn action_observations(&self) -> Result<Vec<ActionObservation>, SynapseCalyxError> {
@@ -288,13 +333,14 @@ impl SynapseCalyxVault {
         panel_version: u32,
         training: &[ActionObservation],
         held_out: &[ActionObservation],
-    ) -> Result<(GoodhartReport, usize, usize), SynapseCalyxError> {
+    ) -> Result<(GoodhartReport, usize, usize, String), SynapseCalyxError> {
         let profile_key = guard_profile_key(panel_version);
         let bytes = self.read_cf_latest(ColumnFamily::Guard, &profile_key)?.ok_or_else(|| validation_error(
             "SYNAPSE_CALYX_ACTION_VALIDATION_GUARD_ABSENT",
             format!("no panel-keyed Ward profile exists for action panel {panel_version}"),
             "calibrate the action-panel guard from real good and bad cases before oracle_validate",
         ))?;
+        let guard_profile_sha256 = hex(&Sha256::digest(&bytes));
         let profile: GuardProfile = serde_json::from_slice(&bytes).map_err(|error| {
             validation_error(
                 "SYNAPSE_CALYX_ACTION_VALIDATION_GUARD_CORRUPT",
@@ -379,6 +425,7 @@ impl SynapseCalyxVault {
             },
             trusted.len(),
             held_out_good.len(),
+            guard_profile_sha256,
         ))
     }
 
