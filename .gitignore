@@ -71,3 +71,4 @@ tracing-*.log
 
 # Vendored Calyx nested workspace build artifacts (docs/calyx/)
 /calyx/target/
+/logs/
