@@ -41,6 +41,15 @@ pub enum ActionError {
     },
     #[error("action foreground lost: {detail}")]
     ForegroundLost { detail: String },
+    /// The per-emission exact-target fence stopped a global-input emission
+    /// because the foreground drifted mid-sequence (#2057). Distinct from
+    /// `ForegroundLost` in that it carries the exact boundary that stopped and
+    /// both window identities, and it is raised strictly *before* the OS call.
+    #[error("global input refused at emission boundary: {detail}")]
+    ForegroundEmissionRefused {
+        detail: String,
+        drift: Box<crate::foreground_fence::ForegroundDrift>,
+    },
     #[error("action unsupported key: {detail}")]
     UnsupportedKey { detail: String },
     #[error("action observed no state delta: {detail}")]
@@ -73,7 +82,9 @@ impl ActionError {
                 error_codes::ACTION_ELEMENT_PATTERN_UNSUPPORTED
             }
             Self::TransientElementExpired { .. } => error_codes::TRANSIENT_ELEMENT_EXPIRED,
-            Self::ForegroundLost { .. } => error_codes::ACTION_FOREGROUND_LOST,
+            Self::ForegroundLost { .. } | Self::ForegroundEmissionRefused { .. } => {
+                error_codes::ACTION_FOREGROUND_LOST
+            }
             Self::UnsupportedKey { .. } => error_codes::ACTION_UNSUPPORTED_KEY,
             Self::NoObservedDelta { .. } => error_codes::ACTION_NO_OBSERVED_DELTA,
             Self::DragDistanceExceedsLimit { .. } => {
@@ -101,6 +112,7 @@ impl ActionError {
             | Self::ElementPatternUnsupported { detail, .. }
             | Self::TransientElementExpired { detail, .. }
             | Self::ForegroundLost { detail }
+            | Self::ForegroundEmissionRefused { detail, .. }
             | Self::UnsupportedKey { detail }
             | Self::NoObservedDelta { detail }
             | Self::DragDistanceExceedsLimit { detail }
@@ -146,6 +158,9 @@ impl ActionError {
                 Self::TransientElementExpired { element_id, detail }
             }
             Self::ForegroundLost { .. } => Self::ForegroundLost { detail },
+            Self::ForegroundEmissionRefused { drift, .. } => {
+                Self::ForegroundEmissionRefused { detail, drift }
+            }
             Self::UnsupportedKey { .. } => Self::UnsupportedKey { detail },
             Self::NoObservedDelta { .. } => Self::NoObservedDelta { detail },
             Self::DragDistanceExceedsLimit { .. } => Self::DragDistanceExceedsLimit { detail },
@@ -171,6 +186,7 @@ impl ActionError {
             | Self::ElementPatternUnsupported { .. }
             | Self::TransientElementExpired { .. }
             | Self::ForegroundLost { .. }
+            | Self::ForegroundEmissionRefused { .. }
             | Self::UnsupportedKey { .. }
             | Self::NoObservedDelta { .. }
             | Self::DragDistanceExceedsLimit { .. }

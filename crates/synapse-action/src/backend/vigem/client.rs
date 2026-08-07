@@ -8,6 +8,8 @@ use synapse_core::{
     ButtonAction, GamepadController, GamepadReport, PadButton, PadId, Stick, Trigger,
 };
 
+#[cfg(windows)]
+use crate::foreground_fence::{self, EmissionSite};
 use crate::{ActionError, EmitState, recovery};
 
 #[cfg(windows)]
@@ -150,27 +152,27 @@ impl VigemBackendInner {
             ButtonAction::Down => {
                 let mut report = report_for_pad(state, pad);
                 push_unique(&mut report.buttons, button);
-                self.send_report(pad, &report)?;
+                self.send_report(pad, &report, EmissionSite::delivery("pad_button_down"))?;
                 apply_pad_button(state, pad, button, ButtonAction::Down);
                 Ok(())
             }
             ButtonAction::Up => {
                 let mut report = report_for_pad(state, pad);
                 report.buttons.retain(|held| *held != button);
-                self.send_report(pad, &report)?;
+                self.send_report(pad, &report, EmissionSite::release("pad_button_up"))?;
                 apply_pad_button(state, pad, button, ButtonAction::Up);
                 Ok(())
             }
             ButtonAction::Press => {
                 let mut report = report_for_pad(state, pad);
                 push_unique(&mut report.buttons, button);
-                self.send_report(pad, &report)?;
+                self.send_report(pad, &report, EmissionSite::delivery("pad_button_press_down"))?;
                 apply_pad_button(state, pad, button, ButtonAction::Down);
                 if hold_ms > 0 {
                     std::thread::sleep(Duration::from_millis(u64::from(hold_ms)));
                 }
                 report.buttons.retain(|held| *held != button);
-                self.send_report(pad, &report)?;
+                self.send_report(pad, &report, EmissionSite::release("pad_button_press_up"))?;
                 apply_pad_button(state, pad, button, ButtonAction::Up);
                 Ok(())
             }
@@ -190,7 +192,7 @@ impl VigemBackendInner {
             Stick::Left => report.thumb_l = (x, y),
             Stick::Right => report.thumb_r = (x, y),
         }
-        self.send_report(pad, &report)?;
+        self.send_report(pad, &report, EmissionSite::delivery("pad_stick"))?;
         apply_pad_stick(state, pad, stick, x, y);
         Ok(())
     }
@@ -207,7 +209,7 @@ impl VigemBackendInner {
             Trigger::Left => report.lt = value,
             Trigger::Right => report.rt = value,
         }
-        self.send_report(pad, &report)?;
+        self.send_report(pad, &report, EmissionSite::delivery("pad_trigger"))?;
         apply_pad_trigger(state, pad, trigger, value);
         Ok(())
     }
@@ -219,18 +221,33 @@ impl VigemBackendInner {
         report: GamepadReport,
     ) -> Result<(), ActionError> {
         if is_neutral_report(&report) {
-            self.send_report(pad, &report)?;
+            self.send_report(pad, &report, EmissionSite::release("pad_report_neutral"))?;
             apply_pad_report(state, pad, report);
             recovery::clear_held_pad(pad)?;
             return Ok(());
         }
         recovery::record_held_pad_report(pad, &report)?;
-        self.send_report(pad, &report)?;
+        self.send_report(pad, &report, EmissionSite::delivery("pad_report"))?;
         apply_pad_report(state, pad, report);
         Ok(())
     }
 
-    fn send_report(&mut self, pad: PadId, report: &GamepadReport) -> Result<(), ActionError> {
+    /// The single HID-report emission boundary for the virtual pad.
+    ///
+    /// A `ViGEm` report is delivered to whichever process is polling `XInput`/HID —
+    /// in practice the foreground game — so it is global desktop input with the
+    /// same time-of-check/time-of-use exposure as `SendInput`, and a `Press`
+    /// holds a real sleep between its two reports. The fence therefore runs per
+    /// report, not per action (#2057). A report that *neutralizes* held pad
+    /// state is a release emission and is allowed through a tripped fence so a
+    /// stick or trigger is never left latched.
+    fn send_report(
+        &mut self,
+        pad: PadId,
+        report: &GamepadReport,
+        site: EmissionSite,
+    ) -> Result<(), ActionError> {
+        foreground_fence::guard_emission(site)?;
         let target = self.ensure_pad(pad, report.controller)?;
         target.update(report)
     }

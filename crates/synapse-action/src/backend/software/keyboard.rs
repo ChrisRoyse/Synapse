@@ -1,6 +1,7 @@
 use enigo::{Direction, Enigo, Key as EnigoKey, Keyboard};
 use synapse_core::{Key, KeyCode};
 
+use crate::foreground_fence::{self, EmissionSite};
 use crate::{ActionError, EmitState, recovery};
 
 use super::utils::{enigo, enigo_error, enigo_preserving_held_keys, sleep_ms};
@@ -103,7 +104,20 @@ pub(super) fn release_keys_with(enigo: &mut Enigo, keys: &[Key]) -> Result<(), A
     Ok(())
 }
 
+/// Emits one key transition through `enigo`, which reaches `SendInput`
+/// internally — a second global-input emission boundary alongside
+/// [`super::input::send_input_batch`], so it carries its own fence check.
+///
+/// A key *release* is classified as a release emission and is allowed through a
+/// tripped fence: stranding a held `Ctrl`/`Alt`/`Shift` across the desktop is a
+/// worse failure for the human than one stray key-up in the window that took
+/// the foreground. A key *press* is refused on drift (#2057).
 fn emit_key(enigo: &mut Enigo, key: &Key, direction: Direction) -> Result<(), ActionError> {
+    foreground_fence::guard_emission(match direction {
+        Direction::Release => EmissionSite::release("key_release"),
+        Direction::Press => EmissionSite::delivery("key_press"),
+        Direction::Click => EmissionSite::delivery("key_click"),
+    })?;
     if key.use_scancode {
         let KeyCode::HidCode { value } = &key.code else {
             return Err(unsupported_key(key));

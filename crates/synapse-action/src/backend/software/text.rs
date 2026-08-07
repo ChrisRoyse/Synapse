@@ -11,19 +11,31 @@ use super::{
 };
 use crate::ActionError;
 use crate::backend::text_dispatch::{TextDispatchInput, text_dispatch_plan};
+use crate::foreground_fence::EmissionSite;
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_type_text"))]
 pub(super) fn type_text(text: &str, dynamics: &KeystrokeDynamics) -> Result<(), ActionError> {
     type_text_with_sender(text, dynamics, send_text_input)
 }
 
+/// Types a planned string, one OS emission per UTF-16 unit.
+///
+/// The plan sleeps a sampled inter-keystroke interval between steps, so this
+/// loop spans real time — seconds for a long string. Each `sender` call reaches
+/// `send_input_batch`, which re-reads the live foreground immediately before
+/// its `SendInput`. The emission position (`unit_index`/`unit_total`) is
+/// threaded down so a refusal names the exact character the sequence stopped
+/// at, and the caller can re-issue only the undelivered remainder (#2057).
 fn type_text_with_sender(
     text: &str,
     dynamics: &KeystrokeDynamics,
-    mut sender: impl FnMut(TextDispatchInput) -> Result<(), ActionError>,
+    mut sender: impl FnMut(TextDispatchInput, EmissionSite) -> Result<(), ActionError>,
 ) -> Result<(), ActionError> {
     let release_epoch = crate::hotkey::operator_release_epoch();
-    for (step_index, step) in text_dispatch_plan(text, dynamics).into_iter().enumerate() {
+    let plan = text_dispatch_plan(text, dynamics);
+    let unit_total = plan.iter().map(|step| step.inputs.len()).sum::<usize>();
+    let mut unit_index = 0_usize;
+    for (step_index, step) in plan.into_iter().enumerate() {
         if sleep_ms_since(step.iki_ms_before, release_epoch) {
             return Err(operator_release_error(
                 "delay",
@@ -40,7 +52,13 @@ fn type_text_with_sender(
                 Some(input_index),
                 step.iki_ms_before,
             )?;
-            sender(input)?;
+            sender(
+                input,
+                EmissionSite::delivery("type_text_unit")
+                    .at(unit_index)
+                    .of(unit_total),
+            )?;
+            unit_index += 1;
             thread::yield_now();
             ensure_operator_release_not_requested(
                 release_epoch,
@@ -89,27 +107,28 @@ fn operator_release_error(
     }
 }
 
-fn send_text_input(input: TextDispatchInput) -> Result<(), ActionError> {
+fn send_text_input(input: TextDispatchInput, site: EmissionSite) -> Result<(), ActionError> {
     match input {
-        TextDispatchInput::UnicodeUnit(unit) => send_unicode_unit(unit),
-        TextDispatchInput::VirtualKey(vkey) => {
-            send_virtual_key(VIRTUAL_KEY(vkey), "text virtual key")
-        }
+        TextDispatchInput::UnicodeUnit(unit) => send_unicode_unit(unit, site),
+        TextDispatchInput::VirtualKey(vkey) => send_virtual_key(VIRTUAL_KEY(vkey), site),
     }
 }
 
-fn send_unicode_unit(unit: u16) -> Result<(), ActionError> {
+/// One UTF-16 unit is a self-contained down+up pair in a single `SendInput`
+/// batch, so the pair is one indivisible delivery: it can never be split by
+/// the fence into a stranded key-down.
+fn send_unicode_unit(unit: u16, site: EmissionSite) -> Result<(), ActionError> {
     let inputs = [
         keyboard_input(unit, KEYEVENTF_UNICODE),
         keyboard_input(unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
     ];
-    send_input_batch(&inputs, "unicode text character")
+    send_input_batch(&inputs, site)
 }
 
-fn send_virtual_key(vkey: VIRTUAL_KEY, detail: &'static str) -> Result<(), ActionError> {
+fn send_virtual_key(vkey: VIRTUAL_KEY, site: EmissionSite) -> Result<(), ActionError> {
     let inputs = [
         virtual_keyboard_input(vkey, KEYBD_EVENT_FLAGS(0)),
         virtual_keyboard_input(vkey, KEYEVENTF_KEYUP),
     ];
-    send_input_batch(&inputs, detail)
+    send_input_batch(&inputs, site)
 }

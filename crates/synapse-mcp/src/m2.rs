@@ -1234,6 +1234,26 @@ pub(crate) fn action_error_to_mcp(error: &ActionError) -> ErrorData {
                 "retry_after_ms": retry_after_ms,
             })),
         ),
+        // The emission fence refuses strictly *before* the OS call, so there is
+        // provably nothing delivered to verify. Carrying the structured drift
+        // through keeps `refused_before_delivery` on the payload — the facade
+        // uses that marker to avoid reporting `delivered_unverified` for a call
+        // that emitted nothing (#1830/#2057).
+        ActionError::ForegroundEmissionRefused { detail, drift } => {
+            let mut data = drift.to_json();
+            if let Value::Object(map) = &mut data {
+                map.insert(
+                    "code".to_owned(),
+                    Value::String(error.code().to_owned()),
+                );
+                map.insert("detail".to_owned(), Value::String(detail.clone()));
+                map.insert(
+                    "resolution".to_owned(),
+                    Value::String(drift.reason.remediation().to_owned()),
+                );
+            }
+            ErrorData::new(ErrorCode(-32099), detail.clone(), Some(data))
+        }
         _ => crate::m1::mcp_error(error.code(), error.to_string()),
     }
 }

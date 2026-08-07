@@ -33,6 +33,7 @@ use super::{
     utils::sleep_ms,
 };
 use crate::backend::mouse_coordinates::{VirtualDesktop, normalize_absolute_mouse_point};
+use crate::foreground_fence::{self, EmissionSite};
 use crate::{
     ActionError, EmitState, StrokeError, TimedPathPoint, plan_timed_stroke, recovery, sample_curve,
     screen_point_from_path_point,
@@ -58,8 +59,18 @@ pub(super) fn cursor_position() -> Result<Point, ActionError> {
     })
 }
 
+/// Puts the physical cursor back where the human left it before the agent took
+/// the input lease.
+///
+/// This is classified as a release emission: it *undoes* agent state rather
+/// than conveying intent, so refusing it after a foreground drift would strand
+/// the operator's cursor wherever the agent parked it — the mouse equivalent of
+/// a stuck modifier key (#2057).
 pub(super) fn set_cursor_position(point: Point) -> Result<Point, ActionError> {
-    send_absolute_mouse_move(point, "foreground input context cursor restore")?;
+    send_absolute_mouse_move(
+        point,
+        EmissionSite::release("foreground_input_context_cursor_restore"),
+    )?;
     cursor_position()
 }
 
@@ -79,7 +90,7 @@ pub(super) fn mouse_move(
         let from = cursor_position()?;
         mouse_move_curve(from, *point, curve, duration_ms)?;
     }
-    send_absolute_mouse_move(*point, "absolute mouse move")
+    send_absolute_mouse_move(*point, EmissionSite::delivery("absolute_mouse_move"))
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_move_relative"))]
@@ -92,7 +103,7 @@ pub(super) fn mouse_move_relative(dx: f32, dy: f32) -> Result<(), ActionError> {
     let current = cursor_position()?;
     send_absolute_mouse_move(
         relative_mouse_target(current, rounded),
-        "relative mouse move",
+        EmissionSite::delivery("relative_mouse_move"),
     )
 }
 
@@ -138,7 +149,7 @@ pub(super) fn mouse_drag(
     duration_ms: u32,
     state: &mut EmitState,
 ) -> Result<(), ActionError> {
-    send_absolute_mouse_move(from, "drag origin absolute mouse move")?;
+    send_absolute_mouse_move(from, EmissionSite::delivery("drag_origin_absolute_mouse_move"))?;
     mouse_button(button, ButtonAction::Down, 0, state)?;
     let drag_result = mouse_move_curve(from, to, curve, duration_ms)
         .and_then(|()| verify_cursor_position(to, "drag target cursor readback"));
@@ -182,9 +193,12 @@ pub(super) fn mouse_stroke(
             return Err(error);
         }
     };
-    if let Err(error) =
-        send_absolute_mouse_move(first_point, "mouse stroke origin absolute mouse move")
-    {
+    if let Err(error) = send_absolute_mouse_move(
+        first_point,
+        EmissionSite::delivery("mouse_stroke_origin_absolute_mouse_move")
+            .at(0)
+            .of(plan.samples.len()),
+    ) {
         let error = annotate_stroke_emit_error(error, "origin_move", Some(0));
         log_stroke_emit_error(&context, Some(0), Some(first.point), "origin_move", &error);
         return Err(error);
@@ -243,7 +257,10 @@ pub(super) fn mouse_stroke(
 #[tracing::instrument(skip_all, fields(action_kind = "software_mouse_scroll"))]
 pub(super) fn mouse_scroll(dy: i32, dx: i32, at: Option<Point>) -> Result<(), ActionError> {
     if let Some(point) = at {
-        send_absolute_mouse_move(point, "scroll point absolute mouse move")?;
+        send_absolute_mouse_move(
+            point,
+            EmissionSite::delivery("scroll_point_absolute_mouse_move"),
+        )?;
     }
     let mut inputs = Vec::with_capacity(2);
     if dy != 0 {
@@ -262,7 +279,7 @@ pub(super) fn mouse_scroll(dy: i32, dx: i32, at: Option<Point>) -> Result<(), Ac
             MOUSEEVENTF_HWHEEL,
         ));
     }
-    send_input_batch(&inputs, "mouse scroll")
+    send_input_batch(&inputs, EmissionSite::delivery("mouse_scroll_wheel"))
 }
 
 #[tracing::instrument(skip_all, fields(action_kind = "software_aim_at"))]
@@ -301,7 +318,10 @@ fn mouse_move_curve(
     duration_ms: u32,
 ) -> Result<(), ActionError> {
     if matches!(curve, AimCurve::Instant) {
-        return send_absolute_mouse_move(to, "curve instant absolute mouse move");
+        return send_absolute_mouse_move(
+            to,
+            EmissionSite::delivery("curve_instant_absolute_mouse_move"),
+        );
     }
     let samples = sample_curve(curve, from, to, duration_ms, None);
     let desktop = virtual_desktop()?;
@@ -323,7 +343,9 @@ fn mouse_move_curve(
         }
         send_input_batch(
             &[absolute_mouse_input_for_desktop(point, desktop)],
-            "curve absolute mouse move",
+            EmissionSite::delivery("curve_absolute_mouse_move")
+                .at(index)
+                .of(last_index + 1),
         )?;
     }
     Ok(())
@@ -402,7 +424,9 @@ fn emit_stroke_stream(
         };
         let result = send_input_batch(
             &[absolute_mouse_input_for_desktop(point, desktop)],
-            "mouse stroke absolute move",
+            EmissionSite::delivery("mouse_stroke_absolute_move")
+                .at(index)
+                .of(samples.len()),
         );
         if let Err(error) = result {
             let error = annotate_stroke_emit_error(error, "send_input", Some(index));
@@ -508,7 +532,8 @@ fn stroke_delay_ms(
     clippy::too_many_lines,
     reason = "cursor readback and DPI compensation are intentionally kept together to preserve fallback ordering"
 )]
-fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), ActionError> {
+fn send_absolute_mouse_move(point: Point, site: EmissionSite) -> Result<(), ActionError> {
+    let detail = site.stage;
     activate_thread_dpi_awareness();
     let desktop = virtual_desktop()?;
     if !desktop.contains(point) {
@@ -525,7 +550,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     // desktops Windows can map MOUSEEVENTF_ABSOLUTE through a logical desktop
     // surface and move the cursor away from the physical UIA point.
     let compensation = dpi_compensation_for_point(point);
-    if set_physical_cursor_pos(point, detail) {
+    if set_physical_cursor_pos(point, site)? {
         let first_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, first_actual) {
             return Ok(());
@@ -545,7 +570,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
                 detail,
                 "physical cursor move read back a scaled coordinate; retrying with monitor-DPI compensation"
             );
-            if set_physical_cursor_pos(compensation.adjusted, detail) {
+            if set_physical_cursor_pos(compensation.adjusted, site)? {
                 let compensated_actual = read_physical_cursor_position(detail)?;
                 if cursor_readback_matches(point, compensated_actual) {
                     return Ok(());
@@ -580,7 +605,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
     }
 
     if let Some(compensation) = compensation
-        && set_physical_cursor_pos(compensation.adjusted, detail)
+        && set_physical_cursor_pos(compensation.adjusted, site)?
     {
         let compensated_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, compensated_actual) {
@@ -588,7 +613,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
         }
     }
 
-    send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], detail)?;
+    send_input_batch(&[absolute_mouse_input_for_desktop(point, desktop)], site)?;
     let send_input_actual = read_physical_cursor_position(detail)?;
     if cursor_readback_matches(point, send_input_actual) {
         Ok(())
@@ -611,7 +636,7 @@ fn send_absolute_mouse_move(point: Point, detail: &'static str) -> Result<(), Ac
                 compensation.adjusted,
                 desktop,
             )],
-            detail,
+            site,
         )?;
         let compensated_actual = read_physical_cursor_position(detail)?;
         if cursor_readback_matches(point, compensated_actual) {
@@ -869,8 +894,15 @@ fn extract_sample_index(detail: &str) -> Option<usize> {
         .flatten()
 }
 
-fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
-    match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
+/// Mutates the physical cursor, which is global desktop state and therefore an
+/// emission boundary in its own right: `SetPhysicalCursorPos` moves the human's
+/// pointer no matter which window is foreground. The fence runs immediately
+/// before the OS call, and a refusal propagates instead of silently falling
+/// through to the `SendInput` cursor path below (#2057).
+fn set_physical_cursor_pos(point: Point, site: EmissionSite) -> Result<bool, ActionError> {
+    let detail = site.stage;
+    foreground_fence::guard_emission(site)?;
+    Ok(match unsafe { SetPhysicalCursorPos(point.x, point.y) } {
         Ok(()) => true,
         Err(error) if error.code() != windows::core::HRESULT(0) => {
             tracing::warn!(
@@ -893,7 +925,7 @@ fn set_physical_cursor_pos(point: Point, detail: &'static str) -> bool {
             );
             false
         }
-    }
+    })
 }
 
 fn read_physical_cursor_position(detail: &'static str) -> Result<WinPoint, ActionError> {
@@ -1009,16 +1041,20 @@ fn scale_coordinate_for_dpi(coord: i32, dpi: u32) -> i32 {
     }
 }
 
+/// Emits one mouse button transition.
+///
+/// A button *up* is classified as a release emission: refusing it would leave
+/// the physical button latched down across the whole desktop, which is strictly
+/// worse for the human than one stray button-up in whatever took the foreground
+/// (#2057). A button *down* conveys intent and is refused on drift.
 fn send_mouse_button_event(button: MouseButton, action: ButtonAction) -> Result<(), ActionError> {
     let (flags, data) = mouse_button_event_parts(button, action);
-    send_input_batch(
-        &[mouse_input(0, 0, data, flags)],
-        match action {
-            ButtonAction::Down => "mouse button down",
-            ButtonAction::Up => "mouse button up",
-            ButtonAction::Press => "mouse button press",
-        },
-    )
+    let site = match action {
+        ButtonAction::Down => EmissionSite::delivery("mouse_button_down"),
+        ButtonAction::Up => EmissionSite::release("mouse_button_up"),
+        ButtonAction::Press => EmissionSite::delivery("mouse_button_press"),
+    };
+    send_input_batch(&[mouse_input(0, 0, data, flags)], site)
 }
 
 const fn mouse_button_event_parts(

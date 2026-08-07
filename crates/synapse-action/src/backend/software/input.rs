@@ -6,6 +6,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 
 use crate::ActionError;
+use crate::foreground_fence::{self, EmissionSite};
 
 pub(super) const fn keyboard_input(scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     INPUT {
@@ -58,7 +59,16 @@ pub(super) const fn mouse_input(
     }
 }
 
-pub(super) fn send_input_batch(inputs: &[INPUT], detail: &'static str) -> Result<(), ActionError> {
+/// The single `SendInput` choke point for the software backend.
+///
+/// Every global keyboard/mouse emission in this crate funnels through here, so
+/// this is where the exact-target fence has to run: `SendInput` takes no
+/// destination, and the window manager routes the events from whatever holds
+/// the foreground at delivery time (#2057). The fence check is the *last*
+/// statement before the OS call — nothing sleeps, allocates, or blocks between
+/// them — so the time-of-check/time-of-use window is one `SendInput` call, the
+/// smallest unit user mode can achieve.
+pub(super) fn send_input_batch(inputs: &[INPUT], site: EmissionSite) -> Result<(), ActionError> {
     if inputs.is_empty() {
         return Ok(());
     }
@@ -66,19 +76,21 @@ pub(super) fn send_input_batch(inputs: &[INPUT], detail: &'static str) -> Result
         i32::try_from(mem::size_of::<INPUT>()).map_err(|_err| ActionError::BackendUnavailable {
             detail: "INPUT struct size does not fit SendInput cbSize".to_owned(),
         })?;
-    // SAFETY: `inputs` points to initialized Windows `INPUT` values for the
-    // duration of the call, and `cb_size` is exactly `size_of::<INPUT>()`.
-    let sent = unsafe { SendInput(inputs, cb_size) };
     let expected = u32::try_from(inputs.len()).map_err(|_err| ActionError::BackendUnavailable {
         detail: "SendInput input count does not fit u32".to_owned(),
     })?;
+    foreground_fence::guard_emission(site)?;
+    // SAFETY: `inputs` points to initialized Windows `INPUT` values for the
+    // duration of the call, and `cb_size` is exactly `size_of::<INPUT>()`.
+    let sent = unsafe { SendInput(inputs, cb_size) };
     if sent == expected {
         Ok(())
     } else {
         Err(ActionError::BackendUnavailable {
             detail: format!(
-                "SendInput inserted {sent}/{} events for {detail}",
-                inputs.len()
+                "SendInput inserted {sent}/{} events for {}",
+                inputs.len(),
+                site.stage
             ),
         })
     }

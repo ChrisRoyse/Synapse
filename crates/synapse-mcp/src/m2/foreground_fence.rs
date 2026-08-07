@@ -25,8 +25,21 @@
 //! Fail-closed direction matters: unarmed, lease-lost, and unreadable states
 //! all refuse before delivery. Raw global input without an exact destination
 //! is not a capability; it is input to whichever human window wins the race.
-
-use std::sync::{Mutex, OnceLock};
+//!
+//! # Where the armed identity actually lives (#2057)
+//!
+//! One high-level action is many OS emissions over real time (`type_text` calls
+//! `SendInput` once per UTF-16 unit, strokes emit per timed sample), so a check
+//! that only runs here leaves a time-of-check/time-of-use gap: the human can
+//! take the foreground mid-sequence and receive the suffix. The armed identity
+//! is therefore owned by [`synapse_action::foreground_fence`], one crate below,
+//! where it is re-verified immediately before every `SendInput`, physical
+//! cursor mutation, and ViGEm HID report.
+//!
+//! This module is the MCP-facing face of that single store — not a parallel
+//! copy. It keeps the two policies that belong at the tool boundary and have no
+//! meaning at an emission site: *unarmed global input is refused outright*, and
+//! refusals are rendered as `ErrorData` with `refused_before_delivery`.
 
 use rmcp::{ErrorData, model::ErrorCode};
 use serde_json::{Value, json};
@@ -45,33 +58,37 @@ pub(crate) struct ArmedForeground {
     pub armed_by: &'static str,
 }
 
-fn cell() -> &'static Mutex<Option<ArmedForeground>> {
-    static CELL: OnceLock<Mutex<Option<ArmedForeground>>> = OnceLock::new();
-    CELL.get_or_init(|| Mutex::new(None))
-}
-
-fn guard() -> std::sync::MutexGuard<'static, Option<ArmedForeground>> {
-    cell()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
 /// Arms the fence with a fully resolved top-level window identity.
 ///
 /// Callers either provide a verified `GetForegroundWindow()` readback or use
 /// [`arm_expected_target`] to resolve an agent-owned target without activating
 /// it. In both cases the stored identity comes from live Win32 state.
 pub(crate) fn arm(armed: ArmedForeground) {
+    // The window class is read here, once, and carried into the emission-layer
+    // store: USER handles are recycled, so `HWND` equality alone cannot prove
+    // that the window the fence checks per emission is still the window that
+    // was bound (#2057).
+    let class_name = synapse_action::foreground_fence::window_identity(armed.hwnd)
+        .map(|identity| identity.class_name)
+        .unwrap_or_default();
     tracing::info!(
         code = "M2_FOREGROUND_FENCE_ARMED",
         hwnd = armed.hwnd,
         pid = armed.pid,
+        class_name = %class_name,
         process_name = %armed.process_name,
         window_title = %armed.window_title,
         armed_by = armed.armed_by,
         "foreground delivery fence armed to the verified foreground window"
     );
-    *guard() = Some(armed);
+    synapse_action::foreground_fence::arm(synapse_action::ForegroundTarget {
+        hwnd: armed.hwnd,
+        pid: armed.pid,
+        class_name,
+        process_name: armed.process_name,
+        window_title: armed.window_title,
+        armed_by: armed.armed_by,
+    });
 }
 
 /// Arms an exact agent-owned target without activating it.
@@ -156,8 +173,7 @@ pub(crate) fn arm_expected_target(
 /// trusted input, so leaving the fence armed would refuse later legitimate
 /// dispatch from a fresh activation.
 pub(crate) fn disarm(reason: &str) {
-    let previous = guard().take();
-    if let Some(previous) = previous {
+    if let Some(previous) = synapse_action::foreground_fence::disarm(reason) {
         tracing::info!(
             code = "M2_FOREGROUND_FENCE_DISARMED",
             reason,
@@ -170,7 +186,13 @@ pub(crate) fn disarm(reason: &str) {
 
 /// Currently armed expectation, for diagnostics and response readback.
 pub(crate) fn armed() -> Option<ArmedForeground> {
-    guard().clone()
+    synapse_action::foreground_fence::armed().map(|target| ArmedForeground {
+        hwnd: target.hwnd,
+        pid: target.pid,
+        process_name: target.process_name,
+        window_title: target.window_title,
+        armed_by: target.armed_by,
+    })
 }
 
 /// Refuses dispatch unless the live foreground is still the armed window.
@@ -240,93 +262,35 @@ pub(crate) fn ensure(stage: &'static str) -> Result<(), ErrorData> {
             })),
         ));
     }
-    #[cfg(windows)]
-    {
-        let actual = synapse_a11y::current_foreground_context().map_err(|error| {
-            // Armed but unreadable: refuse. An unverifiable destination is
-            // exactly the case this fence exists to stop.
-            tracing::error!(
-                code = error_codes::ACTION_FOREGROUND_LOST,
-                stage,
-                expected_hwnd = expected.hwnd,
-                error = %error,
-                "foreground fence could not read the live foreground before dispatch"
+    // The identity comparison itself is the emission layer's, so the tool
+    // boundary and every `SendInput` boundary agree on what "the same window"
+    // means — HWND *and* pid *and* window class, never the handle value alone
+    // (#2057).
+    synapse_action::foreground_fence::check(stage).map_err(|drift| {
+        let mut data = drift.to_json();
+        if let Value::Object(map) = &mut data {
+            map.insert(
+                "code".to_owned(),
+                Value::String(error_codes::ACTION_FOREGROUND_LOST.to_owned()),
             );
-            ErrorData::new(
-                ErrorCode(-32099),
-                format!(
-                    "foreground input refused at {stage}: the live foreground could not be read back, so the destination of this input is unverified (expected hwnd 0x{:x} {})",
-                    expected.hwnd, expected.process_name
-                ),
-                Some(json!({
-                    "code": error_codes::ACTION_FOREGROUND_LOST,
-                    // This code is also raised by post-action readbacks, where
-                    // input *was* delivered and the caller must verify. The
-                    // fence refuses strictly before dispatch, so there is
-                    // provably nothing to verify; the marker keeps the facade
-                    // from reporting `delivered_unverified` for a call that
-                    // delivered nothing (#1830).
-                    "refused_before_delivery": true,
-                    "stage": stage,
-                    "expected": fence_window_json(&expected),
-                    "actual": Value::Null,
-                    "source_of_truth": SOURCE_OF_TRUTH,
-                    "readback_error": error.to_string(),
-                    "resolution": "re-run act operation=invoke verb=focus_window and retry; never dispatch trusted input to an unverified window",
-                })),
-            )
-        })?;
-        if actual.hwnd != expected.hwnd {
-            tracing::error!(
-                code = error_codes::ACTION_FOREGROUND_LOST,
-                stage,
-                expected_hwnd = expected.hwnd,
-                expected_process = %expected.process_name,
-                actual_hwnd = actual.hwnd,
-                actual_pid = actual.pid,
-                actual_process = %actual.process_name,
-                actual_title = %actual.window_title,
-                "refused foreground input: the foreground moved away from the armed window before dispatch"
+            map.insert(
+                "resolution".to_owned(),
+                Value::String(drift.reason.remediation().to_owned()),
             );
-            return Err(ErrorData::new(
-                ErrorCode(-32099),
-                format!(
-                    "foreground input refused at {stage}: the foreground is hwnd 0x{:x} ({} — {:?}), not the armed window hwnd 0x{:x} ({}). Dispatching would have delivered this input to an unrelated window.",
-                    actual.hwnd,
-                    actual.process_name,
-                    actual.window_title,
-                    expected.hwnd,
-                    expected.process_name
-                ),
-                Some(json!({
-                    "code": error_codes::ACTION_FOREGROUND_LOST,
-                    // This code is also raised by post-action readbacks, where
-                    // input *was* delivered and the caller must verify. The
-                    // fence refuses strictly before dispatch, so there is
-                    // provably nothing to verify; the marker keeps the facade
-                    // from reporting `delivered_unverified` for a call that
-                    // delivered nothing (#1830).
-                    "refused_before_delivery": true,
-                    "stage": stage,
-                    "expected": fence_window_json(&expected),
-                    "actual": {
-                        "hwnd": actual.hwnd,
-                        "pid": actual.pid,
-                        "process_name": actual.process_name,
-                        "window_title": actual.window_title,
-                    },
-                    "source_of_truth": SOURCE_OF_TRUTH,
-                    "resolution": "re-run act operation=invoke verb=focus_window to re-acquire the foreground, then retry the input",
-                })),
-            ));
         }
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = stage;
-        Ok(())
-    }
+        tracing::error!(
+            code = error_codes::ACTION_FOREGROUND_LOST,
+            detail_code = drift.reason.detail_code(),
+            stage,
+            expected_hwnd = drift.expected.hwnd,
+            expected_process = %drift.expected.process_name,
+            actual_hwnd = drift.actual.as_ref().map_or(0, |actual| actual.hwnd),
+            actual_process = %drift.actual.as_ref().map_or("", |actual| actual.process_name.as_str()),
+            actual_title = %drift.actual.as_ref().map_or("", |actual| actual.window_title.as_str()),
+            "refused foreground input: the foreground is not the armed window at the dispatch boundary"
+        );
+        ErrorData::new(ErrorCode(-32099), drift.message(), Some(data))
+    })
 }
 
 fn fence_window_json(armed: &ArmedForeground) -> Value {

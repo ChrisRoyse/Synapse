@@ -7,6 +7,7 @@ pub mod curve;
 pub mod dynamics;
 pub mod emitter;
 pub mod error;
+pub mod foreground_fence;
 pub mod handle;
 pub mod hotkey;
 pub mod humanize;
@@ -44,6 +45,9 @@ pub use emitter::{
     EmitState, HELD_KEY_MAX_DURATION_MS,
 };
 pub use error::{ActionError, ActionResult};
+pub use foreground_fence::{
+    DriftReason, EmissionKind, EmissionSite, ForegroundDrift, ForegroundTarget, WindowIdentity,
+};
 pub use handle::{
     ACTION_QUEUE_CAPACITY, ActionComboScheduler, ActionHandle, ActionMessage, RELEASE_ALL_HANDLE,
     SessionInputLeaseReleaseSummary, SessionInputSessionSnapshot, SessionInputSnapshot,
