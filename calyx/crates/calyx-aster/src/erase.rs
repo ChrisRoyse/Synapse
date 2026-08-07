@@ -169,7 +169,7 @@ where
             "erase VaultContext belongs to another vault",
         ));
     }
-    vault.with_native_compaction_guard(|| {
+    vault.with_native_compaction_guard("erase_scope_tombstone", || {
         vault.with_durable_commit_lock(|| {
             let snapshot = vault.latest_seq();
             let real_ledger = vault.has_real_ledger_hook();
@@ -275,7 +275,7 @@ where
             "erase VaultContext belongs to another vault",
         ));
     }
-    vault.with_native_compaction_guard(|| {
+    vault.with_native_compaction_guard("erase_scope_purge", || {
         vault.with_durable_commit_lock(|| {
             let snapshot = vault.latest_seq();
             let targets = collect_targets(vault, scope, snapshot)?;

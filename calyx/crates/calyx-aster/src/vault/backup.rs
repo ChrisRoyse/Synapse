@@ -277,7 +277,7 @@ where
         };
         prepare_target_dir(target_vault_dir, durable.root())?;
         self.drain_checkpoints_paced("backup preflight")?;
-        self.with_native_compaction_guard(|| {
+        self.with_native_compaction_guard("vault_backup", || {
             let source = durable.root().to_path_buf();
             // Prove manifest coverage and pin the snapshot inside one durable
             // commit critical section, so no commit can advance `latest_seq`

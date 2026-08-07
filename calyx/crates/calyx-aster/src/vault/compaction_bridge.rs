@@ -12,10 +12,11 @@ use crate::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
 use crate::sst::{invalidate_reader, shared_reader};
 use crate::storage_names::{SstName, classify_sst, sst_order_key};
 use calyx_core::{CalyxError, Clock, Result};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 /// Backstop against a fan-out reduction that never converges. Each pass makes
 /// strictly positive progress (enforced below), so this can only be reached by
@@ -126,7 +127,8 @@ where
         let Some(durable) = &self.durable else {
             return Ok(None);
         };
-        let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        let _maintenance_guard =
+            try_acquire_native_compaction_guard(durable, "single_cf_compaction")?;
         // Drain the staged checkpoint backlog in bounded commit-lock holds
         // BEFORE taking the lock for the coverage snapshot (issue #1806); the
         // acquisition below then only has to absorb what was committed during
@@ -183,7 +185,20 @@ where
         let Some(durable) = &self.durable else {
             return Ok(Vec::new());
         };
-        let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        // The periodic GC lane waits its turn (issue #2067): it fires once every
+        // five minutes and must eventually run, so it reserves a fair handoff
+        // instead of sampling the lock once and giving up. The boot readiness
+        // lane keeps non-blocking admission — it runs before the daemon serves
+        // anything, so there is nothing to be fair to.
+        let _maintenance_guard = if readiness_only {
+            try_acquire_native_compaction_guard(durable, "write_stall_readiness_compaction")?
+        } else {
+            acquire_native_compaction_guard_fair(
+                durable,
+                "storage_gc_native_fanout",
+                NATIVE_COMPACTION_FAIR_WAIT,
+            )?
+        };
         // Issue #1806: this pass already performed its physical rewrites off
         // the durable commit lock, but its *preflight* checkpoint drained the
         // entire staged backlog inside one acquisition — the actual 469 s /
@@ -576,12 +591,21 @@ where
             // by their later sequence.
             self.drain_checkpoints_paced("tombstone purge router-prefix coverage")?;
         }
-        self.with_native_compaction_guard(|| {
-            for cf in unique {
-                self.purge_tombstoned_cf_snapshot(cf, minimum_durable_seq)?;
-            }
-            Ok(())
-        })
+        // Same fair-handoff reservation as the fan-out lane (issue #2067): this
+        // is the periodic GC pass, it holds no other lock at this point, and it
+        // must eventually purge the tombstones it just committed.
+        let Some(durable) = &self.durable else {
+            return Ok(());
+        };
+        let _maintenance_guard = acquire_native_compaction_guard_fair(
+            durable,
+            "storage_gc_tombstone_purge",
+            NATIVE_COMPACTION_FAIR_WAIT,
+        )?;
+        for cf in unique {
+            self.purge_tombstoned_cf_snapshot(cf, minimum_durable_seq)?;
+        }
+        Ok(())
     }
 
     /// Captures one manifest-covered CF view under a short commit-lock read and
@@ -782,18 +806,27 @@ where
     ///
     /// Returns the guard's backpressure error when a maintenance pass is already
     /// active, or whatever `f` returns.
-    pub fn with_maintenance_guard<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        self.with_native_compaction_guard(f)
+    ///
+    /// `purpose` is recorded for as long as the guard lives, so a pass that is
+    /// refused names exactly who it lost to and for how long that holder has
+    /// owned the lock (issue #2067).
+    pub fn with_maintenance_guard<T>(
+        &self,
+        purpose: &'static str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.with_native_compaction_guard(purpose, f)
     }
 
     pub(crate) fn with_native_compaction_guard<T>(
         &self,
+        purpose: &'static str,
         f: impl FnOnce() -> Result<T>,
     ) -> Result<T> {
         let Some(durable) = &self.durable else {
             return f();
         };
-        let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+        let _maintenance_guard = try_acquire_native_compaction_guard(durable, purpose)?;
         f()
     }
 
@@ -819,28 +852,259 @@ where
     }
 }
 
+/// Longest a fair admission waits for the active pass to finish before it
+/// reports backpressure.
+///
+/// The periodic storage GC pass is the only admission that waits. It already
+/// runs on the dedicated blocking maintenance pool, so this wait parks no async
+/// runtime worker, and it is well inside the 5-minute GC interval so a deferred
+/// tick can never queue behind its own successor.
+pub(super) const NATIVE_COMPACTION_FAIR_WAIT: Duration = Duration::from_secs(120);
+const NATIVE_COMPACTION_FAIR_POLL: Duration = Duration::from_millis(50);
+
+/// Admission bookkeeping for one `native.compaction.lock` path.
+///
+/// This records *who* holds the maintenance guard and *since when*, and carries
+/// the FIFO reservation queue that makes handoff fair. It is deliberately
+/// separate from the OS file lock: the file lock proves exclusion (including
+/// across processes), while this proves attribution and ordering inside the one
+/// process that owns the vault (`vault.lock` admits exactly one).
+#[derive(Debug, Default)]
+struct NativeCompactionAdmission {
+    holder: Option<NativeCompactionHolder>,
+    /// Tickets of passes waiting for a fair handoff, oldest first. A non-empty
+    /// queue also refuses *barging* admissions, which is what stops a stream of
+    /// short passes from starving a waiter (issue #2067).
+    reservations: VecDeque<u64>,
+    next_ticket: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct NativeCompactionHolder {
+    purpose: &'static str,
+    acquired_at: Instant,
+}
+
+/// One leaked admission cell per lock path. Leaked because the cell must
+/// outlive every guard that references it, and a vault's lock path set is fixed
+/// and tiny.
+type NativeCompactionAdmissionCell = &'static Mutex<NativeCompactionAdmission>;
+
+static NATIVE_COMPACTION_ADMISSIONS: OnceLock<
+    Mutex<BTreeMap<PathBuf, NativeCompactionAdmissionCell>>,
+> = OnceLock::new();
+
+fn admission_state(path: &Path) -> NativeCompactionAdmissionCell {
+    let registry = NATIVE_COMPACTION_ADMISSIONS.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let mut registry = registry
+        .lock()
+        .expect("native compaction admission registry poisoned");
+    if let Some(state) = registry.get(path) {
+        return state;
+    }
+    let state: NativeCompactionAdmissionCell =
+        Box::leak(Box::new(Mutex::new(NativeCompactionAdmission::default())));
+    registry.insert(path.to_path_buf(), state);
+    state
+}
+
+/// The exclusive maintenance guard, with the holder recorded for as long as it
+/// lives so a refused admission can name exactly who it lost to.
+pub(super) struct NativeCompactionGuard {
+    state: NativeCompactionAdmissionCell,
+    _file: crate::file_lock::FileLockGuard,
+}
+
+impl Drop for NativeCompactionGuard {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.holder = None;
+        }
+    }
+}
+
+/// A pending place in the fair-handoff queue.
+///
+/// Dropping it removes the ticket, so an abandoned or failed wait cannot block
+/// admissions forever.
+struct NativeCompactionReservation {
+    state: NativeCompactionAdmissionCell,
+    ticket: u64,
+}
+
+impl NativeCompactionReservation {
+    fn take(state: NativeCompactionAdmissionCell) -> Result<Self> {
+        let mut guard = state
+            .lock()
+            .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?;
+        let ticket = guard.next_ticket;
+        guard.next_ticket = guard.next_ticket.saturating_add(1);
+        guard.reservations.push_back(ticket);
+        drop(guard);
+        Ok(Self { state, ticket })
+    }
+}
+
+impl Drop for NativeCompactionReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.reservations.retain(|ticket| *ticket != self.ticket);
+        }
+    }
+}
+
+fn record_holder(
+    state: NativeCompactionAdmissionCell,
+    purpose: &'static str,
+    file: crate::file_lock::FileLockGuard,
+) -> Result<NativeCompactionGuard> {
+    state
+        .lock()
+        .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?
+        .holder = Some(NativeCompactionHolder {
+        purpose,
+        acquired_at: Instant::now(),
+    });
+    Ok(NativeCompactionGuard { state, _file: file })
+}
+
+fn native_compaction_busy(
+    path: &Path,
+    purpose: &'static str,
+    holder: Option<NativeCompactionHolder>,
+    reserved_ahead: usize,
+    waited: Duration,
+) -> CalyxError {
+    let (holder_purpose, held_for_ms) =
+        holder.map_or(("unrecorded_in_this_process", 0), |holder| {
+            (
+                holder.purpose,
+                u64::try_from(holder.acquired_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+            )
+        });
+    let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+    tracing::warn!(
+        code = "CALYX_ASTER_NATIVE_COMPACTION_BUSY",
+        path = %path.display(),
+        requested_by = purpose,
+        holder = holder_purpose,
+        held_for_ms,
+        reserved_ahead,
+        waited_ms,
+        "native compaction admission rejected because another maintenance pass is active"
+    );
+    CalyxError {
+        code: "CALYX_ASTER_NATIVE_COMPACTION_BUSY",
+        message: format!(
+            "native compaction lock {} is held by another maintenance pass: holder={holder_purpose} held_for_ms={held_for_ms} requested_by={purpose} reserved_ahead={reserved_ahead} waited_ms={waited_ms}",
+            path.display()
+        ),
+        remediation: "this is admission backpressure, not a storage fault: the named holder still \
+                      owns its unit and will release it. Retry, or inspect that holder if \
+                      held_for_ms keeps growing across attempts",
+    }
+}
+
+/// Non-blocking admission: reports backpressure immediately when a pass is
+/// already active, or when a fair-handoff reservation is outstanding.
+///
+/// Refusing while another pass is *reserved* is the anti-barging rule. Without
+/// it a stream of short passes (a whole-vault verify requested every few
+/// seconds) can hold the lock across every instant the 5-minute GC tick samples
+/// it, and GC never runs (issue #2067).
 pub(super) fn try_acquire_native_compaction_guard(
     durable: &DurableVault,
-) -> Result<crate::file_lock::FileLockGuard> {
+    purpose: &'static str,
+) -> Result<NativeCompactionGuard> {
     let path = durable.native_compaction_lock_path();
+    let state = admission_state(&path);
+    let (holder, reserved_ahead) = {
+        let guard = state
+            .lock()
+            .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?;
+        (guard.holder, guard.reservations.len())
+    };
+    if reserved_ahead > 0 {
+        return Err(native_compaction_busy(
+            &path,
+            purpose,
+            holder,
+            reserved_ahead,
+            Duration::ZERO,
+        ));
+    }
     match crate::file_lock::FileLockGuard::try_acquire(&path)? {
-        Some(guard) => Ok(guard),
-        None => {
-            tracing::warn!(
-                code = "CALYX_ASTER_NATIVE_COMPACTION_BUSY",
-                path = %path.display(),
-                "native compaction admission rejected because another maintenance pass is active"
-            );
-            Err(CalyxError {
-                code: "CALYX_ASTER_NATIVE_COMPACTION_BUSY",
-                message: format!(
-                    "native compaction lock {} is held by another maintenance pass",
-                    path.display()
-                ),
-                remediation: "inspect the active storage GC task and its structured compaction \
-                              progress, then retry after that pass completes",
-            })
+        Some(file) => record_holder(state, purpose, file),
+        None => Err(native_compaction_busy(
+            &path,
+            purpose,
+            holder,
+            reserved_ahead,
+            Duration::ZERO,
+        )),
+    }
+}
+
+/// Fair admission: reserves a place in FIFO order and waits up to `budget`.
+///
+/// The reservation is what guarantees eventual progress — while it is
+/// outstanding every non-reserved admission is refused, so the waiter takes the
+/// lock the moment the current holder releases it rather than losing another
+/// race. Correctness is untouched: the current holder still completes its whole
+/// unit under the guard, and this call takes no other lock while it waits.
+pub(super) fn acquire_native_compaction_guard_fair(
+    durable: &DurableVault,
+    purpose: &'static str,
+    budget: Duration,
+) -> Result<NativeCompactionGuard> {
+    let path = durable.native_compaction_lock_path();
+    let state = admission_state(&path);
+    let reservation = NativeCompactionReservation::take(state)?;
+    let started = Instant::now();
+    loop {
+        let (holder, at_head, reserved_ahead) = {
+            let guard = state.lock().map_err(|_| {
+                CalyxError::backpressure("native compaction admission state poisoned")
+            })?;
+            // Only this call's `NativeCompactionReservation` can retire the
+            // ticket, and it is still alive here, so a missing ticket means the
+            // admission queue lost an entry. Fail loudly rather than silently
+            // treating this waiter as head-of-line.
+            let position = guard
+                .reservations
+                .iter()
+                .position(|ticket| *ticket == reservation.ticket)
+                .ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "native compaction reservation {} vanished from the admission queue for {}",
+                        reservation.ticket,
+                        path.display()
+                    ))
+                })?;
+            (guard.holder, position == 0, position)
+        };
+        if at_head && let Some(file) = crate::file_lock::FileLockGuard::try_acquire(&path)? {
+            let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            let guard = record_holder(state, purpose, file)?;
+            drop(reservation);
+            if waited_ms > 0 {
+                tracing::info!(
+                    code = "CALYX_ASTER_NATIVE_COMPACTION_FAIR_HANDOFF",
+                    path = %path.display(),
+                    purpose,
+                    waited_ms,
+                    "took the native compaction lock through a fair handoff after waiting out the previous pass"
+                );
+            }
+            return Ok(guard);
         }
+        let waited = started.elapsed();
+        if waited >= budget {
+            let error = native_compaction_busy(&path, purpose, holder, reserved_ahead, waited);
+            drop(reservation);
+            return Err(error);
+        }
+        std::thread::sleep(NATIVE_COMPACTION_FAIR_POLL);
     }
 }
 

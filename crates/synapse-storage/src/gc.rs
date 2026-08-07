@@ -11,7 +11,35 @@ const GC_RETRY_BASE_DELAY: Duration = Duration::from_millis(500);
 const GC_RETRY_MAX_DELAY: Duration = Duration::from_secs(5);
 const GC_RETRYABLE_CALYX_BACKPRESSURE: &str = "retryable_calyx_backpressure";
 const GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE: &str = "retry_exhausted_calyx_backpressure";
+const GC_DEFERRED_ON_MAINTENANCE_LOCK: &str = "deferred_on_maintenance_lock";
+const GC_MAINTENANCE_LOCK_STARVED: &str = "maintenance_lock_starved";
 const GC_TERMINAL_ERROR: &str = "terminal_non_retryable";
+
+/// Calyx's admission-refusal code for the shared native maintenance lock.
+///
+/// Matched by value rather than imported because it is a Calyx subsystem-local
+/// code that crosses the Synapse bridge verbatim (it has no `SYNAPSE_CALYX_*`
+/// alias in the PRD-18 mapping table), so `StorageError::code()` reports exactly
+/// this string.
+const CALYX_ASTER_NATIVE_COMPACTION_BUSY: &str = "CALYX_ASTER_NATIVE_COMPACTION_BUSY";
+
+/// In-tick attempts allowed when admission to the native maintenance lock was
+/// refused.
+///
+/// Calyx's fair-handoff admission already waited out the active holder before
+/// reporting this, so the retry allowance here is deliberately small: more
+/// attempts would push one tick past the start of its successor without adding
+/// any waiting that the fair handoff did not already do.
+const GC_MAINTENANCE_LOCK_MAX_ATTEMPTS: u32 = 2;
+
+/// How long continuous admission refusal stays *backpressure* before it is
+/// escalated to a storage error.
+///
+/// Four GC intervals. Below this the maintenance lock is legitimately busy and
+/// GC is deferred, which is a healthy, self-clearing state; at or above it the
+/// lock is not being handed over at all and that is a real fault worth failing
+/// health on — named with the exact holder and hold duration Calyx reported.
+const GC_MAINTENANCE_LOCK_DEFER_BUDGET: Duration = Duration::from_mins(20);
 
 /// One storage GC pass across all configured column families.
 #[derive(Debug, Default)]
@@ -99,6 +127,22 @@ pub struct GcTaskReadback {
     pub last_successful_total_evicted_rows: Option<u64>,
     pub last_successful_after_value_sum: Option<u64>,
     pub last_unsupported_policy_skips: Vec<String>,
+    /// True while the newest tick was refused admission to the shared Calyx
+    /// native maintenance lock rather than failing (#2067).
+    ///
+    /// This is backpressure, not a fault: some other named pass owns the lock
+    /// and will release it. `last_error` stays `None` in this state — and so
+    /// storage health stays out of `error` — until the deferral outlives
+    /// [`GC_MAINTENANCE_LOCK_DEFER_BUDGET`], at which point `last_error` names
+    /// the holder and how long it has held.
+    pub deferred_on_maintenance_lock: bool,
+    /// When the current unbroken run of deferrals began.
+    pub deferred_since_unix_ms: Option<u64>,
+    /// Length of that unbroken run, in ticks.
+    pub consecutive_maintenance_lock_deferrals: u32,
+    /// Calyx's own refusal text for the newest deferral, which carries the
+    /// holder's purpose and how many milliseconds it had held the lock.
+    pub last_maintenance_lock_detail: Option<String>,
     /// The single pinned committed sequence the last successful pass took its
     /// #1882 protection set from (#2058).
     pub last_successful_source_census_pinned_seq: Option<u64>,
@@ -277,12 +321,13 @@ pub fn spawn_runner(
                             move || tick_runner.run_once(),
                         )
                         .await;
-                        let Some(classification) = retryable_gc_error(&attempt_result) else {
+                        let Some(kind) = retryable_gc_failure_kind(&attempt_result) else {
                             break attempt_result;
                         };
-                        if attempt >= GC_RETRY_MAX_ATTEMPTS {
+                        if attempt >= kind.max_attempts() {
                             break attempt_result;
                         }
+                        let classification = kind.retrying_classification();
                         let delay = gc_retry_delay(started.unix_ms, attempt);
                         let next_retry_unix_ms = unix_time_ms_now().saturating_add(
                             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
@@ -310,16 +355,30 @@ pub fn spawn_runner(
                         // storage/commit/checkpoint lock.
                         tokio::time::sleep(delay).await;
                     };
-                    mark_gc_tick_completed(&task_state, started, attempt, &result);
+                    let deferral = mark_gc_tick_completed(&task_state, started, attempt, &result);
                     if let Err(error) = result {
-                        tracing::warn!(
-                            code = "STORAGE_MAINTENANCE_TICK_FAILED",
-                            task = task_kind.label(),
-                            attempts = attempt,
-                            classification = final_error_classification(&error, attempt),
-                            error = %error,
-                            "storage maintenance tick failed"
-                        );
+                        match deferral {
+                            Some(deferral) if !deferral.escalated => tracing::warn!(
+                                code = "STORAGE_MAINTENANCE_DEFERRED_ON_LOCK",
+                                task = task_kind.label(),
+                                attempts = attempt,
+                                classification = GC_DEFERRED_ON_MAINTENANCE_LOCK,
+                                deferred_since_unix_ms = deferral.since_unix_ms,
+                                deferred_for_ms = deferral.deferred_for_ms,
+                                consecutive_deferrals = deferral.consecutive,
+                                escalate_after_ms = GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis(),
+                                error = %error,
+                                "storage maintenance was refused admission to the shared Calyx maintenance lock; this tick is deferred, not failed"
+                            ),
+                            _ => tracing::warn!(
+                                code = "STORAGE_MAINTENANCE_TICK_FAILED",
+                                task = task_kind.label(),
+                                attempts = attempt,
+                                classification = final_error_classification(&error, attempt),
+                                error = %error,
+                                "storage maintenance tick failed"
+                            ),
+                        }
                     }
                 }
             }
@@ -371,9 +430,29 @@ fn mark_gc_retry_scheduled(
         readback.last_attempt_count = attempt;
         readback.next_retry_unix_ms = Some(next_retry_unix_ms);
         readback.retry_exhausted = false;
-        readback.last_error = result.as_ref().err().map(ToString::to_string);
+        // A deferral mid-tick must not flash `last_error` — a health read that
+        // lands between attempts would otherwise see a self-clearing admission
+        // refusal as a storage fault (#2067). The refusal text is still exposed,
+        // as the deferral detail it is.
+        if classification == GC_DEFERRED_ON_MAINTENANCE_LOCK {
+            readback.last_error = None;
+            readback.last_maintenance_lock_detail = result.as_ref().err().map(ToString::to_string);
+        } else {
+            readback.last_error = result.as_ref().err().map(ToString::to_string);
+        }
         readback.last_error_classification = Some(classification.to_owned());
     }
+}
+
+/// What a tick that ended in maintenance-lock deferral looked like.
+#[derive(Clone, Copy, Debug)]
+struct GcDeferral {
+    since_unix_ms: u64,
+    deferred_for_ms: u64,
+    consecutive: u32,
+    /// The unbroken deferral outlived [`GC_MAINTENANCE_LOCK_DEFER_BUDGET`], so
+    /// it was promoted from backpressure to a reported storage error.
+    escalated: bool,
 }
 
 fn mark_gc_tick_completed(
@@ -381,20 +460,70 @@ fn mark_gc_tick_completed(
     started: TickStarted,
     attempts: u32,
     result: &StorageResult<GcReport>,
-) {
+) -> Option<GcDeferral> {
+    let mut deferral = None;
     if let Ok(mut readback) = state.readback.lock() {
-        readback.last_completed_unix_ms = Some(unix_time_ms_now());
+        let completed_unix_ms = unix_time_ms_now();
+        readback.last_completed_unix_ms = Some(completed_unix_ms);
         readback.last_duration_ms = Some(duration_millis_u64(started.instant.elapsed()));
         readback.last_attempt_count = attempts;
         readback.next_retry_unix_ms = None;
+        let failure_kind = result.as_ref().err().map(gc_failure_kind);
+        if failure_kind == Some(GcFailureKind::MaintenanceLockBusy) {
+            // Admission backpressure: some other named pass legitimately owns
+            // the lock. Report it as the deferral it is and leave `last_error`
+            // clear so health does not call a self-clearing contention a
+            // storage fault — unless the deferral has outlived its budget, in
+            // which case the lock is genuinely not being handed over (#2067).
+            let since_unix_ms = *readback
+                .deferred_since_unix_ms
+                .get_or_insert(started.unix_ms);
+            let consecutive = readback
+                .consecutive_maintenance_lock_deferrals
+                .saturating_add(1);
+            let deferred_for_ms = completed_unix_ms.saturating_sub(since_unix_ms);
+            let detail = result
+                .as_ref()
+                .err()
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            let escalated = deferred_for_ms
+                >= u64::try_from(GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis()).unwrap_or(u64::MAX);
+            readback.deferred_on_maintenance_lock = true;
+            readback.consecutive_maintenance_lock_deferrals = consecutive;
+            readback.last_maintenance_lock_detail = Some(detail.clone());
+            readback.retry_exhausted = false;
+            readback.last_unsupported_policy_skips = Vec::new();
+            if escalated {
+                readback.last_error = Some(format!(
+                    "storage maintenance has been unable to acquire the Calyx native maintenance lock for {deferred_for_ms} ms across {consecutive} consecutive ticks (escalation budget {} ms); the refusal names its holder: {detail}",
+                    GC_MAINTENANCE_LOCK_DEFER_BUDGET.as_millis()
+                ));
+                readback.last_error_classification = Some(GC_MAINTENANCE_LOCK_STARVED.to_owned());
+            } else {
+                readback.last_error = None;
+                readback.last_error_classification =
+                    Some(GC_DEFERRED_ON_MAINTENANCE_LOCK.to_owned());
+            }
+            deferral = Some(GcDeferral {
+                since_unix_ms,
+                deferred_for_ms,
+                consecutive,
+                escalated,
+            });
+            return deferral;
+        }
+        readback.deferred_on_maintenance_lock = false;
+        readback.deferred_since_unix_ms = None;
+        readback.consecutive_maintenance_lock_deferrals = 0;
+        readback.last_maintenance_lock_detail = None;
         readback.last_error = result.as_ref().err().map(ToString::to_string);
         readback.last_error_classification = result
             .as_ref()
             .err()
             .map(|error| final_error_classification(error, attempts).to_owned());
-        readback.retry_exhausted = result.as_ref().err().is_some_and(|error| {
-            retryable_storage_error(error) && attempts >= GC_RETRY_MAX_ATTEMPTS
-        });
+        readback.retry_exhausted =
+            failure_kind.is_some_and(|kind| kind.is_retryable() && attempts >= kind.max_attempts());
         if let Ok(report) = result {
             readback.last_successful_unix_ms = readback.last_completed_unix_ms;
             readback.last_successful_cf_readback_count =
@@ -438,27 +567,72 @@ fn mark_gc_tick_completed(
             })
             .unwrap_or_default();
     }
+    deferral
 }
 
-fn retryable_gc_error(result: &StorageResult<GcReport>) -> Option<&'static str> {
+/// Why a maintenance attempt failed, at the granularity the tick loop acts on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GcFailureKind {
+    /// Calyx asked the caller to slow down. The work itself is sound.
+    CalyxBackpressure,
+    /// Admission to the shared native maintenance lock was refused because
+    /// another named pass owns it. Transient by construction (#2067).
+    MaintenanceLockBusy,
+    /// Anything else: a real storage failure that retrying cannot fix.
+    Terminal,
+}
+
+impl GcFailureKind {
+    const fn is_retryable(self) -> bool {
+        matches!(self, Self::CalyxBackpressure | Self::MaintenanceLockBusy)
+    }
+
+    const fn max_attempts(self) -> u32 {
+        match self {
+            Self::CalyxBackpressure => GC_RETRY_MAX_ATTEMPTS,
+            Self::MaintenanceLockBusy => GC_MAINTENANCE_LOCK_MAX_ATTEMPTS,
+            Self::Terminal => 1,
+        }
+    }
+
+    const fn retrying_classification(self) -> &'static str {
+        match self {
+            Self::CalyxBackpressure => GC_RETRYABLE_CALYX_BACKPRESSURE,
+            Self::MaintenanceLockBusy => GC_DEFERRED_ON_MAINTENANCE_LOCK,
+            Self::Terminal => GC_TERMINAL_ERROR,
+        }
+    }
+}
+
+fn gc_failure_kind(error: &StorageError) -> GcFailureKind {
+    match error.code() {
+        code if code == synapse_calyx::SYNAPSE_CALYX_BACKPRESSURE => {
+            GcFailureKind::CalyxBackpressure
+        }
+        CALYX_ASTER_NATIVE_COMPACTION_BUSY => GcFailureKind::MaintenanceLockBusy,
+        _ => GcFailureKind::Terminal,
+    }
+}
+
+fn retryable_gc_failure_kind(result: &StorageResult<GcReport>) -> Option<GcFailureKind> {
     result
         .as_ref()
         .err()
-        .filter(|error| retryable_storage_error(error))
-        .map(|_| GC_RETRYABLE_CALYX_BACKPRESSURE)
-}
-
-fn retryable_storage_error(error: &StorageError) -> bool {
-    error.code() == synapse_calyx::SYNAPSE_CALYX_BACKPRESSURE
+        .map(gc_failure_kind)
+        .filter(|kind| kind.is_retryable())
 }
 
 fn final_error_classification(error: &StorageError, attempts: u32) -> &'static str {
-    if retryable_storage_error(error) && attempts >= GC_RETRY_MAX_ATTEMPTS {
-        GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE
-    } else if retryable_storage_error(error) {
-        GC_RETRYABLE_CALYX_BACKPRESSURE
-    } else {
-        GC_TERMINAL_ERROR
+    let kind = gc_failure_kind(error);
+    match kind {
+        GcFailureKind::CalyxBackpressure if attempts >= kind.max_attempts() => {
+            GC_RETRY_EXHAUSTED_CALYX_BACKPRESSURE
+        }
+        GcFailureKind::CalyxBackpressure => GC_RETRYABLE_CALYX_BACKPRESSURE,
+        // Reached only through the non-deferral branch (a deferral classifies
+        // itself against the escalation budget instead of the attempt count).
+        GcFailureKind::MaintenanceLockBusy => GC_DEFERRED_ON_MAINTENANCE_LOCK,
+        GcFailureKind::Terminal => GC_TERMINAL_ERROR,
     }
 }
 

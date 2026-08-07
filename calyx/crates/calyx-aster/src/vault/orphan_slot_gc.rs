@@ -272,7 +272,8 @@ where
                         "orphan slot-CF retirement lost its durable maintenance vault",
                     )
                 })?;
-                let _maintenance_guard = try_acquire_native_compaction_guard(durable)?;
+                let _maintenance_guard =
+                    try_acquire_native_compaction_guard(durable, "orphan_slot_cf_retire")?;
                 quantized_physical = self
                     .rows
                     .retire_router_cf(quantized_cf, "retire orphan slot CF")?;
