@@ -903,11 +903,21 @@ pub struct PerceptionDetectionHealth {
     /// runs real model inference. False means no inference happens, ever, until
     /// the configuration changes.
     pub inference_configured: bool,
-    /// `configured` | `not_configured`. Deliberately never `ok`/`healthy`: the
-    /// word this field exists to stop being reused is the one that hid the gap.
+    /// `configured` | `not_configured` | `misconfigured`. Deliberately never
+    /// `ok`/`healthy`: the word this field exists to stop being reused is the one
+    /// that hid the gap.
+    ///
+    /// `misconfigured` (#2064) is the third state, and it is not a shade of
+    /// either neighbour: the profile *did* ask for inference, but it names a
+    /// detector this daemon cannot load, so every observe in a pixel-bearing
+    /// mode fails rather than completing without detections. It reported
+    /// `configured` until #2064, leaving `configured_model_registered: false` as
+    /// the only tell — a field a reader had to already suspect to look at.
     pub status: String,
     /// Machine-readable cause, present exactly when `inference_configured` is
-    /// false. `DETECTION_NOT_CONFIGURED` for a profile that asks for no detector.
+    /// false. `DETECTION_NOT_CONFIGURED` for a profile that asks for no
+    /// detector; `DETECTION_MODEL_NOT_LOADED` — the same code the detection
+    /// worker raises — for one that names a detector that cannot be loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason_code: Option<String>,
     /// The exact configuration change that would turn inference on, present
@@ -919,7 +929,9 @@ pub struct PerceptionDetectionHealth {
     pub configured_model_id: Option<String>,
     /// True when `configured_model_id` resolves in the model registry. `None`
     /// when the profile names no model. `Some(false)` is a fail-loud
-    /// misconfiguration: every observe in a pixel-bearing mode will error.
+    /// misconfiguration: every observe in a pixel-bearing mode will error, and
+    /// since #2064 `status` says `misconfigured` for it rather than leaving this
+    /// field to carry the verdict alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub configured_model_registered: Option<bool>,
     pub max_detections: u32,

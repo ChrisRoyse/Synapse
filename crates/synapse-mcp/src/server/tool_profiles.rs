@@ -2166,6 +2166,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "pass an exact source cf_name/key_hex pair and inspect the source row before retrying",
             ),
             op(
+                "row_read",
+                false,
+                false,
+                "one exact physical CF row decoded through the typed record its writer used",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "name an allowlisted readable cf_name (CF_OBSERVATIONS) and exactly one of key_hex / observation_id, both returned under `diagnostics.persisted` on every observe response; a non-allowlisted CF, a missing row, an oversized value, and an undecodable value all fail closed and no raw row bytes are ever returned",
+            ),
+            op(
                 "temporal_panels",
                 false,
                 false,

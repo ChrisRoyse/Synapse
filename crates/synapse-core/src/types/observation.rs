@@ -340,6 +340,48 @@ pub struct ObservationDiagnostics {
     pub entities_truncated: bool,
     pub size_bytes: u32,
     pub size_estimate_tokens: u32,
+    /// Durable identity of the `CF_OBSERVATIONS` row this observation was
+    /// written to (#2064).
+    ///
+    /// Stamped onto the **response** after the audit write returns, so a caller
+    /// can name the exact row it just produced and read it back through
+    /// `storage operation=row_read`. Before #2064 the key was minted inside the
+    /// write path and never left it, which made "what did the daemon actually
+    /// persist for that observation" unanswerable from the public surface at any
+    /// grant level — and that was the acceptance criterion #2054 could not
+    /// perform.
+    ///
+    /// Always `None` in a persisted row: the key is assigned by the write, so
+    /// stamping it into the value the write is carrying would make the row body
+    /// depend on its own key. `None` therefore means "this is the stored row",
+    /// not "unknown".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persisted: Option<ObservationPersistedRow>,
+}
+
+/// The exact `CF_OBSERVATIONS` row an observe wrote (#2064).
+///
+/// `key_hex` is the physical row key — `ts_ns` big-endian `u64` followed by
+/// `key_seq` big-endian `u32`, 12 bytes / 24 hex characters — which is the form
+/// `storage operation=anchors` and `storage operation=row_read` accept. The
+/// decomposed parts are carried beside it so a caller never has to parse hex to
+/// correlate with `OBSERVATION_AUDIT_RECORDED` log records.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ObservationPersistedRow {
+    /// Column family the row lives in. Always `CF_OBSERVATIONS`.
+    pub cf_name: String,
+    /// Hex-encoded exact physical row key (`ts_ns` BE `u64` || `key_seq` BE `u32`).
+    pub key_hex: String,
+    /// The row's own `observation_id` (`observe-{ts_ns:020}-{key_seq:010}`).
+    pub observation_id: String,
+    /// Key timestamp component. Not `Observation::at`: this is the audit clock
+    /// read at write time, which is what the key is built from.
+    pub ts_ns: u64,
+    /// Key sequence component — the process-global observation audit counter.
+    /// Named `key_seq` because `Observation::seq` is the assembler's own,
+    /// unrelated, per-process observation counter.
+    pub key_seq: u32,
 }
 
 pub const PERCEIVED_TEXT_UNTRUSTED_NOTICE: &str =

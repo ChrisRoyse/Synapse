@@ -21,6 +21,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
             ("gc_once", params.gc_once.is_some()),
             ("put_probe_rows", params.put_probe_rows.is_some()),
             ("anchors", params.anchors.is_some()),
+            ("row_read", params.row_read.is_some()),
             ("temporal_panels", params.temporal_panels.is_some()),
             ("corpus_histogram", params.corpus_histogram.is_some()),
             ("panel_coverage", params.panel_coverage.is_some()),

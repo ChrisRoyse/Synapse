@@ -2874,13 +2874,17 @@ fn perception_detection_health(state: &crate::m1::M1State) -> PerceptionDetectio
     let configured_model_registered = configured_model_id
         .as_deref()
         .map(|id| synapse_models::registered_model(id).is_some());
+    // #2064: the status is the gate's own verdict label, not a two-valued
+    // reduction of it. A profile naming an unloadable detector reported
+    // `configured` here while every pixel-bearing observe failed, with
+    // `configured_model_registered: false` as the only tell.
     let (status, reason_code, remediation) = gate.map_or_else(
         || ("configured".to_owned(), None, None),
-        |gate| {
+        |fault| {
             (
-                "not_configured".to_owned(),
-                Some(gate.reason_code),
-                Some(gate.remediation),
+                fault.kind.status().to_owned(),
+                Some(fault.reason_code),
+                Some(fault.remediation),
             )
         },
     );

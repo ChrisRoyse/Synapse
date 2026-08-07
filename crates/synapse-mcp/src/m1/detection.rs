@@ -50,14 +50,43 @@ impl Default for DetectionRuntimeConfig {
     }
 }
 
-/// Why the detection stage will perform no model inference (#2054).
+/// Which configuration fault stops detection inference (#2054, #2064).
+///
+/// The two are not interchangeable and must never share a wire label.
+/// `NotConfigured` is a profile that deliberately runs no detector: the observe
+/// completes and reports `SensorStatus::NotConfigured`. `Misconfigured` is a
+/// profile that names a detector this daemon cannot load: every observe in a
+/// pixel-bearing mode *fails*. Health reported the second as `configured` until
+/// #2064 — with `configured_model_registered: false` as the only tell, a field a
+/// reader had to already suspect to look at — which is a health surface claiming
+/// a capability that errors on first use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DetectionFaultKind {
+    NotConfigured,
+    Misconfigured,
+}
+
+impl DetectionFaultKind {
+    /// The `perception.detection.status` wire label. Deliberately never `ok` or
+    /// `healthy`: those are the words #2054 exists to stop being reused here.
+    #[must_use]
+    pub const fn status(self) -> &'static str {
+        match self {
+            Self::NotConfigured => "not_configured",
+            Self::Misconfigured => "misconfigured",
+        }
+    }
+}
+
+/// Why the detection stage will perform no successful model inference (#2054).
 ///
 /// Carried onto `diagnostics.detection_status` as
 /// `SensorStatus::NotConfigured` and into `health.subsystems.perception`, so
 /// both surfaces name the same cause with the same remediation instead of
 /// holding two independent opinions about whether a detector runs.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct DetectionNotConfigured {
+pub struct DetectionInferenceFault {
+    pub kind: DetectionFaultKind,
     pub reason_code: String,
     pub detail: String,
     pub remediation: String,
@@ -67,10 +96,16 @@ pub struct DetectionNotConfigured {
 ///
 /// Pure over [`DetectionRuntimeConfig`]: `None` means an observe in a
 /// pixel-bearing perception mode performs real model inference, `Some` names
-/// every reason it performs none. Both the observe path and the `health` tool
-/// call this, so a health reader and an observation can never disagree.
+/// why it does not. Both the observe path and the `health` tool call this, so a
+/// health reader and an observation can never disagree.
 #[must_use]
-pub fn detection_inference_gate(config: &DetectionRuntimeConfig) -> Option<DetectionNotConfigured> {
+pub fn detection_inference_gate(
+    config: &DetectionRuntimeConfig,
+) -> Option<DetectionInferenceFault> {
+    let remediation = format!(
+        "set [detection].model_id to a registered detector ({}) and [detection].max_detections>0 in the active profile, then re-apply the profile",
+        registered_detection_model_ids().join(" | ")
+    );
     let mut causes = Vec::new();
     if config.model_id.is_none() {
         causes.push("the active profile declares no [detection].model_id");
@@ -78,24 +113,48 @@ pub fn detection_inference_gate(config: &DetectionRuntimeConfig) -> Option<Detec
     if config.max_detections == 0 {
         causes.push("the active profile declares [detection].max_detections=0");
     }
-    if causes.is_empty() {
+    if !causes.is_empty() {
+        return Some(DetectionInferenceFault {
+            kind: DetectionFaultKind::NotConfigured,
+            reason_code: error_codes::DETECTION_NOT_CONFIGURED.to_owned(),
+            detail: format!(
+                "no detector inference ran: {}; effective detection config model_id={} max_detections={} confidence_threshold={}",
+                causes.join(" and "),
+                config.model_id.as_deref().unwrap_or("<none>"),
+                config.max_detections,
+                config.confidence_threshold
+            ),
+            remediation,
+        });
+    }
+    // #2064: a named-but-unloadable detector is the third state. It is not
+    // `not_configured` (the operator did ask for inference) and it is emphatically
+    // not `configured` (nothing can run). Resolved through exactly the id set the
+    // remediation above advertises, which is the same set the detection worker
+    // resolves against, so health cannot call loadable what the worker rejects.
+    let model_id = config.model_id.as_deref()?;
+    if loadable_detection_model(model_id) {
         return None;
     }
-    let remediation = format!(
-        "set [detection].model_id to a registered detector ({}) and [detection].max_detections>0 in the active profile, then re-apply the profile",
-        registered_detection_model_ids().join(" | ")
-    );
-    Some(DetectionNotConfigured {
-        reason_code: error_codes::DETECTION_NOT_CONFIGURED.to_owned(),
+    Some(DetectionInferenceFault {
+        kind: DetectionFaultKind::Misconfigured,
+        reason_code: error_codes::DETECTION_MODEL_NOT_LOADED.to_owned(),
         detail: format!(
-            "no detector inference ran: {}; effective detection config model_id={} max_detections={} confidence_threshold={}",
-            causes.join(" and "),
-            config.model_id.as_deref().unwrap_or("<none>"),
-            config.max_detections,
-            config.confidence_threshold
+            "the active profile names detector model_id={model_id:?}, which this daemon cannot load: it resolves to no registered detector. Every observe in a pixel-bearing perception mode fails; effective detection config max_detections={} confidence_threshold={}",
+            config.max_detections, config.confidence_threshold
         ),
         remediation,
     })
+}
+
+/// Whether the detection worker would resolve this id to a loadable detector.
+///
+/// Membership in [`registered_detection_model_ids`], not bare registry
+/// membership: a registered *non-detector* (the ASR model shares the registry)
+/// is just as unloadable here, and it is an id an operator can plausibly
+/// mistype into `[detection].model_id`.
+fn loadable_detection_model(model_id: &str) -> bool {
+    registered_detection_model_ids().contains(&model_id)
 }
 
 /// Registered detector ids an operator may name in `[detection].model_id`.
@@ -636,21 +695,48 @@ pub fn populate_detection_from_state(
     // detector never runs indistinguishable from one whose detector completed
     // inference. The status now names the exact cause, and no `detection`
     // latency is recorded because no detection work was timed.
-    if let Some(not_configured) = detection_inference_gate(config) {
-        tracing::warn!(
-            code = error_codes::DETECTION_NOT_CONFIGURED,
-            mode = ?mode,
-            model_id = ?config.model_id,
-            max_detections = config.max_detections,
-            confidence_threshold = config.confidence_threshold,
-            remediation = %not_configured.remediation,
-            "detection stage ran no model inference: the active profile configures no detector"
-        );
-        input.detection_status = SensorStatus::NotConfigured {
-            reason_code: not_configured.reason_code,
-            detail: format!("{}; {}", not_configured.detail, not_configured.remediation),
-        };
-        return Ok(());
+    if let Some(fault) = detection_inference_gate(config) {
+        match fault.kind {
+            DetectionFaultKind::NotConfigured => {
+                tracing::warn!(
+                    code = error_codes::DETECTION_NOT_CONFIGURED,
+                    mode = ?mode,
+                    model_id = ?config.model_id,
+                    max_detections = config.max_detections,
+                    confidence_threshold = config.confidence_threshold,
+                    remediation = %fault.remediation,
+                    "detection stage ran no model inference: the active profile configures no detector"
+                );
+                input.detection_status = SensorStatus::NotConfigured {
+                    reason_code: fault.reason_code,
+                    detail: format!("{}; {}", fault.detail, fault.remediation),
+                };
+                return Ok(());
+            }
+            // #2064: this used to fall through, capture a frame, spawn the
+            // isolated worker, and fail there with a generic message. The
+            // verdict is already known from configuration alone, so it fails
+            // here instead — same outcome, named cause, and no capture or GPU
+            // reservation spent proving it.
+            DetectionFaultKind::Misconfigured => {
+                tracing::error!(
+                    code = error_codes::DETECTION_MODEL_NOT_LOADED,
+                    mode = ?mode,
+                    model_id = ?config.model_id,
+                    remediation = %fault.remediation,
+                    "detection stage refused inference: the active profile names a detector this daemon cannot load"
+                );
+                return Err(ErrorData::invalid_params(
+                    format!(
+                        "{}: {}; {}",
+                        error_codes::DETECTION_MODEL_NOT_LOADED,
+                        fault.detail,
+                        fault.remediation
+                    ),
+                    None,
+                ));
+            }
+        }
     }
 
     let started = Instant::now();

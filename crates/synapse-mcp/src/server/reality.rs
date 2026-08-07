@@ -1053,7 +1053,11 @@ impl SynapseService {
         let mut state = self.m1_state()?;
         state.last_observed_foreground = Some(observation.foreground.clone());
         drop(state);
-        self.persist_observation(&observation, reason)?;
+        // #2064: the audit write now returns the durable CF_OBSERVATIONS row
+        // key. This path returns a reality audit, not the observation, so there
+        // is no response field to stamp it onto; the key remains readable in the
+        // OBSERVATION_AUDIT_RECORDED log record.
+        let _persisted_row = self.persist_observation(&observation, reason)?;
 
         let compact_state = compact_state(&observation)?;
         let compact_state_hash = hash_json(&compact_state)?;

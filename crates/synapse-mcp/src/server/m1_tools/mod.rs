@@ -653,7 +653,18 @@ impl SynapseService {
         let mut state = self.m1_state()?;
         state.last_observed_foreground = Some(observation.foreground.clone());
         drop(state);
-        self.persist_observation_for_mcp_session(&observation, "observe", mcp_session_id)?;
+        // #2064: the audit write mints the CF_OBSERVATIONS row key, and before
+        // this the key never left the write path — so no caller could name the
+        // row its own observe had just produced, and "read the persisted row"
+        // was unperformable at every grant level. Stamping it onto the response
+        // is what makes `storage operation=row_read` addressable. The size
+        // fields are recomputed because they describe this response, not the
+        // pre-persist assembly.
+        let persisted =
+            self.persist_observation_for_mcp_session(&observation, "observe", mcp_session_id)?;
+        observation.diagnostics.persisted = Some(persisted);
+        synapse_perception::refresh_size_fields(&mut observation)
+            .map_err(|err| mcp_error(err.code(), err.to_string()))?;
         self.record_timeline_enrichments(
             &observation,
             clipboard_timeline_sample.as_ref(),

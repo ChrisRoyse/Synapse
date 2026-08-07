@@ -232,6 +232,50 @@ pub(super) async fn handle(
                 |out| out.anchors = Some(response),
             )))
         }
+        StorageOperation::RowRead => {
+            let spec = params
+                .0
+                .row_read
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "row_read"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_row_read(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "storage",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/reflex initialization and retry storage operation=row_read",
+                )
+            })?;
+            let response = crate::m3::storage::read_storage_row(&db, &spec).map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    &spec.cf_name,
+                    STORAGE_SOT,
+                    error,
+                    "name an allowlisted readable cf_name and exactly one of key_hex / \
+                         observation_id, both of which every observe response returns under \
+                         `diagnostics.persisted`",
+                )
+            })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "{} row key={} value_bytes={} decoded_as={} observation_id={}",
+                    response.cf_name,
+                    response.key_hex,
+                    response.value_len_bytes,
+                    response.decoded_as,
+                    response.observation.observation_id
+                ),
+                |out| out.row_read = Some(Box::new(response)),
+            )))
+        }
         StorageOperation::TemporalPanels => {
             let spec = params
                 .0

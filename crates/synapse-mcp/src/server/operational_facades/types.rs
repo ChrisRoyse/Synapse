@@ -32,10 +32,11 @@ use crate::m3::{
         StoragePutProbeRowsParams, StoragePutProbeRowsResponse, StorageRestoreVerifyParams,
         StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
         StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
-        StorageRetireSearchGenerationResponse, StorageSearchRebuildParams,
-        StorageSearchRebuildResponse, StorageSummaryResponse, StorageTemporalBackfillParams,
-        StorageTemporalBackfillResponse, StorageTemporalPanelsParams,
-        StorageTemporalPanelsResponse, StorageTemporalRerankParams, StorageTemporalRerankResponse,
+        StorageRetireSearchGenerationResponse, StorageRowReadParams, StorageRowReadResponse,
+        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
+        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
+        StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
+        StorageTemporalRerankResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -46,6 +47,7 @@ pub enum StorageOperation {
     GcOnce,
     PutProbeRows,
     Anchors,
+    RowRead,
     TemporalPanels,
     CorpusHistogram,
     PanelCoverage,
@@ -70,6 +72,7 @@ impl StorageOperation {
             Self::GcOnce => "gc_once",
             Self::PutProbeRows => "put_probe_rows",
             Self::Anchors => "anchors",
+            Self::RowRead => "row_read",
             Self::TemporalPanels => "temporal_panels",
             Self::CorpusHistogram => "corpus_histogram",
             Self::PanelCoverage => "panel_coverage",
@@ -102,6 +105,8 @@ pub struct StorageParams {
     pub put_probe_rows: Option<StoragePutProbeRowsParams>,
     #[serde(default)]
     pub anchors: Option<StorageAnchorsParams>,
+    #[serde(default)]
+    pub row_read: Option<StorageRowReadParams>,
     #[serde(default)]
     pub temporal_panels: Option<StorageTemporalPanelsParams>,
     #[serde(default)]
@@ -148,6 +153,12 @@ pub struct StorageResponse {
     pub put_probe_rows: Option<StoragePutProbeRowsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchors: Option<StorageAnchorsResponse>,
+    /// Boxed: this variant carries a decoded `StoredObservation` projection,
+    /// which is by far the widest arm of `StorageResponse`. Inline it and the
+    /// whole facade handler's stack frame crosses clippy's 512 KB ceiling for
+    /// every operation, including the ones that never touch a row body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_read: Option<Box<StorageRowReadResponse>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_panels: Option<StorageTemporalPanelsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

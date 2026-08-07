@@ -838,6 +838,49 @@ pub struct StorageCorpusHistogramParams {
     pub max_buckets: Option<u32>,
 }
 
+/// Read one exact authoritative source row and return its decoded body (#2064).
+///
+/// Every other read on this facade returns keys, hashes, counts, or derived
+/// anchors. None of them returns a row *body*, so "what did the daemon actually
+/// persist for that observation" could not be answered from the public surface
+/// at any grant level — which is precisely the acceptance criterion #2054 was
+/// unable to perform, and the reason every perception issue closed on the wire
+/// format alone.
+///
+/// Deliberately narrow, in three directions at once:
+/// - **Allowlist, not a CF parameter.** Only [`ROW_READ_READABLE_CFS`] decodes;
+///   every other CF fails closed naming the allowlist. A generic raw-row dump
+///   over `ALL_COLUMN_FAMILIES` would be a credential/keystroke exfiltration
+///   surface wearing a diagnostics hat.
+/// - **Typed projection, not raw bytes.** The row is decoded through the exact
+///   record the writer used and re-emitted as fixed-arity fields, so the
+///   response size does not scale with the row (an observation carries hundreds
+///   of accessibility nodes). Content-bearing strings are reported as SHA-256
+///   digests and lengths, matching what `reality` already does for the same two
+///   fields, so a caller can prove equality with what it holds without the
+///   facade handing back screen text.
+/// - **Read-only, `READ_STORAGE` only.** No maintenance capability: verifying
+///   what was stored is not maintenance, and gating it behind maintenance is
+///   what made the vault's ground truth unreachable for routine FSV.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRowReadParams {
+    /// Source CF to read. Only `CF_OBSERVATIONS` is readable; anything else
+    /// fails closed naming the allowlist.
+    pub cf_name: String,
+    /// Hex-encoded exact physical row key. For `CF_OBSERVATIONS` this is the
+    /// 24-character `ts_ns` BE `u64` || `seq` BE `u32` key returned as
+    /// `diagnostics.persisted.key_hex` on every `observe` response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_hex: Option<String>,
+    /// `observe-{ts_ns:020}-{seq:010}` — the row's own `observation_id`, which
+    /// encodes both key components. Accepted as an alternative to `key_hex` so
+    /// the ids other surfaces already return (`profile` quality evidence,
+    /// `OBSERVATION_AUDIT_RECORDED` log records) are directly readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageTemporalRerankParams {
@@ -893,6 +936,93 @@ pub struct StorageAnchorsResponse {
     pub cx_id: String,
     pub anchor_count: u64,
     pub anchors: Vec<StorageAnchorRow>,
+}
+
+/// One exact source row, decoded through the record its writer used (#2064).
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageRowReadResponse {
+    pub source_of_truth: String,
+    pub cf_name: String,
+    /// The physical key that was read, always echoed in hex regardless of which
+    /// input form named it.
+    pub key_hex: String,
+    /// Which parameter the key came from: `key_hex` or `observation_id`.
+    pub key_source: String,
+    /// Exact stored value length. The projection below is fixed-arity, so this
+    /// is the only place the row's real size is visible.
+    pub value_len_bytes: u64,
+    /// Digest of the exact stored bytes, before decoding. Two reads of an
+    /// unchanged row agree here byte for byte.
+    pub value_sha256: String,
+    /// Typed record the row was decoded through.
+    pub decoded_as: String,
+    /// What this response does and does not disclose from the row body.
+    pub redaction_policy: String,
+    pub observation: StorageObservationRowReadback,
+}
+
+/// `StoredObservation` reduced to fixed-arity, non-content fields (#2064).
+///
+/// `diagnostics` is re-emitted verbatim because every field in it is a status,
+/// a latency, a bound, a count, or a capability readback — no perceived text,
+/// no page URLs, no titles (`CdpDiagnostics` documents that contract for the
+/// browser fields). It is also the exact block #2054 turned on: whether the
+/// stored row says `detection_status = not_configured` is answerable here and
+/// nowhere else on the public surface.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageObservationRowReadback {
+    pub schema_version: u32,
+    pub observation_id: String,
+    pub ts_ns: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    pub mode: String,
+    pub reason: String,
+    pub redacted: bool,
+    pub redaction_count: u64,
+    pub diagnostics: synapse_core::ObservationDiagnostics,
+    pub foreground: StorageObservationForegroundReadback,
+    /// Cardinalities of the row's content-bearing collections. The members
+    /// themselves are perceived screen content and are never returned here.
+    pub elements: u64,
+    pub entities: u64,
+    pub recent_events: u64,
+    pub fs_recent: u64,
+    pub focused_present: bool,
+    pub clipboard_summary_present: bool,
+    pub audio_transcription_present: bool,
+    pub hud_readings: u64,
+    pub hud_errors: u64,
+}
+
+/// The stored foreground, with its two content-bearing strings digested.
+///
+/// `window_title` and `process_path` are hashed rather than returned, which is
+/// the same split `reality` already publishes for the same two fields: a caller
+/// holding the value can prove equality, and a caller that does not cannot
+/// learn it.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageObservationForegroundReadback {
+    pub hwnd: i64,
+    pub pid: u32,
+    pub process_name: String,
+    pub process_path_len_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_path_sha256: Option<String>,
+    pub window_title_len_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title_sha256: Option<String>,
+    pub monitor_index: u32,
+    pub dpi_scale: f32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steam_appid: Option<u32>,
+    pub is_fullscreen: bool,
+    pub is_dwm_composed: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -2988,6 +3118,13 @@ pub fn required_permissions_temporal_panels(
     required([Permission::ReadStorage])
 }
 
+/// Read-only, and deliberately not maintenance-gated (#2064). Reading back the
+/// row you just wrote is verification, not maintenance.
+#[must_use]
+pub fn required_permissions_row_read(_params: &StorageRowReadParams) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
 #[must_use]
 pub fn required_permissions_corpus_histogram(
     _params: &StorageCorpusHistogramParams,
@@ -3051,6 +3188,263 @@ pub fn inspect_storage_anchors(
         .calyx_anchor_scan_for_source(cf_name, &key, &source_value)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(storage_anchors_response(report, source_value_len_bytes))
+}
+
+/// The complete set of column families `operation=row_read` will decode.
+///
+/// An allowlist rather than a parameter over `ALL_COLUMN_FAMILIES`: a row body
+/// is raw captured material, and the only CF here is the one whose typed record
+/// this facade can project down to non-content fields. Extending it means
+/// writing the projection first — a CF with no projection has no safe body to
+/// return, which is why the miss fails closed instead of falling back to bytes.
+const ROW_READ_READABLE_CFS: &[&str] = &[cf::CF_OBSERVATIONS];
+
+/// Refuse to decode a stored value larger than this (8 MiB).
+///
+/// The projection is fixed-arity so the *response* is bounded regardless, but a
+/// row this large means the value is not the record it claims to be, and
+/// decoding it would burn the runtime worker proving that. Fails loud with the
+/// measured size rather than truncating into a plausible-looking answer.
+const ROW_READ_MAX_VALUE_BYTES: u64 = 8 * 1024 * 1024;
+
+/// What `operation=row_read` discloses from a row body.
+///
+/// Distinct from [`STORAGE_METADATA_ONLY_REDACTION_POLICY`], which the row
+/// *samples* in `operation=inspect` carry: those omit the value entirely, this
+/// one decodes it and returns the non-content fields. Naming the difference on
+/// the wire keeps a reader from assuming either policy applies to the other.
+const STORAGE_ROW_READ_REDACTION_POLICY: &str = "typed_non_content_fields_verbatim_sha256_digests_and_lengths_for_content_bearing_strings_collection_members_omitted";
+
+/// `observation_id` prefix minted by the observation audit write path.
+const OBSERVATION_ID_PREFIX: &str = "observe-";
+/// Digits `observation_id` zero-pads `ts_ns` to.
+const OBSERVATION_ID_TS_DIGITS: usize = 20;
+/// Digits `observation_id` zero-pads the key sequence to.
+const OBSERVATION_ID_SEQ_DIGITS: usize = 10;
+
+/// Reads one exact allowlisted source row and returns its decoded body (#2064).
+///
+/// # Errors
+///
+/// Fails closed on a CF outside [`ROW_READ_READABLE_CFS`], on an input that
+/// names zero or two keys, on an unparseable key, on an absent row, on an
+/// oversized value, and on a value that will not decode as the record the CF
+/// declares. A row that will not decode is reported with its key and the decode
+/// error — never approximated, and never returned as raw bytes.
+pub fn read_storage_row(
+    db: &synapse_storage::Db,
+    params: &StorageRowReadParams,
+) -> Result<StorageRowReadResponse, ErrorData> {
+    let cf_name = row_read_cf(&params.cf_name)?;
+    let (key, key_source) = row_read_key(params)?;
+    let key_hex = hex_encode(&key);
+    let value = db
+        .get_cf(cf_name, &key)
+        .map_err(|error| storage_mcp_error(&error))?
+        .ok_or_else(|| {
+            mcp_error_with_remediation(
+                error_codes::STORAGE_READ_FAILED,
+                format!("storage operation=row_read source row not found: cf_name={cf_name} key_hex={key_hex}"),
+                "the row is absent from the physical CF, not merely unreadable; confirm the key \
+                 against the `diagnostics.persisted` block of the observe response that produced \
+                 it, and note that audit retention may have evicted an older row",
+            )
+        })?;
+    let value_len_bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+    if value_len_bytes > ROW_READ_MAX_VALUE_BYTES {
+        return Err(mcp_error_with_remediation(
+            "SYNAPSE_STORAGE_ROW_READ_VALUE_TOO_LARGE",
+            format!(
+                "storage operation=row_read refused a {value_len_bytes}-byte value in \
+                 cf_name={cf_name} key_hex={key_hex}; the ceiling is {ROW_READ_MAX_VALUE_BYTES} bytes"
+            ),
+            "a stored observation this large is not the record the CF declares; inspect the row \
+             with storage operation=inspect row samples and repair the writer before reading it \
+             back",
+        ));
+    }
+    let stored: synapse_core::StoredObservation =
+        serde_json::from_slice(&value).map_err(|error| {
+            mcp_error_with_remediation(
+                error_codes::STORAGE_READ_FAILED,
+                format!(
+                    "storage operation=row_read could not decode cf_name={cf_name} \
+                     key_hex={key_hex} as StoredObservation: {error}"
+                ),
+                "the physical row does not match the record its writer declares; this is a \
+                 storage/schema defect, not a caller error — the raw bytes are deliberately not \
+                 returned as a fallback",
+            )
+        })?;
+    Ok(StorageRowReadResponse {
+        source_of_truth: "exact physical CF row decoded through the typed record its writer used"
+            .to_owned(),
+        cf_name: cf_name.to_owned(),
+        key_hex,
+        key_source: key_source.to_owned(),
+        value_len_bytes,
+        value_sha256: sha256_hex(&value),
+        decoded_as: "StoredObservation".to_owned(),
+        redaction_policy: STORAGE_ROW_READ_REDACTION_POLICY.to_owned(),
+        observation: observation_row_readback(stored),
+    })
+}
+
+fn row_read_cf(raw: &str) -> Result<&'static str, ErrorData> {
+    let trimmed = raw.trim();
+    ROW_READ_READABLE_CFS
+        .iter()
+        .copied()
+        .find(|cf_name| *cf_name == trimmed)
+        .ok_or_else(|| {
+            mcp_error_with_remediation(
+                "SYNAPSE_STORAGE_ROW_READ_CF_NOT_READABLE",
+                format!("storage operation=row_read does not read cf_name {trimmed:?}"),
+                &format!(
+                    "readable column families are: {}. A CF outside that list has no typed \
+                     non-content projection, and this operation returns no raw row bytes under \
+                     any circumstances",
+                    ROW_READ_READABLE_CFS.join(", ")
+                ),
+            )
+        })
+}
+
+/// Resolves the caller's key input to exactly one physical key.
+///
+/// Exactly one of `key_hex` / `observation_id`, mirroring the "exactly one
+/// operation spec" rule the facade already enforces: two keys that disagree is
+/// a caller bug that must not silently resolve to whichever one was checked
+/// first.
+fn row_read_key(params: &StorageRowReadParams) -> Result<(Vec<u8>, &'static str), ErrorData> {
+    let key_hex = params
+        .key_hex
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let observation_id = params
+        .observation_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (key_hex, observation_id) {
+        (Some(key_hex), None) => {
+            let key = hex_decode(key_hex).map_err(|detail| {
+                mcp_error_with_remediation(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("storage operation=row_read key_hex invalid: {detail}"),
+                    "pass the even-length hexadecimal key returned as \
+                     `diagnostics.persisted.key_hex` on the observe response that wrote the row",
+                )
+            })?;
+            Ok((key, "key_hex"))
+        }
+        (None, Some(observation_id)) => {
+            Ok((observation_key_from_id(observation_id)?, "observation_id"))
+        }
+        (Some(_), Some(_)) => Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=row_read accepts key_hex or observation_id, not both".to_owned(),
+            "send exactly one key form; two forms that disagree have no correct resolution",
+        )),
+        (None, None) => Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=row_read requires key_hex or observation_id".to_owned(),
+            "every observe response carries both under `diagnostics.persisted`",
+        )),
+    }
+}
+
+/// Rebuilds the physical key from `observe-{ts_ns:020}-{seq:010}`.
+///
+/// The id is not an opaque handle — the write path derives it from the same two
+/// numbers it builds the key from, so this is an exact inverse, not a lookup.
+fn observation_key_from_id(observation_id: &str) -> Result<Vec<u8>, ErrorData> {
+    let malformed = |detail: &str| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=row_read observation_id {observation_id:?} is malformed: {detail}"
+            ),
+            "the expected form is `observe-` then the audit timestamp zero-padded to 20 digits, \
+             `-`, then the audit sequence zero-padded to 10 digits, exactly as returned in \
+             `diagnostics.persisted.observation_id`",
+        )
+    };
+    let rest = observation_id
+        .strip_prefix(OBSERVATION_ID_PREFIX)
+        .ok_or_else(|| malformed("missing the `observe-` prefix"))?;
+    let (ts_digits, seq_digits) = rest
+        .split_once('-')
+        .ok_or_else(|| malformed("missing the `-` between the timestamp and sequence"))?;
+    if ts_digits.len() != OBSERVATION_ID_TS_DIGITS || seq_digits.len() != OBSERVATION_ID_SEQ_DIGITS
+    {
+        return Err(malformed(&format!(
+            "expected {OBSERVATION_ID_TS_DIGITS} timestamp digits and \
+             {OBSERVATION_ID_SEQ_DIGITS} sequence digits, got {} and {}",
+            ts_digits.len(),
+            seq_digits.len()
+        )));
+    }
+    let ts_ns = ts_digits
+        .parse::<u64>()
+        .map_err(|error| malformed(&format!("timestamp is not a u64: {error}")))?;
+    let seq = seq_digits
+        .parse::<u32>()
+        .map_err(|error| malformed(&format!("sequence is not a u32: {error}")))?;
+    let mut key = Vec::with_capacity(12);
+    key.extend_from_slice(&ts_ns.to_be_bytes());
+    key.extend_from_slice(&seq.to_be_bytes());
+    Ok(key)
+}
+
+fn observation_row_readback(
+    stored: synapse_core::StoredObservation,
+) -> StorageObservationRowReadback {
+    StorageObservationRowReadback {
+        schema_version: stored.schema_version,
+        observation_id: stored.observation_id,
+        ts_ns: stored.ts_ns,
+        session_id: stored.session_id,
+        mode: json_label(&stored.mode),
+        reason: stored.reason,
+        redacted: stored.redacted,
+        redaction_count: stored.redactions.len() as u64,
+        foreground: StorageObservationForegroundReadback {
+            hwnd: stored.foreground.hwnd,
+            pid: stored.foreground.pid,
+            process_name: stored.foreground.process_name,
+            process_path_len_bytes: stored.foreground.process_path.len() as u64,
+            process_path_sha256: content_digest(&stored.foreground.process_path),
+            window_title_len_bytes: stored.foreground.window_title.len() as u64,
+            window_title_sha256: content_digest(&stored.foreground.window_title),
+            monitor_index: stored.foreground.monitor_index,
+            dpi_scale: stored.foreground.dpi_scale,
+            profile_id: stored.foreground.profile_id,
+            steam_appid: stored.foreground.steam_appid,
+            is_fullscreen: stored.foreground.is_fullscreen,
+            is_dwm_composed: stored.foreground.is_dwm_composed,
+        },
+        elements: stored.elements.len() as u64,
+        entities: stored.entities.len() as u64,
+        recent_events: stored.recent_events.len() as u64,
+        fs_recent: stored.fs_recent.len() as u64,
+        focused_present: stored.focused.is_some(),
+        clipboard_summary_present: stored.clipboard_summary.is_some(),
+        audio_transcription_present: stored.audio.transcription.is_some(),
+        hud_readings: stored.hud.by_name.len() as u64,
+        hud_errors: stored.hud.errors.len() as u64,
+        diagnostics: stored.diagnostics,
+    }
+}
+
+/// Digest of a content-bearing string, `None` when the string is empty.
+///
+/// Empty is reported as absence rather than as the digest of the empty string,
+/// so a caller cannot mistake "the daemon stored nothing here" for "the daemon
+/// stored something I do not have".
+fn content_digest(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| sha256_hex(value.as_bytes()))
 }
 
 /// Hard ceiling on rows one histogram pass may scan.
