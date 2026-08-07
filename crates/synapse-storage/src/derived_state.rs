@@ -765,8 +765,31 @@ pub(crate) fn run_derived_state_maintenance() {
                 tracing::warn!(
                     code = "STORAGE_DERIVED_STATE_PANEL_VERSION_UNCLAIMED",
                     unknown_panel_versions = ?report.unknown_panel_versions,
-                    "the Base CF holds panel generations that no catalog entry claims; their \
-                     records are read by no active-panel surface and are counted as stranded"
+                    "the Base CF holds panel generations that NEITHER the built-in catalog nor \
+                     the Registry CF generation allocator claims; their records are read by no \
+                     active-panel surface, no re-measure knows how to rebuild them, and they are \
+                     counted as stranded"
+                );
+            }
+            // #2062: attributed, but attributed to a panel that is minting a
+            // generation per pass and retiring none. Distinct from the line
+            // above, which is now the genuinely-unclaimed case.
+            if !report.dynamic_panels_multi_live.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_DYNAMIC_GENERATIONS_UNRETIRED",
+                    dynamic_panels_multi_live = ?report.dynamic_panels_multi_live,
+                    "one or more dynamic panels hold more than one live generation; a publisher \
+                     minted a generation without retiring its predecessor, so those records are \
+                     stranded as they are created and no reclaim can see them"
+                );
+            }
+            if !report.reserved_generations_absent_from_catalog.is_empty() {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_RESERVED_GENERATION_UNDECLARED",
+                    reserved_generations_absent_from_catalog =
+                        ?report.reserved_generations_absent_from_catalog,
+                    "the allocator reserves built-in generations that builtin_panel_catalog does \
+                     not name; their rows are attributable but no panel row measures them"
                 );
             }
             // A failed backfill page must not leave the tick counted as a clean
@@ -943,10 +966,11 @@ fn drive_app_transition_graph(db: &Db) -> crate::StorageResult<()> {
             return Ok(());
         }
     }
-    let readback = db.publish_graph_position_snapshot(
+    let readback = publish_graph_snapshot(
+        db,
         GraphPositionKind::App,
         source_seq,
-        now_unix_ms().unwrap_or(lease.read_at_unix_ms),
+        lease.read_at_unix_ms,
         &transitions,
     )?;
     tracing::info!(
@@ -982,10 +1006,23 @@ fn drive_path_hierarchy(
     if lifecycle_has_snapshot(db, SYN_PATH_HIERARCHY_PANEL_VERSION, fingerprint)? {
         return Ok(());
     }
-    let readback = db.publish_path_hierarchy_snapshot(
-        source_seq,
-        now_unix_ms().unwrap_or(read_at_unix_ms),
-        &paths,
+    let readback = db
+        .publish_path_hierarchy_snapshot(
+            source_seq,
+            now_unix_ms().unwrap_or(read_at_unix_ms),
+            &paths,
+        )
+        .inspect_err(|error| {
+            name_orphaned_derived_generation(
+                db,
+                crate::constellations::SYN_PATH_HIERARCHY_PANEL_NAME,
+                &format!("publish path hierarchy snapshot: {error}"),
+            );
+        })?;
+    supersede_derived_generation(
+        db,
+        crate::constellations::SYN_PATH_HIERARCHY_PANEL_NAME,
+        readback.panel_version,
     )?;
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_PATH_GRAPH_PUBLISHED",
@@ -999,6 +1036,155 @@ fn drive_path_hierarchy(
         "scheduled path hierarchy snapshot was atomically published and physically read back"
     );
     Ok(())
+}
+
+/// Named ids one orphan report will print before it summarises.
+const DERIVED_ORPHAN_NAME_CAP: usize = 16;
+
+/// Publishes one graph-position snapshot and retires what it supersedes
+/// (#1685, #2062).
+///
+/// The publish, the orphan report and the supersession are one unit here rather
+/// than three at each call site: a publish that commits without retiring its
+/// predecessor is exactly the defect #2062 reports, and a second copy of this
+/// sequence is a second place for it to be omitted.
+fn publish_graph_snapshot(
+    db: &Db,
+    kind: GraphPositionKind,
+    source_seq: u64,
+    read_at_unix_ms: u64,
+    transitions: &[(String, String, u64)],
+) -> crate::StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback> {
+    let readback = db
+        .publish_graph_position_snapshot(
+            kind,
+            source_seq,
+            now_unix_ms().unwrap_or(read_at_unix_ms),
+            transitions,
+        )
+        .inspect_err(|error| {
+            name_orphaned_derived_generation(
+                db,
+                kind.panel_name(),
+                &format!("publish {} graph snapshot: {error}", kind.panel_name()),
+            );
+        })?;
+    supersede_derived_generation(db, kind.panel_name(), readback.panel_version)?;
+    Ok(readback)
+}
+
+/// Retires the generations a derived snapshot publish has just superseded
+/// (#2062 ask 1).
+///
+/// # The ordering, and why it is the only safe one
+///
+/// This runs **after** the publish has committed and read back, never before,
+/// and that is the same discipline an LSM compaction uses on its inputs: the
+/// output version is installed first and only then are the input files moved
+/// onto the obsolete list. Retiring first would mark rows reclaimable against a
+/// successor that might never exist, which is how a reclaimer deletes the only
+/// copy of something.
+///
+/// # Why the predecessor is not computed here
+///
+/// The allocator selects it, by exact owner identity — every generation whose
+/// owner string is `dynamic:<panel_name>:<operation_id>` and which is not the
+/// successor. A caller-side "everything below the new one" would be a range
+/// guess, and a wrong one: three publishers share one vault-global number line,
+/// so the ids immediately below `successor` typically belong to the *other two*
+/// panels and are live.
+///
+/// # What was missing
+///
+/// Nothing retired anything. Each pass minted a generation, wrote its whole
+/// snapshot under it, and left the previous one owned, un-superseded and
+/// invisible to `superseded_reclaim_candidates` — 98 generations and 62,566
+/// rows on the deployed daemon, growing by ~200 generations a day, with no
+/// mechanism that could ever have noticed.
+fn supersede_derived_generation(
+    db: &Db,
+    panel_name: &str,
+    successor: u32,
+) -> crate::StorageResult<()> {
+    let readback = db.supersede_panel_generations(panel_name, successor)?;
+    if readback.retired.is_empty() {
+        tracing::debug!(
+            code = "STORAGE_DERIVED_SNAPSHOT_GENERATION_ALREADY_SOLE",
+            panel_name,
+            successor,
+            already_retired = readback.already_retired.len(),
+            "the published derived generation was already this panel's only live generation"
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        code = "STORAGE_DERIVED_SNAPSHOT_GENERATION_SUPERSEDED",
+        panel_name,
+        successor,
+        retired_count = readback.retired.len(),
+        retired = ?readback
+            .retired
+            .iter()
+            .take(DERIVED_ORPHAN_NAME_CAP)
+            .collect::<Vec<_>>(),
+        already_retired = readback.already_retired.len(),
+        committed_seq = readback.committed_seq,
+        "predecessor derived generations were durably retired behind the committed successor and \
+         are now visible to superseded reclaim"
+    );
+    Ok(())
+}
+
+/// Names the generation a failed publish may have already allocated (#2062
+/// ask 1).
+///
+/// The allocation and the row batch are two commits. A publish that fails
+/// between them leaves a generation owned and empty, and the ask is explicit:
+/// an orphan must be **named loudly, not leaked silently**.
+///
+/// It is deliberately not retired here. Retirement records a *successor*, and a
+/// failed publish produced none; inventing one would either point at a
+/// generation that does not hold this snapshot or re-retire a live one. The
+/// orphan is instead named now and swept by the next successful publish, whose
+/// supersession retires every live generation of the panel other than itself —
+/// which is exactly the "full scan on restart" half of `RocksDB`'s obsolete-file
+/// tracking, there for the same reason: a reference dropped by a crash is not
+/// recoverable from memory and must be reconciled against durable state later.
+fn name_orphaned_derived_generation(db: &Db, panel_name: &str, cause: &str) {
+    let owner_prefix = format!("dynamic:{panel_name}:");
+    match db.panel_generation_allocator() {
+        Ok(allocator) => {
+            let live: Vec<u32> = allocator
+                .owners
+                .iter()
+                .filter(|(generation, owner)| {
+                    owner.starts_with(&owner_prefix) && !allocator.retired.contains_key(generation)
+                })
+                .map(|(generation, _)| *generation)
+                .collect();
+            tracing::error!(
+                code = "STORAGE_DERIVED_SNAPSHOT_GENERATION_ORPHANED",
+                panel_name,
+                cause,
+                live_generation_count = live.len(),
+                live_generations = ?live.iter().rev().take(DERIVED_ORPHAN_NAME_CAP).collect::<Vec<_>>(),
+                newest_live_generation = ?live.last(),
+                "a derived snapshot publish failed; every generation named here is owned by this \
+                 panel and un-retired, so the newest is an empty generation the failed publish \
+                 allocated. It is swept by the next successful publish's supersession"
+            );
+        }
+        Err(error) => {
+            tracing::error!(
+                code = "STORAGE_DERIVED_SNAPSHOT_GENERATION_ORPHAN_UNREADABLE",
+                panel_name,
+                cause,
+                error = %error,
+                "a derived snapshot publish failed AND the panel generation allocator could not \
+                 be read, so whether it left an orphaned generation is unknown"
+            );
+        }
+    }
 }
 
 fn lifecycle_has_snapshot(
@@ -1100,10 +1286,11 @@ fn drive_agent_spawn_graph(db: &Db) -> crate::StorageResult<()> {
     )? {
         return Ok(());
     }
-    let readback = db.publish_graph_position_snapshot(
+    let readback = publish_graph_snapshot(
+        db,
         GraphPositionKind::Process,
         source_seq,
-        now_unix_ms().unwrap_or(read_at_unix_ms),
+        read_at_unix_ms,
         &transitions,
     )?;
     tracing::info!(

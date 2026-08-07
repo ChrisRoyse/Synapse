@@ -116,6 +116,40 @@
 //!   did not read that source CF at all, so nothing is known. Unknown is not
 //!   zero, and it is reported as its own number rather than as completion.
 //!
+//! # Two authorities declare a generation, not one (#2062)
+//!
+//! [`builtin_panel_catalog`] is a compile-time table, so it structurally cannot
+//! name a generation minted at runtime. The vault-global panel generation
+//! allocator can and does: its Registry-CF `owners` map claims every generation
+//! anything ever wrote to, as `builtin:<panel>` for a reserved one and
+//! `dynamic:<panel>:<operation_id>` for an allocated one.
+//!
+//! Joining the census against the catalog alone therefore produced a **half
+//! false** red light. The live daemon reported 98 generations holding 62,566
+//! rows as claimed by nothing, and health held `calyx_panel_coverage` at
+//! `error` on that basis. Every one of them was claimed — by
+//! `dynamic:syn-graphpos-app-v1:…`, `dynamic:syn-graphpos-process-v1:…` and
+//! `dynamic:syn-path-hierarchy-v1:…` — in an authority the census did not read.
+//! A permanently-red instrument is a broken instrument, and this one was red for
+//! rows that were attributable all along.
+//!
+//! So the census now reads both, and the finding splits three ways:
+//!
+//! * claimed by the catalog — an ordinary [`PanelCoverageRow`];
+//! * claimed only by the allocator — an
+//!   [`PanelCoverageReport::owned_dynamic_generations`] rollup, per owning panel
+//!   rather than per generation, because a derived publisher mints one
+//!   generation per pass and 98 census rows is a report nobody reads;
+//! * claimed by **neither** — [`PanelCoverageReport::unknown_panel_versions`],
+//!   which is now the genuine finding it always claimed to be.
+//!
+//! The retirement ledger travels with the owners map, and it is what makes the
+//! rollup a retention statement rather than an inventory: a retired generation
+//! has a named successor that is already durable, so it is closed by
+//! *declaration* instead of by the timestamp heuristic
+//! [`SupersededGeneration::closed`] has to use, and its ungrounded rows join
+//! [`PanelCoverageReport::superseded_reclaim_candidates`].
+//!
 //! # Fail-visible, not fail-quiet
 //!
 //! A panel version present in the `Base` CF that no catalog entry claims is
@@ -218,6 +252,103 @@ pub struct StrandedAnchorIdentity {
     pub source_key_hex: String,
     /// The newest superseded generation that still holds this row's anchors.
     pub superseded_panel_version: u32,
+}
+
+/// Generations named individually inside one owned-generation rollup (#2062).
+///
+/// A derived publisher mints one generation per five-minute pass, so the
+/// population is unbounded in principle and 98 of them were live when this was
+/// written. The rollup names a bounded prefix and says so when it binds, for
+/// the same reason [`SYN_ANCHOR_DEBT_IDENTITY_CAP`] does: a list silently
+/// shortened is a report that looks complete and is not.
+pub const SYN_OWNED_GENERATION_NAME_CAP: usize = 64;
+
+/// The panel generation allocator's ownership authority, as the census join
+/// reads it (#2062).
+///
+/// Both halves are load-bearing and neither substitutes for the other.
+/// `owners` answers *who wrote this generation* — the question the catalog
+/// could not answer for a runtime-minted id, and the whole reason 62,566
+/// attributable rows read as unattributable. `retired` answers *is anything
+/// still writing there*, which is what separates the one live derived
+/// generation from superseded history that reclaim may consider.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PanelGenerationOwnership {
+    /// Generation -> `builtin:<panel_name>` or `dynamic:<panel>:<operation_id>`.
+    pub owners: BTreeMap<u32, String>,
+    /// Retired generation -> the generation that superseded it.
+    pub retired: BTreeMap<u32, u32>,
+}
+
+/// How a generation's owner string names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerKind {
+    Builtin,
+    Dynamic,
+}
+
+impl OwnerKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Dynamic => "dynamic",
+        }
+    }
+}
+
+impl PanelGenerationOwnership {
+    /// Splits an owner claim into `(kind, panel_name)`.
+    ///
+    /// Returns `None` for an owner string in neither declared shape. That is
+    /// not treated as ownership: an unparseable claim names no panel, so the
+    /// generation stays in `unknown_panel_versions` where a human will see it,
+    /// rather than being folded into a rollup under a guessed name.
+    fn claim(&self, panel_version: u32) -> Option<(OwnerKind, &str)> {
+        let owner = self.owners.get(&panel_version)?;
+        if let Some(rest) = owner.strip_prefix("dynamic:") {
+            let panel_name = rest.split(':').next().filter(|name| !name.is_empty())?;
+            return Some((OwnerKind::Dynamic, panel_name));
+        }
+        owner
+            .strip_prefix("builtin:")
+            .filter(|name| !name.is_empty())
+            .map(|name| (OwnerKind::Builtin, name))
+    }
+}
+
+/// Every `Base` generation one panel owns through the allocator, rolled up
+/// (#2062).
+///
+/// Per panel rather than per generation on purpose. The three derived
+/// publishers mint a generation per pass, so a per-generation report grows
+/// without bound and answers the wrong question — what an operator needs to
+/// know is how many generations one panel is carrying, how many of them are
+/// still live, and how many rows are sitting behind the live one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnedGenerationRollup {
+    /// Panel name taken from the owner claim, never inferred from the number.
+    pub panel_name: String,
+    /// `dynamic` for an allocated generation, `builtin` for a reserved one that
+    /// the catalog nonetheless does not name.
+    pub owner_kind: String,
+    pub generations_present: usize,
+    /// Generations with no recorded successor. **Healthy is exactly one.**
+    /// More than one means a publisher minted without retiring its
+    /// predecessor, which is the #2062 leak still open.
+    pub live_generations: Vec<u32>,
+    /// Generations with a durably recorded successor, bounded by
+    /// [`SYN_OWNED_GENERATION_NAME_CAP`].
+    pub retired_generations: Vec<u32>,
+    pub retired_generations_truncated: bool,
+    pub newest_generation: u32,
+    pub records: usize,
+    pub live_records: usize,
+    pub retired_records: usize,
+    pub grounded_records: usize,
+    /// Grounded records on retired generations. Sacred: an anchor is not
+    /// regenerated by re-running the derived pass, so these are excluded from
+    /// the reclaim candidates below exactly as declared superseded ones are.
+    pub retired_grounded_records: usize,
 }
 
 /// One panel's coverage and grounding row.
@@ -487,10 +618,39 @@ impl PanelCoverageRow {
 pub struct PanelCoverageReport {
     /// One row per declared panel, in catalog order.
     pub panels: Vec<PanelCoverageRow>,
-    /// Panel versions physically present in `Base` that no catalog entry claims,
-    /// with their record counts. Reported rather than dropped: an unclaimed
-    /// generation is exactly the kind of thing that strands records invisibly.
+    /// Panel versions physically present in `Base` that **neither** authority
+    /// claims — not the catalog, and not the allocator's owners map (#2062).
+    ///
+    /// Reported rather than dropped: an unclaimed generation is exactly the
+    /// kind of thing that strands records invisibly. Non-empty is a genuine
+    /// finding now, which it was not while runtime-minted generations landed
+    /// here purely because the census read one of the two authorities.
     pub unknown_panel_versions: Vec<(u32, usize)>,
+    /// Generations the allocator owns that the catalog does not name, rolled up
+    /// per owning panel (#2062).
+    ///
+    /// This is where the three derived-snapshot publishers' generations are
+    /// attributed. A rollup carrying more than one entry in
+    /// [`OwnedGenerationRollup::live_generations`] is the leak still open, and
+    /// is named again in [`Self::dynamic_panels_multi_live`].
+    pub owned_dynamic_generations: Vec<OwnedGenerationRollup>,
+    /// Dynamic panels holding more than one live generation with records — a
+    /// publisher that minted without retiring its predecessor (#2062).
+    ///
+    /// Named `panel (n live: …)` so a log line identifies the write path.
+    /// Empty is the healthy state.
+    pub dynamic_panels_multi_live: Vec<String>,
+    /// Generations reserved as `builtin:<panel>` that no catalog entry names,
+    /// with their record counts (#2062).
+    ///
+    /// Attributed, so not an unclaimed-generation finding — but a declaration
+    /// gap of its own: the boot reservation list and
+    /// [`builtin_panel_catalog`] are separately maintained, so a version can be
+    /// reserved and then not appear in any panel's `panel_version` or
+    /// `superseded_versions`. Reported apart rather than folded into either
+    /// neighbouring list, because attributing it silently would replace one
+    /// blind spot with another.
+    pub reserved_generations_absent_from_catalog: Vec<(u32, usize)>,
     pub base_cf_rows: usize,
     /// Sum over every generation present. `base_cf_rows - decode_failures`.
     pub records_total: usize,
@@ -821,6 +981,7 @@ pub fn build_panel_coverage_report(
     census: &SynapseCalyxPanelCensus,
     source_cf_rows: &BTreeMap<String, u64>,
     source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
+    ownership: &PanelGenerationOwnership,
 ) -> PanelCoverageReport {
     let catalog = builtin_panel_catalog();
     let mut panels = Vec::with_capacity(catalog.len());
@@ -1189,32 +1350,107 @@ pub fn build_panel_coverage_report(
         });
     }
 
-    let unknown_panel_versions: Vec<(u32, usize)> = census
-        .entries
+    // #2062. Every census generation the catalog does not claim is offered to
+    // the allocator's owners map before it is called unknown. Three outcomes,
+    // and the whole point is that they are three and not one.
+    let mut unknown_panel_versions: Vec<(u32, usize)> = Vec::new();
+    let mut reserved_generations_absent_from_catalog: Vec<(u32, usize)> = Vec::new();
+    let mut rollups: BTreeMap<(String, &'static str), OwnedGenerationRollup> = BTreeMap::new();
+    for row in &census.entries {
+        if claimed_versions.contains(&row.panel_version) {
+            continue;
+        }
+        let Some((owner_kind, panel_name)) = ownership.claim(row.panel_version) else {
+            // Claimed by neither authority. THE finding: rows exist under a
+            // generation nothing ever declared, so no surface reads them and
+            // no re-measure knows how to rebuild them.
+            unknown_panel_versions.push((row.panel_version, row.records));
+            // Stranded by definition, so it belongs in the same total as the
+            // declared superseded generations, and its grounded records in the
+            // sacred total. It never contributes reclaim candidates: with no
+            // owner and no catalog entry there is no known source CF and no
+            // known active counterpart, so none of the four reclaim conditions
+            // can even be evaluated.
+            superseded_records_total += row.records;
+            superseded_grounded_records_total += row.grounded_records;
+            continue;
+        };
+        if owner_kind == OwnerKind::Builtin {
+            reserved_generations_absent_from_catalog.push((row.panel_version, row.records));
+        }
+        let retired_by = ownership.retired.get(&row.panel_version).copied();
+        let rollup = rollups
+            .entry((panel_name.to_owned(), owner_kind.as_str()))
+            .or_insert_with(|| OwnedGenerationRollup {
+                panel_name: panel_name.to_owned(),
+                owner_kind: owner_kind.as_str().to_owned(),
+                generations_present: 0,
+                live_generations: Vec::new(),
+                retired_generations: Vec::new(),
+                retired_generations_truncated: false,
+                newest_generation: row.panel_version,
+                records: 0,
+                live_records: 0,
+                retired_records: 0,
+                grounded_records: 0,
+                retired_grounded_records: 0,
+            });
+        rollup.generations_present += 1;
+        rollup.newest_generation = rollup.newest_generation.max(row.panel_version);
+        rollup.records += row.records;
+        rollup.grounded_records += row.grounded_records;
+        if retired_by.is_some() {
+            rollup.retired_records += row.records;
+            rollup.retired_grounded_records += row.grounded_records;
+            if rollup.retired_generations.len() < SYN_OWNED_GENERATION_NAME_CAP {
+                rollup.retired_generations.push(row.panel_version);
+            } else {
+                rollup.retired_generations_truncated = true;
+            }
+            // A retired generation is closed by DECLARATION, not by the
+            // timestamp comparison `SupersededGeneration::closed` has to fall
+            // back on: the successor named in the retirement record was already
+            // durable when the record was written, so nothing can still be
+            // writing here. Its ungrounded rows are therefore exactly the
+            // #1927 ask 3 population — superseded, closed, and holding nothing
+            // the successor snapshot does not already carry — and they belong
+            // in the same upper bound. Grounded ones stay out: an anchor is an
+            // observed outcome and no re-publish regenerates it.
+            //
+            // Still an upper bound and still not a delete list, for the same
+            // reason as every other contributor to this number.
+            superseded_records_total += row.records;
+            superseded_grounded_records_total += row.grounded_records;
+            superseded_reclaim_candidates_total += row.records.saturating_sub(row.grounded_records);
+        } else {
+            rollup.live_records += row.records;
+            if rollup.live_generations.len() < SYN_OWNED_GENERATION_NAME_CAP {
+                rollup.live_generations.push(row.panel_version);
+            }
+        }
+    }
+    let owned_dynamic_generations: Vec<OwnedGenerationRollup> = rollups.into_values().collect();
+    let dynamic_panels_multi_live: Vec<String> = owned_dynamic_generations
         .iter()
-        .filter(|row| !claimed_versions.contains(&row.panel_version))
-        .map(|row| (row.panel_version, row.records))
+        .filter(|rollup| rollup.live_generations.len() > 1)
+        .map(|rollup| {
+            format!(
+                "{} ({} live generation(s) {:?} holding {} record(s); a publisher minted without \
+                 retiring its predecessor)",
+                rollup.panel_name,
+                rollup.live_generations.len(),
+                rollup.live_generations,
+                rollup.live_records,
+            )
+        })
         .collect();
-    // An unclaimed generation is stranded by definition: no active-panel surface
-    // reads it, so it belongs in the same total as the declared superseded ones.
-    // Its grounded records belong in the sacred total for the same reason, and
-    // it never contributes reclaim candidates — a generation no catalog entry
-    // claims has no known source CF and no known active counterpart, so none of
-    // the four reclaim conditions can even be evaluated for it.
-    superseded_records_total += unknown_panel_versions
-        .iter()
-        .map(|(_, records)| *records)
-        .sum::<usize>();
-    superseded_grounded_records_total += census
-        .entries
-        .iter()
-        .filter(|row| !claimed_versions.contains(&row.panel_version))
-        .map(|row| row.grounded_records)
-        .sum::<usize>();
 
     PanelCoverageReport {
         panels,
         unknown_panel_versions,
+        owned_dynamic_generations,
+        dynamic_panels_multi_live,
+        reserved_generations_absent_from_catalog,
         base_cf_rows: census.base_cf_rows,
         records_total: census.records_total(),
         decode_failures: census.decode_failures,

@@ -1859,6 +1859,33 @@ impl Db {
             .publish_path_hierarchy_snapshot(source_seq, created_at_ms, paths)
     }
 
+    /// Retires every generation a dynamic panel owns other than the successor
+    /// that just committed (#2062 ask 1).
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when the successor is unowned, owned by another panel,
+    /// itself retired, or older than a live generation of the same panel.
+    pub fn supersede_panel_generations(
+        &self,
+        panel_name: &str,
+        successor: u32,
+    ) -> StorageResult<synapse_calyx::PanelGenerationSupersession> {
+        self.backend
+            .supersede_panel_generations(panel_name, successor)
+    }
+
+    /// Reads the vault-global panel generation allocator's ownership authority.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the Registry-CF allocator row cannot be read or validated.
+    pub fn panel_generation_allocator(
+        &self,
+    ) -> StorageResult<synapse_calyx::PanelGenerationAllocatorReadback> {
+        self.backend.panel_generation_allocator()
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_TIMELINE` row.
     ///

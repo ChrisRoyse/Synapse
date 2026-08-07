@@ -807,6 +807,17 @@ pub trait StorageBackend: Send + Sync {
         created_at_ms: u64,
         paths: &[String],
     ) -> StorageResult<synapse_calyx::panel_lifecycle::SynapseCalyxDerivedSnapshotReadback>;
+    /// Retires every generation a dynamic panel owns other than the successor
+    /// that just committed (#2062 ask 1).
+    fn supersede_panel_generations(
+        &self,
+        panel_name: &str,
+        successor: u32,
+    ) -> StorageResult<synapse_calyx::PanelGenerationSupersession>;
+    /// Reads the vault-global panel generation allocator's ownership authority.
+    fn panel_generation_allocator(
+        &self,
+    ) -> StorageResult<synapse_calyx::PanelGenerationAllocatorReadback>;
     fn run_panel_backfill(
         &self,
         panel_version: u32,
@@ -2254,27 +2265,108 @@ fn retire_search_generation_on_vault(
     )
 }
 
+/// Panel generations this process has proven are claimed in the Registry-CF
+/// allocator (#2062 ask 2).
+///
+/// A claim is monotone — the allocator never releases an owner row, only adds a
+/// retirement record beside it — so a generation proven claimed once stays
+/// claimed for the life of the vault, and the durable check is paid once per
+/// generation rather than once per Base row. Seeded at vault open by the
+/// built-in reservation readback, extended by
+/// [`ensure_base_write_generation_claimed`].
+static CLAIMED_PANEL_GENERATIONS: std::sync::LazyLock<std::sync::Mutex<BTreeSet<u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(BTreeSet::new()));
+
+fn remember_claimed_panel_generation(panel_generation: u32) {
+    let mut guard = match CLAIMED_PANEL_GENERATIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(panel_generation);
+}
+
+fn panel_generation_already_proven(panel_generation: u32) -> bool {
+    let guard = match CLAIMED_PANEL_GENERATIONS.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.contains(&panel_generation)
+}
+
+/// Refuses a `Base` write whose panel generation no authority claims (#2062
+/// ask 2).
+///
+/// The allocator's `owners` map is the single authority: a built-in generation
+/// is claimed by the boot reservation above, a runtime generation by the
+/// allocation that mints it, and nothing else can produce a claim. A row
+/// written under a generation absent from it belongs to no panel — no surface
+/// reads it, no re-measure rebuilds it, and the only thing that ever notices is
+/// a census hours later, which is precisely how 62,566 rows accumulated before
+/// anyone asked where they came from.
+///
+/// Call this wherever a panel version reaches a write **as data**. Constant
+/// generations are proven at vault open instead, and runtime generations by
+/// their own allocation, so neither pays this.
+fn ensure_base_write_generation_claimed(
+    vault: &SynapseCalyxVault,
+    panel_generation: u32,
+) -> StorageResult<()> {
+    if panel_generation_already_proven(panel_generation) {
+        return Ok(());
+    }
+    let claim = vault
+        .ensure_panel_generation_claimed(panel_generation)
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_base",
+                "verify the panel generation claim of a Base write",
+                &source,
+            )
+        })?;
+    tracing::debug!(
+        code = "STORAGE_PANEL_GENERATION_CLAIM_PROVEN",
+        panel_generation,
+        owner = %claim.owner,
+        retired_by = ?claim.retired_by,
+        "a Base write's panel generation carries a durable Registry CF ownership claim"
+    );
+    remember_claimed_panel_generation(panel_generation);
+    Ok(())
+}
+
+/// Reserves an ownership claim for every generation a compile-time write site
+/// can name, taken from [`constellations::builtin_panel_catalog`] itself.
+///
+/// # Why the catalog and not a list (#2062 ask 2)
+///
+/// This used to carry its own hand-written array of eleven `(name, version)`
+/// pairs, maintained separately from the catalog every other surface reads. Two
+/// separately-maintained declarations of the same fact diverge, and this pair
+/// had: the three derived-snapshot panels were in the catalog and not in the
+/// array, so their generations were claimed only later, by the publish path,
+/// and only if a publish happened to run.
+///
+/// Deriving the list from the catalog is what makes the write-side invariant
+/// provable rather than conventional. Every panel version a constant-named
+/// write site can reach is claimed here, this runs during vault open, and a
+/// failure fails the open — so no writer in the process can name a generation
+/// the allocator does not own. Runtime-minted generations are claimed by the
+/// allocation that produces them, before the batch that uses them is written,
+/// which is the other half of the same invariant.
+///
+/// Superseded versions are deliberately NOT reserved: nothing writes to them,
+/// and one of them (`SYN_AGENT_EVENT_PANEL_VERSION_PRE_1983`, carried in
+/// `syn-graphpos-app-v1`'s lineage) is a *different* panel's retired
+/// generation, so reserving lineage entries by owning panel would manufacture
+/// an ownership conflict out of a correct declaration.
 fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> StorageResult<()> {
-    let reservations = [
-        (SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION),
-        (SYN_EPISODE_PANEL_NAME, SYN_EPISODE_PANEL_VERSION),
-        (SYN_AGENT_EVENT_PANEL_NAME, SYN_AGENT_EVENT_PANEL_VERSION),
-        (
-            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
-        ),
-        (SYN_ACTION_PANEL_NAME, SYN_ACTION_PANEL_VERSION),
-        (SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION),
-        (SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION),
-        (SYN_OBSERVATION_PANEL_NAME, SYN_OBSERVATION_PANEL_VERSION),
-        (SYN_OUTCOME_PANEL_NAME, SYN_OUTCOME_PANEL_VERSION),
-        (SYN_MCP_USAGE_PANEL_NAME, SYN_MCP_USAGE_PANEL_VERSION),
-        (
-            SYN_RECURRENCE_SUBJECT_PANEL_NAME,
-            SYN_RECURRENCE_SUBJECT_PANEL_VERSION,
-        ),
-    ]
-    .map(|(name, generation)| (name.to_owned(), generation));
+    let mut reservations: Vec<(String, u32)> = Vec::new();
+    for entry in constellations::builtin_panel_catalog() {
+        let reservation = (entry.panel_name.to_owned(), entry.panel_version);
+        if !reservations.contains(&reservation) {
+            reservations.push(reservation);
+        }
+    }
     let readback = vault
         .reserve_panel_generations(&reservations)
         .map_err(|source| {
@@ -2284,19 +2376,34 @@ fn ensure_builtin_panel_generation_reservations(vault: &SynapseCalyxVault) -> St
                 &source,
             )
         })?;
-    if readback.owner_count < reservations.len() as u64
-        || readback.next_generation <= SYN_MCP_USAGE_PANEL_VERSION
-    {
+    // Every reserved generation must read back owned by exactly the panel that
+    // reserved it. The old count-only check could be satisfied by unrelated
+    // owners — including the runtime-minted ones — so it could not establish
+    // the thing the write gate depends on.
+    let mut unowned: Vec<String> = Vec::new();
+    for (panel_name, generation) in &reservations {
+        let expected = format!("builtin:{panel_name}");
+        if readback.owners.get(generation) != Some(&expected) {
+            unowned.push(format!(
+                "{generation} expected={expected:?} actual={:?}",
+                readback.owners.get(generation)
+            ));
+        }
+    }
+    if !unowned.is_empty() || readback.next_generation <= SYN_MCP_USAGE_PANEL_VERSION {
         return Err(StorageError::WriteFailed {
             cf_name: "calyx_registry".to_owned(),
             detail: format!(
-                "STORAGE_CALYX_PANEL_GENERATION_READBACK_INVALID: owners={} expected_at_least={} next={} required_above={}; remediation=inspect native Registry CF allocator ownership before any panel lifecycle mutation",
+                "STORAGE_CALYX_PANEL_GENERATION_READBACK_INVALID: owners={} expected_at_least={} next={} required_above={} unowned={unowned:?}; remediation=inspect native Registry CF allocator ownership before any panel lifecycle mutation",
                 readback.owner_count,
                 reservations.len(),
                 readback.next_generation,
                 SYN_MCP_USAGE_PANEL_VERSION
             ),
         });
+    }
+    for (_, generation) in &reservations {
+        remember_claimed_panel_generation(*generation);
     }
     tracing::info!(
         code = "STORAGE_CALYX_PANEL_GENERATIONS_RESERVED",
@@ -3149,6 +3256,13 @@ impl StorageBackend for CalyxBackend {
                 "remeasure lifecycle backfill source row",
                 true,
                 |vault| {
+                    // #2062 ask 2. `panel_version` reaches this write as data
+                    // read out of a catalog entry, not as a constant this
+                    // process proved at vault open, so the claim is verified
+                    // before the row is written rather than discovered by a
+                    // census afterwards. Memoized: one Registry read per
+                    // generation per process, not one per row.
+                    ensure_base_write_generation_claimed(vault, panel_version)?;
                     let expected = lifecycle_constellation_from_source(
                         vault,
                         entry.panel_name,
@@ -3561,10 +3675,23 @@ impl StorageBackend for CalyxBackend {
             );
         }
 
+        // #2062: the second authority. The catalog is a compile-time table and
+        // structurally cannot claim a generation minted at runtime, so a census
+        // joined against it alone reported 98 owned generations holding 62,566
+        // rows as claimed by nothing and held `calyx_panel_coverage` at `error`
+        // on that basis. This read is one Registry-CF point read per five-minute
+        // tick, against a whole-Base scan it sits beside.
+        let allocator = self.panel_generation_allocator()?;
+        let ownership = crate::panel_coverage::PanelGenerationOwnership {
+            owners: allocator.owners,
+            retired: allocator.retired,
+        };
+
         let report = crate::panel_coverage::build_panel_coverage_report(
             &census,
             &source_cf_rows,
             &source_cf_keys,
+            &ownership,
         );
         if !report.accounting_holds() {
             // Never a silent discrepancy: the caller is told the counts do not
@@ -4647,6 +4774,48 @@ impl StorageBackend for CalyxBackend {
                     created_at_ms,
                     paths,
                 )
+            },
+        )
+    }
+
+    fn supersede_panel_generations(
+        &self,
+        panel_name: &str,
+        successor: u32,
+    ) -> StorageResult<synapse_calyx::PanelGenerationSupersession> {
+        self.with_vault(
+            "calyx_registry",
+            "retire the superseded generations of a dynamic panel",
+            true,
+            |vault| {
+                vault
+                    .supersede_panel_generations(panel_name, successor)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_registry",
+                            "retire the superseded generations of a dynamic panel",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn panel_generation_allocator(
+        &self,
+    ) -> StorageResult<synapse_calyx::PanelGenerationAllocatorReadback> {
+        self.with_vault(
+            "calyx_registry",
+            "read the vault-global panel generation allocator",
+            true,
+            |vault| {
+                vault.panel_generation_allocator().map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_registry",
+                        "read the vault-global panel generation allocator",
+                        &source,
+                    )
+                })
             },
         )
     }

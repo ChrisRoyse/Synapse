@@ -66,9 +66,29 @@ use synapse_storage::constellations::{
     PanelSource, SYN_ACTION_PANEL_VERSION, SYN_TIMELINE_PANEL_VERSION,
     SYN_TIMELINE_PANEL_VERSION_PRE_1900, builtin_panel_catalog,
 };
-use synapse_storage::panel_coverage::build_panel_coverage_report;
+use synapse_storage::panel_coverage::{
+    PanelCoverageReport, PanelGenerationOwnership,
+    build_panel_coverage_report as build_panel_coverage_report_joined,
+};
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// Every census below is hand-assembled from declared built-in generations, so
+/// the #2062 allocator authority is empty *by construction* rather than by
+/// omission: no runtime-minted generation appears in any of these cases. The
+/// owner-map join has its own case in `panel_backfill_selection_fsv`.
+fn build_panel_coverage_report(
+    census: &SynapseCalyxPanelCensus,
+    source_cf_rows: &BTreeMap<String, u64>,
+    source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
+) -> PanelCoverageReport {
+    build_panel_coverage_report_joined(
+        census,
+        source_cf_rows,
+        source_cf_keys,
+        &PanelGenerationOwnership::default(),
+    )
+}
 const HEAVY_PATH_RECORD_CLAMP: usize = 20_000;
 
 /// `CF_TIMELINE`, which `syn-timeline-v1` declares as both its source and its

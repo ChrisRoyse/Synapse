@@ -66,10 +66,13 @@ pub use lens::{
     ensure_input_modality, ensure_vector_shape,
 };
 pub use panel_generation::{
-    CALYX_PANEL_GENERATION_CONFLICT, CALYX_PANEL_GENERATION_EXHAUSTED,
-    CALYX_PANEL_GENERATION_INVALID, PanelGenerationAllocation, PanelGenerationAllocatorReadback,
-    allocate_vault_panel_generation, read_vault_panel_generation_allocator,
-    reserve_vault_panel_generations,
+    CALYX_DYNAMIC_PANEL_GENERATION_FLOOR, CALYX_PANEL_GENERATION_CONFLICT,
+    CALYX_PANEL_GENERATION_EXHAUSTED, CALYX_PANEL_GENERATION_INVALID,
+    CALYX_PANEL_GENERATION_UNCLAIMED, PanelGenerationAllocation, PanelGenerationAllocatorReadback,
+    PanelGenerationClaim, PanelGenerationSupersession, allocate_vault_panel_generation,
+    ensure_vault_panel_generation_claimed, read_vault_panel_generation_allocator,
+    read_vault_panel_generation_claim, reserve_vault_panel_generations,
+    supersede_vault_panel_generations,
 };
 pub use panel_ops::{
     AppliedPanelTemplate, CALYX_PANEL_LENS_MISSING, PanelCapabilityGateOutcome, PanelDiff,

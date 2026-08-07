@@ -39,9 +39,28 @@ use synapse_storage::cf;
 use synapse_storage::constellations::{
     SYN_AGENT_TRANSCRIPT_PANEL_VERSION, SYN_EPISODE_PANEL_VERSION, SYN_TIMELINE_PANEL_VERSION,
 };
-use synapse_storage::panel_coverage::{SYN_PANEL_COVERAGE_FLOOR, build_panel_coverage_report};
+use synapse_storage::panel_coverage::{
+    PanelCoverageReport, PanelGenerationOwnership, SYN_PANEL_COVERAGE_FLOOR,
+    build_panel_coverage_report as build_panel_coverage_report_joined,
+};
 
 const SCHEMA_VERSION: u32 = 1;
+
+/// The cases below hand-assemble censuses that carry no runtime-minted
+/// generation, so the allocator authority is empty *by construction* rather
+/// than by omission (#2062). CASE 7 supplies a real one.
+fn build_panel_coverage_report(
+    census: &SynapseCalyxPanelCensus,
+    source_cf_rows: &BTreeMap<String, u64>,
+    source_cf_keys: &BTreeMap<String, std::collections::BTreeSet<String>>,
+) -> PanelCoverageReport {
+    build_panel_coverage_report_joined(
+        census,
+        source_cf_rows,
+        source_cf_keys,
+        &PanelGenerationOwnership::default(),
+    )
+}
 
 /// #1927's own measurement: the active transcript generation held this many of
 /// its source CF's rows.
@@ -189,18 +208,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     // -----------------------------------------------------------------------
     // CASE 2 — an unrepairable deficiency must not be reported as clean.
     // -----------------------------------------------------------------------
-    println!("== CASE 2: two deficient panels, one with NO re-measure path ==");
-    println!("  agent-event declares backfill_source_cf = None, so it CANNOT be repaired.");
-    println!("  It must still be named, and the repairable panel must be the one selected.");
+    println!("== CASE 2: a Derived panel next to a coverage-deficient one ==");
+    println!("  Until #1984 this case staged agent-event as 'deficient with NO re-measure");
+    println!("  path'; #1984 gave it CF_AGENT_EVENTS, and the current catalog leaves no");
+    println!("  panel that can occupy that state: every backfill_source_cf=None panel is");
+    println!("  PanelSource::Derived, and a Derived panel has no source denominator, so");
+    println!("  its coverage is UNKNOWN by construction — never deficient. Its debt");
+    println!("  surfaces as anchor debt instead. This case now proves that invariant:");
+    println!("  graphpos-app must be neither deficient nor unbackfillable nor selected.");
     let mut rows = BTreeMap::new();
     rows.insert(cf::CF_AGENT_TRANSCRIPTS.to_owned(), 1_000);
-    rows.insert(cf::CF_AGENT_EVENTS.to_owned(), 9_000);
     let report = build_panel_coverage_report(
         &census(
             vec![
                 entry(SYN_AGENT_TRANSCRIPT_PANEL_VERSION, 100, 0),
                 entry(
-                    synapse_storage::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
+                    synapse_storage::constellations::SYN_GRAPHPOS_APP_PANEL_VERSION,
                     10,
                     0,
                 ),
@@ -217,19 +240,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         report.most_owed_backfill().map(|target| &target.panel_name),
     );
     check(
-        "both panels named deficient",
-        report.coverage_deficient_panels.len() == 2,
+        "only the measurable panel is named deficient",
+        report.coverage_deficient_panels == vec!["syn-agent-transcript-v1".to_owned()],
         format!("{:?}", report.coverage_deficient_panels),
         &mut failures,
     );
     check(
-        "the unrepairable one is named unbackfillable",
-        report.unbackfillable_deficient_panels == vec!["syn-agent-event-v1".to_owned()],
+        "the Derived panel is unknown, never deficient — so nothing is unbackfillable",
+        report.unbackfillable_deficient_panels.is_empty(),
         format!("{:?}", report.unbackfillable_deficient_panels),
         &mut failures,
     );
     check(
-        "the REPAIRABLE panel is selected, though it has fewer uncovered rows (900 vs 8990)",
+        "the measurable deficient panel is the one selected",
         report
             .most_owed_backfill()
             .is_some_and(|target| target.panel_version == SYN_AGENT_TRANSCRIPT_PANEL_VERSION),
@@ -315,6 +338,97 @@ fn main() -> Result<(), Box<dyn Error>> {
             report.records_total,
             report.base_cf_rows,
             report.accounting_holds()
+        ),
+        &mut failures,
+    );
+    println!();
+
+    // -----------------------------------------------------------------------
+    // CASE 4b — the SECOND authority: an allocator-owned generation (#2062).
+    // -----------------------------------------------------------------------
+    println!("== CASE 4b: an allocator-owned generation is attributed, not called unclaimed ==");
+    println!("  input: the SAME census as CASE 4, plus an owners map claiming 1234567 as");
+    println!("         dynamic:syn-graphpos-app-v1:<op> and retiring it behind 1234568.");
+    println!("  expected: unknown_panel_versions EMPTY, one rollup naming the owning panel,");
+    println!("            and its 700 ungrounded rows counted as reclaim candidates.");
+    let ownership = PanelGenerationOwnership {
+        owners: BTreeMap::from([
+            (1_234_567_u32, "dynamic:syn-graphpos-app-v1:aa00".to_owned()),
+            (1_234_568_u32, "dynamic:syn-graphpos-app-v1:bb11".to_owned()),
+        ]),
+        retired: BTreeMap::from([(1_234_567_u32, 1_234_568_u32)]),
+    };
+    let report = build_panel_coverage_report_joined(
+        &census(
+            vec![
+                entry(SYN_EPISODE_PANEL_VERSION, 100, 100),
+                entry(1_234_567, 700, 0),
+            ],
+            0,
+        ),
+        &rows,
+        &BTreeMap::new(),
+        &ownership,
+    );
+    println!(
+        "  measured: unknown={:?} rollups={:?} reclaim_candidates={}",
+        report.unknown_panel_versions,
+        report.owned_dynamic_generations,
+        report.superseded_reclaim_candidates
+    );
+    check(
+        "an owned generation is NOT reported as unclaimed",
+        report.unknown_panel_versions.is_empty(),
+        format!("{:?}", report.unknown_panel_versions),
+        &mut failures,
+    );
+    check(
+        "it is attributed to its owning panel by owner identity",
+        report.owned_dynamic_generations.len() == 1
+            && report.owned_dynamic_generations[0].panel_name == "syn-graphpos-app-v1"
+            && report.owned_dynamic_generations[0].retired_generations == vec![1_234_567_u32]
+            && report.owned_dynamic_generations[0]
+                .live_generations
+                .is_empty(),
+        format!("{:?}", report.owned_dynamic_generations),
+        &mut failures,
+    );
+    check(
+        "its retired ungrounded rows become reclaim candidates",
+        report.superseded_reclaim_candidates == 700 && report.superseded_records_total == 700,
+        format!(
+            "candidates={} superseded_total={}",
+            report.superseded_reclaim_candidates, report.superseded_records_total
+        ),
+        &mut failures,
+    );
+    // And the negative: ownership with NO retirement is the leak, not health.
+    let unretired = PanelGenerationOwnership {
+        owners: BTreeMap::from([
+            (1_234_567_u32, "dynamic:syn-graphpos-app-v1:aa00".to_owned()),
+            (1_234_568_u32, "dynamic:syn-graphpos-app-v1:bb11".to_owned()),
+        ]),
+        retired: BTreeMap::new(),
+    };
+    let leak = build_panel_coverage_report_joined(
+        &census(
+            vec![
+                entry(SYN_EPISODE_PANEL_VERSION, 100, 100),
+                entry(1_234_567, 700, 0),
+                entry(1_234_568, 700, 0),
+            ],
+            0,
+        ),
+        &rows,
+        &BTreeMap::new(),
+        &unretired,
+    );
+    check(
+        "two live generations of one dynamic panel are named as the defect",
+        leak.dynamic_panels_multi_live.len() == 1 && leak.superseded_reclaim_candidates == 0,
+        format!(
+            "multi_live={:?} candidates={}",
+            leak.dynamic_panels_multi_live, leak.superseded_reclaim_candidates
         ),
         &mut failures,
     );
