@@ -589,9 +589,9 @@ fn recommend_model(
             };
             let cell = counts.entry(model.to_owned()).or_default();
             if success {
-                cell.success += 1
+                cell.success += 1;
             } else {
-                cell.failure += 1
+                cell.failure += 1;
             }
             if let Some(cost) = attempt
                 .spawn_id
