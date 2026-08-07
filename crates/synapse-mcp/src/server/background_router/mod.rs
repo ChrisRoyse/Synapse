@@ -3118,6 +3118,19 @@ impl SynapseService {
         }
         let ttl_ms = params.ttl_ms.unwrap_or(30_000);
         super::lease_tools::validate_lease_ttl_ms("act_foreground", ttl_ms)?;
+        // #2063 finding 3: a session that owns a hidden Win32 desktop can never
+        // make its target the input desktop's foreground, so the foreground lane
+        // is structurally unavailable to it. Refuse here — before the lease is
+        // acquired and before break_glass is entered — instead of escalating,
+        // failing at the click-level guard, and then unwinding the escalation.
+        // The refusal names the hidden desktop rather than blaming a foreground
+        // race that never happened.
+        if let Some(hidden_desktop) = self.session_hidden_desktop_readback(&session_id)? {
+            return Err(super::m2_tools::hidden_desktop_foreground_refusal(
+                "act_foreground",
+                &hidden_desktop,
+            ));
+        }
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "act_foreground",
@@ -6175,6 +6188,34 @@ async fn target_act_coordinate_click(
             }
         }
         SessionTarget::Window { hwnd } => {
+            // #2063 finding 3: refuse the hidden-desktop case with its own
+            // reason BEFORE the generic foreground guard below. That guard is
+            // reached first today and always wins, because a hidden-desktop
+            // window can never *be* the OS foreground — so every hidden-desktop
+            // refusal came back as `foreground_moved_before_click` with
+            // remediation ("focus the target, then retry") that cannot work, and
+            // `hidden_desktop_foreground_tier_refused` was unreachable from the
+            // public facade.
+            if let Some(hidden_desktop) = service.session_hidden_desktop_readback(&session_id)? {
+                let error = super::m2_tools::hidden_desktop_coordinate_click_refusal(
+                    "target_act",
+                    &hidden_desktop,
+                    coordinate.x,
+                    coordinate.y,
+                );
+                service.audit_action_denied_with_details_for_session(
+                    "target_act",
+                    &error,
+                    &request_details,
+                    &session_id,
+                );
+                return Ok((
+                    "act_click",
+                    false,
+                    target_act_error_status(&error),
+                    target_act_error_result("act_click", error),
+                ));
+            }
             let point = match target_act_window_coordinate_to_screen_point(hwnd, coordinate) {
                 Ok(point) => point,
                 Err(error) => {

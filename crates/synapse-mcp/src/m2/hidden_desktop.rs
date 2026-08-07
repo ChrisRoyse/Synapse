@@ -34,6 +34,22 @@
 //!   (`FOREGROUND_ACTIVATION_REFUSED`), never rerouted here.
 //! - Activating or switching desktops (`SwitchDesktop`), and any fallback to
 //!   the human's foreground.
+//!
+//! #2063 extends this to the click and key tiers. The #2056 FSV proved that a
+//! daemon-desktop UIA `InvokePattern` call *did* reach a hidden-desktop button,
+//! which looks like a counter-example to desktop isolation but is not a
+//! guarantee: Microsoft splits UIA providers into server-side providers (which
+//! talk to the UIA core across the process boundary through its own RPC channel)
+//! and client-side *proxy* providers, which "communicate with the application
+//! across the process boundary by **sending and receiving Windows messages**".
+//! Proxy-backed controls are therefore subject to the same "window messages can
+//! be sent only between processes that are on the same desktop" rule as
+//! `WM_SETTEXT`, so cross-desktop UIA reach is provider-implementation
+//! dependent, silently partial, and must never be relied on. Every tier that can
+//! address a hidden-desktop HWND resolves its route here first and executes
+//! through a worker attached to the owning desktop, so the route is uniform,
+//! recorded, and the verification readback is taken on the desktop that owns the
+//! window.
 
 use rmcp::ErrorData;
 use synapse_core::{ElementId, error_codes};
@@ -62,6 +78,103 @@ impl HiddenDesktopValueRoute {
 
     pub(crate) fn route_label(&self) -> String {
         format!("hidden_desktop_worker:{}", self.desktop_name)
+    }
+}
+
+/// #2063: a resolved background-action route keyed on a *window* rather than on
+/// an element value. `HiddenDesktopValueRoute` can only be resolved for targets
+/// that expose a readable UIA `ValuePattern` / native text route, so it is not
+/// usable as the desktop-membership oracle for a click (a button exposes no
+/// value) or for a keystroke (there is no element at all). This route uses the
+/// same physical oracle the worker already applies for observation — a live
+/// `IsWindow` readback taken by a worker process attached to that exact desktop
+/// — and therefore works for every HWND-addressable action tier.
+#[derive(Clone, Debug)]
+pub(crate) struct HiddenDesktopWindowRoute {
+    pub(crate) desktop_name: String,
+    pub(crate) hwnd: i64,
+}
+
+impl HiddenDesktopWindowRoute {
+    /// Audit/ledger route label. Recorded verbatim in the tool response and
+    /// therefore in the `CF_ACTION_LOG` row, so an auditor can tell a
+    /// hidden-desktop delivery from a visible-desktop one (#2063 finding 1).
+    pub(crate) fn route_label(&self) -> String {
+        format!("hidden_desktop_worker:{}", self.desktop_name)
+    }
+}
+
+/// Probes each session-owned desktop for physical ownership of `hwnd`.
+///
+/// Same contract as [`resolve_hidden_desktop_value_route`], but the per-desktop
+/// probe is the worker `context` op (live `IsWindow` + `GetWindowRect`), which
+/// makes no demand on the target's UIA pattern surface.
+pub(crate) fn resolve_hidden_desktop_window_route(
+    tool: &'static str,
+    hwnd: i64,
+    desktop_names: &[String],
+) -> Result<Option<HiddenDesktopWindowRoute>, ErrorData> {
+    if desktop_names.is_empty() {
+        return Ok(None);
+    }
+    let mut misses = Vec::with_capacity(desktop_names.len());
+    for desktop_name in desktop_names {
+        match crate::desktop_worker::hidden_desktop_window_context(desktop_name, hwnd) {
+            Ok(context) => {
+                tracing::info!(
+                    code = "M2_HIDDEN_DESKTOP_ACTION_ROUTE_RESOLVED",
+                    tool,
+                    hwnd,
+                    desktop_name = desktop_name.as_str(),
+                    window_pid = context.pid,
+                    required_foreground = false,
+                    source_of_truth =
+                        "session-owned desktop worker IsWindow + window context readback",
+                    "readback=hidden_desktop_action_route desktop owns the target HWND"
+                );
+                return Ok(Some(HiddenDesktopWindowRoute {
+                    desktop_name: desktop_name.clone(),
+                    hwnd,
+                }));
+            }
+            Err(error) if hidden_desktop_target_miss(&error) => {
+                misses.push(format!("{desktop_name}: {}", error.message));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    if window_live_on_daemon_desktop(hwnd) {
+        tracing::debug!(
+            code = "M2_HIDDEN_DESKTOP_ACTION_ROUTE_NOT_OWNED",
+            tool,
+            hwnd,
+            probed_desktops = desktop_names.len(),
+            "target HWND is live on the daemon desktop; using the ordinary background tiers"
+        );
+        return Ok(None);
+    }
+    Err(stale_hidden_hwnd_error(
+        tool,
+        None,
+        hwnd,
+        desktop_names,
+        &misses,
+    ))
+}
+
+/// Names the desktop that physically owns `hwnd`, for refusal evidence only
+/// (#2063 finding 4). Never fails: an unattributable HWND is reported as such
+/// rather than silently assumed to be on the caller's desktop.
+pub(crate) fn desktop_label_for_hwnd(hwnd: i64, desktop_names: &[String]) -> String {
+    for desktop_name in desktop_names {
+        if crate::desktop_worker::hidden_desktop_window_context(desktop_name, hwnd).is_ok() {
+            return format!("hidden_desktop:{desktop_name}");
+        }
+    }
+    if window_live_on_daemon_desktop(hwnd) {
+        "daemon_input_desktop".to_owned()
+    } else {
+        "unattributable_no_probed_desktop_owns_this_hwnd".to_owned()
     }
 }
 
@@ -127,7 +240,7 @@ pub(crate) fn resolve_hidden_desktop_value_route(
     }
     Err(stale_hidden_hwnd_error(
         tool,
-        element_id,
+        Some(element_id),
         hwnd,
         desktop_names,
         &misses,
@@ -172,15 +285,20 @@ fn element_hwnd(tool: &'static str, element_id: &ElementId) -> Result<i64, Error
 
 fn stale_hidden_hwnd_error(
     tool: &'static str,
-    element_id: &ElementId,
+    element_id: Option<&ElementId>,
     hwnd: i64,
     desktop_names: &[String],
     misses: &[String],
 ) -> ErrorData {
+    let element_id = element_id.map(ToString::to_string);
+    let element_suffix = element_id
+        .as_ref()
+        .map(|id| format!(" (element {id})"))
+        .unwrap_or_default();
     tracing::error!(
         code = error_codes::A11Y_ELEMENT_STALE,
         tool,
-        element_id = %element_id,
+        element_id = element_id.as_deref().unwrap_or(""),
         hwnd,
         desktop_names = ?desktop_names,
         misses = ?misses,
@@ -190,13 +308,13 @@ fn stale_hidden_hwnd_error(
     ErrorData::new(
         rmcp::model::ErrorCode(-32099),
         format!(
-            "{tool} target HWND {hwnd:#x} (element {element_id}) is stale: it is not a live window on any session-owned hidden desktop {desktop_names:?}, and it is not a live window on the daemon's own desktop either. Re-observe the target (observe/find) to obtain a fresh element id; Synapse will not activate or switch desktops to look for it."
+            "{tool} target HWND {hwnd:#x}{element_suffix} is stale: it is not a live window on any session-owned hidden desktop {desktop_names:?}, and it is not a live window on the daemon's own desktop either. Re-observe the target (observe/find) to obtain a fresh element id; Synapse will not activate or switch desktops to look for it."
         ),
         Some(serde_json::json!({
             "code": error_codes::A11Y_ELEMENT_STALE,
             "tool": tool,
             "reason": "stale_hidden_desktop_hwnd",
-            "element_id": element_id.to_string(),
+            "element_id": element_id,
             "hwnd": hwnd,
             "probed_desktops": desktop_names,
             "per_desktop_misses": misses,

@@ -115,6 +115,11 @@ pub struct ActPressResponse {
     pub backend_used: String,
     pub backend_tier_used: String,
     pub required_foreground: bool,
+    /// #2063: exact worker route when the keyboard target window lives on a
+    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
+    /// Absent for ordinary daemon-desktop tiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_route: Option<String>,
     pub postcondition: ActPostcondition,
 }
 
@@ -131,6 +136,10 @@ pub struct ActKeymapResponse {
     pub backend_used: String,
     pub backend_tier_used: String,
     pub required_foreground: bool,
+    /// #2063: carried through from the delegated `act_press` response so a
+    /// keymap alias delivered to a hidden-desktop window is auditable too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_route: Option<String>,
 }
 
 impl PressBackend {

@@ -175,12 +175,42 @@ impl SynapseService {
             &action_preflight_details(&preflight),
             &request_context,
         )?;
-        if let Err(error) = self.ensure_target_claim_allows_action(
-            "act_click",
-            click_claim_target(&params),
-            &request_context,
-        ) {
+        // #2063 finding 4: resolve the claim target BEFORE any delivery, and
+        // never let a screen-coordinate click fall through to
+        // `current_foreground_session_target()`. A coordinate is meaningful only
+        // on the input desktop, so a coordinate click issued by a session bound
+        // to a window on another desktop must fail loud with both desktops
+        // named, not silently re-aim at whatever the human has in front of them.
+        let click_claim = match self.act_click_claim_target(&params, &request_context) {
+            Ok(target) => target,
+            Err(error) => {
+                return audit_target_claim_denial(self, "act_click", error, &request_context);
+            }
+        };
+        if let Err(error) =
+            self.ensure_target_claim_allows_action("act_click", click_claim, &request_context)
+        {
             return audit_target_claim_denial(self, "act_click", error, &request_context);
+        }
+        // #2063 finding 1: a UIA element click whose window lives on a
+        // session-owned hidden desktop runs entirely through that desktop's
+        // worker, so the delivery, the route label, and the verification
+        // readback all belong to the desktop that owns the window.
+        match self
+            .act_click_hidden_desktop_route(&params, &request_context, boundary)
+            .await
+        {
+            Ok(Some(response)) => {
+                let result: Result<ActClickResponse, ErrorData> = Ok(response);
+                self.audit_action_result_for_request("act_click", &result, &request_context)?;
+                return result.map(Json);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let result: Result<ActClickResponse, ErrorData> = Err(error);
+                self.audit_action_result_for_request("act_click", &result, &request_context)?;
+                return result.map(Json);
+            }
         }
         if let Err(error) = maybe_auto_wait_for_actionability(
             self,
@@ -985,15 +1015,165 @@ impl SynapseService {
         &self,
         request_context: &RequestContext<RoleServer>,
     ) -> Result<Vec<String>, ErrorData> {
+        Ok(self
+            .session_hidden_desktop_for_request(request_context)?
+            .map(|readback| readback.desktop_names)
+            .unwrap_or_default())
+    }
+
+    /// #2063: the session's hidden-desktop registry row, or `None` when the
+    /// request carries no MCP session or the session owns no desktop.
+    fn session_hidden_desktop_for_request(
+        &self,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<super::session_lifecycle::SessionHiddenDesktopReadback>, ErrorData> {
         let Some(session_id) =
             super::context::mcp_session_id_from_request_context(request_context)?
         else {
-            return Ok(Vec::new());
+            return Ok(None);
         };
-        Ok(self
-            .session_hidden_desktop_readback(&session_id)?
-            .map(|readback| readback.desktop_names)
-            .unwrap_or_default())
+        self.session_hidden_desktop_readback(&session_id)
+    }
+
+    /// #2063 finding 4: the exact target whose claim a click must satisfy.
+    ///
+    /// For element clicks this is unchanged (the element's own root window).
+    /// For screen-coordinate clicks it is the session's *bound* target and
+    /// nothing else. Previously a coordinate click passed `None` here, so
+    /// `ensure_target_claim_allows_action` fell back to
+    /// `current_foreground_session_target()` — the human's OS foreground window
+    /// — which is how a hidden-desktop-owning session ended up making a claim
+    /// against a live agent's PowerShell window on the visible desktop. Only an
+    /// unrelated session's claim stopped that click.
+    fn act_click_claim_target(
+        &self,
+        params: &ActClickParams,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<SessionTarget>, ErrorData> {
+        let crate::m2::ActClickTarget::Point(point) = &params.target else {
+            return Ok(click_claim_target(params));
+        };
+        // A hidden Win32 desktop is never the input desktop, so a physical
+        // cursor click cannot be aimed at it at all. Refuse with the exact
+        // reason instead of letting a later generic guard mislabel it.
+        if let Some(hidden_desktop) = self.session_hidden_desktop_for_request(request_context)? {
+            return Err(hidden_desktop_coordinate_click_refusal(
+                "act_click",
+                &hidden_desktop,
+                point.x,
+                point.y,
+            ));
+        }
+        let Some(session_id) =
+            super::context::mcp_session_id_from_request_context(request_context)?
+        else {
+            return Ok(click_claim_target(params));
+        };
+        let Some(bound) = self.session_target(Some(&session_id))? else {
+            return Ok(click_claim_target(params));
+        };
+        let bound_hwnd = match &bound {
+            SessionTarget::Window { hwnd } => *hwnd,
+            SessionTarget::Cdp { window_hwnd, .. } => *window_hwnd,
+        };
+        // Compare roots on both sides: `WindowFromPoint` hit-tests a child, and
+        // a session may legitimately have bound a child HWND.
+        let bound_hwnd = synapse_a11y::top_level_root_hwnd(bound_hwnd).map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!(
+                    "act_click could not read the top-level root of this session's bound target HWND {bound_hwnd:#x} before a screen-coordinate click: {error}"
+                ),
+            )
+        })?;
+        let resolved = crate::m2::window_root_at_screen_point(synapse_core::Point {
+            x: point.x,
+            y: point.y,
+        });
+        if resolved != Some(bound_hwnd) {
+            // Attribute both HWNDs to a physical desktop, including desktops
+            // owned by *other* sessions, so the refusal names the cross-desktop
+            // aim instead of just the HWND mismatch.
+            let probe_desktops = self
+                .hidden_desktop_readbacks()?
+                .into_iter()
+                .flat_map(|readback| readback.desktop_names)
+                .collect::<Vec<_>>();
+            return Err(coordinate_click_foreign_window_error(
+                "act_click",
+                &session_id,
+                point.x,
+                point.y,
+                resolved,
+                bound_hwnd,
+                &probe_desktops,
+            ));
+        }
+        Ok(Some(bound))
+    }
+
+    /// #2063 finding 1: routes a UIA element click through the worker process
+    /// attached to the session-owned desktop that physically owns the element's
+    /// window. `Ok(None)` keeps the ordinary daemon-desktop tier router.
+    async fn act_click_hidden_desktop_route(
+        &self,
+        params: &ActClickParams,
+        request_context: &RequestContext<RoleServer>,
+        boundary: OperatorPanicActionBoundary,
+    ) -> Result<Option<ActClickResponse>, ErrorData> {
+        let crate::m2::ActClickTarget::Element(element) = &params.target else {
+            return Ok(None);
+        };
+        // `use_invoke_pattern=false` asks for the coordinate/foreground tier,
+        // which the #2056 hidden-desktop policy already refuses by name.
+        if !params.use_invoke_pattern {
+            return Ok(None);
+        }
+        // Web element ids reach their tab over the DevTools channel, which is
+        // not desktop-scoped; rerouting them through a desktop worker would be
+        // wrong, not safer.
+        #[cfg(windows)]
+        if synapse_a11y::cdp_backend_from_element_id(&element.element_id).is_some() {
+            return Ok(None);
+        }
+        let hwnd = element
+            .element_id
+            .parts()
+            .map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_ELEMENT_NOT_RESOLVED,
+                    format!(
+                        "act_click element id {} is malformed: {error}",
+                        element.element_id
+                    ),
+                )
+            })?
+            .hwnd;
+        let Some(route) =
+            self.hidden_desktop_window_route_for_request("act_click", hwnd, request_context)?
+        else {
+            return Ok(None);
+        };
+        crate::m2::act_click_hidden_desktop_worker(params, &element.element_id, route, boundary)
+            .await
+            .map(Some)
+    }
+
+    /// #2063: resolves which session-owned hidden desktop physically owns
+    /// `hwnd`, for the HWND-addressed action tiers (click / key). `Ok(None)`
+    /// means the ordinary daemon-desktop background tiers are the correct route;
+    /// a stale HWND that no desktop owns fails loud.
+    fn hidden_desktop_window_route_for_request(
+        &self,
+        tool: &'static str,
+        hwnd: i64,
+        request_context: &RequestContext<RoleServer>,
+    ) -> Result<Option<crate::m2::HiddenDesktopWindowRoute>, ErrorData> {
+        let desktop_names = self.session_owned_desktop_names(request_context)?;
+        if desktop_names.is_empty() {
+            return Ok(None);
+        }
+        crate::m2::resolve_hidden_desktop_window_route(tool, hwnd, &desktop_names)
     }
 
     fn act_set_field_text_resolve_params(
@@ -2135,7 +2315,16 @@ impl SynapseService {
     }
 }
 
-fn hidden_desktop_foreground_refusal(
+/// #2056/#2063: the precise refusal for a raw-input/foreground-lane request made
+/// by a session that owns a hidden Win32 desktop.
+///
+/// Only one desktop at a time is the *input desktop*, and a hidden desktop is
+/// never it, so `SetForegroundWindow`/`SetCursorPos`/`SendInput` can never aim
+/// at such a target. The generic "the foreground moved" guard reaches the same
+/// verdict by accident and prints remediation ("focus the target, then retry")
+/// that can never work here — so every path that can refuse for this reason must
+/// name it (#2063 finding 3).
+pub(crate) fn hidden_desktop_foreground_refusal(
     tool: &'static str,
     hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
 ) -> ErrorData {
@@ -2155,6 +2344,164 @@ fn hidden_desktop_foreground_refusal(
             "launch_pids": hidden_desktop.launch_pids,
             "resource_count": hidden_desktop.resource_count,
             "foreground_tier_allowed": false,
+        })),
+    )
+}
+
+/// #2063: ledger tier name for the hidden-desktop keyboard route. Distinct from
+/// the plain `postmessage` tier so a `CF_ACTION_LOG` reader can tell them apart.
+const PRESS_TIER_HIDDEN_DESKTOP_WORKER: &str = "postmessage_hidden_desktop_worker";
+const HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH: &str =
+    "session_owned_desktop_worker_target_hwnd_text_or_selection";
+
+/// Re-frames a hidden-desktop worker failure with the exact route and stage so a
+/// refusal is never mistaken for a daemon-desktop failure (#2063).
+fn hidden_desktop_press_stage_error(
+    route: &crate::m2::HiddenDesktopWindowRoute,
+    stage: &'static str,
+    error: ErrorData,
+) -> ErrorData {
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    let route_label = route.route_label();
+    tracing::error!(
+        code = code.as_str(),
+        tool = "act_press",
+        hwnd = route.hwnd,
+        desktop_route = route_label.as_str(),
+        stage,
+        required_foreground = false,
+        detail = %error.message,
+        "act_press hidden-desktop worker stage failed"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act_press hidden-desktop {stage} failed for HWND {:#x} on session-owned desktop {}: {}",
+            route.hwnd, route.desktop_name, error.message
+        ),
+        Some(json!({
+            "code": code,
+            "tool": "act_press",
+            "operation": stage,
+            "desktop_route": route_label,
+            "desktop_name": route.desktop_name,
+            "hwnd": route.hwnd,
+            "required_foreground": false,
+            "backend_tier_used": PRESS_TIER_HIDDEN_DESKTOP_WORKER,
+            "source_of_truth": HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
+            "worker_error": error.data,
+        })),
+    )
+}
+
+/// #2063 finding 3/4: a screen-coordinate click asked for by a session that
+/// owns a hidden Win32 desktop. Named separately from the generic
+/// "foreground moved" guard because the remediation is different in kind: there
+/// is no focus step that can make a hidden desktop the input desktop.
+pub(crate) fn hidden_desktop_coordinate_click_refusal(
+    tool: &'static str,
+    hidden_desktop: &super::session_lifecycle::SessionHiddenDesktopReadback,
+    x: i32,
+    y: i32,
+) -> ErrorData {
+    tracing::warn!(
+        code = error_codes::FOREGROUND_ACTIVATION_REFUSED,
+        reason = "hidden_desktop_foreground_tier_refused",
+        tool,
+        session_id = %hidden_desktop.session_id,
+        desktop_names = ?hidden_desktop.desktop_names,
+        x,
+        y,
+        source_of_truth = "session process/desktop lease registry",
+        "coordinate click refused: the requesting session owns hidden desktops and screen coordinates only exist on the input desktop"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} refused the screen-coordinate click at ({x}, {y}) because MCP session {:?} owns hidden desktop(s) {:?}. Screen coordinates address the *input* desktop only, so this click could only ever land on the human's visible desktop, never on the session's own desktop. Use an element-addressed action (act_click element_id / act_set_field_text), which routes through the owning desktop's worker.",
+            hidden_desktop.session_id, hidden_desktop.desktop_names
+        ),
+        Some(json!({
+            "code": error_codes::FOREGROUND_ACTIVATION_REFUSED,
+            "reason": "hidden_desktop_foreground_tier_refused",
+            "tool": tool,
+            "refused_before_delivery": true,
+            "session_id": hidden_desktop.session_id,
+            "desktop_names": hidden_desktop.desktop_names,
+            "launch_pids": hidden_desktop.launch_pids,
+            "resource_count": hidden_desktop.resource_count,
+            "requested_point": { "x": x, "y": y, "coordinate_space": "screen" },
+            "foreground_tier_allowed": false,
+            "session_target_rebound": false,
+            "source_of_truth": "session process/desktop lease registry",
+            "remediation": "address the target by element id so Synapse can route through the session-owned desktop's worker; Synapse will not aim raw input at the human's input desktop on this session's behalf",
+        })),
+    )
+}
+
+/// #2063 finding 4: a screen-coordinate click whose hit-tested window is not the
+/// session's bound target. Carries both HWNDs *and* both owning desktops, so the
+/// operator can see the cross-desktop aim that was refused, and requires an
+/// explicit re-target rather than silently adopting the resolved window.
+fn coordinate_click_foreign_window_error(
+    tool: &'static str,
+    session_id: &str,
+    x: i32,
+    y: i32,
+    resolved_hwnd: Option<i64>,
+    bound_hwnd: i64,
+    probe_desktops: &[String],
+) -> ErrorData {
+    let resolved_desktop =
+        resolved_hwnd.map(|hwnd| crate::m2::desktop_label_for_hwnd(hwnd, probe_desktops));
+    let bound_desktop = crate::m2::desktop_label_for_hwnd(bound_hwnd, probe_desktops);
+    tracing::warn!(
+        code = error_codes::ACTION_TARGET_INVALID,
+        reason = "coordinate_click_resolved_foreign_window",
+        tool,
+        session_id,
+        x,
+        y,
+        resolved_hwnd = resolved_hwnd.unwrap_or_default(),
+        resolved_desktop = resolved_desktop
+            .as_deref()
+            .unwrap_or("no_window_under_point"),
+        bound_hwnd,
+        bound_desktop = bound_desktop.as_str(),
+        source_of_truth = "WindowFromPoint on the input desktop + session target registry",
+        "coordinate click refused: the window under the requested point is not this session's bound target"
+    );
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "{tool} refused the screen-coordinate click at ({x}, {y}): the window physically under that point is {} ({}), but this session's bound target is HWND {bound_hwnd:#x} ({bound_desktop}). Synapse will not re-aim a coordinate click at a window the session did not bind, and will not rebind the session target on your behalf. Re-target explicitly (target operation=set) if this other window is really the intended target.",
+            resolved_hwnd
+                .map(|hwnd| format!("HWND {hwnd:#x}"))
+                .unwrap_or_else(|| "no window at all".to_owned()),
+            resolved_desktop
+                .as_deref()
+                .unwrap_or("no_window_under_point"),
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_TARGET_INVALID,
+            "reason": "coordinate_click_resolved_foreign_window",
+            "tool": tool,
+            "refused_before_delivery": true,
+            "session_id": session_id,
+            "requested_point": { "x": x, "y": y, "coordinate_space": "screen" },
+            "resolved_hwnd": resolved_hwnd,
+            "resolved_desktop": resolved_desktop,
+            "bound_target_hwnd": bound_hwnd,
+            "bound_target_desktop": bound_desktop,
+            "session_target_rebound": false,
+            "source_of_truth": "WindowFromPoint on the input desktop + session target registry",
+            "remediation": "bind the intended window with target operation=set (or click it by element id), then retry; Synapse never rebinds an explicitly bound session target as a side effect of an action",
         })),
     )
 }
@@ -3152,6 +3499,7 @@ impl SynapseService {
             required_foreground: tier_attempts
                 .iter()
                 .any(|attempt| attempt.required_foreground),
+            desktop_route: None,
             tier_attempts,
             postcondition,
             press_hold_ms: params.hold_ms,
@@ -4284,11 +4632,117 @@ impl SynapseService {
                 .act_press_cdp_background_target(window_hwnd, cdp_target_id, params, boundary)
                 .await
                 .map(Some),
-            SessionTarget::Window { hwnd } => self
-                .act_press_postmessage_background_target(hwnd, params, boundary)
-                .await
-                .map(Some),
+            // #2063 finding 2: the PostMessage keyboard tier used to run here
+            // unconditionally, ahead of the hidden-desktop gate that lives in
+            // `acquire_tool_foreground_input_lease_with_ttl`, and reported
+            // `delivered_unverified` against a hidden-desktop HWND. Windows
+            // documents that window messages can be sent only between processes
+            // on the same desktop, so that "delivery" was unprovable. Consult
+            // the desktop-membership oracle BEFORE the desktop-agnostic tier and
+            // run the whole sequence on the owning desktop instead.
+            SessionTarget::Window { hwnd } => {
+                if let Some(route) = self.hidden_desktop_window_route_for_request(
+                    "act_press",
+                    hwnd,
+                    request_context,
+                )? {
+                    return self
+                        .act_press_hidden_desktop_target(route, params, boundary)
+                        .await
+                        .map(Some);
+                }
+                self.act_press_postmessage_background_target(hwnd, params, boundary)
+                    .await
+                    .map(Some)
+            }
         }
+    }
+
+    /// #2063 finding 2: delivers a keystroke to a window on a session-owned
+    /// hidden desktop through worker processes attached to that exact desktop.
+    ///
+    /// Three separate worker processes: the before-read, the delivery, and the
+    /// after-read. The mutation is never its own witness, and the readbacks are
+    /// taken on the desktop that owns the window rather than on the daemon's own
+    /// desktop, where `IsWindow` for that HWND is false. No visual fallback: if
+    /// the on-desktop text/selection Source of Truth shows no change, the call
+    /// fails loud with `ACTION_NO_OBSERVED_DELTA` rather than claiming
+    /// `delivered_unverified`.
+    async fn act_press_hidden_desktop_target(
+        &self,
+        route: crate::m2::HiddenDesktopWindowRoute,
+        params: ActPressParams,
+        boundary: OperatorPanicActionBoundary,
+    ) -> Result<ActPressResponse, ErrorData> {
+        let started = Instant::now();
+        let route_label = route.route_label();
+        let key_labels = act_press_normalized_labels(&params)?;
+        let expected_effect = hwnd_keyboard_expected_effect(&params)?;
+        let verify_timeout_ms = params.verify_timeout_ms;
+
+        let before = HwndKeyboardDeltaSignature {
+            target: crate::desktop_worker::hidden_desktop_key_state(
+                &route.desktop_name,
+                route.hwnd,
+            )
+            .map_err(|error| hidden_desktop_press_stage_error(&route, "before_read", error))?,
+            clipboard_sequence: crate::m2::press::clipboard_sequence_number(),
+        };
+
+        boundary.ensure("immediately_before_hidden_desktop_press_keys")?;
+        let (keys_pressed, _delivery_state) = crate::desktop_worker::hidden_desktop_press_keys(
+            &route.desktop_name,
+            route.hwnd,
+            &key_labels,
+            params.hold_ms,
+        )
+        .map_err(|error| hidden_desktop_press_stage_error(&route, "press_keys", error))?;
+
+        tokio::time::sleep(Duration::from_millis(u64::from(verify_timeout_ms))).await;
+
+        let after = HwndKeyboardDeltaSignature {
+            target: crate::desktop_worker::hidden_desktop_key_state(
+                &route.desktop_name,
+                route.hwnd,
+            )
+            .map_err(|error| hidden_desktop_press_stage_error(&route, "after_read", error))?,
+            clipboard_sequence: crate::m2::press::clipboard_sequence_number(),
+        };
+
+        tracing::info!(
+            code = "M2_ACT_PRESS_HIDDEN_DESKTOP_READBACK",
+            tool = "act_press",
+            hwnd = route.hwnd,
+            desktop_route = route_label.as_str(),
+            backend_tier_used = PRESS_TIER_HIDDEN_DESKTOP_WORKER,
+            required_foreground = false,
+            keys = ?key_labels,
+            keys_pressed,
+            expected_effect = hwnd_keyboard_expected_effect_name(&expected_effect),
+            source_of_truth = HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
+            "readback=act_press route={route_label} keys={key_labels:?} keys_pressed={keys_pressed}"
+        );
+
+        let postcondition = verify_hwnd_keyboard_delta_signature(
+            "act_press",
+            HIDDEN_DESKTOP_PRESS_SOURCE_OF_TRUTH,
+            verify_timeout_ms,
+            before,
+            after,
+            expected_effect,
+            "observed target HWND text/selection change on the session-owned desktop after PostMessage keyboard delivery",
+        )?;
+
+        Ok(ActPressResponse {
+            ok: true,
+            keys_pressed,
+            elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            backend_used: "software".to_owned(),
+            backend_tier_used: PRESS_TIER_HIDDEN_DESKTOP_WORKER.to_owned(),
+            required_foreground: false,
+            desktop_route: Some(route_label),
+            postcondition,
+        })
     }
 
     async fn try_act_keymap_background_target(

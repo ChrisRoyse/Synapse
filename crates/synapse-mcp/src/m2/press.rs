@@ -22,6 +22,16 @@ pub use schema::{
 
 pub(crate) use postmessage::HwndKeyboardTargetState;
 pub(crate) use postmessage::clipboard_sequence_number;
+/// #2063: synchronous PostMessage keyboard delivery for the hidden-desktop
+/// worker child process (window messages cannot cross desktops).
+pub(crate) use postmessage::post_key_sequence_blocking;
+
+/// #2063: re-normalizes key labels inside the hidden-desktop worker so the
+/// worker validates exactly what the daemon validated, from the request file
+/// rather than the OS process table.
+pub(crate) fn normalized_press_keys(labels: &[String]) -> Result<Vec<Key>, ErrorData> {
+    keys::normalized_keys(labels)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedKeymapPress {
@@ -75,6 +85,7 @@ pub(crate) async fn act_press_with_handle_and_boundary(
         backend_used: backend_used_name(backend).to_owned(),
         backend_tier_used: "foreground".to_owned(),
         required_foreground: true,
+        desktop_route: None,
         postcondition: press_postcondition_not_requested(),
     })
 }
@@ -126,6 +137,7 @@ pub(crate) async fn act_press_cdp_target(
         backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
         backend_tier_used: "cdp".to_owned(),
         required_foreground: false,
+        desktop_route: None,
         postcondition: press_postcondition_not_requested(),
     })
 }
@@ -152,6 +164,7 @@ pub(crate) async fn act_press_postmessage_target(
         backend_used: backend_used_name(params.backend.to_backend()).to_owned(),
         backend_tier_used: "postmessage".to_owned(),
         required_foreground: false,
+        desktop_route: None,
         postcondition: press_postcondition_not_requested(),
     })
 }
@@ -224,6 +237,7 @@ pub(crate) fn act_keymap_response_from_press(
         backend_used: response.backend_used,
         backend_tier_used: response.backend_tier_used,
         required_foreground: response.required_foreground,
+        desktop_route: response.desktop_route,
     }
 }
 

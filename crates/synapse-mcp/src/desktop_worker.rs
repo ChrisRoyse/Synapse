@@ -22,6 +22,21 @@ pub(crate) enum DesktopWorkerOp {
     /// / Win32 `WM_SETTEXT` mutation on the session-owned desktop.
     #[value(name = "set-element-value")]
     SetElementValue,
+    /// #2063 background ACTION route: perform the semantic UIA click
+    /// (Invoke/Toggle/SelectionItem/ExpandCollapse/LegacyIAccessible) on the
+    /// session-owned desktop instead of from the daemon's own desktop.
+    #[value(name = "invoke-element")]
+    InvokeElement,
+    /// #2063 background ACTION route: read the PostMessage keyboard target's
+    /// text/selection state on the session-owned desktop. This is the
+    /// independent before/after Source of Truth for a hidden-desktop keystroke.
+    #[value(name = "key-state")]
+    KeyState,
+    /// #2063 background ACTION route: deliver the PostMessage keyboard sequence
+    /// on the session-owned desktop. Window messages cannot cross desktops, so
+    /// this is the only route that can actually reach the target.
+    #[value(name = "press-keys")]
+    PressKeys,
 }
 
 impl DesktopWorkerOp {
@@ -32,14 +47,24 @@ impl DesktopWorkerOp {
             Self::Capture => "capture",
             Self::ElementValue => "element-value",
             Self::SetElementValue => "set-element-value",
+            Self::InvokeElement => "invoke-element",
+            Self::KeyState => "key-state",
+            Self::PressKeys => "press-keys",
         }
     }
 
-    /// Action ops carry their element id (and replacement text) in a temp
-    /// request file instead of the command line, so field contents never land
-    /// in the OS process table.
+    /// Action ops carry their element id (and replacement text / key labels) in
+    /// a temp request file instead of the command line, so field contents and
+    /// keystrokes never land in the OS process table.
     const fn requires_request_file(self) -> bool {
-        matches!(self, Self::ElementValue | Self::SetElementValue)
+        matches!(
+            self,
+            Self::ElementValue
+                | Self::SetElementValue
+                | Self::InvokeElement
+                | Self::KeyState
+                | Self::PressKeys
+        )
     }
 }
 
@@ -55,13 +80,24 @@ pub(crate) struct DesktopWorkerCli {
     pub request_path: Option<PathBuf>,
 }
 
-/// Request body for the #2056 hidden-desktop ACTION ops.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Request body for the #2056/#2063 hidden-desktop ACTION ops.
+///
+/// `element_id` is absent for the HWND-addressed keyboard ops (#2063), which
+/// have no element at all; every op that needs one validates its presence
+/// explicitly instead of substituting a default.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HiddenDesktopActionRequest {
-    pub element_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub element_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Normalized key labels for `press-keys` (#2063).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+    /// Key hold duration in milliseconds for `press-keys` (#2063).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_ms: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -116,6 +152,19 @@ enum WorkerPayload {
     SetElementValue {
         element_id: String,
         readback: synapse_a11y::ElementValueSetReadback,
+    },
+    InvokeElement {
+        element_id: String,
+        action: synapse_a11y::ElementClickAction,
+    },
+    KeyState {
+        hwnd: i64,
+        state: crate::m2::HwndKeyboardTargetState,
+    },
+    PressKeys {
+        hwnd: i64,
+        keys_pressed: u32,
+        state: crate::m2::HwndKeyboardTargetState,
     },
 }
 
@@ -216,6 +265,69 @@ fn run_worker_operation(args: &DesktopWorkerCli) -> Result<WorkerPayload, Worker
                 readback,
             })
         }
+        // #2063: the semantic UIA click runs here, on the desktop that owns the
+        // window, so the delivery is not silently dependent on whether the
+        // target happens to expose a server-side UIA provider reachable from the
+        // daemon's desktop.
+        DesktopWorkerOp::InvokeElement => {
+            let request = worker_action_request(args)?;
+            worker_action_window_live(hwnd)?;
+            let element_id = worker_action_element_id(&request, hwnd)?;
+            let action = synapse_a11y::click_element_action(&element_id)
+                .map_err(|error| worker_error(error.code(), error.to_string()))?;
+            Ok(WorkerPayload::InvokeElement {
+                element_id: element_id.to_string(),
+                action,
+            })
+        }
+        DesktopWorkerOp::KeyState => {
+            let _request = worker_action_request(args)?;
+            worker_action_window_live(hwnd)?;
+            let state = crate::m2::hwnd_keyboard_target_state(hwnd)
+                .map_err(|error| worker_mcp_error(&error))?;
+            Ok(WorkerPayload::KeyState { hwnd, state })
+        }
+        DesktopWorkerOp::PressKeys => {
+            let request = worker_action_request(args)?;
+            worker_action_window_live(hwnd)?;
+            let labels = request.keys.as_deref().ok_or_else(|| {
+                worker_param_error("press-keys request is missing normalized key labels")
+            })?;
+            let hold_ms = request
+                .hold_ms
+                .ok_or_else(|| worker_param_error("press-keys request is missing hold_ms"))?;
+            let keys = crate::m2::normalized_press_keys(labels)
+                .map_err(|error| worker_mcp_error(&error))?;
+            let keys_pressed = u32::try_from(keys.len())
+                .map_err(|_err| worker_param_error("press-keys key count exceeds u32::MAX"))?;
+            let state = crate::m2::post_key_sequence_blocking(hwnd, &keys, hold_ms)
+                .map_err(|error| worker_mcp_error(&error))?;
+            Ok(WorkerPayload::PressKeys {
+                hwnd,
+                keys_pressed,
+                state,
+            })
+        }
+    }
+}
+
+/// Re-frames a daemon-shaped `ErrorData` raised inside the worker as a worker
+/// envelope, preserving its structured `code` so the daemon's per-desktop miss
+/// classification and refusal surfacing keep working verbatim.
+#[cfg(windows)]
+fn worker_mcp_error(error: &rmcp::ErrorData) -> WorkerEnvelope {
+    let code = error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(error_codes::TOOL_INTERNAL_ERROR)
+        .to_owned();
+    WorkerEnvelope {
+        ok: false,
+        payload: None,
+        error_code: Some(code),
+        error_detail: Some(error.message.to_string()),
     }
 }
 
@@ -269,13 +381,13 @@ fn worker_action_element_id(
     request: &HiddenDesktopActionRequest,
     hwnd: i64,
 ) -> Result<ElementId, WorkerEnvelope> {
-    let element_id = ElementId::parse(&request.element_id).map_err(|error| {
+    let raw = request.element_id.as_deref().ok_or_else(|| {
+        worker_param_error("desktop worker element action request is missing element_id")
+    })?;
+    let element_id = ElementId::parse(raw).map_err(|error| {
         worker_error(
             error_codes::ACTION_ELEMENT_NOT_RESOLVED,
-            format!(
-                "desktop worker action element id {:?} is malformed: {error}",
-                request.element_id
-            ),
+            format!("desktop worker action element id {raw:?} is malformed: {error}"),
         )
     })?;
     let parts = element_id.parts().map_err(|error| {
@@ -643,8 +755,8 @@ pub(crate) fn hidden_desktop_element_value(
         DesktopWorkerOp::ElementValue,
         hwnd,
         &HiddenDesktopActionRequest {
-            element_id: element_id.to_string(),
-            text: None,
+            element_id: Some(element_id.to_string()),
+            ..HiddenDesktopActionRequest::default()
         },
     )? {
         WorkerPayload::ElementValue { readback, .. } => Ok(readback),
@@ -670,8 +782,9 @@ pub(crate) fn hidden_desktop_set_element_value(
         DesktopWorkerOp::SetElementValue,
         hwnd,
         &HiddenDesktopActionRequest {
-            element_id: element_id.to_string(),
+            element_id: Some(element_id.to_string()),
             text: Some(text.to_owned()),
+            ..HiddenDesktopActionRequest::default()
         },
     )? {
         WorkerPayload::SetElementValue { readback, .. } => Ok(readback),
@@ -680,6 +793,125 @@ pub(crate) fn hidden_desktop_set_element_value(
             format!("desktop worker returned unexpected set element value payload: {payload:?}"),
         )),
     }
+}
+
+/// #2063: performs the semantic UIA click on the session-owned desktop that
+/// physically owns the target HWND. No desktop switch, no foreground
+/// activation, no raw input, and no daemon-desktop UIA call.
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_invoke_element(
+    desktop_name: &str,
+    element_id: &ElementId,
+) -> Result<synapse_a11y::ElementClickAction, rmcp::ErrorData> {
+    let hwnd = hidden_desktop_action_hwnd(element_id)?;
+    match run_action_worker(
+        desktop_name,
+        DesktopWorkerOp::InvokeElement,
+        hwnd,
+        &HiddenDesktopActionRequest {
+            element_id: Some(element_id.to_string()),
+            ..HiddenDesktopActionRequest::default()
+        },
+    )? {
+        WorkerPayload::InvokeElement { action, .. } => Ok(action),
+        payload => Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected invoke element payload: {payload:?}"),
+        )),
+    }
+}
+
+/// #2063: reads the PostMessage keyboard target's text/selection state on the
+/// session-owned desktop. Used as both the desktop-membership probe and the
+/// independent before/after Source of Truth for a hidden-desktop keystroke.
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_key_state(
+    desktop_name: &str,
+    root_hwnd: i64,
+) -> Result<crate::m2::HwndKeyboardTargetState, rmcp::ErrorData> {
+    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", root_hwnd)?;
+    match run_action_worker(
+        desktop_name,
+        DesktopWorkerOp::KeyState,
+        root_hwnd,
+        &HiddenDesktopActionRequest::default(),
+    )? {
+        WorkerPayload::KeyState { state, .. } => Ok(state),
+        payload => Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected key state payload: {payload:?}"),
+        )),
+    }
+}
+
+/// #2063: delivers the PostMessage keyboard sequence on the session-owned
+/// desktop. Windows documents that window messages can be sent only between
+/// processes on the same desktop, so a daemon-desktop `PostMessage` to a
+/// hidden-desktop HWND can never be proven delivered — this is the only honest
+/// route.
+#[cfg(windows)]
+pub(crate) fn hidden_desktop_press_keys(
+    desktop_name: &str,
+    root_hwnd: i64,
+    key_labels: &[String],
+    hold_ms: u32,
+) -> Result<(u32, crate::m2::HwndKeyboardTargetState), rmcp::ErrorData> {
+    crate::m1::validate_window_hwnd_shape("hidden_desktop_worker", root_hwnd)?;
+    match run_action_worker(
+        desktop_name,
+        DesktopWorkerOp::PressKeys,
+        root_hwnd,
+        &HiddenDesktopActionRequest {
+            keys: Some(key_labels.to_vec()),
+            hold_ms: Some(hold_ms),
+            ..HiddenDesktopActionRequest::default()
+        },
+    )? {
+        WorkerPayload::PressKeys {
+            keys_pressed,
+            state,
+            ..
+        } => Ok((keys_pressed, state)),
+        payload => Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("desktop worker returned unexpected press keys payload: {payload:?}"),
+        )),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_invoke_element(
+    _desktop_name: &str,
+    _element_id: &ElementId,
+) -> Result<synapse_a11y::ElementClickAction, rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop workers are only supported on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_key_state(
+    _desktop_name: &str,
+    _root_hwnd: i64,
+) -> Result<crate::m2::HwndKeyboardTargetState, rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop workers are only supported on Windows",
+    ))
+}
+
+#[cfg(not(windows))]
+pub(crate) fn hidden_desktop_press_keys(
+    _desktop_name: &str,
+    _root_hwnd: i64,
+    _key_labels: &[String],
+    _hold_ms: u32,
+) -> Result<(u32, crate::m2::HwndKeyboardTargetState), rmcp::ErrorData> {
+    Err(crate::m1::mcp_error(
+        error_codes::OBSERVE_NO_PERCEPTION_AVAILABLE,
+        "hidden desktop workers are only supported on Windows",
+    ))
 }
 
 #[cfg(not(windows))]

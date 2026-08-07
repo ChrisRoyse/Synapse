@@ -114,6 +114,12 @@ pub struct ActClickResponse {
     pub backend_used: String,
     pub backend_tier_used: String,
     pub required_foreground: bool,
+    /// #2063: exact worker route when the clicked element's window lives on a
+    /// session-owned hidden desktop (`hidden_desktop_worker:<desktop name>`).
+    /// Absent for ordinary daemon-desktop tiers. Recorded verbatim in the
+    /// `CF_ACTION_LOG` row so an auditor can tell the two apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_route: Option<String>,
     pub tier_attempts: Vec<ActClickTierAttempt>,
     pub postcondition: ActClickPostcondition,
     pub press_hold_ms: u32,

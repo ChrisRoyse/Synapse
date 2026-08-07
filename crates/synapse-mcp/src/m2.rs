@@ -41,10 +41,10 @@ pub(crate) use click::ForegroundClickPolicy;
 pub use click::{ActClickParams, ActClickPostcondition, ActClickResponse, ActClickTarget};
 pub(crate) use click::{
     ActClickTierAttempt, CLICK_REASON_NO_OBSERVED_DELTA, CLICK_TIER_FOREGROUND,
-    CLICK_TIER_POSTMESSAGE, act_click_postmessage_with_params, act_click_with_handle_and_lease,
-    attach_click_tier_attempts, click_params_can_route_background_first,
-    click_target_foreground_guard_hwnds, click_target_root_hwnd, click_tier_delivered,
-    click_tier_failed,
+    CLICK_TIER_POSTMESSAGE, act_click_hidden_desktop_worker, act_click_postmessage_with_params,
+    act_click_with_handle_and_lease, attach_click_tier_attempts,
+    click_params_can_route_background_first, click_target_foreground_guard_hwnds,
+    click_target_root_hwnd, click_tier_delivered, click_tier_failed, window_root_at_screen_point,
 };
 pub use clipboard::{ActClipboardParams, ActClipboardResponse};
 pub(crate) use clipboard::{
@@ -56,7 +56,10 @@ pub use focus_window::{
     ActFocusWindowParams, ActFocusWindowResponse, act_focus_window_request_details,
     act_focus_window_target_hwnd,
 };
-pub(crate) use hidden_desktop::{HiddenDesktopValueRoute, resolve_hidden_desktop_value_route};
+pub(crate) use hidden_desktop::{
+    HiddenDesktopValueRoute, HiddenDesktopWindowRoute, desktop_label_for_hwnd,
+    resolve_hidden_desktop_value_route, resolve_hidden_desktop_window_route,
+};
 pub(crate) use pad::act_pad_with_handle_and_boundary;
 pub use pad::{ActPadParams, ActPadResponse};
 pub use postcondition::default_verify_timeout_ms;
@@ -68,7 +71,8 @@ pub(crate) use press::{
     HwndKeyboardTargetState, ResolvedKeymapPress, act_keymap_response_from_press,
     act_press_cdp_target, act_press_normalized_labels, act_press_postmessage_target,
     act_press_with_handle_and_boundary, delete_key_action, hwnd_keyboard_target_state,
-    resolve_keymap_press, select_all_chord_action,
+    normalized_press_keys, post_key_sequence_blocking, resolve_keymap_press,
+    select_all_chord_action,
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub(crate) use scroll::act_scroll_with_handle_and_boundary;

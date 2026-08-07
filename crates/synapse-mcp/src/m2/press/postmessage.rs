@@ -1,12 +1,12 @@
 use rmcp::ErrorData;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use synapse_action::ActionError;
 use synapse_core::Key;
 
 use super::{action_error_to_mcp, key_label};
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HwndKeyboardTargetState {
     pub root_hwnd: i64,
@@ -49,6 +49,45 @@ pub(crate) async fn post_key_sequence(
     post_key_sequence_impl(root_hwnd, keys, hold_ms, boundary).await
 }
 
+/// #2063: the same PostMessage keyboard sequence, executed synchronously.
+///
+/// This runs inside a short-lived desktop-worker child process attached to the
+/// hidden desktop that owns `root_hwnd` — the only place the messages can
+/// physically be delivered. The operator-panic boundary is deliberately not
+/// re-evaluated here: the daemon proves admission immediately before it spawns
+/// this worker, holds the action authority for the whole spawn/reap window, and
+/// the worker's own process-global epoch is a fresh, meaningless value.
+#[cfg(windows)]
+pub(crate) fn post_key_sequence_blocking(
+    root_hwnd: i64,
+    keys: &[Key],
+    hold_ms: u32,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    let dispatch = post_key_dispatch(root_hwnd, keys, None)?;
+    if hold_ms > 0 {
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(hold_ms)));
+    }
+    post_key_finish(root_hwnd, &dispatch, None)
+}
+
+#[cfg(not(windows))]
+pub(crate) fn post_key_sequence_blocking(
+    _root_hwnd: i64,
+    _keys: &[Key],
+    _hold_ms: u32,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    Err(action_error_to_mcp(&ActionError::BackendUnavailable {
+        detail: "act_press PostMessage keyboard tier is only available on Windows".to_owned(),
+    }))
+}
+
+#[cfg(windows)]
+struct PostKeyDispatch {
+    key_specs: Vec<KeySpec>,
+    target_hwnd: i64,
+    release_keys: bool,
+}
+
 #[cfg(windows)]
 async fn post_key_sequence_impl(
     root_hwnd: i64,
@@ -56,6 +95,25 @@ async fn post_key_sequence_impl(
     hold_ms: u32,
     boundary: crate::m2::OperatorPanicActionBoundary,
 ) -> Result<HwndKeyboardTargetState, ErrorData> {
+    let dispatch = post_key_dispatch(root_hwnd, keys, Some(boundary))?;
+    if hold_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
+    }
+    let boundary_error = boundary
+        .ensure("after_postmessage_key_hold_before_release")
+        .err();
+    post_key_finish(root_hwnd, &dispatch, boundary_error)
+}
+
+#[cfg(windows)]
+fn post_key_dispatch(
+    root_hwnd: i64,
+    keys: &[Key],
+    boundary: Option<crate::m2::OperatorPanicActionBoundary>,
+) -> Result<PostKeyDispatch, ErrorData> {
+    let ensure = |stage: &'static str| -> Result<(), ErrorData> {
+        boundary.map_or(Ok(()), |boundary| boundary.ensure(stage))
+    };
     let key_specs = keys
         .iter()
         .map(key_spec)
@@ -77,7 +135,7 @@ async fn post_key_sequence_impl(
         let target =
             best_keyboard_target(root_hwnd).map_err(|error| action_error_to_mcp(&error))?;
         if is_ctrl_a_shortcut(&key_specs) {
-            boundary.ensure("immediately_before_postmessage_select_all")?;
+            ensure("immediately_before_postmessage_select_all")?;
             select_all_edit_target(&target).map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else if let Some(chord) = edit_control_chord(&key_specs) {
@@ -87,18 +145,18 @@ async fn post_key_sequence_impl(
             // and verify the real effect (clipboard sequence number for copy/cut,
             // window-text change for paste/undo/redo) so we never falsely report
             // success on a chord the control ignored.
-            boundary.ensure("immediately_before_postmessage_edit_chord")?;
+            ensure("immediately_before_postmessage_edit_chord")?;
             send_edit_control_chord(&target, &chord)
                 .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else if is_plain_printable_text(&key_specs) {
-            boundary.ensure("immediately_before_postmessage_plain_text")?;
+            ensure("immediately_before_postmessage_plain_text")?;
             post_char_messages(target.hwnd, &key_specs)
                 .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         } else {
             for spec in &key_specs {
-                boundary.ensure("immediately_before_postmessage_key_down")?;
+                ensure("immediately_before_postmessage_key_down")?;
                 post_key_message(
                     target.hwnd,
                     windows::Win32::UI::WindowsAndMessaging::WM_KEYDOWN,
@@ -107,22 +165,30 @@ async fn post_key_sequence_impl(
                 .map_err(|error| action_error_to_mcp(&error))?;
             }
             release_keys = true;
-            boundary.ensure("immediately_before_postmessage_key_chars")?;
+            ensure("immediately_before_postmessage_key_chars")?;
             post_char_messages(target.hwnd, &key_specs)
                 .map_err(|error| action_error_to_mcp(&error))?;
             hwnd_to_i64(target.hwnd)
         }
     };
-    if hold_ms > 0 {
-        tokio::time::sleep(std::time::Duration::from_millis(u64::from(hold_ms))).await;
-    }
-    let boundary_error = boundary
-        .ensure("after_postmessage_key_hold_before_release")
-        .err();
-    let target = hwnd_from_i64(target_hwnd).map_err(|error| action_error_to_mcp(&error))?;
+    Ok(PostKeyDispatch {
+        key_specs,
+        target_hwnd,
+        release_keys,
+    })
+}
+
+#[cfg(windows)]
+fn post_key_finish(
+    root_hwnd: i64,
+    dispatch: &PostKeyDispatch,
+    boundary_error: Option<ErrorData>,
+) -> Result<HwndKeyboardTargetState, ErrorData> {
+    let target =
+        hwnd_from_i64(dispatch.target_hwnd).map_err(|error| action_error_to_mcp(&error))?;
     let mut release_error = None;
-    if release_keys {
-        for spec in key_specs.iter().rev() {
+    if dispatch.release_keys {
+        for spec in dispatch.key_specs.iter().rev() {
             if let Err(error) = post_key_message(
                 target,
                 windows::Win32::UI::WindowsAndMessaging::WM_KEYUP,
