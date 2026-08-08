@@ -17,26 +17,13 @@ build-time only and are not part of the runtime.
 
 ```powershell
 bun run check
-bun run test:coverage
 bun run build:storybook
-bun run test:visual
-bun run test:a11y
 ```
 
-These are local supporting gates only. They do not replace manual Synapse FSV.
-
-`test:visual` starts local Storybook and snapshots every case in
-`dashboard/tests/storybook-cases.ts` across dark/light and comfortable/compact
-globals. Screenshots target the Storybook root and allow at most
-`maxDiffPixelRatio: 0.002` or `maxDiffPixels: 96`; update baselines only with an
-explicit `bun run test:visual:update`.
-
-The reproducible runner image is pinned to:
-
-```text
-mcr.microsoft.com/playwright:v1.60.0-noble
-```
-
-Storybook is pinned to `9.1.20`. The current `@storybook/test-runner` package
-advertises Storybook 10 peers, so this workspace uses Playwright Test directly
-against Storybook iframe URLs instead of adding a mismatched runner dependency.
+These are structural build/charter checks only. They do not verify behavior and
+do not replace manual Synapse Full State Verification. Visual and accessibility
+acceptance is performed manually in the already-running Chrome session: read
+the rendered dashboard state before the trigger, perform the real interaction,
+then independently inspect the rendered state and daemon Source of Truth after
+the trigger. Storybook remains a local component-inspection surface, including
+its interactive accessibility panel; it is not an automated test runner.

@@ -19,10 +19,8 @@
   },
   "include": [
     "vite.config.ts",
-    "playwright*.config.ts",
     ".storybook/**/*.ts",
     ".storybook/**/*.tsx",
-    "scripts/**/*.ts",
-    "tests/**/*.ts"
+    "scripts/**/*.ts"
   ]
 }

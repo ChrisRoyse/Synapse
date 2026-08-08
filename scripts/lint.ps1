@@ -26,14 +26,15 @@
   full compile):
 
     0. D1 zero-test / zero-harness doctrine (#2037, #2042, #2045, #2153,
-       #2154). A pure text and manifest scan — no compilation, no execution,
-       nothing behavioural.
+       #2154, #2164). A pure text, manifest, lockfile, and executable-path scan
+       — no compilation, no execution, nothing behavioural.
        Rejects `#[test]` / `#[tokio::test]` / `#[bench]` / `#[cfg(test)]`,
        `[dev-dependencies]` / `[[test]]` / `[[bench]]` manifest sections, and
-       FSV executable targets/scripts, in both workspaces. Runs first because it
-       is the cheapest gate and because gate 6 (`clippy --all-targets`) would
-       otherwise spend a full compile building the very targets this one
-       forbids.
+       FSV executable targets/scripts, plus JavaScript/TypeScript test scripts,
+       direct runner dependencies, runner configs, and test source paths. Runs
+       first because it is the cheapest gate and because gate 6
+       (`clippy --all-targets`) would otherwise spend a full compile building
+       the very targets this one forbids.
     1. SHARED-LINT-CONTRACT agreement. `clippy.toml` is resolved per workspace,
        so a `disallowed-methods` rule at the root reaches no calyx crate. The
        rule is therefore duplicated into `calyx/clippy.toml`, and the two copies
@@ -120,7 +121,7 @@ function Add-Failure {
 
 # ---------------------------------------------------------------------------
 # Gate 0 — D1 zero-test / zero-harness doctrine (#2037, #2042, #2045,
-# #2153, #2154)
+# #2153, #2154, #2164)
 # ---------------------------------------------------------------------------
 #
 # Numbered 0, not 8, on purpose: it is inserted BEFORE the seven existing gates
@@ -145,7 +146,12 @@ function Add-Failure {
 # Cargo's target discovery is wider than manifest tables: `examples/*.rs`,
 # `tests/*.rs`, and `benches/*.rs` become executable targets without a manifest
 # line. Gate 0 therefore reads manifests, the filesystem layout, and Cargo's own
-# authoritative `metadata --no-deps` target inventory. Metadata parses target
+# authoritative `metadata --no-deps` target inventory. JavaScript package
+# managers likewise make every package script directly invocable and expose
+# direct runner dependencies as commands. Gate 0 therefore parses every
+# package.json plus the root workspace records of every text bun.lock; it does
+# not confuse transitive Storybook implementation packages with a repository-
+# owned test entry point. Metadata parses target
 # declarations without compiling or executing them; this is structural policy
 # verification, never behavioral verification.
 #
@@ -232,7 +238,7 @@ function Remove-RustComments {
     return $out
 }
 
-Write-Gate 'Gate 0     D1 zero-test / zero-harness doctrine (#2037, #2042, #2045, #2153, #2154)'
+Write-Gate 'Gate 0     D1 zero-test / zero-harness doctrine (#2037, #2042, #2045, #2153, #2154, #2164)'
 try {
     $RelativeTo = { param([string]$Path) $Path.Substring($RepoRoot.Length).TrimStart('\', '/') }
 
@@ -289,6 +295,12 @@ try {
     $fsvTargetSourceHits = [System.Collections.Generic.List[string]]::new()
     $testBenchSourceHits = [System.Collections.Generic.List[string]]::new()
     $fsvScriptHits = [System.Collections.Generic.List[string]]::new()
+    $packageScriptHits = [System.Collections.Generic.List[string]]::new()
+    $packageRunnerDependencyHits = [System.Collections.Generic.List[string]]::new()
+    $packageExecutablePathHits = [System.Collections.Generic.List[string]]::new()
+    $packageManifestInvalidHits = [System.Collections.Generic.List[string]]::new()
+    $packageLockInvalidHits = [System.Collections.Generic.List[string]]::new()
+    $unsupportedPackageLockHits = [System.Collections.Generic.List[string]]::new()
     $manifests = Get-D1Files -Root $RepoRoot -Names @('Cargo.toml')
     foreach ($file in $manifests) {
         $lines = [IO.File]::ReadAllLines($file)
@@ -371,6 +383,114 @@ try {
         }
     }
 
+    # Package scripts are executable surface, not descriptive metadata. Parse
+    # manifests instead of grepping JSON so whitespace, key order, and escaped
+    # command strings cannot bypass the policy. Dependency matching is limited
+    # to direct manifest/workspace-root entries: Storybook may carry internal
+    # testing libraries transitively without creating a repository-owned test
+    # command, while a direct runner dependency does create one.
+    $testScriptNameRe = [regex]'(?i)^(?:pre|post)?(?:test(?:[:._-].*)?|bench(?:mark)?(?:[:._-].*)?|coverage(?:[:._-].*)?)$'
+    $testRunnerCommandRe = [regex]'(?i)(?:^|[\s;&|])(?:(?:bunx|npx)\s+)?(?:playwright\s+test|vitest(?:\s|$)|jest(?:\s|$)|mocha(?:\s|$)|ava(?:\s|$)|tap(?:\s|$)|tape(?:\s|$)|jasmine(?:\s|$)|cypress\s+(?:run|open)|node\s+--test|bun\s+test|cargo\s+(?:test|bench)|(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test(?=[:\s]|$)|storybook\s+test)'
+    $testRunnerDependencyRe = [regex]'(?i)^(?:@playwright/test|@axe-core/playwright|playwright|playwright-core|@storybook/test-runner|vitest|@vitest/.+|jest|jest-.+|@jest/.+|mocha|ava|tap|tape|jasmine|jasmine-core|cypress|@testing-library/.+)$'
+    $packageDependencySections = @('dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies')
+    $packageManifests = Get-D1Files -Root $RepoRoot -Names @('package.json')
+    $packageManifestsScanned = 0
+    foreach ($file in $packageManifests) {
+        $packageManifestsScanned++
+        try {
+            $manifest = [IO.File]::ReadAllText($file) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        }
+        catch {
+            $packageManifestInvalidHits.Add("        $(& $RelativeTo $file)  invalid JSON: $($_.Exception.Message)")
+            continue
+        }
+        if ($manifest.ContainsKey('scripts')) {
+            if ($manifest.scripts -isnot [System.Collections.IDictionary]) {
+                $packageManifestInvalidHits.Add("        $(& $RelativeTo $file)  scripts must be a JSON object")
+            }
+            else {
+                foreach ($entry in $manifest.scripts.GetEnumerator()) {
+                    $name = [string]$entry.Key
+                    $command = [string]$entry.Value
+                    if ($testScriptNameRe.IsMatch($name) -or $testRunnerCommandRe.IsMatch($command)) {
+                        $packageScriptHits.Add("        $(& $RelativeTo $file)  script=$name command=$command")
+                    }
+                }
+            }
+        }
+        foreach ($section in $packageDependencySections) {
+            if (-not $manifest.ContainsKey($section)) { continue }
+            if ($manifest[$section] -isnot [System.Collections.IDictionary]) {
+                $packageManifestInvalidHits.Add("        $(& $RelativeTo $file)  $section must be a JSON object")
+                continue
+            }
+            foreach ($name in $manifest[$section].Keys) {
+                if ($testRunnerDependencyRe.IsMatch([string]$name)) {
+                    $packageRunnerDependencyHits.Add("        $(& $RelativeTo $file)  $section.$name=$($manifest[$section][$name])")
+                }
+            }
+        }
+    }
+
+    # Bun's text lock is JSON with trailing commas, which PowerShell's parser
+    # accepts. Inspect only direct workspace dependency maps; scanning every
+    # transitive package would reject production authoring tools such as
+    # Storybook merely because their internals reuse Vitest utilities.
+    $bunLocks = Get-D1Files -Root $RepoRoot -Names @('bun.lock')
+    $packageLockWorkspacesScanned = 0
+    foreach ($file in $bunLocks) {
+        try {
+            $lock = [IO.File]::ReadAllText($file) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+        }
+        catch {
+            $packageLockInvalidHits.Add("        $(& $RelativeTo $file)  invalid Bun text lock: $($_.Exception.Message)")
+            continue
+        }
+        if (-not $lock.ContainsKey('workspaces') -or $lock.workspaces -isnot [System.Collections.IDictionary]) {
+            $packageLockInvalidHits.Add("        $(& $RelativeTo $file)  missing object-valued workspaces map")
+            continue
+        }
+        foreach ($workspace in $lock.workspaces.GetEnumerator()) {
+            $packageLockWorkspacesScanned++
+            if ($workspace.Value -isnot [System.Collections.IDictionary]) {
+                $packageLockInvalidHits.Add("        $(& $RelativeTo $file)  workspace '$($workspace.Key)' must be an object")
+                continue
+            }
+            foreach ($section in $packageDependencySections) {
+                if (-not $workspace.Value.ContainsKey($section)) { continue }
+                if ($workspace.Value[$section] -isnot [System.Collections.IDictionary]) {
+                    $packageLockInvalidHits.Add("        $(& $RelativeTo $file)  workspace '$($workspace.Key)' $section must be an object")
+                    continue
+                }
+                foreach ($name in $workspace.Value[$section].Keys) {
+                    if ($testRunnerDependencyRe.IsMatch([string]$name)) {
+                        $packageRunnerDependencyHits.Add("        $(& $RelativeTo $file)  workspace='$($workspace.Key)' $section.$name=$($workspace.Value[$section][$name])")
+                    }
+                }
+            }
+        }
+    }
+
+    # Fail closed when a future package manager introduces a lock format this
+    # gate does not parse. Silent non-coverage is how #2164 survived.
+    foreach ($name in @('bun.lockb', 'package-lock.json', 'npm-shrinkwrap.json', 'pnpm-lock.yaml', 'yarn.lock')) {
+        foreach ($file in Get-D1Files -Root $RepoRoot -Names @($name)) {
+            $unsupportedPackageLockHits.Add("        $(& $RelativeTo $file)  unsupported package lock format")
+        }
+    }
+
+    $packageSourceExtensions = @('.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx', '.mts', '.cts')
+    $testSourceLeafRe = [regex]'(?i)(?:^|[-_.])(?:test|tests|spec|coverage|benchmark|bench)(?:[-_.]|$)'
+    $testConfigLeafRe = [regex]'(?i)^(?:playwright(?:\.[^.]+)*|vitest|jest|cypress)\.config\.(?:js|jsx|mjs|cjs|ts|tsx|mts|cts)$'
+    foreach ($file in Get-D1Files -Root $RepoRoot -Extensions $packageSourceExtensions) {
+        $relative = (& $RelativeTo $file).Replace('\', '/')
+        $leaf = Split-Path -Leaf $file
+        if ($relative -match '/(?:test|tests|__tests__|spec|specs)/' -or
+            $testSourceLeafRe.IsMatch($leaf) -or $testConfigLeafRe.IsMatch($leaf)) {
+            $packageExecutablePathHits.Add("        $relative  (package test/config executable source)")
+        }
+    }
+
     if ($devDepHits.Count -gt 0) {
         Add-Failure 'SYNAPSE_LINT_D1_DEV_DEPENDENCIES_PRESENT' `
         ("$($devDepHits.Count) [dev-dependencies] section(s), which directive D1 bans outright (#2042):" + [Environment]::NewLine + ($devDepHits -join [Environment]::NewLine)) `
@@ -401,10 +521,43 @@ try {
         ("$($fsvScriptHits.Count) executable FSV script driver(s), which directive D1 forbids (#2154):" + [Environment]::NewLine + ($fsvScriptHits -join [Environment]::NewLine)) `
             'delete the driver and perform the trigger/readback sequence manually through the real production surface.'
     }
+    if ($packageManifestInvalidHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_MANIFEST_INVALID' `
+        ("$($packageManifestInvalidHits.Count) package manifest(s) could not be structurally inventoried:" + [Environment]::NewLine + ($packageManifestInvalidHits -join [Environment]::NewLine)) `
+            'repair the JSON/object shape. Gate 0 will not claim the package surface is test-free when it cannot parse the manifest.'
+    }
+    if ($packageLockInvalidHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_LOCK_INVALID' `
+        ("$($packageLockInvalidHits.Count) Bun lock workspace surface(s) could not be structurally inventoried:" + [Environment]::NewLine + ($packageLockInvalidHits -join [Environment]::NewLine)) `
+            'regenerate the text lock with bun install --lockfile-only, then re-run Gate 0. An unreadable lock is not accepted as dependency absence.'
+    }
+    if ($unsupportedPackageLockHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_LOCK_UNSUPPORTED' `
+        ("$($unsupportedPackageLockHits.Count) package lockfile(s) use an unparsed format:" + [Environment]::NewLine + ($unsupportedPackageLockHits -join [Environment]::NewLine)) `
+            'use the repository-standard text bun.lock, or extend Gate 0 with a structural parser for the new lock format in the same change. Do not add an uninspected dependency surface.'
+    }
+    if ($packageScriptHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_TEST_SCRIPT_PRESENT' `
+        ("$($packageScriptHits.Count) executable automated-test/benchmark package script(s) remain:" + [Environment]::NewLine + ($packageScriptHits -join [Environment]::NewLine)) `
+            'delete the package script and its runner/config/source/dependency surface. UI acceptance is manual Synapse FSV in the real application.'
+    }
+    if ($packageRunnerDependencyHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_TEST_RUNNER_DEPENDENCY_PRESENT' `
+        ("$($packageRunnerDependencyHits.Count) direct automated-test runner/support dependency entry or lock workspace entry remains:" + [Environment]::NewLine + ($packageRunnerDependencyHits -join [Environment]::NewLine)) `
+            'remove the direct runner dependency and regenerate its lockfile. Do not replace it with another automated runner or mock surface.'
+    }
+    if ($packageExecutablePathHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_PACKAGE_TEST_SOURCE_PRESENT' `
+        ("$($packageExecutablePathHits.Count) JavaScript/TypeScript test, coverage, benchmark, or runner-config source path(s) remain:" + [Environment]::NewLine + ($packageExecutablePathHits -join [Environment]::NewLine)) `
+            'delete the automated source/config and manually verify the real production trigger plus a separate physical Source-of-Truth readback.'
+    }
     if ($devDepHits.Count -eq 0 -and $testTargetHits.Count -eq 0 -and
         $testBenchSourceHits.Count -eq 0 -and $fsvTargetHits.Count -eq 0 -and
-        $fsvTargetSourceHits.Count -eq 0 -and $fsvScriptHits.Count -eq 0) {
-        Write-Host "   OK   $($manifests.Count) manifests, $cargoTargetsScanned Cargo targets, and tracked source paths expose no dev-dependencies, test/bench targets, or FSV executable drivers" -ForegroundColor Green
+        $fsvTargetSourceHits.Count -eq 0 -and $fsvScriptHits.Count -eq 0 -and
+        $packageManifestInvalidHits.Count -eq 0 -and $packageLockInvalidHits.Count -eq 0 -and
+        $unsupportedPackageLockHits.Count -eq 0 -and $packageScriptHits.Count -eq 0 -and
+        $packageRunnerDependencyHits.Count -eq 0 -and $packageExecutablePathHits.Count -eq 0) {
+        Write-Host "   OK   $($manifests.Count) Cargo manifests, $cargoTargetsScanned Cargo targets, $packageManifestsScanned package manifests, $packageLockWorkspacesScanned Bun lock workspaces, and executable source paths expose no automated-test/bench/FSV surface" -ForegroundColor Green
     }
 }
 catch {
