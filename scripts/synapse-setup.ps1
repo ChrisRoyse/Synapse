@@ -14530,11 +14530,17 @@ if (-not $liveDaemonHandoffRequired) {
     Step "Verified installed daemon binary without live drain -> $ExePath"
 } else {
     Step "Draining live daemon and installing verified binary -> $ExePath"
-    Assert-SynapseRestartAllowed -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
+    # One handoff gets one reason identity. The Chrome maintenance pause binds
+    # its acknowledgement to this value and deliberately rejects reuse under a
+    # different reason. Keep every phase on this single value so adding a new
+    # drain/readback step cannot silently split one deploy into competing state
+    # tokens (#2156).
+    $deployDrainReason = 'deploy'
+    Assert-SynapseRestartAllowed -Reason $deployDrainReason -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -HealthTimeoutSec ([Math]::Min(300, [Math]::Max(120, $InstallHealthTimeoutSeconds))) -ForceRestart:$ForceRestart -AllowActiveClientDrain
     $daemonSupervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
-    $null = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
+    $null = Assert-SynapseDaemonTaskRestartAuthorityIdentity -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason $deployDrainReason
     if ($ForceRestart) {
-        $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason 'install_binary'
+        $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason $deployDrainReason
     }
     # #2092: ONE drain, shared with -Stop, parameterised reason=deploy.
     #
@@ -14551,7 +14557,7 @@ if (-not $liveDaemonHandoffRequired) {
     # loud (SYNAPSE_DAEMON_STOP_FORCED / SYNAPSE_DAEMON_SUPERVISOR_STOP_FORCED)
     # and both are the exception, not the path.
     $deployDrain = Invoke-SynapseDaemonRevokedDrain `
-        -Reason 'deploy' `
+        -Reason $deployDrainReason `
         -TaskName $TaskName `
         -RuntimeBinDir $RuntimeBinDir `
         -Bind $Bind `
@@ -14597,7 +14603,7 @@ if (-not $liveDaemonHandoffRequired) {
     # Fallback verification pass (see the function header): with the stop-request
     # in force this normally observes zero targets on attempt 1 and returns.
     Stop-SynapseMcpProcessesForInstallHandoff `
-        -Reason 'install_binary' `
+        -Reason $deployDrainReason `
         -Bind $Bind `
         -DbPath $DbPath `
         -TokenPath $TokenPath `
