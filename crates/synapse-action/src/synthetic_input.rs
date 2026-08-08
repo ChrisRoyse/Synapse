@@ -366,9 +366,13 @@ pub struct SyntheticReleaseReport {
     pub buttons_found_down: u32,
     /// Mirrored strands that were still registered and got a release.
     pub tracked_strands_released: usize,
-    /// Modifier key-ups emitted (always the full set: the sweep is unconditional).
+    /// Modifier key-ups emitted (always the full set: the modifier sweep is
+    /// unconditional, which is safe because a key-up of an up key is inert).
     pub modifier_releases_emitted: usize,
-    /// Mouse button-ups emitted (always the full set).
+    /// Mouse button-ups emitted. CONDITIONAL: one per button with release
+    /// evidence (OS reports it down, or the process mirror holds it). `0` on a
+    /// clean sweep — a bare button-up is a phantom click
+    /// (`WM_RBUTTONUP` → `WM_CONTEXTMENU`), never inert.
     pub button_releases_emitted: usize,
     /// `SendInput` batches that did not fully insert even after retry.
     pub emission_failures: usize,
@@ -848,13 +852,33 @@ mod win32 {
             }
         }
 
-        // 5. Every mouse button, unconditionally.
+        // 5. Mouse buttons — CONDITIONAL, unlike the modifiers, and the
+        //    asymmetry is load-bearing (operator-interference incident,
+        //    2026-08-08). A key-up for a key that is already up is inert, so
+        //    the modifier sweep can afford "release everything, always". A
+        //    button-up is NOT inert: `DefWindowProc` turns a bare
+        //    `WM_RBUTTONUP` into `WM_CONTEXTMENU`, so an unconditional
+        //    `RBUTTON` release IS a right-click to whatever sits under the
+        //    operator's cursor, and bare `XBUTTON` ups drive browser
+        //    back/forward. The unconditional form meant every sweep — every
+        //    daemon boot, every raw release_all fallback — phantom-right-
+        //    clicked the operator's desktop (caught live by an LL mouse hook:
+        //    bare injected RBUTTON_UP events, no downs, at each isolated
+        //    daemon boot). A button-up is emitted only when there is evidence
+        //    a release is owed: the OS reports the button physically down
+        //    (step 1's snapshot — covers strands inherited from a dead
+        //    generation, the case phase C/D proved), or this process's mirror
+        //    says we pressed it (covers a mid-action sweep racing the OS
+        //    readback). Neither evidence, no emission — there is nothing to
+        //    release, and "release anyway" is the phantom click.
         for index in 0..BUTTON_SLOTS {
             if let Some(button) = button_from_index(index) {
-                if let Some(since) = BUTTON_SINCE_MS.get(button_index(button)) {
-                    since.store(0, Ordering::Release);
-                }
-                if len < MAX_BATCH {
+                let mirror_held = BUTTON_SINCE_MS
+                    .get(button_index(button))
+                    .map(|since| since.swap(0, Ordering::AcqRel))
+                    .is_some_and(|since| since != 0);
+                let os_reports_down = report.buttons_found_down & (1 << index) != 0;
+                if (os_reports_down || mirror_held) && len < MAX_BATCH {
                     batch[len] = release_input_for_button(button);
                     len += 1;
                     report.button_releases_emitted += 1;
@@ -1078,7 +1102,7 @@ pub fn release_all_synthetic_input_on_startup() -> SyntheticReleaseReport {
             scanned_key_releases_emitted = report.scanned_key_releases_emitted,
             emission_failures = report.emission_failures,
             source_of_truth = "GetAsyncKeyState read before the startup SendInput release sweep",
-            "readback=synthetic_input edge=startup no modifier, no mouse button and no scanned virtual key was down; the unconditional modifier/button release sweep ran anyway"
+            "readback=synthetic_input edge=startup no modifier, no mouse button and no scanned virtual key was down; the unconditional modifier release sweep ran anyway and no button-up was emitted (buttons release only on evidence — a bare button-up is a phantom click)"
         );
     }
     if report.emission_failures > 0 {
