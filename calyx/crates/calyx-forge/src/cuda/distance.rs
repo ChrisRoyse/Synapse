@@ -1,7 +1,7 @@
 use std::str;
 use std::sync::Arc;
 
-use cudarc::driver::{CudaModule, CudaSlice, LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaModule, CudaSlice, CudaView, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::Ptx;
 
 use crate::cpu::{check_finite, check_shape_2d};
@@ -10,8 +10,13 @@ use crate::cuda::validate::{check_device_f32, read_checked_device_f32};
 use crate::{CudaContext, ForgeError, Result};
 
 const BLOCK_THREADS: u32 = 256;
+/// Grid `y` carries the query row for the batched kNN launches; CUDA caps it
+/// at 65535.
+pub(crate) const DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH: usize = 65_535;
 const DISTANCE_REMEDIATION: &str =
     "Check CUDA distance kernel inputs and fail closed instead of returning invalid scores";
+pub(crate) const DISTANCE_INPUT_REMEDIATION: &str =
+    "Ensure all input vectors are normalized finite f32; check upstream embedding model output";
 const DEVICE_REMEDIATION: &str =
     "Check CUDA, embedded distance PTX, and CUDA GPU device availability";
 
@@ -277,10 +282,42 @@ fn launch_distance(
     n_cands: usize,
     out: &mut CudaSlice<f32>,
 ) -> Result<()> {
-    check_device_shape(query.len(), 1, dim, "cuda distance query")?;
+    launch_distance_batched(
+        ctx,
+        op,
+        kernel_name,
+        &query.as_view(),
+        candidates,
+        dim,
+        n_cands,
+        1,
+        out,
+    )
+}
+
+/// Launches one distance kernel for `n_queries` query rows against the shared
+/// candidate matrix, writing a row-major `[n_queries, n_cands]` score matrix.
+///
+/// #2107 H4: the caller used to run this once per query, paying a separate
+/// upload, allocation, launch and readback each time. `gridDim.y` now carries
+/// the query row, and `n_queries == 1` reproduces the previous launch geometry
+/// exactly, so single-query results are unchanged bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn launch_distance_batched(
+    ctx: &CudaContext,
+    op: &'static str,
+    kernel_name: &'static str,
+    queries: &CudaView<'_, f32>,
+    candidates: &CudaSlice<f32>,
+    dim: usize,
+    n_cands: usize,
+    n_queries: usize,
+    out: &mut CudaSlice<f32>,
+) -> Result<()> {
+    check_device_shape(queries.len(), n_queries, dim, "cuda distance query")?;
     check_device_shape(candidates.len(), n_cands, dim, "cuda distance candidates")?;
-    check_device_shape(out.len(), n_cands, 1, "cuda distance output")?;
-    if n_cands == 0 {
+    check_device_shape(out.len(), n_queries, n_cands, "cuda distance output")?;
+    if n_cands == 0 || n_queries == 0 {
         return Ok(());
     }
 
@@ -291,13 +328,23 @@ fn launch_distance(
         got: vec![n_cands],
         remediation: "cuda distance n_cands exceeds grid dimension limit".to_string(),
     })?;
+    let n_queries_u32 = u32::try_from(n_queries)
+        .ok()
+        .filter(|_| n_queries <= DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH)
+        .ok_or_else(|| ForgeError::ShapeMismatch {
+            expected: vec![DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH],
+            got: vec![n_queries],
+            remediation:
+                "cuda distance query batch exceeds the CUDA grid.y limit; tile the query batch"
+                    .to_string(),
+        })?;
     let module = distance_module(ctx)?;
     let func = ctx
         .cached_function(&module, distance_cache_key(kernel_name), kernel_name)
         .map_err(|err| device_unavailable(ctx, format!("{op} load function failed: {err}")))?;
     let stream = ctx.inner().default_stream();
     let cfg = LaunchConfig {
-        grid_dim: (n_cands_u32, 1, 1),
+        grid_dim: (n_cands_u32, n_queries_u32, 1),
         block_dim: (BLOCK_THREADS, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -305,7 +352,7 @@ fn launch_distance(
     let mut launch = stream.launch_builder(func.as_ref());
     unsafe {
         launch
-            .arg(query)
+            .arg(queries)
             .arg(candidates)
             .arg(&dim_i32)
             .arg(&n_cands_i32)
@@ -314,6 +361,41 @@ fn launch_distance(
     }
     .map_err(|err| device_unavailable(ctx, format!("{op} kernel launch failed: {err}")))?;
     Ok(())
+}
+
+/// Device-side finiteness gate for a buffer that was just uploaded (#2107 H3).
+///
+/// The host scan this replaces walked the whole candidate matrix with a scalar
+/// loop immediately before handing the same bytes to the GPU. The device
+/// kernel reads the buffer at device bandwidth instead. The refusal is
+/// identical: the same `ForgeError::NumericalInvariant` code, from the same
+/// call, before any result is produced — and the exact index-bearing message is
+/// still recovered, because on the refusal path (and only there) the host copy
+/// the caller already holds is scanned to name the offending element.
+pub(crate) fn check_uploaded_finite(
+    ctx: &CudaContext,
+    op: &'static str,
+    host: &[f32],
+    device: &CudaSlice<f32>,
+) -> Result<()> {
+    match check_device_f32(ctx, op, device, false, DISTANCE_INPUT_REMEDIATION) {
+        Ok(()) => Ok(()),
+        Err(ForgeError::NumericalInvariant { .. }) => {
+            check_finite(host, op)?;
+            Err(ForgeError::NumericalInvariant {
+                op: op.to_string(),
+                detail: format!(
+                    "device finiteness gate refused a {} element buffer that the host scan found \
+                     entirely finite: device and host disagree about the uploaded bytes",
+                    host.len()
+                ),
+                remediation: "Re-run with CALYX_FORGE_AUDIT_OUTPUT=1 and check the host-to-device \
+                              transfer and device memory integrity"
+                    .to_string(),
+            })
+        }
+        Err(other) => Err(other),
+    }
 }
 
 fn launch_paired_cosine(
@@ -442,7 +524,7 @@ fn distance_ptx_module(
         })
 }
 
-fn check_device_output(
+pub(crate) fn check_device_output(
     ctx: &CudaContext,
     op: &'static str,
     out: &CudaSlice<f32>,

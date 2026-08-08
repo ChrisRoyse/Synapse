@@ -11,10 +11,7 @@ use crate::vram::{
     CudaVramProbe, HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore,
     VramBudgeter, VramStats,
 };
-use crate::{
-    Backend, CUDA_EXACT_TOPK_MAX_K, CudaBackend, DeviceInfo, ForgeError, KnnBatch, KnnMetric,
-    Result,
-};
+use crate::{Backend, CudaBackend, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result};
 
 const F32_BYTES: usize = size_of::<f32>();
 const I32_BYTES: usize = size_of::<i32>();
@@ -138,12 +135,15 @@ impl VramBudgetedCudaBackend {
         already_device_resident_scores: bool,
     ) -> Result<usize> {
         let k_eff = k.min(score_count);
-        let chunks = score_count.div_ceil(CUDA_EXACT_TOPK_MAX_K);
-        let output_entries = chunks.checked_mul(k_eff).ok_or_else(|| {
-            budget_error(format!(
-                "{operation} top-k temporary shape overflow: chunks={chunks} k={k_eff}"
-            ))
-        })?;
+        // The device merge ladder (#2107 H1) holds two levels at once while it
+        // collapses; `topk_device_entry_peak` walks the same loop the kernel
+        // driver walks, so the reserved shape is the allocated shape.
+        let output_entries = crate::cuda::topk::topk_device_entry_peak(1, score_count, k_eff);
+        if output_entries == 0 && k_eff > 0 && score_count > 0 {
+            return Err(budget_error(format!(
+                "{operation} top-k temporary shape overflow: scores={score_count} k={k_eff}"
+            )));
+        }
         let score_bytes = if already_device_resident_scores {
             0
         } else {
@@ -167,35 +167,41 @@ impl VramBudgetedCudaBackend {
         })
     }
 
+    /// Device-buffer bytes one batched kNN dispatch holds at its peak.
+    ///
+    /// After #2107 the CUDA path uploads the whole query matrix once, and each
+    /// launch materializes a `tile x candidate_count` score matrix plus the
+    /// device top-k merge ladder — for *every* metric, including `L2Squared`,
+    /// which used to rank on the host. The tile is computed with the same
+    /// [`crate::cuda::knn_query_tile`] the dispatch uses, so this is a
+    /// measurement rather than an estimate.
     fn measured_knn_bytes(
         &self,
         queries: &[f32],
         candidates: &[f32],
         dim: usize,
         k: usize,
-        metric: KnnMetric,
+        _metric: KnnMetric,
     ) -> Result<usize> {
         if queries.is_empty() || candidates.is_empty() || dim == 0 || k == 0 {
             return Ok(0);
         }
         let candidate_count = candidates.len() / dim;
+        let query_count = queries.len() / dim.max(1);
         let k_eff = k.min(candidate_count);
-        let topk_entries = if matches!(metric, KnnMetric::Cosine | KnnMetric::Dot) {
-            let chunks = candidate_count.div_ceil(CUDA_EXACT_TOPK_MAX_K);
-            chunks.checked_mul(k_eff).ok_or_else(|| {
-                budget_error(format!(
-                    "knn top-k temporary shape overflow: chunks={chunks} k={k_eff}"
-                ))
-            })?
-        } else {
-            0
-        };
+        let tile = crate::cuda::knn_query_tile(candidate_count, query_count);
+        let score_elements = tile.checked_mul(candidate_count).ok_or_else(|| {
+            budget_error(format!(
+                "knn score matrix shape overflow: tile={tile} candidates={candidate_count}"
+            ))
+        })?;
+        let topk_entries = crate::cuda::topk::topk_device_entry_peak(tile, candidate_count, k_eff);
         let resident_f32 = checked_sum(
             "knn",
             &[
                 candidates.len(),
-                dim.min(queries.len()),
-                candidate_count,
+                queries.len(),
+                score_elements,
                 topk_entries,
             ],
         )?;

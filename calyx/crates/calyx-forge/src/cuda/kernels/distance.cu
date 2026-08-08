@@ -29,8 +29,13 @@ __device__ __forceinline__ void reduce_sums(
     }
 }
 
+// BATCHING (#2107 H4): `blockIdx.y` is the query row. A single-query launch is
+// `gridDim.y == 1`, which walks exactly the same per-block reduction tree over
+// exactly the same operands in exactly the same order as the pre-batching
+// kernel, so batched results are bit-identical to the per-query loop they
+// replace. Only the launch geometry changed.
 extern "C" __global__ __launch_bounds__(256) void cosine_batch_f32(
-    const float *query,
+    const float *queries,
     const float *candidates,
     int dim,
     int n_cands,
@@ -46,11 +51,15 @@ extern "C" __global__ __launch_bounds__(256) void cosine_batch_f32(
         return;
     }
 
+    const float *query = queries + (long long)blockIdx.y * (long long)dim;
+    const long long out_index = (long long)blockIdx.y * (long long)n_cands + cand;
+
     float dot = 0.0f;
     float norm_q = 0.0f;
     float norm_c = 0.0f;
     int bad = dim <= 0;
-    const int base = cand * dim;
+    // 64-bit row base: n_cands * dim overflows int32 for wide candidate panels.
+    const long long base = (long long)cand * (long long)dim;
 
     for (int i = tid; i < dim; i += blockDim.x) {
         const float q = query[i];
@@ -78,15 +87,15 @@ extern "C" __global__ __launch_bounds__(256) void cosine_batch_f32(
     if (tid == 0) {
         const float denom = sqrtf(norm_q_shared[0]) * sqrtf(norm_c_shared[0]);
         if (bad_shared[0]) {
-            out[cand] = NAN;
+            out[out_index] = NAN;
         } else {
-            out[cand] = denom > 0.0f ? dot_shared[0] / denom : -2.0f;
+            out[out_index] = denom > 0.0f ? dot_shared[0] / denom : -2.0f;
         }
     }
 }
 
 extern "C" __global__ __launch_bounds__(256) void dot_batch_f32(
-    const float *query,
+    const float *queries,
     const float *candidates,
     int dim,
     int n_cands,
@@ -101,9 +110,13 @@ extern "C" __global__ __launch_bounds__(256) void dot_batch_f32(
         return;
     }
 
+    const float *query = queries + (long long)blockIdx.y * (long long)dim;
+    const long long out_index = (long long)blockIdx.y * (long long)n_cands + cand;
+
     float dot = 0.0f;
     int bad = dim < 0;
-    const int base = cand * dim;
+    // 64-bit row base: n_cands * dim overflows int32 for wide candidate panels.
+    const long long base = (long long)cand * (long long)dim;
 
     for (int i = tid; i < dim; i += blockDim.x) {
         const float q = query[i];
@@ -119,12 +132,12 @@ extern "C" __global__ __launch_bounds__(256) void dot_batch_f32(
     reduce_sums(dot_shared, unused_shared, bad_shared, tid);
 
     if (tid == 0) {
-        out[cand] = bad_shared[0] ? NAN : dot_shared[0];
+        out[out_index] = bad_shared[0] ? NAN : dot_shared[0];
     }
 }
 
 extern "C" __global__ __launch_bounds__(256) void l2_batch_f32(
-    const float *query,
+    const float *queries,
     const float *candidates,
     int dim,
     int n_cands,
@@ -139,9 +152,13 @@ extern "C" __global__ __launch_bounds__(256) void l2_batch_f32(
         return;
     }
 
+    const float *query = queries + (long long)blockIdx.y * (long long)dim;
+    const long long out_index = (long long)blockIdx.y * (long long)n_cands + cand;
+
     float l2 = 0.0f;
     int bad = dim < 0;
-    const int base = cand * dim;
+    // 64-bit row base: n_cands * dim overflows int32 for wide candidate panels.
+    const long long base = (long long)cand * (long long)dim;
 
     for (int i = tid; i < dim; i += blockDim.x) {
         const float q = query[i];
@@ -158,7 +175,7 @@ extern "C" __global__ __launch_bounds__(256) void l2_batch_f32(
     reduce_sums(l2_shared, unused_shared, bad_shared, tid);
 
     if (tid == 0) {
-        out[cand] = bad_shared[0] ? NAN : l2_shared[0];
+        out[out_index] = bad_shared[0] ? NAN : l2_shared[0];
     }
 }
 

@@ -158,6 +158,30 @@ impl Backend for CudaBackend {
     }
 }
 
+/// Upper bound on the f32 score matrix one batched kNN launch materializes on
+/// the device.
+///
+/// The batched path (#2107 H4) trades one score buffer per query for one score
+/// matrix per tile. This constant is what keeps that matrix a bounded,
+/// *measurable* shape: the VRAM admission measurement computes the identical
+/// tile from [`knn_query_tile`], so the reserved bytes are the bytes the
+/// kernels allocate.
+pub const CUDA_KNN_TILE_SCORE_BYTES: usize = 256 * 1024 * 1024;
+
+/// Query rows processed by one batched kNN launch for this candidate count.
+#[must_use]
+pub fn knn_query_tile(candidate_count: usize, query_count: usize) -> usize {
+    if candidate_count == 0 || query_count == 0 {
+        return 0;
+    }
+    let budget_rows = (CUDA_KNN_TILE_SCORE_BYTES / size_of::<f32>()) / candidate_count;
+    budget_rows
+        .max(1)
+        .min(query_count)
+        .min(distance::DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH)
+        .min(topk::TOPK_MAX_ROWS_PER_LAUNCH)
+}
+
 fn knn_cuda(
     ctx: &CudaContext,
     queries: &[f32],
@@ -167,7 +191,8 @@ fn knn_cuda(
     k: usize,
     metric: KnnMetric,
 ) -> Result<KnnBatch> {
-    let candidate_count = crate::cpu::validate_knn_shape(queries, candidates, query_count, dim)?;
+    let candidate_count =
+        crate::cpu::validate_knn_shape_only(queries, candidates, query_count, dim)?;
     let k_eff = k.min(candidate_count);
     if query_count == 0 || k_eff == 0 {
         return KnnBatch::new(
@@ -179,12 +204,15 @@ fn knn_cuda(
             Vec::new(),
         );
     }
-    if matches!(metric, KnnMetric::Cosine | KnnMetric::Dot) && k_eff > CUDA_EXACT_TOPK_MAX_K {
+    // Every metric now ranks on the device, so every metric carries the exact
+    // top-k bound. `L2Squared` used to escape it by sorting all candidates on
+    // the host (#2107 H2); that host sort is gone.
+    if k_eff > CUDA_EXACT_TOPK_MAX_K {
         return Err(ForgeError::ShapeMismatch {
             expected: vec![CUDA_EXACT_TOPK_MAX_K],
             got: vec![k_eff],
             remediation: format!(
-                "cuda knn uses exact topk and is bounded to k <= {CUDA_EXACT_TOPK_MAX_K}"
+                "cuda knn uses exact device topk for every metric and is bounded to k <= {CUDA_EXACT_TOPK_MAX_K}"
             ),
         });
     }
@@ -198,86 +226,72 @@ fn knn_cuda(
     let mut indices = Vec::with_capacity(total_hits);
     let mut scores = Vec::with_capacity(total_hits);
     let stream = ctx.inner().default_stream();
+
+    // One upload for the whole call, then a device-side finiteness gate over
+    // the uploaded bytes (#2107 H3) instead of a host scalar pre-scan.
     let candidates_dev = stream
         .clone_htod(candidates)
         .map_err(|err| cuda_knn_device(ctx, format!("candidate upload failed: {err}")))?;
+    distance::check_uploaded_finite(ctx, "knn", candidates, &candidates_dev)?;
+    let queries_dev = stream
+        .clone_htod(queries)
+        .map_err(|err| cuda_knn_device(ctx, format!("query upload failed: {err}")))?;
+    distance::check_uploaded_finite(ctx, "knn", queries, &queries_dev)?;
 
-    for query in queries.chunks_exact(dim) {
-        let query_dev = stream
-            .clone_htod(query)
-            .map_err(|err| cuda_knn_device(ctx, format!("query upload failed: {err}")))?;
-        let mut out_dev = stream
-            .alloc_zeros(candidate_count)
+    let (kernel_name, op, sentinel, order) = match metric {
+        KnnMetric::Cosine => (
+            "cosine_batch_f32",
+            "cosine_batch_gpu",
+            true,
+            topk::TopkOrder::MaxK,
+        ),
+        KnnMetric::Dot => (
+            "dot_batch_f32",
+            "dot_batch_gpu",
+            false,
+            topk::TopkOrder::MaxK,
+        ),
+        KnnMetric::L2Squared => ("l2_batch_f32", "l2_batch_gpu", false, topk::TopkOrder::MinK),
+    };
+
+    let tile = knn_query_tile(candidate_count, query_count);
+    let mut first_query = 0_usize;
+    while first_query < query_count {
+        let rows = tile.min(query_count - first_query);
+        let query_offset = first_query * dim;
+        let tile_queries = queries_dev
+            .try_slice(query_offset..query_offset + rows * dim)
+            .ok_or_else(|| {
+                cuda_knn_device(ctx, format!("query tile slice at row {first_query} failed"))
+            })?;
+        let score_len =
+            rows.checked_mul(candidate_count)
+                .ok_or_else(|| ForgeError::ShapeMismatch {
+                    expected: vec![rows, candidate_count],
+                    got: vec![usize::MAX],
+                    remediation: "cuda knn score matrix shape overflows usize".to_string(),
+                })?;
+        let mut scores_dev = stream
+            .alloc_zeros(score_len)
             .map_err(|err| cuda_knn_device(ctx, format!("score allocation failed: {err}")))?;
-        match metric {
-            KnnMetric::Cosine => {
-                distance::cosine_batch_gpu(
-                    ctx,
-                    &query_dev,
-                    &candidates_dev,
-                    dim,
-                    candidate_count,
-                    &mut out_dev,
-                )?;
-                append_ranked(
-                    &mut indices,
-                    &mut scores,
-                    topk::topk_gpu(ctx, &out_dev, k_eff, candidate_count)?,
-                );
-            }
-            KnnMetric::Dot => {
-                distance::dot_batch_gpu(
-                    ctx,
-                    &query_dev,
-                    &candidates_dev,
-                    dim,
-                    candidate_count,
-                    &mut out_dev,
-                )?;
-                append_ranked(
-                    &mut indices,
-                    &mut scores,
-                    topk::topk_gpu(ctx, &out_dev, k_eff, candidate_count)?,
-                );
-            }
-            KnnMetric::L2Squared => {
-                distance::l2_batch_gpu(
-                    ctx,
-                    &query_dev,
-                    &candidates_dev,
-                    dim,
-                    candidate_count,
-                    &mut out_dev,
-                )?;
-                let l2_scores =
-                    distance::read_checked_device_output(ctx, "knn_l2_squared", &out_dev, false)?;
-                append_ranked(&mut indices, &mut scores, rank_l2(&l2_scores, k_eff));
-            }
-        }
+        distance::launch_distance_batched(
+            ctx,
+            op,
+            kernel_name,
+            &tile_queries,
+            &candidates_dev,
+            dim,
+            candidate_count,
+            rows,
+            &mut scores_dev,
+        )?;
+        distance::check_device_output(ctx, op, &scores_dev, sentinel)?;
+        let ranked = topk::topk_batched_gpu(ctx, &scores_dev, rows, candidate_count, k_eff, order)?;
+        indices.extend_from_slice(&ranked.indices);
+        scores.extend_from_slice(&ranked.scores);
+        first_query += rows;
     }
     KnnBatch::new(query_count, k_eff, candidate_count, metric, indices, scores)
-}
-
-fn append_ranked(indices: &mut Vec<usize>, scores: &mut Vec<f32>, ranked: Vec<(usize, f32)>) {
-    for (index, score) in ranked {
-        indices.push(index);
-        scores.push(score);
-    }
-}
-
-fn rank_l2(scores: &[f32], k: usize) -> Vec<(usize, f32)> {
-    let mut ranked = scores
-        .iter()
-        .copied()
-        .enumerate()
-        .collect::<Vec<(usize, f32)>>();
-    ranked.sort_by(|left, right| {
-        left.1
-            .total_cmp(&right.1)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    ranked.truncate(k);
-    ranked
 }
 
 fn cuda_knn_device(ctx: &CudaContext, detail: String) -> ForgeError {

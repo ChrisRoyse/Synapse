@@ -3764,6 +3764,7 @@ dependencies = [
 name = "synapse-audio"
 version = "0.1.0"
 dependencies = [
+ "calyx-forge",
  "chrono",
  "metrics",
  "ort",

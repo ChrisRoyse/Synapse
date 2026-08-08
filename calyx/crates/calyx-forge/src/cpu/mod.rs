@@ -170,6 +170,25 @@ pub(crate) fn validate_knn_shape(
     query_count: usize,
     dim: usize,
 ) -> Result<usize> {
+    let candidate_count = validate_knn_shape_only(queries, candidates, query_count, dim)?;
+    check_finite(queries, "knn")?;
+    check_finite(candidates, "knn")?;
+    Ok(candidate_count)
+}
+
+/// Shape-only half of [`validate_knn_shape`].
+///
+/// The CUDA path (#2107 H3) runs the finiteness half on the device against the
+/// buffers it has already uploaded, instead of scanning the same candidate
+/// matrix on the host immediately before sending it over PCIe. `CpuBackend`
+/// still runs the full host validation, which is what
+/// [`validate_knn_shape`] does.
+pub(crate) fn validate_knn_shape_only(
+    queries: &[f32],
+    candidates: &[f32],
+    query_count: usize,
+    dim: usize,
+) -> Result<usize> {
     if dim == 0 {
         if queries.is_empty() && candidates.is_empty() && query_count == 0 {
             return Ok(0);
@@ -189,8 +208,6 @@ pub(crate) fn validate_knn_shape(
                 .to_string(),
         });
     }
-    check_finite(queries, "knn")?;
-    check_finite(candidates, "knn")?;
     Ok(candidates.len() / dim)
 }
 
