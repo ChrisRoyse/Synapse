@@ -25,7 +25,7 @@
 //! `operation_committed` so callers know whether the primary effect stands.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     path::Path,
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -822,6 +822,26 @@ fn anchor_agent_event_outcomes(
     records: &[AgentEventRecord],
     source_rows: &[(Vec<u8>, Vec<u8>)],
 ) -> StorageResult<()> {
+    // #2117: the terminal rows of every spawn this batch touches, materialized
+    // by ONE pass over `CF_AGENT_EVENTS` instead of the two full passes per
+    // terminal record this loop used to run (`canonical_spawn_terminal_event`
+    // and `anchor_spawn_terminal_event_rows` walked the same family with the
+    // same predicate, 2·N times for N terminal records — 93,078 JSON decodes
+    // per record on the deployed 46,539-row family).
+    //
+    // Nothing inside this loop writes `CF_AGENT_EVENTS`: the constellation and
+    // anchor writes address other families, and the transcript finalizer never
+    // touches this family. The family is therefore immutable for the duration
+    // of the loop and one materialization is exactly as current as N of them.
+    //
+    // A batch with no terminal record names no spawns and scans nothing at all.
+    let terminal_spawns = records
+        .iter()
+        .filter(|record| terminal_agent_outcome(record).is_some())
+        .filter_map(|record| nonblank_option(record.spawn_id.as_deref()))
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<String>>();
+    let terminal_rows = SpawnTerminalEventRows::materialize(db, &terminal_spawns)?;
     for (record, (source_key, source_value)) in records.iter().zip(source_rows) {
         if record.kind == AgentEventKind::ToolCallFinished {
             let error_present = tool_call_error_present(record);
@@ -864,10 +884,10 @@ fn anchor_agent_event_outcomes(
             continue;
         };
         finalize_spawn_transcripts_for_terminal_event(db, spawn_id, record)?;
-        let Some(canonical) = canonical_spawn_terminal_event(db, spawn_id)? else {
+        let Some(canonical) = canonical_spawn_terminal_event(&terminal_rows, spawn_id)? else {
             continue;
         };
-        anchor_spawn_terminal_event_rows(db, spawn_id)?;
+        anchor_spawn_terminal_event_rows(db, &terminal_rows, spawn_id)?;
         anchor_spawn_transcript_rows(db, spawn_id, canonical.outcome, canonical.observed_ts_ns)?;
     }
     Ok(())
@@ -877,10 +897,14 @@ pub(crate) fn anchor_spawn_end_state_from_storage(
     db: &Db,
     spawn_id: &str,
 ) -> StorageResult<Option<&'static str>> {
-    let Some(canonical) = canonical_spawn_terminal_event(db, spawn_id)? else {
+    // #2117: one materialization feeds both the canonical decision and the
+    // anchor write, where this used to run two identical full scans.
+    let terminal_rows =
+        SpawnTerminalEventRows::materialize(db, &BTreeSet::from([spawn_id.to_owned()]))?;
+    let Some(canonical) = canonical_spawn_terminal_event(&terminal_rows, spawn_id)? else {
         return Ok(None);
     };
-    anchor_spawn_terminal_event_rows(db, spawn_id)?;
+    anchor_spawn_terminal_event_rows(db, &terminal_rows, spawn_id)?;
     anchor_spawn_transcript_rows(db, spawn_id, canonical.outcome, canonical.observed_ts_ns)?;
     Ok(Some(canonical.outcome))
 }
@@ -891,20 +915,101 @@ struct SpawnTerminalObservation {
     observed_ts_ns: u64,
 }
 
+/// One `CF_AGENT_EVENTS` row that carries a terminal outcome for a spawn of
+/// interest, kept exactly as the scan produced it.
+///
+/// The key is retained **undecoded**: `canonical_spawn_terminal_event` is the
+/// site that decodes it and raises the key/record timestamp-drift error, and it
+/// must keep raising that error at the same point in the batch it did when it
+/// ran its own scan.
+struct SpawnTerminalEventRow {
+    key: Vec<u8>,
+    value: Vec<u8>,
+    record: AgentEventRecord,
+    outcome: &'static str,
+}
+
+/// The terminal `CF_AGENT_EVENTS` rows of a named set of spawns, in scan order,
+/// materialized by a single pass over the family (#2117).
+///
+/// Replaces "read every row, then keep the ones matching this spawn" — run
+/// twice per terminal record — with "read every row once, keep the ones
+/// matching any spawn in this batch". The retained row set for any one spawn is
+/// identical by construction: same source, same predicate, same order.
+struct SpawnTerminalEventRows {
+    rows_scanned: usize,
+    by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>>,
+}
+
+impl SpawnTerminalEventRows {
+    fn materialize(db: &Db, spawns: &BTreeSet<String>) -> StorageResult<Self> {
+        let mut by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>> = BTreeMap::new();
+        let mut rows_scanned = 0_usize;
+        if spawns.is_empty() {
+            // Nothing to look for. The family is not read at all — the common
+            // case on the write path, where most batches carry no terminal
+            // record and the old code also scanned nothing.
+            return Ok(Self {
+                rows_scanned,
+                by_spawn,
+            });
+        }
+        for (key, value) in db.scan_cf(cf::CF_AGENT_EVENTS)? {
+            rows_scanned = rows_scanned.saturating_add(1);
+            // Decoding every row is retained deliberately: the two scans this
+            // replaces both decoded every row and both failed the whole
+            // projection on any undecodable row anywhere in the family. Keeping
+            // that means a corrupt row still fails exactly as loudly as before.
+            let record: AgentEventRecord = decode_json(&value)?;
+            let Some(spawn_id) = nonblank_option(record.spawn_id.as_deref()) else {
+                continue;
+            };
+            if !spawns.contains(spawn_id) {
+                continue;
+            }
+            let Some(outcome) = terminal_agent_outcome(&record) else {
+                continue;
+            };
+            by_spawn
+                .entry(spawn_id.to_owned())
+                .or_default()
+                .push(SpawnTerminalEventRow {
+                    key,
+                    value,
+                    record,
+                    outcome,
+                });
+        }
+        tracing::debug!(
+            code = "AGENT_END_STATE_TERMINAL_ROWS_MATERIALIZED",
+            spawns_requested = spawns.len(),
+            spawns_matched = by_spawn.len(),
+            rows_scanned,
+            terminal_rows = by_spawn.values().map(Vec::len).sum::<usize>(),
+            cf_name = cf::CF_AGENT_EVENTS,
+            "readback=one physical CF_AGENT_EVENTS pass shared by the canonical end-state decision and the terminal-row anchor write"
+        );
+        Ok(Self {
+            rows_scanned,
+            by_spawn,
+        })
+    }
+
+    fn rows_for(&self, spawn_id: &str) -> &[SpawnTerminalEventRow] {
+        self.by_spawn.get(spawn_id).map_or(&[], Vec::as_slice)
+    }
+}
+
 fn canonical_spawn_terminal_event(
-    db: &Db,
+    terminal_rows: &SpawnTerminalEventRows,
     spawn_id: &str,
 ) -> StorageResult<Option<SpawnTerminalObservation>> {
     let mut canonical: Option<SpawnTerminalObservation> = None;
-    for (key, value) in db.scan_cf(cf::CF_AGENT_EVENTS)? {
-        let record: AgentEventRecord = decode_json(&value)?;
-        if nonblank_option(record.spawn_id.as_deref()) != Some(spawn_id) {
-            continue;
-        }
-        let Some(outcome) = terminal_agent_outcome(&record) else {
-            continue;
-        };
-        let (key_ts_ns, _seq) = synapse_storage::agent_events::decode_agent_event_key(&key)
+    for row in terminal_rows.rows_for(spawn_id) {
+        let key = &row.key;
+        let record = &row.record;
+        let outcome = row.outcome;
+        let (key_ts_ns, _seq) = synapse_storage::agent_events::decode_agent_event_key(key)
             .map_err(|error| StorageError::ReadFailed {
                 cf_name: cf::CF_AGENT_EVENTS.to_owned(),
                 detail: format!("agent end-state anchor scan found corrupt event key: {error}"),
@@ -945,7 +1050,7 @@ fn canonical_spawn_terminal_event(
                     canonical_observed_ts_ns = existing.observed_ts_ns,
                     conflicting_outcome = outcome,
                     conflicting_observed_ts_ns = record.ts_ns,
-                    conflicting_event_key = %synapse_storage::constellations::hex_encode(&key),
+                    conflicting_event_key = %synapse_storage::constellations::hex_encode(key),
                     cf_name = cf::CF_AGENT_EVENTS,
                     rule = "earliest_terminal_observation_wins",
                     "spawn has conflicting terminal outcomes; the earliest observation stays canonical and this later disagreeing observation is recorded, not adopted — reconcile the disagreeing writers"
@@ -973,27 +1078,24 @@ fn canonical_spawn_terminal_event(
     Ok(canonical)
 }
 
-fn anchor_spawn_terminal_event_rows(db: &Db, spawn_id: &str) -> StorageResult<()> {
+fn anchor_spawn_terminal_event_rows(
+    db: &Db,
+    terminal_rows: &SpawnTerminalEventRows,
+    spawn_id: &str,
+) -> StorageResult<()> {
     let mut anchored = 0_usize;
-    for (source_key, source_value) in db.scan_cf(cf::CF_AGENT_EVENTS)? {
-        let record: AgentEventRecord = decode_json(&source_value)?;
-        if nonblank_option(record.spawn_id.as_deref()) != Some(spawn_id) {
-            continue;
-        }
-        let Some(outcome) = terminal_agent_outcome(&record) else {
-            continue;
-        };
-        db.put_agent_event_constellation(&source_key, &source_value, &record)?;
+    for row in terminal_rows.rows_for(spawn_id) {
+        db.put_agent_event_constellation(&row.key, &row.value, &row.record)?;
         put_agent_grounding_anchor(
             db,
             cf::CF_AGENT_EVENTS,
-            &source_key,
-            &source_value,
+            &row.key,
+            &row.value,
             grounding::enum_anchor(
                 "synapse:agent_end_state",
-                outcome,
+                row.outcome,
                 SOURCE_AGENT_EVENT,
-                grounding::observed_at_ms_from_ns(record.ts_ns),
+                grounding::observed_at_ms_from_ns(row.record.ts_ns),
             ),
             "agent end-state event anchor",
         )?;
@@ -1003,6 +1105,7 @@ fn anchor_spawn_terminal_event_rows(db: &Db, spawn_id: &str) -> StorageResult<()
         code = "AGENT_END_STATE_EVENT_ROWS_ANCHORED",
         spawn_id,
         event_rows = anchored,
+        rows_scanned = terminal_rows.rows_scanned,
         "terminal agent outcomes grounded on terminal spawn event constellations"
     );
     Ok(())

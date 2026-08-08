@@ -302,6 +302,16 @@ pub struct SynapseCalyxWeaveReport {
     pub agreement_zero_norm_sample_truncated: bool,
     pub xterm_cf_rows_after: usize,
     pub graph_cf_rows_after: usize,
+    /// How the two readback counts above were obtained on this pass (#2114):
+    /// `walked` (physically re-walked), `walked_drift_check` (re-walked to
+    /// confront the memo with the disk), or `unchanged_since_last_walk` (the
+    /// vault has committed nothing since the walk that produced them, so the
+    /// row set is provably the same one). Reported rather than implied — a
+    /// count that was not re-walked must not read like one that was.
+    #[serde(default)]
+    pub xterm_cf_rows_readback: String,
+    #[serde(default)]
+    pub graph_cf_rows_readback: String,
     /// Effective half-open time window applied to `Base` rows, echoed back.
     pub since_ts_ns: Option<i64>,
     pub until_ts_ns: Option<i64>,
@@ -484,12 +494,13 @@ impl SynapseCalyxVault {
             self.flush()?;
         }
 
-        let xterm_cf_rows_after = self
-            .count_cf_latest_bounded(ColumnFamily::XTerm)?
-            .rows_visited;
-        let graph_cf_rows_after = self
-            .count_cf_latest_bounded(ColumnFamily::Graph)?
-            .rows_visited;
+        // #2114: still a physical readback of what this weave persisted, but no
+        // longer re-walked when the vault provably has not changed since the
+        // last walk. The provenance of each number rides along on the report.
+        let xterm_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::XTerm)?;
+        let graph_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::Graph)?;
+        let xterm_cf_rows_after = xterm_readback.rows();
+        let graph_cf_rows_after = graph_readback.rows();
 
         let mut abundance = self.build_abundance_report(
             params.panel_version,
@@ -521,6 +532,8 @@ impl SynapseCalyxVault {
             agreement_zero_norm_sample_truncated,
             xterm_cf_rows_after,
             graph_cf_rows_after,
+            xterm_cf_rows_readback: xterm_readback.provenance().to_owned(),
+            graph_cf_rows_readback: graph_readback.provenance().to_owned(),
             since_ts_ns: params.since_ts_ns,
             until_ts_ns: params.until_ts_ns,
             records_outside_window,
@@ -650,11 +663,11 @@ impl SynapseCalyxVault {
             measured_slot_instances += record.slots.len();
         }
         let xterm_cf_rows = self
-            .count_cf_latest_bounded(ColumnFamily::XTerm)?
-            .rows_visited;
+            .count_cf_latest_bounded_memoized(ColumnFamily::XTerm)?
+            .rows();
         let graph_cf_rows = self
-            .count_cf_latest_bounded(ColumnFamily::Graph)?
-            .rows_visited;
+            .count_cf_latest_bounded_memoized(ColumnFamily::Graph)?
+            .rows();
         // `N` is the panel contract, not the subset one loader accepted: the
         // DDA yield `n·(N + C(N,2) + 1)` is a statement about the panel, and
         // shrinking `N` to the carried subset understates the association
@@ -4992,8 +5005,8 @@ impl SynapseCalyxVault {
         });
         self.persist_temporal_row(ColumnFamily::Graph, key, &out_edge)?;
         let graph_cf_rows_after = self
-            .count_cf_latest_bounded(ColumnFamily::Graph)?
-            .rows_visited;
+            .count_cf_latest_bounded_memoized(ColumnFamily::Graph)?
+            .rows();
 
         Ok(SynapseCalyxCausalityReport {
             panel_version: params.panel_version,

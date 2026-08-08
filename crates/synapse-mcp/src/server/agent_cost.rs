@@ -54,7 +54,10 @@
 //! Exact multi-model attribution from Claude `modelUsage` (#949) is per-spawn;
 //! per-turn cost is priced by the spawn's primary model.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use schemars::JsonSchema;
@@ -2695,6 +2698,69 @@ static COST_ROLLUP_MATERIALIZE_PERMITS: std::sync::LazyLock<
     std::sync::Arc<tokio::sync::Semaphore>,
 > = std::sync::LazyLock::new(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1)));
 
+// --------------------------------------------------------------------------
+// Invalidation model for the periodic pass (#2113)
+// --------------------------------------------------------------------------
+//
+// The periodic pass used to re-scan the entire `CF_AGENT_TRANSCRIPTS` corpus
+// every `SYNAPSE_TRANSCRIPT_INGEST_INTERVAL_SECS` (15 s default) with no guard
+// at all. On the deployed daemon that was 599 consecutive passes over ~370 k
+// rows each — 221 M row visits in four hours — every one of which wrote
+// `cells_written=0`. The pass is a pure function of exactly two inputs:
+//
+//   1. the `CF_AGENT_TRANSCRIPTS` row set, and
+//   2. `sealed_horizon_ns` (which flips an unresolved spawn from "still
+//      growing, no contribution" to "stable, contributes an incomplete cell").
+//
+// so a pass whose two inputs are both unchanged since the last **complete**
+// pass provably cannot write, delete, or change a single cell. The gate below
+// proves both, cheaply:
+//
+// * **Sealed horizon** is derived from the clock, so comparing it to the one
+//   the last complete pass published is free. It advances exactly once per
+//   hour, which is also what guarantees a full pass still runs hourly.
+// * **Corpus writes** are counted by an in-process epoch that
+//   `commit_transcript_chunk` — the *single* commit site for
+//   `CF_AGENT_TRANSCRIPTS` rows, shared by the transcript and ambient ingest
+//   paths — bumps on every applied batch. The epoch is in-process only and
+//   starts unmatched, so the first pass after a daemon start always runs.
+//
+// Deliberately NOT adopted (issue #2113 proposal 2): resuming from "the highest
+// transcript key covered by the last complete pass". Transcript keys are
+// `spawn_id || 0x00 || line_no` and spawn ids are random, not monotonic, so a
+// new spawn sorts anywhere in the key space and appended lines of an existing
+// spawn sit below the global maximum key. A key watermark would silently skip
+// both. It is a scan-narrowing heuristic that trades exactness for speed, which
+// this rollup cannot afford — rejected, and recorded on the issue.
+//
+// Row *deletions* (disk-pressure shedding at Level3, GC) do not bump the epoch
+// because they do not run through the commit site. They are covered by the
+// hourly sealed-horizon pass, which is a full exact pass over the live corpus:
+// a shed row can therefore delay, but never suppress, its own reconciliation.
+
+/// Bumped once per applied `CF_AGENT_TRANSCRIPTS` commit batch. Monotonic for
+/// the life of the process; never persisted (a restart must re-prove the
+/// corpus, and does, because `ROLLUP_COVERED_WRITE_EPOCH` also resets).
+static TRANSCRIPT_CORPUS_WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// `epoch + 1` of the corpus the last **complete** pass covered, or `0` for
+/// "no complete pass in this process yet". The `+ 1` biasing keeps the
+/// "nothing covered" state distinguishable from "covered epoch 0" without a
+/// second atomic.
+static ROLLUP_COVERED_WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Records that transcript rows were committed, invalidating any rollup pass
+/// that has already read the corpus.
+///
+/// Called from `commit_transcript_chunk` after the guarded batch is applied and
+/// physically read back — i.e. only for rows that are actually durable.
+pub(crate) fn note_transcript_corpus_write(rows: usize) {
+    if rows == 0 {
+        return;
+    }
+    TRANSCRIPT_CORPUS_WRITE_EPOCH.fetch_add(1, Ordering::SeqCst);
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AgentCostRollupBackfillParams {
@@ -3265,6 +3331,11 @@ pub(crate) fn materialize_cost_rollups(
 ) -> Result<RollupMaterializeReport, ErrorData> {
     let built_at_ns = unix_time_ns_now();
     let sealed_horizon_ns = rollup_floor_hour(built_at_ns.saturating_sub(ROLLUP_SEAL_GRACE_NS));
+    // Sampled BEFORE the first row is read. A commit that lands while this pass
+    // is scanning therefore leaves the published epoch behind the live one, and
+    // the next cycle runs rather than skipping — the pass never claims to have
+    // covered a write it may have scanned past.
+    let corpus_write_epoch_at_start = TRANSCRIPT_CORPUS_WRITE_EPOCH.load(Ordering::SeqCst);
 
     if reset {
         purge_all_rollup_rows(db)?;
@@ -3354,9 +3425,14 @@ pub(crate) fn materialize_cost_rollups(
         if rows.is_empty() {
             break;
         }
-        for (key, value) in &rows {
+        // The page's own last key, taken before the rows are consumed: the scan
+        // cursor needs it, and moving the rows into `current_rows` below (rather
+        // than cloning key AND value of every row, ~740 k heap allocations and
+        // ~390 MB of copying per pass on the deployed corpus) consumes the page.
+        let next_start = rows.last().map(|(last_key, _value)| key_after(last_key));
+        for (key, value) in rows {
             transcript_rows_scanned = transcript_rows_scanned.saturating_add(1);
-            let (spawn_id, _line_no) = decode_agent_transcript_key(key)
+            let (spawn_id, _line_no) = decode_agent_transcript_key(&key)
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?;
             match &current_spawn {
                 Some(current) if current == &spawn_id => {}
@@ -3390,12 +3466,12 @@ pub(crate) fn materialize_cost_rollups(
                     current_rows = Vec::new();
                 }
             }
-            current_rows.push((key.clone(), value.clone()));
+            current_rows.push((key, value));
         }
-        let Some((last_key, _value)) = rows.last() else {
+        let Some(next_start) = next_start else {
             break;
         };
-        start = key_after(last_key);
+        start = next_start;
         if !more {
             break;
         }
@@ -3435,6 +3511,12 @@ pub(crate) fn materialize_cost_rollups(
     )?;
     db.delete_batch(cf::CF_KV, [ROLLUP_PROGRESS_KEY.as_bytes().to_vec()])
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    // Only a COMPLETE pass may publish coverage: an interrupted pass leaves the
+    // resume cursor and must not license a skip.
+    ROLLUP_COVERED_WRITE_EPOCH.store(
+        corpus_write_epoch_at_start.saturating_add(1),
+        Ordering::SeqCst,
+    );
 
     tracing::info!(
         code = "AGENT_COST_ROLLUP_MATERIALIZED",
@@ -3446,6 +3528,7 @@ pub(crate) fn materialize_cost_rollups(
         cells_deleted,
         built_at_ns,
         sealed_horizon_ns,
+        corpus_write_epoch = corpus_write_epoch_at_start,
         "materialized cost TimeSeries rollups off the MCP runtime"
     );
 
@@ -3477,16 +3560,98 @@ fn checkpoint_rollup_progress(
     )
 }
 
+/// What one periodic maintenance call did. The three outcomes are distinct on
+/// purpose: "another pass holds the permit" and "no input changed" are not the
+/// same event, and reporting either as the other would make the maintenance log
+/// unreadable exactly when it matters (#2113).
+pub(crate) enum CostRollupMaintenanceOutcome {
+    /// Another materialization (an operator backfill, or a slow prior pass)
+    /// holds the single admission permit.
+    Busy,
+    /// Every input the rollups read is unchanged since the last complete pass,
+    /// so the pass was proved a no-op and the corpus was not scanned.
+    SkippedUnchanged,
+    /// A full incremental pass ran.
+    Ran(Result<RollupMaterializeReport, ErrorData>),
+}
+
 /// Runs an incremental rollup pass only if no other materialization holds the
-/// admission permit. Returns `None` when a pass is already in flight. Used by
-/// the periodic transcript-ingest maintenance hook so rollups stay current
-/// without an operator call.
-pub(crate) fn materialize_cost_rollups_if_idle(
-    db: &Db,
-) -> Option<Result<RollupMaterializeReport, ErrorData>> {
-    let permit = COST_ROLLUP_MATERIALIZE_PERMITS.try_acquire().ok()?;
+/// admission permit **and** an input the rollups depend on has actually
+/// changed (#2113). Used by the periodic transcript-ingest maintenance hook so
+/// rollups stay current without an operator call.
+///
+/// Operator `rollup_backfill` calls `materialize_cost_rollups` directly and is
+/// deliberately not gated: an operator asking for a rebuild gets one.
+pub(crate) fn materialize_cost_rollups_if_idle(db: &Db) -> CostRollupMaintenanceOutcome {
+    let Ok(permit) = COST_ROLLUP_MATERIALIZE_PERMITS.try_acquire() else {
+        return CostRollupMaintenanceOutcome::Busy;
+    };
     let _permit = permit;
-    Some(materialize_cost_rollups(db, false))
+    match rollup_pass_would_be_noop(db) {
+        Err(error) => CostRollupMaintenanceOutcome::Ran(Err(error)),
+        Ok(Some(skip)) => {
+            tracing::debug!(
+                code = "AGENT_COST_ROLLUP_SKIPPED_UNCHANGED",
+                sealed_horizon_ns = skip.sealed_horizon_ns,
+                last_built_at_ns = skip.last_built_at_ns,
+                corpus_write_epoch = skip.corpus_write_epoch,
+                spawns_marked = skip.spawns_marked,
+                "both rollup inputs (transcript corpus, sealed horizon) are unchanged since the last complete pass, so no cell can differ; the corpus was not scanned"
+            );
+            CostRollupMaintenanceOutcome::SkippedUnchanged
+        }
+        Ok(None) => CostRollupMaintenanceOutcome::Ran(materialize_cost_rollups(db, false)),
+    }
+}
+
+/// Evidence that a periodic pass can be skipped, or `None` when it must run.
+#[derive(Clone, Copy, Debug)]
+struct RollupSkipEvidence {
+    sealed_horizon_ns: u64,
+    last_built_at_ns: u64,
+    corpus_write_epoch: u64,
+    spawns_marked: u64,
+}
+
+/// Proves — or fails to prove — that a periodic pass would write nothing.
+///
+/// Returns `Ok(Some(evidence))` only when **every** input the materialization
+/// reads is unchanged since the last complete pass in this process. Anything
+/// less (no meta, an incomplete meta, a schema the reader refuses, an advanced
+/// sealed horizon, a corpus write, a process that has not yet completed a pass)
+/// returns `Ok(None)` and the full pass runs. The proof is conjunctive and
+/// fails toward doing the work.
+fn rollup_pass_would_be_noop(db: &Db) -> Result<Option<RollupSkipEvidence>, ErrorData> {
+    let covered = ROLLUP_COVERED_WRITE_EPOCH.load(Ordering::SeqCst);
+    if covered == 0 {
+        // No complete pass in this process yet: nothing has been proven about
+        // the corpus, so the first pass after a start always scans.
+        return Ok(None);
+    }
+    let live_epoch = TRANSCRIPT_CORPUS_WRITE_EPOCH.load(Ordering::SeqCst);
+    if covered.saturating_sub(1) != live_epoch {
+        return Ok(None);
+    }
+    let Some(meta) = read_rollup_meta(db)? else {
+        return Ok(None);
+    };
+    if !meta.complete {
+        return Ok(None);
+    }
+    let sealed_horizon_ns =
+        rollup_floor_hour(unix_time_ns_now().saturating_sub(ROLLUP_SEAL_GRACE_NS));
+    if sealed_horizon_ns != meta.sealed_horizon_ns {
+        // An hour sealed. Every unresolved spawn whose latest evidence just
+        // fell behind the horizon gains an incomplete cell, so the corpus must
+        // be re-read even though not one row changed.
+        return Ok(None);
+    }
+    Ok(Some(RollupSkipEvidence {
+        sealed_horizon_ns,
+        last_built_at_ns: meta.built_at_ns,
+        corpus_write_epoch: live_epoch,
+        spawns_marked: meta.spawns_marked,
+    }))
 }
 
 /// Answers a fleet cost `summarize` from the materialized hour-window rollups

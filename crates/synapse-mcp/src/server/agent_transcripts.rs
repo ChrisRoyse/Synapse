@@ -1108,6 +1108,13 @@ pub(super) fn commit_transcript_chunk(
             })?;
     }
 
+    // #2113: this is the single commit site for `CF_AGENT_TRANSCRIPTS` rows
+    // (both the transcript and ambient ingest paths funnel through it), and the
+    // rows are durable and physically read back by the time control reaches
+    // here. Recording the write is what lets the periodic cost-rollup pass
+    // prove the corpus is unchanged and skip its full-corpus scan.
+    super::agent_cost::note_transcript_corpus_write(rows.len());
+
     tracing::debug!(
         code = "TRANSCRIPT_CHUNK_COMMITTED",
         source_kind = code_prefix,
@@ -2764,15 +2771,19 @@ fn run_cost_rollup_maintenance(m3_state: &Arc<Mutex<M3State>>) {
             }
         }
     };
+    use super::agent_cost::CostRollupMaintenanceOutcome;
     match super::agent_cost::materialize_cost_rollups_if_idle(&db) {
-        None => {
+        CostRollupMaintenanceOutcome::Busy => {
             tracing::debug!(
                 code = "AGENT_COST_ROLLUP_MAINTENANCE_BUSY",
                 "cost rollup materialization already in progress; periodic pass skipped"
             );
         }
-        Some(Ok(_report)) => {}
-        Some(Err(error)) => {
+        // #2113: the pass proved itself a no-op and said so with its own
+        // evidence record; nothing further to report here.
+        CostRollupMaintenanceOutcome::SkippedUnchanged => {}
+        CostRollupMaintenanceOutcome::Ran(Ok(_report)) => {}
+        CostRollupMaintenanceOutcome::Ran(Err(error)) => {
             tracing::warn!(
                 code = "AGENT_COST_ROLLUP_MAINTENANCE_FAILED",
                 error = %error.message,

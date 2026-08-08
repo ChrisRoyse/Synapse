@@ -2371,6 +2371,16 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
     let mut records_woven = 0u64;
     let mut last_xterm_rows = 0usize;
     let mut last_graph_rows = 0usize;
+    // #2114: how the two counts above were obtained on the last completed part.
+    // The weave no longer re-walks `XTerm` + `Graph` (2.75 M rows on the
+    // deployed vault) after a pass that the commit sequence proves changed
+    // nothing, so this log line must say which of the two it is reporting
+    // rather than let "readback=physical ... counts" imply a walk that did not
+    // run. Starts as `not_woven`: a tick that completes zero interval parts
+    // reports no readback at all, which is exactly what happened.
+    let mut last_xterm_readback = "not_woven".to_owned();
+    let mut last_graph_readback = "not_woven".to_owned();
+    let mut walked_readbacks = 0_usize;
     // Exclusive end of contiguously woven time. Every completed part is adjacent
     // to the last, so this is a position the next tick may safely resume from.
     let mut frontier_ns = since_ns;
@@ -2492,6 +2502,16 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
         records_woven = records_woven.saturating_add(report.records_woven as u64);
         last_xterm_rows = report.xterm_cf_rows_after;
         last_graph_rows = report.graph_cf_rows_after;
+        for provenance in [
+            report.xterm_cf_rows_readback.as_str(),
+            report.graph_cf_rows_readback.as_str(),
+        ] {
+            if provenance.starts_with("walked") {
+                walked_readbacks = walked_readbacks.saturating_add(1);
+            }
+        }
+        last_xterm_readback = report.xterm_cf_rows_readback;
+        last_graph_readback = report.graph_cf_rows_readback;
     }
 
     commit_weave_frontier(panel_version, since_ns, frontier_ns)?;
@@ -2554,9 +2574,13 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<u64, Stri
         records_woven,
         xterm_cf_rows = last_xterm_rows,
         graph_cf_rows = last_graph_rows,
+        xterm_cf_rows_readback = %last_xterm_readback,
+        graph_cf_rows_readback = %last_graph_readback,
+        cf_readback_walks = walked_readbacks,
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "readback=physical XTerm/Graph CF counts after every record in the woven prefix of the \
-         bounded ingest interval; the watermark now stands at frontier_ns"
+        "readback=physical XTerm/Graph CF counts, each either walked on this pass or proved \
+         unchanged by an unmoved commit sequence (see *_readback); the watermark now stands at \
+         frontier_ns"
     );
 
     // --- Classifying the stop: progress, or a wall (#2085) ---
