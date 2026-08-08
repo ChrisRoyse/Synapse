@@ -684,6 +684,23 @@ where
         self.rows.current_seq()
     }
 
+    /// One column family's exact `O(1)` change signal (#2139).
+    ///
+    /// [`Self::latest_seq`] moves on every commit to *any* family, which makes
+    /// it a usable invalidation key only for a vault that is entirely
+    /// quiescent — a far stronger and rarer condition than "this one family did
+    /// not change", and the reason the #2114 count memo never reused anything on
+    /// a busy vault. See [`crate::mvcc::CfChangeSignal`] for what the fields
+    /// license.
+    pub fn cf_change_signal(&self, cf: ColumnFamily) -> crate::mvcc::CfChangeSignal {
+        self.rows.cf_change_signal(cf)
+    }
+
+    /// Greatest committed sequence that wrote a row into `cf`, in `O(1)`.
+    pub fn latest_seq_for_cf(&self, cf: ColumnFamily) -> Seq {
+        self.rows.latest_seq_for_cf(cf)
+    }
+
     /// Latest committed seq whose batch wrote derived-search-content inputs
     /// (issue #1100). Content-neutral commits (idempotency-ledger appends,
     /// time-index sentinels) advance [`Self::latest_seq`] but not this.

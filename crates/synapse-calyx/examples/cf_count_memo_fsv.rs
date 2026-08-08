@@ -15,13 +15,15 @@
 //! ## The fix, and why it is not a cache
 //!
 //! `count_cf_latest_bounded_memoized` reuses the previous walk **only** when
-//! `latest_seq()` still equals the sequence that served every page of it. A row
-//! can only enter or leave a family through a committed MVCC transaction, and
-//! every commit allocates a strictly greater sequence — so an unmoved sequence
-//! is a proof that the row set is the identical row set, not a guess that it
-//! probably is. A walk that straddled a commit (`atomic() == false`) is never
-//! memoized, and every `CF_COUNT_MEMO_DRIFT_CHECK_REUSES` reuses the count is
-//! re-measured against the disk anyway.
+//! the family's own commit sequence has not passed the sequence that served
+//! every page of it (#2139; it was the vault-wide `latest_seq()` when this was
+//! first written). A row can only enter or leave a family through a committed
+//! MVCC transaction, and every such commit publishes that family's sequence
+//! before its rows become visible — so an unmoved per-CF sequence is a proof
+//! that the row set is the identical row set, not a guess that it probably is.
+//! A walk that straddled a commit (`atomic() == false`) is never memoized, and
+//! every `CF_COUNT_MEMO_DRIFT_CHECK_REUSES` reuses the count is re-measured
+//! against the disk anyway.
 //!
 //! ## What this run proves
 //!
@@ -30,8 +32,10 @@
 //! 2. **The walk really is skipped** — the `scan_cf_range_page_latest` guard
 //!    census counts holds, so a skipped walk is visible as *zero new holds*
 //!    rather than merely a faster call.
-//! 3. **A write invalidates it** — one committed row moves the sequence, the
-//!    next memoized call walks, and the number it reports is the new one.
+//! 3. **A write invalidates its own family** — one committed `Graph` row moves
+//!    `Graph`'s signal, the next memoized call for `Graph` walks and reports the
+//!    new number, and `XTerm` still reuses with a count a physical walk agrees
+//!    with (#2139).
 //! 4. **The drift check fires and agrees** — after the reuse budget the memo is
 //!    confronted with the disk and reports `walked_drift_check` with the same
 //!    count, with no `SYNAPSE_CALYX_CF_COUNT_MEMO_DRIFT` record emitted.
@@ -261,8 +265,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!();
     }
 
-    // ---- A committed write must invalidate every memo, on every family.
-    println!("--- write invalidation ---");
+    // ---- A committed write must invalidate the memo of the family it wrote.
+    //
+    // #2139 narrowed this from "every memo" to "this family's memo": the
+    // invalidation key is the per-CF change signal, not the vault-wide
+    // sequence. The other family must therefore still reuse, and its reused
+    // count must still equal a physical walk — which is what is asserted below,
+    // and what `cf_count_memo_per_cf_fsv` covers in full.
+    println!("--- write invalidation (per-CF since #2139) ---");
     vault.write_cf_batch(vec![SynapseCalyxCfWrite {
         cf: ColumnFamily::Graph,
         key: fsv_key(ColumnFamily::Graph, rows),
@@ -283,9 +293,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             walked.rows,
             walked.holds
         );
-        if memoized.provenance == "unchanged_since_last_walk" {
+        let written_family = cf == ColumnFamily::Graph;
+        if written_family && memoized.provenance == "unchanged_since_last_walk" {
             failures.push(format!(
-                "{}: a committed write did not invalidate the memo",
+                "{}: a committed write to this family did not invalidate its memo",
+                cf.name()
+            ));
+        }
+        if !written_family && memoized.provenance != "unchanged_since_last_walk" {
+            failures.push(format!(
+                "{}: a committed write to another family re-walked this one; the #2139 signal is \
+                 not per-CF",
                 cf.name()
             ));
         }

@@ -495,10 +495,27 @@ impl SynapseCalyxVault {
         }
 
         // #2114: still a physical readback of what this weave persisted, but no
-        // longer re-walked when the vault provably has not changed since the
+        // longer re-walked when the family provably has not changed since the
         // last walk. The provenance of each number rides along on the report.
+        //
+        // #2139 sharpened "the vault has not changed" to "this family has not
+        // changed": on the deployed daemon the vault-wide condition was defeated
+        // by every unrelated transcript-ingest commit, so the memo reused
+        // nothing and the 2.75 M-row walks continued exactly as before.
         let xterm_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::XTerm)?;
         let graph_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::Graph)?;
+        tracing::debug!(
+            code = "SYNAPSE_CALYX_WEAVE_CF_COUNT_READBACK",
+            panel_version = params.panel_version,
+            xterm_provenance = xterm_readback.provenance(),
+            xterm_rows = xterm_readback.rows(),
+            xterm_cf_last_commit_seq = xterm_readback.cf_last_commit_seq,
+            graph_provenance = graph_readback.provenance(),
+            graph_rows = graph_readback.rows(),
+            graph_cf_last_commit_seq = graph_readback.cf_last_commit_seq,
+            vault_latest_seq = graph_readback.vault_latest_seq,
+            "post-weave CF row counts, with the per-CF signal each decision was made on"
+        );
         let xterm_cf_rows_after = xterm_readback.rows();
         let graph_cf_rows_after = graph_readback.rows();
 

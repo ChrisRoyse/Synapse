@@ -271,6 +271,69 @@ fn row_shard_index(cf: ColumnFamily) -> usize {
     cf.shard_index()
 }
 
+/// The exact per-column-family change signal (#2139).
+///
+/// `changed_keys_after_at` costs `O(family)` whatever the answer is, so asking
+/// "did anything change in this family?" cost the same as the walk it was meant
+/// to avoid. Three consumers wanted that question answered in constant time —
+/// the search-generation freshness trigger, the CF-count readback memo (#2114),
+/// and the cost-rollup corpus gate (#2113) — and none could have it.
+///
+/// This is that answer, maintained where the ordering already exists: inside the
+/// commit, under the row-table write guard it already holds, before the rows it
+/// is about become visible to any reader.
+///
+/// # What each field licenses
+///
+/// * `last_commit_seq` — the greatest sequence allocated by a commit (or replayed
+///   by recovery) that wrote at least one row into this family. **A reader that
+///   observes `last_commit_seq <= S` may conclude that no row entered or left
+///   the family after sequence `S`**, because every row mutation in this store
+///   goes through one of the three write sites that publish this value first.
+/// * `out_of_band_epoch` — a counter of the physical CF-content changes that
+///   allocate no sequence at all: retiring a whole router CF, and retiring
+///   compaction/GC input SSTs. These do not move `last_commit_seq`, so a memo
+///   keyed only on sequences would survive them. Comparing the epoch for
+///   equality closes that hole.
+///
+/// Snapshot-version GC is deliberately **not** a signal: it never removes a key
+/// entry and always retains the newest version at or below the reader floor
+/// (`mvcc::store::gc::reclaim_chain`), so it cannot change any family's latest
+/// row set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CfChangeSignal {
+    /// Greatest committed sequence that wrote a row into this family, or `0`
+    /// when this process has committed none.
+    pub last_commit_seq: Seq,
+    /// Physical content changes to this family that allocated no sequence.
+    pub out_of_band_epoch: u64,
+}
+
+/// One family's change signal in its atomic form.
+#[derive(Debug, Default)]
+struct CfChangeCell {
+    last_commit_seq: AtomicU64,
+    out_of_band_epoch: AtomicU64,
+}
+
+/// One cell per [`ColumnFamily::shard_index`], allocated once at construction.
+///
+/// Indexed by shard rather than by family because `ColumnFamily` is not densely
+/// indexable — `Slot { slot, .. }` carries a `u16`, so a true per-family array
+/// would be 131,072 entries. Sharing the static families' one-cell-each mapping
+/// costs nothing (`shard_index` is injective over [`ColumnFamily::STATIC`]) and
+/// makes slot families alias in pools of 16.
+///
+/// **Aliasing is safe in the only direction that matters.** Two slot families
+/// sharing a cell can make a *quiet* family look changed, never the reverse: the
+/// cell is a maximum over the commits of every family that maps to it, so
+/// `last_commit_seq <= S` still proves that none of them — including the one
+/// asked about — committed after `S`. The cost of a collision is one extra
+/// physical walk, never a stale answer.
+fn new_cf_change_cells() -> Vec<CfChangeCell> {
+    (0..ROW_SHARDS).map(|_| CfChangeCell::default()).collect()
+}
+
 /// How long a row-table **read** guard may be held before it is reported.
 ///
 /// `VersionedCfStore::rows` is one vault-wide `RwLock<RowTable>`, so a commit
@@ -878,6 +941,9 @@ pub struct VersionedCfStore {
     snapshot_gc_cursor: std::sync::Mutex<gc::SnapshotGcCursor>,
     /// Per-site tallies for every row-table guard taken on this vault.
     row_guard_census: RowGuardCensus,
+    /// Exact `O(1)` per-family change signal (#2139). See [`CfChangeCell`] and
+    /// [`new_cf_change_cells`]. Fixed length, allocated once, never resized.
+    cf_change: Vec<CfChangeCell>,
 }
 
 impl VersionedCfStore {
@@ -1072,6 +1138,7 @@ impl VersionedCfStore {
             snapshot_gc_counters: SnapshotGcCounters::default(),
             snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
+            cf_change: new_cf_change_cells(),
         }
     }
 
@@ -1104,6 +1171,7 @@ impl VersionedCfStore {
             snapshot_gc_counters: SnapshotGcCounters::default(),
             snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
+            cf_change: new_cf_change_cells(),
         }
     }
 
@@ -1171,6 +1239,11 @@ impl VersionedCfStore {
             .collect::<Vec<_>>()
             .join(",");
         let eager_lookup = self.router_eager_lookup_on_refresh.load(Ordering::Acquire);
+        // Before the level swap below makes the new view visible (#2139).
+        // Retention GC reaches this path with inputs whose replacement dropped
+        // expired rows, so this is a real content change that allocates no
+        // sequence — the one case a sequence-keyed memo cannot see.
+        self.note_cf_content_changed_outside_commit(&unique);
 
         // ---- Phase A: exclusive, metadata only ----------------------------
         // The guard lives only inside this block: Phase B below MUST run with
@@ -1257,6 +1330,9 @@ impl VersionedCfStore {
                 "{operation}: physical SST reclaim requires a live CF router; cfs={cf_names}"
             )));
         };
+        // Before `reclaim()` touches a file (#2139); see
+        // `retire_then_purge_cf_inputs`.
+        self.note_cf_content_changed_outside_commit(&unique);
         tracing::info!(
             code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_START",
             operation,
@@ -1359,6 +1435,10 @@ impl VersionedCfStore {
                 "{operation}: physical CF retire requires a live CF router"
             )));
         };
+        // Retiring the CF removes its rows outright, and allocates no sequence
+        // (#2139). Published before the retire so no reader can see the emptied
+        // family through an unchanged signal.
+        self.note_cf_content_changed_outside_commit(&[cf]);
         let physical = router.retire_cf(cf)?;
         let elapsed_ms = started_at.elapsed().as_millis();
         if elapsed_ms > u128::from(EXCLUSIVE_ROUTER_RECLAIM_WARN_MS) {
@@ -1377,6 +1457,74 @@ impl VersionedCfStore {
     /// Latest committed sequence.
     pub fn current_seq(&self) -> Seq {
         self.seqs.current()
+    }
+
+    /// This family's change signal, read at this instant, in `O(1)` (#2139).
+    ///
+    /// See [`CfChangeSignal`] for what the two fields license. Reading is two
+    /// relaxed-cost atomic loads and touches no lock, no row, and no shard, so
+    /// a caller may ask on every cycle without the question costing what the
+    /// answer avoids — which is the whole point of the issue this closes.
+    pub fn cf_change_signal(&self, cf: ColumnFamily) -> CfChangeSignal {
+        let cell = &self.cf_change[row_shard_index(cf)];
+        // The two loads are not atomic together, and do not need to be. Both
+        // counters are monotonically non-decreasing and both are published
+        // *before* the change they describe becomes visible to any reader, so a
+        // pair read at instants `t1 <= t2` proves "unchanged through `t1`" —
+        // a real instant, which is all a physical walk gives either.
+        let last_commit_seq = cell.last_commit_seq.load(Ordering::Acquire);
+        let out_of_band_epoch = cell.out_of_band_epoch.load(Ordering::Acquire);
+        CfChangeSignal {
+            last_commit_seq,
+            out_of_band_epoch,
+        }
+    }
+
+    /// Greatest sequence that wrote a row into `cf`, in `O(1)`.
+    ///
+    /// The narrow form of [`Self::cf_change_signal`] for callers comparing
+    /// against a sequence they already hold.
+    pub fn latest_seq_for_cf(&self, cf: ColumnFamily) -> Seq {
+        self.cf_change_signal(cf).last_commit_seq
+    }
+
+    /// Publishes `seq` as the family's last-commit sequence for every family in
+    /// `rows`.
+    ///
+    /// **Called under the row-table write guard, before the rows are applied.**
+    /// That ordering is the whole proof: a reader can only observe this commit's
+    /// rows after the guard is released, and the guard is released after this
+    /// store, so no reader can see a row whose family still reports an older
+    /// sequence. The reverse skew — the sequence published while the row is not
+    /// yet visible — is harmless: it can only make a reader re-measure.
+    ///
+    /// `fetch_max` rather than `store` because recovery replays batches whose
+    /// sequences are ordered but whose *families* interleave, and because a
+    /// regression here would be indistinguishable from a quiet family.
+    fn publish_cf_commit_seq(&self, rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)], seq: Seq) {
+        for (cf, _key, _value) in rows {
+            self.cf_change[row_shard_index(*cf)]
+                .last_commit_seq
+                .fetch_max(seq, Ordering::AcqRel);
+        }
+    }
+
+    /// Records a physical change to a family's content that allocated no
+    /// sequence (#2139).
+    ///
+    /// Retiring a router CF removes its rows outright; retiring compaction or
+    /// retention-GC input SSTs replaces the served level for the family. Neither
+    /// moves [`Self::current_seq`], so neither can be detected by a sequence
+    /// comparison, and a count memo keyed only on sequences would survive a
+    /// retention GC that deleted half the family. Bumping an epoch the memo
+    /// compares for equality closes that hole without pretending a sequence was
+    /// allocated.
+    fn note_cf_content_changed_outside_commit(&self, cfs: &[ColumnFamily]) {
+        for cf in cfs {
+            self.cf_change[row_shard_index(*cf)]
+                .out_of_band_epoch
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     pub fn set_start_seq(&self, seq: Seq) -> Result<()> {
@@ -1753,6 +1901,12 @@ impl VersionedCfStore {
         }
         self.advance_affected_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
         let seq = self.seqs.allocate();
+        // Publish the per-family change signal BEFORE the rows are applied and
+        // while the row write guard for every touched family is still held
+        // (#2139). A reader can reach these rows only after the guard is
+        // released, so it can never observe a row whose family still reports a
+        // sequence below this commit's.
+        self.publish_cf_commit_seq(&rows, seq);
         timings.watermark_us = elapsed_us(&attribution_started) - timings.panel_attribution_us;
         let row_apply_started = Instant::now();
         for (cf, key, value) in &rows {
@@ -1959,6 +2113,11 @@ impl VersionedCfStore {
             self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
         }
         self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
+        // Same publication point as the live commit path (#2139): recovery
+        // restores rows at their original sequences, so the per-family signal
+        // must carry them too or a family whose only writes were replayed would
+        // report `last_commit_seq = 0` while holding rows at much higher ones.
+        self.publish_cf_commit_seq(&rows, seq);
         for (cf, key, value) in rows {
             table
                 .entry_mut(cf)?
@@ -2067,6 +2226,7 @@ impl VersionedCfStore {
                 self.derived_content_seq.fetch_max(seq, Ordering::AcqRel);
             }
             self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
+            self.publish_cf_commit_seq(&rows, seq);
             for (cf, key, value) in rows {
                 table
                     .entry_mut(cf)?

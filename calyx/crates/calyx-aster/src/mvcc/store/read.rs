@@ -330,6 +330,16 @@ impl VersionedCfStore {
     /// latest-only recovered router does not retain original per-row sequence
     /// numbers below `changed_key_history_floor`, so such a
     /// request fails closed and names the required rebase boundary.
+    ///
+    /// # Cost
+    ///
+    /// `O(1)` when nothing changed, `O(family)` when something did (#2139). The
+    /// name promises a delta and the fold is a scan: there is no per-sequence
+    /// index to seek into, so producing the key *list* still costs a walk of
+    /// the family. What the per-family commit sequence removes is the far more
+    /// common question — *is the list empty?* — which used to cost the same
+    /// walk. Callers that only want to know whether anything changed should ask
+    /// [`Self::latest_seq_for_cf`] directly and never enter this function.
     pub fn changed_keys_after_at(
         &self,
         snapshot: Snapshot,
@@ -351,6 +361,29 @@ impl VersionedCfStore {
                 cf.name(),
                 self.changed_key_history_floor
             )));
+        }
+        // `O(1)` exit for the answer this is asked for most often: nothing
+        // (#2139).
+        //
+        // Paging fixed how long the guard is held; it did not change that the
+        // fold visits every key of the family and every key's whole version
+        // chain, so "did anything change?" cost the same whether the answer was
+        // 0 or 1,000,000 — and the search-generation freshness trigger asks it
+        // on every decision, against a ~1 M-row `Base`.
+        //
+        // The per-family commit sequence answers it exactly. Every version in
+        // this family was written by a commit that published
+        // `last_commit_seq >= its own seq` before the version became visible, so
+        // `last_commit_seq <= after_exclusive` means no version anywhere in the
+        // family satisfies `seq > after_exclusive`, and the delta is empty.
+        // There are no keys to return and therefore none to barrier-check,
+        // which is the same result the full fold produces on this input.
+        //
+        // This is a proof, not a heuristic, and it fails toward the walk: if the
+        // signal has moved at all — including from a commit to another family
+        // that shares a slot-signal cell — the full fold below runs.
+        if self.cf_change_signal(cf).last_commit_seq <= after_exclusive {
+            return Ok(Vec::new());
         }
         // Folded in bounded pages, releasing the row read guard between them
         // (#2060). The single hold this replaces was `O(family)` — 117 ms over

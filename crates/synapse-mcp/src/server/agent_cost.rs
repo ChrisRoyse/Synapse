@@ -2749,13 +2749,117 @@ static TRANSCRIPT_CORPUS_WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// second atomic.
 static ROLLUP_COVERED_WRITE_EPOCH: AtomicU64 = AtomicU64::new(0);
 
+// --------------------------------------------------------------------------
+// Unsealed-hour writes do not invalidate the pass (#2142)
+// --------------------------------------------------------------------------
+//
+// The #2113 gate above is exactly right and still almost never fires, because
+// its corpus premise is "no transcript row was committed". Transcript ingest
+// commits every few seconds whenever *any* agent session is live, so on the
+// deployed daemon the skip fired only on an idle box: three consecutive passes
+// 17 s apart, ~371 k rows each, `cells_written=0`, at corpus epochs 15 -> 17 ->
+// 18. The rows that moved the epoch were this session's own current-hour
+// transcript lines.
+//
+// The sharper premise, and why it is exact:
+//
+// * A rollup cell is placed at `rollup_floor_hour(t)` where `t` is a real row
+//   timestamp — `authoritative_ts` for a resolved spawn, `latest_ts` for an
+//   unresolved one (and that branch only produces a cell at all when
+//   `latest_ts < sealed_horizon`).
+// * A fleet read serves windows strictly below the sealed horizon published by
+//   the last complete pass (`summarize_fleet_from_rollups` clamps
+//   `effective_until_ns` to `meta.sealed_horizon_ns` and iterates
+//   `window_start < effective_until_ns`).
+// * The sealed horizon is hour-aligned. So a row with `ts_ns >= H` can only
+//   ever place a cell at a window `>= H`, which no read at horizon `H` returns.
+// * A commit whose rows are ALL at or above `H` therefore cannot change any
+//   value this rollup generation can serve. It becomes able to the moment the
+//   horizon advances past its hour — and the gate already forces a full,
+//   exact, whole-corpus pass on every horizon advance, hourly.
+//
+// So: bump the corpus epoch only when a committed chunk carries at least one
+// row strictly below the published horizon (a late write into an already-sealed
+// hour, which is the rare case), and let the hourly horizon advance pick up
+// everything else. Nothing is skipped, only deferred to the pass that was going
+// to run anyway.
+//
+// The conservative direction is the default everywhere: no published horizon
+// yet (nothing has completed a pass in this process), an absent timestamp, or a
+// chunk whose minimum cannot be established all bump.
+//
+// One consequence stated rather than hidden: a spawn that both resolves and is
+// then contradicted inside the same unsealed hour raises
+// `AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT` at the horizon
+// advance instead of within 15 s. That is a data anomaly requiring
+// `rollup_backfill reset=true` either way; deferring its detection by at most
+// one hour does not change the remedy, and fewer spawns reach the conflict at
+// all because their contribution is first published when it is already stable.
+
+/// `sealed_horizon_ns + 1` published by the last **complete** pass, or `0` for
+/// "no complete pass in this process yet". Same `+ 1` biasing, and the same
+/// meaning, as [`ROLLUP_COVERED_WRITE_EPOCH`]: a real horizon of 0 (a clock at
+/// the Unix epoch) must not read as "published".
+static ROLLUP_COVERED_SEALED_HORIZON_NS: AtomicU64 = AtomicU64::new(0);
+
+/// Committed chunks whose rows all fell at or above the published sealed
+/// horizon, and so did not invalidate the rollups (#2142). Reported on the skip
+/// log line: without it, "the corpus did not change" and "the corpus changed in
+/// a way that cannot matter yet" are indistinguishable from the outside.
+static TRANSCRIPT_CORPUS_UNSEALED_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// The sealed horizon the last complete pass published, or `None` when this
+/// process has completed no pass.
+pub(crate) fn published_rollup_sealed_horizon_ns() -> Option<u64> {
+    match ROLLUP_COVERED_SEALED_HORIZON_NS.load(Ordering::SeqCst) {
+        0 => None,
+        biased => Some(biased - 1),
+    }
+}
+
+/// The horizon a corpus write is judged against: the published one, or the one
+/// the clock says right now, whichever is **later**.
+///
+/// Both, not just the published one, and the reason is a real race. A complete
+/// pass publishes its covered epoch and then its horizon; a chunk committing
+/// between those two stores would read the previous, lower horizon and could
+/// suppress a bump for a row that the just-published generation *can* serve —
+/// the epoch says "covered", the row is not, and nothing runs until the next
+/// hour. Taking the maximum closes it: during that window the clock already
+/// reads the newer horizon.
+///
+/// It is also what makes the threshold safe before any pass has completed, and
+/// robust to a clock that steps backwards.
+fn rollup_write_gate_horizon_ns() -> u64 {
+    let live_ns = rollup_floor_hour(unix_time_ns_now().saturating_sub(ROLLUP_SEAL_GRACE_NS));
+    published_rollup_sealed_horizon_ns().map_or(live_ns, |published| published.max(live_ns))
+}
+
 /// Records that transcript rows were committed, invalidating any rollup pass
-/// that has already read the corpus.
+/// that has already read the corpus — **unless every committed row lands at or
+/// above the sealed horizon**, in which case no cell any read can return could
+/// differ (#2142; see the block comment above).
 ///
 /// Called from `commit_transcript_chunk` after the guarded batch is applied and
 /// physically read back — i.e. only for rows that are actually durable.
-pub(crate) fn note_transcript_corpus_write(rows: usize) {
+/// `min_priced_ts_ns` is the minimum `ts_ns` across those rows, or `None` when
+/// the caller could not establish one; `None` bumps.
+pub(crate) fn note_transcript_corpus_write(rows: usize, min_priced_ts_ns: Option<u64>) {
     if rows == 0 {
+        return;
+    }
+    let horizon_ns = rollup_write_gate_horizon_ns();
+    if let Some(min_ts_ns) = min_priced_ts_ns
+        && min_ts_ns >= horizon_ns
+    {
+        TRANSCRIPT_CORPUS_UNSEALED_WRITES.fetch_add(1, Ordering::SeqCst);
+        tracing::trace!(
+            code = "AGENT_COST_ROLLUP_UNSEALED_WRITE_IGNORED",
+            rows,
+            min_priced_ts_ns = min_ts_ns,
+            sealed_horizon_ns = horizon_ns,
+            "every committed transcript row is at or above the sealed horizon, so it cannot change a servable rollup cell before the horizon advances"
+        );
         return;
     }
     TRANSCRIPT_CORPUS_WRITE_EPOCH.fetch_add(1, Ordering::SeqCst);
@@ -3517,6 +3621,13 @@ pub(crate) fn materialize_cost_rollups(
         corpus_write_epoch_at_start.saturating_add(1),
         Ordering::SeqCst,
     );
+    // Same rule for the horizon the write gate compares against (#2142): only a
+    // complete pass may publish it, and it is the same number this pass just
+    // wrote into `__meta`, so the write gate and the read clamp are keyed off
+    // one value rather than two that can drift. The window between this store
+    // and the one above is covered by `rollup_write_gate_horizon_ns` taking the
+    // maximum of this value and the live clock.
+    ROLLUP_COVERED_SEALED_HORIZON_NS.store(sealed_horizon_ns.saturating_add(1), Ordering::SeqCst);
 
     tracing::info!(
         code = "AGENT_COST_ROLLUP_MATERIALIZED",
@@ -3529,6 +3640,7 @@ pub(crate) fn materialize_cost_rollups(
         built_at_ns,
         sealed_horizon_ns,
         corpus_write_epoch = corpus_write_epoch_at_start,
+        unsealed_writes_ignored = TRANSCRIPT_CORPUS_UNSEALED_WRITES.load(Ordering::SeqCst),
         "materialized cost TimeSeries rollups off the MCP runtime"
     );
 
@@ -3596,7 +3708,8 @@ pub(crate) fn materialize_cost_rollups_if_idle(db: &Db) -> CostRollupMaintenance
                 last_built_at_ns = skip.last_built_at_ns,
                 corpus_write_epoch = skip.corpus_write_epoch,
                 spawns_marked = skip.spawns_marked,
-                "both rollup inputs (transcript corpus, sealed horizon) are unchanged since the last complete pass, so no cell can differ; the corpus was not scanned"
+                unsealed_writes_ignored = skip.unsealed_writes_ignored,
+                "both rollup inputs (transcript corpus below the sealed horizon, sealed horizon) are unchanged since the last complete pass, so no servable cell can differ; the corpus was not scanned"
             );
             CostRollupMaintenanceOutcome::SkippedUnchanged
         }
@@ -3611,6 +3724,10 @@ struct RollupSkipEvidence {
     last_built_at_ns: u64,
     corpus_write_epoch: u64,
     spawns_marked: u64,
+    /// Committed chunks this process suppressed as unsealed-hour-only (#2142).
+    /// A skip with a rising count here is a skip that a busy vault reached,
+    /// which is precisely what the #2113 gate alone could not do.
+    unsealed_writes_ignored: u64,
 }
 
 /// Proves — or fails to prove — that a periodic pass would write nothing.
@@ -3651,6 +3768,7 @@ fn rollup_pass_would_be_noop(db: &Db) -> Result<Option<RollupSkipEvidence>, Erro
         last_built_at_ns: meta.built_at_ns,
         corpus_write_epoch: live_epoch,
         spawns_marked: meta.spawns_marked,
+        unsealed_writes_ignored: TRANSCRIPT_CORPUS_UNSEALED_WRITES.load(Ordering::SeqCst),
     }))
 }
 

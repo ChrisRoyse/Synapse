@@ -1113,7 +1113,17 @@ pub(super) fn commit_transcript_chunk(
     // rows are durable and physically read back by the time control reaches
     // here. Recording the write is what lets the periodic cost-rollup pass
     // prove the corpus is unchanged and skip its full-corpus scan.
-    super::agent_cost::note_transcript_corpus_write(rows.len());
+    //
+    // #2142: the *minimum* priced timestamp of the chunk decides whether the
+    // write can matter yet. `ts_ns` is the exact field the rollup prices on
+    // (`spawn_rollup_contribution` reads `record.ts_ns` and nothing else), and
+    // it is already decoded here — this is a read of the same structs that were
+    // just committed, not a re-derivation. `min()` over a non-empty slice is
+    // `Some`; the `None` arm is unreachable for a chunk that reached this line
+    // (`rows.is_empty()` returned above) and bumps unconditionally if it ever
+    // becomes reachable, which is the conservative direction.
+    let min_priced_ts_ns = rows.iter().map(|row| row.record.ts_ns).min();
+    super::agent_cost::note_transcript_corpus_write(rows.len(), min_priced_ts_ns);
 
     tracing::debug!(
         code = "TRANSCRIPT_CHUNK_COMMITTED",
