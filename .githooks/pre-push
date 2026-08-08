@@ -31,8 +31,10 @@
 # reaches both entry points by construction.
 #
 # What stays here is the part that is genuinely hook-specific: deciding from the
-# pushed ref range whether this push touches anything the gates can speak about,
-# so a docs-only push is not charged a compile.
+# pushed ref range whether this push needs the expensive Rust/Cargo gates. The
+# cheap D1 policy gate runs for every push because it scans executable surfaces
+# outside Rust too; a script-only push must not bypass the exact gate that owns
+# scripts (#2154).
 #
 # COST NOTE: `scripts/lint.ps1` always covers BOTH workspaces, where this hook
 # used to gate only the touched one. That is deliberate — the root workspace
@@ -50,7 +52,7 @@ set -e
 # lock files and the gate scripts themselves are all inputs to a gate, and a push
 # that changes one of them while touching no Rust at all is exactly the push that
 # most needs checking.
-needs_gate=0
+needs_full_gate=0
 zero_oid=0000000000000000000000000000000000000000
 
 # `git push` hands the hook the destination remote's name — or, for a push to a
@@ -196,14 +198,9 @@ while read -r _local_ref local_sha remote_ref remote_sha; do
   fi
 
   if printf '%s\n' "$changed_paths" | grep -qE '\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)(deny|clippy|rust-toolchain)\.toml$|^scripts/(lint|calyx-lock|install-cargo-deny)\.ps1$'; then
-    needs_gate=1
+    needs_full_gate=1
   fi
 done
-
-if [ "$needs_gate" -eq 0 ]; then
-  echo "pre-push: no Rust/Cargo/gate-config changes in this push — skipping the lint gate."
-  exit 0
-fi
 
 # ---------------------------------------------------------------------------
 # Delegate — and fail closed if the gate cannot be run
@@ -233,9 +230,16 @@ else
   exit 1
 fi
 
-echo "pre-push: running the full gate set via scripts/lint.ps1 ($shell_bin) ..."
-echo "pre-push:   1 clippy.toml contract   2 toolchain pin   3 lock-graph agreement"
-echo "pre-push:   4 cargo fmt              5 cargo deny      6 cargo clippy"
+if [ "$needs_full_gate" -eq 0 ]; then
+  echo "pre-push: no Rust/Cargo/full-gate inputs changed — running mandatory D1 Gate 0 only."
+  lint_args="-PolicyOnly"
+else
+  echo "pre-push: running the full gate set via scripts/lint.ps1 ($shell_bin) ..."
+  echo "pre-push:   0 D1 policy              1 clippy.toml contract   2 toolchain pin"
+  echo "pre-push:   3 lock-graph agreement   4 cargo fmt              5 cargo deny"
+  echo "pre-push:   6 cargo clippy           7 unreached API ratchet"
+  lint_args=""
+fi
 
 # Capture the status from the command itself, NOT from after the `if`.
 #
@@ -250,17 +254,24 @@ echo "pre-push:   4 cargo fmt              5 cargo deny      6 cargo clippy"
 # SYNAPSE_LINT_FMT_ROOT_FAILED printed BLOCKED and the push still landed on
 # origin/main. A gate that announces it is blocking and then does not is worse
 # than no gate, because the operator reads the word BLOCKED and believes it.
-"$shell_bin" -NoProfile -File "$lint_script"
-status=$?
+if "$shell_bin" -NoProfile -File "$lint_script" $lint_args; then
+  status=0
+else
+  status=$?
+fi
 
 if [ "$status" -eq 0 ]; then
-  echo "pre-push: gate green — every gate passed in both workspaces."
+  if [ "$needs_full_gate" -eq 0 ]; then
+    echo "pre-push: D1 Gate 0 green — no claim is made about the skipped full gate set."
+  else
+    echo "pre-push: gate green — every gate passed in both workspaces."
+  fi
   exit 0
 fi
 echo ""
 echo "pre-push: BLOCKED — scripts/lint.ps1 exited $status. The failing gate, its error code"
 echo "          and its remediation are printed above; lint.ps1 names all three and does not"
 echo "          have a partial-success exit path."
-echo "pre-push: re-run 'pwsh -File scripts/lint.ps1' to iterate, or 'git push --no-verify'"
+echo "pre-push: re-run 'pwsh -File scripts/lint.ps1${lint_args:+ $lint_args}' to iterate, or 'git push --no-verify'"
 echo "          only for a genuine emergency. Local gates are the automated backstop (#351)."
 exit "$status"

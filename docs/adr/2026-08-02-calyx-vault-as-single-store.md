@@ -73,10 +73,11 @@ values:
   from genesis.
 - `health` — `calyx_panel_base_cf_rows: 96,845`, `calyx_vault_latest_seq:
   249,900`, `calyx_vault_open: true`, `storage_backend: "calyx"`.
-- Reopen readback — `crates/synapse-calyx/examples/mvcc_commit_split_fsv.rs`
-  closes a vault and reopens it, then reads back every key written across its
+- Reopen readback — manual FSV closed a vault and reopened it through the
+  production storage surface, then separately read every key written across its
   phases: 1,180 present, 0 lost, 0 stale, `latest_seq` identical across the
-  reopen.
+  reopen. The former automated driver was removed by D1 policy; this row records
+  historical evidence, not a supported invocation path.
 
 ## Consequences
 

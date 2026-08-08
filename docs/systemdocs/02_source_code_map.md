@@ -129,7 +129,8 @@ crates/synapse-a11y/src/platform/windows/resolve.rs  # element resolution from p
 crates/synapse-a11y/src/platform/windows/snapshot.rs # UIA subtree walk -> snapshot
 crates/synapse-a11y/src/platform/windows/window.rs   # HWND enumeration / foreground
 ```
-`examples/cdp_*_probe.rs` (7) manual CDP probes; `benches/uia_snapshot_depth2_60elem.rs`; `tests/uwp_snapshot_regression.rs`.
+`examples/cdp_*_probe.rs` (7) operator diagnostics. Automated `tests/` and
+`benches/` targets were removed repo-wide by D1 policy.
 
 ### crates/synapse-capture
 Screen/window capture (Windows Graphics Capture + DXGI fallback), DPI, coordinate mapping. `#![allow(unsafe_code)]`. Depends on `synapse-core`, `synapse-telemetry`.

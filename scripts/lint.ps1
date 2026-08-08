@@ -25,13 +25,15 @@
   Gates, in order (cheapest first, so a config mistake is not paid for with a
   full compile):
 
-    0. D1 zero-test / zero-harness doctrine (#2037, #2042, #2045). A pure text
-       and manifest scan — no compilation, no execution, nothing behavioural.
+    0. D1 zero-test / zero-harness doctrine (#2037, #2042, #2045, #2153,
+       #2154). A pure text and manifest scan — no compilation, no execution,
+       nothing behavioural.
        Rejects `#[test]` / `#[tokio::test]` / `#[bench]` / `#[cfg(test)]`,
        `[dev-dependencies]` / `[[test]]` / `[[bench]]` manifest sections, and
-       `*_fsv` binary targets, in both workspaces. Runs first because it is the
-       cheapest gate and because gate 6 (`clippy --all-targets`) would otherwise
-       spend a full compile building the very targets this one forbids.
+       FSV executable targets/scripts, in both workspaces. Runs first because it
+       is the cheapest gate and because gate 6 (`clippy --all-targets`) would
+       otherwise spend a full compile building the very targets this one
+       forbids.
     1. SHARED-LINT-CONTRACT agreement. `clippy.toml` is resolved per workspace,
        so a `disallowed-methods` rule at the root reaches no calyx crate. The
        rule is therefore duplicated into `calyx/clippy.toml`, and the two copies
@@ -67,15 +69,24 @@
   `-SkipClippy` pass is still a real statement about dependency policy and lock
   agreement — just not about lint cleanliness. For a fast pre-commit pass.
 
+.PARAMETER PolicyOnly
+  Run only Gate 0, print its complete fail-closed verdict, and exit. The
+  pre-push hook uses this cheap path for pushes that do not need the Rust/Cargo
+  gates, so D1 enforcement cannot be bypassed by adding only a script or another
+  non-Rust file.
+
 .EXAMPLE
   pwsh -File scripts/lint.ps1
 .EXAMPLE
   pwsh -File scripts/lint.ps1 -Fix
+.EXAMPLE
+  pwsh -File scripts/lint.ps1 -PolicyOnly
 #>
 [CmdletBinding()]
 param(
     [switch]$Fix,
-    [switch]$SkipClippy
+    [switch]$SkipClippy,
+    [switch]$PolicyOnly
 )
 
 Set-StrictMode -Version Latest
@@ -85,6 +96,10 @@ $RepoRoot = Split-Path -Parent $PSScriptRoot
 $CalyxRoot = Join-Path $RepoRoot 'calyx'
 
 $script:Failures = @()
+
+if ($PolicyOnly -and ($Fix -or $SkipClippy)) {
+    throw 'SYNAPSE_LINT_POLICY_ONLY_CONFLICT: -PolicyOnly cannot be combined with -Fix or -SkipClippy; run the requested gate shape explicitly'
+}
 
 function Write-Gate {
     param([string]$Name)
@@ -129,8 +144,10 @@ function Add-Failure {
 #
 # Cargo's target discovery is wider than manifest tables: `examples/*.rs`,
 # `tests/*.rs`, and `benches/*.rs` become executable targets without a manifest
-# line. Gate 0 therefore reads both manifests and the filesystem layout. It does
-# not compile or execute any target and is never behavioral verification.
+# line. Gate 0 therefore reads manifests, the filesystem layout, and Cargo's own
+# authoritative `metadata --no-deps` target inventory. Metadata parses target
+# declarations without compiling or executing them; this is structural policy
+# verification, never behavioral verification.
 #
 # WHAT THIS IS NOT
 #
@@ -266,22 +283,15 @@ try {
     # --- 0b/0c: forbidden manifest sections and FSV executable targets ------
     $devDepRe = [regex]'^\s*\[\s*(?:[A-Za-z0-9_."''\-\*\(\)= ]*\.)?dev[-_]dependencies\s*\]'
     $testTargetRe = [regex]'^\s*\[\[\s*(test|bench)\s*\]\]'
-    $targetOpenRe = [regex]'^\s*\[\[\s*(bin|example)\s*\]\]'
-    $sectionRe = [regex]'^\s*\['
-    $nameRe = [regex]'^\s*(name|path)\s*=\s*"([^"]*)"'
-
     $devDepHits = [System.Collections.Generic.List[string]]::new()
     $testTargetHits = [System.Collections.Generic.List[string]]::new()
     $fsvTargetHits = [System.Collections.Generic.List[string]]::new()
+    $fsvTargetSourceHits = [System.Collections.Generic.List[string]]::new()
     $testBenchSourceHits = [System.Collections.Generic.List[string]]::new()
     $fsvScriptHits = [System.Collections.Generic.List[string]]::new()
     $manifests = Get-D1Files -Root $RepoRoot -Names @('Cargo.toml')
     foreach ($file in $manifests) {
         $lines = [IO.File]::ReadAllLines($file)
-        $inTarget = $false
-        $targetKind = ''
-        $targetStart = 0
-        $targetFlagged = $false
         for ($i = 0; $i -lt $lines.Count; $i++) {
             $line = $lines[$i]
             if ($devDepRe.IsMatch($line)) {
@@ -290,22 +300,41 @@ try {
             if ($testTargetRe.IsMatch($line)) {
                 $testTargetHits.Add("        $(& $RelativeTo $file):$($i + 1)  $($line.Trim())")
             }
-            $targetOpen = $targetOpenRe.Match($line)
-            if ($targetOpen.Success) {
-                $inTarget = $true
-                $targetKind = $targetOpen.Groups[1].Value
-                $targetStart = $i + 1
-                $targetFlagged = $false
-                continue
-            }
-            if ($inTarget -and $sectionRe.IsMatch($line)) { $inTarget = $false }
-            # One row per target block, not one per key: a target whose name and
-            # path both say fsv is one forbidden target, not two.
-            if ($inTarget -and -not $targetFlagged) {
-                $m = $nameRe.Match($line)
-                if ($m.Success -and $m.Groups[2].Value -match '(^|[/_\-])fsv([_\-.]|$)') {
-                    $targetFlagged = $true
-                    $fsvTargetHits.Add("        $(& $RelativeTo $file):$targetStart  [[$targetKind]] $($line.Trim())")
+        }
+    }
+
+    # Cargo owns target semantics, so Cargo's parsed inventory is the authority
+    # for what is executable. This catches auto-discovered targets and explicit
+    # TOML targets regardless of quoting, key order, whitespace, or path shape;
+    # the old regex parser could be bypassed by valid single-quoted TOML.
+    $metadataSpecs = @(
+        [pscustomobject]@{ Label = 'root'; Manifest = Join-Path $RepoRoot 'Cargo.toml' },
+        [pscustomobject]@{ Label = 'calyx'; Manifest = Join-Path $CalyxRoot 'Cargo.toml' }
+    )
+    $cargoTargetsScanned = 0
+    foreach ($spec in $metadataSpecs) {
+        $metadataRaw = (& cargo metadata --manifest-path $spec.Manifest --no-deps `
+                --format-version 1 --locked --offline 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0) {
+            throw "SYNAPSE_LINT_D1_CARGO_METADATA_FAILED: $($spec.Label) cargo metadata exited $LASTEXITCODE; $($metadataRaw.Trim())"
+        }
+        try {
+            $metadata = $metadataRaw | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            throw "SYNAPSE_LINT_D1_CARGO_METADATA_INVALID: $($spec.Label) cargo metadata returned invalid JSON; $($_.Exception.Message)"
+        }
+        foreach ($package in $metadata.packages) {
+            foreach ($target in $package.targets) {
+                $cargoTargetsScanned++
+                $kinds = @($target.kind)
+                if (($kinds -contains 'test') -or ($kinds -contains 'bench')) {
+                    $testTargetHits.Add("        $($spec.Label):$($package.name):$($target.name)  cargo kind=$($kinds -join ',') source=$($target.src_path)")
+                }
+                if ((($kinds -contains 'bin') -or ($kinds -contains 'example')) -and
+                    ($target.name -match '(^|[_\-])fsv([_\-.]|$)' -or
+                    $target.src_path -match '(^|[\\/_\-])fsv([_\.\\/\-]|$)')) {
+                    $fsvTargetHits.Add("        $($spec.Label):$($package.name):$($target.name)  cargo kind=$($kinds -join ',') source=$($target.src_path)")
                 }
             }
         }
@@ -325,7 +354,7 @@ try {
             if ($file -match '[\\/](src[\\/]bin|examples)[\\/]' -and
                 $stem -match '(^|[_\-])fsv([_\-]|$)') {
                 $targetSurface = if ($file -match '[\\/]examples[\\/]') { 'example' } else { 'src/bin' }
-                $fsvTargetHits.Add("        $relative  (autodiscovered $targetSurface target)")
+                $fsvTargetSourceHits.Add("        $relative  ($targetSurface executable source)")
             }
         }
     }
@@ -359,8 +388,13 @@ try {
     }
     if ($fsvTargetHits.Count -gt 0) {
         Add-Failure 'SYNAPSE_LINT_D1_FSV_EXECUTABLE_TARGET_PRESENT' `
-        ("$($fsvTargetHits.Count) FSV binary/example target(s), which directive D1 forbids (#2045, #2153):" + [Environment]::NewLine + ($fsvTargetHits -join [Environment]::NewLine)) `
+        ("$($fsvTargetHits.Count) Cargo-inventoried FSV binary/example target(s), which directive D1 forbids (#2045, #2153):" + [Environment]::NewLine + ($fsvTargetHits -join [Environment]::NewLine)) `
             'delete the executable target and every dependency/support surface reached only by it; manual FSV must trigger the real production surface and independently read its physical source of truth.'
+    }
+    if ($fsvTargetSourceHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_FSV_EXECUTABLE_SOURCE_PRESENT' `
+        ("$($fsvTargetSourceHits.Count) FSV-named binary/example source(s), which directive D1 forbids even if Cargo auto-discovery is disabled:" + [Environment]::NewLine + ($fsvTargetSourceHits -join [Environment]::NewLine)) `
+            'delete the executable source; disabling Cargo target discovery does not turn an automated FSV driver into an allowed repository artifact.'
     }
     if ($fsvScriptHits.Count -gt 0) {
         Add-Failure 'SYNAPSE_LINT_D1_FSV_SCRIPT_DRIVER_PRESENT' `
@@ -369,13 +403,31 @@ try {
     }
     if ($devDepHits.Count -eq 0 -and $testTargetHits.Count -eq 0 -and
         $testBenchSourceHits.Count -eq 0 -and $fsvTargetHits.Count -eq 0 -and
-        $fsvScriptHits.Count -eq 0) {
-        Write-Host "   OK   $($manifests.Count) manifests and tracked source paths expose no dev-dependencies, test/bench targets, or FSV executable drivers" -ForegroundColor Green
+        $fsvTargetSourceHits.Count -eq 0 -and $fsvScriptHits.Count -eq 0) {
+        Write-Host "   OK   $($manifests.Count) manifests, $cargoTargetsScanned Cargo targets, and tracked source paths expose no dev-dependencies, test/bench targets, or FSV executable drivers" -ForegroundColor Green
     }
 }
 catch {
     Add-Failure 'SYNAPSE_LINT_D1_SWEEP_FAILED' $_.Exception.Message `
         'the doctrine sweep itself failed; this gate fails closed rather than reporting an invariant it did not check'
+}
+
+if ($PolicyOnly) {
+    Write-Host ''
+    if ($script:Failures.Count -eq 0) {
+        Write-Host 'POLICY OK: Gate 0 found no automated-test or FSV-driver surface.' -ForegroundColor Green
+        exit 0
+    }
+
+    Write-Host "POLICY FAILED — $($script:Failures.Count) Gate 0 failure(s):" -ForegroundColor Red
+    foreach ($failure in $script:Failures) {
+        Write-Host ''
+        Write-Host "  code        : $($failure.Code)" -ForegroundColor Red
+        Write-Host "  detail      : $($failure.Detail)"
+        Write-Host "  remediation : $($failure.Remediation)"
+    }
+    Write-Host ''
+    exit 1
 }
 
 # ---------------------------------------------------------------------------
