@@ -39,12 +39,13 @@
 //! | # | shape stamped onto the Base row | expectation |
 //! |---|---|---|
 //! | 1 | `Ingest` / `Cx(self)` — plain `put` | 1 grounded hit (control) |
-//! | 2 | `Grounding` / `Query(multi marker)` — **the #2084 shape** | 1 grounded hit, trace names it batch-scoped |
+//! | 2 | `Grounding` / `Query(multi marker)` — **the #2084 shape** | 1 grounded hit, trace names it batch-**verified** |
 //! | 3 | `Ingest` / `Cx(first of batch)`, payload enumerates all | 1 grounded hit via the payload member list |
-//! | 4 | `Ingest` / `Query(operation id)` — derived snapshot publish | 1 grounded hit, trace names it batch-scoped |
+//! | 4 | `Ingest` / `Query(operation id)` — derived snapshot publish | 1 grounded hit, trace names it batch-verified |
 //! | 5 | `Migrate` / `Cx(a different constellation)` | refused `CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED` |
-//! | 6 | `Anneal` / `Kernel(..)` — a shape no writer stamps | refused `CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED` naming `anneal/kernel` |
-//! | 7 | `Ingest` / `Cx(other)` with a payload that enumerates nothing | refused `CALYX_LEDGER_CORRUPT` — a genuinely malformed entry keeps the loud verdict |
+//! | 6 | `Anneal` / `Kernel(..)` — a shape no writer stamps, **historical row** | refused `CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED` naming `anneal/kernel` |
+//! | 7 | `Ingest` / `Cx(other)` with a payload that enumerates nothing, **historical row** | refused `CALYX_LEDGER_CORRUPT` — a genuinely malformed entry keeps the loud verdict |
+//! | 8 | `Grounding` / `Query(multi marker)` with **no member declaration** — a pre-#2096 row | 1 grounded hit, trace names it batch-**scoped** |
 //!
 //! Cases 5–7 are what stop this being a rubber stamp: a verifier that simply
 //! accepted everything would pass 1–4 and fail all of 5–7. Case 7 in particular
@@ -57,6 +58,27 @@
 //! corruption remediation, so an intact-ledger refusal can never again tell an
 //! operator to restore the vault.
 //!
+//! ## What #2094/#2095/#2096 changed here
+//!
+//! Cases 6 and 7 used to be stamped through the live
+//! `write_cf_batch_with_ledger_entry` path. #2095 gave that path a declared
+//! legality contract, so it now REFUSES to mint either shape onto a Base row —
+//! the refusal itself is proved by `ledger_hygiene_contracts_fsv`. Both shapes
+//! are nevertheless still reachable by the READER, because rows committed before
+//! that gate existed carry them and an append-only ledger cannot be rewritten.
+//! So they are constructed here the only way that is now honest: the ledger entry
+//! is appended on its own and the Base row is written with its `provenance`
+//! pointing at it, reproducing byte-for-byte the state a pre-#2095 writer left
+//! behind. A reader that stopped handling those rows would strand every one of
+//! them, so this instrument keeps proving it does.
+//!
+//! Cases 2 and 4 tightened in the other direction: their batch entries now carry
+//! a `batch_members` declaration (#2096), so the engine positively VERIFIES
+//! membership from the entry instead of accepting it on the strength of the
+//! entry-hash binding alone. Case 8 is the pre-#2096 form of case 2 and pins the
+//! trusting path for historical rows, so the tightening cannot quietly become a
+//! refusal of everything already committed.
+//!
 //! Usage:
 //! `cargo run -p synapse-storage --example provenance_coverage_shapes_fsv -- <empty-scratch-dir>`
 
@@ -65,6 +87,7 @@ use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use calyx_aster::cf::{ColumnFamily, base_key};
+use calyx_aster::vault::base_rewrite::BaseRowRewrite;
 use calyx_aster::vault::{AsterVault, VaultOptions};
 use calyx_core::{Anchor, AnchorKind, AnchorValue, CxId, SlotId, VaultId, VaultStore as _};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
@@ -231,6 +254,47 @@ fn restamp_with_shape(
     Ok(())
 }
 
+/// Reproduces the on-disk state a **pre-#2095/#2096 writer** left behind: a
+/// ledger entry of an arbitrary shape, and a Base row whose `provenance` points
+/// at it with no membership declaration anywhere.
+///
+/// The two steps are separate on purpose. `write_cf_batch_with_ledger_entry` now
+/// refuses undeclared shapes and injects a `batch_members` declaration into
+/// everything it does accept, so it can no longer produce these rows — which is
+/// exactly the #2095/#2096 fix working. Appending the entry alone and writing the
+/// Base row through the raw commit path yields the identical bytes an older build
+/// committed, which is the only state under which the reader's historical
+/// branches are reachable. Nothing here fabricates slot hashes: `BaseRowRewrite`
+/// carries the stored ones through (#1888).
+fn restamp_historical(
+    scratch: &Scratch,
+    cx_id: CxId,
+    kind: EntryKind,
+    subject: SubjectId,
+    payload: &serde_json::Value,
+) -> Result<u64, Box<dyn Error>> {
+    let ledger_ref = scratch.vault.append_ledger_entry(
+        kind,
+        subject,
+        serde_json::to_vec(payload)?,
+        ActorId::Service("provenance-coverage-shapes-fsv".to_owned()),
+    )?;
+    let bytes = scratch
+        .vault
+        .read_cf_at(
+            scratch.vault.latest_seq(),
+            ColumnFamily::Base,
+            &base_key(cx_id),
+        )?
+        .ok_or("Base row disappeared before historical restamping")?;
+    let mut rewrite = BaseRowRewrite::decode(&bytes)?;
+    rewrite.constellation_mut().provenance = ledger_ref.clone();
+    scratch
+        .vault
+        .write_cf_batch([(ColumnFamily::Base, base_key(cx_id), rewrite.encode()?)])?;
+    Ok(ledger_ref.seq)
+}
+
 /// The outcome of one probe: either the hits the engine returned, or the
 /// structured refusal it produced.
 enum Probe {
@@ -281,16 +345,25 @@ fn probe(scratch: &Scratch) -> Result<(Probe, Vec<SearchTraceEvent>), Box<dyn Er
     Ok((probe, trace))
 }
 
-/// True when the engine's own trace declares this hit was accepted as a
-/// batch-scoped attestation — the evidence that recognition happened through the
-/// declared batch rule and not by accident.
-fn traced_batch_scoped(trace: &[SearchTraceEvent]) -> Vec<String> {
+/// The details the engine's own trace emitted under one coverage phase — the
+/// evidence that recognition happened through the declared rule and not by
+/// accident.
+///
+/// Two phases matter here and must never be conflated:
+/// `provenance.ledger_coverage.batch_verified` means membership was decided FROM
+/// the entry's member declaration (#2096); `...batch_scoped` means the entry
+/// declared no members and acceptance rested on the entry-hash and chain-link
+/// binding alone, which is all a pre-#2096 row can offer.
+fn traced_coverage(trace: &[SearchTraceEvent], phase: &str) -> Vec<String> {
     trace
         .iter()
-        .filter(|event| event.phase == "provenance.ledger_coverage.batch_scoped")
+        .filter(|event| event.phase == phase)
         .map(|event| event.detail.clone().unwrap_or_default())
         .collect()
 }
+
+const BATCH_VERIFIED: &str = "provenance.ledger_coverage.batch_verified";
+const BATCH_SCOPED: &str = "provenance.ledger_coverage.batch_scoped";
 
 /// A refusal on an intact ledger row must never route an operator to a restore.
 fn assert_no_restore_advice(case: &str, message: &str, remediation: &str) -> Result<(), String> {
@@ -466,19 +539,24 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         let (probe, trace) = probe(&scratch)?;
         println!("  {}", describe(&probe));
-        let scoped = traced_batch_scoped(&trace);
-        for detail in &scoped {
-            println!("  TRACE provenance.ledger_coverage.batch_scoped {detail}");
+        let verified = traced_coverage(&trace, BATCH_VERIFIED);
+        for detail in &verified {
+            println!("  TRACE {BATCH_VERIFIED} {detail}");
+        }
+        for detail in &traced_coverage(&trace, BATCH_SCOPED) {
+            println!("  TRACE {BATCH_SCOPED} {detail}");
         }
         if let Err(error) = expect_marked_hit(case, &scratch, &probe) {
             failures.push(error);
-        } else if !scoped
-            .iter()
-            .any(|detail| detail.contains("kind=grounding") && detail.contains("subject=query"))
-        {
+        } else if !verified.iter().any(|detail| {
+            detail.contains("kind=grounding")
+                && detail.contains("subject=query")
+                && detail.contains(&format!("members={ROWS}"))
+        }) {
             failures.push(format!(
-                "{case}: the hit was served but the engine never declared it batch-scoped; \
-                 coverage was decided by some other route than the declared rule"
+                "{case}: the hit was served but the engine never declared it batch-VERIFIED with \
+                 {ROWS} declared members; post-#2096 this shape must be decided from the entry's \
+                 own member list, not accepted on the entry-hash binding alone"
             ));
         }
     }
@@ -543,11 +621,21 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("  marked row provenance seq={seq} hash={hash}..");
         let (probe, trace) = probe(&scratch)?;
         println!("  {}", describe(&probe));
-        for detail in &traced_batch_scoped(&trace) {
-            println!("  TRACE provenance.ledger_coverage.batch_scoped {detail}");
+        let verified = traced_coverage(&trace, BATCH_VERIFIED);
+        for detail in &verified {
+            println!("  TRACE {BATCH_VERIFIED} {detail}");
+        }
+        for detail in &traced_coverage(&trace, BATCH_SCOPED) {
+            println!("  TRACE {BATCH_SCOPED} {detail}");
         }
         if let Err(error) = expect_marked_hit(case, &scratch, &probe) {
             failures.push(error);
+        } else if verified.is_empty() {
+            failures.push(format!(
+                "{case}: the derived-snapshot publish shape was served without a member \
+                 declaration; #2096 requires the layer-commit writer to enumerate the Base rows \
+                 it stamps"
+            ));
         }
     }
 
@@ -586,20 +674,22 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // ---- 6. Anneal / Kernel(..) — an undeclared shape ----------------------
+    // ---- 6. Anneal / Kernel(..) — an undeclared shape, historical row ------
     {
-        let case = "6 Anneal/Kernel (undeclared)";
+        let case = "6 Anneal/Kernel (undeclared, historical)";
         let scratch = open_scratch(&root, "case6_shape_unregistered")?;
-        restamp_with_shape(
+        let seq = restamp_historical(
             &scratch,
             scratch.marked,
             EntryKind::Anneal,
             SubjectId::Kernel(b"fsv-2084-anneal-change".to_vec()),
             &json!({ "kind": "Anneal", "change_id": 1 }),
         )?;
-        let (seq, hash) = stored_provenance(&scratch, scratch.marked)?;
+        let (stored_seq, hash) = stored_provenance(&scratch, scratch.marked)?;
         println!("\n=== {case} — a shape no declared writer stamps onto a Base row ===");
-        println!("  marked row provenance seq={seq} hash={hash}..");
+        println!(
+            "  minted historically at seq={seq}; marked row provenance seq={stored_seq} hash={hash}.."
+        );
         let (probe, _trace) = probe(&scratch)?;
         println!("  {}", describe(&probe));
         if let Err(error) = expect_refusal(case, &probe, SHAPE_UNREGISTERED, &["anneal/kernel"]) {
@@ -625,14 +715,16 @@ fn main() -> Result<(), Box<dyn Error>> {
             .iter()
             .find(|id| **id != scratch.marked)
             .ok_or("corpus has no second row")?;
-        restamp_with_shape(
+        restamp_historical(
             &scratch,
             scratch.marked,
             EntryKind::Ingest,
             SubjectId::Cx(other),
             // Declared to enumerate (Ingest under a Cx subject that is not ours)
-            // but carries no member declaration at all: unreadable as its own
-            // declared shape, which is a real ledger-content defect.
+            // but carries no member declaration at all — neither the #2096
+            // `batch_members` block nor the legacy top-level `cx_id` array. It is
+            // unreadable as its own declared shape, which is a real
+            // ledger-content defect.
             &json!({ "mode": "batch_ingest", "count": 4 }),
         )?;
         let (seq, hash) = stored_provenance(&scratch, scratch.marked)?;
@@ -642,6 +734,57 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("  {}", describe(&probe));
         if let Err(error) = expect_refusal(case, &probe, LEDGER_CORRUPT, &["cx_id"]) {
             failures.push(error);
+        }
+    }
+
+    // ---- 8. a PRE-#2096 batch entry that names no member at all ------------
+    // The ledger is append-only, so every multi-constellation grounding batch
+    // written before #2096 still carries no member declaration. Tightening the
+    // reader must not strand them: this case pins the trusting path that those
+    // rows — and only those rows — still take.
+    {
+        let case = "8 Grounding/Query(multi), no declaration";
+        let scratch = open_scratch(&root, "case8_batch_scoped_legacy")?;
+        let seq = restamp_historical(
+            &scratch,
+            scratch.marked,
+            EntryKind::Grounding,
+            SubjectId::Query(GROUNDING_MULTI_SUBJECT.to_vec()),
+            // Exactly the pre-#2096 payload: hashed source keys, a count, and
+            // nothing that names a constellation.
+            &json!({
+                "schema": "synapse.grounding_anchor_batch.v1",
+                "source_cf": "agent_transcripts",
+                "source_count": ROWS,
+            }),
+        )?;
+        let (stored_seq, hash) = stored_provenance(&scratch, scratch.marked)?;
+        println!("\n=== {case} — a row committed before members were declarable ===");
+        println!(
+            "  minted historically at seq={seq}; marked row provenance seq={stored_seq} hash={hash}.."
+        );
+        let (probe, trace) = probe(&scratch)?;
+        println!("  {}", describe(&probe));
+        let scoped = traced_coverage(&trace, BATCH_SCOPED);
+        for detail in &scoped {
+            println!("  TRACE {BATCH_SCOPED} {detail}");
+        }
+        if let Err(error) = expect_marked_hit(case, &scratch, &probe) {
+            failures.push(error);
+        } else if !scoped
+            .iter()
+            .any(|detail| detail.contains("kind=grounding") && detail.contains("subject=query"))
+        {
+            failures.push(format!(
+                "{case}: a pre-#2096 batch row was served, but not through the batch-scoped \
+                 trusting path; either it was silently upgraded to a verified verdict it cannot \
+                 support, or coverage was decided by some other route"
+            ));
+        }
+        if !traced_coverage(&trace, BATCH_VERIFIED).is_empty() {
+            failures.push(format!(
+                "{case}: an entry carrying NO member declaration was reported as batch-verified"
+            ));
         }
     }
 

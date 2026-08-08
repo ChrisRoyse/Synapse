@@ -12,7 +12,9 @@ use crate::media_artifact::{
 };
 use crate::vault::encode::WriteRow;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, Result, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, PayloadBuilder, RedactionPolicy, SubjectId};
+use calyx_ledger::{
+    ActorId, EntryKind, PayloadBuilder, RedactionPolicy, SubjectId, declare_batch_members,
+};
 use serde_json::json;
 
 const BATCH_ACTOR: &str = "calyx-aster-batch-ingest";
@@ -363,6 +365,32 @@ where
                 .into_iter()
                 .map(|(cf, key, value)| WriteRow { cf, key, value }),
         );
+        // #2096: a caller-supplied ledger entry becomes the provenance of every
+        // Base row this batch writes, under a subject the caller chose — the
+        // derived-snapshot publication stamps `Query(operation_id)` and recorded
+        // only `constellation_count`, a number, so the set it covered was
+        // unrecoverable from the ledger. Declare the members here, where the
+        // accepted set is final, rather than at each call site where it is not
+        // yet known.
+        //
+        // The implicit-entry path is untouched: `batch_payload` already
+        // enumerates every accepted id under the top-level `cx_id` key.
+        let ledger_entry = match ledger_entry {
+            // An explicit entry over zero accepted constellations stamps no Base
+            // row (every input deduplicated to an existing one). There is
+            // nothing to declare, and refusing would break dedup idempotency.
+            Some(entry) if !accepted.is_empty() => {
+                let members = accepted
+                    .iter()
+                    .map(|cx| cx.constellation.cx_id)
+                    .collect::<Vec<_>>();
+                Some(BatchLedgerEntry {
+                    payload: declare_batch_members(&entry.payload, &members)?,
+                    ..entry
+                })
+            }
+            other => other,
+        };
         let mut hook_guard = match &self.ledger_hook {
             Some(hook) => Some(ledger_hook::lock_hook(hook)?),
             None => None,

@@ -56,6 +56,12 @@ calyx-loom = { workspace = true }
 #                    provenance coverage table is exercised shape by shape
 #                    against the real writers rather than described (#2084).
 calyx-ledger = { workspace = true }
+# blake3            ledger_hygiene_contracts_fsv must compute the SAME content
+#                    address the ledger reproduce path verifies against
+#                    (`verify_input_hash` hashes the recorded input with blake3),
+#                    so the recorded evidence it mints is accepted by the
+#                    production reader rather than by a look-alike (#2094).
+blake3 = "1"
 # tracing-subscriber the instruments that must read the engine's own structured
 #                    log as evidence rather than infer it from return values
 #                    (#1936). The daemon installs its own subscriber.

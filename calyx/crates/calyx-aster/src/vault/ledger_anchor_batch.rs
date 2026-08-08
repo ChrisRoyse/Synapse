@@ -6,7 +6,7 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
     ActorId, EntryKind, LedgerAppender, LedgerCfStore, LedgerHeadAnchor, LedgerRow, SubjectId,
-    decode as decode_ledger,
+    declare_batch_members, decode as decode_ledger, require_base_stamp_declared,
 };
 
 struct AnchorBatchLedgerInput {
@@ -44,6 +44,21 @@ where
         actor: ActorId,
     ) -> Result<LedgerRef> {
         validate_anchor_batch(&anchors)?;
+        // This path rewrites the Base row's `provenance`, so the shape must be
+        // one the search-side coverage table can serve (#2095). Checked before
+        // the commit lock is taken: a refusal here costs nothing and names the
+        // writer that chose the shape.
+        //
+        // Unlike the multi-constellation sibling this path does NOT add a
+        // `batch_members` declaration (#2096), for two reasons. It covers
+        // exactly one constellation, which its `Cx` subject already names, so a
+        // member list would add nothing a reader can use. And the idempotent
+        // branch below compares the requested payload byte-for-byte against the
+        // stored entry (`validate_existing_batch_ledger`): rewriting the payload
+        // here would make every anchor batch already committed on a live vault
+        // fail that comparison as `CALYX_ASTER_CORRUPT_SHARD` on its next
+        // idempotent replay.
+        require_base_stamp_declared("anchors_with_ledger_entry", kind, &subject)?;
         let entry = AnchorBatchLedgerInput {
             kind,
             subject,
@@ -161,13 +176,8 @@ where
         actor: ActorId,
     ) -> Result<MultiCxAnchorBatchOutcome> {
         let requested_anchor_count = validate_multi_cx_anchor_batch(&entries)?;
-        let entry = AnchorBatchLedgerInput {
-            kind,
-            subject,
-            payload,
-            actor,
-        };
-        self.with_durable_commit_lock(|| {
+        require_base_stamp_declared("anchors_for_many_with_ledger_entry", kind, &subject)?;
+        self.with_durable_commit_lock(move || {
             let latest = self.snapshot();
             let mut existing_anchor_count = 0usize;
             let mut missing_entries = Vec::<(CxId, calyx_core::Constellation, Vec<Anchor>)>::new();
@@ -196,6 +206,30 @@ where
                     written_anchor_count: 0,
                 });
             }
+
+            // #2096: this entry is about to become the provenance of every Base
+            // row below, under a subject that names none of them. Declare the
+            // membership in the payload so "which constellations does seq N
+            // cover" is answerable from the ledger alone.
+            //
+            // The members are the constellations actually RESTAMPED — the
+            // `missing_entries` set, not the full request. A constellation whose
+            // anchors were all already present keeps its earlier provenance and
+            // is genuinely not covered by this entry; listing it would make the
+            // declaration a lie in the one direction that matters, since the
+            // reader treats a complete declaration as authoritative about
+            // non-membership too.
+            let members = missing_entries
+                .iter()
+                .map(|(id, _constellation, _anchors)| *id)
+                .collect::<Vec<_>>();
+            let payload = declare_batch_members(&payload, &members)?;
+            let entry = AnchorBatchLedgerInput {
+                kind,
+                subject,
+                payload,
+                actor,
+            };
 
             let Some(hook) = &self.ledger_hook else {
                 let store = AnchorBatchRawLedgerStore { vault: self };

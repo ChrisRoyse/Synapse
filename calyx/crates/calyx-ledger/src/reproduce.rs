@@ -93,7 +93,54 @@ impl ReproduceInputResolver for InlineInputResolver {
     }
 }
 
+/// A reproduce request named an answer whose slot evidence does not exist.
+///
+/// This is not drift and not corruption: the ledger row is intact, and nothing
+/// about the answer has been shown to differ. There is simply nothing recorded
+/// to re-measure, so no verdict can be reached (#2094).
+pub const CALYX_REPRODUCE_EVIDENCE_UNAVAILABLE: &str = "CALYX_REPRODUCE_EVIDENCE_UNAVAILABLE";
+
+const EVIDENCE_UNAVAILABLE_REMEDIATION: &str = "the answer entry records no per-slot measurement evidence, so its result cannot be \
+     re-measured and no reproduce verdict is possible. Nothing is corrupt and nothing has \
+     drifted: wire the writer that records `recorded_slots` (inline) or `measure_refs` (pointing \
+     at EntryKind::Measure entries) at the time the answer is produced, then reproduce answers \
+     minted after that. Do NOT read the absence of evidence as a passing verdict";
+
+fn evidence_unavailable(message: impl Into<String>) -> CalyxError {
+    CalyxError {
+        code: CALYX_REPRODUCE_EVIDENCE_UNAVAILABLE,
+        message: message.into(),
+        remediation: EVIDENCE_UNAVAILABLE_REMEDIATION,
+    }
+}
+
 /// Reads the answer entry and its referenced Measure entries from the ledger CF.
+///
+/// # The evidence contract, and why this refuses more than it used to (#2094)
+///
+/// An answer entry claims its slot measurements either inline (`recorded_slots`)
+/// or by reference (`measure_refs`, seqs pointing at entries whose payload is
+/// one [`RecordedSlot`]). The reference form is gated on the referenced entry
+/// actually being a measurement record — without that gate a `measure_refs` seq
+/// could name any entry at all and `recorded_slot_from_value` would either fail
+/// confusingly or succeed against a payload that coincidentally carried the
+/// right field names.
+///
+/// A workspace-wide sweep for #2094 found that gate to be unsatisfiable: nothing
+/// mints [`EntryKind::Measure`] (it is
+/// [`crate::kind::WriterStatus::ReservedUnwritten`]), and nothing mints
+/// `measure_refs` or `recorded_slots` either. The whole contract is
+/// producer-less, and the gate was dead code that looked like protection.
+///
+/// The gate is kept — it is the correct check, and `Measure` is the correct kind
+/// for the evidence — but it is now expressed against the declared
+/// [`EntryKind::carries_recorded_slot`] predicate, and the unreachability is
+/// surfaced at the front door instead of being hidden behind it: a context that
+/// resolves NO recorded slots is refused with
+/// [`CALYX_REPRODUCE_EVIDENCE_UNAVAILABLE`]. It used to be returned empty, and
+/// `assert_within_tolerance` scores empty-against-empty as `reproduced = true` —
+/// so an answer with no evidence at all could report as successfully reproduced.
+/// A reproduce verdict that no measurement backed is worse than no verdict.
 pub fn build_reproduce_context(
     cf_reader: &impl LedgerCfStore,
     answer_id: &QueryId,
@@ -108,19 +155,43 @@ pub fn build_reproduce_context(
     let by_seq: BTreeMap<_, _> = entries.iter().map(|entry| (entry.seq, entry)).collect();
     let mut ledger_entries = vec![answer.clone()];
     let mut recorded_slots = recorded_slots_from_value(&payload)?;
+    let inline_slots = recorded_slots.len();
 
-    for seq in measure_refs(&payload)? {
-        let measure = by_seq
-            .get(&seq)
-            .ok_or_else(|| CalyxError::ledger_corrupt(format!("measure ref {seq} not found")))?;
-        if measure.kind != EntryKind::Measure {
-            return Err(CalyxError::ledger_corrupt(format!(
-                "measure ref {seq} points to {} entry",
-                measure.kind
+    let refs = measure_refs(&payload)?;
+    let referenced = refs.len();
+    for seq in refs {
+        let measure = by_seq.get(&seq).ok_or_else(|| {
+            // The referenced seq is genuinely absent from an append-only chain,
+            // which is a ledger-content defect.
+            CalyxError::ledger_corrupt(format!(
+                "answer entry at seq {} references measurement evidence at seq {seq}, which is \
+                 not present in the ledger",
+                answer.seq
+            ))
+        })?;
+        if !measure.kind.carries_recorded_slot() {
+            return Err(evidence_unavailable(format!(
+                "answer entry at seq {} references measurement evidence at seq {seq}, but that \
+                 entry is a {} entry and only {} entries are declared to carry a recorded slot",
+                answer.seq,
+                measure.kind,
+                EntryKind::Measure
             )));
         }
         recorded_slots.push(recorded_slot_from_value(&payload_value(measure)?)?);
         ledger_entries.push((*measure).clone());
+    }
+
+    if recorded_slots.is_empty() {
+        return Err(evidence_unavailable(format!(
+            "answer entry at seq {} records no per-slot measurement evidence: it carries \
+             {inline_slots} inline `recorded_slots` and {referenced} `measure_refs`. No writer in \
+             this workspace mints either field, nor any {} entry to point one at (#2094), so \
+             re-measurement has nothing to run and an empty replay must NOT be scored as a \
+             successful reproduction",
+            answer.seq,
+            EntryKind::Measure
+        )));
     }
 
     Ok(ReproduceContext {

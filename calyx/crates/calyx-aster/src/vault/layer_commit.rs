@@ -1,7 +1,9 @@
 use super::{AsterVault, durable, encode, ledger_hook, reject_raw_ledger_rows};
 use crate::cf::ColumnFamily;
-use calyx_core::{CalyxError, Clock, Result, Seq};
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_core::{CalyxError, Clock, CxId, Result, Seq};
+use calyx_ledger::{
+    ActorId, EntryKind, SubjectId, declare_batch_members, require_base_stamp_declared,
+};
 
 /// One auditable ledger event to stage alongside a raw CF batch.
 pub struct CfLedgerEntry {
@@ -15,6 +17,31 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Commits raw CF rows and one ledger entry in a single durable batch.
+    ///
+    /// # The Base-row contract (#2095)
+    ///
+    /// Any `Base` row in `rows` has its `provenance` rewritten to point at the
+    /// entry this call mints, which makes the caller's `(kind, subject)` pair
+    /// the answer a future reader gets when it asks what commits that
+    /// constellation. Before #2095 the pair was entirely unconstrained: any
+    /// crate could stamp any shape — including one whose subject and payload
+    /// named no constellation at all — onto an unbounded set of stored
+    /// constellations, and the first symptom was a refused query (#2084).
+    ///
+    /// A batch carrying `Base` rows is therefore held to the same declared table
+    /// the search-side verifier reads
+    /// ([`calyx_ledger::base_stamp::coverage_rule`]):
+    ///
+    /// * an undeclared `(kind, subject)` pair is refused before anything is
+    ///   staged, with [`calyx_ledger::CALYX_LEDGER_BASE_STAMP_UNDECLARED`];
+    /// * the payload is required to be a JSON object and gains a
+    ///   [`calyx_ledger::batch_members`] declaration naming every constellation
+    ///   stamped, so the entry answers its own membership question (#2096).
+    ///
+    /// A batch with no `Base` rows — every in-tree caller today: the
+    /// KV/document/relational/timeseries/blob layers and the cross-model
+    /// transaction — stamps no provenance and is unaffected by either rule.
     pub fn write_cf_batch_with_ledger_entry(
         &self,
         rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
@@ -31,6 +58,13 @@ where
         if data_rows.is_empty() {
             return Ok(self.latest_seq());
         }
+        let stamped = stamped_base_row_ids(&data_rows)?;
+        let payload = if stamped.is_empty() {
+            payload
+        } else {
+            require_base_stamp_declared("write_cf_batch_with_ledger_entry", kind, &subject)?;
+            declare_batch_members(&payload, &stamped)?
+        };
 
         self.with_durable_commit_lock(|| {
             if let Some(hook) = &self.ledger_hook {
@@ -165,6 +199,22 @@ fn staged_ledger_ref(staged: &[calyx_ledger::StagedLedgerRow]) -> Result<calyx_c
         .first()
         .map(calyx_ledger::StagedLedgerRow::ledger_ref)
         .ok_or_else(|| CalyxError::ledger_group_commit_failed("no staged ledger rows"))
+}
+
+/// The constellations whose provenance this batch is about to rewrite.
+///
+/// Decoded from the caller's own `Base` rows rather than taken on trust, so the
+/// membership declaration names exactly the rows that get stamped and cannot
+/// drift from them.
+fn stamped_base_row_ids(rows: &[encode::WriteRow]) -> Result<Vec<CxId>> {
+    rows.iter()
+        .filter(|row| row.cf == ColumnFamily::Base)
+        .map(|row| {
+            Ok(super::base_rewrite::BaseRowRewrite::decode(&row.value)?
+                .constellation()
+                .cx_id)
+        })
+        .collect()
 }
 
 fn attach_ledger_ref_to_base_rows(

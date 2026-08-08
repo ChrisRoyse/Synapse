@@ -6,7 +6,11 @@ use calyx_aster::ledger_view::read_ledger_seqs_traced;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, LedgerRef};
-use calyx_ledger::{EntryKind, LedgerEntry, SubjectId, decode};
+use calyx_ledger::base_stamp::CoverageRule;
+use calyx_ledger::{
+    BatchMembers, LedgerEntry, MemberVerdict, SubjectId, SubjectShape, coverage_rule, decode,
+    read_batch_members,
+};
 use calyx_sextant::{
     CALYX_SEXTANT_PROVENANCE_MISSING, CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
     CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED, FreshnessTag, Hit, ProvenanceSource,
@@ -236,8 +240,28 @@ impl TargetedLedgerVerifier {
         // alone (#2084). Coverage answers a different question — does this entry
         // attest THIS constellation — and its negatives are provenance faults,
         // not vault damage.
-        match entry_coverage(entry, cx_id)? {
+        let coverage = entry_coverage(entry, cx_id)?;
+        match coverage {
             Coverage::Subject | Coverage::PayloadList => {}
+            Coverage::BatchMemberList => {
+                // #2096: a batch entry that enumerates its members. Coverage is
+                // decided FROM the entry, not merely consistent with it, so the
+                // trace records the stronger fact separately — an FSV that
+                // cannot tell these two apart cannot prove the tightening.
+                trace.emit_detail(
+                    "provenance.ledger_coverage.batch_verified",
+                    None,
+                    Some(1),
+                    Some(format!(
+                        "cx={cx_id} seq={} kind={entry_kind} subject={} members={}",
+                        expected.seq,
+                        subject.tag(),
+                        declared_members(entry)?
+                            .total()
+                            .map_or_else(|| "?".to_owned(), |total| total.to_string()),
+                    )),
+                );
+            }
             Coverage::BatchScope => {
                 // The entry is a declared batch attestation that does not
                 // enumerate its members, so coverage rests on the entry-hash and
@@ -342,165 +366,6 @@ fn missing_provenance(message: impl Into<String>) -> CalyxError {
     sextant_error(CALYX_SEXTANT_PROVENANCE_MISSING, message)
 }
 
-/// The `SubjectId` variant, stripped of its identity payload so the coverage
-/// table can dispatch on shape.
-///
-/// The conversion is an exhaustive `match` on purpose: a subject variant added
-/// to `calyx-ledger` fails this build instead of silently collapsing into an
-/// existing arm.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SubjectShape {
-    Cx,
-    Lens,
-    Kernel,
-    Guard,
-    Query,
-}
-
-impl SubjectShape {
-    fn of(subject: &SubjectId) -> Self {
-        match subject {
-            SubjectId::Cx(_) => Self::Cx,
-            SubjectId::Lens(_) => Self::Lens,
-            SubjectId::Kernel(_) => Self::Kernel,
-            SubjectId::Guard(_) => Self::Guard,
-            SubjectId::Query(_) => Self::Query,
-        }
-    }
-
-    /// Stable label carried in evidence so a refusal names the shape it saw.
-    fn tag(self) -> &'static str {
-        match self {
-            Self::Cx => "cx",
-            Self::Lens => "lens",
-            Self::Kernel => "kernel",
-            Self::Guard => "guard",
-            Self::Query => "query",
-        }
-    }
-}
-
-/// How one declared ledger-entry shape names the constellations it covers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CoverageRule {
-    /// The entry covers exactly the constellation named by its `Cx` subject, so
-    /// a `Cx` subject naming a different constellation is a decided negative.
-    SubjectCx,
-    /// A batch entry that enumerates its members in the payload under `cx_id`.
-    /// A payload that cannot be read as that shape is malformed — a genuine
-    /// corruption signal, not a negative.
-    EnumeratedCxList,
-    /// A declared batch entry that stamps one `LedgerRef` onto every Base row it
-    /// commits without naming any of them in the entry. Membership is not
-    /// decidable from the entry; the Base row's binding to it is established by
-    /// the entry-hash and chain-link checks that run before coverage.
-    BatchScoped,
-    /// No writer in this workspace stamps a Base row's provenance with this
-    /// shape. Fail closed naming the shape rather than guess at its membership.
-    Unregistered,
-}
-
-/// The declared coverage rule for one `(EntryKind, SubjectShape)` shape.
-///
-/// #2084: coverage recognition used to be two hard-coded special cases — a `Cx`
-/// subject naming the hit, or an `Ingest` entry whose payload listed it — and
-/// every other legitimately minted shape fell through to a bare `false`, which
-/// the caller reported as `CALYX_LEDGER_CORRUPT` with a "restore from restic"
-/// remediation, on rows whose entry hash had just matched their Base provenance
-/// byte for byte. The concrete shape that tripped it is the multi-constellation
-/// grounding anchor batch (`Grounding` / `Query`), which stamps one entry onto
-/// every constellation in the batch.
-///
-/// Recognition is now this declared table, and both matches below are exhaustive
-/// — over `EntryKind` and over `SubjectShape` — so a kind or subject variant
-/// added to `calyx-ledger` breaks this build rather than degrading into a false
-/// corruption verdict at query time. Each arm cites the writer that mints it.
-fn coverage_rule(kind: EntryKind, subject: SubjectShape) -> CoverageRule {
-    match kind {
-        // Single ingest stamps `Cx(cx)` (calyx-aster vault/store.rs,
-        // vault/dedup_commit.rs, vault/ledger_append.rs
-        // `stage_raw_ingest_ledger_locked`) and is decided by the subject.
-        // Batch ingest names only the FIRST accepted constellation as subject
-        // and enumerates the whole batch in the payload `cx_id` array
-        // (calyx-aster vault/batch_ingest.rs `batch_payload`), so a `Cx` subject
-        // that is not ours must enumerate. Every other subject variant is an
-        // opaque batch marker minted by a caller supplying its own subject and
-        // payload: the derived snapshot publication
-        // (`Query(operation_id)`, synapse-calyx panel_lifecycle.rs), the
-        // cross-model transaction (`Query(batch digest)`, calyx-aster
-        // txn/cross_model.rs), the precondition-gated ingest
-        // (`Guard(vault_id)`, calyx-aster vault/ingest_precondition.rs) and the
-        // KV/document/relational/timeseries/blob layer commits. None of those
-        // enumerate their members.
-        EntryKind::Ingest => match subject {
-            SubjectShape::Cx => CoverageRule::EnumeratedCxList,
-            SubjectShape::Lens
-            | SubjectShape::Kernel
-            | SubjectShape::Guard
-            | SubjectShape::Query => CoverageRule::BatchScoped,
-        },
-        // The single-anchor grounding writer stamps `Cx(cx)` (synapse-calyx
-        // `put_grounding_anchors`). The multi-constellation writer stamps ONE
-        // `Query(b"synapse.grounding_anchor.multi.v1")` entry onto every
-        // constellation in the batch (synapse-calyx
-        // `put_grounding_anchors_for_many` -> calyx-aster
-        // vault/ledger_anchor_batch.rs `multi_cx_anchor_rows_with_ledger_ref`)
-        // and its payload lists hashed source-row keys, never cx ids. That is
-        // the shape #2084 reported as vault corruption.
-        EntryKind::Grounding => match subject {
-            SubjectShape::Cx => CoverageRule::SubjectCx,
-            SubjectShape::Query => CoverageRule::BatchScoped,
-            SubjectShape::Lens | SubjectShape::Kernel | SubjectShape::Guard => {
-                CoverageRule::Unregistered
-            }
-        },
-        // Single-subject rewrites of one stored constellation:
-        //   Migrate  — retained-input-pointer and temporal-metadata backfills
-        //              (calyx-aster vault/input_pointer.rs, vault/temporal_metadata.rs)
-        //   Guard    — reactive trigger persistence and Ward verdicts
-        //              (calyx-loom reactive/durable.rs, calyx-ward ledger.rs)
-        //   Admin    — GC orphan Base repair (calyx-aster gc/orphan_reconciler)
-        //   Erase    — per-constellation tombstones (calyx-aster erase.rs)
-        // Each names its constellation in the subject and never covers a second
-        // one, so a different `Cx` subject is a decided negative. Their non-`Cx`
-        // forms (vault-wide erase `Guard(scope digest)`, residency/retention
-        // `Guard(..)`, reproduce and checkpoint `Query(..)`, subscription
-        // `Guard(..)`) commit no Base rows at all.
-        EntryKind::Migrate | EntryKind::Guard | EntryKind::Admin | EntryKind::Erase => {
-            match subject {
-                SubjectShape::Cx => CoverageRule::SubjectCx,
-                SubjectShape::Lens
-                | SubjectShape::Kernel
-                | SubjectShape::Guard
-                | SubjectShape::Query => CoverageRule::Unregistered,
-            }
-        }
-        // Kinds with no Base-stamping writer in the workspace. Measure, Score,
-        // Admission and AgentForecast have no writer at all; Assay, Kernel,
-        // Answer, Anneal, Policy and BatchCommitment write evidence rows
-        // (Registry/Graph/AnnealReport/checkpoint cohorts) and never rewrite a
-        // Base row's provenance. A `Cx` subject naming the hit is still accepted
-        // before this table is consulted, so reaching here means the entry
-        // neither names the hit nor belongs to a declared batch shape.
-        EntryKind::Measure
-        | EntryKind::Assay
-        | EntryKind::Kernel
-        | EntryKind::Answer
-        | EntryKind::Anneal
-        | EntryKind::Admission
-        | EntryKind::AgentForecast
-        | EntryKind::Policy
-        | EntryKind::Score
-        | EntryKind::BatchCommitment => match subject {
-            SubjectShape::Cx
-            | SubjectShape::Lens
-            | SubjectShape::Kernel
-            | SubjectShape::Guard
-            | SubjectShape::Query => CoverageRule::Unregistered,
-        },
-    }
-}
-
 /// The decided relationship between one ledger entry and one constellation.
 ///
 /// Separating these from "the entry is unreadable" is the whole point of #2084:
@@ -511,12 +376,43 @@ enum Coverage {
     Subject,
     /// The entry's payload member list names this constellation.
     PayloadList,
+    /// A batch entry's versioned `batch_members` declaration names this
+    /// constellation, so a batch shape is positively verified rather than
+    /// merely accepted (#2096).
+    BatchMemberList,
     /// A declared batch shape whose membership the entry does not enumerate.
     BatchScope,
     /// A recognised shape that positively does not cover this constellation.
     NotCovered,
 }
 
+/// Decides one ledger entry against one constellation.
+///
+/// # Where the rules live (#2095)
+///
+/// The `(EntryKind, SubjectShape)` table this dispatches on used to live in this
+/// file, which meant the writer that stamped a Base row and the reader that
+/// judged it were free to disagree — and did, which is #2084. It now lives in
+/// [`calyx_ledger::base_stamp`], the crate both sides already depend on, and
+/// `calyx-aster` refuses at WRITE time any pair this table would refuse here.
+/// The two are the same declaration, not two copies of one.
+///
+/// # Why batch entries are no longer merely trusted (#2096)
+///
+/// A `BatchScoped` shape stamps one entry onto every Base row it commits. Before
+/// #2096 none of them named a member, so acceptance rested entirely on the
+/// entry-hash and chain-link binding checked before coverage — good enough to
+/// know the row points at an intact, unaltered entry, but not enough to *prove*
+/// that entry attests this row. Entries minted after #2096 carry a
+/// [`calyx_ledger::batch_members`] declaration, and where one is present it is
+/// authoritative in both directions: a listed hit is positively verified, and a
+/// hit absent from a COMPLETE list is a decided negative.
+///
+/// Historical entries carry no declaration and keep the trusting path exactly as
+/// before — an append-only ledger cannot be upgraded in place, so re-judging old
+/// rows under a rule they predate would refuse hits on evidence that was never
+/// required of their writers. A truncated declaration is likewise never read as
+/// a negative: absence from a bounded prefix proves nothing.
 fn entry_coverage(entry: &LedgerEntry, cx_id: CxId) -> CliResult<Coverage> {
     if entry.subject == SubjectId::Cx(cx_id) {
         return Ok(Coverage::Subject);
@@ -524,14 +420,26 @@ fn entry_coverage(entry: &LedgerEntry, cx_id: CxId) -> CliResult<Coverage> {
     let subject = SubjectShape::of(&entry.subject);
     match coverage_rule(entry.kind, subject) {
         CoverageRule::SubjectCx => Ok(Coverage::NotCovered),
-        CoverageRule::EnumeratedCxList => {
-            if payload_names_cx(entry, cx_id)? {
-                Ok(Coverage::PayloadList)
-            } else {
-                Ok(Coverage::NotCovered)
+        CoverageRule::EnumeratedCxList => match declared_members(entry)?.verdict(cx_id) {
+            MemberVerdict::Listed => Ok(Coverage::PayloadList),
+            MemberVerdict::NotListed => Ok(Coverage::NotCovered),
+            // Pre-#2096 entries of an enumerating shape carry their members in
+            // the top-level `cx_id` convention instead. A shape declared to
+            // enumerate that names its members NOWHERE is malformed, and
+            // `payload_names_cx` keeps that loud corruption verdict.
+            MemberVerdict::Undecided => {
+                if payload_names_cx(entry, cx_id)? {
+                    Ok(Coverage::PayloadList)
+                } else {
+                    Ok(Coverage::NotCovered)
+                }
             }
-        }
-        CoverageRule::BatchScoped => Ok(Coverage::BatchScope),
+        },
+        CoverageRule::BatchScoped => match declared_members(entry)?.verdict(cx_id) {
+            MemberVerdict::Listed => Ok(Coverage::BatchMemberList),
+            MemberVerdict::NotListed => Ok(Coverage::NotCovered),
+            MemberVerdict::Undecided => Ok(Coverage::BatchScope),
+        },
         CoverageRule::Unregistered => Err(sextant_error(
             CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
             format!(
@@ -545,6 +453,28 @@ fn entry_coverage(entry: &LedgerEntry, cx_id: CxId) -> CliResult<Coverage> {
         )
         .into()),
     }
+}
+
+/// Reads the entry's versioned batch membership declaration.
+///
+/// A declaration that is present but unreadable is a writer defect in a shape
+/// that promised to be decidable, so it fails closed naming the shape rather
+/// than degrading into the trusting path it was introduced to replace.
+fn declared_members(entry: &LedgerEntry) -> CliResult<BatchMembers> {
+    Ok(read_batch_members(&entry.payload).map_err(|error| {
+        sextant_error(
+            CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
+            format!(
+                "ledger seq {} carries the {}/{} shape with a batch membership declaration this \
+                 build cannot read ({}); the entry hash matches the stored Base provenance, so \
+                 the ledger row itself is intact",
+                entry.seq,
+                entry.kind,
+                SubjectShape::of(&entry.subject).tag(),
+                error.message
+            ),
+        )
+    })?)
 }
 
 /// Reads the `cx_id` member declaration of an enumerating batch entry.
