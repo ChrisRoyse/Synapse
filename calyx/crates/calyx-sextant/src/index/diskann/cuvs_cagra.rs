@@ -8,7 +8,7 @@ use calyx_core::Result;
 use cuvs_sys as ffi;
 
 use super::build::{
-    DiskAnnBuildMetric, DiskAnnBuildParams, medoid, normalize, write_graph_from_adjacency,
+    DiskAnnBuildMetric, DiskAnnBuildParams, build_space, medoid, write_graph_from_adjacency,
     write_graph_from_adjacency_f32,
 };
 use super::graph::invalid;
@@ -23,10 +23,12 @@ pub(super) fn build_diskann_graph_cuvs_cagra(
     if vectors.len() == 1 {
         return write_cagra_graph(path, vectors, params, 0, &[Vec::new()], metric);
     }
-    let space = cagra_build_space(vectors, metric);
+    // The Vamana builder's flat space is exactly the row-major `n x dim` block
+    // cuVS wants as its dataset, so this shares one allocation with it.
+    let space = build_space(vectors, params.dim, metric);
     let entry = medoid(&space, metric);
     let graph_degree = params.m_max.min(vectors.len() - 1);
-    let mut dataset = flatten(&space, params.dim);
+    let mut dataset = space.into_flat();
 
     let res = Resources::new()?;
     let index_params = CagraParams::new()?;
@@ -64,21 +66,6 @@ fn write_cagra_graph(
             write_graph_from_adjacency_f32(path, vectors, params, entry, adjacency)
         }
     }
-}
-
-fn cagra_build_space(vectors: &[(u32, Vec<f32>)], metric: DiskAnnBuildMetric) -> Vec<Vec<f32>> {
-    match metric {
-        DiskAnnBuildMetric::UnitL2 => normalize(vectors),
-        DiskAnnBuildMetric::RawL2 => vectors.iter().map(|(_, vector)| vector.clone()).collect(),
-    }
-}
-
-fn flatten(norm: &[Vec<f32>], dim: usize) -> Vec<f32> {
-    let mut out = Vec::with_capacity(norm.len() * dim);
-    for row in norm {
-        out.extend_from_slice(row);
-    }
-    out
 }
 
 fn graph_to_adjacency(

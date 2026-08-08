@@ -30,7 +30,7 @@ use super::graph::{
 
 pub use metric::DiskAnnBuildMetric;
 #[cfg(sextant_cuvs)]
-pub(super) use metric::normalize;
+pub(super) use metric::build_space;
 #[cfg(sextant_cuvs)]
 pub(super) use vamana::medoid;
 use vamana::vamana;

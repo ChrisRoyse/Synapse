@@ -17,6 +17,12 @@ default = []
 # is exported as `CUVS_COMPILED` for build-info capability readback — deploy
 # gates must assert that, never the feature name.
 cuda = ["dep:cudarc", "dep:cuvs-sys"]
+# `forge-gpu` turns on calyx-forge's CUDA surface so the DiskANN build lane can
+# be measured against a real `Backend` (#2103). It is a *probe* feature: nothing
+# in the library depends on it, and the CPU build path is byte-for-byte the same
+# with it on or off. Kept separate from `cuda` because that feature means cuVS,
+# which is Linux-only, while forge's CUDA backend builds on this host.
+forge-gpu = ["calyx-forge/cuda"]
 
 [dependencies]
 bincode.workspace = true
@@ -40,6 +46,11 @@ zstd.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 cudarc = { workspace = true, optional = true, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13030"] }
 cuvs-sys = { workspace = true, optional = true }
+
+[[example]]
+name = "diskann_build_gpu_probe_fsv"
+path = "examples/diskann_build_gpu_probe_fsv.rs"
+required-features = ["forge-gpu"]
 
 [lints]
 workspace = true
