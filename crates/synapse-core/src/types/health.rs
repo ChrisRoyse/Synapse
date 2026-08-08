@@ -273,6 +273,25 @@ pub struct SubsystemHealth {
     pub storage_gc_last_successful_source_census_base_rows: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_referenced_rows: Option<u64>,
+    /// In-RAM MVCC version-chain versions reclaimed by the last successful
+    /// `storage_gc` tick (#2122).
+    ///
+    /// Absent means no reclamation pass has completed in this daemon
+    /// generation. It was structurally absent for the whole life of every
+    /// daemon before this field existed, because `snapshot_version_gc` had no
+    /// caller anywhere in Synapse: every commit's value bytes were cloned into
+    /// an in-RAM version chain and never freed, which is the mechanism behind
+    /// the 1.07 GB/hour private-commit ratchet #2115 measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_snapshot_versions_reclaimed: Option<u64>,
+    /// That pass's full readback as one parseable `key=value` line: the pinned
+    /// floor it reclaimed below and the vault's current sequence (a floor stuck
+    /// far below is a leaked reader lease, the fix's one silent failure mode),
+    /// bytes and chains reclaimed, whether the sweep completed, the longest
+    /// row-table shard write-guard hold it took, and the process's committed
+    /// private memory around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_snapshot_version_detail: Option<String>,
     /// Verdict of the last scheduled physical vault verification (#2059):
     /// `verified` | `unverifiable` | `corrupt` | `unreadable`.
     ///

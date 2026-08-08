@@ -33,7 +33,7 @@ pub use snapshot_gc::{
     DEFAULT_GC_MIN_INTERVAL_MS, DEFAULT_MAX_PINNED_SEQ_GAP, DEFAULT_READER_LEASE_MS, GapAlert,
     GcMetrics, GcRateLimit, GcResult, GcScheduler, GcSchedulerTick, GcTask, ReadLease, ReaderId,
     SnapshotGcCounters, SnapshotGcReclaimer, SnapshotGcTick, SnapshotPinMetrics,
-    SnapshotPinWatchdog, SnapshotVersionGc,
+    SnapshotPinWatchdog, SnapshotVersionGc, gc_error,
 };
 pub use wal_recycler::{
     DEFAULT_FSYNC_BUDGET_PER_TICK, DEFAULT_FSYNC_P99_ALERT_US, DEFAULT_MAX_RECYCLE_PER_TICK,

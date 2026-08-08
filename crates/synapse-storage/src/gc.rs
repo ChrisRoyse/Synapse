@@ -52,6 +52,76 @@ pub struct GcReport {
     /// zeroed struct: a reported `pinned_seq` of 0 would be indistinguishable
     /// from a real census that failed to record one.
     pub source_census: Option<DerivedSourceCensus>,
+    /// One bounded in-RAM MVCC version-chain reclamation pass (#2122).
+    ///
+    /// `None` for maintenance kinds that run no such pass, for the same reason
+    /// `source_census` is an `Option`: a zeroed pass would read as "reclamation
+    /// ran and freed nothing", which is exactly the state a daemon with the
+    /// reclaimer unwired reports, and telling those two apart is the whole point
+    /// of publishing it.
+    pub snapshot_version_gc: Option<SnapshotVersionGcPassReport>,
+}
+
+/// One snapshot-version GC pass plus the memory measurement that bracketed it.
+///
+/// The Calyx-side pass says what was reclaimed; the private-commit samples say
+/// whether it mattered. Both are needed: #2122's whole failure mode was a
+/// subsystem reporting success (a GC task that ran every 5 minutes, on time,
+/// with no errors) while the number that actually moves — process committed
+/// private memory — ratcheted up 1.07 GB/hour underneath it.
+#[derive(Clone, Debug, Default)]
+pub struct SnapshotVersionGcPassReport {
+    pub pass: synapse_calyx::SynapseCalyxSnapshotVersionGcPass,
+    /// Process committed private bytes sampled immediately before the pass.
+    ///
+    /// Private commit, never working set: on Windows the working set is trimmed
+    /// by the OS and fell while this leak grew (see
+    /// `synapse_calyx::process_private_bytes`).
+    pub private_bytes_before: u64,
+    /// The same counter immediately after the pass.
+    ///
+    /// Not expected to fall by `bytes_reclaimed`: freeing an allocation returns
+    /// it to the process allocator, which decides separately whether to return
+    /// the page to the OS. This measures the pass's effect on the number the
+    /// operator sees, which is the honest thing to publish even when the two
+    /// disagree.
+    pub private_bytes_after: u64,
+    /// Budget multiplier this pass ran at; 1 is the unescalated base.
+    pub escalation_factor: u32,
+    pub budget_max_versions: usize,
+    pub budget_max_pass_us: u64,
+}
+
+impl SnapshotVersionGcPassReport {
+    /// One-line readback for health and logs.
+    #[must_use]
+    pub fn detail(&self) -> String {
+        format!(
+            "floor_seq={} current_seq={} active_leases={} versions_reclaimed={} bytes_reclaimed={} \
+             chains_compacted={} chains_scanned={} shards={}/{} shard_guard_holds={} \n             sweep_completed={} stopped_on={} \
+             elapsed_us={} max_shard_hold_us={} private_bytes_before={} private_bytes_after={} \
+             escalation_factor={} budget_max_versions={} budget_max_pass_us={}",
+            self.pass.floor_seq,
+            self.pass.current_seq,
+            self.pass.active_leases,
+            self.pass.versions_reclaimed,
+            self.pass.bytes_reclaimed,
+            self.pass.chains_compacted,
+            self.pass.chains_scanned,
+            self.pass.shards_visited,
+            self.pass.shards_total,
+            self.pass.shard_guard_holds,
+            self.pass.sweep_completed,
+            self.pass.stopped_on,
+            self.pass.elapsed_us,
+            self.pass.max_shard_hold_us,
+            self.private_bytes_before,
+            self.private_bytes_after,
+            self.escalation_factor,
+            self.budget_max_versions,
+            self.budget_max_pass_us,
+        )
+    }
 }
 
 /// What the #1882 GC protection set was derived from (#2058).
@@ -152,6 +222,33 @@ pub struct GcTaskReadback {
     pub last_successful_source_census_base_rows: Option<u64>,
     /// Source rows that census protected from eviction.
     pub last_successful_source_census_referenced_rows: Option<u64>,
+    /// In-RAM MVCC versions reclaimed by the last successful pass (#2122).
+    ///
+    /// The pass/fail number for the fix: it was structurally zero forever,
+    /// because `snapshot_version_gc` had no caller anywhere in Synapse.
+    pub last_successful_snapshot_versions_reclaimed: Option<u64>,
+    /// Value bytes those versions held.
+    pub last_successful_snapshot_version_bytes_reclaimed: Option<u64>,
+    /// The pinned-reader floor that pass reclaimed strictly below, and the
+    /// vault's committed sequence at the time.
+    ///
+    /// Published as a pair because a floor stuck far below `current_seq` is the
+    /// one way this fix fails silently: a leaked reader lease pins it and every
+    /// subsequent pass correctly reclaims nothing while reporting success.
+    pub last_successful_snapshot_version_floor_seq: Option<u64>,
+    pub last_successful_snapshot_version_current_seq: Option<u64>,
+    /// Whether that pass visited every shard and every chain. Only a completed
+    /// sweep licenses reading `versions_reclaimed = 0` as "nothing left to
+    /// reclaim" rather than "this pass ran out of budget first".
+    pub last_successful_snapshot_version_sweep_completed: Option<bool>,
+    /// Longest single row-table shard write-guard hold in that pass, in
+    /// microseconds. This is the commit-latency cost of reclamation and the
+    /// number that has to stay bounded for it to be safe to run continuously.
+    pub last_successful_snapshot_version_max_shard_hold_us: Option<u64>,
+    /// Process committed private bytes sampled just after that pass.
+    pub last_successful_snapshot_version_private_bytes: Option<u64>,
+    /// The full pass readback, as one parseable line.
+    pub last_successful_snapshot_version_detail: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -562,6 +659,12 @@ fn mark_gc_tick_completed(
                 readback.last_successful_source_census_referenced_rows =
                     Some(census.referenced_rows);
             }
+            // Same discipline: left untouched by maintenance kinds that run no
+            // reclamation pass, so a checkpoint tick reporting through this
+            // readback cannot erase what the last real pass measured (#2122).
+            if let Some(reclaim) = report.snapshot_version_gc.as_ref() {
+                mark_snapshot_version_gc_pass(&mut readback, reclaim);
+            }
         }
         readback.last_unsupported_policy_skips = result
             .as_ref()
@@ -577,6 +680,22 @@ fn mark_gc_tick_completed(
             .unwrap_or_default();
     }
     deferral
+}
+
+/// Publishes one snapshot-version GC pass into the task readback (#2122).
+fn mark_snapshot_version_gc_pass(
+    readback: &mut GcTaskReadback,
+    reclaim: &SnapshotVersionGcPassReport,
+) {
+    readback.last_successful_snapshot_versions_reclaimed = Some(reclaim.pass.versions_reclaimed);
+    readback.last_successful_snapshot_version_bytes_reclaimed = Some(reclaim.pass.bytes_reclaimed);
+    readback.last_successful_snapshot_version_floor_seq = Some(reclaim.pass.floor_seq);
+    readback.last_successful_snapshot_version_current_seq = Some(reclaim.pass.current_seq);
+    readback.last_successful_snapshot_version_sweep_completed = Some(reclaim.pass.sweep_completed);
+    readback.last_successful_snapshot_version_max_shard_hold_us =
+        Some(reclaim.pass.max_shard_hold_us);
+    readback.last_successful_snapshot_version_private_bytes = Some(reclaim.private_bytes_after);
+    readback.last_successful_snapshot_version_detail = Some(reclaim.detail());
 }
 
 /// Why a maintenance attempt failed, at the granularity the tick loop acts on.

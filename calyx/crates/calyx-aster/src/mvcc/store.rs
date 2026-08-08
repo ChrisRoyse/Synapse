@@ -16,6 +16,11 @@ use crate::sst::SstSummary;
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, Ts};
 pub use flusher::FlushStatus;
 use flusher::RouterFlusher;
+pub use gc::{
+    DEFAULT_SNAPSHOT_VERSION_GC_MAX_CHAINS, DEFAULT_SNAPSHOT_VERSION_GC_MAX_PASS_US,
+    DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US, DEFAULT_SNAPSHOT_VERSION_GC_MAX_VERSIONS,
+    SnapshotVersionGcBudget, SnapshotVersionGcPass, SnapshotVersionGcStop,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
@@ -283,7 +288,11 @@ pub const ROW_READ_GUARD_WARN_US: u64 = 25_000;
 /// See [`thread_cpu_us`].
 const WINDOWS_SCHEDULER_TICK_US: u64 = 15_625;
 
-/// Every call site that takes the vault-wide row-table read guard.
+/// Every call site that takes a row-table guard.
+///
+/// Read guards, with one deliberate exception: the snapshot-version reclaimer's
+/// per-shard **write** hold is counted here too, because that is the hold whose
+/// boundedness the census exists to prove (see [`Self::SnapshotVersionReclaim`]).
 ///
 /// This replaced a `&'static str`. The string was fine for a log line but
 /// useless as a key: it cannot be indexed without hashing, it cannot be
@@ -326,6 +335,19 @@ pub enum RowGuardSite {
     ScanCfRangeAtOverlay,
     OverlayTableKeys,
     SnapshotGcDebt,
+    /// The per-shard **write** guard the snapshot-version reclaimer takes
+    /// (#2122).
+    ///
+    /// The one write site in an otherwise read-only census, and deliberately so.
+    /// #2122 was diagnosed from `snapshot_gc_debt` showing `holds=0` since boot
+    /// against `read_latest`'s 193,269,889 — the census was the instrument that
+    /// proved the reclaimer had never run. Reclamation now runs, and the same
+    /// instrument has to answer the follow-up question the fix creates: does it
+    /// stall commits? A write hold blocks every commit routed to that shard, so
+    /// its duration is the number that matters, and putting it anywhere else
+    /// would mean proving boundedness in a different instrument from the one
+    /// that proved the absence.
+    SnapshotVersionReclaim,
     PinSnapshotForPanel,
     PanelContentSeqsSnapshot,
     MigratePanelContentSeqsToAtLeast,
@@ -342,7 +364,7 @@ impl RowGuardSite {
     /// Every site, in declaration order. The census is indexed by position
     /// here, so this array is the contract that makes a zero-hold site
     /// reportable rather than invisible.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::ReadLatest,
         Self::ReadBatchLatest,
         Self::ScanCfLatest,
@@ -360,6 +382,7 @@ impl RowGuardSite {
         Self::ScanCfRangeAtOverlay,
         Self::OverlayTableKeys,
         Self::SnapshotGcDebt,
+        Self::SnapshotVersionReclaim,
         Self::PinSnapshotForPanel,
         Self::PanelContentSeqsSnapshot,
         Self::MigratePanelContentSeqsToAtLeast,
@@ -390,6 +413,7 @@ impl RowGuardSite {
             Self::ScanCfRangeAtOverlay => "scan_cf_range_at_overlay",
             Self::OverlayTableKeys => "overlay_table_keys",
             Self::SnapshotGcDebt => "snapshot_gc_debt",
+            Self::SnapshotVersionReclaim => "snapshot_version_reclaim",
             Self::PinSnapshotForPanel => "pin_snapshot_for_panel",
             Self::PanelContentSeqsSnapshot => "panel_content_seqs_snapshot",
             Self::MigratePanelContentSeqsToAtLeast => "migrate_panel_content_seqs_to_at_least",
@@ -681,19 +705,12 @@ impl RowWriteSet<'_> {
         Ok(self.guards[slot].1.entry(cf).or_default())
     }
 
-    /// Every column family this writer holds.
-    fn iter(&self) -> impl Iterator<Item = (&ColumnFamily, &BTreeMap<Vec<u8>, VersionChain>)> {
-        self.guards.iter().flat_map(|(_, guard)| guard.iter())
-    }
-
-    /// Every column family this writer holds, mutably.
-    fn iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&ColumnFamily, &mut BTreeMap<Vec<u8>, VersionChain>)> {
-        self.guards
-            .iter_mut()
-            .flat_map(|(_, guard)| guard.iter_mut())
-    }
+    // `iter`/`iter_mut` over every locked shard were removed with the
+    // whole-table snapshot-version reclaim they existed for (#2122). Nothing
+    // else wants a writer that spans shards: the recovery restore paths write
+    // through `entry_mut` per column family, and the reclaimer now takes one
+    // shard's guard at a time. Keeping a cross-shard iterator on the write set
+    // would keep the wide hold one call away from being reintroduced.
 }
 
 /// The row-table shards one atomic commit must hold.
@@ -853,7 +870,13 @@ pub struct VersionedCfStore {
     resource_counters: Arc<ResourceCounters>,
     snapshot_gc: SnapshotGcReclaimer,
     snapshot_gc_counters: SnapshotGcCounters,
-    /// Per-site tallies for every row-table read guard taken on this vault.
+    /// Where the next bounded snapshot-version GC pass resumes (#2122).
+    ///
+    /// A pass that stops on its budget must resume where it stopped, not at the
+    /// start: restarting would reclaim the low shards over and over and never
+    /// reach the high ones whenever the debt exceeds one pass's budget.
+    snapshot_gc_cursor: std::sync::Mutex<gc::SnapshotGcCursor>,
+    /// Per-site tallies for every row-table guard taken on this vault.
     row_guard_census: RowGuardCensus,
 }
 
@@ -1047,6 +1070,7 @@ impl VersionedCfStore {
             resource_counters: Arc::new(ResourceCounters::default()),
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
         }
     }
@@ -1078,6 +1102,7 @@ impl VersionedCfStore {
             resource_counters,
             snapshot_gc: SnapshotGcReclaimer::default(),
             snapshot_gc_counters: SnapshotGcCounters::default(),
+            snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
         }
     }

@@ -4,8 +4,8 @@ use crate::cf::ColumnFamily;
 use crate::compaction::{
     CompactionResult, CompactionThrottle, catalog_from_vault_tiers, compact_shards,
 };
-use crate::gc::{GcRateLimit, GcResult, SnapshotGcTick};
-use crate::mvcc::Snapshot;
+use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotGcTick};
+use crate::mvcc::{Snapshot, SnapshotVersionGcBudget, SnapshotVersionGcPass};
 use crate::storage_names::sst_order_key;
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
@@ -44,6 +44,80 @@ where
     /// Runs snapshot GC using env-configured anti-storm limits.
     pub fn snapshot_version_gc_once_from_env(&self) -> Result<GcResult> {
         self.snapshot_version_gc_once(GcRateLimit::from_env()?)
+    }
+
+    /// Reclaims snapshot-obsolete **in-RAM** MVCC version chains. One bounded
+    /// pass, no durable I/O.
+    ///
+    /// # Why this is separate from [`Self::snapshot_version_gc_once`]
+    ///
+    /// That method does two unrelated jobs behind one name: it trims the RAM
+    /// version chains, and then it flushes the vault and physically compacts
+    /// obsolete SSTs under the durable commit lock. The second half is disk
+    /// reclamation, costs a full `flush_locked` plus a compaction, and takes the
+    /// one lock that serialises every vault write — the exact profile #1806
+    /// measured holding that lock for ~64 s.
+    ///
+    /// The leak in #2122 is entirely in the first half. Binding the fix for a
+    /// 1 GB/hour RAM ratchet to a multi-second lock acquisition would make the
+    /// cadence a negotiation between two problems that have nothing to do with
+    /// each other, so this entry point does the RAM half and *only* the RAM
+    /// half: shard-at-a-time write guards on the row table, no durable commit
+    /// lock, no flush, no SST, no WAL. Physical SST reclamation keeps its own
+    /// path and its own cadence.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed with `CALYX_ASTER_VAULT_CLOSING` once a close has been
+    /// declared (#2100) — reclamation is maintenance, and a commanded close must
+    /// be able to stop maintenance rather than queue behind it — and with a
+    /// corrupt-shard error if a row-table shard lock is poisoned.
+    pub fn snapshot_version_gc_memory_once(
+        &self,
+        budget: SnapshotVersionGcBudget,
+    ) -> Result<SnapshotVersionGcPass> {
+        self.ensure_not_closing("snapshot version GC (in-RAM chains)")?;
+        let now = self.clock.now();
+        let floor = self.rows.snapshot_gc_safe_point(now);
+        self.rows
+            .reclaim_snapshot_versions_paged(floor, budget, now)
+    }
+
+    /// Lifetime snapshot-GC counters without the whole-table debt census.
+    ///
+    /// See [`crate::mvcc::VersionedCfStore::snapshot_gc_counters_only`]: the
+    /// exact debt is an `O(all versions)` walk under a guard covering every
+    /// shard, which is not something a health read may take.
+    #[must_use]
+    pub fn snapshot_gc_counters_only(&self) -> GcMetrics {
+        self.rows.snapshot_gc_counters_only()
+    }
+
+    /// Exact reclaimable in-RAM version debt at the current floor.
+    ///
+    /// **A diagnostic, not a health read.** It walks every version chain in the
+    /// vault under a read guard covering every shard, so it is `O(all
+    /// versions)` and every commit queues behind it. Manual verification and
+    /// operator inspection want an exact number and can pay for it; the
+    /// maintenance tick reports what its bounded pass actually did instead (see
+    /// `SnapshotVersionGcPass::sweep_completed`).
+    #[must_use]
+    pub fn snapshot_gc_debt_exact(&self) -> u64 {
+        use crate::gc::SnapshotVersionGc as _;
+        let floor = self.rows.snapshot_gc_safe_point(self.clock.now());
+        self.rows.snapshot_gc_debt(floor)
+    }
+
+    /// The pinned-reader floor snapshot-version GC would reclaim below right now.
+    ///
+    /// Exposed because a floor that never advances is the one way this fix can
+    /// silently stop working: a leaked reader lease pins it, every subsequent
+    /// pass reclaims nothing, and the memory curve looks exactly like the bug
+    /// again. Reading the floor next to `current_seq` makes that state nameable
+    /// instead of inferred.
+    #[must_use]
+    pub fn snapshot_gc_floor_seq(&self) -> u64 {
+        self.rows.snapshot_gc_safe_point(self.clock.now())
     }
 
     /// Reads one CF row through an explicit tracked reader snapshot.

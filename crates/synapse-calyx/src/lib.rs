@@ -47,7 +47,7 @@ use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::erase::{EraseRegistry, EraseScope, subject_metadata_value};
-use calyx_aster::mvcc::{Freshness, Snapshot};
+use calyx_aster::mvcc::{Freshness, Snapshot, SnapshotVersionGcBudget, SnapshotVersionGcPass};
 use calyx_aster::recurrence::{
     ConstellationRecurrenceAppendRequest, OccurrenceContext, RecurrenceAppendDisposition,
     RecurrenceAppendOnceRequest, RecurrenceSeriesReadback, RetentionPolicy, append_occurrence_once,
@@ -2542,6 +2542,134 @@ pub struct SynapseCalyxRowGuardSiteCensus {
     pub starved_holds: u64,
 }
 
+/// Bounds on one snapshot-version GC pass, as Synapse configures them (#2122).
+///
+/// Mirrors `calyx_aster::mvcc::SnapshotVersionGcBudget` so the storage crate can
+/// size a pass without depending on `calyx-aster` directly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SynapseCalyxSnapshotVersionGcBudget {
+    pub max_versions: usize,
+    pub max_chains_scanned: usize,
+    pub max_pass_us: u64,
+    pub max_shard_hold_us: u64,
+}
+
+impl Default for SynapseCalyxSnapshotVersionGcBudget {
+    fn default() -> Self {
+        SnapshotVersionGcBudget::default().into()
+    }
+}
+
+impl SynapseCalyxSnapshotVersionGcBudget {
+    /// Reads the budget from the environment, failing closed on an invalid or
+    /// zero value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when a `CALYX_SNAPSHOT_VERSION_GC_*` variable
+    /// is set but not a positive integer.
+    pub fn from_env() -> Result<Self, SynapseCalyxError> {
+        SnapshotVersionGcBudget::from_env()
+            .map(Into::into)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("read snapshot-version GC budget from env", &error)
+            })
+    }
+
+    /// Scales the work budgets by `factor`, never the per-shard hold budget.
+    #[must_use]
+    pub fn scaled(self, factor: u32) -> Self {
+        SnapshotVersionGcBudget::from(self).scaled(factor).into()
+    }
+}
+
+impl From<SnapshotVersionGcBudget> for SynapseCalyxSnapshotVersionGcBudget {
+    fn from(budget: SnapshotVersionGcBudget) -> Self {
+        Self {
+            max_versions: budget.max_versions,
+            max_chains_scanned: budget.max_chains_scanned,
+            max_pass_us: budget.max_pass_us,
+            max_shard_hold_us: budget.max_shard_hold_us,
+        }
+    }
+}
+
+impl From<SynapseCalyxSnapshotVersionGcBudget> for SnapshotVersionGcBudget {
+    fn from(budget: SynapseCalyxSnapshotVersionGcBudget) -> Self {
+        Self {
+            max_versions: budget.max_versions,
+            max_chains_scanned: budget.max_chains_scanned,
+            max_pass_us: budget.max_pass_us,
+            max_shard_hold_us: budget.max_shard_hold_us,
+        }
+    }
+}
+
+/// What one snapshot-version GC pass actually did (#2122).
+///
+/// Every field is a measurement. `sweep_completed` is the one that licenses a
+/// claim: only a pass that visited every shard and every chain proves the
+/// reclaimable debt is drained, so `versions_reclaimed == 0` on its own means
+/// "this pass freed nothing", never "there was nothing to free".
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxSnapshotVersionGcPass {
+    pub floor_seq: u64,
+    pub current_seq: u64,
+    pub active_leases: usize,
+    pub versions_reclaimed: u64,
+    pub bytes_reclaimed: u64,
+    pub chains_compacted: u64,
+    pub chains_scanned: u64,
+    pub shards_visited: usize,
+    pub shards_total: usize,
+    /// Row-table shard write guards acquired. Above `shards_visited` whenever
+    /// the per-shard hold budget made the pass release and re-acquire mid-walk.
+    pub shard_guard_holds: u64,
+    pub sweep_completed: bool,
+    pub stopped_on: String,
+    pub elapsed_us: u64,
+    pub max_shard_hold_us: u64,
+    pub resume_shard: usize,
+}
+
+impl From<SnapshotVersionGcPass> for SynapseCalyxSnapshotVersionGcPass {
+    fn from(pass: SnapshotVersionGcPass) -> Self {
+        Self {
+            floor_seq: pass.floor_seq,
+            current_seq: pass.current_seq,
+            active_leases: pass.active_leases,
+            versions_reclaimed: pass.versions_reclaimed,
+            bytes_reclaimed: pass.bytes_reclaimed,
+            chains_compacted: pass.chains_compacted,
+            chains_scanned: pass.chains_scanned,
+            shards_visited: pass.shards_visited,
+            shards_total: pass.shards_total,
+            shard_guard_holds: pass.shard_guard_holds,
+            sweep_completed: pass.sweep_completed,
+            stopped_on: pass.stopped_on.as_str().to_owned(),
+            elapsed_us: pass.elapsed_us,
+            max_shard_hold_us: pass.max_shard_hold_us,
+            resume_shard: pass.resume_shard,
+        }
+    }
+}
+
+/// This process's committed private memory in bytes.
+///
+/// Re-exported through Synapse's Calyx bridge because it is the only
+/// memory number a pressure decision may be keyed off on Windows: working set
+/// (what `calyx_heap_rss_bytes` reports) is trimmed by the OS and fell while the
+/// #2122 daemon leaked 1.07 GB/hour. On Linux this is `RssAnon`.
+///
+/// # Errors
+///
+/// Fails closed when the OS counter cannot be read. There is deliberately no
+/// working-set fallback.
+pub fn process_private_bytes() -> Result<u64, SynapseCalyxError> {
+    calyx_aster::resource::process_private_bytes()
+        .map_err(|error| SynapseCalyxError::from_calyx("read process private commit", &error))
+}
+
 impl SynapseCalyxVaultStatus {
     #[must_use]
     pub fn disabled() -> Self {
@@ -2685,6 +2813,66 @@ pub struct SynapseCalyxVault {
     math_runtime: SynapseCalyxMathRuntime,
     open_mode: SynapseCalyxVaultOpenMode,
     lineage: SynapseCalyxVaultLineage,
+    /// Physical CF row counts kept alongside the committed sequence they were
+    /// measured at, so a repeat count can be *proved* redundant (#2114).
+    cf_count_memo: std::sync::Mutex<BTreeMap<ColumnFamily, MemoizedCfCount>>,
+}
+
+/// One physical CF row count, the walk that produced it, and the bookkeeping
+/// that decides when it must be re-measured (#2114).
+#[derive(Clone, Debug)]
+struct MemoizedCfCount {
+    /// The walk exactly as `count_cf_latest_bounded` returned it. Only atomic
+    /// walks are memoized: a paged walk that straddled a commit describes an
+    /// interval rather than an instant, and carrying such a number forward
+    /// would propagate an inexactness instead of retiring it.
+    walk: SynapseCalyxCfWalk,
+    /// Reuses served since this walk, for the drift-check cadence.
+    reuses: u64,
+}
+
+/// After this many consecutive reuses of one CF's memoized count, the next
+/// request re-measures physically even though the sequence proof still holds,
+/// and asserts the two agree. The proof below is a construction, not a
+/// heuristic — but a construction whose premise ("nothing committed") is
+/// supplied by another subsystem's counter is worth confronting with the disk
+/// on a bounded cadence rather than trusted forever.
+const CF_COUNT_MEMO_DRIFT_CHECK_REUSES: u64 = 32;
+
+/// A physical CF row count together with how it was obtained (#2114).
+///
+/// The provenance travels with the number so a log line can say which it is
+/// rather than implying a fresh walk that may not have happened.
+#[derive(Clone, Debug)]
+pub struct MemoizedCfCountReadback {
+    /// The walk that produced the count — freshly measured, or the memoized
+    /// one that the commit sequence proves still describes the family.
+    pub walk: SynapseCalyxCfWalk,
+    /// Whether the column family was physically walked on this call.
+    pub measured: bool,
+    /// When reused, the committed sequence that has not moved since the walk.
+    pub unchanged_since_seq: Option<Seq>,
+    /// Whether this measurement was forced by the reuse-cadence drift check.
+    pub drift_checked: bool,
+}
+
+impl MemoizedCfCountReadback {
+    /// Rows the column family holds.
+    #[must_use]
+    pub const fn rows(&self) -> usize {
+        self.walk.rows_visited
+    }
+
+    /// A short label naming how the count was obtained, for the log line that
+    /// reports it.
+    #[must_use]
+    pub const fn provenance(&self) -> &'static str {
+        match (self.measured, self.drift_checked) {
+            (true, true) => "walked_drift_check",
+            (true, false) => "walked",
+            (false, _) => "unchanged_since_last_walk",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3381,6 +3569,7 @@ impl SynapseCalyxVault {
             math_runtime,
             open_mode,
             lineage,
+            cf_count_memo: std::sync::Mutex::new(BTreeMap::new()),
         };
         opened.initialize_anneal_tuning()?;
         let status = status_from_vault(
@@ -6426,6 +6615,121 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// The same physical count as [`Self::count_cf_latest_bounded`], reusing the
+    /// previous measurement **only when the vault has committed nothing since
+    /// it was taken** (#2114).
+    ///
+    /// # Why this is a physical readback and not a cache
+    ///
+    /// The weave's post-write readback is an assertion about what the weave
+    /// persisted, and it was being paid at catastrophic granularity: three
+    /// panels per maintenance tick, each re-walking `XTerm` + `Graph` in full —
+    /// 2.75 M rows on the deployed vault — after every weave call, including
+    /// the ones that wrote nothing. Four hours of that was 63.2 M rows/h and
+    /// 639 s of wall clock for 483 woven records, and it was the dominant
+    /// source of `Graph` row-guard holds, blocking every `Graph` commit.
+    ///
+    /// The reuse condition is a proof, not a sample:
+    ///
+    /// * A row can only enter or leave a column family through a committed
+    ///   MVCC transaction, and every commit allocates a sequence strictly
+    ///   greater than the last.
+    /// * The memoized walk records the sequence that served its pages, and is
+    ///   memoized only when every page was served by that same one
+    ///   ([`SynapseCalyxCfWalk::atomic`]) — so it describes one instant, not an
+    ///   interval.
+    /// * If `latest_seq()` still equals that sequence, no transaction has
+    ///   committed in the whole vault since. The row set is therefore the
+    ///   identical row set, and its count is the identical count.
+    ///
+    /// Anything weaker re-measures: a non-atomic walk is never memoized, any
+    /// commit anywhere invalidates every entry, and every
+    /// [`CF_COUNT_MEMO_DRIFT_CHECK_REUSES`] reuses the count is re-measured
+    /// against the disk anyway and any disagreement is reported at error level
+    /// with both numbers and the sequences that produced them.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any page-read failure from [`Self::walk_cf_latest`].
+    pub fn count_cf_latest_bounded_memoized(
+        &self,
+        cf: ColumnFamily,
+    ) -> Result<MemoizedCfCountReadback, SynapseCalyxError> {
+        let latest_seq = self.vault.latest_seq();
+        let memoized = {
+            let memo = match self.cf_count_memo.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            memo.get(&cf).cloned()
+        };
+        let due_drift_check = memoized
+            .as_ref()
+            .is_some_and(|entry| entry.reuses >= CF_COUNT_MEMO_DRIFT_CHECK_REUSES);
+        if let Some(entry) = &memoized
+            && !due_drift_check
+            && entry.walk.snapshot_seq_last == latest_seq
+        {
+            let mut memo = match self.cf_count_memo.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(stored) = memo.get_mut(&cf) {
+                stored.reuses = stored.reuses.saturating_add(1);
+            }
+            return Ok(MemoizedCfCountReadback {
+                walk: entry.walk.clone(),
+                measured: false,
+                unchanged_since_seq: Some(latest_seq),
+                drift_checked: false,
+            });
+        }
+
+        let walk = self.count_cf_latest_bounded(cf)?;
+        if due_drift_check
+            && let Some(entry) = &memoized
+            && entry.walk.snapshot_seq_last == latest_seq
+            && walk.atomic()
+            && walk.rows_visited != entry.walk.rows_visited
+        {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_CF_COUNT_MEMO_DRIFT",
+                column_family = cf.name(),
+                memoized_rows = entry.walk.rows_visited,
+                measured_rows = walk.rows_visited,
+                memoized_seq = entry.walk.snapshot_seq_last,
+                measured_seq_first = walk.snapshot_seq_first,
+                measured_seq_last = walk.snapshot_seq_last,
+                latest_seq,
+                reuses = entry.reuses,
+                "a physical recount disagrees with a count the commit sequence proved unchanged; the vault mutated {} without allocating a sequence, or latest_seq regressed — the measured count is adopted and the memo re-anchored",
+                cf.name()
+            );
+        }
+        let mut memo = match self.cf_count_memo.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if walk.atomic() {
+            memo.insert(
+                cf,
+                MemoizedCfCount {
+                    walk: walk.clone(),
+                    reuses: 0,
+                },
+            );
+        } else {
+            // A walk that straddled a commit cannot license a later skip.
+            memo.remove(&cf);
+        }
+        Ok(MemoizedCfCountReadback {
+            walk,
+            measured: true,
+            unchanged_since_seq: None,
+            drift_checked: due_drift_check,
+        })
+    }
+
     /// Per-site row-table read-guard counters, read at this instant.
     ///
     /// The same census `health` publishes, on the vault handle, so an in-process
@@ -6647,6 +6951,49 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("sync Calyx Aster WAL", &error))
     }
 
+    /// Reclaims snapshot-obsolete in-RAM MVCC version chains, one bounded pass.
+    ///
+    /// Every vault commit appends a full clone of its value bytes to an in-RAM
+    /// version chain. Nothing in Synapse ever reclaimed them: #2122 measured the
+    /// `snapshot_gc_debt` guard site at **zero holds since boot** against
+    /// `read_latest`'s 193,269,889, while the daemon's private commit ratcheted
+    /// 25,599 MB -> 28,206 MB with a 2.8 MB maximum drawdown. This is the call
+    /// that was missing.
+    ///
+    /// RAM only — no durable commit lock, no flush, no SST, no WAL. See
+    /// `AsterVault::snapshot_version_gc_memory_once` for the safety and
+    /// boundedness arguments.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when the vault is closing
+    /// (`CALYX_ASTER_VAULT_CLOSING`, which is close fencing rather than a fault)
+    /// or a row-table shard lock is poisoned.
+    pub fn reclaim_snapshot_versions_once(
+        &self,
+        budget: SynapseCalyxSnapshotVersionGcBudget,
+    ) -> Result<SynapseCalyxSnapshotVersionGcPass, SynapseCalyxError> {
+        let pass = self
+            .vault
+            .snapshot_version_gc_memory_once(budget.into())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("reclaim Calyx MVCC snapshot versions", &error)
+            })?;
+        Ok(SynapseCalyxSnapshotVersionGcPass::from(pass))
+    }
+
+    /// The pinned-reader floor snapshot-version GC would reclaim below right
+    /// now, next to the vault's current committed sequence.
+    ///
+    /// A floor that stops advancing is the one silent failure mode of the #2122
+    /// fix: a leaked reader lease pins it, every pass then reclaims nothing, and
+    /// the memory curve reverts to the bug while every counter still reports
+    /// "ran, succeeded".
+    #[must_use]
+    pub fn snapshot_gc_floor(&self) -> (u64, u64) {
+        (self.vault.snapshot_gc_floor_seq(), self.vault.latest_seq())
+    }
+
     /// Materializes pending durable checkpoints and advances the manifest
     /// `durable_seq` floor without running compaction.
     ///
@@ -6708,6 +7055,7 @@ impl SynapseCalyxVault {
             math_runtime,
             open_mode: _,
             lineage,
+            cf_count_memo: _,
         } = self;
         let close_started = std::time::Instant::now();
         let vault_dir = config.vault_dir.clone();

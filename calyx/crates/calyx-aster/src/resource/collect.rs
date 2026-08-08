@@ -4,7 +4,7 @@ use crate::compaction::{
     DEFAULT_COMPACTION_TARGET_BYTES, DEFAULT_COMPACTION_TARGET_FILES, catalog_from_vault_dir,
 };
 use crate::mvcc::VersionedCfStore;
-use crate::resource::heap::heap_rss_bytes;
+use crate::resource::heap::{heap_rss_bytes, process_private_bytes};
 use crate::resource::status::{
     CfCompactionDebt, CompactionDebtStatus, HeapStatus, PinnedSeqStatus,
     RESOURCE_STATUS_SCHEMA_VERSION, ResourceStatus, VramBudgetStatus, WalStatus,
@@ -29,6 +29,7 @@ pub fn collect_resource_status(
     ensure_vault_dir(vault_dir)?;
     let heap = HeapStatus {
         rss_bytes: heap_rss_bytes()?,
+        private_bytes: process_private_bytes()?,
     };
     let compaction = collect_compaction(vault_dir)?;
     let gc = store.snapshot_gc_metrics(now);

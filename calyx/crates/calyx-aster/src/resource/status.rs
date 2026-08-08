@@ -7,7 +7,12 @@ use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 
 /// Schema version for forward compatibility of persisted status documents.
-pub const RESOURCE_STATUS_SCHEMA_VERSION: u32 = 1;
+///
+/// 2 (#2122): `HeapStatus` gained `private_bytes`. A reader that only knows
+/// version 1 sees a document whose one memory number is working set — the
+/// number that falls while the process leaks — and has no way to tell that a
+/// truer one exists. The version bump is how it finds out.
+pub const RESOURCE_STATUS_SCHEMA_VERSION: u32 = 2;
 
 /// One-call aggregate of vault resource health (PRD 18 §4).
 ///
@@ -28,10 +33,20 @@ pub struct ResourceStatus {
     pub wal: WalStatus,
 }
 
-/// Process heap section, probed from `/proc/self/status`.
+/// Process memory section, probed from the OS's own counters.
+///
+/// Two numbers, because on Windows they answer different questions and only one
+/// of them can be leaked against. See [`crate::resource::heap_rss_bytes`] and
+/// [`crate::resource::process_private_bytes`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeapStatus {
+    /// Resident set (Linux `VmRSS`) / working set (Windows `WorkingSetSize`):
+    /// how much of the process the OS currently keeps in physical RAM.
     pub rss_bytes: u64,
+    /// Committed private memory (Windows `PrivateUsage`, Linux `RssAnon`): how
+    /// much the process has taken and not given back. **This is the leak
+    /// indicator**; `rss_bytes` moves when the OS trims and is not one.
+    pub private_bytes: u64,
 }
 
 /// Memtable byte-cap status across the currently open CF routers.
@@ -116,6 +131,11 @@ impl ResourceStatus {
         };
         let base = format!("vault=\"{vault}\"");
         metric("calyx_heap_rss_bytes", base.clone(), self.heap.rss_bytes);
+        metric(
+            "calyx_process_private_bytes",
+            base.clone(),
+            self.heap.private_bytes,
+        );
         metric(
             "calyx_memtable_total_used_bytes",
             base.clone(),

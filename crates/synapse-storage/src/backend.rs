@@ -2618,13 +2618,193 @@ impl gc::GcRunner for CalyxCheckpointRunner {
     }
 }
 
+/// Highest budget multiplier a memory-pressure escalation may reach.
+///
+/// 4x the base pass budget is 8 s of reclamation inside a 300 s maintenance
+/// tick — a 2.7% duty cycle, and the per-shard guard-hold budget is *not*
+/// scaled, so the worst case a commit can see is unchanged no matter how
+/// escalated the pass is. The ceiling exists because "run until the debt is
+/// gone" is not a bound: a pass that cannot converge inside 8 s is reporting a
+/// problem (a pinned floor, a write rate the vault cannot sustain) that running
+/// longer would hide rather than fix.
+const MAX_SNAPSHOT_VERSION_GC_ESCALATION: u32 = 4;
+
+/// Memory-pressure state carried across snapshot-version GC passes (#2122).
+///
+/// The trigger is deliberately *relative*, not an absolute byte threshold: an
+/// absolute one would have to be guessed, would be wrong on every machine with
+/// a different corpus, and would sit at whatever value made the graph look right
+/// on the day it was written. This escalates only on evidence the daemon
+/// produced itself — the previous pass did not finish its sweep **and** private
+/// commit did not fall — and de-escalates the moment a sweep completes, which is
+/// the point at which there is nothing left to chase.
+#[derive(Debug)]
+struct SnapshotVersionGcPressure {
+    factor: u32,
+    last_private_bytes: Option<u64>,
+    last_sweep_completed: bool,
+}
+
+impl Default for SnapshotVersionGcPressure {
+    fn default() -> Self {
+        Self {
+            factor: 1,
+            last_private_bytes: None,
+            last_sweep_completed: true,
+        }
+    }
+}
+
+impl SnapshotVersionGcPressure {
+    /// Chooses this pass's budget multiplier from the previous pass's outcome
+    /// and the private-commit trend.
+    fn plan(&mut self, private_bytes_now: u64) -> u32 {
+        let grew = self
+            .last_private_bytes
+            .is_none_or(|previous| private_bytes_now >= previous);
+        self.factor = if self.last_sweep_completed {
+            // Nothing was left over, so nothing needs chasing. Reset rather than
+            // decay: a completed sweep is proof, not a trend.
+            1
+        } else if grew {
+            self.factor
+                .saturating_mul(2)
+                .min(MAX_SNAPSHOT_VERSION_GC_ESCALATION)
+        } else {
+            // Sweep incomplete but memory is falling: the current budget is
+            // already winning. Holding it steady avoids escalating into work the
+            // daemon is not asking for.
+            self.factor
+        };
+        self.factor
+    }
+
+    const fn record(&mut self, private_bytes_after: u64, sweep_completed: bool) {
+        self.last_private_bytes = Some(private_bytes_after);
+        self.last_sweep_completed = sweep_completed;
+    }
+}
+
 struct CalyxGcRunner {
     vault: Arc<CalyxVaultRuntime>,
+    snapshot_version_gc: Mutex<SnapshotVersionGcPressure>,
 }
 
 impl CalyxGcRunner {
-    const fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
-        Self { vault }
+    fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
+        Self {
+            vault,
+            snapshot_version_gc: Mutex::new(SnapshotVersionGcPressure::default()),
+        }
+    }
+
+    /// Runs one bounded in-RAM MVCC version-chain reclamation pass (#2122).
+    ///
+    /// # Errors
+    ///
+    /// Fails closed. There is no "reclamation is best-effort" branch here on
+    /// purpose: the defect this fixes is a reclaimer that never ran while every
+    /// surrounding indicator reported health, and swallowing its failures would
+    /// rebuild exactly that. A vault that is closing refuses with
+    /// `CALYX_ASTER_VAULT_CLOSING`, which the maintenance loop already
+    /// classifies as fencing rather than a fault.
+    fn reclaim_snapshot_versions_once(&self) -> StorageResult<gc::SnapshotVersionGcPassReport> {
+        let base =
+            synapse_calyx::SynapseCalyxSnapshotVersionGcBudget::from_env().map_err(|source| {
+                StorageError::BackendInvalidConfig {
+                    value: "CALYX_SNAPSHOT_VERSION_GC_*".to_owned(),
+                    detail: format!("read snapshot-version GC budget: {source}"),
+                }
+            })?;
+        let private_bytes_before = calyx_process_private_bytes()?;
+        // A poisoned pressure lock means an earlier pass panicked while holding
+        // it. Reclamation still runs — refusing it would trade a memory leak for
+        // a panic's aftermath — but at the unescalated base budget, and it says
+        // so rather than quietly reporting a factor it did not compute.
+        let escalation_factor = self.snapshot_version_gc.lock().map_or_else(
+            |_poisoned| {
+                tracing::warn!(
+                    code = "STORAGE_SNAPSHOT_VERSION_GC_PRESSURE_POISONED",
+                    private_bytes_before,
+                    "snapshot-version GC pressure state is poisoned by an earlier panic; running                      this pass at the base budget with no memory-pressure escalation"
+                );
+                1
+            },
+            |mut state| state.plan(private_bytes_before),
+        );
+        let budget = base.scaled(escalation_factor);
+        let pass = self.vault.with_vault(
+            CALYX_GC_CF,
+            "reclaim MVCC snapshot versions",
+            true,
+            |vault| {
+                vault
+                    .reclaim_snapshot_versions_once(budget)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            CALYX_GC_CF,
+                            "reclaim in-RAM MVCC snapshot version chains",
+                            &source,
+                        )
+                    })
+            },
+        )?;
+        let private_bytes_after = calyx_process_private_bytes()?;
+        match self.snapshot_version_gc.lock() {
+            Ok(mut state) => state.record(private_bytes_after, pass.sweep_completed),
+            Err(_poisoned) => tracing::warn!(
+                code = "STORAGE_SNAPSHOT_VERSION_GC_PRESSURE_POISONED",
+                private_bytes_after,
+                sweep_completed = pass.sweep_completed,
+                "could not record this pass's outcome into the pressure state; the next pass will                  plan from a stale sample"
+            ),
+        }
+        let report = gc::SnapshotVersionGcPassReport {
+            pass,
+            private_bytes_before,
+            private_bytes_after,
+            escalation_factor,
+            budget_max_versions: budget.max_versions,
+            budget_max_pass_us: budget.max_pass_us,
+        };
+        tracing::info!(
+            code = "STORAGE_SNAPSHOT_VERSION_GC_PASS",
+            floor_seq = report.pass.floor_seq,
+            current_seq = report.pass.current_seq,
+            active_leases = report.pass.active_leases,
+            versions_reclaimed = report.pass.versions_reclaimed,
+            bytes_reclaimed = report.pass.bytes_reclaimed,
+            chains_compacted = report.pass.chains_compacted,
+            chains_scanned = report.pass.chains_scanned,
+            shards_visited = report.pass.shards_visited,
+            shards_total = report.pass.shards_total,
+            shard_guard_holds = report.pass.shard_guard_holds,
+            sweep_completed = report.pass.sweep_completed,
+            stopped_on = report.pass.stopped_on.as_str(),
+            elapsed_us = report.pass.elapsed_us,
+            max_shard_hold_us = report.pass.max_shard_hold_us,
+            private_bytes_before,
+            private_bytes_after,
+            escalation_factor,
+            budget_max_versions = budget.max_versions,
+            budget_max_pass_us = budget.max_pass_us,
+            "reclaimed snapshot-obsolete in-RAM MVCC version chains"
+        );
+        Ok(report)
+    }
+
+    /// Logical row-cap eviction followed by in-RAM MVCC version reclamation.
+    ///
+    /// The order is load-bearing: eviction deletes by **writing tombstones**,
+    /// and every tombstone is a commit that appends another full value clone to
+    /// another version chain (#2122 — the GC we were already running made the
+    /// leak grow faster). Reclaiming afterwards sweeps this pass's own
+    /// tombstone versions instead of leaving them resident until some later
+    /// cadence happens to land on them.
+    fn run_full_once(&self) -> StorageResult<gc::GcReport> {
+        let mut report = self.run_default_once()?;
+        report.snapshot_version_gc = Some(self.reclaim_snapshot_versions_once()?);
+        Ok(report)
     }
 
     fn run_default_once(&self) -> StorageResult<gc::GcReport> {
@@ -2651,8 +2831,19 @@ impl CalyxGcRunner {
 }
 
 impl gc::GcRunner for CalyxGcRunner {
+    /// The `storage_gc` maintenance tick.
+    ///
+    /// # Why reclamation lives on this tick and not on one of its own
+    ///
+    /// Ordering (see [`CalyxGcRunner::run_full_once`]) is one reason; admission
+    /// is the other. Riding this tick inherits its whole discipline for free:
+    /// one blocking-pool permit, one retry classification, one
+    /// `STORAGE_MAINTENANCE_COMPLETED` record, one deferral budget against the
+    /// shared Calyx maintenance lock. A fourth periodic task would have had to
+    /// duplicate all of it to say the same thing, and would have had to
+    /// negotiate with this one for the lock while doing so.
     fn run_once(&self) -> StorageResult<gc::GcReport> {
-        self.run_default_once()
+        self.run_full_once()
     }
 }
 
@@ -3178,8 +3369,17 @@ impl StorageBackend for CalyxBackend {
         })
     }
 
+    /// On-demand equivalent of one `storage_gc` tick.
+    ///
+    /// Runs the same two passes in the same order as the periodic tick,
+    /// reclamation included (#2122) — an on-demand "run GC now" that quietly
+    /// omitted half of what the scheduled one does would make the two
+    /// indistinguishable in the readback and different in effect. The only
+    /// difference is that this constructs a fresh runner, so the pass starts at
+    /// the unescalated base budget rather than inheriting the periodic tick's
+    /// memory-pressure state.
     fn run_gc_once(&self) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault)).run_default_once()
+        CalyxGcRunner::new(Arc::clone(&self.vault)).run_full_once()
     }
 
     fn run_gc_once_with_row_caps(
@@ -11720,6 +11920,22 @@ struct CalyxGcCapOutcome {
     eviction_skipped_reason: Option<&'static str>,
 }
 
+/// This process's committed private memory, or a structured failure.
+///
+/// Fails closed rather than substituting working set. Working set is the metric
+/// #2122 showed to be wrong by 2-5x in the direction that suppresses the alarm
+/// — it oscillated 4,731-12,158 MB while private commit rose monotonically
+/// 25,599 -> 28,206 MB — so falling back to it would let a pressure decision be
+/// made from a number known to be misleading, while looking like it succeeded.
+fn calyx_process_private_bytes() -> StorageResult<u64> {
+    synapse_calyx::process_private_bytes().map_err(|source| StorageError::WriteFailed {
+        cf_name: CALYX_GC_CF.to_owned(),
+        detail: format!(
+            "read process committed private memory for snapshot-version GC pressure: {source}"
+        ),
+    })
+}
+
 fn calyx_gc_default_budgets() -> StorageResult<Vec<CalyxGcBudget>> {
     DEFAULTS
         .iter()
@@ -12317,6 +12533,9 @@ fn run_calyx_gc_budgets(
     Ok(gc::GcReport {
         cf_reports,
         source_census: Some(source_census),
+        // The eviction pass takes no reclamation decision. `CalyxGcRunner`
+        // attaches the pass it runs *after* this one returns (#2122).
+        snapshot_version_gc: None,
     })
 }
 

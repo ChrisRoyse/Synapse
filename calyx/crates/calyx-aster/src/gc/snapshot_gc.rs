@@ -13,7 +13,7 @@ mod reclaimer;
 pub use reclaimer::{
     CALYX_GC_ERROR, DEFAULT_GC_MAX_OPS_PER_RUN, DEFAULT_GC_MIN_INTERVAL_MS, GcMetrics, GcRateLimit,
     GcResult, GcScheduler, GcSchedulerTick, GcTask, SnapshotGcCounters, SnapshotGcReclaimer,
-    SnapshotVersionGc,
+    SnapshotVersionGc, gc_error,
 };
 
 /// Reader id used by the watchdog and MVCC lease registry.
