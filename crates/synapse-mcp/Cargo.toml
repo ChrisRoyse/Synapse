@@ -56,6 +56,10 @@ futures-util.workspace = true
 http.workspace = true
 image.workspace = true
 metrics.workspace = true
+# Pinned rather than floating: this crate installs the process-wide
+# `#[global_allocator]` (src/main.rs), so a silent minor bump would swap the
+# allocator under the daemon between builds. Version moves are a reviewable act.
+mimalloc = "0.1.52"
 notify.workspace = true
 rmcp = { workspace = true, features = [
     "transport-streamable-http-server",

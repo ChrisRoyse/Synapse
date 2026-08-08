@@ -52,6 +52,55 @@
         clippy::unwrap_used
     )
 )]
+/// Process-wide allocator for every `synapse-mcp` binary.
+///
+/// # Why this is not a style preference
+///
+/// The daemon ran on the Windows NT Heap (Rust's default `System` allocator),
+/// which commits segments and effectively never decommits them. Under this
+/// daemon's allocation pattern — full-CF scans producing hundreds of thousands
+/// of individual `Vec<u8>` row payloads per call, repeatedly — the heap's
+/// high-water mark ratchets up and never comes back down.
+///
+/// Measured on two independent long-lived daemons via a `VirtualQueryEx` walk of
+/// the committed address space:
+///
+/// | daemon | PRIVATE regions | 64 KB-1 MB band | commit / working set |
+/// |---|---:|---:|---:|
+/// | pid 66956 (#2115) | 264,537 | 120,703 regions / 21.42 GB | 25.8 GB / 4.7 GB |
+/// | pid 29756 (#2141) | 254,579 | 110,508 regions / 16.60 GB | 20.8 GB / 9.8 GB |
+///
+/// In both cases ~81% of private commit sits in the 64 KB-1 MB band, spread over
+/// six figures of regions. That distribution is a fragmented heap, not a live
+/// collection: the working set collapsing to a fraction of commit proves the
+/// *live* set is far smaller than what the process holds from the OS.
+///
+/// mimalloc targets exactly this shape. Its free-list sharding keeps same-size
+/// blocks together in 64 KB pages, and its eager page purging returns an emptied
+/// page to the OS with `MEM_DECOMMIT` on Windows (`MIMALLOC_PURGE_DELAY`,
+/// default 1000 ms) rather than holding the commit forever.
+///
+/// # Why the default configuration is left alone
+///
+/// `MIMALLOC_PURGE_DELAY=0` would purge on every emptied page — lower commit,
+/// measurably worse throughput on a daemon that allocates in bursts. The 1000 ms
+/// default coalesces a burst's frees into one decommit, which is the behaviour
+/// this workload wants. It is an environment variable, so an operator can retune
+/// it on a host without a rebuild.
+///
+/// # Blast radius
+///
+/// This replaces the allocator for the whole process, including the CUDA/ORT
+/// host allocations made through `calyx-forge` and `synapse-models`. Those paths
+/// allocate device memory through their own driver APIs; only their host-side
+/// bookkeeping crosses this allocator, which is ordinary heap traffic.
+///
+/// Tracked by #2115 (the histogram and the double-materializing scan that feeds
+/// it) and #2141 (which gated this change on exactly the histogram evidence
+/// tabulated above, rather than on the plausibility of the story).
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod approval_protocol;
 mod bearer_token;
 mod chrome_debugger_bridge;
