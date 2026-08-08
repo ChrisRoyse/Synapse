@@ -1095,6 +1095,30 @@ impl M3State {
                 self.calyx_vault_config.as_ref(),
             ));
         };
+        // #2100, phase one of the two-phase exit record. This is the single
+        // funnel every drain (HTTP endpoint, stdio, OS shutdown) reaches before
+        // the vault close, and the close is the long part: on the deployment
+        // host its post-flush tail ran 63-87 s with no output, long enough for
+        // the deploy drain to escalate and kill the process before
+        // `ended_at_unix_ms` was ever written.
+        //
+        // Writing the marker HERE, immediately before the close begins, is what
+        // makes that kill distinguishable from a crash at the next boot. It is
+        // deliberately not fatal: failing the close because a forensic marker
+        // could not be written would destroy the very shutdown it exists to
+        // describe. The failure is reported instead.
+        if let Err(error) = crate::daemon_lifecycle::record_exit_intent(reason, "calyx_vault_close")
+        {
+            tracing::error!(
+                code = "MCP_DAEMON_LIFECYCLE_EXIT_INTENT_FAILED",
+                reason,
+                phase = "calyx_vault_close",
+                error = %error,
+                "could not record the phase-one shutdown marker before closing the Calyx vault; a \
+                 kill during this close will read as `dirty` rather than `interrupted_graceful` at \
+                 the next boot"
+            );
+        }
         match db.close_calyx_vault(reason).map_err(|error| {
             storage_owned_calyx_error("flush and close sole Calyx storage vault", &error)
         }) {

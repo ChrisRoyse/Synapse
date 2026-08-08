@@ -63,7 +63,8 @@ where
         // symptom). Pace that drain first; the acquisition below then only
         // absorbs commits that landed during the pacing loop.
         self.drain_checkpoints_paced("snapshot GC preflight")?;
-        self.with_durable_commit_lock(|| {
+        // Maintenance lane: fenced once a close is declared (#2100).
+        self.with_durable_commit_lock_maintenance("snapshot GC SST reclaim", || {
             self.reclaim_snapshot_ssts_locked(safe_point, max_input_files)
         })
     }

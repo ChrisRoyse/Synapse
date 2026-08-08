@@ -11673,6 +11673,84 @@ function Assert-SynapseProcessStopTarget {
     return $current
 }
 
+# --- #2100: the drain's exit-wait is sized by STALL, not by wall clock -------
+#
+# The failure this replaces, from the first production run of the #2092 unified
+# drain: the daemon accepted the shutdown at 00:16:23.87Z, flushed durably at
+# 00:16:29.22Z, and then went completely silent inside its vault close. The
+# drain waited its flat 90 s budget, escalated to an identity-verified kill at
+# 00:17:56.64Z -- mid-close, after the flush, before the graceful exit record --
+# and the next boot read `previous_shutdown=dirty`.
+#
+# A flat budget cannot tell a close that is working from one that is hung, so it
+# has to guess, and any constant it guesses is wrong in one direction: too short
+# kills healthy closes (what happened), too long stalls every deploy behind a
+# genuinely wedged daemon. The daemon's own log is the discriminator that was
+# always available and never read -- its last-write timestamp advances exactly
+# while the close is making progress.
+#
+# Two liveness witnesses, both physical and both already on disk:
+#
+#   1. the daemon stderr log's (path, length, LastWriteTimeUtc) -- the close now
+#      emits `SYNAPSE_CALYX_VAULT_CLOSE_PHASE` per phase for precisely this
+#      reason, so a working close always advances it;
+#   2. `daemon-run-current.json`'s phase-one `ending_*` marker -- written BEFORE
+#      the close begins, with an `ending_phase` the close refreshes.
+#
+# While either advances, the deadline extends. When neither has advanced for
+# `StallSeconds` the wait escalates, which is the honest signal: the daemon is
+# not merely slow, it has stopped doing anything. An absolute ceiling still
+# bounds the whole wait so a daemon that logs forever cannot block a deploy.
+function Get-SynapseDaemonLivenessSample {
+    param(
+        [AllowNull()][string]$LogDir,
+        [Parameter(Mandatory=$true)][string]$DbPath
+    )
+
+    $logPath = '<none>'
+    $logLength = -1
+    $logWriteTicks = 0
+    if (-not [string]::IsNullOrWhiteSpace($LogDir) -and (Test-Path -LiteralPath $LogDir -PathType Container)) {
+        $newest = Get-ChildItem -LiteralPath $LogDir -Filter 'daemon-stderr-gen*.log' -File -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+        if ($null -ne $newest) {
+            $logPath = $newest.FullName
+            $logLength = [int64]$newest.Length
+            $logWriteTicks = [int64]$newest.LastWriteTimeUtc.Ticks
+        }
+    }
+
+    $endingPhase = '<none>'
+    $endingAt = 0
+    $endedAt = 0
+    $runCurrentPath = Join-Path $DbPath 'daemon-run-current.json'
+    if (Test-Path -LiteralPath $runCurrentPath -PathType Leaf) {
+        try {
+            $run = Get-Content -Raw -LiteralPath $runCurrentPath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($null -ne $run.ending_phase) { $endingPhase = [string]$run.ending_phase }
+            if ($null -ne $run.ending_at_unix_ms) { $endingAt = [int64]$run.ending_at_unix_ms }
+            if ($null -ne $run.ended_at_unix_ms) { $endedAt = [int64]$run.ended_at_unix_ms }
+        } catch {
+            # A torn read of a file being atomically replaced is expected and is
+            # not evidence of anything; the next poll resolves it.
+            $endingPhase = '<unreadable>'
+        }
+    }
+
+    [pscustomobject]@{
+        LogPath        = $logPath
+        LogLength      = $logLength
+        LogWriteTicks  = $logWriteTicks
+        EndingPhase    = $endingPhase
+        EndingAtUnixMs = $endingAt
+        EndedAtUnixMs  = $endedAt
+        RunCurrentPath = $runCurrentPath
+        # One comparable value: any change in any witness is progress.
+        Fingerprint    = "$logPath|$logLength|$logWriteTicks|$endingPhase|$endingAt|$endedAt"
+    }
+}
+
 function Stop-SynapseMcpProcesses {
     param(
         [Parameter(Mandatory=$true)][string]$Reason,
@@ -11688,7 +11766,20 @@ function Stop-SynapseMcpProcesses {
         # leaves a zombie window until the daemon's own 90s shutdown watchdog
         # forces the same termination without installing the new binary.
         [switch]$EscalateAfterGracefulTimeout,
-        [int]$TimeoutSeconds = 15
+        [int]$TimeoutSeconds = 15,
+        # #2100: where the daemon's own liveness evidence lives. Optional so the
+        # `-Remove` path and any caller without a log directory keeps the old
+        # flat-budget behaviour explicitly rather than by accident -- when this is
+        # absent the run-record marker is still read, and when neither witness is
+        # available the wait degrades to the wall-clock budget and SAYS SO.
+        [AllowNull()][string]$LogDir,
+        # Longest the daemon may produce no evidence of progress at all before
+        # the exit-wait escalates. This, not $TimeoutSeconds, is the number that
+        # decides a kill on a healthy-but-slow close.
+        [int]$StallSeconds = 25,
+        # Absolute backstop on the extended wait, so a daemon that keeps writing
+        # forever still cannot hold a deploy open indefinitely.
+        [int]$MaxWaitSeconds = 600
     )
 
     $allBefore = @(Get-SynapseMcpProcessSnapshot)
@@ -11773,7 +11864,26 @@ function Stop-SynapseMcpProcesses {
             }
         }
 
-        $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+        # --- #2100: stall-based exit wait -------------------------------------
+        $waitStarted = Get-Date
+        $hardDeadline = $waitStarted.AddSeconds([Math]::Max($TimeoutSeconds, $MaxWaitSeconds))
+        $liveness = Get-SynapseDaemonLivenessSample -LogDir $LogDir -DbPath $DbPath
+        $livenessAvailable = ($liveness.LogWriteTicks -gt 0) -or ($liveness.EndingAtUnixMs -gt 0)
+        $lastProgressAt = $waitStarted
+        $lastFingerprint = $liveness.Fingerprint
+        $progressObservations = 0
+        $extendedSeconds = 0
+        $lastProgressLogAt = $waitStarted
+        $exitWaitVerdict = 'pending'
+        Info ("SYNAPSE_GRACEFUL_SHUTDOWN_EXIT_WAIT_START reason={0} base_timeout_s={1} stall_s={2} max_wait_s={3} liveness_available={4} log_path={5} ending_phase={6} remediation=the exit-wait escalates when the daemon stops producing evidence of progress, not when a constant expires (#2100)." -f `
+            $Reason,
+            $TimeoutSeconds,
+            $StallSeconds,
+            $MaxWaitSeconds,
+            $livenessAvailable,
+            $liveness.LogPath,
+            $liveness.EndingPhase)
+
         do {
             Start-Sleep -Milliseconds 250
             $remainingHttpPids = @($httpProcesses | Where-Object {
@@ -11783,11 +11893,56 @@ function Stop-SynapseMcpProcesses {
                 $null -ne $current -and ((Test-SynapseMcpExecutableLeafName -Name $current.Name) -or (Test-SynapseMcpExecutableLeafName -Name $exeLeaf))
             })
             if ($remainingHttpPids.Count -eq 0) {
-                Info "Synapse graceful shutdown verified reason=$Reason http_process_count=0"
+                $exitWaitVerdict = 'exited'
+                $waitedMs = [int64]((Get-Date) - $waitStarted).TotalMilliseconds
+                Info ("Synapse graceful shutdown verified reason={0} http_process_count=0 waited_ms={1} extended_s={2} progress_observations={3}" -f `
+                    $Reason, $waitedMs, $extendedSeconds, $progressObservations)
                 Wait-SynapseBindReleased -Reason $Reason -Bind $Bind -TimeoutSeconds $TimeoutSeconds -ForceRestart:$ForceRestart
                 break
             }
-        } while ((Get-Date) -lt $deadline)
+
+            $now = Get-Date
+            $liveness = Get-SynapseDaemonLivenessSample -LogDir $LogDir -DbPath $DbPath
+            if ($liveness.Fingerprint -ne $lastFingerprint) {
+                $lastFingerprint = $liveness.Fingerprint
+                $lastProgressAt = $now
+                $progressObservations += 1
+            }
+            $stalledSeconds = [int]($now - $lastProgressAt).TotalSeconds
+            $elapsedSeconds = [int]($now - $waitStarted).TotalSeconds
+
+            # The base budget is spent. From here the wait continues ONLY while
+            # the daemon keeps proving it is doing something.
+            if ($elapsedSeconds -ge $TimeoutSeconds) {
+                if (-not $livenessAvailable) {
+                    $exitWaitVerdict = 'no_liveness_witness'
+                    break
+                }
+                if ($stalledSeconds -ge $StallSeconds) {
+                    $exitWaitVerdict = 'stalled'
+                    break
+                }
+                if ($now -ge $hardDeadline) {
+                    $exitWaitVerdict = 'ceiling'
+                    break
+                }
+                $extendedSeconds = $elapsedSeconds - $TimeoutSeconds
+                if (($now - $lastProgressLogAt).TotalSeconds -ge 5) {
+                    $lastProgressLogAt = $now
+                    Info ("SYNAPSE_GRACEFUL_SHUTDOWN_EXIT_WAIT_EXTENDED reason={0} elapsed_s={1} extended_s={2} stalled_s={3} stall_budget_s={4} ceiling_s={5} progress_observations={6} ending_phase={7} log_path={8} log_bytes={9}" -f `
+                        $Reason,
+                        $elapsedSeconds,
+                        $extendedSeconds,
+                        $stalledSeconds,
+                        $StallSeconds,
+                        $MaxWaitSeconds,
+                        $progressObservations,
+                        $liveness.EndingPhase,
+                        $liveness.LogPath,
+                        $liveness.LogLength)
+                }
+            }
+        } while ($true)
 
         $remainingHttpPids = @($httpProcesses | Where-Object {
             $pidValue = [int]$_.ProcessId
@@ -11796,9 +11951,25 @@ function Stop-SynapseMcpProcesses {
             $null -ne $current -and ((Test-SynapseMcpExecutableLeafName -Name $current.Name) -or (Test-SynapseMcpExecutableLeafName -Name $exeLeaf))
         })
         if ($remainingHttpPids.Count -gt 0) {
-            $message = ("SYNAPSE_GRACEFUL_SHUTDOWN_TIMEOUT reason={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}" -f `
+            $waitedMs = [int64]((Get-Date) - $waitStarted).TotalMilliseconds
+            $liveness = Get-SynapseDaemonLivenessSample -LogDir $LogDir -DbPath $DbPath
+            # The verdict names WHY the wait ended, which is the whole point: a
+            # kill after `stalled` is a kill of a daemon that had stopped, and a
+            # kill after `no_liveness_witness` says the drain could not tell and
+            # fell back to the wall clock. #2100's escalation reported neither.
+            $message = ("SYNAPSE_GRACEFUL_SHUTDOWN_TIMEOUT reason={0} verdict={1} base_timeout_s={2} waited_ms={3} stall_budget_s={4} ceiling_s={5} progress_observations={6} liveness_available={7} log_path={8} log_bytes={9} ending_phase={10} ending_at_unix_ms={11} remaining_count={12}`nremaining:`n{13}" -f `
                 $Reason,
+                $exitWaitVerdict,
                 $TimeoutSeconds,
+                $waitedMs,
+                $StallSeconds,
+                $MaxWaitSeconds,
+                $progressObservations,
+                $livenessAvailable,
+                $liveness.LogPath,
+                $liveness.LogLength,
+                $liveness.EndingPhase,
+                $liveness.EndingAtUnixMs,
                 $remainingHttpPids.Count,
                 (Format-SynapseMcpProcessSnapshot -Snapshot $remainingHttpPids))
             if ($ForceRestart) {
@@ -12682,6 +12853,7 @@ function Invoke-SynapseDaemonRevokedDrain {
         -Bind $Bind `
         -DbPath $DbPath `
         -TokenPath $TokenPath `
+        -LogDir $LogDir `
         -ForceRestart:$ForceRestart `
         -EscalateAfterGracefulTimeout:$EscalateAfterGracefulTimeout `
         -TimeoutSeconds ([Math]::Min(90, $TimeoutSeconds))
@@ -13110,6 +13282,7 @@ function Stop-SynapseMcpProcessesForInstallHandoff {
             -Bind $Bind `
             -DbPath $DbPath `
             -TokenPath $TokenPath `
+            -LogDir $LogDir `
             -ForceRestart:$ForceRestart `
             -EscalateAfterGracefulTimeout `
             -TimeoutSeconds ([Math]::Min(60, $remainingBudget))

@@ -27,7 +27,8 @@ where
     C: Clock,
 {
     pub fn compact_duplicate_anchors(&self) -> Result<AnchorCompactionReport> {
-        self.with_durable_commit_lock(|| {
+        // Maintenance lane: fenced once a close is declared (#2100).
+        self.with_durable_commit_lock_maintenance("duplicate anchor compaction", || {
             let snapshot = self.snapshot();
             let mut report = AnchorCompactionReport::default();
             let mut rows = Vec::new();

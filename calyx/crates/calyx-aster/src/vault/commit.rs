@@ -513,6 +513,71 @@ where
         self.commit_lock_waiters.load(Ordering::Acquire)
     }
 
+    /// The reason this vault is closing, once a close has been declared (#2100).
+    #[must_use]
+    pub fn close_intent(&self) -> Option<&'static str> {
+        self.close_intent.get().copied()
+    }
+
+    /// Declares that this vault is closing, fencing new maintenance work.
+    ///
+    /// Returns the reason actually in force: a second declaration does not
+    /// overwrite the first, because the first close is the one whose evidence
+    /// the exit record carries.
+    ///
+    /// This is the root fix for #2100 ask 2. Before it, a commanded close could
+    /// queue behind arbitrary fan-out work that had been admitted *after* the
+    /// close was requested; the close had no way to say "no more maintenance",
+    /// only to wait its turn like any other pass.
+    pub fn declare_close_intent(&self, reason: &'static str) -> &'static str {
+        let in_force = *self.close_intent.get_or_init(|| reason);
+        tracing::info!(
+            code = "CALYX_ASTER_VAULT_CLOSE_INTENT_DECLARED",
+            reason,
+            in_force,
+            commit_lock_waiters = self.durable_commit_lock_waiters(),
+            "fenced new maintenance admissions of the native compaction lock and of the durable \
+             commit lock; the close no longer queues behind work admitted after it was commanded"
+        );
+        in_force
+    }
+
+    /// Fails closed when a close has been declared, naming it.
+    pub(crate) fn ensure_not_closing(&self, operation: &'static str) -> Result<()> {
+        let Some(reason) = self.close_intent() else {
+            return Ok(());
+        };
+        Err(CalyxError {
+            code: "CALYX_ASTER_VAULT_CLOSING",
+            message: format!(
+                "refusing to admit maintenance operation {operation} because this vault is closing (close_reason={reason})"
+            ),
+            remediation: "this is close fencing, not a storage fault: the vault was commanded to \
+                          close and refuses new maintenance work so the close cannot queue behind \
+                          it. Reopen the vault to resume maintenance",
+        })
+    }
+
+    /// [`Self::with_durable_commit_lock`] for **maintenance** lanes only.
+    ///
+    /// The distinction this draws is the one #2100 needed and the vault did not
+    /// have: a commit is work the caller is waiting on and must still complete
+    /// while the daemon drains, whereas a background maintenance lane taking the
+    /// one lock that serialises every vault write is exactly what a commanded
+    /// close must be able to stop. Callers that are on the close's own path
+    /// (checkpoint drain, final flush, the close fan-out preparation) keep using
+    /// [`Self::with_durable_commit_lock`] — fencing those would fence the close
+    /// against itself.
+    #[track_caller]
+    pub(crate) fn with_durable_commit_lock_maintenance<T>(
+        &self,
+        operation: &'static str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        self.ensure_not_closing(operation)?;
+        self.with_durable_commit_lock(f)
+    }
+
     /// Runs `f` under the process + cross-process durable commit boundary,
     /// recording how long the caller queued and how long it held the lock.
     ///

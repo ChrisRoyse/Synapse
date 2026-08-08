@@ -32,6 +32,32 @@ const PREVIOUS_SHUTDOWN_CLEAN: &str = "clean";
 const PREVIOUS_SHUTDOWN_DIRTY: &str = "dirty";
 /// No previous run record at all -- a first boot on this vault.
 const PREVIOUS_SHUTDOWN_NONE: &str = "none";
+/// The previous run declared a commanded graceful shutdown and began its close,
+/// but died before finalizing the exit record (#2100).
+///
+/// # Why this is its own verdict and not `dirty`
+///
+/// `dirty` used to cover two materially different events. One is "the process
+/// died while running": nothing was flushed on purpose, the WAL tail is whatever
+/// the last group commit left, and an operator should look for a crash. The
+/// other is "an operator or a deploy commanded a shutdown, the daemon flushed
+/// durably, and it was then killed part-way through the close" — which is
+/// exactly what #2100 reports, three times over, and which reads as *identical*
+/// to a crash at the next boot.
+///
+/// The distinction is only knowable if the intent is recorded **before** the
+/// close begins, so [`record_exit_intent`] writes an `ending_*` marker first and
+/// [`record_exit_for_state_locked`] finalizes it into `ended_*`. Marker without
+/// finalization is this verdict. That is the same two-phase shape PostgreSQL's
+/// `pg_control` uses between `DB_SHUTDOWNING` and `DB_SHUTDOWNED`: the
+/// in-progress state is a distinct recorded value precisely so a crash during
+/// shutdown is distinguishable from a crash during operation.
+///
+/// It is deliberately NOT reported as clean. Nothing about it proves the close
+/// finished; it proves only that the daemon was trying to. The evidence rides
+/// with it (`previous_ending_reason`, `previous_ending_phase`,
+/// `previous_ending_at_unix_ms`) so an operator can see how far it got.
+const PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL: &str = "interrupted_graceful";
 // These files live inside the vault directory, so their names are owned by
 // `synapse_calyx::vault_runtime`: a vault backup must exclude exactly this set
 // by name (they are the running process's state, never vault data) and the two
@@ -90,6 +116,21 @@ struct RunRecord {
     bind_addr: Option<String>,
     db_path: String,
     started_at_unix_ms: u64,
+    /// When a commanded shutdown *began*, written before the close runs (#2100).
+    ///
+    /// This is phase one of the two-phase exit record. Its presence without
+    /// `ended_at_unix_ms` is what makes an escalated kill mid-close
+    /// distinguishable from a crash-while-running; see
+    /// [`PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ending_at_unix_ms: Option<u64>,
+    /// Why the shutdown was commanded (`http_endpoint`, `os_shutdown`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ending_reason: Option<String>,
+    /// The drain phase in progress when the marker was written, so a boot can
+    /// say *how far* the interrupted close got rather than only that it started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ending_phase: Option<String>,
     ended_at_unix_ms: Option<u64>,
     ended_reason: Option<String>,
     /// How the *previous* run on this vault ended, decided at boot (#2083).
@@ -114,6 +155,14 @@ struct RunRecord {
     previous_ended_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_ended_at_unix_ms: Option<u64>,
+    /// The previous run's phase-one shutdown marker, carried onto this run's
+    /// record so `interrupted_graceful` arrives with its evidence (#2100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_ending_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_ending_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_ending_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -591,12 +640,18 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         bind_addr: config.bind_addr,
         db_path: paths.db_path.clone(),
         started_at_unix_ms: now_unix_ms(),
+        ending_at_unix_ms: None,
+        ending_reason: None,
+        ending_phase: None,
         ended_at_unix_ms: None,
         ended_reason: None,
         previous_shutdown: None,
         previous_run_id: None,
         previous_ended_reason: None,
         previous_ended_at_unix_ms: None,
+        previous_ending_reason: None,
+        previous_ending_phase: None,
+        previous_ending_at_unix_ms: None,
     };
     let max_segment_bytes = configured_max_segment_bytes();
     let (tool_events, exit_events) = with_lifecycle_ledger_lock(
@@ -657,9 +712,17 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     run.previous_run_id = Some(previous.run_id.clone());
                     run.previous_ended_reason = previous.ended_reason.clone();
                     run.previous_ended_at_unix_ms = previous.ended_at_unix_ms;
+                    run.previous_ending_reason = previous.ending_reason.clone();
+                    run.previous_ending_phase = previous.ending_phase.clone();
+                    run.previous_ending_at_unix_ms = previous.ending_at_unix_ms;
+                    // Three-way, not two-way (#2100). `ended` beats `ending`:
+                    // a finalized record is the whole truth and the marker it
+                    // supersedes is only how that close began.
                     run.previous_shutdown = Some(
                         if previous.ended_at_unix_ms.is_some() {
                             PREVIOUS_SHUTDOWN_CLEAN
+                        } else if previous.ending_at_unix_ms.is_some() {
+                            PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL
                         } else {
                             PREVIOUS_SHUTDOWN_DIRTY
                         }
@@ -678,11 +741,24 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     run_id: previous.run_id.clone(),
                     pid: previous.pid,
                     event_kind: "previous_run_unclean".to_owned(),
-                    cause: "process_missing_on_startup".to_owned(),
+                    cause: if previous.ending_at_unix_ms.is_some() {
+                        "killed_during_commanded_close"
+                    } else {
+                        "process_missing_on_startup"
+                    }
+                    .to_owned(),
                     detail: json!({
                         "new_pid": std::process::id(),
                         "new_run_id": run.run_id.clone(),
                         "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
+                        // #2100: the phase-one marker, carried into the
+                        // append-only ledger as well as onto the run record, so
+                        // the evidence survives even if the successor's record
+                        // is later superseded.
+                        "previous_shutdown_verdict": run.previous_shutdown.clone(),
+                        "previous_ending_at_unix_ms": previous.ending_at_unix_ms,
+                        "previous_ending_reason": previous.ending_reason.clone(),
+                        "previous_ending_phase": previous.ending_phase.clone(),
                     }),
                     recorded_at_unix_ms: now_unix_ms(),
                     run: Some(previous.clone()),
@@ -731,6 +807,9 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
     let previous_run_id = run.previous_run_id.clone();
     let previous_ended_reason = run.previous_ended_reason.clone();
     let previous_ended_at_unix_ms = run.previous_ended_at_unix_ms;
+    let previous_ending_reason = run.previous_ending_reason.clone();
+    let previous_ending_phase = run.previous_ending_phase.clone();
+    let previous_ending_at_unix_ms = run.previous_ending_at_unix_ms;
     let run_id = run.run_id.clone();
     let state = DaemonLifecycleState {
         run,
@@ -772,6 +851,28 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             run_current_path = %paths.run_current_path,
             exit_events_path = %paths.exit_events_path,
             "previous daemon run ended without recording a graceful exit; a previous_run_unclean event was appended to the exit ledger"
+        );
+    } else if previous_shutdown == PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL {
+        // #2100: a warning, like `dirty`, because the close did not finish --
+        // but a *different* warning, because the remediation is different. This
+        // one says the shutdown was commanded and got as far as the named phase
+        // before something killed it, which points at the drain's exit-wait
+        // budget rather than at a crash.
+        tracing::warn!(
+            code = "MCP_DAEMON_PREVIOUS_SHUTDOWN",
+            previous_shutdown = %previous_shutdown,
+            previous_run_id = previous_run_id.as_deref().unwrap_or("<none>"),
+            previous_ended_reason = previous_ended_reason.as_deref().unwrap_or("<none>"),
+            previous_ended_at_unix_ms,
+            previous_ending_reason = previous_ending_reason.as_deref().unwrap_or("<none>"),
+            previous_ending_phase = previous_ending_phase.as_deref().unwrap_or("<none>"),
+            previous_ending_at_unix_ms,
+            run_id = %run_id,
+            run_current_path = %paths.run_current_path,
+            exit_events_path = %paths.exit_events_path,
+            "previous daemon run was commanded to shut down, wrote its phase-one ending marker, and \
+             died before finalizing the exit record; this is an interrupted graceful close, not a \
+             crash while running"
         );
     } else {
         tracing::info!(
@@ -1057,6 +1158,105 @@ pub(crate) fn record_graceful_exit_after_lifetime_lock_close(
         action_result,
         unlock_result,
     )
+}
+
+/// Phase one of the two-phase exit record: the daemon is *about to* close
+/// (#2100).
+///
+/// # What it buys
+///
+/// The daemon's graceful drain flushes durably and then runs a close whose
+/// tail — vault teardown, lineage record, GPU release, lock release — took 63
+/// and 87+ seconds on the deployment host. The deploy drain's exit-wait
+/// escalated inside that window and killed the process, so `ended_at_unix_ms`
+/// was never written and the next boot read `previous_shutdown=dirty
+/// previous_ended_reason=none`: the same verdict a crash-while-serving produces.
+///
+/// Writing the intent first makes the two distinguishable. It is cheap and
+/// bounded by construction — one atomic JSON replace of a file that is already
+/// open, taken before anything that can block — so the marker lands even when
+/// everything after it stalls.
+///
+/// Idempotent: a second call for the same run refreshes `ending_phase` so a long
+/// close can say how far it got, and never moves `ending_at_unix_ms` backwards
+/// off the first declaration.
+///
+/// # Errors
+///
+/// Returns an error when the lifecycle ledger is not configured, its lock or
+/// state cannot be taken, or the run record cannot be republished.
+pub(crate) fn record_exit_intent(cause: &'static str, phase: &'static str) -> anyhow::Result<()> {
+    let slot = state_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let Some(state) = guard.as_mut() else {
+        bail!("daemon lifecycle ledger is not configured for exit intent ({cause})");
+    };
+    let db_path = PathBuf::from(&state.paths.db_path);
+    with_lifecycle_ledger_lock(&db_path, "record daemon exit intent", || {
+        record_exit_intent_for_state_locked(state, cause, phase)
+    })
+}
+
+fn record_exit_intent_for_state_locked(
+    state: &mut DaemonLifecycleState,
+    cause: &'static str,
+    phase: &'static str,
+) -> anyhow::Result<()> {
+    let mut run = state.run.clone();
+    let first_declaration = run.ending_at_unix_ms.is_none();
+    if first_declaration {
+        run.ending_at_unix_ms = Some(now_unix_ms());
+        run.ending_reason = Some(cause.to_owned());
+    }
+    run.ending_phase = Some(phase.to_owned());
+    // Never overwrite a successor's record. Same rule as the exit finalizer: if
+    // another daemon already owns `daemon-run-current.json`, this run's marker
+    // would be a lie about which process is closing.
+    let current = read_optional_json::<RunRecord>(Path::new(&state.paths.run_current_path))
+        .with_context(|| {
+            format!(
+                "read daemon current run before exit intent {}",
+                state.paths.run_current_path
+            )
+        })?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "daemon current run disappeared before exit intent: {}",
+                state.paths.run_current_path
+            )
+        })?;
+    if current.run_id != state.run.run_id {
+        tracing::info!(
+            code = "MCP_DAEMON_LIFECYCLE_RUN_CURRENT_SUPERSEDED",
+            run_id = %state.run.run_id,
+            run_current_path = %state.paths.run_current_path,
+            "skipped the phase-one ending marker because a successor already owns the current-run record"
+        );
+        state.run = run;
+        return Ok(());
+    }
+    write_json_atomic(Path::new(&state.paths.run_current_path), &run).with_context(|| {
+        format!(
+            "write daemon ending current run {}",
+            state.paths.run_current_path
+        )
+    })?;
+    tracing::info!(
+        code = "MCP_DAEMON_LIFECYCLE_EXIT_INTENT_RECORDED",
+        run_id = %run.run_id,
+        pid = run.pid,
+        cause,
+        phase,
+        first_declaration,
+        ending_at_unix_ms = run.ending_at_unix_ms,
+        run_current_path = %state.paths.run_current_path,
+        "recorded the phase-one shutdown marker before the close began; a kill after this point \
+         reads as interrupted_graceful rather than dirty at the next boot"
+    );
+    state.run = run;
+    Ok(())
 }
 
 pub(crate) fn record_startup_exit(cause: &'static str, detail: Value) -> anyhow::Result<()> {
@@ -2449,8 +2649,16 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         .unwrap_or("unrecorded");
     let previous_run_id = state.run.previous_run_id.as_deref().unwrap_or("none");
     let previous_ended_reason = state.run.previous_ended_reason.as_deref().unwrap_or("none");
+    // #2100: an `interrupted_graceful` verdict is only actionable with the
+    // phase-one evidence beside it, so /health carries the marker too.
+    let previous_ending_reason = state
+        .run
+        .previous_ending_reason
+        .as_deref()
+        .unwrap_or("none");
+    let previous_ending_phase = state.run.previous_ending_phase.as_deref().unwrap_or("none");
     format!(
-        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} previous_shutdown={} previous_run_id={} previous_ended_reason={} last_error={}",
+        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} previous_shutdown={} previous_run_id={} previous_ended_reason={} previous_ending_reason={} previous_ending_phase={} last_error={}",
         state.run.run_id,
         state.run.pid,
         state.paths.run_current_path,
@@ -2463,6 +2671,8 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         previous_shutdown,
         previous_run_id,
         previous_ended_reason,
+        previous_ending_reason,
+        previous_ending_phase,
         last_error
     )
 }

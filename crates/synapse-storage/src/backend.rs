@@ -9687,18 +9687,39 @@ fn sweep_calyx_namespace_rows<V>(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
     site: &'static str,
-    mut visit: V,
+    visit: V,
 ) -> StorageResult<CalyxKvSweep>
 where
     V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
 {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    sweep_calyx_range_rows(vault, cf_name, site, &range, visit)
+}
+
+/// [`sweep_calyx_namespace_rows`] over an arbitrary ordered sub-range of one
+/// column family's namespace.
+///
+/// Split out so the ordinary ordered-range read path (`scan_cf`,
+/// `scan_cf_prefix*`, `scan_cf_from`) shares exactly this decode, this TTL rule
+/// and this ordering assertion with the maintenance sweeps instead of keeping a
+/// second, unpaged copy of them (#2060).
+fn sweep_calyx_range_rows<V>(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    site: &'static str,
+    range: &KeyRange,
+    mut visit: V,
+) -> StorageResult<CalyxKvSweep>
+where
+    V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
+{
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let now_ms = vault
         .clock_now_ms()
         .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
     let mut previous: Option<Vec<u8>> = None;
-    sweep_kv_range_pages(vault, cf_name, site, &range, |key, value| {
+    sweep_kv_range_pages(vault, cf_name, site, range, |key, value| {
         let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, key)?;
         let envelope = decode_calyx_value_raw(value).map_err(|detail| {
             tracing::error!(
@@ -9800,47 +9821,87 @@ fn read_all_rows_from_vault_filtered(
     read_rows_from_vault_range_filtered(vault, cf_name, &range, include_expired)
 }
 
+/// `site` label for the ordinary ordered-range read (`scan_cf`,
+/// `scan_cf_prefix*`, `scan_cf_from`, and every read-only namespace scan).
+///
+/// Deliberately not a new *guard census* name — the row-guard sites stay
+/// `scan_cf_range_page_latest` so windows collected before and after this change
+/// stay directly comparable, which is the same reasoning `RowGuardSite::as_str`
+/// and `CALYX_GC_RETENTION_SWEEP_SITE` already document. This label only
+/// attributes `STORAGE_CALYX_BOUNDED_SWEEP` lines to the tool read rather than
+/// to a maintenance tick.
+const CALYX_ORDERED_RANGE_READ_SITE: &str = "calyx_ordered_range_read";
+
+/// Materialises an ordered logical range with **bounded** row-table read-guard
+/// holds (#2060).
+///
+/// # What changed and why the answer is unchanged
+///
+/// This used to be one `scan_kv_range_latest` per call — a single hold of the
+/// shared MVCC row-table read guard across the merge and materialisation of a
+/// whole namespace. Measured on the live daemon it was the last remaining
+/// contributor to `scan_cf_range_latest`'s over-budget holds after #2058/#2041
+/// and 682e6fdb: 25-30 ms per hold at very high rate under ordinary MCP tool
+/// load, with a 224 ms worst hold, and every vault commit waits behind it.
+///
+/// It now folds through [`sweep_calyx_range_rows`] — the same 256-row pager the
+/// GC retention sweep and the panel-coverage census already use — releasing the
+/// guard between pages. The decode, the TTL rule, the include-expired switch and
+/// the strictly-increasing logical-key assertion are unchanged; only the length
+/// of the critical section is.
+///
+/// Three properties of the row table make the paged fold **equal** to the held
+/// one rather than an approximation of it (the argument established by #2058 and
+/// restated for the census in #2060):
+///
+/// 1. Row-table entries are only ever created — snapshot GC trims version chains
+///    in place — so the key order a cursor walks is append-only and stable and a
+///    cursor can neither skip nor double-visit a key.
+/// 2. A commit concurrent with the fold allocates a sequence strictly above the
+///    pinned one each page reads at, so it is excluded from that page's answer.
+/// 3. A concurrent reclaim keeps each chain's newest version at or below the
+///    safe point, and that point is clamped to the oldest pinned sequence across
+///    live leases, so the version this fold reads is never the one dropped. The
+///    lease is re-checked per page, so a fold that outlived its pin fails closed.
+///
+/// The one property paging does **not** preserve is that the whole range is read
+/// at a single instant. That costs nothing here: this path only reads and
+/// proposes no mutation, so — unlike the GC eviction sweep, which needs a
+/// pre-delete re-check — a row rewritten between two pages simply contributes
+/// its newer value to a listing. When the window is not a single instant the
+/// sweep says so rather than implying atomicity it did not have.
 fn read_rows_from_vault_range_filtered(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
     range: &KeyRange,
     include_expired: bool,
 ) -> StorageResult<Vec<RawRow>> {
-    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
-    let rows = vault
-        .scan_kv_range_latest(range)
-        .map_err(|source| calyx_read_failed(cf_name, "scan ordered Calyx KV range", &source))?;
-    let mut decoded = Vec::with_capacity(rows.len());
-    let now_ms = vault
-        .clock_now_ms()
-        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
-    for (key, value) in rows {
-        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
-        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
-            tracing::error!(
-                code = error_codes::STORAGE_READ_FAILED,
-                cf = cf_name,
-                detail,
-                "Calyx storage backend rejected malformed KV retention envelope"
-            );
-            StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail,
+    let mut decoded: Vec<RawRow> = Vec::new();
+    let sweep = sweep_calyx_range_rows(
+        vault,
+        cf_name,
+        CALYX_ORDERED_RANGE_READ_SITE,
+        range,
+        |user_key, payload, expired| {
+            if include_expired || !expired {
+                decoded.push((user_key.to_vec(), payload.to_vec()));
             }
-        })?;
-        if include_expired || !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-            decoded.push((user_key, envelope.payload.to_vec()));
-        }
-    }
-    if !decoded
-        .windows(2)
-        .all(|pair| pair[0].0.as_slice() < pair[1].0.as_slice())
-    {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf_name.to_owned(),
-            detail: "CALYX_ORDERED_KEY_RANGE_OUT_OF_ORDER: physical ordered namespace did not decode into strictly increasing logical keys; remediation=inspect duplicate/corrupt namespace-one keys before retrying"
-                .to_owned(),
-        });
+            Ok(())
+        },
+    )?;
+    if !sweep.atomic() {
+        tracing::debug!(
+            code = "STORAGE_CALYX_ORDERED_RANGE_READ_INTERVAL",
+            cf = cf_name,
+            site = CALYX_ORDERED_RANGE_READ_SITE,
+            pages = sweep.pages,
+            rows_visited = sweep.rows_visited,
+            snapshot_seq_first = sweep.snapshot_seq_first,
+            snapshot_seq_last = sweep.snapshot_seq_last,
+            include_expired,
+            "ordered Calyx range read spanned more than one committed sequence; the rows are each \
+             individually current, the set is a bounded interval rather than one instant"
+        );
     }
     Ok(decoded)
 }

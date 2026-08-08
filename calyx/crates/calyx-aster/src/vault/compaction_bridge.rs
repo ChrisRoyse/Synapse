@@ -76,6 +76,27 @@ fn is_tiny_file_fanout_debt(pending_files: usize, pending_bytes: u64) -> bool {
     pending_bytes / files < TINY_FILE_COMPACTION_AVG_BYTES_CEILING
 }
 
+/// Which lane is asking for one native fan-out pass.
+///
+/// The three differ only in how they are *admitted*, and that difference is the
+/// whole point: a boot must not wait, the periodic tick must eventually run, and
+/// a commanded close must not queue behind either (#1812, #2067, #2100).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FanoutLane {
+    /// Open-time write-stall readiness (#1812): non-blocking admission.
+    Readiness,
+    /// The 5-minute storage GC tick (#2067): fair FIFO admission.
+    Periodic,
+    /// A commanded vault close (#2100): head-of-queue, short budget.
+    Close,
+}
+
+impl FanoutLane {
+    const fn readiness_only(self) -> bool {
+        matches!(self, Self::Readiness)
+    }
+}
+
 #[derive(Debug)]
 pub struct VaultCompactionScheduler {
     catalog: Arc<CompactionCatalog>,
@@ -165,7 +186,7 @@ where
     /// Total CF bytes are telemetry, not debt: this flat immutable-file layer
     /// cannot reduce a healthy large dataset merely by rewriting it.
     pub fn compact_native_fanout_once(&self) -> Result<Vec<CompactionResult>> {
-        self.compact_fanout_pass(false)
+        self.compact_fanout_pass(FanoutLane::Periodic)
     }
 
     /// Open-time readiness pass (#1812): compacts ONLY the CFs whose file
@@ -178,26 +199,105 @@ where
     /// routine and tiny-file drain lanes stay owned by the periodic GC task,
     /// so a steady-state boot pays only the catalog scan here.
     pub fn compact_write_stall_readiness_once(&self) -> Result<Vec<CompactionResult>> {
-        self.compact_fanout_pass(true)
+        self.compact_fanout_pass(FanoutLane::Readiness)
     }
 
-    fn compact_fanout_pass(&self, readiness_only: bool) -> Result<Vec<CompactionResult>> {
+    /// The close's fan-out preparation, bounded and never fatal to the close.
+    ///
+    /// # Why this is not `compact_native_fanout_once`
+    ///
+    /// On the production run in #2100 the close took the ordinary periodic lane,
+    /// whose admission budget is [`NATIVE_COMPACTION_FAIR_WAIT`] — **120
+    /// seconds** — against a deploy drain that escalates its exit-wait at ~90.
+    /// A close that can spend more than the drain's whole budget queueing for a
+    /// maintenance guard cannot reach its own exit record, which is exactly the
+    /// failure #2100 reports.
+    ///
+    /// This lane instead:
+    ///
+    /// 1. raises the close fence, so no *new* pass can be admitted behind it;
+    /// 2. reserves at the head of the admission queue;
+    /// 3. waits at most [`CLOSE_COMPACTION_WAIT`] for whatever pass was already
+    ///    running;
+    /// 4. on refusal, reports `Ok(None)` — the fan-out preparation was skipped,
+    ///    named, and logged.
+    ///
+    /// Step 4 is not a silent fallback. The preparation compacts SST fan-out to
+    /// make the *next* open cheaper; durability at this point rests on the WAL
+    /// and the flush that follows, neither of which this touches. Failing the
+    /// whole close for it would trade the graceful exit record — the thing
+    /// #2100 exists to preserve — for a boot-time optimisation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only when the pass was admitted and then failed. A
+    /// refused admission is `Ok(None)`.
+    pub fn compact_native_fanout_for_close(
+        &self,
+        reason: &'static str,
+    ) -> Result<Option<Vec<CompactionResult>>> {
+        let Some(durable) = &self.durable else {
+            return Ok(Some(Vec::new()));
+        };
+        let in_force = self.declare_close_intent(reason);
+        let (fence_reason, released_waiters, holder) =
+            fence_native_compaction_for_close(durable, in_force)?;
+        tracing::info!(
+            code = "CALYX_ASTER_VAULT_CLOSE_FENCE_RAISED",
+            reason,
+            close_reason = fence_reason,
+            released_waiters,
+            active_holder = holder.unwrap_or("<none>"),
+            close_admission_wait_ms =
+                u64::try_from(CLOSE_COMPACTION_WAIT.as_millis()).unwrap_or(u64::MAX),
+            "raised the native-compaction close fence; queued maintenance waiters will be released \
+             on their next poll and no new pass can be admitted"
+        );
+        match self.compact_fanout_pass(FanoutLane::Close) {
+            Ok(results) => Ok(Some(results)),
+            Err(error) if error.code == "CALYX_ASTER_NATIVE_COMPACTION_BUSY" => {
+                tracing::warn!(
+                    code = "CALYX_ASTER_VAULT_CLOSE_FANOUT_SKIPPED",
+                    reason,
+                    close_admission_wait_ms = u64::try_from(CLOSE_COMPACTION_WAIT.as_millis())
+                        .unwrap_or(u64::MAX),
+                    error_code = error.code,
+                    error = %error.message,
+                    "close fan-out preparation was not admitted inside its bounded budget; closing \
+                     WITHOUT it. Durability is unaffected (the WAL and the final flush carry it); \
+                     the next open pays the un-compacted fan-out instead"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn compact_fanout_pass(&self, lane: FanoutLane) -> Result<Vec<CompactionResult>> {
         let Some(durable) = &self.durable else {
             return Ok(Vec::new());
         };
+        let readiness_only = lane.readiness_only();
         // The periodic GC lane waits its turn (issue #2067): it fires once every
         // five minutes and must eventually run, so it reserves a fair handoff
         // instead of sampling the lock once and giving up. The boot readiness
         // lane keeps non-blocking admission — it runs before the daemon serves
-        // anything, so there is nothing to be fair to.
-        let _maintenance_guard = if readiness_only {
-            try_acquire_native_compaction_guard(durable, "write_stall_readiness_compaction")?
-        } else {
-            acquire_native_compaction_guard_fair(
+        // anything, so there is nothing to be fair to. The close lane reserves at
+        // the head of the queue on a short budget (issue #2100).
+        let _maintenance_guard = match lane {
+            FanoutLane::Readiness => {
+                try_acquire_native_compaction_guard(durable, "write_stall_readiness_compaction")?
+            }
+            FanoutLane::Periodic => acquire_native_compaction_guard_fair(
                 durable,
                 "storage_gc_native_fanout",
                 NATIVE_COMPACTION_FAIR_WAIT,
-            )?
+            )?,
+            FanoutLane::Close => acquire_native_compaction_guard_fair(
+                durable,
+                CLOSE_COMPACTION_PURPOSE,
+                CLOSE_COMPACTION_WAIT,
+            )?,
         };
         // Issue #1806: this pass already performed its physical rewrites off
         // the durable commit lock, but its *preflight* checkpoint drained the
@@ -877,6 +977,18 @@ struct NativeCompactionAdmission {
     /// short passes from starving a waiter (issue #2067).
     reservations: VecDeque<u64>,
     next_ticket: u64,
+    /// Set when a close has been declared for the vault that owns this lock
+    /// path (issue #2100).
+    ///
+    /// Fairness (#2067) and close preemption are different requirements and
+    /// this field is where they are reconciled: while it is `None` the queue is
+    /// strictly FIFO, and once it is `Some` every non-close admission is refused
+    /// and every parked waiter is released rather than kept fair against a lane
+    /// that will never run again. Recorded here rather than only on the vault
+    /// because the admission state is what every waiter already polls, so a
+    /// parked waiter learns about the close on its next poll instead of after
+    /// its budget.
+    closing: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -933,13 +1045,24 @@ struct NativeCompactionReservation {
 }
 
 impl NativeCompactionReservation {
-    fn take(state: NativeCompactionAdmissionCell) -> Result<Self> {
+    /// Takes a reservation, optionally at the **head** of the queue.
+    ///
+    /// The close's own fan-out preparation is the only priority admission, and
+    /// it is not a fairness violation: the close fence has already refused every
+    /// admission behind it, so the tickets it jumps belong to passes that are
+    /// about to be released with `CALYX_ASTER_VAULT_CLOSING` anyway. Jumping
+    /// them is what keeps the close from paying their queue depth (#2100).
+    fn take_at(state: NativeCompactionAdmissionCell, front: bool) -> Result<Self> {
         let mut guard = state
             .lock()
             .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?;
         let ticket = guard.next_ticket;
         guard.next_ticket = guard.next_ticket.saturating_add(1);
-        guard.reservations.push_back(ticket);
+        if front {
+            guard.reservations.push_front(ticket);
+        } else {
+            guard.reservations.push_back(ticket);
+        }
         drop(guard);
         Ok(Self { state, ticket })
     }
@@ -1005,6 +1128,77 @@ fn native_compaction_busy(
     }
 }
 
+/// Purpose string of the one pass a close is allowed to run: the fan-out
+/// preparation inside [`AsterVault::compact_native_fanout_for_close`].
+///
+/// Compared by pointer-free equality against the `purpose` an admission asks
+/// for, so the close's own pass is the single exception to the close fence.
+pub(super) const CLOSE_COMPACTION_PURPOSE: &str = "vault_close_fanout";
+
+/// Longest the close's own fan-out preparation waits for an already-running
+/// pass to release the maintenance guard.
+///
+/// Much shorter than [`NATIVE_COMPACTION_FAIR_WAIT`] on purpose. Once the close
+/// fence is up no *new* pass can be admitted, so the only thing this can wait
+/// for is one pass that was already running, and a close that waits two minutes
+/// for it has already lost: #2100's production drain escalated its exit-wait at
+/// ~90 s. The fan-out preparation is an optimisation for the *next* boot, not a
+/// durability requirement — the flush and the WAL are — so the close reports the
+/// skip and proceeds rather than trading a graceful exit record for it.
+pub(super) const CLOSE_COMPACTION_WAIT: Duration = Duration::from_secs(10);
+
+/// Raises the close fence for the vault that owns `path` (issue #2100).
+///
+/// Returns the reason in force. Idempotent and set-once, matching
+/// [`AsterVault::declare_close_intent`].
+pub(super) fn fence_native_compaction_for_close(
+    durable: &DurableVault,
+    reason: &'static str,
+) -> Result<(&'static str, usize, Option<&'static str>)> {
+    let path = durable.native_compaction_lock_path();
+    let state = admission_state(&path);
+    let mut guard = state
+        .lock()
+        .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?;
+    let in_force = *guard.closing.get_or_insert(reason);
+    let released_waiters = guard.reservations.len();
+    let holder = guard.holder.map(|holder| holder.purpose);
+    Ok((in_force, released_waiters, holder))
+}
+
+/// The close reason fencing `path`, if one has been declared.
+fn admission_close_reason(state: NativeCompactionAdmissionCell) -> Option<&'static str> {
+    state.lock().ok().and_then(|guard| guard.closing)
+}
+
+fn native_compaction_closing(
+    path: &Path,
+    purpose: &'static str,
+    close_reason: &'static str,
+    waited: Duration,
+) -> CalyxError {
+    let waited_ms = u64::try_from(waited.as_millis()).unwrap_or(u64::MAX);
+    tracing::info!(
+        code = "CALYX_ASTER_NATIVE_COMPACTION_CLOSE_FENCED",
+        path = %path.display(),
+        requested_by = purpose,
+        close_reason,
+        waited_ms,
+        "refused a native compaction admission because the vault is closing; the close must not \
+         queue behind maintenance admitted after it was commanded"
+    );
+    CalyxError {
+        code: "CALYX_ASTER_VAULT_CLOSING",
+        message: format!(
+            "native compaction lock {} is fenced because the vault is closing: close_reason={close_reason} requested_by={purpose} waited_ms={waited_ms}",
+            path.display()
+        ),
+        remediation: "this is close fencing, not a storage fault: the vault was commanded to close \
+                      and refuses new maintenance passes so the close cannot queue behind them. \
+                      Reopen the vault to resume maintenance",
+    }
+}
+
 /// Non-blocking admission: reports backpressure immediately when a pass is
 /// already active, or when a fair-handoff reservation is outstanding.
 ///
@@ -1018,12 +1212,22 @@ pub(super) fn try_acquire_native_compaction_guard(
 ) -> Result<NativeCompactionGuard> {
     let path = durable.native_compaction_lock_path();
     let state = admission_state(&path);
-    let (holder, reserved_ahead) = {
+    let (holder, reserved_ahead, closing) = {
         let guard = state
             .lock()
             .map_err(|_| CalyxError::backpressure("native compaction admission state poisoned"))?;
-        (guard.holder, guard.reservations.len())
+        (guard.holder, guard.reservations.len(), guard.closing)
     };
+    if let Some(close_reason) = closing
+        && purpose != CLOSE_COMPACTION_PURPOSE
+    {
+        return Err(native_compaction_closing(
+            &path,
+            purpose,
+            close_reason,
+            Duration::ZERO,
+        ));
+    }
     if reserved_ahead > 0 {
         return Err(native_compaction_busy(
             &path,
@@ -1059,9 +1263,32 @@ pub(super) fn acquire_native_compaction_guard_fair(
 ) -> Result<NativeCompactionGuard> {
     let path = durable.native_compaction_lock_path();
     let state = admission_state(&path);
-    let reservation = NativeCompactionReservation::take(state)?;
+    let close_priority = purpose == CLOSE_COMPACTION_PURPOSE;
+    if !close_priority && let Some(close_reason) = admission_close_reason(state) {
+        return Err(native_compaction_closing(
+            &path,
+            purpose,
+            close_reason,
+            Duration::ZERO,
+        ));
+    }
+    let reservation = NativeCompactionReservation::take_at(state, close_priority)?;
     let started = Instant::now();
     loop {
+        // The close fence is re-read on EVERY poll, not only at entry. A waiter
+        // that sampled it once would keep burning its budget after the close was
+        // commanded, which is precisely the 120 s the close could not afford
+        // (#2100).
+        if !close_priority && let Some(close_reason) = admission_close_reason(state) {
+            let waited = started.elapsed();
+            drop(reservation);
+            return Err(native_compaction_closing(
+                &path,
+                purpose,
+                close_reason,
+                waited,
+            ));
+        }
         let (holder, at_head, reserved_ahead) = {
             let guard = state.lock().map_err(|_| {
                 CalyxError::backpressure("native compaction admission state poisoned")

@@ -6670,10 +6670,32 @@ impl SynapseCalyxVault {
     /// Flushes and closes the durable vault, then proves the lock can be
     /// reacquired before reporting a safe shutdown readback.
     ///
+    /// # Every phase is timed and reported (#2100)
+    ///
+    /// This used to emit three log lines across the whole close. On the
+    /// production deploy in #2100 the last of them
+    /// (`SYNAPSE_CALYX_VAULT_FLUSHED`, 00:16:29.22Z) was the last line the
+    /// daemon ever wrote: the drain escalated 87 s later, mid-close, so the
+    /// graceful exit record never landed and the next boot read
+    /// `previous_shutdown=dirty`. The *successful* close one generation earlier
+    /// shows the same shape — 63 s of complete silence between
+    /// `SYNAPSE_CALYX_VAULT_FLUSHED` and
+    /// `SYNAPSE_CALYX_VAULT_LINEAGE_CLOSE_RECORDED` — so the cost was structural,
+    /// not a one-off, and no post-hoc analysis could attribute it because
+    /// nothing in that region emits anything.
+    ///
+    /// Now every phase emits `SYNAPSE_CALYX_VAULT_CLOSE_PHASE` with its own
+    /// elapsed time, and a phase past [`CLOSE_PHASE_SLOW_BUDGET_MS`] escalates
+    /// to `SYNAPSE_CALYX_VAULT_CLOSE_PHASE_SLOW`. That serves two callers at
+    /// once: an operator gets the attribution, and the deploy drain gets a
+    /// **liveness heartbeat** — its exit-wait now extends while the daemon log's
+    /// last write keeps advancing and escalates on a stall instead of on wall
+    /// clock, which is only sound if a working close actually writes something.
+    ///
     /// # Errors
     ///
-    /// Returns an error when flush, PID-sidecar cleanup, lock release, or the
-    /// re-lock proof fails.
+    /// Returns an error when flush, the sealed-memtable drain, PID-sidecar
+    /// cleanup, lock release, or the re-lock proof fails.
     pub fn close(
         self,
         reason: &'static str,
@@ -6687,36 +6709,76 @@ impl SynapseCalyxVault {
             open_mode: _,
             lineage,
         } = self;
+        let close_started = std::time::Instant::now();
+        let vault_dir = config.vault_dir.clone();
         let latest_seq = vault.latest_seq();
         let closing_vault_id = vault.vault_id().to_string();
-        let close_compaction = vault.compact_native_fanout_once().map_err(|error| {
-            SynapseCalyxError::from_calyx(
-                "checkpoint and prepare Calyx SST fan-out before close",
-                &error,
-            )
-        })?;
+
+        // Phase 1: declare the close and prepare the SST fan-out under the close
+        // fence. `compact_native_fanout_for_close` raises the fence FIRST, so
+        // every maintenance pass admitted after this instant is refused and
+        // every parked waiter is released; the close then reserves at the head
+        // of the admission queue on a 10 s budget instead of the periodic lane's
+        // 120 s. A refused admission is reported, not fatal — see that method.
+        let phase_started = std::time::Instant::now();
+        let close_compaction = vault
+            .compact_native_fanout_for_close(reason)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "checkpoint and prepare Calyx SST fan-out before close",
+                    &error,
+                )
+            })?;
+        let fanout_prepared = close_compaction.is_some();
+        let compaction_attempts = close_compaction.map_or(0, |results| results.len());
+        record_close_phase(
+            reason,
+            "fanout_prepare",
+            phase_started,
+            close_started,
+            &vault_dir,
+        );
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_CLOSE_FANOUT_READY",
             reason,
-            vault_dir = %config.vault_dir.display(),
-            compaction_attempts = close_compaction.len(),
+            vault_dir = %vault_dir.display(),
+            compaction_attempts,
+            fanout_prepared,
             "checkpointed pending commits and prepared native SST fan-out before final router flush"
         );
+
+        // Phase 2: the final flush.
+        let phase_started = std::time::Instant::now();
         vault.flush().map_err(|error| {
             SynapseCalyxError::from_calyx("flush durable Calyx Aster vault", &error)
         })?;
+        record_close_phase(reason, "flush", phase_started, close_started, &vault_dir);
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_FLUSHED",
             reason,
-            vault_dir = %config.vault_dir.display(),
+            vault_dir = %vault_dir.display(),
             latest_seq,
             "flushed durable Calyx Aster vault before shutdown"
         );
-        drop(vault);
-        // Record the closing high-water mark while it is still knowable. The
-        // vault is already flushed, so failing here cannot lose rows — but it
-        // must fail loudly, because after the directory is deleted this sibling
-        // journal is the only surviving evidence of how much was there (#1875).
+
+        // Phase 3: the teardown. This is the 63-87 s region, and it used to be
+        // the single statement `drop(vault)`.
+        let phase_started = std::time::Instant::now();
+        let teardown = vault.close_teardown(reason);
+        record_close_phase(reason, "teardown", phase_started, close_started, &vault_dir);
+        teardown.verdict().map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                "drain sealed Calyx memtables during vault teardown",
+                &error,
+            )
+        })?;
+
+        // Phase 4: record the closing high-water mark while it is still
+        // knowable. The vault is already flushed, so failing here cannot lose
+        // rows — but it must fail loudly, because after the directory is deleted
+        // this sibling journal is the only surviving evidence of how much was
+        // there (#1875).
+        let phase_started = std::time::Instant::now();
         let lineage_after_close = lineage::evaluate_and_record(
             &config.vault_dir,
             &closing_vault_id,
@@ -6727,10 +6789,17 @@ impl SynapseCalyxVault {
             // open, so this call always takes the existing-generation path.
             lineage::VaultOpenGenesis::PreExisting,
         )?;
+        record_close_phase(
+            reason,
+            "lineage_record",
+            phase_started,
+            close_started,
+            &vault_dir,
+        );
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_LINEAGE_CLOSE_RECORDED",
             reason,
-            vault_dir = %config.vault_dir.display(),
+            vault_dir = %vault_dir.display(),
             lineage_path = %lineage_after_close.lineage_path.display(),
             vault_id = %closing_vault_id,
             generation_at_open = lineage.generation,
@@ -6738,6 +6807,7 @@ impl SynapseCalyxVault {
             latest_seq,
             "recorded the closing durable high-water mark in the vault lineage journal"
         );
+        let phase_started = std::time::Instant::now();
         let gpu_reservation_release = match math_runtime.close() {
             Ok(readback) => readback,
             Err(error) => {
@@ -6752,7 +6822,22 @@ impl SynapseCalyxVault {
                 return Err(error);
             }
         };
+        record_close_phase(
+            reason,
+            "math_runtime_close",
+            phase_started,
+            close_started,
+            &vault_dir,
+        );
+        let phase_started = std::time::Instant::now();
         let lock_readback = lock.close(reason)?;
+        record_close_phase(
+            reason,
+            "lock_release",
+            phase_started,
+            close_started,
+            &vault_dir,
+        );
         let readback = SynapseCalyxVaultCloseReadback {
             enabled: true,
             reason,
@@ -6775,10 +6860,62 @@ impl SynapseCalyxVault {
             re_lock_probe_succeeded = readback.re_lock_probe_succeeded,
             gpu_reservation_release = ?readback.gpu_reservation_release,
             latest_seq,
+            close_total_ms = u64::try_from(close_started.elapsed().as_millis())
+                .unwrap_or(u64::MAX),
             "closed durable Calyx Aster vault"
         );
         Ok(readback)
     }
+}
+
+/// Above this, one close phase is reported as slow rather than merely recorded.
+///
+/// Two seconds, not because a slower phase is a fault, but because the deploy
+/// drain's stall detector needs a line to be *emitted* well inside its stall
+/// budget: a phase that runs for a minute must say so while it is running, not
+/// after. Under it the phase still emits its ordinary record, so the log always
+/// advances at least once per phase.
+const CLOSE_PHASE_SLOW_BUDGET_MS: u128 = 2_000;
+
+/// Emits one close-phase record (issue #2100).
+///
+/// Every phase emits, unconditionally. That is deliberate: this is not only
+/// telemetry, it is the liveness signal the deploy drain's stall-based exit-wait
+/// reads off the daemon log's last-write timestamp. A phase that emitted only
+/// when slow would leave the drain unable to tell a working close from a hung
+/// one, which is the exact ambiguity #2100 ask 1 exists to remove.
+fn record_close_phase(
+    reason: &'static str,
+    phase: &'static str,
+    phase_started: std::time::Instant,
+    close_started: std::time::Instant,
+    vault_dir: &std::path::Path,
+) {
+    let phase_ms = phase_started.elapsed().as_millis();
+    let close_elapsed_ms = close_started.elapsed().as_millis();
+    if phase_ms > CLOSE_PHASE_SLOW_BUDGET_MS {
+        tracing::warn!(
+            code = "SYNAPSE_CALYX_VAULT_CLOSE_PHASE_SLOW",
+            reason,
+            phase,
+            phase_ms = u64::try_from(phase_ms).unwrap_or(u64::MAX),
+            close_elapsed_ms = u64::try_from(close_elapsed_ms).unwrap_or(u64::MAX),
+            slow_budget_ms = u64::try_from(CLOSE_PHASE_SLOW_BUDGET_MS).unwrap_or(u64::MAX),
+            vault_dir = %vault_dir.display(),
+            "a Calyx vault close phase exceeded its reporting budget; the drain's exit-wait extends \
+             while these records keep advancing and escalates when they stop"
+        );
+        return;
+    }
+    tracing::info!(
+        code = "SYNAPSE_CALYX_VAULT_CLOSE_PHASE",
+        reason,
+        phase,
+        phase_ms = u64::try_from(phase_ms).unwrap_or(u64::MAX),
+        close_elapsed_ms = u64::try_from(close_elapsed_ms).unwrap_or(u64::MAX),
+        vault_dir = %vault_dir.display(),
+        "completed one Calyx vault close phase"
+    );
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -181,6 +181,80 @@ pub struct AsterVault<C = SystemClock> {
     /// isolated vault's handles and cached anchors can never be confused with
     /// the live daemon's.
     ledger_projections: Mutex<Option<crate::ledger_head::LedgerProjections>>,
+    /// Set exactly once, by [`Self::declare_close_intent`], to the reason this
+    /// vault is closing (issue #2100).
+    ///
+    /// # What it fences, and why a flag is the right shape
+    ///
+    /// A close has to reach the flush and the final record; it must not be able
+    /// to queue behind maintenance work that was admitted *after* the close was
+    /// commanded. Nothing in the vault used to distinguish those two, so
+    /// `compact_native_fanout_once` on the close path took the ordinary fair
+    /// admission with a 120 s budget and could sit behind an arbitrary
+    /// concurrently-admitted pass.
+    ///
+    /// Once this is set:
+    ///
+    /// * every **new** native-compaction admission is refused with
+    ///   `CALYX_ASTER_VAULT_CLOSING`, whatever its purpose, except the close's
+    ///   own (see [`crate::vault::compaction_bridge`]);
+    /// * every fair-admission waiter already parked on that lock aborts instead
+    ///   of burning the rest of its budget;
+    /// * every maintenance acquisition of the durable commit lock
+    ///   ([`Self::with_durable_commit_lock_maintenance`]) is refused, so no
+    ///   background lane can take the one lock that serialises vault writes
+    ///   after the close has started.
+    ///
+    /// Set-once rather than a toggle: a close cannot be un-commanded, and a
+    /// fence that could be cleared would let a maintenance lane race the close
+    /// back onto the lock. `OnceLock` carries the reason as well as the bit, so
+    /// a refusal names *which* close fenced it.
+    close_intent: std::sync::OnceLock<&'static str>,
+}
+
+/// What each named step of [`AsterVault::close_teardown`] cost (issue #2100).
+///
+/// Carried out of the teardown rather than only logged so the caller can put the
+/// same split on its own close record — an operator reading a `previous_shutdown`
+/// verdict should not have to correlate two log streams to learn which step of
+/// the close ran long.
+#[derive(Debug)]
+pub struct VaultTeardownReport {
+    /// The close reason this teardown ran under.
+    pub reason: &'static str,
+    /// Sealed memtables still awaiting their SST when the teardown began.
+    ///
+    /// Before #2100 these were collected by `RouterFlusher::drop`'s unbudgeted,
+    /// unlogged join. A non-zero value here is the exact backlog the close had
+    /// to absorb.
+    pub sealed_outstanding_before: usize,
+    /// Draining that backlog under the flusher's own budget.
+    pub flush_drain_ms: u128,
+    /// Releasing the MVCC row store, its version chains and the router.
+    pub rows_teardown_ms: u128,
+    /// Releasing the durable handle (WAL batcher, staged checkpoints, crypto).
+    pub durable_teardown_ms: u128,
+    /// Releasing the Ledger projections and hook.
+    pub residual_teardown_ms: u128,
+    /// Whole teardown, end to end.
+    pub total_ms: u128,
+    /// The first background flush failure, if the drain surfaced one.
+    ///
+    /// Held rather than returned as `Err` so the timings are never lost to the
+    /// failure: a close that failed its drain is exactly the close whose cost
+    /// breakdown matters most.
+    pub drain_error: Option<CalyxError>,
+}
+
+impl VaultTeardownReport {
+    /// The teardown's own verdict, separated from its measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first background flush failure the drain surfaced.
+    pub fn verdict(&self) -> Result<()> {
+        self.drain_error.clone().map_or(Ok(()), Err)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -526,6 +600,7 @@ where
             post_commit_error_seq: AtomicU64::new(0),
             commit_stage_observer: Default::default(),
             ledger_projections: Default::default(),
+            close_intent: std::sync::OnceLock::new(),
             recovery_report: VaultRecoveryReport {
                 last_recovered_seq: 0,
                 torn_tail: None,
@@ -648,6 +723,114 @@ where
     /// does not drain inside its budget.
     pub fn drain_pending_flushes(&self) -> Result<()> {
         self.rows.drain_pending_flushes()
+    }
+
+    /// Tears the vault down in **named, individually timed steps** instead of
+    /// one opaque `drop` (issue #2100).
+    ///
+    /// # Why this exists
+    ///
+    /// `SynapseCalyx::close` used to log `SYNAPSE_CALYX_VAULT_FLUSHED`, run
+    /// `drop(vault)`, and log the next line. On the production deploy that
+    /// #2100 was opened for, and on the *successful* close one daemon
+    /// generation earlier, that single unlogged statement took **63 and 87+
+    /// seconds** with not one intervening log line — long enough for the deploy
+    /// drain to escalate and kill the process before the graceful exit record
+    /// was written. The region could not be attributed after the fact because
+    /// nothing in it emits anything, and the issue's own reading of the evidence
+    /// (a stall behind the durable commit lock) is falsified by the same log:
+    /// the last `CALYX_ASTER_DURABLE_COMMIT_LOCK_SLOW` before the gap reported
+    /// `wait_ms=0 hold_ms=1478`.
+    ///
+    /// So the teardown names its steps. `vault_close_bound_fsv` measures them on
+    /// an isolated vault (where the row/version teardown is 0.29 us per resident
+    /// MVCC version, scaling 2.04x for 2x versions); this makes the same split
+    /// readable on the deployment host, where the absolute number is two orders
+    /// of magnitude larger and had no attribution at all.
+    ///
+    /// The explicit flusher drain is also a *bound*, not only a measurement: the
+    /// sealed memtables that the final flush produced were previously written by
+    /// the flusher thread and collected by `RouterFlusher::drop`'s join, which
+    /// has no budget and no telemetry. `drain_pending_flushes` has both.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first background flush failure, or a failure to drain inside
+    /// the flusher's budget. The teardown still completes: the report is
+    /// returned alongside the verdict so the caller can log what the close cost
+    /// even when the drain failed.
+    #[must_use]
+    pub fn close_teardown(self, reason: &'static str) -> VaultTeardownReport {
+        let started = Instant::now();
+        let outstanding_before = self.rows.flush_status().outstanding;
+        let drain_started = Instant::now();
+        let drain = self.rows.drain_pending_flushes();
+        let flush_drain_ms = drain_started.elapsed().as_millis();
+        let drain_error = drain.err();
+
+        let Self {
+            vault_id: _,
+            vault_salt: _,
+            clock: _,
+            rows,
+            durable,
+            dedup_policy: _,
+            retention_horizon: _,
+            ledger_hook,
+            read_only: _,
+            selected_cfs: _,
+            commit_lock: _,
+            commit_lock_waiters: _,
+            recurrence_write_lock: _,
+            ledger_state_reconciliation_required: _,
+            post_commit_error_seq: _,
+            recovery_report: _,
+            residency: _,
+            commit_stage_observer: _,
+            ledger_projections,
+            close_intent: _,
+        } = self;
+
+        // Order matters and is the same order the compiler would have used:
+        // the row store owns the flusher thread and must go before the router it
+        // writes into, and the durable handle must outlive both.
+        let rows_started = Instant::now();
+        drop(rows);
+        let rows_teardown_ms = rows_started.elapsed().as_millis();
+
+        let durable_started = Instant::now();
+        drop(durable);
+        let durable_teardown_ms = durable_started.elapsed().as_millis();
+
+        let residual_started = Instant::now();
+        drop(ledger_projections);
+        drop(ledger_hook);
+        let residual_teardown_ms = residual_started.elapsed().as_millis();
+
+        let report = VaultTeardownReport {
+            reason,
+            sealed_outstanding_before: outstanding_before,
+            flush_drain_ms,
+            rows_teardown_ms,
+            durable_teardown_ms,
+            residual_teardown_ms,
+            total_ms: started.elapsed().as_millis(),
+            drain_error,
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_VAULT_TEARDOWN_TIMED",
+            reason,
+            sealed_outstanding_before = report.sealed_outstanding_before,
+            flush_drain_ms = report.flush_drain_ms,
+            rows_teardown_ms = report.rows_teardown_ms,
+            durable_teardown_ms = report.durable_teardown_ms,
+            residual_teardown_ms = report.residual_teardown_ms,
+            total_ms = report.total_ms,
+            drain_ok = report.drain_error.is_none(),
+            "tore the Calyx vault down in named steps; this region was one unlogged `drop` before \
+             #2100 and carried 63-87 s of the production close"
+        );
+        report
     }
 
     pub fn vault_id(&self) -> VaultId {
@@ -1639,7 +1822,8 @@ where
             ));
         }
         self.drain_checkpoints_paced("WAL recycle preflight")?;
-        self.with_durable_commit_lock(|| {
+        // Maintenance lane: fenced once a close is declared (#2100).
+        self.with_durable_commit_lock_maintenance("durable WAL recycle", || {
             let Some(durable) = &self.durable else {
                 return Ok(WalRecycleReport::default());
             };
