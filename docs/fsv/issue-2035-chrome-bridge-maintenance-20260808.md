@@ -102,3 +102,16 @@ The run exposed two separate gaps, tracked rather than hidden:
 Neither gap changes the #2035 verdict: exact tab creation, navigation, reload,
 cleanup, baseline preservation, and fail-closed validation all ran against the
 configured physical browser.
+
+## Companion verdict: issue #2052
+
+The same real reload also closed #2052. A fresh parser/source read reported zero
+PowerShell parse errors across 23,447 tokens. The token
+`SYNAPSE_CHROME_STALE_BUILD_CLEANUP_FAILED` occurs exactly once in the entire
+installer, at line 1531 inside its owning stale-build cleanup function, and zero
+times inside `Invoke-SynapseChromeAddressBarNavigation` (lines 2097–2295).
+
+The real navigation completed without any stale-build or navigation failure,
+then the independent Chrome/UIA/bridge/event reads above proved its physical
+effect and cleanup. The three rejected edge calls caused no host or tab mutation,
+so structurally invalid input cannot reach the removed dynamic-scope hazard.
