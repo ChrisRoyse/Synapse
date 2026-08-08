@@ -53,6 +53,7 @@
     )
 )]
 mod approval_protocol;
+mod bearer_token;
 mod chrome_debugger_bridge;
 mod connect;
 mod daemon_lifecycle;
@@ -71,6 +72,7 @@ mod m4;
 #[cfg(windows)]
 mod os_shutdown;
 mod process_qos;
+mod process_topology;
 mod safety;
 mod secret_crypto;
 mod server;

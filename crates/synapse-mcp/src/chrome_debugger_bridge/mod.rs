@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, bail};
+use anyhow::Context;
 use axum::{
     Json,
     extract::{
@@ -134,8 +134,6 @@ const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native ho
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension with scripts\\install-synapse-chrome-debugger.ps1; the installer atomically deploys every build to the one persistent %LOCALAPPDATA%\\synapse\\chrome-extension\\active directory and auto-loads that exact unpacked directory into the already-open active Chrome profile while refusing to launch a second Chrome profile; the constant profile path survives browser/OS restart while the build ID and service-worker SHA prove the loaded bytes; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus a persisted/read-verified chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, exposes browser_file_upload with target-scoped DOM.setFileInputFiles/Page.fileChooserOpened for session-owned Chrome bridge tabs, and has explicit browser_debugger-profile chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, Runtime.evaluate page evaluation, Page.addScriptToEvaluateOnNewDocument init scripts, Runtime.addBinding/Runtime.bindingCalled binding capture, Page.handleJavaScriptDialog dialog handling, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; browser_debugger facade operations require profile operation=set profile=browser_debugger with confirm_break_glass=true and a reason; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
 const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon invokes the exact Reload or Load unpacked control in the already-open authenticated Chrome profile, never launches a second Chrome process/profile, and separately verifies the Chrome profile row plus a new authenticated bridge host";
 const SETUP_REPAIR_MCP_GUIDANCE: &str = "mcp_setup_repair=call public MCP tool setup with operation=repair from profile=maintenance and repair.reason=chrome_bridge_build_skew";
-const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
-const APPDATA_ENV: &str = "APPDATA";
 
 #[derive(Clone, Debug)]
 pub struct NativeHostInvocation {
@@ -10324,33 +10322,13 @@ async fn register_native_host(
     Ok(registered)
 }
 
+/// The native host authenticates to the daemon, so it must resolve the bearer
+/// token by exactly the daemon's rule. This used to be a second, independent
+/// copy of the resolution logic; #2099 changed the precedence in `http::auth`
+/// and a divergent copy here would authenticate against a token the daemon is
+/// not using. There is now one implementation.
 fn load_token_value() -> anyhow::Result<String> {
-    match token_file_path() {
-        Some(path) if path.is_file() => {
-            let token = std::fs::read_to_string(&path)
-                .with_context(|| format!("read HTTP bearer token file {}", path.display()))?;
-            normalize_token(&token)
-                .with_context(|| format!("HTTP bearer token file is empty: {}", path.display()))
-        }
-        Some(_) | None => {
-            let token = std::env::var(TOKEN_ENV)
-                .with_context(|| format!("{TOKEN_ENV} is unset and token.txt is absent"))?;
-            normalize_token(&token).with_context(|| format!("{TOKEN_ENV} is empty"))
-        }
-    }
-}
-
-fn token_file_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os(APPDATA_ENV)?;
-    Some(PathBuf::from(appdata).join("synapse").join("token.txt"))
-}
-
-fn normalize_token(raw: &str) -> anyhow::Result<String> {
-    let token = raw.trim();
-    if token.is_empty() {
-        bail!("empty token")
-    }
-    Ok(token.to_owned())
+    crate::bearer_token::load_token_value()
 }
 
 async fn read_native_messages(

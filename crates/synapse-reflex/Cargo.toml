@@ -23,6 +23,12 @@ synapse-storage = { version = "0.1.0", path = "../synapse-storage" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# tracing-subscriber process_topology_fsv reads the derived-state graph lane's
+#                    own structured yield event as evidence, because a return
+#                    value cannot distinguish "this lane derived no edges" from
+#                    "this lane was not consulted" (#2097). The daemon installs
+#                    its own subscriber; this is for the manual instrument only.
+tracing-subscriber = { workspace = true }
 uuid.workspace = true
 
 [target.'cfg(windows)'.dependencies]

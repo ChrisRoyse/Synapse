@@ -1,6 +1,5 @@
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{net::SocketAddr, sync::Arc};
 
-use anyhow::{Context, bail};
 use axum::{
     body::Body,
     extract::State,
@@ -11,8 +10,8 @@ use axum::{
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
-const APPDATA_ENV: &str = "APPDATA";
+use crate::bearer_token::{TokenSource, load_token};
+
 const BRIDGE_REGISTER_TOKEN_HEADER: &str = "x-synapse-bridge-register-token";
 const BRIDGE_REGISTER_TOKEN_DOMAIN: &[u8] = b"synapse.chrome_bridge.register.v1";
 
@@ -22,12 +21,6 @@ pub(super) struct HttpAuth {
     bridge_register_token_digest: [u8; 32],
     source: TokenSource,
     bind_addr: SocketAddr,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum TokenSource {
-    File(PathBuf),
-    Env,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -49,7 +42,11 @@ pub(super) enum OriginFailure {
 
 impl HttpAuth {
     pub(super) fn load(bind_addr: SocketAddr) -> anyhow::Result<Self> {
-        let (token, source) = load_token()?;
+        let resolution = load_token()?;
+        // Name the winning source in the boot log before anything can reject a
+        // request for using the other one (#2099).
+        resolution.report();
+        let (token, source) = (resolution.token, resolution.source);
         Ok(Self {
             token_digest: digest_token(&token),
             bridge_register_token_digest: digest_token(&derive_bridge_register_token(&token)),
@@ -59,10 +56,7 @@ impl HttpAuth {
     }
 
     pub(super) const fn source_label(&self) -> &'static str {
-        match self.source {
-            TokenSource::File(_) => "file",
-            TokenSource::Env => "env",
-        }
+        self.source.label()
     }
 
     pub(super) fn authorize(&self, headers: &HeaderMap) -> Result<(), AuthFailure> {
@@ -147,7 +141,7 @@ pub(super) async fn require_http_security(
         ) {
             return match auth.authorize_bridge_register(request.headers()) {
                 Ok(()) => next.run(request).await,
-                Err(failure) => unauthorized_request(failure, &request),
+                Err(failure) => unauthorized_request(failure, &request, auth.source_label()),
             };
         }
     }
@@ -156,48 +150,14 @@ pub(super) async fn require_http_security(
     }
     match auth.authorize(request.headers()) {
         Ok(()) => next.run(request).await,
-        Err(failure) => unauthorized_request(failure, &request),
+        Err(failure) => unauthorized_request(failure, &request, auth.source_label()),
     }
 }
 
-/// Load the daemon bearer token value (file or env), for in-process consumers
-/// such as the `--mode connect` bridge that must authenticate to the daemon.
-pub(crate) fn load_token_value() -> anyhow::Result<String> {
-    load_token().map(|(token, _source)| token)
-}
-
-fn load_token() -> anyhow::Result<(String, TokenSource)> {
-    match token_file_path() {
-        Some(path) if path.is_file() => {
-            let token = std::fs::read_to_string(&path)
-                .with_context(|| format!("read HTTP bearer token file {}", path.display()))?;
-            let token = normalize_token(&token)
-                .with_context(|| format!("HTTP bearer token file is empty: {}", path.display()))?;
-            Ok((token, TokenSource::File(path)))
-        }
-        Some(_) | None => load_env_token(),
-    }
-}
-
-fn load_env_token() -> anyhow::Result<(String, TokenSource)> {
-    let token = std::env::var(TOKEN_ENV)
-        .with_context(|| format!("{TOKEN_ENV} is unset and token.txt is absent"))?;
-    let token = normalize_token(&token).with_context(|| format!("{TOKEN_ENV} is empty"))?;
-    Ok((token, TokenSource::Env))
-}
-
-fn token_file_path() -> Option<PathBuf> {
-    let appdata = std::env::var_os(APPDATA_ENV)?;
-    Some(PathBuf::from(appdata).join("synapse").join("token.txt"))
-}
-
-fn normalize_token(raw: &str) -> anyhow::Result<String> {
-    let token = raw.trim();
-    if token.is_empty() {
-        bail!("empty token")
-    }
-    Ok(token.to_owned())
-}
+/// Re-export of the crate-wide bearer-token loader (#2099), kept here because
+/// `http::auth` used to own the resolution and in-crate callers reach it via
+/// `crate::http::load_token_value`.
+pub(crate) use crate::bearer_token::load_token_value;
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, AuthFailure> {
     let raw = headers
@@ -311,10 +271,18 @@ fn origin_header(headers: &HeaderMap) -> Option<&str> {
         .map(str::trim)
 }
 
-fn unauthorized_request(failure: AuthFailure, request: &Request<Body>) -> Response {
+/// `token_source` names where *this daemon's* token came from (#2099). Without
+/// it, a client authenticating with the other source's token gets an
+/// unexplained 401 and the operator has nothing to compare against.
+fn unauthorized_request(
+    failure: AuthFailure,
+    request: &Request<Body>,
+    token_source: &'static str,
+) -> Response {
     tracing::warn!(
         code = synapse_core::error_codes::HTTP_TOKEN_INVALID,
         reason = ?failure,
+        token_source,
         method = %request.method(),
         path = request.uri().path(),
         origin = origin_header(request.headers()).unwrap_or("<missing>"),

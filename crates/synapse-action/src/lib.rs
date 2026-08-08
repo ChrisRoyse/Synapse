@@ -88,7 +88,8 @@ pub use path::{
     path_point_at, path_point_at_arclen, sample_path, sample_path_arclen,
 };
 pub use process_parentage::{
-    PROCESS_PARENTAGE_SCHEMA_VERSION, ParentageState, ProcessParentage, capture_process_parentage,
+    PROCESS_PARENTAGE_SCHEMA_VERSION, ParentageState, ProcessParentage, ProcessTopology,
+    ProcessTopologyEntry, capture_process_parentage, capture_process_topology,
 };
 pub use rate_limit::{
     SOFTWARE_RATE_LIMIT_PER_S, TokenBucket, TokenBucketSnapshot, VIGEM_RATE_LIMIT_PER_S,

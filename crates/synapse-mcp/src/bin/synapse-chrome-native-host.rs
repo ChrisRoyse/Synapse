@@ -6,6 +6,13 @@ use anyhow::{Context, bail};
 use synapse_telemetry::{TelemetryConfig, TelemetryGuard, init_tracing};
 use tracing_subscriber::filter::LevelFilter;
 
+// The native host authenticates to the daemon, so it must resolve the bearer
+// token by exactly the daemon's rule (#2099). It composes the one shared
+// implementation rather than carrying a copy that could silently disagree.
+#[allow(dead_code)]
+#[path = "../bearer_token.rs"]
+mod bearer_token;
+
 #[allow(dead_code)]
 #[path = "../chrome_debugger_bridge/mod.rs"]
 mod chrome_debugger_bridge;

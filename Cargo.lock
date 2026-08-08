@@ -3968,6 +3968,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "windows",
 ]
@@ -3976,6 +3977,7 @@ dependencies = [
 name = "synapse-storage"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "calyx-assay",
  "calyx-aster",
  "calyx-core",

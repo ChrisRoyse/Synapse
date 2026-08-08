@@ -8873,6 +8873,13 @@ fn process_identity_text(record: &Value) -> Option<String> {
             "/target",
             "/command_line",
             "/matched_title",
+            // #2097: observed-process rows carry no path, target or command
+            // line by design — the kernel process-table snapshot exposes only
+            // the image name, and that is deliberately all the topology
+            // observer records. Appended **last** so it is consulted only when
+            // every richer identity is absent; existing launch rows always
+            // match `/target` first and are therefore measured unchanged.
+            "/image_name",
         ],
     )
 }

@@ -392,7 +392,11 @@ impl SynapseService {
             .map_err(|error| mcp_error(error.code(), error.to_string()))
     }
 
-    pub(super) fn reflex_runtime(
+    /// `pub(crate)` rather than `pub(super)` because the process-topology
+    /// observer (#2097) lives at the crate root — it is a periodic writer of
+    /// `CF_PROCESS_HISTORY`, not an MCP tool — and needs the same runtime handle
+    /// the tool surface uses.
+    pub(crate) fn reflex_runtime(
         &self,
     ) -> Result<Arc<Mutex<synapse_reflex::ReflexRuntime>>, ErrorData> {
         let event_bus = self.sse_state()?.event_bus();

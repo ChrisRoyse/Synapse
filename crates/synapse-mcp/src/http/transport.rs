@@ -1376,6 +1376,30 @@ fn start_http_runtime(
         background_tasks.push(own_http_background_task("ambient_ingest", task));
     }
 
+    // #2097: the second writer of CF_PROCESS_HISTORY. Without it the process
+    // graph lane sees only processes this daemon launched, and can derive
+    // nothing but a star centred on the daemon's own pid.
+    let process_topology_observer =
+        match crate::process_topology::spawn_periodic_process_topology_observer(
+            service.clone(),
+            shutdown_cancel.clone(),
+        )
+        .context("spawn periodic process topology observer")
+        {
+            Ok(task) => task,
+            Err(error) => {
+                return Err(HttpRuntimeStartupFailure::new(
+                    "process_topology_observer",
+                    error,
+                    background_tasks,
+                    None,
+                ));
+            }
+        };
+    if let Some(task) = process_topology_observer {
+        background_tasks.push(own_http_background_task("process_topology_observer", task));
+    }
+
     let operator_hotkey_guard = match crate::safety::install_operator_hotkey(service.clone())
         .context("install operator panic hotkey")
     {

@@ -239,6 +239,102 @@ pub fn capture_process_parentage(child_pid: u32) -> ProcessParentage {
     }
 }
 
+/// One observed process and its guarded parentage, both read from the **same**
+/// process-table snapshot.
+///
+/// The pid-reuse guard is only sound when the child's and the parent's creation
+/// times come from one consistent read; a topology built by re-snapshotting per
+/// pid would compare times taken at different instants and could both miss real
+/// edges and admit fabricated ones.
+#[derive(Clone, Debug)]
+pub struct ProcessTopologyEntry {
+    pub pid: u32,
+    /// Image **name** only (e.g. `cmd.exe`), never a command line. The kernel
+    /// snapshot exposes nothing more, and nothing more is wanted: a process
+    /// graph needs identity and structure, not arguments.
+    pub image_name: Option<String>,
+    /// Creation FILETIME in 100 ns ticks since 1601. Together with `pid` this is
+    /// the stable identity of a process occurrence — a pid alone is not, because
+    /// Windows recycles pids.
+    pub start_time_100ns: u64,
+    pub parentage: ProcessParentage,
+}
+
+/// The whole live process table, observed once, with every entry's parentage
+/// resolved against that same observation.
+#[derive(Clone, Debug)]
+pub struct ProcessTopology {
+    pub observed_at_unix_ms: u64,
+    pub observer_pid: u32,
+    /// Names the exact mechanism that produced this observation, so a persisted
+    /// row can say how it was read rather than merely asserting it was.
+    pub capture_source: &'static str,
+    pub entries: Vec<ProcessTopologyEntry>,
+}
+
+/// Observe the entire process table once and resolve every entry's parentage
+/// from that single snapshot.
+///
+/// This is the whole-tree counterpart of [`capture_process_parentage`], and it
+/// exists because the per-pid form cannot build a tree affordably or soundly:
+/// `NtQuerySystemInformation(SystemProcessInformation)` returns the *complete*
+/// table on every call, so calling it once per pid would do O(n) full-table
+/// kernel reads to learn what one read already contains, and would compare
+/// creation times drawn from different instants.
+///
+/// The returned entries are unfiltered and unranked — this function observes,
+/// it does not decide what is worth recording. Callers apply their own bounds.
+///
+/// # Errors
+///
+/// Returns the exact failure text when the kernel snapshot cannot be taken, and
+/// on non-Windows builds returns the reason no observer exists. Unlike
+/// [`capture_process_parentage`], which is about one pid and can therefore
+/// express "unobservable" as a state on that pid, a whole-table capture that
+/// failed has no rows to attach a state to, so it fails loudly instead.
+pub fn capture_process_topology() -> Result<ProcessTopology, String> {
+    let observed_at_unix_ms = now_unix_ms();
+    #[cfg(not(windows))]
+    {
+        let _ = observed_at_unix_ms;
+        Err(
+            "process topology capture is implemented only on Windows; this build cannot observe \
+             the process table"
+                .to_owned(),
+        )
+    }
+    #[cfg(windows)]
+    {
+        let snapshot = system_process_snapshot()
+            .map_err(|error| format!("kernel process-table snapshot failed: {error}"))?;
+        let observer_pid = std::process::id();
+        let observer_start_time_100ns = snapshot
+            .get(&observer_pid)
+            .map(|entry| entry.creation_time_100ns);
+        let entries = snapshot
+            .values()
+            .map(|entry| ProcessTopologyEntry {
+                pid: entry.pid,
+                image_name: entry.image_name.clone(),
+                start_time_100ns: entry.creation_time_100ns,
+                parentage: parentage_from_snapshot(
+                    &snapshot,
+                    entry,
+                    observer_pid,
+                    observer_start_time_100ns,
+                    observed_at_unix_ms,
+                ),
+            })
+            .collect();
+        Ok(ProcessTopology {
+            observed_at_unix_ms,
+            observer_pid,
+            capture_source: PARENTAGE_SOURCE,
+            entries,
+        })
+    }
+}
+
 #[cfg(windows)]
 fn capture_process_parentage_windows(child_pid: u32, observed_at_unix_ms: u64) -> ProcessParentage {
     let snapshot = match system_process_snapshot() {
@@ -269,6 +365,32 @@ fn capture_process_parentage_windows(child_pid: u32, observed_at_unix_ms: u64) -
         record.observer_start_time_100ns = observer_start_time_100ns;
         return record;
     };
+    parentage_from_snapshot(
+        &snapshot,
+        child,
+        observer_pid,
+        observer_start_time_100ns,
+        observed_at_unix_ms,
+    )
+}
+
+/// Resolve one process-table entry's parentage **within** the snapshot it came
+/// from.
+///
+/// Both the single-pid capture and the whole-table topology capture route
+/// through here, so there is exactly one implementation of the reuse guard and
+/// of the closed state vocabulary. `child` is a borrow into `snapshot`, which is
+/// what makes the guard sound: the child's creation time and its claimed
+/// parent's creation time are necessarily from the same consistent read.
+#[cfg(windows)]
+fn parentage_from_snapshot(
+    snapshot: &std::collections::BTreeMap<u32, SystemProcessEntry>,
+    child: &SystemProcessEntry,
+    observer_pid: u32,
+    observer_start_time_100ns: Option<u64>,
+    observed_at_unix_ms: u64,
+) -> ProcessParentage {
+    let child_pid = child.pid;
     let base = ProcessParentage {
         schema_version: PROCESS_PARENTAGE_SCHEMA_VERSION,
         state: ParentageState::ParentVerified,
@@ -300,9 +422,7 @@ fn capture_process_parentage_windows(child_pid: u32, observed_at_unix_ms: u64) -
             state: ParentageState::ParentIdentityUnavailable,
             parent_pid_observed: Some(parent_pid),
             unavailable_reason: Some(format!(
-                "the kernel recorded parent pid {parent_pid} for pid {child_pid}, but that pid had \
-                 no process-table entry at capture time; the real parent exited and the pid may \
-                 since be recycled, so the edge is unprovable"
+                "the kernel recorded parent pid {parent_pid} for pid {child_pid}, but that pid had                  no process-table entry at capture time; the real parent exited and the pid may                  since be recycled, so the edge is unprovable"
             )),
             ..base
         };

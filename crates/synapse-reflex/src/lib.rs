@@ -12,6 +12,7 @@ pub mod kinds;
 mod lifecycle;
 mod listing;
 pub mod lowered;
+pub mod process_topology;
 mod runtime;
 pub mod scheduler;
 mod storage;
