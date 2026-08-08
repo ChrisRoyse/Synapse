@@ -5,7 +5,7 @@ use crate::compaction::{
     CompactionResult, CompactionThrottle, catalog_from_vault_tiers, compact_shards,
 };
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotGcTick};
-use crate::mvcc::{Snapshot, SnapshotVersionGcBudget, SnapshotVersionGcPass};
+use crate::mvcc::{SnapshotVersionGcBudget, SnapshotVersionGcPass};
 use crate::storage_names::sst_order_key;
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
@@ -93,21 +93,6 @@ where
         self.rows.snapshot_gc_counters_only()
     }
 
-    /// Exact reclaimable in-RAM version debt at the current floor.
-    ///
-    /// **A diagnostic, not a health read.** It walks every version chain in the
-    /// vault under a read guard covering every shard, so it is `O(all
-    /// versions)` and every commit queues behind it. Manual verification and
-    /// operator inspection want an exact number and can pay for it; the
-    /// maintenance tick reports what its bounded pass actually did instead (see
-    /// `SnapshotVersionGcPass::sweep_completed`).
-    #[must_use]
-    pub fn snapshot_gc_debt_exact(&self) -> u64 {
-        use crate::gc::SnapshotVersionGc as _;
-        let floor = self.rows.snapshot_gc_safe_point(self.clock.now());
-        self.rows.snapshot_gc_debt(floor)
-    }
-
     /// The pinned-reader floor snapshot-version GC would reclaim below right now.
     ///
     /// Exposed because a floor that never advances is the one way this fix can
@@ -118,16 +103,6 @@ where
     #[must_use]
     pub fn snapshot_gc_floor_seq(&self) -> u64 {
         self.rows.snapshot_gc_safe_point(self.clock.now())
-    }
-
-    /// Reads one CF row through an explicit tracked reader snapshot.
-    pub fn read_pinned_cf(
-        &self,
-        snapshot: Snapshot,
-        cf: ColumnFamily,
-        key: &[u8],
-    ) -> Result<Option<Vec<u8>>> {
-        self.rows.read_at(snapshot, cf, key, &self.clock)
     }
 
     fn reclaim_snapshot_ssts(&self, safe_point: u64, max_input_files: usize) -> Result<GcResult> {

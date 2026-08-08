@@ -1183,9 +1183,9 @@ impl From<calyx_aster::vault::ConditionalCfWriteOutcome> for SynapseCalyxConditi
 /// `scan_cf_latest(Base)` at a 290 ms mean hold and a 2.65 s maximum, over
 /// budget on 335 of 335 holds.
 ///
-/// **This value was swept, not picked.** `base_walk_hold_fsv` walks the real
-/// 106,787-row `Base` CF at six page sizes and reports the worst single hold
-/// against `ROW_READ_GUARD_WARN_US` (25,000 us):
+/// **This value was swept, not picked.** Manual FSV walked the real 106,787-row
+/// `Base` CF at six page sizes and read the worst single hold against
+/// `ROW_READ_GUARD_WARN_US` (25,000 us):
 ///
 /// ```text
 /// page_rows   pages  worst_hold_us  mean_hold_us   total_us  over_budget
@@ -6448,8 +6448,8 @@ impl SynapseCalyxVault {
     ///
     /// The physical evidence behind #1978's router gate: on a `full_mvcc_restore`
     /// vault this must equal the same family read through a second handle opened
-    /// latest-only, whose only source *is* the router. See
-    /// `examples/page_walk_router_parity_fsv.rs`.
+    /// latest-only, whose only source *is* the router. Manual FSV compares those
+    /// independent reads against the physical table count.
     #[must_use]
     pub fn count_cf_latest_table_only(&self, cf: ColumnFamily) -> usize {
         self.vault.latest_row_count_table_only(cf)
@@ -6497,9 +6497,9 @@ impl SynapseCalyxVault {
     ///
     /// A walk over a CF without a retained index **fails closed** with
     /// `CALYX_ASTER_SST_PAGE_INDEX_MISSING` rather than returning a partial or
-    /// empty result — which is the correct outcome and is asserted by
-    /// `base_walk_hold_fsv`, because an empty answer for a populated CF is
-    /// exactly the class of silent wrong answer this issue exists to remove.
+    /// empty result — which is the correct outcome and is verified manually,
+    /// because an empty answer for a populated CF is exactly the class of silent
+    /// wrong answer this issue exists to remove.
     /// It does mean this is not a drop-in replacement for `scan_cf_latest` on
     /// an arbitrary CF: check the open policy before migrating a new caller.
     ///

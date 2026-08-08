@@ -29,8 +29,8 @@
 //! row from one (`vault/durable/recovery_readback.rs` skips `SstName::Flush`),
 //! WAL recycling is gated on the *checkpoint* manifest rather than on flushes,
 //! and `router_coverage` treats flush SSTs as the population being validated,
-//! never as evidence. `router_flush_durability_window_fsv` deleted **every**
-//! flush SST from a vault and still recovered 460/460 keys from the WAL alone.
+//! never as evidence. Manual FSV deleted **every** flush SST from a vault and
+//! still recovered 460/460 keys from the WAL alone.
 //! Deferring produces *fewer* flush SSTs at any instant, so it can only make
 //! those checks easier to satisfy.
 //!

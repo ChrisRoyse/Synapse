@@ -13,60 +13,13 @@ publish.workspace = true
 default = []
 
 [dependencies]
+calyx-assay = { workspace = true }
 calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
 calyx-lenses = { workspace = true }
 calyx-mincut = { version = "0.1.0", path = "../../calyx/crates/calyx-mincut" }
 calyx-registry = { workspace = true }
 fs2.workspace = true
-# --- ordinary dependencies reached only from this crate's examples/ ----------
-#
-# These were a `[dev-dependencies]` block until #2042. Operator directive D1
-# (2026-07-15) bans that section outright: a dev-only dependency surface is the
-# manifest half of a test surface, and it is what let `criterion`/`proptest`/
-# `tempfile` sit here before the purge. Cargo has no example-only dependency
-# table, so an example's dependency IS an ordinary dependency; declaring them
-# here states the real edge instead of hiding it behind a section whose whole
-# meaning is "not shipped".
-#
-# Nothing in `src/` imports any of them, so none is linked into the daemon —
-# `synapse-mcp` pulls in `synapse-storage`'s lib, and an unreferenced crate
-# dependency contributes no code to that binary. Every one is already in the
-# root build graph through `synapse-calyx`, so this costs no extra compilation.
-#
-# crc32fast          provenance_tamper_fsv rewrites an SST with correct
-#                    record/body CRCs so the provenance verifier is the thing
-#                    being read, not the storage layer's frame check (#1874).
-crc32fast = "1"
-# calyx-search       reconciled_recall_fsv drives delta reconciliation directly
-#                    so an empty result is attributed to a named stage (#1907).
-calyx-search = { workspace = true }
-# calyx-forge        host_math_baseline_fsv times the production CPU math
-# calyx-sextant      kernels so the host baseline is a measurement.
-calyx-forge = { workspace = true }
-calyx-sextant = { workspace = true }
-# calyx-assay        ensemble_card_known_synergy_fsv reads the capability card's
-#                    own pair rows back to prove no gain is a clamp (#1942).
-calyx-assay = { workspace = true }
-# calyx-loom         loom_agreement_kernel_fsv measures the weave cosine against
-#                    the scalar loop it replaced (#1917).
-calyx-loom = { workspace = true }
-# calyx-ledger       provenance_coverage_shapes_fsv mints one ledger entry of
-#                    every declared (kind, subject) shape so the search
-#                    provenance coverage table is exercised shape by shape
-#                    against the real writers rather than described (#2084).
-calyx-ledger = { workspace = true }
-# blake3            ledger_hygiene_contracts_fsv must compute the SAME content
-#                    address the ledger reproduce path verifies against
-#                    (`verify_input_hash` hashes the recorded input with blake3),
-#                    so the recorded evidence it mints is accepted by the
-#                    production reader rather than by a look-alike (#2094).
-blake3 = "1"
-# tracing-subscriber the instruments that must read the engine's own structured
-#                    log as evidence rather than infer it from return values
-#                    (#1936). The daemon installs its own subscriber.
-tracing-subscriber = { workspace = true }
-# ----------------------------------------------------------------------------
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -76,6 +29,11 @@ synapse-telemetry = { version = "0.1.0", path = "../synapse-telemetry" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# `dump_cf` is a supported operator diagnostic example. Cargo has no
+# example-only dependency table, so its subscriber is an ordinary dependency;
+# unlike the deleted FSV drivers, the example remains part of the declared
+# diagnostic surface.
+tracing-subscriber = { workspace = true }
 
 [lints]
 workspace = true

@@ -408,10 +408,6 @@ where
         &mut self.store
     }
 
-    pub fn into_store(self) -> S {
-        self.store
-    }
-
     fn verify_tip(&self) -> Result<()> {
         let (next_seq, prev_hash, last_ts) = recover_tip(&self.store)?;
         if next_seq == self.next_seq && prev_hash == self.prev_hash && last_ts == self.last_ts {

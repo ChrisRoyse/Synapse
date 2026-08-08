@@ -759,8 +759,8 @@ where
     /// the last `CALYX_ASTER_DURABLE_COMMIT_LOCK_SLOW` before the gap reported
     /// `wait_ms=0 hold_ms=1478`.
     ///
-    /// So the teardown names its steps. `vault_close_bound_fsv` measures them on
-    /// an isolated vault (where the row/version teardown is 0.29 us per resident
+    /// So the teardown names its steps. Manual FSV measured them on an isolated
+    /// vault (where the row/version teardown is 0.29 us per resident
     /// MVCC version, scaling 2.04x for 2x versions); this makes the same split
     /// readable on the deployment host, where the absolute number is two orders
     /// of magnitude larger and had no attribution at all.
@@ -1767,8 +1767,8 @@ where
         // The background flusher's barrier (#1951).
         //
         // Router-flush SSTs are not the recovery authority — the WAL is, and
-        // `router_flush_durability_window_fsv` proved it by deleting every one
-        // of them and still recovering 460/460 keys. So this is not a
+        // manual FSV proved it by deleting every one of them and still
+        // recovering 460/460 keys. So this is not a
         // durability requirement; it is an honesty one. A checkpoint is the
         // moment the vault asserts its physical projection is materialized, and
         // returning `Ok` here while an SST write is still outstanding — or has

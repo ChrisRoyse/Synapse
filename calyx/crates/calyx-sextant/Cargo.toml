@@ -47,10 +47,5 @@ zstd.workspace = true
 cudarc = { workspace = true, optional = true, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13030"] }
 cuvs-sys = { workspace = true, optional = true }
 
-[[example]]
-name = "diskann_build_gpu_probe_fsv"
-path = "examples/diskann_build_gpu_probe_fsv.rs"
-required-features = ["forge-gpu"]
-
 [lints]
 workspace = true

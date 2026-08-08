@@ -104,7 +104,8 @@ function Add-Failure {
 }
 
 # ---------------------------------------------------------------------------
-# Gate 0 — D1 zero-test / zero-harness doctrine (#2037, #2042, #2045)
+# Gate 0 — D1 zero-test / zero-harness doctrine (#2037, #2042, #2045,
+# #2153, #2154)
 # ---------------------------------------------------------------------------
 #
 # Numbered 0, not 8, on purpose: it is inserted BEFORE the seven existing gates
@@ -115,7 +116,8 @@ function Add-Failure {
 #
 # Operator directive D1 (2026-07-15) deleted the entire automated test surface
 # of this repository: zero `#[test]`, zero `#[tokio::test]`, zero `#[cfg(test)]`
-# modules, zero `[dev-dependencies]`, zero benches, zero FSV harness binaries.
+# modules, zero `[dev-dependencies]`, zero benches, zero FSV harness binaries,
+# examples, or scripts.
 # Verification is manual Full State Verification against a physical source of
 # truth.
 #
@@ -124,6 +126,11 @@ function Add-Failure {
 # (#2042) and two auto-discovered `*_fsv` bin targets (#2045) had all come back
 # through ordinary feature commits. The invariant depended on memory, and memory
 # is not a gate.
+#
+# Cargo's target discovery is wider than manifest tables: `examples/*.rs`,
+# `tests/*.rs`, and `benches/*.rs` become executable targets without a manifest
+# line. Gate 0 therefore reads both manifests and the filesystem layout. It does
+# not compile or execute any target and is never behavioral verification.
 #
 # WHAT THIS IS NOT
 #
@@ -208,7 +215,7 @@ function Remove-RustComments {
     return $out
 }
 
-Write-Gate 'Gate 0     D1 zero-test / zero-harness doctrine (#2037, #2042, #2045)'
+Write-Gate 'Gate 0     D1 zero-test / zero-harness doctrine (#2037, #2042, #2045, #2153, #2154)'
 try {
     $RelativeTo = { param([string]$Path) $Path.Substring($RepoRoot.Length).TrimStart('\', '/') }
 
@@ -256,22 +263,25 @@ try {
         Write-Host "   OK   $rustScanned .rs files carry no #[test]/#[tokio::test]/#[bench]/#[cfg(test)]" -ForegroundColor Green
     }
 
-    # --- 0b/0c: forbidden manifest sections and *_fsv bin targets -----------
+    # --- 0b/0c: forbidden manifest sections and FSV executable targets ------
     $devDepRe = [regex]'^\s*\[\s*(?:[A-Za-z0-9_."''\-\*\(\)= ]*\.)?dev[-_]dependencies\s*\]'
     $testTargetRe = [regex]'^\s*\[\[\s*(test|bench)\s*\]\]'
-    $binOpenRe = [regex]'^\s*\[\[\s*bin\s*\]\]'
+    $targetOpenRe = [regex]'^\s*\[\[\s*(bin|example)\s*\]\]'
     $sectionRe = [regex]'^\s*\['
     $nameRe = [regex]'^\s*(name|path)\s*=\s*"([^"]*)"'
 
     $devDepHits = [System.Collections.Generic.List[string]]::new()
     $testTargetHits = [System.Collections.Generic.List[string]]::new()
-    $fsvBinHits = [System.Collections.Generic.List[string]]::new()
+    $fsvTargetHits = [System.Collections.Generic.List[string]]::new()
+    $testBenchSourceHits = [System.Collections.Generic.List[string]]::new()
+    $fsvScriptHits = [System.Collections.Generic.List[string]]::new()
     $manifests = Get-D1Files -Root $RepoRoot -Names @('Cargo.toml')
     foreach ($file in $manifests) {
         $lines = [IO.File]::ReadAllLines($file)
-        $inBin = $false
-        $binStart = 0
-        $binFlagged = $false
+        $inTarget = $false
+        $targetKind = ''
+        $targetStart = 0
+        $targetFlagged = $false
         for ($i = 0; $i -lt $lines.Count; $i++) {
             $line = $lines[$i]
             if ($devDepRe.IsMatch($line)) {
@@ -280,35 +290,55 @@ try {
             if ($testTargetRe.IsMatch($line)) {
                 $testTargetHits.Add("        $(& $RelativeTo $file):$($i + 1)  $($line.Trim())")
             }
-            if ($binOpenRe.IsMatch($line)) {
-                $inBin = $true
-                $binStart = $i + 1
-                $binFlagged = $false
+            $targetOpen = $targetOpenRe.Match($line)
+            if ($targetOpen.Success) {
+                $inTarget = $true
+                $targetKind = $targetOpen.Groups[1].Value
+                $targetStart = $i + 1
+                $targetFlagged = $false
                 continue
             }
-            if ($inBin -and $sectionRe.IsMatch($line)) { $inBin = $false }
-            # One row per [[bin]] block, not one per key: a target whose name and
+            if ($inTarget -and $sectionRe.IsMatch($line)) { $inTarget = $false }
+            # One row per target block, not one per key: a target whose name and
             # path both say fsv is one forbidden target, not two.
-            if ($inBin -and -not $binFlagged) {
+            if ($inTarget -and -not $targetFlagged) {
                 $m = $nameRe.Match($line)
                 if ($m.Success -and $m.Groups[2].Value -match '(^|[/_\-])fsv([_\-.]|$)') {
-                    $binFlagged = $true
-                    $fsvBinHits.Add("        $(& $RelativeTo $file):$binStart  [[bin]] $($line.Trim())")
+                    $targetFlagged = $true
+                    $fsvTargetHits.Add("        $(& $RelativeTo $file):$targetStart  [[$targetKind]] $($line.Trim())")
                 }
             }
         }
     }
 
-    # Autodiscovered bins: a file under any `src/bin/` whose stem names fsv is a
-    # shipping binary even though no manifest mentions it. That is exactly how
-    # #2045 happened, so the file layout is checked, not only the manifests.
+    # Auto-discovered targets: Cargo treats src/bin/*.rs and examples/*.rs as
+    # executable targets, and tests/*.rs / benches/*.rs as forbidden behavioral
+    # targets, even when no manifest mentions them. #2153 proved that checking
+    # only src/bin reproduced the same omission for 118 example targets.
     foreach ($root in $D1RustRoots) {
         foreach ($file in Get-D1Files -Root (Join-Path $RepoRoot $root) -Extensions @('.rs')) {
-            if ($file -notmatch '[\\/]src[\\/]bin[\\/]') { continue }
+            $relative = & $RelativeTo $file
             $stem = [System.IO.Path]::GetFileNameWithoutExtension($file)
-            if ($stem -match '(^|[_\-])fsv([_\-]|$)') {
-                $fsvBinHits.Add("        $(& $RelativeTo $file)  (autodiscovered src/bin target)")
+            if ($file -match '[\\/](tests|benches)[\\/]') {
+                $testBenchSourceHits.Add("        $relative  (autodiscovered $($Matches[1]) target)")
             }
+            if ($file -match '[\\/](src[\\/]bin|examples)[\\/]' -and
+                $stem -match '(^|[_\-])fsv([_\-]|$)') {
+                $targetSurface = if ($file -match '[\\/]examples[\\/]') { 'example' } else { 'src/bin' }
+                $fsvTargetHits.Add("        $relative  (autodiscovered $targetSurface target)")
+            }
+        }
+    }
+
+    # D1 also forbids script-based FSV drivers. Scan executable source names,
+    # never their output and never the historical Markdown evidence corpus.
+    $scriptExtensions = @('.ps1', '.psm1', '.sh', '.bash', '.py', '.rb', '.pl',
+        '.lua', '.js', '.mjs', '.cjs', '.ts', '.cmd', '.bat', '.go', '.cs',
+        '.c', '.cc', '.cpp')
+    foreach ($file in Get-D1Files -Root $RepoRoot -Extensions $scriptExtensions) {
+        $stem = [System.IO.Path]::GetFileNameWithoutExtension($file)
+        if ($stem -match '(^|[_\-])fsv([_\-]|$)') {
+            $fsvScriptHits.Add("        $(& $RelativeTo $file)  (executable FSV driver source)")
         }
     }
 
@@ -322,13 +352,25 @@ try {
         ("$($testTargetHits.Count) [[test]]/[[bench]] target section(s), which directive D1 deleted repo-wide:" + [Environment]::NewLine + ($testTargetHits -join [Environment]::NewLine)) `
             'delete the section and the tests/ or benches/ directory it points at; measurement is manual FSV against a physical source of truth.'
     }
-    if ($fsvBinHits.Count -gt 0) {
-        Add-Failure 'SYNAPSE_LINT_D1_FSV_BIN_TARGET_PRESENT' `
-        ("$($fsvBinHits.Count) *_fsv binary target(s), which every release links (#2045):" + [Environment]::NewLine + ($fsvBinHits -join [Environment]::NewLine)) `
-            'delete the target and any support surface it exclusively reached. Set autobins = false in the owning [package] so a file dropped into src/ bin builds nothing until someone writes a reviewable [[bin]] block for it.'
+    if ($testBenchSourceHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_TEST_BENCH_SOURCE_PRESENT' `
+        ("$($testBenchSourceHits.Count) auto-discovered tests/ or benches/ source(s), which directive D1 deleted repo-wide:" + [Environment]::NewLine + ($testBenchSourceHits -join [Environment]::NewLine)) `
+            'delete the tests/ or benches/ source and verify behavior manually against its physical source of truth.'
     }
-    if ($devDepHits.Count -eq 0 -and $testTargetHits.Count -eq 0 -and $fsvBinHits.Count -eq 0) {
-        Write-Host "   OK   $($manifests.Count) Cargo.toml files declare no [dev-dependencies], [[test]], [[bench]] or *_fsv bin" -ForegroundColor Green
+    if ($fsvTargetHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_FSV_EXECUTABLE_TARGET_PRESENT' `
+        ("$($fsvTargetHits.Count) FSV binary/example target(s), which directive D1 forbids (#2045, #2153):" + [Environment]::NewLine + ($fsvTargetHits -join [Environment]::NewLine)) `
+            'delete the executable target and every dependency/support surface reached only by it; manual FSV must trigger the real production surface and independently read its physical source of truth.'
+    }
+    if ($fsvScriptHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_D1_FSV_SCRIPT_DRIVER_PRESENT' `
+        ("$($fsvScriptHits.Count) executable FSV script driver(s), which directive D1 forbids (#2154):" + [Environment]::NewLine + ($fsvScriptHits -join [Environment]::NewLine)) `
+            'delete the driver and perform the trigger/readback sequence manually through the real production surface.'
+    }
+    if ($devDepHits.Count -eq 0 -and $testTargetHits.Count -eq 0 -and
+        $testBenchSourceHits.Count -eq 0 -and $fsvTargetHits.Count -eq 0 -and
+        $fsvScriptHits.Count -eq 0) {
+        Write-Host "   OK   $($manifests.Count) manifests and tracked source paths expose no dev-dependencies, test/bench targets, or FSV executable drivers" -ForegroundColor Green
     }
 }
 catch {

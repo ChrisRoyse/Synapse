@@ -4734,8 +4734,8 @@ pub fn run_intelligence_ensemble_card(
 ///
 /// The A37 gate compares each lens against its pairwise neighbours, so below a
 /// handful of lenses the "most correlated other lens" is barely a sample. Six
-/// is what `ensemble_card_known_synergy_fsv` exercises and what the twelve-slot
-/// built-in panels comfortably clear.
+/// is the manually verified lower bound and what the twelve-slot built-in
+/// panels comfortably clear.
 const DEFAULT_MIN_GATE_LENSES: u32 = 6;
 
 /// Measures pairwise lens redundancy + effective rank and persists redundant

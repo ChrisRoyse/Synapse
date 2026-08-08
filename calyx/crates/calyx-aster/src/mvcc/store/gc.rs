@@ -238,8 +238,8 @@ pub(super) struct SnapshotGcCursor {
     /// Inclusive, not exclusive, and that is a correctness property rather than
     /// a preference. A pass stops when its budget runs out *before* processing
     /// the key it is looking at, so an exclusive cursor would resume after a key
-    /// that was never processed and skip it — verified by
-    /// `snapshot_version_gc_fsv`, which caught exactly that as 72 versions
+    /// that was never processed and skip it — manual FSV caught exactly that as
+    /// 72 versions
     /// reclaimed short of the debt census across 196 paged passes. Resuming *at*
     /// the key re-walks it, which is idempotent: reclamation of an already-clean
     /// chain frees nothing.
@@ -500,8 +500,8 @@ impl PassWalk {
     ///
     /// The inclusive cursor is load-bearing. Every early return here happens
     /// *before* the current chain is touched, so an exclusive cursor would skip
-    /// it: `snapshot_version_gc_fsv` caught precisely that as 196 paged passes
-    /// reclaiming 18,872 of 18,944 reclaimable versions. Re-walking the boundary
+    /// it: manual FSV caught precisely that as 196 paged passes reclaiming
+    /// 18,872 of 18,944 reclaimable versions. Re-walking the boundary
     /// key costs one chain visit and is idempotent, because reclaiming an
     /// already-clean chain frees nothing.
     ///

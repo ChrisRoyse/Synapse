@@ -1,7 +1,7 @@
 use super::base_rewrite::BaseRowRewrite;
 use super::{AsterVault, encode};
 use crate::cf::{ColumnFamily, base_key, slot_key};
-use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotId, SlotVector};
+use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotVector};
 
 impl<C> AsterVault<C>
 where
@@ -40,17 +40,6 @@ where
             ];
             self.commit_rows_locked(&rows)
         })
-    }
-
-    pub fn read_slot_vector_at(
-        &self,
-        snapshot: Seq,
-        cx_id: CxId,
-        slot_id: SlotId,
-    ) -> Result<Option<SlotVector>> {
-        self.read_cf_at(snapshot, ColumnFamily::slot(slot_id), &slot_key(cx_id))?
-            .map(|bytes| encode::decode_slot_vector(&bytes))
-            .transpose()
     }
 
     fn base_rewrite_declaring_slot(

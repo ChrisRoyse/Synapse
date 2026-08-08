@@ -50,9 +50,9 @@ const STT_GPU_DEVICE_INDEX: u32 = 0;
 /// and release capacity it has not given back, which is a lie in both
 /// directions. A session-lifetime envelope is the only honest shape here.
 ///
-/// The number is a measurement: `stt_gpu_ep_fsv` reads `nvidia-smi` before and
-/// after session construction and refuses if the observed device delta exceeds
-/// this envelope.
+/// The number is a measurement: manual FSV reads `nvidia-smi` before and after
+/// session construction and refuses if the observed device delta exceeds this
+/// envelope.
 const STT_GPU_ADMISSION_MIB: u64 = 1_536;
 // Exact prompt used by the pinned Olive graph's behavioral parity probe:
 // decoder start followed by no-timestamps.

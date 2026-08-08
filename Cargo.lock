@@ -3824,7 +3824,6 @@ dependencies = [
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
- "tracing-subscriber",
  "ulid",
  "uuid",
  "windows-sys 0.61.2",
@@ -3988,7 +3987,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "uuid",
  "windows",
 ]
@@ -3997,19 +3995,12 @@ dependencies = [
 name = "synapse-storage"
 version = "0.1.0"
 dependencies = [
- "blake3",
  "calyx-assay",
  "calyx-aster",
  "calyx-core",
- "calyx-forge",
- "calyx-ledger",
  "calyx-lenses",
- "calyx-loom",
  "calyx-mincut",
  "calyx-registry",
- "calyx-search",
- "calyx-sextant",
- "crc32fast",
  "fs2",
  "serde",
  "serde_json",

@@ -94,8 +94,8 @@ pub fn agreement_scalar(a: &[f32], b: &[f32]) -> Result<f32> {
 /// cosine, and it is deliberately exhaustive: a new [`CosineFailure`] variant
 /// breaks this match rather than falling through to a generic code.
 ///
-/// Every code is preserved from the pre-unification implementation so
-/// `loom_agreement_kernel_fsv` keeps measuring the same contract. `Empty` maps
+/// Every code is preserved from the pre-unification implementation so manual
+/// FSV keeps measuring the same contract. `Empty` maps
 /// to the **dimension** code, not zero-norm: Loom's `ensure_same_dim` refused
 /// `a.is_empty()` in the same branch as a length disagreement, and a
 /// consolidation that quietly moved an empty pair to a different code would be

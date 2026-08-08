@@ -2518,9 +2518,8 @@ fn rescan_anchor_matches(
 /// against the RENDERED form; comparing the bare kind can never match, so the
 /// exactly-one-match self-check silently finds nothing and every accept/decline
 /// fails after it has already mutated the row (#2068 defect 2). The identical
-/// trap is called out in
-/// `synapse-storage/examples/transcript_outcome_anchor_fsv.rs` — this helper
-/// exists so the rendering is derived in exactly one place here, never
+/// trap was caught during manual outcome-anchor FSV — this helper exists so the
+/// rendering is derived in exactly one place here, never
 /// re-spelled at a call site.
 fn rendered_anchor_kind(anchor_kind: &str) -> String {
     format!("label:{anchor_kind}")

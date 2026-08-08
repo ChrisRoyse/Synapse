@@ -84,33 +84,6 @@ where
         })
     }
 
-    pub fn put_batch_with_ingest_ledger<I>(
-        &self,
-        constellations: I,
-        subject: SubjectId,
-        payload: Vec<u8>,
-        actor: ActorId,
-    ) -> Result<Vec<CxId>>
-    where
-        I: IntoIterator<Item = Constellation>,
-    {
-        RedactionPolicy::check_payload(&payload)?;
-        let input = constellations.into_iter().collect::<Vec<_>>();
-        if input.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.with_durable_commit_lock(|| {
-            self.put_batch_locked_with_ledger(
-                input,
-                Some(BatchLedgerEntry {
-                    subject,
-                    payload,
-                    actor,
-                }),
-            )
-        })
-    }
-
     pub fn put_batch_with_ingest_ledger_and_media_artifact<I>(
         &self,
         constellations: I,
@@ -215,27 +188,6 @@ where
                     .map(|outcome| outcome.cx_id)
                     .collect()
             })
-        })
-    }
-
-    fn put_batch_locked_with_ledger(
-        &self,
-        input: Vec<Constellation>,
-        ledger_entry: Option<BatchLedgerEntry>,
-    ) -> Result<Vec<CxId>> {
-        self.put_batch_locked_with_options(
-            input,
-            ledger_entry,
-            None,
-            Vec::new(),
-            DuplicatePutPolicy::StrictConstellation,
-        )
-        .map(|commit| {
-            commit
-                .outcomes
-                .into_iter()
-                .map(|outcome| outcome.cx_id)
-                .collect()
         })
     }
 

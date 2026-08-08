@@ -969,8 +969,8 @@ fn latest_rows_from_view(
 /// `CfRouter::range_keys_until` only ever receives keys already known live. The
 /// original reading stopped at the router and did not follow into the level.
 ///
-/// `examples/router_latest_tombstone_fsv.rs` proves this on a handle whose
-/// `router_latest_readback` is read back as `true`, across all four merge
+/// Manual FSV proves this on a handle whose `router_latest_readback` is read
+/// back as `true`, across all four merge
 /// states (flushed tombstone, memtable-resident tombstone, resurrection,
 /// tombstone for a never-written key): the key view and the value view agree,
 /// and agree on the independently-known correct answer.

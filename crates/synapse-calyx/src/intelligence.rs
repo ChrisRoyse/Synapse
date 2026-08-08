@@ -3720,8 +3720,8 @@ impl SynapseCalyxVault {
         }
         // `excluded_slots` is honoured here, not only by the corpus loader.
         //
-        // Found by `ensemble_card_facade_fsv`: this path ignored the parameter
-        // entirely, so withheld slots still entered the card. That is worse than
+        // Manual FSV found that this path ignored the parameter entirely, so
+        // withheld slots still entered the card. That is worse than
         // a missing feature — `excluded_slots` is the documented remediation for
         // the structural anchor-leakage refusal above, so a caller could lift the
         // refusal and still be measuring the label. The refusal and the way to

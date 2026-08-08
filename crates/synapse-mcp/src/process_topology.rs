@@ -27,18 +27,17 @@ pub const PROCESS_TOPOLOGY_STARTUP_DELAY_ENV: &str = "SYNAPSE_PROCESS_TOPOLOGY_S
 /// The observer is **off by default**, and that is a deliberate refusal rather
 /// than a soft rollout.
 ///
-/// The writer works and is proven end to end by
-/// `cargo run -p synapse-reflex --example process_topology_fsv`: a real
-/// `pwsh -> cmd -> ping` chain is observed, recorded with the #2089 reuse guard,
-/// and the process lane derives 483 edges over 98 distinct parent nodes from
-/// physically-read rows — against a launch-only baseline of a single hub.
+/// The writer was manually verified end to end: a real `pwsh -> cmd -> ping`
+/// chain was observed, recorded with the #2089 reuse guard, and the process lane
+/// derived 483 edges over 98 distinct parent nodes from physically-read rows —
+/// against a launch-only baseline of a single hub.
 ///
 /// What it cannot yet do is *publish*. `drive_agent_spawn_graph` measures
 /// structural signatures over the fused graph, and on a real 495-node process
 /// forest `eigenvector_centrality` refuses with
-/// `CALYX_SPECTRAL_NOT_CONVERGED` — and not marginally: the shipped
-/// `spectral_process_graph_fsv` reports `required_max_iter>65536` against the
-/// frozen `eigenvector_max_iter = 256`, i.e. no iteration budget reaches the
+/// `CALYX_SPECTRAL_NOT_CONVERGED` — and not marginally: manual FSV recorded
+/// `required_max_iter>65536` against the frozen `eigenvector_max_iter = 256`,
+/// i.e. no iteration budget reaches the
 /// frozen `tol = 1e-6` on that shape. Until that is resolved, turning this
 /// observer on by default would take the daemon's derived-state tick from
 /// succeeding on every pass to failing on every pass, five minutes apart, for

@@ -551,8 +551,8 @@ fn want(k: usize, len: usize) -> usize {
 /// kernel by `is_x86_feature_detected!` since it was written, and DiskANN has
 /// always scored through it.
 ///
-/// Measured on this workspace's default `target-cpu=x86-64-v2` baseline
-/// (`synapse-storage --example host_math_baseline_fsv`), 20k rows per pass:
+/// Measured manually on this workspace's default `target-cpu=x86-64-v2`
+/// baseline, 20k rows per pass:
 ///
 /// ```text
 ///   dim=32    private scalar loop  29.0M rows/s   ->  dispatched  59.3M rows/s

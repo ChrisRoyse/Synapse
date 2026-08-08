@@ -60,8 +60,8 @@ pub const SYN_TIMELINE_PANEL_NAME: &str = "syn-timeline-v1";
 /// anything but `+1`. The panel therefore had no lens whose "these two records
 /// are alike" was a measurement, so no neighbourhood analysis on it — blind
 /// spots, find-similar ranking, the between-record graph — could resolve
-/// anything. Measured on a frozen copy of the live vault
-/// (`panel_grading_probe_fsv`), the new lens returns 42 distinct
+/// anything. Measured manually on a frozen copy of the live vault, the new lens
+/// returns 42 distinct
 /// nearest-neighbour values over `[0.953, 1.000]` with a modal share of 0.578.
 pub const SYN_TIMELINE_PANEL_VERSION: u32 = 1_963_001;
 /// The timeline layout #1963 superseded, kept named so an audit can identify
@@ -475,8 +475,8 @@ const AT_SLOT_TEXT_BM25: SlotId = SlotId::new(107);
 /// for, while a hash collision is uncorrectable and makes a query for one term
 /// score documents that only ever contained another.
 ///
-/// Measured by `crates/synapse-calyx/examples/lexical_dimension_sizing_fsv.rs`
-/// over the real provider session corpus these rows are derived from (46 files,
+/// Measured manually over the real provider session corpus these rows are
+/// derived from (46 files,
 /// 2,487 text-bearing documents, 117,972 tokens, **8,702 distinct terms**):
 ///
 /// | dim | load factor | colliding terms | collision rate |
@@ -568,8 +568,8 @@ const AT_SLOT_TEXT_FULL_BM25: SlotId = SlotId::new(109);
 /// bound it below the lens ceiling, so this lane needs no truncation of its own
 /// and cannot fail closed on length.
 ///
-/// Re-measure with `crates/synapse-calyx/examples/lexical_dimension_sizing_fsv.rs`
-/// before changing this; do not adjust it by intuition.
+/// Re-measure manually against the physical corpus before changing this; do not
+/// adjust it by intuition.
 const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 
 /// Dimension of `syn.action.target_vector.v1` (#2050).
@@ -7899,7 +7899,7 @@ const fn interruption_ratio(record: &EpisodeRecord) -> f64 {
 /// Deliberately **not** included: the absolute timestamp. The nearest neighbour
 /// in a dense event stream is always seconds away, so any absolute-time
 /// component saturates the nearest-neighbour cosine at 1.0 — measured, not
-/// assumed: `panel_grading_probe_fsv` shows a half-circle encoding of the same
+/// assumed: manual FSV showed a half-circle encoding of the same
 /// frozen event-time rank returning `distinct=1` over all 932 rows. Time enters
 /// only as *position within* a day and a week, which is a genuine property of
 /// the activity rather than a serial number.
