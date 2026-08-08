@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead as _, BufReader, Write as _},
     path::{Path, PathBuf},
     sync::{Mutex, MutexGuard, OnceLock},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context as _, bail};
@@ -1087,6 +1087,66 @@ pub(crate) fn record_forced_exit_nonblocking(
         bail!("daemon lifecycle ledger is not configured for forced exit ({cause})");
     };
     record_exit_for_state_locked(state, "daemon_exit", cause, detail)
+}
+
+/// Writes the graceful exit record from the #2090 OS-shutdown drain.
+///
+/// # Why this is not [`record_forced_exit_nonblocking`]
+///
+/// That one takes the state lock with `try_lock` and gives up immediately,
+/// which is right for a panic hook already unwinding. This runs on an
+/// OS-created handler thread with a real, documented budget (`SPI_GETHUNGAPPTIMEOUT`
+/// / `SPI_GETWAITTOKILLTIMEOUT`, ~5 s), while the tokio runtime is still live
+/// and may legitimately hold the lock for a few milliseconds. Losing the exit
+/// record to a momentary lock hold would report `previous_shutdown=dirty` on the
+/// next boot for a shutdown that was in fact orderly, so the lock is retried
+/// until `deadline` and only then reported as a failure.
+///
+/// `cause` becomes `ended_reason` on `daemon-run-current.json`, so it names the
+/// OS trigger (`os_console_close` / `os_window_close` / `os_logoff` / `os_shutdown` / `os_session_end`)
+/// rather than the generic `graceful`.
+pub(crate) fn record_os_shutdown_exit(
+    cause: &'static str,
+    detail: Value,
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    let slot = state_slot();
+    loop {
+        match slot.try_lock() {
+            Ok(mut guard) => {
+                let Some(state) = guard.as_mut() else {
+                    bail!(
+                        "daemon lifecycle ledger is not configured for OS shutdown exit ({cause})"
+                    );
+                };
+                return record_exit_for_state(state, "daemon_exit", cause, detail);
+            }
+            Err(std::sync::TryLockError::Poisoned(_poisoned)) => {
+                bail!("daemon lifecycle state lock poisoned during OS shutdown exit ({cause})");
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    bail!(
+                        "daemon lifecycle state lock stayed held for the whole OS shutdown budget slice ({cause})"
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+/// Appends the post-exit-record readback of the #2090 OS-shutdown drain
+/// (lifetime-lock sidecar release) to the exit ledger.
+///
+/// It is a diagnostic event, not a second exit event: the run record already
+/// ended at [`record_os_shutdown_exit`], and rewriting it here would move
+/// `ended_at_unix_ms` after the fact.
+pub(crate) fn record_os_shutdown_diagnostic(
+    cause: &'static str,
+    detail: Value,
+) -> anyhow::Result<()> {
+    append_diagnostic_event("os_shutdown_lock_release", cause, detail)
 }
 
 pub(crate) fn health_subsystem() -> SubsystemHealth {

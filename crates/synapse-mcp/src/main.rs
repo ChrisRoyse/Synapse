@@ -65,6 +65,11 @@ mod m1;
 mod m2;
 mod m3;
 mod m4;
+// #2090: OS-initiated shutdown (console close, logoff, restart) is a
+// Windows-only contract. The POSIX daemon's signal path already runs the full
+// drain with no OS deadline, so there is nothing to gate in on other hosts.
+#[cfg(windows)]
+mod os_shutdown;
 mod process_qos;
 mod safety;
 mod secret_crypto;

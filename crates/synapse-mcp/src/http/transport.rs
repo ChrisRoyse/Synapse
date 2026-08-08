@@ -2225,6 +2225,21 @@ pub(super) async fn serve(
     .context("initialize shared HTTP service state")?;
     let m3_state_for_recorder = service.m3_state_handle();
     let m2_emitter_owner = take_m2_emitter_owner(&service);
+    // #2090: install OS-shutdown handling as soon as there is state worth
+    // draining and before the listener binds. Registered here rather than in
+    // `main` because the handler thread cannot reach the guards this future
+    // owns; the m3 handle, vault path and shell-job root are exactly what the
+    // bounded drain needs to flush the vault and clear the PID sidecars.
+    // The handle is registered WEAKLY: a strong process-global clone would
+    // permanently inflate the m3 storage owner count that the graceful
+    // `/shutdown` postcondition checks, and every graceful shutdown would fail
+    // closed with retained lifetime locks.
+    #[cfg(windows)]
+    crate::os_shutdown::install(crate::os_shutdown::OsShutdownDrainContext {
+        m3_state: Arc::downgrade(&m3_state_for_recorder),
+        db_path: db_path.clone(),
+        shell_job_root: canonical_shell_job_root.clone(),
+    });
     let startup_service_init_ms = startup_timer.mark("service_init");
 
     // Eager storage and Calyx vault open: validate lock/schema/vault state

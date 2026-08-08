@@ -1283,6 +1283,16 @@ function Wait-SynapsePostExitParent {
 
 trap {
     $errorText = $_ | Out-String
+    # #2092: the deploy drain's restart-authority revocation is DURABLE -- it
+    # outlives this process by design, which is exactly what makes it safe
+    # against the install-handoff race and exactly what would strand the host if
+    # a failed deploy left it behind. Restoring it is the first thing the trap
+    # does, before any manifest/lock bookkeeping that could itself throw.
+    try {
+        Restore-SynapseDeployRestartAuthorityBestEffort -Reason 'setup_failed'
+    } catch {
+        Info "WARN: SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORE_TRAP_FAILED error=$($_.Exception.Message)"
+    }
     if (-not [string]::IsNullOrWhiteSpace([string]$script:SynapseCurrentDaemonStagingDirectory)) {
         try {
             Remove-SynapseCurrentDaemonStagingArtifact
@@ -1511,6 +1521,82 @@ function Clear-SynapseDaemonSupervisorStopRequest {
     }
     Info "Synapse daemon supervisor restart authority restored: path=$Path reason=$Reason cleared_stop_request=$($before | ConvertTo-Json -Compress -Depth 8)"
     return $before
+}
+
+# ---------------------------------------------------------------------------
+# #2092 -- deploy-scoped restart-authority bookkeeping.
+#
+# The deploy drain now revokes restart authority the same durable way -Stop does
+# (stop-request + Disable-ScheduledTask) instead of Unregister-ScheduledTask.
+# That is strictly more recoverable EXCEPT for one thing: the revocation now
+# outlives this process, so every setup exit path between the drain (section 5)
+# and the restore (section 7) must put it back. #2092 called this fan-out out
+# explicitly as the main risk of writing the stop-request from the deploy path,
+# so the restore is recorded in script scope at revocation time and replayed
+# from the trap, from the post-exit continuation handoff, and from section 7.
+#
+# These two helpers are the BEST-EFFORT form used from the trap: they never call
+# Die (throwing inside a trap loses the original failure) and they never fail the
+# run. The section-7 restore uses the fail-closed Clear-/Resume- functions.
+# ---------------------------------------------------------------------------
+$script:SynapseDeployStopRequestPath = $null
+$script:SynapseDeployTaskSuspendedName = $null
+
+function Set-SynapseDeployRestartAuthorityRevocation {
+    param(
+        [Parameter(Mandatory=$true)][string]$StopRequestPath,
+        [Parameter(Mandatory=$true)][string]$TaskName
+    )
+    $script:SynapseDeployStopRequestPath = $StopRequestPath
+    $script:SynapseDeployTaskSuspendedName = $TaskName
+}
+
+function Clear-SynapseDeployRestartAuthorityRevocation {
+    $script:SynapseDeployStopRequestPath = $null
+    $script:SynapseDeployTaskSuspendedName = $null
+}
+
+function Restore-SynapseDeployRestartAuthorityBestEffort {
+    param([Parameter(Mandatory=$true)][string]$Reason)
+
+    $stopRequestPath = $script:SynapseDeployStopRequestPath
+    $taskName = $script:SynapseDeployTaskSuspendedName
+    if ([string]::IsNullOrWhiteSpace($stopRequestPath) -and [string]::IsNullOrWhiteSpace($taskName)) {
+        return
+    }
+    Clear-SynapseDeployRestartAuthorityRevocation
+
+    if (-not [string]::IsNullOrWhiteSpace($stopRequestPath)) {
+        try {
+            if (Test-Path -LiteralPath $stopRequestPath -PathType Leaf) {
+                Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction Stop
+            }
+            $stillPresent = Test-Path -LiteralPath $stopRequestPath -PathType Leaf
+            Info "SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORED reason=$Reason stop_request_path=$stopRequestPath stop_request_present_after=$stillPresent"
+            if ($stillPresent) {
+                Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_INCOMPLETE reason=$Reason path=$stopRequestPath remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
+            }
+        } catch {
+            Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_FAILED reason=$Reason path=$stopRequestPath error=$($_.Exception.Message) remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($taskName)) {
+        try {
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($null -eq $task) {
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_SKIPPED reason=$Reason task=$taskName task_present=false"
+            } elseif ([string]$task.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+                $after = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORED reason=$Reason task=$taskName state_after=$($(if ($after) { $after.State } else { '<absent>' }))"
+            } else {
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_NOT_NEEDED reason=$Reason task=$taskName state=$($task.State)"
+            }
+        } catch {
+            Info "WARN: SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_FAILED reason=$Reason task=$taskName error=$($_.Exception.Message) remediation=run Enable-ScheduledTask -TaskName $taskName by hand, or rerun setup; autostart stays disabled until it is enabled"
+        }
+    }
 }
 
 function New-HiddenDaemonLauncher {
@@ -2077,13 +2163,36 @@ while ($true) {
 
     $startTime = Get-Date
     $process = Start-Process -FilePath $ExePath -ArgumentList $DaemonArgumentText -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -RedirectStandardError $stderrLog -PassThru
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) stderr_log=$stderrLog"
+    # #2090: touching .Handle caches the native process handle in the
+    # System.Diagnostics.Process object. Without it, `Start-Process -PassThru`
+    # does not keep a handle open, the kernel object is released when the child
+    # exits, and `$process.ExitCode` reads back $null for EVERY exit. That made
+    # the `$exitCode -eq 0` park below dead code since it was written: a daemon
+    # that exited cleanly was indistinguishable from one that crashed, and the
+    # supervisor relaunched it. It is load-bearing now, because the #2090
+    # OS-shutdown drain exits 0 specifically to tell the supervisor "the machine
+    # is going down, do not start another daemon".
+    $daemonProcessHandle = $null
+    try {
+        $daemonProcessHandle = $process.Handle
+    } catch {
+        Write-LogLine "SYNAPSE_DAEMON_LAUNCH_HANDLE_CACHE_FAILED generation=$generation pid=$($process.Id) error=$($_.Exception.Message)"
+    }
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) stderr_log=$stderrLog exit_code_observable=$($null -ne $daemonProcessHandle)"
     Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id; stderr_log = $stderrLog }
     Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon child process is running.'
 
     $process.WaitForExit()
     $endTime = Get-Date
     $exitCode = $process.ExitCode
+    if ($null -eq $exitCode) {
+        # Fail closed, loudly. An unobservable exit code is NOT a clean exit, so
+        # the supervisor must treat it as a failure and restart -- but it must
+        # say so, because "the daemon exited and I could not tell how" is a
+        # different fact from "the daemon crashed".
+        Write-LogLine "SYNAPSE_DAEMON_EXIT_CODE_UNOBSERVABLE generation=$generation pid=$($process.Id) handle_cached=$($null -ne $daemonProcessHandle) effect=treated as a non-zero exit; the supervisor will restart rather than park"
+        Write-SupervisorEvent 'exit_code_unobservable' @{ generation = $generation; child_pid = $process.Id; handle_cached = ($null -ne $daemonProcessHandle) }
+    }
     $runtimeMs = [int64](($endTime - $startTime).TotalMilliseconds)
     $stderrTail = ''
     try {
@@ -11857,6 +11966,28 @@ function Format-SynapseDaemonSupervisorProcessSnapshot {
     }) -join "`n")
 }
 
+# #2092: when a drain times out waiting for the supervisor to park, "it did not
+# park" is not a diagnosis. The supervisor's own last ledger line says whether it
+# never saw the stop-request, saw it and threw, or is sitting in a restart
+# backoff -- three different remediations. Read-only and never fatal: a missing
+# or unreadable ledger is reported as such, because this runs on a path that is
+# already failing.
+function Get-SynapseDaemonSupervisorLastEventText {
+    param([Parameter(Mandatory=$true)][string]$LogDir)
+
+    $eventsPath = Join-Path $LogDir 'daemon-supervisor-events.jsonl'
+    if (-not (Test-Path -LiteralPath $eventsPath -PathType Leaf)) {
+        return "<missing:$eventsPath>"
+    }
+    try {
+        $last = Get-Content -LiteralPath $eventsPath -Tail 1 -ErrorAction Stop
+        if ([string]::IsNullOrWhiteSpace($last)) { return "<empty:$eventsPath>" }
+        return ($last -replace '\s+', ' ').Trim()
+    } catch {
+        return "<unreadable:$eventsPath error=$($_.Exception.Message)>"
+    }
+}
+
 function Stop-SynapseDaemonSupervisorProcessesForInstallHandoff {
     param(
         [Parameter(Mandatory=$true)][string]$SupervisorPath,
@@ -12425,7 +12556,185 @@ function Write-SynapseDaemonLifecycleModeRecord {
 }
 
 # ---------------------------------------------------------------------------
-# #2083 -- the operator stop path.
+# #2092 -- THE drain. One mechanism, two reasons.
+#
+# Before this there were two divergent drains. `-Stop` (#2083) revoked restart
+# authority durably and cooperatively; the deploy path (#2051) unregistered the
+# task and force-killed the supervisor unconditionally, then ran a 300 s retry
+# loop whose entire reason for existing was that a surviving supervisor might
+# relaunch the daemon mid-drain. The observable cost of the second one was that
+# the first boot after EVERY deploy reported `previous_shutdown=dirty`: the
+# supervisor was killed, so the daemon it had already been asked to drain was
+# racing a force stop rather than finishing one.
+#
+# The two are now the same function, parameterised by $Reason:
+#
+#   1. durable stop-request      -- revokes the supervisor's authority in a way
+#                                   that outlives THIS process. The setup
+#                                   maintenance lock cannot do this: it is only
+#                                   honoured while its owner PID is alive.
+#   2. Stop + Disable the task   -- revokes Task Scheduler's authority,
+#                                   REVERSIBLY. This replaces the deploy path's
+#                                   Unregister-ScheduledTask, whose failure mode
+#                                   was that a setup that died between section 5
+#                                   and section 7 left the host with no autostart
+#                                   at all until the next successful full run.
+#   3. authenticated /shutdown   -- the daemon's own graceful drain: refuse new
+#                                   /mcp work, close sessions, release input
+#                                   leases, flush + close the Calyx vault,
+#                                   release lifetime locks, write the graceful
+#                                   lifecycle exit record, then exit.
+#   4. wait for the supervisor   -- it parks on the stop-request. Note the
+#                                   daemon exits 1 on /shutdown by design (that
+#                                   exit code means "restart me" to the
+#                                   supervisor), so step 1 is what makes step 3
+#                                   a stop rather than a restart.
+#
+# Why the durable revocation beats the unregister for the INSTALL HANDOFF race
+# specifically (#2051's original problem): unregistering removes the trigger but
+# does nothing about a supervisor that is already alive, mid-backoff, or started
+# by a logon in the window before the unregister lands -- which is why #2051 also
+# needed the unconditional force-kill AND the relaunch retry loop. The
+# stop-request is consulted by the supervisor at all four of its launch points,
+# so a supervisor that starts DURING the install handoff parks at
+# `supervisor_start` before it ever touches the bind. Task re-registration in
+# section 7 is therefore safe while the revocation is still in force, and the
+# retry loop degrades from mechanism to fallback.
+#
+# Force-kill is not removed; it is demoted to an explicit, loudly logged
+# escalation (`SYNAPSE_DAEMON_SUPERVISOR_STOP_FORCED`) that only runs when the
+# cooperative park window expires.
+# ---------------------------------------------------------------------------
+function Invoke-SynapseDaemonRevokedDrain {
+    param(
+        [Parameter(Mandatory=$true)][ValidateSet('operator_stop','deploy')][string]$Reason,
+        [Parameter(Mandatory=$true)][string]$TaskName,
+        [Parameter(Mandatory=$true)][string]$RuntimeBinDir,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [switch]$ForceRestart,
+        # Deploy only: the install cannot proceed while the old binary is mapped,
+        # so a wedged daemon escalates to the identity-verified exact-PID stop
+        # rather than aborting a half-staged deploy. -Stop never sets this.
+        [switch]$EscalateAfterGracefulTimeout,
+        # Deploy only: a supervisor that will not park cannot be allowed to
+        # relaunch onto bytes that are about to be replaced. -Stop escalates only
+        # with -ForceStop, and dies otherwise.
+        [switch]$AllowParkEscalation,
+        [ValidateRange(5, 600)][int]$TimeoutSeconds = 120,
+        [ValidateRange(5, 300)][int]$ParkTimeoutSeconds = 60
+    )
+
+    $supervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
+    $stopRequestPath = Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir
+    $forced = $false
+    $phases = @()
+
+    # --- before state -----------------------------------------------------
+    $phaseStarted = Get-Date
+    $daemonsBefore = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
+    $supervisorsBefore = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $supervisorPath)
+    $taskBefore = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Info ("Synapse daemon drain before-state reason={0} task_state={1} daemon_count={2} supervisor_count={3}`ndaemons:`n{4}`nsupervisors:`n{5}" -f `
+        $Reason,
+        ($(if ($taskBefore) { $taskBefore.State } else { '<absent>' })),
+        $daemonsBefore.Count,
+        $supervisorsBefore.Count,
+        (Format-SynapseMcpProcessSnapshot -Snapshot $daemonsBefore),
+        (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $supervisorsBefore))
+    $phases += New-SynapseDaemonStopPhase -Name 'before_state' -Started $phaseStarted -Detail ("reason={0} task_state={1} daemon_count={2} supervisor_count={3}" -f `
+        $Reason, ($(if ($taskBefore) { $taskBefore.State } else { '<absent>' })), $daemonsBefore.Count, $supervisorsBefore.Count)
+
+    # --- 1. durable supervisor restart-authority revocation ---------------
+    $phaseStarted = Get-Date
+    $stopRequest = Write-SynapseDaemonSupervisorStopRequest `
+        -Path $stopRequestPath `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -Reason $Reason `
+        -SupervisorPath $supervisorPath
+    if ($Reason -eq 'deploy') {
+        # Record the revocation for the trap / post-exit-continuation restore
+        # BEFORE the task is disabled, so a failure inside the task revocation
+        # itself is still cleaned up.
+        Set-SynapseDeployRestartAuthorityRevocation -StopRequestPath $stopRequestPath -TaskName $TaskName
+    }
+    $phases += New-SynapseDaemonStopPhase -Name 'supervisor_revocation' -Started $phaseStarted -Detail "path=$stopRequestPath requested_by_pid=$($stopRequest.requested_by_pid) requested_at_utc=$($stopRequest.requested_at_utc)"
+
+    # --- 2. reversible Task Scheduler revocation --------------------------
+    $phaseStarted = Get-Date
+    $taskSuspended = Suspend-SynapseDaemonTaskRestartAuthority `
+        -TaskName $TaskName `
+        -SupervisorPath $supervisorPath `
+        -Reason $Reason
+    $phases += New-SynapseDaemonStopPhase -Name 'task_revocation' -Started $phaseStarted -Detail ("task_present={0} state_after={1} revocation=stop+disable (reversible; not unregister)" -f `
+        ($null -ne $taskSuspended), ($(if ($taskSuspended) { $taskSuspended.State } else { '<absent>' })))
+
+    # --- 3. authenticated graceful daemon drain ---------------------------
+    $phaseStarted = Get-Date
+    if ($daemonsBefore.Count -eq 0) {
+        Info "Synapse daemon drain: no target daemon process was running before the drain reason=$Reason bind=$Bind db=$DbPath"
+    }
+    Stop-SynapseMcpProcesses `
+        -Reason $Reason `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -TokenPath $TokenPath `
+        -ForceRestart:$ForceRestart `
+        -EscalateAfterGracefulTimeout:$EscalateAfterGracefulTimeout `
+        -TimeoutSeconds ([Math]::Min(90, $TimeoutSeconds))
+    if ($ForceRestart) {
+        $forced = $true
+        Warn "SYNAPSE_DAEMON_STOP_FORCED reason=$Reason force_restart=true effect=the drain was permitted to escalate past active clients and past graceful-shutdown failures to an identity-verified exact-PID stop. This is NOT the default drain path."
+    }
+    $phases += New-SynapseDaemonStopPhase -Name 'daemon_drain' -Started $phaseStarted -Detail "forced=$forced drain=authenticated_http_shutdown escalate_after_graceful_timeout=$([bool]$EscalateAfterGracefulTimeout)"
+
+    # --- 4. supervisor park -----------------------------------------------
+    $phaseStarted = Get-Date
+    $park = Wait-SynapseDaemonSupervisorParked -SupervisorPath $supervisorPath -Reason $Reason -TimeoutSeconds ([Math]::Min($ParkTimeoutSeconds, $TimeoutSeconds))
+    if (-not $park.Parked) {
+        $parkFailure = ("SYNAPSE_DAEMON_SUPERVISOR_PARK_TIMEOUT reason={0} supervisor_path={1} elapsed_ms={2} remaining_count={3} stop_request={4} stop_request_present={5} supervisor_last_event={6}`nremaining:`n{7}" -f `
+            $Reason,
+            $supervisorPath,
+            $park.ElapsedMs,
+            $park.Remaining.Count,
+            $stopRequestPath,
+            (Test-Path -LiteralPath $stopRequestPath -PathType Leaf),
+            (Get-SynapseDaemonSupervisorLastEventText -LogDir $LogDir),
+            (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $park.Remaining))
+        if (-not ($ForceRestart -or $AllowParkEscalation)) {
+            Die ("{0}`nremediation=the hidden supervisor did not honour the durable stop-request. A supervisor generated before #2083 does not read that file; redeploy setup once so the supervisor is regenerated, or rerun this stop with -ForceRestart to escalate to an explicit identity-verified exact-PID supervisor stop. Do not close terminal/IDE/WSL processes." -f $parkFailure)
+        }
+        Warn "FORCED: $parkFailure"
+        Warn "SYNAPSE_DAEMON_SUPERVISOR_STOP_FORCED reason=$Reason supervisor_path=$supervisorPath effect=escalating to an identity-verified exact-PID supervisor stop because the cooperative park window expired. This is the escalation, not the default."
+        Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $supervisorPath
+        $forced = $true
+        $park = [pscustomobject]@{ Parked = $true; Forced = $true; ElapsedMs = [int64]((Get-Date) - $phaseStarted).TotalMilliseconds; Remaining = @() }
+    } else {
+        Info "SYNAPSE_DAEMON_SUPERVISOR_PARKED_COOPERATIVELY reason=$Reason elapsed_ms=$($park.ElapsedMs) forced=false effect=the supervisor stopped itself on the durable stop-request; no supervisor process was killed"
+    }
+    $phases += New-SynapseDaemonStopPhase -Name 'supervisor_park' -Started $phaseStarted -Detail "parked=true forced=$($park.Forced) elapsed_ms=$($park.ElapsedMs)"
+
+    return [pscustomobject]@{
+        Reason            = $Reason
+        Phases            = $phases
+        Forced            = $forced
+        ParkForced        = [bool]$park.Forced
+        SupervisorPath    = $supervisorPath
+        StopRequestPath   = $stopRequestPath
+        StopRequest       = $stopRequest
+        TaskSuspended     = $taskSuspended
+        TaskBefore        = $taskBefore
+        DaemonsBefore     = $daemonsBefore
+        SupervisorsBefore = $supervisorsBefore
+    }
+}
+
+# ---------------------------------------------------------------------------
+# #2083 -- the operator stop path, now a thin wrapper around the shared #2092
+# drain plus the verification/settle/readback tail that only a -Stop needs.
 #
 # Ordering is load-bearing and is the standard cooperative-shutdown ladder for
 # a supervised Windows process tree: revoke restart authority, ask the process
@@ -12469,26 +12778,12 @@ function Invoke-SynapseDaemonStop {
     $reason = 'operator_stop'
     $supervisorPath = Join-Path $RuntimeBinDir 'synapse-daemon-supervisor.ps1'
     $stopRequestPath = Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir
-    $forced = $false
     $phases = @()
 
     Step "Stopping the Synapse daemon (graceful) task=$TaskName bind=$Bind"
 
-    # --- before state -----------------------------------------------------
-    $phaseStarted = Get-Date
-    $daemonsBefore = @(Select-SynapseMcpDeployTargetProcesses -Snapshot @(Get-SynapseMcpProcessSnapshot) -Bind $Bind -DbPath $DbPath)
-    $supervisorsBefore = @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $supervisorPath)
-    $taskBefore = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     $runRecordBefore = Read-SynapseDaemonLifecycleRunRecord -DbPath $DbPath
-    Info ("Synapse daemon stop before-state task_state={0} daemon_count={1} supervisor_count={2} run_record_ok={3}`ndaemons:`n{4}`nsupervisors:`n{5}" -f `
-        ($(if ($taskBefore) { $taskBefore.State } else { '<absent>' })),
-        $daemonsBefore.Count,
-        $supervisorsBefore.Count,
-        $runRecordBefore.Ok,
-        (Format-SynapseMcpProcessSnapshot -Snapshot $daemonsBefore),
-        (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $supervisorsBefore))
-    $phases += New-SynapseDaemonStopPhase -Name 'before_state' -Started $phaseStarted -Detail ("task_state={0} daemon_count={1} supervisor_count={2}" -f `
-        ($(if ($taskBefore) { $taskBefore.State } else { '<absent>' })), $daemonsBefore.Count, $supervisorsBefore.Count)
+    Info "Synapse daemon stop pre-drain lifecycle readback path=$($runRecordBefore.Path) readable=$($runRecordBefore.Ok)"
 
     # --- guard ------------------------------------------------------------
     $phaseStarted = Get-Date
@@ -12502,64 +12797,26 @@ function Invoke-SynapseDaemonStop {
         -AllowActiveClientDrain
     $phases += New-SynapseDaemonStopPhase -Name 'restart_guard' -Started $phaseStarted -Detail "force_restart=$([bool]$ForceRestart)"
 
-    # --- 1. durable supervisor restart-authority revocation ---------------
-    $phaseStarted = Get-Date
-    $stopRequest = Write-SynapseDaemonSupervisorStopRequest `
-        -Path $stopRequestPath `
-        -Bind $Bind `
-        -DbPath $DbPath `
+    # --- the shared #2092 drain (before_state, revocations, drain, park) ---
+    # -Stop deliberately passes neither -EscalateAfterGracefulTimeout nor
+    # -AllowParkEscalation: an operator stop that cannot be done gracefully must
+    # fail loudly with the exact remaining PIDs, not quietly kill things.
+    $drain = Invoke-SynapseDaemonRevokedDrain `
         -Reason $reason `
-        -SupervisorPath $supervisorPath
-    $phases += New-SynapseDaemonStopPhase -Name 'supervisor_revocation' -Started $phaseStarted -Detail "path=$stopRequestPath requested_by_pid=$($stopRequest.requested_by_pid) requested_at_utc=$($stopRequest.requested_at_utc)"
-
-    # --- 2. reversible Task Scheduler revocation --------------------------
-    $phaseStarted = Get-Date
-    $taskSuspended = Suspend-SynapseDaemonTaskRestartAuthority `
         -TaskName $TaskName `
-        -SupervisorPath $supervisorPath `
-        -Reason $reason
-    $phases += New-SynapseDaemonStopPhase -Name 'task_revocation' -Started $phaseStarted -Detail ("task_present={0} state_after={1}" -f `
-        ($null -ne $taskSuspended), ($(if ($taskSuspended) { $taskSuspended.State } else { '<absent>' })))
-
-    # --- 3. authenticated graceful daemon drain ---------------------------
-    $phaseStarted = Get-Date
-    if ($daemonsBefore.Count -eq 0) {
-        Info "Synapse daemon stop: no target daemon process was running before the drain reason=$reason bind=$Bind db=$DbPath"
-    }
-    Stop-SynapseMcpProcesses `
-        -Reason $reason `
+        -RuntimeBinDir $RuntimeBinDir `
         -Bind $Bind `
         -DbPath $DbPath `
         -TokenPath $TokenPath `
+        -LogDir $LogDir `
         -ForceRestart:$ForceRestart `
-        -TimeoutSeconds ([Math]::Min(90, $TimeoutSeconds))
-    if ($ForceRestart) {
-        $forced = $true
-        Warn "SYNAPSE_DAEMON_STOP_FORCED reason=$reason force_restart=true effect=the drain was permitted to escalate past active clients and past graceful-shutdown failures to an identity-verified exact-PID stop. This is NOT the default stop path."
-    }
-    $phases += New-SynapseDaemonStopPhase -Name 'daemon_drain' -Started $phaseStarted -Detail "forced=$forced drain=authenticated_http_shutdown"
-
-    # --- 4. supervisor park -----------------------------------------------
-    $phaseStarted = Get-Date
-    $park = Wait-SynapseDaemonSupervisorParked -SupervisorPath $supervisorPath -Reason $reason -TimeoutSeconds ([Math]::Min(60, $TimeoutSeconds))
-    if (-not $park.Parked) {
-        $parkFailure = ("SYNAPSE_DAEMON_SUPERVISOR_PARK_TIMEOUT reason={0} supervisor_path={1} elapsed_ms={2} remaining_count={3} stop_request={4}`nremaining:`n{5}" -f `
-            $reason,
-            $supervisorPath,
-            $park.ElapsedMs,
-            $park.Remaining.Count,
-            $stopRequestPath,
-            (Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot $park.Remaining))
-        if (-not $ForceRestart) {
-            Die ("{0}`nremediation=the hidden supervisor did not honour the durable stop-request. A supervisor generated before #2083 does not read that file; redeploy setup once so the supervisor is regenerated, or rerun this stop with -ForceRestart to escalate to an explicit identity-verified exact-PID supervisor stop. Do not close terminal/IDE/WSL processes." -f $parkFailure)
-        }
-        Warn "FORCED: $parkFailure"
-        Warn "SYNAPSE_DAEMON_SUPERVISOR_STOP_FORCED reason=$reason supervisor_path=$supervisorPath effect=escalating to an identity-verified exact-PID supervisor stop because the cooperative park window expired"
-        Stop-SynapseDaemonSupervisorProcessesForInstallHandoff -SupervisorPath $supervisorPath
-        $forced = $true
-        $park = [pscustomobject]@{ Parked = $true; Forced = $true; ElapsedMs = [int64]((Get-Date) - $phaseStarted).TotalMilliseconds; Remaining = @() }
-    }
-    $phases += New-SynapseDaemonStopPhase -Name 'supervisor_park' -Started $phaseStarted -Detail "parked=true forced=$($park.Forced) elapsed_ms=$($park.ElapsedMs)"
+        -TimeoutSeconds $TimeoutSeconds
+    $phases += $drain.Phases
+    $forced = $drain.Forced
+    $taskSuspended = $drain.TaskSuspended
+    $daemonsBefore = $drain.DaemonsBefore
+    $supervisorsBefore = $drain.SupervisorsBefore
+    $taskBefore = $drain.TaskBefore
 
     # --- 5. verify + settle ----------------------------------------------
     $phaseStarted = Get-Date
@@ -12807,22 +13064,47 @@ function Invoke-SynapseDaemonStart {
     Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."
 }
 
+# ---------------------------------------------------------------------------
+# #2092 -- demoted from mechanism to fallback.
+#
+# This retry loop exists because, under #2051, a surviving supervisor could
+# relaunch the daemon in the middle of the install drain. That is no longer the
+# mechanism that stops relaunches: Invoke-SynapseDaemonRevokedDrain writes the
+# durable stop-request and parks the supervisor first, so on a #2083-or-later
+# supervisor this loop normally verifies zero targets on attempt 1 and returns.
+#
+# It is kept because it is the only thing that catches a relaunch from a
+# supervisor that predates the stop-request (a host whose supervisor has not been
+# regenerated yet), and because a deploy must never proceed to binary replacement
+# with a live daemon mapping the old image. Its timeout diagnostics now name the
+# stop-request state and the supervisor's last ledger event, which is what
+# distinguishes "old supervisor, ignores the record" from "new supervisor, threw
+# on the record" from "something else re-registered the task".
+# ---------------------------------------------------------------------------
 function Stop-SynapseMcpProcessesForInstallHandoff {
     param(
         [Parameter(Mandatory=$true)][string]$Reason,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$TokenPath,
+        [Parameter(Mandatory=$true)][string]$LogDir,
+        [AllowNull()][string]$StopRequestPath,
+        [AllowNull()][string]$SupervisorPath,
         [switch]$ForceRestart,
         [int]$TimeoutSeconds = 300
     )
 
+    $stopRequestPresent = if ([string]::IsNullOrWhiteSpace($StopRequestPath)) {
+        '<not_tracked>'
+    } else {
+        [string](Test-Path -LiteralPath $StopRequestPath -PathType Leaf)
+    }
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     $attempt = 0
     do {
         $attempt += 1
         $remainingBudget = [Math]::Max(5, [int](($deadline - (Get-Date)).TotalSeconds))
-        Info "Synapse install handoff drain attempt=$attempt reason=$Reason remaining_budget_s=$remainingBudget"
+        Info "Synapse install handoff drain attempt=$attempt reason=$Reason remaining_budget_s=$remainingBudget stop_request=$StopRequestPath stop_request_present=$stopRequestPresent role=fallback_verification"
         Stop-SynapseMcpProcesses `
             -Reason $Reason `
             -Bind $Bind `
@@ -12840,9 +13122,16 @@ function Stop-SynapseMcpProcessesForInstallHandoff {
             return
         }
 
-        Info ("Synapse install handoff observed daemon relaunch after drain attempt={0} remaining_count={1}`nremaining:`n{2}" -f `
+        $stopRequestPresent = if ([string]::IsNullOrWhiteSpace($StopRequestPath)) {
+            '<not_tracked>'
+        } else {
+            [string](Test-Path -LiteralPath $StopRequestPath -PathType Leaf)
+        }
+        Info ("Synapse install handoff observed daemon relaunch after drain attempt={0} remaining_count={1} stop_request_present={2} supervisor_last_event={3}`nremaining:`n{4}" -f `
             $attempt,
             $targets.Count,
+            $stopRequestPresent,
+            (Get-SynapseDaemonSupervisorLastEventText -LogDir $LogDir),
             (Format-SynapseMcpProcessSnapshot -Snapshot $targets))
         Start-Sleep -Seconds 1
     } while ((Get-Date) -lt $deadline)
@@ -12854,12 +13143,26 @@ function Stop-SynapseMcpProcessesForInstallHandoff {
     } else {
         '<missing>'
     }
-    Die ("SYNAPSE_INSTALL_HANDOFF_RELAUNCH_DRAIN_TIMEOUT reason={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}`nsupervisor_state={4}`nremediation=setup disabled the scheduled task and repeatedly drained exact verified synapse-mcp.exe targets, but a supervisor kept relaunching the installed daemon. Inspect daemon-supervisor-events.jsonl and stop only the verified Synapse supervisor path before retrying; do not close terminal/IDE/WSL host processes." -f `
+    $stopRequestBody = if ([string]::IsNullOrWhiteSpace($StopRequestPath) -or -not (Test-Path -LiteralPath $StopRequestPath -PathType Leaf)) {
+        '<absent>'
+    } else {
+        try { ((Get-Content -Raw -LiteralPath $StopRequestPath).Trim() -replace '\s+', ' ') } catch { "read_failed:$($_.Exception.Message)" }
+    }
+    $survivingSupervisors = if ([string]::IsNullOrWhiteSpace($SupervisorPath)) {
+        '<not_tracked>'
+    } else {
+        Format-SynapseDaemonSupervisorProcessSnapshot -Snapshot @(Get-SynapseDaemonSupervisorProcessSnapshot -SupervisorPath $SupervisorPath)
+    }
+    Die ("SYNAPSE_INSTALL_HANDOFF_RELAUNCH_DRAIN_TIMEOUT reason={0} timeout_s={1} remaining_count={2}`nremaining:`n{3}`nstop_request_path={4}`nstop_request={5}`nsupervisor_last_event={6}`nsupervisor_state={7}`nsurviving_supervisors:`n{8}`nremediation=setup revoked restart authority (durable stop-request + Disable-ScheduledTask) and repeatedly drained exact verified synapse-mcp.exe targets, but something kept relaunching the installed daemon. If stop_request is <absent> the revocation was lost -- inspect the runtime bin directory. If it is present and a supervisor still relaunched, that supervisor predates #2083 and does not read the record: stop only the verified Synapse supervisor path, then rerun so the deploy regenerates it. Do not close terminal/IDE/WSL host processes." -f `
         $Reason,
         $TimeoutSeconds,
         $remaining.Count,
         (Format-SynapseMcpProcessSnapshot -Snapshot $remaining),
-        $supervisorState)
+        ($(if ([string]::IsNullOrWhiteSpace($StopRequestPath)) { '<not_tracked>' } else { $StopRequestPath })),
+        $stopRequestBody,
+        (Get-SynapseDaemonSupervisorLastEventText -LogDir $LogDir),
+        $supervisorState,
+        $survivingSupervisors)
 }
 
 function Assert-SynapseInstallPathUnlocked {
@@ -13892,8 +14195,66 @@ if (-not $liveDaemonHandoffRequired) {
     if ($ForceRestart) {
         $null = Enter-SynapseChromeBridgeMaintenancePause -Bind $Bind -Token $token -Reason 'install_binary'
     }
-    Remove-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $daemonSupervisorPath -Reason 'install_binary'
-    Stop-SynapseMcpProcessesForInstallHandoff -Reason 'install_binary' -Bind $Bind -DbPath $DbPath -TokenPath $TokenPath -ForceRestart:$ForceRestart -TimeoutSeconds 300
+    # #2092: ONE drain, shared with -Stop, parameterised reason=deploy.
+    #
+    # What changed from #2051: the supervisor is asked to park on the durable
+    # stop-request instead of being force-killed, and Task Scheduler authority is
+    # suspended (Stop + Disable) instead of unregistered. The unregister is not
+    # gone -- section 7 still unregisters and re-registers when the launcher
+    # actually changed -- it is just no longer how restart authority is revoked
+    # for the drain, so a setup that dies mid-deploy leaves a disabled task that
+    # the trap re-enables rather than no task at all.
+    #
+    # The deploy is the one caller allowed to escalate: it cannot leave a live
+    # daemon mapping the binary it is about to replace. Both escalations are
+    # loud (SYNAPSE_DAEMON_STOP_FORCED / SYNAPSE_DAEMON_SUPERVISOR_STOP_FORCED)
+    # and both are the exception, not the path.
+    $deployDrain = Invoke-SynapseDaemonRevokedDrain `
+        -Reason 'deploy' `
+        -TaskName $TaskName `
+        -RuntimeBinDir $RuntimeBinDir `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -TokenPath $TokenPath `
+        -LogDir $LogDir `
+        -ForceRestart:$ForceRestart `
+        -EscalateAfterGracefulTimeout `
+        -AllowParkEscalation `
+        -TimeoutSeconds 120
+    $deployDrainRunRecord = Read-SynapseDaemonLifecycleRunRecord -DbPath $DbPath
+    $deployDrainEndedReason = if ($deployDrainRunRecord.Ok) { [string]$deployDrainRunRecord.Record.ended_reason } else { '<unreadable>' }
+    $deployDrainEndedAt = if ($deployDrainRunRecord.Ok) { $deployDrainRunRecord.Record.ended_at_unix_ms } else { $null }
+    $deployDrainClean = ($null -ne $deployDrainEndedAt -and -not [string]::IsNullOrWhiteSpace($deployDrainEndedReason))
+    if ($deployDrain.DaemonsBefore.Count -gt 0 -and -not $deployDrainClean -and -not $deployDrain.Forced) {
+        # Not fatal: the deploy can still install correctly. But this is the
+        # exact fact #2092 exists to change, so it is never silent.
+        Warn ("SYNAPSE_DEPLOY_DRAIN_DIRTY_LIFECYCLE_RECORD path={0} run_id={1} ended_at_unix_ms={2} ended_reason={3} effect=the next boot will report previous_shutdown=dirty remediation=inspect the daemon log for MCP_HTTP_SHUTDOWN_* and SYNAPSE_CALYX_VAULT_CLOSED for the drained generation" -f `
+            $deployDrainRunRecord.Path,
+            [string]$deployDrainRunRecord.Record.run_id,
+            ($(if ($null -eq $deployDrainEndedAt) { '<null>' } else { $deployDrainEndedAt })),
+            ($(if ([string]::IsNullOrWhiteSpace($deployDrainEndedReason)) { '<null>' } else { $deployDrainEndedReason })))
+    }
+    Info ("Synapse deploy drain verified reason=deploy forced={0} park_forced={1} task_state_after={2} stop_request={3} lifecycle_run_id={4} ended_reason={5} clean_shutdown={6} expected_next_boot_previous_shutdown={7}" -f `
+        $deployDrain.Forced,
+        $deployDrain.ParkForced,
+        ($(if ($deployDrain.TaskSuspended) { $deployDrain.TaskSuspended.State } else { '<absent>' })),
+        $deployDrain.StopRequestPath,
+        ($(if ($deployDrainRunRecord.Ok) { [string]$deployDrainRunRecord.Record.run_id } else { '<unreadable>' })),
+        ($(if ([string]::IsNullOrWhiteSpace($deployDrainEndedReason)) { '<null>' } else { $deployDrainEndedReason })),
+        $deployDrainClean,
+        ($(if ($deployDrainClean) { 'clean' } else { 'dirty' })))
+    # Fallback verification pass (see the function header): with the stop-request
+    # in force this normally observes zero targets on attempt 1 and returns.
+    Stop-SynapseMcpProcessesForInstallHandoff `
+        -Reason 'install_binary' `
+        -Bind $Bind `
+        -DbPath $DbPath `
+        -TokenPath $TokenPath `
+        -LogDir $LogDir `
+        -StopRequestPath $deployDrain.StopRequestPath `
+        -SupervisorPath $deployDrain.SupervisorPath `
+        -ForceRestart:$ForceRestart `
+        -TimeoutSeconds 300
     $script:SynapseChromeBridgeMaintenancePausePrepared = $false
     $script:SynapseChromeBridgeMaintenancePausePreparedBind = $null
     $script:SynapseChromeBridgeMaintenancePausePreparedReason = $null
@@ -14037,6 +14398,14 @@ if ($srcProfiles -and (Test-Path $srcProfiles)) {
 } else { Info "Reusing existing profiles at $ProfilesDir." }
 
 if ($script:SynapseBindPostExitContinuationRequired) {
+    # #2092: this branch hands off to a separate process and then Dies, so the
+    # deploy's durable restart-authority revocation must be released here and not
+    # left to the trap. The continuation reacquires everything it needs from
+    # scratch (it re-runs the whole deploy with -SkipBuild), and if it never runs
+    # at all, an enabled task with no stop-request still restores the daemon at
+    # the next logon. Nothing can start a daemon in the gap: the task trigger is
+    # AtLogOn and the supervisor is already parked.
+    Restore-SynapseDeployRestartAuthorityBestEffort -Reason 'post_exit_continuation_handoff'
     $continuation = Start-SynapsePostExitSetupContinuation `
         -Reason 'install_binary' `
         -Bind $Bind `
@@ -14204,6 +14573,17 @@ if ($deployTaskBeforeStart -and [string]$deployTaskBeforeStart.State -eq 'Disabl
     }
     Info "Synapse daemon scheduled task re-enabled before deploy start: task=$TaskName state=$($deployTaskEnabledReadback.State)"
 }
+# #2092: restart authority is now restored for real, so the trap / post-exit
+# handoff must stop trying to restore it. Everything after this point either
+# starts the daemon or adopts a live one; a failure from here on is not a failure
+# that stranded autostart.
+Clear-SynapseDeployRestartAuthorityRevocation
+$deployAuthorityRestoreTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+$deployAuthorityStopRequestPresent = Test-Path -LiteralPath (Get-SynapseDaemonSupervisorStopRequestPath -RuntimeBinDir $RuntimeBinDir) -PathType Leaf
+Info ("SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORE_COMPLETE reason=setup_deploy stop_request_present={0} task={1} task_state={2}" -f `
+    $deployAuthorityStopRequestPresent,
+    $TaskName,
+    ($(if ($deployAuthorityRestoreTask) { $deployAuthorityRestoreTask.State } else { '<absent>' })))
 if (-not $liveDaemonHandoffRequired) {
     Step "Verifying live adoption of auto-start daemon task '$TaskName'"
     # Adoption preserves the running task, so its launcher must be proven intact
