@@ -3214,17 +3214,34 @@ fn process_spawn_rollup(
     let new_cells = spawn_rollup_contribution(spawn_id, rows, sealed_horizon_ns)?;
     register_cost_series(&new_cells, series_roster)?;
     let old_cells = read_spawn_mark(db, spawn_id)?;
-    if old_cells.as_deref() == Some(new_cells.as_slice()) {
-        return Ok(false);
+    // Marker absence is the canonical persisted representation of an empty
+    // contribution. Keep the complete state table here instead of comparing
+    // `Option<Vec<_>>` with a slice and repairing the mismatch afterward:
+    //
+    //   absent  + empty     => unchanged (nothing is, or should be, stored)
+    //   present + identical => unchanged (idempotent replay)
+    //   present + different => immutable-publication conflict
+    //   absent  + non-empty => first publication
+    //
+    // In particular, never issue a delete for absent + empty. Besides turning
+    // a no-op into a durable batch, that path used to return `changed=true` and
+    // made the rollup report claim work that did not happen (#2138). A marker
+    // cannot legitimately transition back to empty: published contributions
+    // are immutable, so that state must keep failing closed rather than delete.
+    match old_cells.as_deref() {
+        None if new_cells.is_empty() => return Ok(false),
+        Some(existing) if existing == new_cells.as_slice() => return Ok(false),
+        Some(_) => {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT: finalized contribution for {spawn_id} changed after publication; run rollup_backfill reset=true to publish a new TimeSeries generation"
+                ),
+            ));
+        }
+        None => {}
     }
-    if old_cells.is_some() {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT: finalized contribution for {spawn_id} changed after publication; run rollup_backfill reset=true to publish a new TimeSeries generation"
-            ),
-        ));
-    }
+
     for contrib in &new_cells {
         write_native_cost_contribution(
             db,
@@ -3235,17 +3252,11 @@ fn process_spawn_rollup(
             cells_written,
         )?;
     }
-    let mark_key = rollup_mark_key(spawn_id);
-    if new_cells.is_empty() {
-        db.delete_batch(cf::CF_KV, [mark_key])
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    } else {
-        let mark = SpawnRollupMark {
-            schema_version: ROLLUP_SCHEMA_VERSION,
-            cells: new_cells,
-        };
-        write_kv_row(db, mark_key, encode_json_row(&mark)?)?;
-    }
+    let mark = SpawnRollupMark {
+        schema_version: ROLLUP_SCHEMA_VERSION,
+        cells: new_cells,
+    };
+    write_kv_row(db, rollup_mark_key(spawn_id), encode_json_row(&mark)?)?;
     Ok(true)
 }
 
