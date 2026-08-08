@@ -11673,6 +11673,144 @@ function Assert-SynapseProcessStopTarget {
     return $current
 }
 
+# --- #2131: one shutdown verdict law, shared with the daemon -----------------
+#
+# The defect this replaces, confirmed on production 2026-08-08: a graceful
+# `-Stop` recorded its phase-one exit-intent marker, spent ~82 s in the
+# post-flush teardown, and was killed by the daemon's own 90 s HTTP watchdog.
+# The watchdog writes an exit record on its way out -- that is its job -- so
+# `ended_at_unix_ms` was present, and every classifier in this script asked only
+# that one question. The deploy drain printed
+# `ended_reason=http_shutdown_watchdog_expired clean_shutdown=True
+# expected_next_boot_previous_shutdown=clean`, i.e. it read the cause, printed
+# the cause, and then ignored the cause when deciding the verdict.
+#
+# `Invoke-SynapseDaemonStart` DIES on
+# `SYNAPSE_DAEMON_START_PREVIOUS_SHUTDOWN_MISMATCH` when its expectation and the
+# daemon's boot verdict disagree, so this is not merely a cosmetic string: the
+# two laws must be the same law. This function is the PowerShell half of
+# `daemon_lifecycle::classify_previous_shutdown`, and the two arms of the cause
+# taxonomy below mirror `GRACEFUL_EXIT_CAUSES` / `classify_exit_cause` exactly.
+# Changing one without the other breaks `-Start`.
+$script:SynapseGracefulExitCauses = @(
+    'graceful',
+    'os_console_close',
+    'os_window_close',
+    'os_logoff',
+    'os_shutdown',
+    'os_session_end'
+)
+$script:SynapseKnownForcedExitCauses = @(
+    'http_shutdown_watchdog_expired',
+    'http_shutdown_watchdog_spawn_failed',
+    'panic',
+    'top_level_error',
+    'stdio_storage_or_calyx_open_or_maintenance_start_failed'
+)
+
+function Get-SynapseDaemonExitCauseClass {
+    param([AllowNull()][string]$Cause)
+
+    if ([string]::IsNullOrWhiteSpace($Cause)) { return 'none' }
+    $trimmed = $Cause.Trim()
+    if ($script:SynapseGracefulExitCauses -contains $trimmed) { return 'graceful' }
+    if (($script:SynapseKnownForcedExitCauses -contains $trimmed) -or
+        $trimmed.StartsWith('startup_') -or
+        $trimmed.EndsWith('_vault_not_closed')) { return 'forced' }
+    return 'unrecognized'
+}
+
+# Returns the verdict the NEXT daemon boot will report for this run record, plus
+# the evidence behind it. `Readable=$false` means the record could not be read at
+# all, which is 'unknown' -- distinct from 'dirty', which is a claim about the
+# daemon rather than about this script's ability to read a file.
+function Get-SynapseDaemonPreviousShutdownVerdict {
+    param(
+        [AllowNull()]$Record,
+        [bool]$Readable = $true
+    )
+
+    if (-not $Readable -or $null -eq $Record) {
+        return [pscustomobject]@{
+            Verdict       = 'unknown'
+            Clean         = $false
+            EndedAtUnixMs = $null
+            EndedReason   = '<unreadable>'
+            CauseClass    = 'none'
+            EndingPhase   = '<unreadable>'
+            MarkerPresent = $false
+            Contradictions = @()
+            Detail        = 'basis=the daemon lifecycle run record could not be read'
+        }
+    }
+
+    $endedAt = $Record.ended_at_unix_ms
+    $endedReasonRaw = [string]$Record.ended_reason
+    $endedReason = if ([string]::IsNullOrWhiteSpace($endedReasonRaw)) { $null } else { $endedReasonRaw.Trim() }
+    $endingAt = $Record.ending_at_unix_ms
+    $endingPhase = if ($null -eq $Record.ending_phase) { 'none' } else { [string]$Record.ending_phase }
+    $endingReason = if ($null -eq $Record.ending_reason) { 'none' } else { [string]$Record.ending_reason }
+    $markerPresent = ($null -ne $endingAt)
+    $causeClass = Get-SynapseDaemonExitCauseClass -Cause $endedReason
+
+    $contradictions = @()
+    if ($null -ne $endedAt -and $null -eq $endedReason) {
+        $contradictions += "ended_at_unix_ms=$endedAt was finalized with no ended_reason naming the cause"
+    }
+    if ($null -eq $endedAt -and $null -ne $endedReason) {
+        $contradictions += "ended_reason=$endedReason was recorded with no ended_at_unix_ms finalizing it"
+    }
+    if ($causeClass -eq 'unrecognized') {
+        $contradictions += "ended_reason=$endedReason is not a terminal cause this script can classify"
+    }
+    if ($null -ne $endedAt -and $null -ne $endingAt -and ([int64]$endedAt -lt [int64]$endingAt)) {
+        $contradictions += "ended_at_unix_ms=$endedAt precedes the ending_at_unix_ms=$endingAt it supersedes"
+    }
+
+    $finalizedGraceful = ($null -ne $endedAt -and $causeClass -eq 'graceful')
+    $verdict = if ($finalizedGraceful -and $contradictions.Count -eq 0) {
+        'clean'
+    } elseif ($markerPresent) {
+        'interrupted_graceful'
+    } else {
+        'dirty'
+    }
+
+    $basis = switch ($verdict) {
+        'clean' { 'the exit record was finalized and its cause names a completed drain' }
+        'interrupted_graceful' {
+            if ($causeClass -eq 'none') { 'a close was commanded and no exit record finalized it' }
+            elseif ($causeClass -eq 'graceful') { 'a close was commanded and its finalization is contradicted by its own fields' }
+            else { 'a close was commanded and then ended by a forced/abnormal cause before it finished' }
+        }
+        default {
+            if ($causeClass -eq 'none') { 'no close was ever commanded and no exit record finalized the run' }
+            else { 'no close was ever commanded and the run ended by a forced/abnormal cause' }
+        }
+    }
+    $contradictionText = if ($contradictions.Count -eq 0) { 'none' } else { ($contradictions -join ' | ') }
+
+    [pscustomobject]@{
+        Verdict        = $verdict
+        Clean          = ($verdict -eq 'clean')
+        EndedAtUnixMs  = $endedAt
+        EndedReason    = $(if ($null -eq $endedReason) { 'none' } else { $endedReason })
+        CauseClass     = $causeClass
+        EndingPhase    = $endingPhase
+        MarkerPresent  = $markerPresent
+        Contradictions = $contradictions
+        Detail         = ("basis={0}; ended_at_unix_ms={1} ended_reason={2} ended_cause_class={3} ending_marker={4} ending_reason={5} ending_phase={6} contradictions={7}" -f `
+            $basis,
+            $(if ($null -eq $endedAt) { 'none' } else { $endedAt }),
+            $(if ($null -eq $endedReason) { 'none' } else { $endedReason }),
+            $causeClass,
+            $(if ($markerPresent) { 'present' } else { 'absent' }),
+            $endingReason,
+            $endingPhase,
+            $contradictionText)
+    }
+}
+
 # --- #2100: the drain's exit-wait is sized by STALL, not by wall clock -------
 #
 # The failure this replaces, from the first production run of the #2092 unified
@@ -13020,21 +13158,39 @@ function Invoke-SynapseDaemonStop {
     if (-not $runRecordAfter.Ok) {
         Die "SYNAPSE_DAEMON_STOP_LIFECYCLE_RECORD_UNREADABLE path=$($runRecordAfter.Path) error=$($runRecordAfter.Error) remediation=the daemon lifecycle run record must be readable after a graceful stop; inspect the vault directory"
     }
-    $endedAt = $runRecordAfter.Record.ended_at_unix_ms
-    $endedReason = [string]$runRecordAfter.Record.ended_reason
-    $cleanShutdown = ($null -ne $endedAt -and -not [string]::IsNullOrWhiteSpace($endedReason))
-    if ($daemonsBefore.Count -gt 0 -and -not $cleanShutdown) {
-        $message = ("SYNAPSE_DAEMON_STOP_DIRTY_LIFECYCLE_RECORD path={0} run_id={1} pid={2} ended_at_unix_ms={3} ended_reason={4} remediation=the daemon exited without writing its graceful lifecycle exit record, so storage flush/close and input-lease release cannot be proven. Inspect the daemon log for MCP_HTTP_SHUTDOWN_* and SYNAPSE_CALYX_VAULT_CLOSED, and the exit ledger daemon-exit.jsonl." -f `
+    # #2131: the verdict is derived from the whole record, not from
+    # `ended_at_unix_ms` alone, and it is the SAME derivation the daemon will run
+    # at its next boot.
+    $stopVerdict = Get-SynapseDaemonPreviousShutdownVerdict -Record $runRecordAfter.Record -Readable $true
+    $endedAt = $stopVerdict.EndedAtUnixMs
+    $endedReason = $stopVerdict.EndedReason
+    $cleanShutdown = $stopVerdict.Clean
+    if ($daemonsBefore.Count -gt 0 -and $stopVerdict.Verdict -eq 'dirty') {
+        # Unchanged fatal case: nothing on disk proves a shutdown was ever even
+        # commanded, so this stop is indistinguishable from a crash.
+        $message = ("SYNAPSE_DAEMON_STOP_DIRTY_LIFECYCLE_RECORD path={0} run_id={1} pid={2} ended_at_unix_ms={3} ended_reason={4} verdict_detail={5} remediation=the daemon exited without proving a commanded graceful close, so storage flush/close and input-lease release cannot be proven. Inspect the daemon log for MCP_HTTP_SHUTDOWN_* and SYNAPSE_CALYX_VAULT_CLOSED, and the exit ledger daemon-exit.jsonl." -f `
             $runRecordAfter.Path,
             [string]$runRecordAfter.Record.run_id,
             [string]$runRecordAfter.Record.pid,
             ($(if ($null -eq $endedAt) { '<null>' } else { $endedAt })),
-            ($(if ([string]::IsNullOrWhiteSpace($endedReason)) { '<null>' } else { $endedReason })))
+            $endedReason,
+            $stopVerdict.Detail)
         if ($forced) {
             Warn "FORCED: $message"
         } else {
             Die $message
         }
+    } elseif ($daemonsBefore.Count -gt 0 -and $stopVerdict.Verdict -eq 'interrupted_graceful') {
+        # New in #2131, and deliberately NOT fatal: the daemon IS stopped, which
+        # is what -Stop promised. What it did not do is finish its close, and
+        # before this the operator was told the opposite.
+        Warn ("SYNAPSE_DAEMON_STOP_INTERRUPTED_GRACEFUL_LIFECYCLE_RECORD path={0} run_id={1} pid={2} ended_reason={3} ending_phase={4} verdict_detail={5} effect=the next boot will report previous_shutdown=interrupted_graceful remediation=the close was commanded and did not finish; inspect the daemon log for SYNAPSE_CALYX_VAULT_CLOSE_PHASE (the last phase recorded is the one that did not complete) and MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED." -f `
+            $runRecordAfter.Path,
+            [string]$runRecordAfter.Record.run_id,
+            [string]$runRecordAfter.Record.pid,
+            $endedReason,
+            $stopVerdict.EndingPhase,
+            $stopVerdict.Detail)
     }
     $vaultLockPath = Join-Path $DbPath 'daemon.lock'
     $vaultPidPath = Join-Path $DbPath 'daemon.pid'
@@ -13047,15 +13203,17 @@ function Invoke-SynapseDaemonStop {
             Die $message
         }
     }
-    Info ("Synapse daemon stop storage readback lifecycle_record={0} run_id={1} ended_at_unix_ms={2} ended_reason={3} clean_shutdown={4} vault_lock_path={5} vault_pid_sidecar_present={6}" -f `
+    Info ("Synapse daemon stop storage readback lifecycle_record={0} run_id={1} ended_at_unix_ms={2} ended_reason={3} clean_shutdown={4} expected_next_boot_previous_shutdown={5} verdict_detail={6} vault_lock_path={7} vault_pid_sidecar_present={8}" -f `
         $runRecordAfter.Path,
         [string]$runRecordAfter.Record.run_id,
         ($(if ($null -eq $endedAt) { '<null>' } else { $endedAt })),
-        ($(if ([string]::IsNullOrWhiteSpace($endedReason)) { '<null>' } else { $endedReason })),
+        $endedReason,
         $cleanShutdown,
+        $stopVerdict.Verdict,
+        $stopVerdict.Detail,
         $vaultLockPath,
         $vaultPidPresent)
-    $phases += New-SynapseDaemonStopPhase -Name 'storage_readback' -Started $phaseStarted -Detail "clean_shutdown=$cleanShutdown ended_reason=$endedReason vault_pid_sidecar_present=$vaultPidPresent"
+    $phases += New-SynapseDaemonStopPhase -Name 'storage_readback' -Started $phaseStarted -Detail "clean_shutdown=$cleanShutdown expected_next_boot_previous_shutdown=$($stopVerdict.Verdict) ended_reason=$endedReason vault_pid_sidecar_present=$vaultPidPresent"
 
     $totalMs = [int64]((Get-Date) - $stopStarted).TotalMilliseconds
     $recordPath = Write-SynapseDaemonLifecycleModeRecord -LogDir $LogDir -Record @{
@@ -13083,16 +13241,19 @@ function Invoke-SynapseDaemonStop {
         lifecycle_ended_at_unix_ms = $endedAt
         lifecycle_ended_reason = $endedReason
         lifecycle_clean_shutdown = $cleanShutdown
+        lifecycle_expected_next_boot_previous_shutdown = $stopVerdict.Verdict
+        lifecycle_verdict_detail = $stopVerdict.Detail
         vault_pid_sidecar_present = $vaultPidPresent
         setup_pid = $PID
         phases = $phases
     }
 
-    Info ("Synapse daemon stop verified reason={0} forced={1} daemon_count=0 supervisor_count=0 task_state={2} clean_shutdown={3} total_ms={4} record={5}" -f `
+    Info ("Synapse daemon stop verified reason={0} forced={1} daemon_count=0 supervisor_count=0 task_state={2} clean_shutdown={3} expected_next_boot_previous_shutdown={4} total_ms={5} record={6}" -f `
         $reason,
         $forced,
         ($(if ($taskSuspended) { $taskSuspended.State } else { 'absent' })),
         $cleanShutdown,
+        $stopVerdict.Verdict,
         $totalMs,
         $recordPath)
     Info "Synapse daemon is stopped. Restart it with: pwsh -NoProfile -File scripts\synapse-setup.ps1 -Start"
@@ -13138,10 +13299,16 @@ function Invoke-SynapseDaemonStart {
     }
 
     $previousRunRecord = Read-SynapseDaemonLifecycleRunRecord -DbPath $DbPath
-    $previousEndedReason = if ($previousRunRecord.Ok) { [string]$previousRunRecord.Record.ended_reason } else { '<unreadable>' }
-    $previousEndedAt = if ($previousRunRecord.Ok) { $previousRunRecord.Record.ended_at_unix_ms } else { $null }
-    $previousShutdownExpected = if (-not $previousRunRecord.Ok) { 'unknown' } elseif ($null -ne $previousEndedAt) { 'clean' } else { 'dirty' }
-    Info "Synapse daemon start pre-boot lifecycle readback path=$($previousRunRecord.Path) readable=$($previousRunRecord.Ok) previous_ended_reason=$previousEndedReason expected_previous_shutdown=$previousShutdownExpected"
+    # #2131: this expectation is load-bearing -- the mismatch check below DIES on
+    # disagreement -- so it must be the daemon's own law, not a second one that
+    # happens to agree on the easy cases. Before this, a watchdog-killed close
+    # expected `clean`, the daemon reported `clean`, and both were wrong
+    # together; the two-way agreement was the thing hiding the bug.
+    $previousVerdict = Get-SynapseDaemonPreviousShutdownVerdict -Record $previousRunRecord.Record -Readable $previousRunRecord.Ok
+    $previousEndedReason = $previousVerdict.EndedReason
+    $previousEndedAt = $previousVerdict.EndedAtUnixMs
+    $previousShutdownExpected = $previousVerdict.Verdict
+    Info "Synapse daemon start pre-boot lifecycle readback path=$($previousRunRecord.Path) readable=$($previousRunRecord.Ok) previous_ended_reason=$previousEndedReason expected_previous_shutdown=$previousShutdownExpected verdict_detail=$($previousVerdict.Detail)"
 
     $clearedStopRequest = Clear-SynapseDaemonSupervisorStopRequest -Path $stopRequestPath -Reason $reason
     $taskResumed = Resume-SynapseDaemonTaskRestartAuthority -TaskName $TaskName -SupervisorPath $supervisorPath -Reason $reason
@@ -13221,6 +13388,7 @@ function Invoke-SynapseDaemonStart {
         supervisor_pid = [int]$supervisorsAfter[0].ProcessId
         previous_shutdown_expected = $previousShutdownExpected
         previous_shutdown_observed = $previousShutdownObserved
+        previous_shutdown_verdict_detail = $previousVerdict.Detail
         previous_ended_reason = $previousEndedReason
         setup_pid = $PID
     }
@@ -14395,27 +14563,37 @@ if (-not $liveDaemonHandoffRequired) {
         -AllowParkEscalation `
         -TimeoutSeconds 120
     $deployDrainRunRecord = Read-SynapseDaemonLifecycleRunRecord -DbPath $DbPath
-    $deployDrainEndedReason = if ($deployDrainRunRecord.Ok) { [string]$deployDrainRunRecord.Record.ended_reason } else { '<unreadable>' }
-    $deployDrainEndedAt = if ($deployDrainRunRecord.Ok) { $deployDrainRunRecord.Record.ended_at_unix_ms } else { $null }
-    $deployDrainClean = ($null -ne $deployDrainEndedAt -and -not [string]::IsNullOrWhiteSpace($deployDrainEndedReason))
+    # #2131: same law as -Stop and -Start. The production instance of the bug was
+    # printed by exactly this line -- `ended_reason=http_shutdown_watchdog_expired
+    # clean_shutdown=True expected_next_boot_previous_shutdown=clean` -- so the
+    # printed expectation is now derived from the cause it was already printing.
+    $deployDrainVerdict = Get-SynapseDaemonPreviousShutdownVerdict -Record $deployDrainRunRecord.Record -Readable $deployDrainRunRecord.Ok
+    $deployDrainEndedReason = $deployDrainVerdict.EndedReason
+    $deployDrainEndedAt = $deployDrainVerdict.EndedAtUnixMs
+    $deployDrainClean = $deployDrainVerdict.Clean
     if ($deployDrain.DaemonsBefore.Count -gt 0 -and -not $deployDrainClean -and -not $deployDrain.Forced) {
         # Not fatal: the deploy can still install correctly. But this is the
         # exact fact #2092 exists to change, so it is never silent.
-        Warn ("SYNAPSE_DEPLOY_DRAIN_DIRTY_LIFECYCLE_RECORD path={0} run_id={1} ended_at_unix_ms={2} ended_reason={3} effect=the next boot will report previous_shutdown=dirty remediation=inspect the daemon log for MCP_HTTP_SHUTDOWN_* and SYNAPSE_CALYX_VAULT_CLOSED for the drained generation" -f `
+        Warn ("SYNAPSE_DEPLOY_DRAIN_UNCLEAN_LIFECYCLE_RECORD path={0} run_id={1} ended_at_unix_ms={2} ended_reason={3} ending_phase={4} verdict_detail={5} effect=the next boot will report previous_shutdown={6} remediation=inspect the daemon log for MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED, the last SYNAPSE_CALYX_VAULT_CLOSE_PHASE (the phase after it is the one that did not complete) and SYNAPSE_CALYX_VAULT_CLOSED for the drained generation" -f `
             $deployDrainRunRecord.Path,
             [string]$deployDrainRunRecord.Record.run_id,
             ($(if ($null -eq $deployDrainEndedAt) { '<null>' } else { $deployDrainEndedAt })),
-            ($(if ([string]::IsNullOrWhiteSpace($deployDrainEndedReason)) { '<null>' } else { $deployDrainEndedReason })))
+            $deployDrainEndedReason,
+            $deployDrainVerdict.EndingPhase,
+            $deployDrainVerdict.Detail,
+            $deployDrainVerdict.Verdict)
     }
-    Info ("Synapse deploy drain verified reason=deploy forced={0} park_forced={1} task_state_after={2} stop_request={3} lifecycle_run_id={4} ended_reason={5} clean_shutdown={6} expected_next_boot_previous_shutdown={7}" -f `
+    Info ("Synapse deploy drain verified reason=deploy forced={0} park_forced={1} task_state_after={2} stop_request={3} lifecycle_run_id={4} ended_reason={5} clean_shutdown={6} expected_next_boot_previous_shutdown={7} ending_phase={8} verdict_detail={9}" -f `
         $deployDrain.Forced,
         $deployDrain.ParkForced,
         ($(if ($deployDrain.TaskSuspended) { $deployDrain.TaskSuspended.State } else { '<absent>' })),
         $deployDrain.StopRequestPath,
         ($(if ($deployDrainRunRecord.Ok) { [string]$deployDrainRunRecord.Record.run_id } else { '<unreadable>' })),
-        ($(if ([string]::IsNullOrWhiteSpace($deployDrainEndedReason)) { '<null>' } else { $deployDrainEndedReason })),
+        $deployDrainEndedReason,
         $deployDrainClean,
-        ($(if ($deployDrainClean) { 'clean' } else { 'dirty' })))
+        $deployDrainVerdict.Verdict,
+        $deployDrainVerdict.EndingPhase,
+        $deployDrainVerdict.Detail)
     # Fallback verification pass (see the function header): with the stop-request
     # in force this normally observes zero targets on attempt 1 and returns.
     Stop-SynapseMcpProcessesForInstallHandoff `

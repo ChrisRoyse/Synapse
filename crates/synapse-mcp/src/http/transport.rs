@@ -126,7 +126,46 @@ const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_SECS";
+/// How long the shutdown may produce **no evidence of progress at all** before
+/// the watchdog forces a nonzero exit (#2131).
+///
+/// This used to be a flat wall-clock budget measured from the moment the
+/// listener came down: 90 s, full stop. On production (#2100/#2131) a graceful
+/// stop flushed the vault durably at 7.9 s and then spent ~82 s inside one
+/// post-flush teardown phase; the watchdog fired at 90 s with **10 s of margin**
+/// against a close that was, as far as anyone could tell, still working. The
+/// obvious fix — raise the number — is the wrong one twice over: it is a guess
+/// about a phase whose cost is proportional to retained version-chain memory
+/// (#2122), and it makes the *hung* case worse by exactly as much as it helps
+/// the slow case.
+///
+/// So the number keeps its value and changes its meaning: it is now a **stall
+/// budget** measured from the last observed progress, not from the arm. A close
+/// that keeps advancing its liveness witnesses is granted more time (up to
+/// [`HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT`]); a close that goes silent still
+/// dies at exactly the same 90 s it always did. That is the same law
+/// `Stop-SynapseMcpProcesses` already applies from outside the process
+/// (`-StallSeconds` / `-MaxWaitSeconds`), and there is no good reason for the
+/// daemon's own watchdog to reason differently about the same close.
 const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Absolute ceiling on the extended shutdown wait, matching the deploy drain's
+/// own `-MaxWaitSeconds` backstop. A daemon whose close keeps emitting forever
+/// must still reach a terminal decision, or the watchdog has stopped being a
+/// watchdog.
+const HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_SECS";
+/// Ten minutes, i.e. the deploy drain's `-MaxWaitSeconds 600`, stated in the
+/// same units the drain states it in.
+const HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT: Duration = Duration::from_mins(10);
+/// How often the watchdog re-samples its liveness witnesses. Also the worst-case
+/// delay between a successful disarm and the thread noticing — which is why it
+/// is short: before #2131 the thread slept the whole budget and lingered ~90 s
+/// past every clean shutdown.
+const HTTP_SHUTDOWN_WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum spacing between `MCP_HTTP_SHUTDOWN_WATCHDOG_EXTENDED` lines. The
+/// witnesses can advance several times a second during a busy close, and a
+/// watchdog that logs per observation would itself become the log volume it is
+/// measuring.
+const HTTP_SHUTDOWN_WATCHDOG_EXTENSION_LOG_INTERVAL: Duration = Duration::from_secs(10);
 const DASHBOARD_LOCAL_MODEL_SPAWN_BODY_LIMIT_BYTES: usize = 256 * 1024;
 const DASHBOARD_SAVED_VIEW_BODY_LIMIT_BYTES: usize = 64 * 1024;
 const DASHBOARD_CONTEXT_BODY_LIMIT_BYTES: usize = 256 * 1024;
@@ -1120,21 +1159,267 @@ fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBac
 }
 
 fn configured_http_shutdown_watchdog_timeout() -> anyhow::Result<Duration> {
-    match std::env::var(HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV) {
+    configured_positive_seconds(
+        HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV,
+        HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT,
+    )
+}
+
+/// The absolute ceiling on the extended shutdown wait (#2131).
+///
+/// Fails closed on a ceiling below the stall budget: a ceiling that undercuts
+/// the budget would silently convert the stall-aware wait back into a flat
+/// wall-clock one *shorter* than the one it replaced, which is the opposite of
+/// what an operator raising a ceiling is asking for. Say so and refuse to boot
+/// rather than run a watchdog whose configuration contradicts itself.
+fn configured_http_shutdown_watchdog_max_wait(stall_budget: Duration) -> anyhow::Result<Duration> {
+    let max_wait = configured_positive_seconds(
+        HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV,
+        HTTP_SHUTDOWN_WATCHDOG_DEFAULT_MAX_WAIT,
+    )?;
+    if max_wait < stall_budget {
+        anyhow::bail!(
+            "{HTTP_SHUTDOWN_WATCHDOG_MAX_WAIT_ENV}={}s is below the stall budget \
+             {HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV}={}s; the ceiling must be at least the budget it \
+             bounds",
+            max_wait.as_secs(),
+            stall_budget.as_secs()
+        );
+    }
+    Ok(max_wait)
+}
+
+fn configured_positive_seconds(name: &'static str, default: Duration) -> anyhow::Result<Duration> {
+    match std::env::var(name) {
         Ok(raw) => {
             let secs = raw.trim().parse::<u64>().with_context(|| {
-                format!("{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} must be a positive integer seconds value, got {raw:?}")
+                format!("{name} must be a positive integer seconds value, got {raw:?}")
             })?;
             if secs == 0 {
-                anyhow::bail!("{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} must be at least 1 second");
+                anyhow::bail!("{name} must be at least 1 second");
             }
             Ok(Duration::from_secs(secs))
         }
-        Err(std::env::VarError::NotPresent) => Ok(HTTP_SHUTDOWN_WATCHDOG_DEFAULT_TIMEOUT),
-        Err(error) => Err(anyhow::anyhow!(
-            "{HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV} is not valid unicode: {error}"
-        )),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(error) => Err(anyhow::anyhow!("{name} is not valid unicode: {error}")),
     }
+}
+
+/// One sample of the physical evidence that a commanded shutdown is still doing
+/// something (#2131).
+///
+/// Both witnesses are the same ones `Get-SynapseDaemonLivenessSample` reads from
+/// outside the process, deliberately: the daemon's own watchdog and the deploy
+/// drain must not be able to disagree about whether a close is alive.
+///
+/// 1. **The daemon's own stderr byte count.** The supervisor redirects stderr to
+///    `daemon-stderr-gen*.log`, and the close emits
+///    `SYNAPSE_CALYX_VAULT_CLOSE_PHASE` per phase precisely so a working close
+///    always advances it. Read through the inherited handle rather than by path,
+///    so the watchdog needs no knowledge of where the supervisor put the file —
+///    and so it degrades honestly to "no witness" when stderr is a console or a
+///    pipe instead of a file.
+/// 2. **`daemon-run-current.json`'s size and mtime.** The phase-one exit-intent
+///    marker and any later phase refresh rewrite it atomically.
+///
+/// Equality is the progress test: *any* change in *any* witness is progress.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShutdownLivenessWitness {
+    stderr_bytes: Option<u64>,
+    run_current_bytes: Option<u64>,
+    run_current_mtime_unix_ms: Option<u64>,
+}
+
+impl ShutdownLivenessWitness {
+    fn sample(run_current_path: &std::path::Path) -> Self {
+        let (run_current_bytes, run_current_mtime_unix_ms) = fs::metadata(run_current_path)
+            .ok()
+            .map_or((None, None), |metadata| {
+                let mtime = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .and_then(|since| u64::try_from(since.as_millis()).ok());
+                (Some(metadata.len()), mtime)
+            });
+        Self {
+            stderr_bytes: stderr_file_len(),
+            run_current_bytes,
+            run_current_mtime_unix_ms,
+        }
+    }
+
+    /// True when at least one witness could be read at all. When none can, the
+    /// watchdog says so and falls back to the flat wall-clock budget instead of
+    /// pretending a constant fingerprint is evidence of a stall.
+    const fn available(&self) -> bool {
+        self.stderr_bytes.is_some()
+            || self.run_current_bytes.is_some()
+            || self.run_current_mtime_unix_ms.is_some()
+    }
+
+    fn describe(&self) -> String {
+        format!(
+            "stderr_bytes={} run_current_bytes={} run_current_mtime_unix_ms={}",
+            self.stderr_bytes
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            self.run_current_bytes
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            self.run_current_mtime_unix_ms
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        )
+    }
+}
+
+/// Byte length of this process's stderr when — and only when — it is a regular
+/// file (#2131).
+///
+/// The handle is borrowed, never owned: dropping a `File` built from it would
+/// close the daemon's stderr, which is the sort of cure that is worse than any
+/// disease a watchdog could diagnose. `ManuallyDrop` is what guarantees that.
+fn stderr_file_len() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
+        let raw = io::stderr().as_raw_handle();
+        if raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is this process's live stderr handle, obtained from the
+        // std handle that owns it. The `File` is wrapped in `ManuallyDrop` so it
+        // is never closed here, and it is only ever read through `metadata`,
+        // which does not move the file pointer or mutate any state.
+        let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_handle(raw) });
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then(|| metadata.len())
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        // SAFETY: same contract as the Windows arm — a borrowed fd wrapped in
+        // `ManuallyDrop` so it is never closed, read only through `metadata`.
+        let file =
+            std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(io::stderr().as_raw_fd()) });
+        let metadata = file.metadata().ok()?;
+        metadata.is_file().then(|| metadata.len())
+    }
+}
+
+/// Runs the stall-aware watchdog wait and returns the verdict that ended it, or
+/// `None` when the watchdog was disarmed because the shutdown reached a terminal
+/// decision (#2131).
+///
+/// The three verdicts are the same vocabulary the deploy drain's exit-wait
+/// reports, and they are the whole point: an expiry that cannot say *why* it
+/// fired is indistinguishable from the flat timeout it replaced.
+///
+/// * `stalled` — witnesses were readable and stopped advancing for the whole
+///   stall budget. This is the honest kill.
+/// * `ceiling` — witnesses kept advancing right up to the absolute backstop. The
+///   close was doing something; it was simply not allowed to do it forever.
+/// * `no_liveness_witness` — neither witness could be read, so the wait degraded
+///   to the flat wall-clock budget. Reported as its own verdict rather than
+///   silently masquerading as `stalled`.
+///
+/// # Self-observation is bounded, not excluded
+///
+/// The extension record below goes to stderr, which is one of the witnesses, so
+/// the watchdog can observe its own writing. It cannot bootstrap itself out of a
+/// stall: the record is only ever emitted *after* genuine external progress, and
+/// the rate limit means one such record buys at most one further poll interval
+/// of extension. A daemon that has actually gone silent still writes nothing,
+/// observes nothing, and dies on schedule.
+fn run_http_shutdown_watchdog_wait(
+    disarmed: &AtomicBool,
+    run_current_path: &std::path::Path,
+    source: &'static str,
+    stall_budget: Duration,
+    max_wait: Duration,
+) -> Option<HttpShutdownWatchdogExpiry> {
+    let armed_at = Instant::now();
+    let ceiling = armed_at + max_wait;
+    let mut deadline = (armed_at + stall_budget).min(ceiling);
+    let mut witness = ShutdownLivenessWitness::sample(run_current_path);
+    let witness_available = witness.available();
+    let mut last_progress_at = armed_at;
+    let mut progress_observations: u64 = 0;
+    // `None` so the FIRST extension always reports. An operator watching a slow
+    // shutdown needs to know the watchdog decided to wait *at the moment it
+    // decided*, not one rate-limit interval later.
+    let mut last_extension_log_at: Option<Instant> = None;
+
+    loop {
+        if disarmed.load(Ordering::Acquire) {
+            return None;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            let verdict = if !witness_available {
+                "no_liveness_witness"
+            } else if deadline >= ceiling {
+                "ceiling"
+            } else {
+                "stalled"
+            };
+            return Some(HttpShutdownWatchdogExpiry {
+                verdict,
+                waited_ms: u64::try_from(now.saturating_duration_since(armed_at).as_millis())
+                    .unwrap_or(u64::MAX),
+                stalled_ms: u64::try_from(
+                    now.saturating_duration_since(last_progress_at).as_millis(),
+                )
+                .unwrap_or(u64::MAX),
+                progress_observations,
+                witness_available,
+                witness: witness.describe(),
+            });
+        }
+        std::thread::sleep(HTTP_SHUTDOWN_WATCHDOG_POLL_INTERVAL.min(deadline - now));
+        if !witness_available {
+            continue;
+        }
+        let next = ShutdownLivenessWitness::sample(run_current_path);
+        if next == witness {
+            continue;
+        }
+        witness = next;
+        progress_observations += 1;
+        last_progress_at = Instant::now();
+        let extended = (last_progress_at + stall_budget).min(ceiling);
+        if extended <= deadline {
+            continue;
+        }
+        deadline = extended;
+        if last_extension_log_at.is_some_and(|logged_at| {
+            last_progress_at.duration_since(logged_at)
+                < HTTP_SHUTDOWN_WATCHDOG_EXTENSION_LOG_INTERVAL
+        }) {
+            continue;
+        }
+        last_extension_log_at = Some(last_progress_at);
+        tracing::warn!(
+            code = "MCP_HTTP_SHUTDOWN_WATCHDOG_EXTENDED",
+            source,
+            waited_ms = last_progress_at.duration_since(armed_at).as_millis(),
+            stall_budget_ms = stall_budget.as_millis(),
+            ceiling_ms = max_wait.as_millis(),
+            remaining_ms = deadline.duration_since(last_progress_at).as_millis(),
+            progress_observations,
+            witness = %witness.describe(),
+            "the commanded shutdown is still advancing its liveness witnesses; extending the \
+             watchdog deadline instead of killing a close that is working"
+        );
+    }
+}
+
+/// Why a stall-aware watchdog wait ended, and the evidence behind it (#2131).
+struct HttpShutdownWatchdogExpiry {
+    verdict: &'static str,
+    waited_ms: u64,
+    stalled_ms: u64,
+    progress_observations: u64,
+    witness_available: bool,
+    witness: String,
 }
 
 fn spawn_http_shutdown_watchdog(
@@ -1142,6 +1427,7 @@ fn spawn_http_shutdown_watchdog(
     db_path: PathBuf,
     source: &'static str,
     timeout: Duration,
+    max_wait: Duration,
 ) -> HttpShutdownWatchdog {
     let disarmed = Arc::new(AtomicBool::new(false));
     let disarmed_for_thread = Arc::clone(&disarmed);
@@ -1152,35 +1438,73 @@ fn spawn_http_shutdown_watchdog(
         bind = %bind,
         db_path = %db_path.display(),
         timeout_ms = timeout.as_millis(),
+        stall_budget_ms = timeout.as_millis(),
+        ceiling_ms = max_wait.as_millis(),
         pid,
-        "HTTP shutdown watchdog armed; process must reach a terminal exit decision before the listener-less deadline"
+        "HTTP shutdown watchdog armed; the budget is a STALL budget measured from the last \
+         observed progress, bounded by an absolute ceiling"
     );
     let db_path_for_thread = db_path.clone();
     match std::thread::Builder::new()
         .name("synapse-http-shutdown-watchdog".to_owned())
         .spawn(move || {
-            std::thread::sleep(timeout);
-            if disarmed_for_thread.load(Ordering::Acquire) {
+            let run_current_path = db_path_for_thread
+                .join(synapse_calyx::vault_runtime::DAEMON_RUN_CURRENT_FILE);
+            let Some(expiry) = run_http_shutdown_watchdog_wait(
+                &disarmed_for_thread,
+                &run_current_path,
+                source,
+                timeout,
+                max_wait,
+            ) else {
                 return;
-            }
+            };
+            // The phase-one marker, read from memory. A watchdog kill after this
+            // marker is `interrupted_graceful` at the next boot, never `clean`
+            // — see `daemon_lifecycle::classify_previous_shutdown`. Reporting it
+            // here means the exit event names the phase that was in progress
+            // without anyone having to correlate two files.
+            let (ending_at_unix_ms, ending_reason, ending_phase) =
+                crate::daemon_lifecycle::current_exit_intent_snapshot().map_or_else(
+                    || (None, "none".to_owned(), "none".to_owned()),
+                    |(at, reason, phase)| (Some(at), reason, phase),
+                );
             let detail = serde_json::json!({
                 "code": "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
                 "source": source,
                 "bind": bind.to_string(),
                 "db_path": db_path_for_thread.display().to_string(),
                 "pid": pid,
-                "timeout_ms": timeout.as_millis(),
-                "reason": "HTTP shutdown accepted and listener teardown started, but the daemon did not reach a terminal process decision before the listener-less deadline",
+                "verdict": expiry.verdict,
+                "stall_budget_ms": timeout.as_millis(),
+                "ceiling_ms": max_wait.as_millis(),
+                "waited_ms": expiry.waited_ms,
+                "stalled_ms": expiry.stalled_ms,
+                "progress_observations": expiry.progress_observations,
+                "liveness_witness_available": expiry.witness_available,
+                "liveness_witness": expiry.witness,
+                "ending_at_unix_ms": ending_at_unix_ms,
+                "ending_reason": ending_reason,
+                "ending_phase": ending_phase,
+                "reason": "HTTP shutdown accepted and listener teardown started, but the daemon did not reach a terminal process decision before the stall-aware deadline",
             });
             tracing::error!(
                 code = "MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED",
                 source,
                 bind = %bind,
                 db_path = %db_path_for_thread.display(),
-                timeout_ms = timeout.as_millis(),
+                verdict = expiry.verdict,
+                stall_budget_ms = timeout.as_millis(),
+                ceiling_ms = max_wait.as_millis(),
+                waited_ms = expiry.waited_ms,
+                stalled_ms = expiry.stalled_ms,
+                progress_observations = expiry.progress_observations,
+                liveness_witness_available = expiry.witness_available,
+                ending_phase = %ending_phase,
                 pid,
                 detail = ?detail,
-                "HTTP shutdown watchdog forcing nonzero process exit because the daemon is unreachable and still alive"
+                "HTTP shutdown watchdog forcing nonzero process exit; the next boot reads this as \
+                 interrupted_graceful when the phase-one marker is present, never as clean"
             );
             if let Err(error) = crate::daemon_lifecycle::record_forced_exit_nonblocking(
                 "http_shutdown_watchdog_expired",
@@ -1193,9 +1517,12 @@ fn spawn_http_shutdown_watchdog(
                 );
             }
             eprintln!(
-                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED pid={pid} source={source} bind={bind} db_path={} timeout_ms={} detail={detail}",
+                "synapse-mcp fatal shutdown error: code=MCP_HTTP_SHUTDOWN_WATCHDOG_EXPIRED pid={pid} source={source} bind={bind} db_path={} verdict={} stall_budget_ms={} ceiling_ms={} waited_ms={} detail={detail}",
                 db_path_for_thread.display(),
-                timeout.as_millis()
+                expiry.verdict,
+                timeout.as_millis(),
+                max_wait.as_millis(),
+                expiry.waited_ms
             );
             std::process::exit(1);
         }) {
@@ -2066,6 +2393,11 @@ pub(super) async fn serve(
         .clone()
         .unwrap_or_else(crate::m3::default_db_path);
     let shutdown_watchdog_timeout = configured_http_shutdown_watchdog_timeout()?;
+    // #2131: the ceiling is validated at boot, not at shutdown. A daemon that
+    // discovers its watchdog is misconfigured only while it is trying to die
+    // has discovered it too late to do anything about it.
+    let shutdown_watchdog_max_wait =
+        configured_http_shutdown_watchdog_max_wait(shutdown_watchdog_timeout)?;
     let single_instance_guard = match crate::single_instance::SingleInstanceGuard::acquire(&db_path)
     {
         Ok(guard) => {
@@ -2628,6 +2960,7 @@ pub(super) async fn serve(
                 db_path.clone(),
                 source,
                 shutdown_watchdog_timeout,
+                shutdown_watchdog_max_wait,
             );
             if shutdown_was_requested {
                 tracing::info!(
@@ -2720,6 +3053,7 @@ pub(super) async fn serve(
                 db_path.clone(),
                 "signal",
                 shutdown_watchdog_timeout,
+                shutdown_watchdog_max_wait,
             );
             if let Err(error) = &signal {
                 tracing::error!(
@@ -2807,6 +3141,7 @@ pub(super) async fn serve(
                 db_path.clone(),
                 "http_endpoint",
                 shutdown_watchdog_timeout,
+                shutdown_watchdog_max_wait,
             );
             // The `/shutdown` handler marks drain state, returns its ACCEPTED
             // response, and only cancels this token after

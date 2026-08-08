@@ -58,6 +58,207 @@ const PREVIOUS_SHUTDOWN_NONE: &str = "none";
 /// with it (`previous_ending_reason`, `previous_ending_phase`,
 /// `previous_ending_at_unix_ms`) so an operator can see how far it got.
 const PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL: &str = "interrupted_graceful";
+
+/// `ended_reason` values that name a shutdown which actually *finished* (#2131).
+///
+/// # Why the verdict cannot be `ended_at.is_some()`
+///
+/// It used to be. The exit record is written by one funnel
+/// ([`record_exit_for_state_locked`]) that stamps `ended_at_unix_ms` for every
+/// caller — including the callers whose entire job is to kill a daemon that did
+/// not finish. The HTTP shutdown watchdog is exactly that: when it expires it
+/// records `ended_reason=http_shutdown_watchdog_expired` and then calls
+/// `std::process::exit(1)` in the middle of the close. The next boot read
+/// `ended_at` and reported
+/// `previous_shutdown=clean previous_ended_reason="http_shutdown_watchdog_expired"`
+/// on production (#2131) — a rollup verdict contradicted by the very field
+/// beside it.
+///
+/// So `clean` is now reserved for a *finalized close whose terminal cause names
+/// a completed drain*: the `graceful` funnel and the #2090 OS-shutdown triggers.
+/// Everything else — watchdog kills, panics, startup aborts, top-level errors —
+/// is a forced exit, and a forced exit is `interrupted_graceful` when the
+/// phase-one marker proves a close was underway and `dirty` when it does not.
+///
+/// This is an allowlist, not a denylist, precisely so a cause added later
+/// defaults to the *unflattering* reading instead of silently inheriting
+/// `clean`.
+const GRACEFUL_EXIT_CAUSES: &[&str] = &[
+    // `record_graceful_exit_after_lifetime_lock_close`: the full drain reached
+    // its end, after the vault close and the lifetime-lock release.
+    "graceful",
+    // #2090 `record_os_shutdown_exit`: a bounded but complete OS-triggered
+    // drain. `os_shutdown.rs` downgrades these to a `*_vault_not_closed`
+    // variant when the vault did not actually reach a close, so reaching this
+    // list means the vault closed.
+    "os_console_close",
+    "os_window_close",
+    "os_logoff",
+    "os_shutdown",
+    "os_session_end",
+];
+
+/// `ended_reason` values known to name a forced or aborted exit.
+///
+/// Membership here changes nothing about the verdict — anything outside
+/// [`GRACEFUL_EXIT_CAUSES`] is treated as forced either way. It exists so an
+/// *unrecognized* cause can be reported as a contradiction rather than quietly
+/// classified, which is the difference between "this build knows this is a kill"
+/// and "this build has never heard of this cause".
+const KNOWN_FORCED_EXIT_CAUSES: &[&str] = &[
+    "http_shutdown_watchdog_expired",
+    "http_shutdown_watchdog_spawn_failed",
+    "panic",
+    "top_level_error",
+    "stdio_storage_or_calyx_open_or_maintenance_start_failed",
+];
+
+/// How a previous run's terminal `ended_reason` classifies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExitCauseClass {
+    /// A drain that reached its declared end.
+    Graceful,
+    /// A kill, panic, or abort. The exit record exists because something wrote
+    /// it on the way out, not because the shutdown succeeded.
+    Forced,
+    /// Neither list knows this cause. Treated as [`Self::Forced`] and reported
+    /// as a contradiction: an unknown terminal cause must never be read
+    /// optimistically.
+    Unrecognized,
+}
+
+fn classify_exit_cause(cause: &str) -> ExitCauseClass {
+    if GRACEFUL_EXIT_CAUSES.contains(&cause) {
+        return ExitCauseClass::Graceful;
+    }
+    if KNOWN_FORCED_EXIT_CAUSES.contains(&cause)
+        // `record_startup_exit` causes are named by their caller and grow with
+        // the startup path; every one of them is an abort before the daemon
+        // ever served, so the family is classified by prefix rather than by an
+        // enumeration that would silently go stale.
+        || cause.starts_with("startup_")
+        // #2131: the #2090 OS drain's honest downgrade when its bounded budget
+        // did not get the vault closed.
+        || cause.ends_with("_vault_not_closed")
+    {
+        return ExitCauseClass::Forced;
+    }
+    ExitCauseClass::Unrecognized
+}
+
+/// The boot verdict on the previous run plus the evidence it was derived from.
+struct PreviousShutdownVerdict {
+    verdict: &'static str,
+    /// One line naming the basis and every contradiction found, so the rollup
+    /// can never be the only thing an operator has to trust (#2131).
+    detail: String,
+}
+
+/// Derives the previous run's shutdown verdict from *all* the evidence its
+/// record carries, not from `ended_at_unix_ms` alone (#2131).
+///
+/// # The law
+///
+/// * `clean` — the exit record was finalized (`ended_at_unix_ms`) **and** its
+///   `ended_reason` names a completed drain **and** nothing in the record
+///   contradicts that.
+/// * `interrupted_graceful` — a close was commanded (the phase-one
+///   `ending_at_unix_ms` marker is present) but the record does not prove it
+///   finished: either no finalization at all, or a finalization whose cause is a
+///   forced exit (the watchdog case), or a finalization contradicted by its own
+///   fields. `ending_phase` names the phase that was in progress.
+/// * `dirty` — no phase-one marker: nothing proves a shutdown was ever
+///   commanded, so this is indistinguishable from a crash while serving.
+///
+/// # Fail closed
+///
+/// Contradictions never resolve in favour of the flattering reading. A record
+/// that says `ended_at` without `ended_reason`, or whose `ended_at` precedes the
+/// `ending_at` it supposedly supersedes, or whose cause this build cannot
+/// classify, loses `clean` and reports *why* in [`PreviousShutdownVerdict::detail`].
+fn classify_previous_shutdown(previous: &RunRecord) -> PreviousShutdownVerdict {
+    let ended_reason = previous
+        .ended_reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|reason| !reason.is_empty());
+    let cause_class = ended_reason.map(classify_exit_cause);
+    let marker_present = previous.ending_at_unix_ms.is_some();
+
+    let mut contradictions: Vec<String> = Vec::new();
+    match (previous.ended_at_unix_ms, ended_reason) {
+        (Some(ended_at), None) => contradictions.push(format!(
+            "ended_at_unix_ms={ended_at} was finalized with no ended_reason naming the cause"
+        )),
+        (None, Some(reason)) => contradictions.push(format!(
+            "ended_reason={reason} was recorded with no ended_at_unix_ms finalizing it"
+        )),
+        _ => {}
+    }
+    if cause_class == Some(ExitCauseClass::Unrecognized)
+        && let Some(reason) = ended_reason
+    {
+        contradictions.push(format!(
+            "ended_reason={reason} is not a terminal cause this build can classify"
+        ));
+    }
+    if let (Some(ended_at), Some(ending_at)) =
+        (previous.ended_at_unix_ms, previous.ending_at_unix_ms)
+        && ended_at < ending_at
+    {
+        contradictions.push(format!(
+            "ended_at_unix_ms={ended_at} precedes the ending_at_unix_ms={ending_at} it supersedes"
+        ));
+    }
+
+    let finalized_graceful =
+        previous.ended_at_unix_ms.is_some() && cause_class == Some(ExitCauseClass::Graceful);
+    let verdict = if finalized_graceful && contradictions.is_empty() {
+        PREVIOUS_SHUTDOWN_CLEAN
+    } else if marker_present {
+        PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL
+    } else {
+        PREVIOUS_SHUTDOWN_DIRTY
+    };
+
+    let basis = match (verdict, cause_class) {
+        (PREVIOUS_SHUTDOWN_CLEAN, _) => {
+            "the exit record was finalized and its cause names a completed drain"
+        }
+        (PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL, Some(ExitCauseClass::Graceful)) => {
+            "a close was commanded and its finalization is contradicted by its own fields"
+        }
+        (PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL, Some(_)) => {
+            "a close was commanded and then ended by a forced/abnormal cause before it finished"
+        }
+        (PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL, None) => {
+            "a close was commanded and no exit record finalized it"
+        }
+        (_, Some(_)) => "no close was ever commanded and the run ended by a forced/abnormal cause",
+        (_, None) => "no close was ever commanded and no exit record finalized the run",
+    };
+    let detail = format!(
+        "basis={basis}; ended_at_unix_ms={} ended_reason={} ended_cause_class={} ending_marker={} ending_reason={} ending_phase={} contradictions={}",
+        previous
+            .ended_at_unix_ms
+            .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        ended_reason.unwrap_or("none"),
+        cause_class.map_or("none", |class| match class {
+            ExitCauseClass::Graceful => "graceful",
+            ExitCauseClass::Forced => "forced",
+            ExitCauseClass::Unrecognized => "unrecognized",
+        }),
+        if marker_present { "present" } else { "absent" },
+        previous.ending_reason.as_deref().unwrap_or("none"),
+        previous.ending_phase.as_deref().unwrap_or("none"),
+        if contradictions.is_empty() {
+            "none".to_owned()
+        } else {
+            contradictions.join(" | ")
+        }
+    );
+    PreviousShutdownVerdict { verdict, detail }
+}
 // These files live inside the vault directory, so their names are owned by
 // `synapse_calyx::vault_runtime`: a vault backup must exclude exactly this set
 // by name (they are the running process's state, never vault data) and the two
@@ -149,6 +350,12 @@ struct RunRecord {
     /// change do not carry them and must still deserialize.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_shutdown: Option<String>,
+    /// The evidence the verdict above was derived from, and every contradiction
+    /// found while deriving it (#2131). A rollup that cannot be audited against
+    /// the record it summarizes is how `clean` came to sit beside
+    /// `ended_reason="http_shutdown_watchdog_expired"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_shutdown_detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     previous_run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -646,6 +853,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
         ended_at_unix_ms: None,
         ended_reason: None,
         previous_shutdown: None,
+        previous_shutdown_detail: None,
         previous_run_id: None,
         previous_ended_reason: None,
         previous_ended_at_unix_ms: None,
@@ -707,6 +915,8 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             match previous_run.as_ref() {
                 None => {
                     run.previous_shutdown = Some(PREVIOUS_SHUTDOWN_NONE.to_owned());
+                    run.previous_shutdown_detail =
+                        Some("basis=no previous run record exists on this vault".to_owned());
                 }
                 Some(previous) => {
                     run.previous_run_id = Some(previous.run_id.clone());
@@ -715,24 +925,23 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     run.previous_ending_reason = previous.ending_reason.clone();
                     run.previous_ending_phase = previous.ending_phase.clone();
                     run.previous_ending_at_unix_ms = previous.ending_at_unix_ms;
-                    // Three-way, not two-way (#2100). `ended` beats `ending`:
-                    // a finalized record is the whole truth and the marker it
-                    // supersedes is only how that close began.
-                    run.previous_shutdown = Some(
-                        if previous.ended_at_unix_ms.is_some() {
-                            PREVIOUS_SHUTDOWN_CLEAN
-                        } else if previous.ending_at_unix_ms.is_some() {
-                            PREVIOUS_SHUTDOWN_INTERRUPTED_GRACEFUL
-                        } else {
-                            PREVIOUS_SHUTDOWN_DIRTY
-                        }
-                        .to_owned(),
-                    );
+                    // #2100 made this three-way; #2131 made it read the whole
+                    // record instead of one field. `ended_at` alone is NOT the
+                    // discriminator: the watchdog writes it on its way to
+                    // killing a close. See `classify_previous_shutdown`.
+                    let decided = classify_previous_shutdown(previous);
+                    run.previous_shutdown = Some(decided.verdict.to_owned());
+                    run.previous_shutdown_detail = Some(decided.detail);
                 }
             }
 
+            // #2131: keyed off the verdict, not off `ended_at_unix_ms`. A
+            // watchdog-killed close DOES carry `ended_at`, and gating the
+            // append-only forensic event on that field is what let the loudest
+            // evidence of an unclean stop go unwritten for exactly the stops
+            // that most needed it.
             if let Some(previous) = previous_run.as_ref()
-                && previous.ended_at_unix_ms.is_none()
+                && run.previous_shutdown.as_deref() != Some(PREVIOUS_SHUTDOWN_CLEAN)
             {
                 append_bounded_json_line(
                 Path::new(&paths.exit_events_path),
@@ -743,6 +952,10 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     event_kind: "previous_run_unclean".to_owned(),
                     cause: if previous.ending_at_unix_ms.is_some() {
                         "killed_during_commanded_close"
+                    } else if previous.ended_at_unix_ms.is_some() {
+                        // #2131: finalized, but by a cause that names a kill or
+                        // an abort, with nothing proving a close was commanded.
+                        "ended_by_forced_cause_without_commanded_close"
                     } else {
                         "process_missing_on_startup"
                     }
@@ -750,7 +963,8 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
                     detail: json!({
                         "new_pid": std::process::id(),
                         "new_run_id": run.run_id.clone(),
-                        "reason": "daemon-run-current had no ended_at_unix_ms when this daemon acquired the DB lock",
+                        "reason": "daemon-run-current did not prove a completed graceful close when this daemon acquired the DB lock",
+                        "previous_shutdown_detail": run.previous_shutdown_detail.clone(),
                         // #2100: the phase-one marker, carried into the
                         // append-only ledger as well as onto the run record, so
                         // the evidence survives even if the successor's record
@@ -804,6 +1018,10 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             paths.run_current_path
         )
     })?;
+    let previous_shutdown_detail = run
+        .previous_shutdown_detail
+        .clone()
+        .unwrap_or_else(|| "unrecorded".to_owned());
     let previous_run_id = run.previous_run_id.clone();
     let previous_ended_reason = run.previous_ended_reason.clone();
     let previous_ended_at_unix_ms = run.previous_ended_at_unix_ms;
@@ -847,6 +1065,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             previous_run_id = previous_run_id.as_deref().unwrap_or("<none>"),
             previous_ended_reason = previous_ended_reason.as_deref().unwrap_or("<none>"),
             previous_ended_at_unix_ms,
+            previous_shutdown_detail = %previous_shutdown_detail,
             run_id = %run_id,
             run_current_path = %paths.run_current_path,
             exit_events_path = %paths.exit_events_path,
@@ -867,12 +1086,13 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             previous_ending_reason = previous_ending_reason.as_deref().unwrap_or("<none>"),
             previous_ending_phase = previous_ending_phase.as_deref().unwrap_or("<none>"),
             previous_ending_at_unix_ms,
+            previous_shutdown_detail = %previous_shutdown_detail,
             run_id = %run_id,
             run_current_path = %paths.run_current_path,
             exit_events_path = %paths.exit_events_path,
             "previous daemon run was commanded to shut down, wrote its phase-one ending marker, and \
-             died before finalizing the exit record; this is an interrupted graceful close, not a \
-             crash while running"
+             did not prove the close finished; this is an interrupted graceful close, not a crash \
+             while running and not a clean stop"
         );
     } else {
         tracing::info!(
@@ -881,6 +1101,7 @@ pub(crate) fn configure(config: DaemonLifecycleConfig) -> anyhow::Result<DaemonL
             previous_run_id = previous_run_id.as_deref().unwrap_or("<none>"),
             previous_ended_reason = previous_ended_reason.as_deref().unwrap_or("<none>"),
             previous_ended_at_unix_ms,
+            previous_shutdown_detail = %previous_shutdown_detail,
             run_id = %run_id,
             run_current_path = %paths.run_current_path,
             "previous daemon shutdown verdict decided at boot"
@@ -1440,6 +1661,34 @@ pub(crate) fn current_run_id() -> Option<String> {
     let slot = state_slot();
     let guard = slot.lock().ok()?;
     guard.as_ref().map(|state| state.run.run_id.clone())
+}
+
+/// This run's phase-one shutdown marker as `(ending_at_unix_ms, reason, phase)`,
+/// read from memory without ever blocking (#2131).
+///
+/// The HTTP shutdown watchdog calls this from its own thread, while the drain it
+/// is supervising may be holding locks anywhere. `try_lock` is therefore the
+/// contract, not an optimization: a watchdog that could block on the lifecycle
+/// state would be a watchdog that can hang, which defeats the only job it has.
+/// `None` means "not knowable right now" and is reported as such.
+pub(crate) fn current_exit_intent_snapshot() -> Option<(u64, String, String)> {
+    let slot = state_slot();
+    let guard = slot.try_lock().ok()?;
+    let state = guard.as_ref()?;
+    let ending_at = state.run.ending_at_unix_ms?;
+    Some((
+        ending_at,
+        state
+            .run
+            .ending_reason
+            .clone()
+            .unwrap_or_else(|| "unrecorded".to_owned()),
+        state
+            .run
+            .ending_phase
+            .clone()
+            .unwrap_or_else(|| "unrecorded".to_owned()),
+    ))
 }
 
 pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolUsageTelemetry {
@@ -2657,8 +2906,17 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         .as_deref()
         .unwrap_or("none");
     let previous_ending_phase = state.run.previous_ending_phase.as_deref().unwrap_or("none");
+    // #2131: the rollup and the evidence it was derived from travel together.
+    // The detail is quoted because it contains spaces; `previous_shutdown=` is
+    // still a single token so the -Start readback regex keeps working.
+    let previous_shutdown_detail = state
+        .run
+        .previous_shutdown_detail
+        .as_deref()
+        .unwrap_or("unrecorded")
+        .replace('"', "'");
     format!(
-        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} previous_shutdown={} previous_run_id={} previous_ended_reason={} previous_ending_reason={} previous_ending_phase={} last_error={}",
+        "run_id={} pid={} run_current_path={} tool_last_path={} tool_events_path={} exit_events_path={} in_flight_count={} tool_ledger={} exit_ledger={} previous_shutdown={} previous_run_id={} previous_ended_reason={} previous_ending_reason={} previous_ending_phase={} previous_shutdown_detail=\"{}\" last_error={}",
         state.run.run_id,
         state.run.pid,
         state.paths.run_current_path,
@@ -2673,6 +2931,7 @@ fn health_detail_for_state(state: &DaemonLifecycleState) -> String {
         previous_ended_reason,
         previous_ending_reason,
         previous_ending_phase,
+        previous_shutdown_detail,
         last_error
     )
 }

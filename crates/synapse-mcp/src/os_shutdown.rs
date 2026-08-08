@@ -308,6 +308,30 @@ fn budget_for(action: u32, documented_default_ms: u32) -> Duration {
 /// The bounded drain. Never returns — it either exits the process after the
 /// ordered drain, or (for a second concurrent trigger) parks until the OS ends
 /// the process, because two concurrent drains over one vault is worse than one.
+/// The `ended_reason` for an OS-triggered drain that did **not** get the vault
+/// closed (#2131).
+///
+/// One static per trigger rather than a formatted string, because
+/// `record_os_shutdown_exit` takes a `&'static str` cause — the lifecycle ledger
+/// deliberately admits only compile-time-known causes so the boot verdict's
+/// classification table can be exhaustive. Every value here ends in
+/// `_vault_not_closed`, which is the suffix
+/// `daemon_lifecycle::classify_exit_cause` reads as a forced exit.
+#[cfg(windows)]
+fn os_shutdown_cause_vault_not_closed(trigger: &'static str) -> &'static str {
+    match trigger {
+        "os_console_close" => "os_console_close_vault_not_closed",
+        "os_window_close" => "os_window_close_vault_not_closed",
+        "os_logoff" => "os_logoff_vault_not_closed",
+        "os_shutdown" => "os_shutdown_vault_not_closed",
+        "os_session_end" => "os_session_end_vault_not_closed",
+        // Unreachable for the five call sites in this module. Deliberately not
+        // the bare trigger: an unmapped trigger reaching here must not be able
+        // to buy a `clean` verdict by falling through.
+        _ => "os_unknown_trigger_vault_not_closed",
+    }
+}
+
 #[cfg(windows)]
 fn run_bounded_drain(trigger: &'static str, budget: Duration) -> ! {
     if DRAIN_STARTED.swap(true, Ordering::SeqCst) {
@@ -446,9 +470,36 @@ fn run_bounded_drain(trigger: &'static str, budget: Duration) -> ! {
     drop(m3_state);
 
     // --- 3. graceful lifecycle exit record ----------------------------------
+    //
+    // #2131: the trigger name is only the whole truth when the vault actually
+    // closed. This drain records an exit for every outcome — including the ones
+    // where the m3 lock never came free, the close returned an error, or no
+    // context was ever registered — and the boot verdict reads `ended_reason`
+    // to decide `clean`. Naming the bare trigger in those cases would recreate
+    // the exact defect #2131 exists to remove one layer down: a rollup that
+    // says "clean" while the completion map beside it says the vault was never
+    // closed. So a partial drain gets a distinct, unmistakable cause.
+    let vault_closed = vault_status == "closed" || vault_status == "storage_owner_already_released";
+    let recorded_cause = if vault_closed {
+        trigger
+    } else {
+        os_shutdown_cause_vault_not_closed(trigger)
+    };
+    if !vault_closed {
+        tracing::error!(
+            code = "MCP_DAEMON_OS_SHUTDOWN_VAULT_NOT_CLOSED",
+            trigger,
+            recorded_cause,
+            vault_status = %vault_status,
+            "the OS shutdown drain did not get the Calyx vault closed; the exit record names a \
+             vault_not_closed cause so the next boot cannot read this stop as clean"
+        );
+    }
     let record_detail = json!({
         "source": "os_shutdown_handler",
         "trigger": trigger,
+        "recorded_cause": recorded_cause,
+        "vault_closed": vault_closed,
         "budget_ms": budget.as_millis(),
         "elapsed_ms_at_record": started.elapsed().as_millis(),
         "completed": {
@@ -465,7 +516,7 @@ fn run_bounded_drain(trigger: &'static str, budget: Duration) -> ! {
         },
     });
     let record_result = crate::daemon_lifecycle::record_os_shutdown_exit(
-        trigger,
+        recorded_cause,
         record_detail,
         deadline.min(Instant::now() + Duration::from_millis(1500)),
     );
@@ -474,8 +525,11 @@ fn run_bounded_drain(trigger: &'static str, budget: Duration) -> ! {
             tracing::warn!(
                 code = "MCP_DAEMON_OS_SHUTDOWN_EXIT_RECORD_WRITTEN",
                 trigger,
+                recorded_cause,
+                vault_closed,
                 elapsed_ms = started.elapsed().as_millis(),
-                "graceful lifecycle exit record written with ended_reason naming the OS trigger"
+                "lifecycle exit record written with ended_reason naming the OS trigger, and \
+                 whether the vault actually closed under it"
             );
             true
         }
