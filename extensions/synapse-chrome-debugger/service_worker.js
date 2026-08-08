@@ -2685,6 +2685,7 @@ chrome.tabs.onCreated.addListener((tab) => {
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
   recordTabRemovedForPageEvents(tabId);
+  forgetCdpDomainsForTab(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   BINDING_DEBUGGER_SESSIONS.delete(tabId);
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
@@ -2701,6 +2702,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 if (chrome.debugger?.onDetach?.addListener) {
   chrome.debugger.onDetach.addListener((source, reason) => {
     if (Number.isInteger(source?.tabId)) {
+      // Detach resets every domain on the target; drop the ledger so a later attach
+      // re-enables from a known-clean state instead of trusting stale ownership.
+      forgetCdpDomainsForTab(source.tabId);
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
       markBindingDebuggerDetached(source.tabId);
       markDialogDebuggerDetached(source.tabId);
@@ -3477,7 +3481,7 @@ async function handleInitScript(params) {
       } else {
         temporaryRemoveAttachment = await attachDebuggerForCommand(selected.tabId, protocolVersion);
         debuggee = temporaryRemoveAttachment.debuggee;
-        await sendDebuggerCommand(debuggee, "Page.enable", {});
+        await acquireCdpDomain(debuggee, "Page", CDP_OWNER_TRANSIENT);
       }
       await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
         identifier
@@ -3506,6 +3510,15 @@ async function handleInitScript(params) {
       `chrome.debugger initScript ${operation} failed for tab ${selected.tabId}: ${errorMessage(error)}`
     );
   } finally {
+    if (temporaryRemoveAttachment) {
+      try {
+        await settleTransientCdpDomains(temporaryRemoveAttachment);
+      } catch (error) {
+        console.error(
+          `Synapse initScript remove left CDP domains enabled on tab ${selected.tabId}: ${errorMessage(error)}`
+        );
+      }
+    }
     if (temporaryRemoveAttachment?.shouldDetach) {
       try {
         await chrome.debugger.detach(temporaryRemoveAttachment.debuggee);
@@ -12655,6 +12668,172 @@ async function recordUnresolvedDebuggerCommandTimeout(
   }
 }
 
+// Four persistent features (init scripts, bindings, dialogs, file choosers) share a
+// single chrome.debugger attachment per tab. The attachment was already refcounted
+// across them through persistentDebuggerSessionIsAttached(), but domain enablement
+// was tracked as per-feature booleans with no disable path anywhere in the extension.
+// A domain enabled for feature A therefore stayed enabled after A released whenever
+// feature B still held the attachment. An enabled Runtime domain is directly
+// observable from page JavaScript, so a released binding left every later page on
+// that tab flagged as automated. Domains are refcounted here by owner so each one is
+// disabled the moment its last owner releases, independently of the attachment.
+const CDP_DOMAIN_OWNERS = new Map();
+
+const CDP_OWNER_INIT_SCRIPT = "initScript";
+const CDP_OWNER_BINDING = "binding";
+const CDP_OWNER_DIALOG = "dialog";
+const CDP_OWNER_FILE_CHOOSER = "fileChooser";
+// One-shot commands that borrow a tab's attachment. attachDebuggerForCommand()
+// reuses a persistent session when one exists, so a one-shot enable can land on a
+// session that outlives the command; this owner is released the moment the command
+// finishes whenever the attachment was borrowed rather than created.
+const CDP_OWNER_TRANSIENT = "transientCommand";
+
+function cdpDomainOwnerSet(tabId, domain, create = false) {
+  let byDomain = CDP_DOMAIN_OWNERS.get(tabId);
+  if (!byDomain) {
+    if (!create) {
+      return null;
+    }
+    byDomain = new Map();
+    CDP_DOMAIN_OWNERS.set(tabId, byDomain);
+  }
+  let owners = byDomain.get(domain);
+  if (!owners) {
+    if (!create) {
+      return null;
+    }
+    owners = new Set();
+    byDomain.set(domain, owners);
+  }
+  return owners;
+}
+
+function cdpDomainIsEnabled(tabId, domain) {
+  return Boolean(cdpDomainOwnerSet(tabId, domain)?.size);
+}
+
+function cdpTabHasAnyDomainOwner(tabId) {
+  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
+  if (!byDomain) {
+    return false;
+  }
+  for (const owners of byDomain.values()) {
+    if (owners.size) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function cdpDomainLedgerSnapshot(tabId) {
+  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
+  const snapshot = {};
+  if (!byDomain) {
+    return snapshot;
+  }
+  for (const [domain, owners] of byDomain.entries()) {
+    if (owners.size) {
+      snapshot[domain] = Array.from(owners).sort();
+    }
+  }
+  return snapshot;
+}
+
+async function acquireCdpDomain(debuggee, domain, ownerId) {
+  const tabId = debuggee?.tabId;
+  if (!Number.isInteger(tabId)) {
+    throw new Error(`acquireCdpDomain requires an integer tabId, received ${String(tabId)}`);
+  }
+  const owners = cdpDomainOwnerSet(tabId, domain, true);
+  if (owners.has(ownerId)) {
+    return false;
+  }
+  const alreadyEnabled = owners.size > 0;
+  if (!alreadyEnabled) {
+    // Enable before recording ownership so a failed enable never leaves the ledger
+    // claiming a domain that is not actually on.
+    await sendDebuggerCommand(debuggee, `${domain}.enable`, {});
+  }
+  owners.add(ownerId);
+  return !alreadyEnabled;
+}
+
+async function releaseCdpDomain(debuggee, domain, ownerId) {
+  const tabId = debuggee?.tabId;
+  if (!Number.isInteger(tabId)) {
+    throw new Error(`releaseCdpDomain requires an integer tabId, received ${String(tabId)}`);
+  }
+  const owners = cdpDomainOwnerSet(tabId, domain);
+  if (!owners?.delete(ownerId)) {
+    return false;
+  }
+  if (owners.size > 0) {
+    return false;
+  }
+  try {
+    await sendDebuggerCommand(debuggee, `${domain}.disable`, {});
+  } catch (error) {
+    // The domain is still enabled and therefore still observable from page JS.
+    // Restore ownership so the ledger keeps describing reality, then surface it.
+    owners.add(ownerId);
+    const detail = `Synapse failed to disable CDP domain ${domain} for tab ${tabId} released by ` +
+      `${ownerId}; domain remains enabled and observable to page scripts. ` +
+      `owners=${JSON.stringify(cdpDomainLedgerSnapshot(tabId))}: ${errorMessage(error)}`;
+    console.error(detail);
+    throw new Error(detail);
+  }
+  return true;
+}
+
+async function releaseCdpDomainsForOwner(debuggee, ownerId) {
+  const tabId = debuggee?.tabId;
+  const byDomain = CDP_DOMAIN_OWNERS.get(tabId);
+  if (!byDomain) {
+    return [];
+  }
+  const disabled = [];
+  const failures = [];
+  for (const domain of Array.from(byDomain.keys())) {
+    try {
+      if (await releaseCdpDomain(debuggee, domain, ownerId)) {
+        disabled.push(domain);
+      }
+    } catch (error) {
+      failures.push(errorMessage(error));
+    }
+  }
+  if (failures.length) {
+    throw new Error(
+      `Synapse CDP domain release failed for owner ${ownerId} on tab ${tabId}: ${failures.join("; ")}`
+    );
+  }
+  return disabled;
+}
+
+// A detach resets every domain on the target, so the ledger is dropped without
+// issuing disable commands against a session that no longer exists.
+function forgetCdpDomainsForTab(tabId) {
+  return CDP_DOMAIN_OWNERS.delete(tabId);
+}
+
+// Settles the domains a one-shot command enabled on a borrowed attachment. When the
+// command owns the attachment the following detach clears every domain, so the
+// ledger is simply dropped; when the attachment was borrowed from a persistent
+// session the transient domains must be disabled explicitly or they outlive the
+// command on a session that keeps running.
+async function settleTransientCdpDomains(attachment) {
+  const tabId = attachment?.debuggee?.tabId;
+  if (!Number.isInteger(tabId)) {
+    return;
+  }
+  if (attachment.shouldDetach) {
+    forgetCdpDomainsForTab(tabId);
+    return;
+  }
+  await releaseCdpDomainsForOwner(attachment.debuggee, CDP_OWNER_TRANSIENT);
+}
+
 async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
   const debuggee = { tabId };
   if (persistentDebuggerSessionIsAttached(tabId)) {
@@ -12695,11 +12874,11 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
 }
 
 async function ensureInitScriptPageDomainEnabled(debuggee, session) {
-  if (!session || session.pageEnabled) {
+  if (!session) {
     return;
   }
-  await sendDebuggerCommand(debuggee, "Page.enable", {});
-  session.pageEnabled = true;
+  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_INIT_SCRIPT);
+  session.pageEnabled = cdpDomainIsEnabled(debuggee.tabId, "Page");
 }
 
 async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier) {
@@ -12715,10 +12894,14 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
   }
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
   if (bindingSessionHasActiveNames(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
+    // Another feature still holds the attachment, so the session survives. Drop only
+    // this owner's domains rather than leaving Page enabled for a session that is gone.
+    await releaseCdpDomainsForOwner(debuggee, CDP_OWNER_INIT_SCRIPT);
     return false;
   }
   try {
     await chrome.debugger.detach(debuggee);
+    forgetCdpDomainsForTab(tabId);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
     markFileChooserDebuggerDetached(tabId, false);
@@ -12798,10 +12981,8 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  if (!session.runtimeEnabled) {
-    await sendDebuggerCommand(debuggee, "Runtime.enable", {});
-    session.runtimeEnabled = true;
-  }
+  await acquireCdpDomain(debuggee, "Runtime", CDP_OWNER_BINDING);
+  session.runtimeEnabled = cdpDomainIsEnabled(tabId, "Runtime");
   return { debuggee, session, newlyArmed, protocolVersion };
 }
 
@@ -12821,10 +13002,15 @@ async function addBindingToSession(debuggee, session, name, executionContextName
 
 async function detachBindingDebuggerSession(tabId, debuggee, session) {
   if (hasActiveInitScriptDebuggerSession(tabId) || dialogSessionIsActive(tabId) || fileChooserSessionIsActive(tabId)) {
+    // Another feature still holds the attachment, so the session survives. Runtime is
+    // disabled here rather than lingering until the unrelated owner finally detaches.
+    await releaseCdpDomainsForOwner(debuggee, CDP_OWNER_BINDING);
+    session.runtimeEnabled = cdpDomainIsEnabled(tabId, "Runtime");
     return false;
   }
   try {
     await chrome.debugger.detach(debuggee);
+    forgetCdpDomainsForTab(tabId);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
     markFileChooserDebuggerDetached(tabId, false);
@@ -12974,10 +13160,8 @@ async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  if (!session.pageEnabled) {
-    await sendDebuggerCommand(debuggee, "Page.enable", {});
-    session.pageEnabled = true;
-  }
+  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_DIALOG);
+  session.pageEnabled = cdpDomainIsEnabled(tabId, "Page");
   return { debuggee, session, newlyArmed, protocolVersion };
 }
 
@@ -13452,6 +13636,18 @@ async function operatorPanicWithDebugger(tabId, operation) {
     attachment = await attachDebuggerForCommand(tabId);
     return await operation(attachment.debuggee);
   } finally {
+    if (attachment) {
+      try {
+        // releaseCdpDomain already logs the offending domain and owner set; a failure
+        // here means a domain stayed enabled, so it must never pass silently. It is
+        // not rethrown because the panic readback is the verdict for this path.
+        await settleTransientCdpDomains(attachment);
+      } catch (error) {
+        console.error(
+          `Synapse operator panic left CDP domains enabled on tab ${tabId}: ${errorMessage(error)}`
+        );
+      }
+    }
     if (attachment?.shouldDetach) {
       try {
         await chrome.debugger.detach(attachment.debuggee);
@@ -13657,7 +13853,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const { tabId, identifier } of Array.from(DURABLE_OWNER_LEDGER.initScripts)) {
     try {
       await operatorPanicWithDebugger(tabId, async (debuggee) => {
-        await sendDebuggerCommand(debuggee, "Page.enable", {});
+        await acquireCdpDomain(debuggee, "Page", CDP_OWNER_TRANSIENT);
         await sendDebuggerCommand(debuggee, "Page.removeScriptToEvaluateOnNewDocument", {
           identifier
         });
@@ -13723,7 +13919,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const { tabId, name } of Array.from(DURABLE_OWNER_LEDGER.bindings)) {
     try {
       await operatorPanicWithDebugger(tabId, async (debuggee) => {
-        await sendDebuggerCommand(debuggee, "Runtime.enable", {});
+        await acquireCdpDomain(debuggee, "Runtime", CDP_OWNER_TRANSIENT);
         await sendDebuggerCommand(debuggee, "Runtime.removeBinding", { name });
       });
       BINDING_DEBUGGER_SESSIONS.get(tabId)?.activeNames?.delete(name);
@@ -14182,10 +14378,8 @@ async function ensureFileChooserDebuggerSession(tabId, intercept, protocolVersio
     newlyArmed = true;
     await recordLedgerDebuggerTab(tabId);
   }
-  if (!session.pageEnabled) {
-    await sendDebuggerCommand(debuggee, "Page.enable", {});
-    session.pageEnabled = true;
-  }
+  await acquireCdpDomain(debuggee, "Page", CDP_OWNER_FILE_CHOOSER);
+  session.pageEnabled = cdpDomainIsEnabled(tabId, "Page");
   if (intercept && !session.interceptEnabled) {
     await sendDebuggerCommand(debuggee, "Page.setInterceptFileChooserDialog", { enabled: true });
     session.interceptEnabled = true;
