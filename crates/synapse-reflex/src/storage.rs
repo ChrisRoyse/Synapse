@@ -612,28 +612,20 @@ impl ReflexRuntime {
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the profile CF cannot be scanned.
+    /// Returns a storage error when the exact profile row cannot be read.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", key_len = key.len()))]
     pub fn storage_profile_row(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-        Ok(self
-            .db
-            .scan_cf(cf::CF_PROFILES)?
-            .into_iter()
-            .find_map(|(row_key, value)| (row_key == key).then_some(value)))
+        self.db.get_cf(cf::CF_PROFILES, key)
     }
 
     /// Returns one exact local registry key-value row by key.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the key-value CF cannot be scanned.
+    /// Returns a storage error when the exact key-value row cannot be read.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime", key_len = key.len()))]
     pub fn storage_kv_row(&self, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
-        Ok(self
-            .db
-            .scan_cf(cf::CF_KV)?
-            .into_iter()
-            .find_map(|(row_key, value)| (row_key == key).then_some(value)))
+        self.db.get_cf(cf::CF_KV, key)
     }
 
     /// Runs one row-cap storage GC pass for operator diagnostics.
