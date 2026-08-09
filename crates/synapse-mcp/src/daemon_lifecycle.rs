@@ -15,6 +15,19 @@ use serde_json::{Value, json};
 use synapse_core::SubsystemHealth;
 
 const SCHEMA_VERSION: u32 = 1;
+/// Schema version for records in `daemon-tool-events.jsonl`.
+///
+/// Version 2 added the typed `terminal_error` projection but still serialized
+/// the raw RMCP error beside it. Version 3 persists the projection only, so a
+/// rejected argument echoed by a deserializer cannot enter the lifecycle
+/// ledger. The outer run/exit records keep their independent v1 schema:
+/// changing one ledger must not silently relabel every other lifecycle record.
+const TOOL_EVENT_SCHEMA_VERSION: u32 = 3;
+const TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION: u32 = 1;
+const MAX_CANONICAL_ERROR_CODE_BYTES: usize = 128;
+const TOOL_SURFACE_SHA256_BYTES: usize = 71;
+const MAX_TOOL_USAGE_DECODE_ERRORS: usize = 32;
+const MAX_ERROR_CODES_PER_AGGREGATE: usize = 32;
 
 /// Boot-time verdict on how the previous run of this vault ended (#2083).
 ///
@@ -415,6 +428,25 @@ pub struct ToolUsageAggregate {
     pub max_duration_ms: u64,
     pub latest_status: String,
     pub latest_error_code: Option<String>,
+    pub distinct_error_code_count: usize,
+    pub error_code_counts_truncated: bool,
+    pub error_code_counts: Vec<ToolUsageErrorCodeCount>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUsageErrorCodeCount {
+    pub error_code: String,
+    pub count: u64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ToolUsageDecodeError {
+    pub segment: String,
+    pub line: usize,
+    pub code: String,
+    pub detail: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -424,11 +456,52 @@ pub struct ToolUsageTelemetry {
     pub max_rows: usize,
     pub rows_scanned: usize,
     pub segment_count: usize,
+    pub terminal_error_projection_schema_version: u32,
+    pub canonical_terminal_error_rows: usize,
+    pub compatibility_terminal_error_rows: usize,
+    pub decode_error_total: usize,
+    pub decode_errors_truncated: bool,
+    pub decode_errors: Vec<ToolUsageDecodeError>,
+    pub aggregate_count: usize,
+    pub aggregates_truncated: bool,
+    pub max_error_codes_per_aggregate: usize,
     pub aggregates: Vec<ToolUsageAggregate>,
     pub read_error: Option<String>,
 }
 
 type ToolUsageKey = (String, Option<String>, Option<String>, Option<String>);
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TerminalErrorProjection {
+    schema_version: u32,
+    facade: String,
+    operation: Option<String>,
+    route_id: Option<String>,
+    status: String,
+    error_code: String,
+    duration_ms: u64,
+    profile: Option<String>,
+    tool_surface_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalErrorDecodeSource {
+    Canonical,
+    Compatibility,
+}
+
+#[derive(Clone, Debug)]
+struct ToolUsageAccumulator {
+    aggregate: ToolUsageAggregate,
+    error_code_counts: BTreeMap<String, u64>,
+}
+
+#[derive(Clone, Debug)]
+struct ToolUsageDecodeFailure {
+    code: &'static str,
+    detail: String,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ToolEvent {
@@ -472,6 +545,8 @@ struct ToolEvent {
     effective_target: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    terminal_error: Option<TerminalErrorProjection>,
     #[serde(skip_serializing_if = "Option::is_none")]
     panic: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1152,7 +1227,7 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
     state.seq = state.seq.saturating_add(1);
     let seq = state.seq;
     let event = ToolEvent {
-        schema_version: SCHEMA_VERSION,
+        schema_version: TOOL_EVENT_SCHEMA_VERSION,
         run_id: state.run.run_id.clone(),
         pid: state.run.pid,
         seq,
@@ -1176,6 +1251,7 @@ pub(crate) fn begin_tool_call(start: ToolCallStart) -> anyhow::Result<ToolCallGu
         session_target_read_error: start.session_target_read_error,
         effective_target: None,
         error: None,
+        terminal_error: None,
         panic: None,
         detail: None,
     };
@@ -1206,7 +1282,7 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
     let seq = state.seq;
     let recorded_at_unix_ms = now_unix_ms();
     let event = ToolEvent {
-        schema_version: SCHEMA_VERSION,
+        schema_version: TOOL_EVENT_SCHEMA_VERSION,
         run_id: state.run.run_id.clone(),
         pid: state.run.pid,
         seq,
@@ -1230,6 +1306,7 @@ pub(crate) fn record_context_event(input: ContextEvent) -> anyhow::Result<u64> {
         session_target_read_error: None,
         effective_target: None,
         error: None,
+        terminal_error: None,
         panic: None,
         detail: Some(input.detail),
     };
@@ -1691,33 +1768,505 @@ pub(crate) fn current_exit_intent_snapshot() -> Option<(u64, String, String)> {
     ))
 }
 
+fn tool_usage_empty(
+    source_of_truth: String,
+    max_rows: usize,
+    read_error: Option<String>,
+) -> ToolUsageTelemetry {
+    ToolUsageTelemetry {
+        source_of_truth,
+        max_rows,
+        rows_scanned: 0,
+        segment_count: 0,
+        terminal_error_projection_schema_version: TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION,
+        canonical_terminal_error_rows: 0,
+        compatibility_terminal_error_rows: 0,
+        decode_error_total: 0,
+        decode_errors_truncated: false,
+        decode_errors: Vec::new(),
+        aggregate_count: 0,
+        aggregates_truncated: false,
+        max_error_codes_per_aggregate: MAX_ERROR_CODES_PER_AGGREGATE,
+        aggregates: Vec::new(),
+        read_error,
+    }
+}
+
+fn tool_usage_decode_failure(
+    code: &'static str,
+    detail: impl Into<String>,
+) -> ToolUsageDecodeFailure {
+    ToolUsageDecodeFailure {
+        code,
+        detail: detail.into(),
+    }
+}
+
+fn validate_bounded_projection_field(
+    field: &'static str,
+    value: Option<&str>,
+    max_bytes: usize,
+) -> Result<(), ToolUsageDecodeFailure> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if value.is_empty() || value.len() > max_bytes {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_PROJECTION_FIELD_OUT_OF_BOUNDS",
+            format!(
+                "field={field} byte_length={} allowed=1..={max_bytes}",
+                value.len()
+            ),
+        ));
+    }
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_' || byte == b'.'
+    }) {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_PROJECTION_FIELD_INVALID",
+            format!(
+                "field={field} must contain only lowercase ASCII letters, digits, underscore, or dot"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_canonical_error_code(code: &str) -> Result<(), ToolUsageDecodeFailure> {
+    if code.is_empty() || code.len() > MAX_CANONICAL_ERROR_CODE_BYTES {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_ERROR_CODE_OUT_OF_BOUNDS",
+            format!(
+                "canonical error-code byte_length={} allowed=1..={MAX_CANONICAL_ERROR_CODE_BYTES}",
+                code.len()
+            ),
+        ));
+    }
+    if !code
+        .bytes()
+        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+        || !code.as_bytes()[0].is_ascii_uppercase()
+    {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_ERROR_CODE_INVALID",
+            "canonical error code must start with an uppercase ASCII letter and contain only uppercase ASCII letters, digits, or underscore",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_surface_sha256(value: Option<&str>) -> Result<(), ToolUsageDecodeFailure> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TOOL_SURFACE_SHA256_INVALID",
+            "tool_surface_sha256 must use the canonical sha256:<64 lowercase hex digits> form",
+        ));
+    };
+    if value.len() != TOOL_SURFACE_SHA256_BYTES
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TOOL_SURFACE_SHA256_INVALID",
+            format!(
+                "tool_surface_sha256 byte_length={} required={TOOL_SURFACE_SHA256_BYTES}; digest must contain exactly 64 lowercase hex digits",
+                value.len()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_error_code_from_error(error: &Value) -> Result<String, ToolUsageDecodeFailure> {
+    fn codes_at_paths<'a>(
+        error: &'a Value,
+        paths: &[(&'static str, &'static str)],
+    ) -> Result<Vec<(&'static str, &'a str)>, ToolUsageDecodeFailure> {
+        let mut present = Vec::new();
+        for (label, pointer) in paths {
+            let Some(value) = error.pointer(pointer).filter(|value| !value.is_null()) else {
+                continue;
+            };
+            let Some(code) = value.as_str() else {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_ERROR_CODE_TYPE_INVALID",
+                    format!("{label} is present but is not a string"),
+                ));
+            };
+            validate_canonical_error_code(code)?;
+            present.push((*label, code));
+        }
+        Ok(present)
+    }
+
+    // The v1 writer emitted both of these paths for the same canonical code.
+    // A `detail_code` beside them classifies a narrower internal cause and is
+    // deliberately not allowed to override the public error class.
+    let primary = codes_at_paths(
+        error,
+        &[
+            ("error.synapse_code", "/synapse_code"),
+            ("error.data.code", "/data/code"),
+        ],
+    )?;
+    // Explicit compatibility for pre-v1 writer shapes. This is reached only
+    // when neither canonical v1 path exists; it is not a precedence fallback.
+    let present = if primary.is_empty() {
+        codes_at_paths(
+            error,
+            &[
+                ("error.code", "/code"),
+                ("error.detail_code", "/detail_code"),
+                ("error.data.detail_code", "/data/detail_code"),
+            ],
+        )?
+    } else {
+        primary
+    };
+    let Some((_, canonical)) = present.first().copied() else {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_ERROR_CODE_MISSING",
+            "terminal error has no canonical code in any documented schema path",
+        ));
+    };
+    if present.iter().any(|(_, code)| *code != canonical) {
+        let path_list = present
+            .iter()
+            .map(|(path, _)| *path)
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_ERROR_CODE_MISMATCH",
+            format!("documented canonical-code paths disagree: {path_list}"),
+        ));
+    }
+    Ok(canonical.to_owned())
+}
+
+fn validate_terminal_error_projection(
+    event: &ToolEvent,
+    projection: &TerminalErrorProjection,
+) -> Result<(), ToolUsageDecodeFailure> {
+    if projection.schema_version != TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_ERROR_SCHEMA_UNSUPPORTED",
+            format!(
+                "terminal_error.schema_version={} supported={TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION}",
+                projection.schema_version
+            ),
+        ));
+    }
+    validate_bounded_projection_field("facade", Some(&projection.facade), 64)?;
+    validate_bounded_projection_field("operation", projection.operation.as_deref(), 64)?;
+    validate_bounded_projection_field("route_id", projection.route_id.as_deref(), 129)?;
+    validate_bounded_projection_field("profile", projection.profile.as_deref(), 32)?;
+    validate_canonical_error_code(&projection.error_code)?;
+    validate_tool_surface_sha256(projection.tool_surface_sha256.as_deref())?;
+    let payload_code = event
+        .error
+        .as_ref()
+        .map(canonical_error_code_from_error)
+        .transpose()?;
+    let projected_facade = projection.facade.as_str();
+    let event_tool = event.tool.as_str();
+    let routing_matches = projected_facade == event_tool
+        && projection.operation == event.operation
+        && projection.route_id == event.route_id;
+    let outcome_matches = projection.status == event.status
+        && payload_code
+            .as_deref()
+            .is_none_or(|payload_code| projection.error_code == payload_code)
+        && Some(projection.duration_ms) == event.duration_ms;
+    let context_matches = projection.profile == event.profile
+        && projection.tool_surface_sha256 == event.tool_surface_sha256;
+    if !(routing_matches && outcome_matches && context_matches) {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_ERROR_PROJECTION_MISMATCH",
+            "terminal_error projection disagrees with its enclosing tool event",
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_error_projection_for_writer(
+    event: &ToolEvent,
+) -> Result<Option<TerminalErrorProjection>, ToolUsageDecodeFailure> {
+    if event.event_kind != "tool_call" || event.status != "error" {
+        return Ok(None);
+    }
+    if event.schema_version != TOOL_EVENT_SCHEMA_VERSION {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_EVENT_SCHEMA_WRITE_INVALID",
+            format!(
+                "new terminal event schema_version={} required={TOOL_EVENT_SCHEMA_VERSION}",
+                event.schema_version
+            ),
+        ));
+    }
+    let duration_ms = event.duration_ms.ok_or_else(|| {
+        tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_DURATION_MISSING",
+            "status=error event is missing duration_ms",
+        )
+    })?;
+    let error = event.error.as_ref().ok_or_else(|| {
+        tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_ERROR_PAYLOAD_MISSING",
+            "status=error event is missing its structured error payload",
+        )
+    })?;
+    let projection = TerminalErrorProjection {
+        schema_version: TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION,
+        facade: event.tool.clone(),
+        operation: event.operation.clone(),
+        route_id: event.route_id.clone(),
+        status: event.status.clone(),
+        error_code: canonical_error_code_from_error(error)?,
+        duration_ms,
+        profile: event.profile.clone(),
+        tool_surface_sha256: event.tool_surface_sha256.clone(),
+    };
+    validate_terminal_error_projection(event, &projection)?;
+    Ok(Some(projection))
+}
+
+fn decode_tool_usage_line(
+    line: &str,
+) -> Result<
+    (
+        ToolEvent,
+        Option<(TerminalErrorProjection, TerminalErrorDecodeSource)>,
+    ),
+    ToolUsageDecodeFailure,
+> {
+    let value: Value = serde_json::from_str(line).map_err(|error| {
+        tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_JSON_INVALID",
+            format!(
+                "JSON decode failed at line {} column {}: {:?}",
+                error.line(),
+                error.column(),
+                error.classify()
+            ),
+        )
+    })?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            tool_usage_decode_failure(
+                "MCP_TOOL_USAGE_EVENT_SCHEMA_MISSING",
+                "lifecycle row has no unsigned integer schema_version",
+            )
+        })?;
+    if schema_version != 1
+        && schema_version != 2
+        && schema_version != u64::from(TOOL_EVENT_SCHEMA_VERSION)
+    {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_EVENT_SCHEMA_UNSUPPORTED",
+            format!(
+                "tool event schema_version={schema_version} supported=1,2,{TOOL_EVENT_SCHEMA_VERSION}"
+            ),
+        ));
+    }
+    let event: ToolEvent = serde_json::from_value(value).map_err(|error| {
+        tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_EVENT_SHAPE_INVALID",
+            format!("schema_version={schema_version} typed decode failed: {error}"),
+        )
+    })?;
+    if event.event_kind != "tool_call" || event.status == "started" {
+        return Ok((event, None));
+    }
+    if event.duration_ms.is_none() || event.finished_at_unix_ms.is_none() {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_TIMING_MISSING",
+            "terminal tool_call event is missing duration_ms or finished_at_unix_ms",
+        ));
+    }
+    match event.status.as_str() {
+        "ok" => {
+            if event.error.is_some() || event.panic.is_some() || event.terminal_error.is_some() {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_OK_EVENT_CONTRADICTED",
+                    "status=ok event carries error, panic, or terminal_error data",
+                ));
+            }
+            Ok((event, None))
+        }
+        "panic" => {
+            if event.panic.is_none() || event.error.is_some() || event.terminal_error.is_some() {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_PANIC_EVENT_CONTRADICTED",
+                    "status=panic event must carry panic data and no error projection",
+                ));
+            }
+            Ok((event, None))
+        }
+        "error" if schema_version == u64::from(TOOL_EVENT_SCHEMA_VERSION) => {
+            if event.error.is_some() {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_V3_RAW_ERROR_PRESENT",
+                    "v3 status=error event must persist terminal_error only, never the raw error payload",
+                ));
+            }
+            let projection = event.terminal_error.clone().ok_or_else(|| {
+                tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_TERMINAL_ERROR_PROJECTION_MISSING",
+                    "v3 status=error event has no terminal_error projection",
+                )
+            })?;
+            validate_terminal_error_projection(&event, &projection)?;
+            Ok((
+                event,
+                Some((projection, TerminalErrorDecodeSource::Canonical)),
+            ))
+        }
+        "error" if schema_version == 2 => {
+            let projection = event.terminal_error.clone().ok_or_else(|| {
+                tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_TERMINAL_ERROR_PROJECTION_MISSING",
+                    "v2 status=error event has no terminal_error projection",
+                )
+            })?;
+            if event.error.is_none() {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_V2_ERROR_PAYLOAD_MISSING",
+                    "v2 status=error compatibility row has no structured error payload",
+                ));
+            }
+            validate_terminal_error_projection(&event, &projection)?;
+            Ok((
+                event,
+                Some((projection, TerminalErrorDecodeSource::Compatibility)),
+            ))
+        }
+        "error" => {
+            let error = event.error.as_ref().ok_or_else(|| {
+                tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_TERMINAL_ERROR_PAYLOAD_MISSING",
+                    "v1 status=error event has no structured error payload",
+                )
+            })?;
+            let duration_ms = event.duration_ms.unwrap_or_default();
+            let projection = TerminalErrorProjection {
+                schema_version: TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION,
+                facade: event.tool.clone(),
+                operation: event.operation.clone(),
+                route_id: event.route_id.clone(),
+                status: event.status.clone(),
+                error_code: canonical_error_code_from_error(error)?,
+                duration_ms,
+                profile: event.profile.clone(),
+                tool_surface_sha256: event.tool_surface_sha256.clone(),
+            };
+            validate_terminal_error_projection(&event, &projection)?;
+            Ok((
+                event,
+                Some((projection, TerminalErrorDecodeSource::Compatibility)),
+            ))
+        }
+        status => Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_TERMINAL_STATUS_UNSUPPORTED",
+            format!("terminal tool_call status={status:?} is not ok, error, or panic"),
+        )),
+    }
+}
+
+fn push_tool_usage_decode_error(
+    errors: &mut Vec<ToolUsageDecodeError>,
+    total: &mut usize,
+    path: &Path,
+    line: usize,
+    failure: ToolUsageDecodeFailure,
+) {
+    *total = total.saturating_add(1);
+    if errors.len() >= MAX_TOOL_USAGE_DECODE_ERRORS {
+        return;
+    }
+    errors.push(ToolUsageDecodeError {
+        segment: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("<non-utf8-segment>")
+            .to_owned(),
+        line,
+        code: failure.code.to_owned(),
+        detail: failure.detail,
+    });
+}
+
+fn finalize_tool_usage_aggregates(
+    accumulators: BTreeMap<ToolUsageKey, ToolUsageAccumulator>,
+    max_aggregates: usize,
+) -> (Vec<ToolUsageAggregate>, usize, bool) {
+    let aggregate_count = accumulators.len();
+    let mut values = accumulators
+        .into_values()
+        .map(|mut accumulator| {
+            let distinct_error_code_count = accumulator.error_code_counts.len();
+            let mut error_code_counts = accumulator
+                .error_code_counts
+                .into_iter()
+                .map(|(error_code, count)| ToolUsageErrorCodeCount { error_code, count })
+                .collect::<Vec<_>>();
+            error_code_counts.sort_by(|left, right| {
+                right
+                    .count
+                    .cmp(&left.count)
+                    .then(left.error_code.cmp(&right.error_code))
+            });
+            error_code_counts.truncate(MAX_ERROR_CODES_PER_AGGREGATE);
+            accumulator.aggregate.distinct_error_code_count = distinct_error_code_count;
+            accumulator.aggregate.error_code_counts_truncated =
+                distinct_error_code_count > error_code_counts.len();
+            accumulator.aggregate.error_code_counts = error_code_counts;
+            accumulator.aggregate
+        })
+        .collect::<Vec<_>>();
+    values.sort_by(|left, right| {
+        right
+            .calls_total
+            .cmp(&left.calls_total)
+            .then(left.tool.cmp(&right.tool))
+            .then(left.operation.cmp(&right.operation))
+    });
+    values.truncate(max_aggregates);
+    let aggregates_truncated = aggregate_count > values.len();
+    (values, aggregate_count, aggregates_truncated)
+}
+
 pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolUsageTelemetry {
     let Some(paths) = current_paths() else {
-        return ToolUsageTelemetry {
-            source_of_truth: "daemon lifecycle ledger not configured".to_owned(),
+        return tool_usage_empty(
+            "daemon lifecycle ledger not configured".to_owned(),
             max_rows,
-            rows_scanned: 0,
-            segment_count: 0,
-            aggregates: Vec::new(),
-            read_error: Some("daemon lifecycle ledger not configured".to_owned()),
-        };
+            Some("daemon lifecycle ledger not configured".to_owned()),
+        );
     };
     let active = PathBuf::from(&paths.tool_events_path);
     let ledger_paths = match lifecycle_ledger_paths_oldest_first(&active) {
         Ok(paths) => paths,
         Err(error) => {
-            return ToolUsageTelemetry {
-                source_of_truth: active.display().to_string(),
+            return tool_usage_empty(
+                active.display().to_string(),
                 max_rows,
-                rows_scanned: 0,
-                segment_count: 0,
-                aggregates: Vec::new(),
-                read_error: Some(format!("{error:#}")),
-            };
+                Some(format!("{error:#}")),
+            );
         }
     };
     let mut rows_scanned = 0_usize;
-    let mut aggregates: BTreeMap<ToolUsageKey, ToolUsageAggregate> = BTreeMap::new();
+    let mut canonical_terminal_error_rows = 0_usize;
+    let mut compatibility_terminal_error_rows = 0_usize;
+    let mut decode_error_total = 0_usize;
+    let mut decode_errors = Vec::new();
+    let mut read_error = None;
+    let mut aggregates: BTreeMap<ToolUsageKey, ToolUsageAccumulator> = BTreeMap::new();
     for path in ledger_paths.iter().rev() {
         if rows_scanned >= max_rows {
             break;
@@ -1730,25 +2279,28 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
         let lines = match lines {
             Ok(lines) => lines,
             Err(error) => {
-                return ToolUsageTelemetry {
-                    source_of_truth: active.display().to_string(),
-                    max_rows,
-                    rows_scanned,
-                    segment_count: ledger_paths.len(),
-                    aggregates: aggregates.into_values().collect(),
-                    read_error: Some(format!("read {}: {error}", path.display())),
-                };
+                read_error = Some(format!("read {}: {error}", path.display()));
+                break;
             }
         };
-        for line in lines.into_iter().rev() {
+        for (line_index, line) in lines.into_iter().enumerate().rev() {
             if rows_scanned >= max_rows {
                 break;
             }
-            let Ok(event) = serde_json::from_str::<ToolEvent>(&line) else {
-                rows_scanned = rows_scanned.saturating_add(1);
-                continue;
-            };
             rows_scanned = rows_scanned.saturating_add(1);
+            let (event, terminal_error) = match decode_tool_usage_line(&line) {
+                Ok(decoded) => decoded,
+                Err(failure) => {
+                    push_tool_usage_decode_error(
+                        &mut decode_errors,
+                        &mut decode_error_total,
+                        path,
+                        line_index.saturating_add(1),
+                        failure,
+                    );
+                    continue;
+                }
+            };
             if event.event_kind != "tool_call" || event.status == "started" {
                 continue;
             }
@@ -1758,62 +2310,94 @@ pub(crate) fn recent_tool_usage(max_rows: usize, max_aggregates: usize) -> ToolU
                 event.route_id.clone(),
                 event.profile.clone(),
             );
-            let error_code = event
-                .error
-                .as_ref()
-                .and_then(|error| error.get("code"))
-                .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-                .or_else(|| {
-                    event
-                        .error
-                        .as_ref()
-                        .and_then(|error| error.get("detail_code"))
-                        .and_then(Value::as_str)
-                        .map(ToOwned::to_owned)
+            let accumulator = aggregates
+                .entry(key)
+                .or_insert_with(|| ToolUsageAccumulator {
+                    aggregate: ToolUsageAggregate {
+                        tool: event.tool.clone(),
+                        operation: event.operation.clone(),
+                        route_id: event.route_id.clone(),
+                        profile: event.profile.clone(),
+                        tool_surface_sha256: event.tool_surface_sha256.clone(),
+                        calls_total: 0,
+                        ok_total: 0,
+                        error_total: 0,
+                        panic_total: 0,
+                        total_duration_ms: 0,
+                        max_duration_ms: 0,
+                        latest_status: event.status.clone(),
+                        latest_error_code: None,
+                        distinct_error_code_count: 0,
+                        error_code_counts_truncated: false,
+                        error_code_counts: Vec::new(),
+                    },
+                    error_code_counts: BTreeMap::new(),
                 });
-            let entry = aggregates.entry(key).or_insert_with(|| ToolUsageAggregate {
-                tool: event.tool.clone(),
-                operation: event.operation.clone(),
-                route_id: event.route_id.clone(),
-                profile: event.profile.clone(),
-                tool_surface_sha256: event.tool_surface_sha256.clone(),
-                calls_total: 0,
-                ok_total: 0,
-                error_total: 0,
-                panic_total: 0,
-                total_duration_ms: 0,
-                max_duration_ms: 0,
-                latest_status: event.status.clone(),
-                latest_error_code: error_code.clone(),
-            });
-            entry.calls_total = entry.calls_total.saturating_add(1);
+            accumulator.aggregate.calls_total = accumulator.aggregate.calls_total.saturating_add(1);
             match event.status.as_str() {
-                "ok" => entry.ok_total = entry.ok_total.saturating_add(1),
-                "panic" => entry.panic_total = entry.panic_total.saturating_add(1),
-                _ => entry.error_total = entry.error_total.saturating_add(1),
+                "ok" => {
+                    accumulator.aggregate.ok_total =
+                        accumulator.aggregate.ok_total.saturating_add(1);
+                }
+                "panic" => {
+                    accumulator.aggregate.panic_total =
+                        accumulator.aggregate.panic_total.saturating_add(1);
+                }
+                "error" => {
+                    accumulator.aggregate.error_total =
+                        accumulator.aggregate.error_total.saturating_add(1);
+                    let Some((projection, source)) = terminal_error else {
+                        unreachable!("decoded status=error event always carries a projection");
+                    };
+                    match source {
+                        TerminalErrorDecodeSource::Canonical => {
+                            canonical_terminal_error_rows =
+                                canonical_terminal_error_rows.saturating_add(1);
+                        }
+                        TerminalErrorDecodeSource::Compatibility => {
+                            compatibility_terminal_error_rows =
+                                compatibility_terminal_error_rows.saturating_add(1);
+                        }
+                    }
+                    accumulator
+                        .aggregate
+                        .latest_error_code
+                        .get_or_insert_with(|| projection.error_code.clone());
+                    let count = accumulator
+                        .error_code_counts
+                        .entry(projection.error_code)
+                        .or_default();
+                    *count = count.saturating_add(1);
+                }
+                _ => unreachable!("decoder rejects unsupported terminal statuses"),
             }
-            let duration_ms = event.duration_ms.unwrap_or(0);
-            entry.total_duration_ms = entry.total_duration_ms.saturating_add(duration_ms);
-            entry.max_duration_ms = entry.max_duration_ms.max(duration_ms);
+            let duration_ms = event.duration_ms.unwrap_or_default();
+            accumulator.aggregate.total_duration_ms = accumulator
+                .aggregate
+                .total_duration_ms
+                .saturating_add(duration_ms);
+            accumulator.aggregate.max_duration_ms =
+                accumulator.aggregate.max_duration_ms.max(duration_ms);
         }
     }
-    let mut values = aggregates.into_values().collect::<Vec<_>>();
-    values.sort_by(|left, right| {
-        right
-            .calls_total
-            .cmp(&left.calls_total)
-            .then(left.tool.cmp(&right.tool))
-            .then(left.operation.cmp(&right.operation))
-    });
-    values.truncate(max_aggregates);
+    let (aggregates, aggregate_count, aggregates_truncated) =
+        finalize_tool_usage_aggregates(aggregates, max_aggregates);
     ToolUsageTelemetry {
         source_of_truth: active.display().to_string(),
         max_rows,
         rows_scanned,
         segment_count: ledger_paths.len(),
-        aggregates: values,
-        read_error: None,
+        terminal_error_projection_schema_version: TERMINAL_ERROR_PROJECTION_SCHEMA_VERSION,
+        canonical_terminal_error_rows,
+        compatibility_terminal_error_rows,
+        decode_error_total,
+        decode_errors_truncated: decode_error_total > decode_errors.len(),
+        decode_errors,
+        aggregate_count,
+        aggregates_truncated,
+        max_error_codes_per_aggregate: MAX_ERROR_CODES_PER_AGGREGATE,
+        aggregates,
+        read_error,
     }
 }
 
@@ -1931,7 +2515,26 @@ fn finish_tool_call(
     event.effective_target = effective_target;
     event.error = error;
     event.panic = panic;
-    write_tool_event(state, &event)?;
+    event.terminal_error = terminal_error_projection_for_writer(&event).map_err(|failure| {
+        tracing::error!(
+            code = "MCP_DAEMON_TERMINAL_ERROR_PROJECTION_INVALID",
+            detail_code = failure.code,
+            tool = %event.tool,
+            operation = event.operation.as_deref().unwrap_or("<none>"),
+            route_id = event.route_id.as_deref().unwrap_or("<none>"),
+            status = %event.status,
+            detail = %failure.detail,
+            "refused to publish a terminal tool event without a valid canonical error projection"
+        );
+        anyhow::anyhow!("{}: {}", failure.code, failure.detail)
+    })?;
+    // The full error belongs to the immediate MCP response only. It may echo a
+    // rejected selector, URL, operation, path, or other caller input. Persist
+    // only the bounded typed projection; otherwise the lifecycle ledger and
+    // every downstream aggregate inherit unbounded/sensitive request data.
+    let mut persisted_event = event.clone();
+    persisted_event.error = None;
+    write_tool_event(state, &persisted_event)?;
     state.in_flight.remove(&seq);
     FinishedToolCallReadback::try_from(event)
 }
@@ -2104,11 +2707,101 @@ fn write_tool_event_inner(
     state: &mut DaemonLifecycleState,
     event: &ToolEvent,
 ) -> anyhow::Result<()> {
+    validate_tool_event_for_write(event)
+        .map_err(|failure| anyhow::anyhow!("{}: {}", failure.code, failure.detail))?;
     append_tool_event(state, event)?;
     // The ledger append above already fsync'd this exact record. Recording it
     // in memory rather than re-publishing it to `daemon-tool-last.json` removes
     // the dual write described on `DaemonLifecycleState::last_tool_event`.
     state.last_tool_event = Some(event.clone());
+    Ok(())
+}
+
+fn validate_tool_event_for_write(event: &ToolEvent) -> Result<(), ToolUsageDecodeFailure> {
+    if event.schema_version != TOOL_EVENT_SCHEMA_VERSION {
+        return Err(tool_usage_decode_failure(
+            "MCP_TOOL_USAGE_EVENT_SCHEMA_WRITE_INVALID",
+            format!(
+                "new tool event schema_version={} required={TOOL_EVENT_SCHEMA_VERSION}",
+                event.schema_version
+            ),
+        ));
+    }
+    if event.event_kind != "tool_call" {
+        if event.terminal_error.is_some() {
+            return Err(tool_usage_decode_failure(
+                "MCP_TOOL_USAGE_CONTEXT_ERROR_PROJECTION_INVALID",
+                "non-tool-call lifecycle event carries terminal_error",
+            ));
+        }
+        return Ok(());
+    }
+    match event.status.as_str() {
+        "started" => {
+            if event.finished_at_unix_ms.is_some()
+                || event.duration_ms.is_some()
+                || event.error.is_some()
+                || event.panic.is_some()
+                || event.terminal_error.is_some()
+            {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_STARTED_EVENT_CONTRADICTED",
+                    "status=started event carries terminal timing or outcome data",
+                ));
+            }
+        }
+        "ok" => {
+            if event.finished_at_unix_ms.is_none()
+                || event.duration_ms.is_none()
+                || event.error.is_some()
+                || event.panic.is_some()
+                || event.terminal_error.is_some()
+            {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_OK_EVENT_CONTRADICTED",
+                    "status=ok event must carry timing and no error, panic, or terminal_error data",
+                ));
+            }
+        }
+        "panic" => {
+            if event.finished_at_unix_ms.is_none()
+                || event.duration_ms.is_none()
+                || event.panic.is_none()
+                || event.error.is_some()
+                || event.terminal_error.is_some()
+            {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_PANIC_EVENT_CONTRADICTED",
+                    "status=panic event must carry timing and panic data only",
+                ));
+            }
+        }
+        "error" => {
+            let projection = event.terminal_error.as_ref().ok_or_else(|| {
+                tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_TERMINAL_ERROR_PROJECTION_MISSING",
+                    "new status=error event has no terminal_error projection",
+                )
+            })?;
+            if event.finished_at_unix_ms.is_none()
+                || event.duration_ms.is_none()
+                || event.panic.is_some()
+                || event.error.is_some()
+            {
+                return Err(tool_usage_decode_failure(
+                    "MCP_TOOL_USAGE_ERROR_EVENT_CONTRADICTED",
+                    "status=error event must carry timing and terminal_error only, with no panic or raw error payload",
+                ));
+            }
+            validate_terminal_error_projection(event, projection)?;
+        }
+        status => {
+            return Err(tool_usage_decode_failure(
+                "MCP_TOOL_USAGE_STATUS_WRITE_INVALID",
+                format!("new tool_call event status={status:?} is unsupported"),
+            ));
+        }
+    }
     Ok(())
 }
 

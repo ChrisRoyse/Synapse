@@ -247,7 +247,8 @@ fn summarize_lifecycle_row(
         recorded_at_unix_ms: value.get("recorded_at_unix_ms").and_then(Value::as_u64),
         mcp_session_id_present: mcp_session_id.is_some(),
         mcp_session_id_sha256: mcp_session_id.as_deref().map(sha256_text),
-        error_code: nested_string(value, &["error", "data", "code"])
+        error_code: nested_string(value, &["terminal_error", "error_code"])
+            .or_else(|| nested_string(value, &["error", "data", "code"]))
             .or_else(|| nested_string(value, &["error", "code"])),
         panic_present: !value.get("panic").is_none_or(Value::is_null),
         detail_code: nested_string(value, &["detail", "code"]),

@@ -588,12 +588,14 @@ impl SynapseService {
                 "tool-call prologue captures exceeded their per-call latency budget"
             );
         }
+        let lifecycle_facade =
+            super::tool_profiles::lifecycle_facade_name(tool_name).unwrap_or("unknown");
         let route_id = operation
             .as_deref()
-            .map(|operation| format!("{tool_name}.{operation}"))
-            .or_else(|| Some(tool_name.to_owned()));
+            .map(|operation| format!("{lifecycle_facade}.{operation}"))
+            .or_else(|| Some(lifecycle_facade.to_owned()));
         crate::daemon_lifecycle::begin_tool_call(crate::daemon_lifecycle::ToolCallStart {
-            tool: tool_name.to_owned(),
+            tool: lifecycle_facade.to_owned(),
             operation,
             route_id,
             profile,
@@ -621,7 +623,12 @@ fn tool_operation_from_arguments(
         .map(str::trim)
         .filter(|operation| !operation.is_empty())
     {
-        return Some(operation.to_ascii_lowercase());
+        let operation = operation.to_ascii_lowercase();
+        return Some(
+            super::tool_profiles::lifecycle_facade_operation(tool_name, &operation)
+                .unwrap_or("invalid")
+                .to_owned(),
+        );
     }
     match tool_name {
         "shell" => Some("run".to_owned()),
@@ -631,7 +638,7 @@ fn tool_operation_from_arguments(
         "profile" => Some("status".to_owned()),
         "telemetry" => Some("status".to_owned()),
         "storage" => Some("summary".to_owned()),
-        _ => None,
+        _ => super::tool_profiles::lifecycle_single_operation(tool_name).map(str::to_owned),
     }
 }
 

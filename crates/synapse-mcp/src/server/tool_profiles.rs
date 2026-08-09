@@ -2908,6 +2908,41 @@ const fn op(
     }
 }
 
+/// Resolve a request name to the static public-facade identifier used by
+/// lifecycle telemetry. Unknown/raw names are intentionally not copied into
+/// the ledger: request-provided tool names are unbounded input, not a metric
+/// dimension.
+pub(crate) fn lifecycle_facade_name(tool_name: &str) -> Option<&'static str> {
+    FACADE_TOOL_CONTRACTS
+        .iter()
+        .find(|contract| contract.tool_name == tool_name)
+        .map(|contract| contract.tool_name)
+}
+
+/// Resolve a request operation to the exact static contract value. The caller
+/// records a fixed `invalid` sentinel when this returns `None`; it never emits
+/// the rejected request value into telemetry.
+pub(crate) fn lifecycle_facade_operation(tool_name: &str, operation: &str) -> Option<&'static str> {
+    FACADE_TOOL_CONTRACTS
+        .iter()
+        .find(|contract| contract.tool_name == tool_name)?
+        .operations
+        .iter()
+        .find(|candidate| candidate.operation == operation)
+        .map(|candidate| candidate.operation)
+}
+
+/// Return the sole contract operation for a flat/single-purpose facade. This
+/// covers tools such as `health`, `observe`, and `read_text` without another
+/// hand-maintained telemetry-only operation table.
+pub(crate) fn lifecycle_single_operation(tool_name: &str) -> Option<&'static str> {
+    let operations = FACADE_TOOL_CONTRACTS
+        .iter()
+        .find(|contract| contract.tool_name == tool_name)?
+        .operations;
+    (operations.len() == 1).then_some(operations[0].operation)
+}
+
 const NORMAL_ALLOWED_EXACT: &[&str] = PUBLIC_TOOL_NAMES;
 const NORMAL_ALLOWED_PREFIXES: &[&str] = &[];
 
