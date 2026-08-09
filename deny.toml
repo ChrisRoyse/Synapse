@@ -112,4 +112,10 @@ highlight = "all"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = ["https://github.com/enigo-rs/enigo"]
+# Exact revisions remain mandatory in Cargo.toml. Remove the vigem-client fork
+# once CasualX/vigem-client#6 is merged and published to crates.io; crates.io
+# 0.1.4's type-only winapi/xinput feature injects an unused xinput.lib link.
+allow-git = [
+    "https://github.com/enigo-rs/enigo",
+    "https://github.com/rofferom/vigem-client",
+]

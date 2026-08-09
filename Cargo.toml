@@ -109,7 +109,6 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
     "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Input_XboxController",
     "Win32_System_LibraryLoader",
     "Win32_Networking_WinSock",
     "Win32_Graphics_Dxgi",
@@ -130,7 +129,10 @@ windows-capture = "2.0.0"
 uiautomation = { version = "0.25.0", features = ["pattern", "control", "event"] }
 chromiumoxide = "0.9.1"
 wasapi = "0.23.0"
-vigem-client = "0.1.4"
+# crates.io 0.1.4 enables winapi/xinput solely for XINPUT_GAMEPAD's layout, which
+# injects the unused SDK xinput.lib into every final link. Pin upstream PR #6's
+# windows-sys migration until it is released: https://github.com/CasualX/vigem-client/pull/6
+vigem-client = { version = "0.1.4", git = "https://github.com/rofferom/vigem-client", rev = "c24e58a258d56bc8cc68156face90e330ecbe155" }
 ort = { version = "2.0.0-rc.12", default-features = false }
 clap = { version = "4.6.1", features = ["derive", "env"] }
 chrono = { version = "0.4.44", features = ["serde"] }
