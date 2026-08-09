@@ -148,7 +148,14 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// so it is not similarity-bearing under *any* metric, and changing Ward's
 /// score function would silently redefine every already-certified conformal FAR
 /// bound and the `calyx-search` guarded reader that consumes the same profile.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_050_001;
+/// #2185 moves the exact #2050 layout to a fresh generation after an earlier
+/// pre-merge build wrote a different slot map under `2_050_001`. A generation
+/// is the durable identity of one slot contract; once two physical layouts have
+/// used an id, that id cannot truthfully name either layout again.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_001;
+/// The contaminated generation #2185 superseded. It remains readable history,
+/// but new rows must never join its mixed physical slot layouts.
+pub const SYN_ACTION_PANEL_VERSION_PRE_2185: u32 = 2_050_001;
 /// The generation #2050 superseded — the layout with no dense target lane.
 pub const SYN_ACTION_PANEL_VERSION_PRE_2050: u32 = 2_020_001;
 pub const SYN_ACTION_PANEL_VERSION_PRE_2020: u32 = 2_006_001;
@@ -2716,6 +2723,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_2006,
                 SYN_ACTION_PANEL_VERSION_PRE_2020,
                 SYN_ACTION_PANEL_VERSION_PRE_2050,
+                SYN_ACTION_PANEL_VERSION_PRE_2185,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },

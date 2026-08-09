@@ -28,9 +28,10 @@ pub(crate) const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
 /// direction, so the value is duplicated by hand). A mismatch fails loud
 /// (`SYNAPSE_CALYX_ACTION_VALIDATION_PANEL_MISMATCH`) rather than reading
 /// evidence measured under a different frozen slot layout: bumped 2_020_001 ->
-/// 2_050_001 with #2050's dense target lens, which deliberately re-arms
+/// 2_185_001 with #2185's uncontaminated copy of #2050's dense target lens,
+/// which deliberately re-arms
 /// readiness — held-out evidence must be re-measured on the new generation.
-pub(crate) const ACTION_PANEL_VERSION: u32 = 2_050_001;
+pub(crate) const ACTION_PANEL_VERSION: u32 = 2_185_001;
 const MIN_ACTION_RECORDS: usize = 50;
 pub(crate) const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
