@@ -565,10 +565,65 @@ catch {
         'the doctrine sweep itself failed; this gate fails closed rather than reporting an invariant it did not check'
 }
 
+# ---------------------------------------------------------------------------
+# Gate 0b — production tool-surface invariants
+# ---------------------------------------------------------------------------
+#
+# `storage_put_probe_rows` is an intentionally debug-gated raw diagnostic. It
+# escaped through the always-public `storage` facade twice (#1595), including
+# after the first fix, because compilation cannot distinguish a legitimate
+# debug route from an illegitimate public projection. Keep that distinction as
+# a cheap source invariant checked on every push.
+
+Write-Gate 'Gate 0b    production tool-surface invariants (#1595)'
+try {
+    $probeFacadeFiles = @(
+        'crates/synapse-mcp/src/server/operational_facades/types.rs',
+        'crates/synapse-mcp/src/server/operational_facades/validation.rs',
+        'crates/synapse-mcp/src/server/operational_facades/response.rs',
+        'crates/synapse-mcp/src/server/operational_facades/storage.rs'
+    )
+    $probeFacadeHits = [System.Collections.Generic.List[string]]::new()
+    foreach ($relative in $probeFacadeFiles) {
+        $path = Join-Path $RepoRoot $relative
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "SYNAPSE_LINT_PUBLIC_SURFACE_SOURCE_MISSING: required facade source is absent: $relative"
+        }
+        $lines = [IO.File]::ReadAllLines($path)
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match 'put_probe_rows') {
+                $probeFacadeHits.Add("        $relative`:$($i + 1)  $($lines[$i].Trim())")
+            }
+        }
+    }
+    $profilePath = Join-Path $RepoRoot 'crates/synapse-mcp/src/server/tool_profiles.rs'
+    if (-not (Test-Path -LiteralPath $profilePath)) {
+        throw 'SYNAPSE_LINT_PUBLIC_SURFACE_SOURCE_MISSING: required tool profile source is absent: crates/synapse-mcp/src/server/tool_profiles.rs'
+    }
+    $profileLines = [IO.File]::ReadAllLines($profilePath)
+    for ($i = 0; $i -lt $profileLines.Count; $i++) {
+        if ($profileLines[$i] -match '"put_probe_rows"') {
+            $probeFacadeHits.Add("        crates/synapse-mcp/src/server/tool_profiles.rs`:$($i + 1)  $($profileLines[$i].Trim())")
+        }
+    }
+    if ($probeFacadeHits.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_SYNTHETIC_WRITER_PUBLIC' `
+        ("$($probeFacadeHits.Count) production storage-facade projection(s) expose the debug-only synthetic writer (#1595):" + [Environment]::NewLine + ($probeFacadeHits -join [Environment]::NewLine)) `
+            'remove put_probe_rows from StorageOperation, StorageParams, StorageResponse, facade validation/dispatch, and the public storage operation contract. Keep storage_put_probe_rows only behind SYNAPSE_DEBUG_TOOLS.'
+    }
+    else {
+        Write-Host '   OK   production storage facade has no put_probe_rows projection; raw diagnostic remains independently debug-gated' -ForegroundColor Green
+    }
+}
+catch {
+    Add-Failure 'SYNAPSE_LINT_PUBLIC_SURFACE_SWEEP_FAILED' $_.Exception.Message `
+        'repair the source inventory or gate implementation; the public tool surface cannot be certified when its structural sweep did not complete'
+}
+
 if ($PolicyOnly) {
     Write-Host ''
     if ($script:Failures.Count -eq 0) {
-        Write-Host 'POLICY OK: Gate 0 found no automated-test or FSV-driver surface.' -ForegroundColor Green
+        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface and Gate 0b found no forbidden public tool projection.' -ForegroundColor Green
         exit 0
     }
 

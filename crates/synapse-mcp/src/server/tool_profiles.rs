@@ -2167,15 +2167,6 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to an explicit maintenance profile before running GC",
             ),
             op(
-                "put_probe_rows",
-                true,
-                false,
-                "one allowlisted storage CF populated through its real codec and synchronous storage write path",
-                Some("exact before/after CF row counts and physical CF byte size"),
-                error_codes::SAFETY_PERMISSION_DENIED,
-                "grant WRITE_STORAGE explicitly and use only the bounded allowlisted diagnostic CF/key modes",
-            ),
-            op(
                 "anchors",
                 false,
                 false,

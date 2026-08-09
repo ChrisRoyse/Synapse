@@ -29,8 +29,7 @@ use crate::m3::{
         StorageGcOnceParams, StorageGcOnceResponse, StorageInspectParams, StorageInspectResponse,
         StorageIntelligenceParams, StorageIntelligenceResponse, StoragePanelCoverageParams,
         StoragePanelCoverageResponse, StoragePanelLifecycleParams, StoragePanelLifecycleResponse,
-        StoragePutProbeRowsParams, StoragePutProbeRowsResponse, StorageRestoreVerifyParams,
-        StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
+        StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
         StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
         StorageRetireSearchGenerationResponse, StorageRowReadParams, StorageRowReadResponse,
         StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
@@ -45,7 +44,6 @@ pub enum StorageOperation {
     Inspect,
     Summary,
     GcOnce,
-    PutProbeRows,
     Anchors,
     RowRead,
     TemporalPanels,
@@ -70,7 +68,6 @@ impl StorageOperation {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
             Self::GcOnce => "gc_once",
-            Self::PutProbeRows => "put_probe_rows",
             Self::Anchors => "anchors",
             Self::RowRead => "row_read",
             Self::TemporalPanels => "temporal_panels",
@@ -101,8 +98,6 @@ pub struct StorageParams {
     pub summary: Option<StorageInspectParams>,
     #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
-    #[serde(default)]
-    pub put_probe_rows: Option<StoragePutProbeRowsParams>,
     #[serde(default)]
     pub anchors: Option<StorageAnchorsParams>,
     #[serde(default)]
@@ -149,8 +144,6 @@ pub struct StorageResponse {
     pub summary: Option<StorageSummaryResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub put_probe_rows: Option<StoragePutProbeRowsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchors: Option<StorageAnchorsResponse>,
     /// Boxed: this variant carries a decoded `StoredObservation` projection,

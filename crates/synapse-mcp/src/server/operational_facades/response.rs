@@ -17,7 +17,6 @@ pub(super) fn storage_response(
         inspect: None,
         summary: None,
         gc_once: None,
-        put_probe_rows: None,
         anchors: None,
         row_read: None,
         temporal_panels: None,

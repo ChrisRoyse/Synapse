@@ -1,3 +1,4 @@
+pub mod action_log;
 pub mod agent_events;
 pub mod agent_transcripts;
 mod backend;
@@ -298,6 +299,51 @@ impl fmt::Debug for Db {
     }
 }
 
+fn validate_action_log_puts(cf_name: &str, rows: &[RawRow]) -> StorageResult<()> {
+    if cf_name != cf::CF_ACTION_LOG {
+        return Ok(());
+    }
+    for (row_index, (key, value)) in rows.iter().enumerate() {
+        validate_one_action_log_put(cf_name, row_index, key, value)?;
+    }
+    Ok(())
+}
+
+fn validate_one_action_log_put(
+    cf_name: &str,
+    row_index: usize,
+    key: &[u8],
+    value: &[u8],
+) -> StorageResult<()> {
+    let Err(error) = action_log::validate_action_log_row(key, value) else {
+        return Ok(());
+    };
+    let diagnostic = action_log::diagnostic_for_invalid_row(key, value, &error);
+    tracing::error!(
+        code = "ACTION_LOG_CODEC_INVALID",
+        failure_code = diagnostic.failure_code,
+        failure_detail = %diagnostic.failure_detail,
+        row_index,
+        key_len_bytes = diagnostic.key_len_bytes,
+        key_sha256 = %diagnostic.key_sha256,
+        value_len_bytes = diagnostic.value_len_bytes,
+        value_sha256 = %diagnostic.value_sha256,
+        "rejected noncanonical CF_ACTION_LOG write before storage mutation"
+    );
+    Err(StorageError::WriteFailed {
+        cf_name: cf_name.to_owned(),
+        detail: format!(
+            "ACTION_LOG_CODEC_INVALID failure_code={} row_index={row_index} key_len_bytes={} key_sha256={} value_len_bytes={} value_sha256={} detail={} remediation=encode a schema_version=1 action or command audit row whose 12-byte big-endian timestamp/sequence key exactly matches ts_ns, seq, and audit_id",
+            diagnostic.failure_code,
+            diagnostic.key_len_bytes,
+            diagnostic.key_sha256,
+            diagnostic.value_len_bytes,
+            diagnostic.value_sha256,
+            diagnostic.failure_detail,
+        ),
+    })
+}
+
 impl Db {
     /// Opens storage with the default Calyx backend.
     ///
@@ -398,12 +444,12 @@ impl Db {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        self.backend.put_batch(
-            cf_name,
-            kvs.into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
-        )
+        let rows = kvs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        validate_action_log_puts(cf_name, &rows)?;
+        self.backend.put_batch(cf_name, rows)
     }
 
     /// Writes a key/value batch while bypassing the pressure ingestion gate.
@@ -419,12 +465,12 @@ impl Db {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
-        self.backend.put_batch_pressure_bypass(
-            cf_name,
-            kvs.into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
-        )
+        let rows = kvs
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        validate_action_log_puts(cf_name, &rows)?;
+        self.backend.put_batch_pressure_bypass(cf_name, rows)
     }
 
     /// Writes key/value batches across multiple column families atomically
@@ -439,6 +485,9 @@ impl Db {
         &self,
         batches: Vec<CfWriteBatch<'_>>,
     ) -> StorageResult<()> {
+        for (cf_name, rows) in &batches {
+            validate_action_log_puts(cf_name, rows)?;
+        }
         self.backend.put_cf_batches_pressure_bypass(
             batches
                 .into_iter()
@@ -468,6 +517,9 @@ impl Db {
         guards: Vec<CfRevisionGuard>,
         batches: Vec<CfWriteBatch<'_>>,
     ) -> StorageResult<RevisionGuardedMutationOutcome> {
+        for (cf_name, rows) in &batches {
+            validate_action_log_puts(cf_name, rows)?;
+        }
         self.backend.put_cf_batches_if_revisions_pressure_bypass(
             guards,
             batches
@@ -524,13 +576,16 @@ impl Db {
         K: Into<Vec<u8>>,
         V: Into<Vec<u8>>,
     {
+        let rows = rows
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        validate_action_log_puts(cf_name, &rows)?;
         self.backend.put_batch_if_revision_pressure_bypass(
             cf_name,
             guard_key,
             expected_revision_sha256,
-            rows.into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
+            rows,
         )
     }
 
@@ -570,13 +625,16 @@ impl Db {
         PK: Into<Vec<u8>>,
         PV: Into<Vec<u8>>,
     {
+        let puts = puts
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        validate_action_log_puts(cf_name, &puts)?;
         self.backend.mutate_batch_if_revisions_pressure_bypass(
             cf_name,
             guards.into_iter().collect(),
             deletes.into_iter().map(Into::into).collect(),
-            puts.into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
+            puts,
         )
     }
 
@@ -600,12 +658,15 @@ impl Db {
         PK: Into<Vec<u8>>,
         PV: Into<Vec<u8>>,
     {
+        let puts = puts
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect::<Vec<_>>();
+        validate_action_log_puts(cf_name, &puts)?;
         self.backend.mutate_batch_pressure_bypass(
             cf_name,
             deletes.into_iter().map(Into::into).collect(),
-            puts.into_iter()
-                .map(|(key, value)| (key.into(), value.into()))
-                .collect(),
+            puts,
         )
     }
 
@@ -962,6 +1023,7 @@ impl Db {
         occurrence_identity: &[u8],
         context: &[u8],
     ) -> StorageResult<ActionOraclePublicationReport> {
+        validate_one_action_log_put(cf::CF_ACTION_LOG, 0, source_key, raw_bytes)?;
         self.backend.put_action_oracle_publication(
             source_key,
             raw_bytes,

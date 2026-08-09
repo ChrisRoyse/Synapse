@@ -55,18 +55,21 @@ pub(super) fn summarize_command_query(
             })),
         ));
     }
-    if response.corrupt_row_count > 0 {
+    if response.corrupt_row_count > 0 || response.noncanonical_key_count > 0 {
         return Err(ErrorData::new(
             ErrorCode(-32099),
-            "audit operation=command_query found corrupt CF_ACTION_LOG rows".to_owned(),
+            "audit operation=command_query found noncanonical CF_ACTION_LOG rows".to_owned(),
             Some(json!({
                 "code": error_codes::STORAGE_READ_FAILED,
+                "failure_code": "COMMAND_AUDIT_INTEGRITY_FAILED",
                 "tool": AUDIT_TOOL,
                 "operation": "command_query",
                 "source_id": response.cf_name,
                 "source_of_truth": AUDIT_SOT,
                 "corrupt_row_count": response.corrupt_row_count,
-                "remediation": "inspect and repair the corrupt CF_ACTION_LOG rows before trusting audit output",
+                "noncanonical_key_count": response.noncanonical_key_count,
+                "page_complete": false,
+                "remediation": "inspect and repair every noncanonical CF_ACTION_LOG row before trusting audit output",
             })),
         ));
     }

@@ -14,7 +14,11 @@
 
 use std::path::Path;
 
-use synapse_storage::{StorageBackendKind, cf, scan_cf_read_only};
+use synapse_storage::{
+    StorageBackendKind,
+    action_log::{diagnostic_for_invalid_row, validate_action_log_row},
+    cf, scan_cf_read_only,
+};
 
 const USAGE: &str = "usage: dump_action_log <db-path>";
 
@@ -31,12 +35,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         cf::CF_ACTION_LOG,
     )?;
     let mut invalid = 0usize;
-    for (_key, value) in &rows {
-        match serde_json::from_slice::<serde_json::Value>(value) {
-            Ok(record) => println!("{record}"),
+    for (key, value) in &rows {
+        match validate_action_log_row(key, value) {
+            Ok(record) => println!("{}", record.value),
             Err(error) => {
                 invalid += 1;
-                eprintln!("INVALID ROW: {error}");
+                let diagnostic = diagnostic_for_invalid_row(key, value, &error);
+                eprintln!(
+                    "INVALID ROW failure_code={} detail={} key_len_bytes={} key_sha256={} value_len_bytes={} value_sha256={}",
+                    diagnostic.failure_code,
+                    diagnostic.failure_detail,
+                    diagnostic.key_len_bytes,
+                    diagnostic.key_sha256,
+                    diagnostic.value_len_bytes,
+                    diagnostic.value_sha256,
+                );
             }
         }
     }

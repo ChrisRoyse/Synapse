@@ -59,47 +59,6 @@ pub(super) async fn handle(
         "tool.invocation kind=storage"
     );
     match operation {
-        StorageOperation::PutProbeRows => {
-            let spec = params
-                .0
-                .put_probe_rows
-                .ok_or_else(|| missing_spec(STORAGE_TOOL, "put_probe_rows"))?;
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_put(&spec),
-            )?;
-            let runtime = service.reflex_runtime().map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    &spec.cf_name,
-                    STORAGE_SOT,
-                    error,
-                    "repair storage/reflex initialization and retry the bounded probe write",
-                )
-            })?;
-            let response = crate::m3::storage::put_probe_rows(&runtime, &spec).map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    &spec.cf_name,
-                    STORAGE_SOT,
-                    error,
-                    "correct the allowlisted CF, canonical row envelope, or storage pressure condition and retry",
-                )
-            })?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "{} rows before={} after={} added={}",
-                    response.cf_name,
-                    response.before_rows,
-                    response.after_rows,
-                    response.rows_added
-                ),
-                |out| out.put_probe_rows = Some(response),
-            )))
-        }
         StorageOperation::Inspect => {
             let spec = params.0.inspect.unwrap_or_default();
             service.require_m3_permissions(

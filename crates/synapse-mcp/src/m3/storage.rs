@@ -5371,7 +5371,7 @@ pub fn put_probe_rows(
 ) -> Result<StoragePutProbeRowsResponse, ErrorData> {
     validate_probe_params(params)?;
     let cf_name = probe_writable_cf(&params.cf_name)?;
-    let rows = build_probe_rows(params);
+    let rows = build_probe_rows(params)?;
     let runtime = lock_runtime(runtime)?;
     let pressure = runtime.storage_pressure_level();
     if params.rows > 0 && !runtime.storage_pressure_permits_write(cf_name) {
@@ -6078,7 +6078,9 @@ fn probe_writable_cf(raw: &str) -> Result<&'static str, ErrorData> {
         })
 }
 
-fn build_probe_rows(params: &StoragePutProbeRowsParams) -> Vec<(Vec<u8>, Vec<u8>)> {
+fn build_probe_rows(
+    params: &StoragePutProbeRowsParams,
+) -> Result<Vec<synapse_storage::RawRow>, ErrorData> {
     let prefix = params.key_prefix.trim();
     let timeline_keys = params.key_mode.as_deref().map(str::trim) == Some("timeline_ts");
     (0..params.rows)
@@ -6094,13 +6096,17 @@ fn build_probe_rows(params: &StoragePutProbeRowsParams) -> Vec<(Vec<u8>, Vec<u8>
             } else {
                 format!("{prefix}:{index:020}").into_bytes()
             };
-            let value = probe_value(params, prefix, index);
-            (key, value)
+            let value = probe_value(params, prefix, index)?;
+            Ok((key, value))
         })
         .collect()
 }
 
-fn probe_value(params: &StoragePutProbeRowsParams, prefix: &str, index: u32) -> Vec<u8> {
+fn probe_value(
+    params: &StoragePutProbeRowsParams,
+    prefix: &str,
+    index: u32,
+) -> Result<Vec<u8>, ErrorData> {
     if let Some(template) = &params.value_json {
         if params.key_mode.as_deref().map(str::trim) == Some("timeline_ts") {
             let ts_ns = params.ts_ns_start.unwrap_or_default().saturating_add(
@@ -6110,12 +6116,11 @@ fn probe_value(params: &StoragePutProbeRowsParams, prefix: &str, index: u32) -> 
                     .saturating_mul(u64::from(index)),
             );
             let merged = timeline_record_value(template, ts_ns);
-            return synapse_storage::encode_json(&merged)
-                .unwrap_or_else(|_error| byte_probe_value(prefix, index, 0));
+            return encode_probe_json(&merged, &params.cf_name, index);
         }
         return json_probe_value(params, template, prefix, index);
     }
-    byte_probe_value(prefix, index, params.value_bytes as usize)
+    Ok(byte_probe_value(prefix, index, params.value_bytes as usize))
 }
 
 /// Merges the per-row timestamp into a `TimelineRecord` template without the
@@ -6146,7 +6151,7 @@ fn json_probe_value(
     template: &Value,
     prefix: &str,
     index: u32,
-) -> Vec<u8> {
+) -> Result<Vec<u8>, ErrorData> {
     let mut value = template.clone();
     if let Some(object) = value.as_object_mut() {
         object
@@ -6168,8 +6173,18 @@ fn json_probe_value(
                 .or_insert_with(|| Value::String(format!("{ts_ns:020}-{index:010}")));
         }
     }
-    synapse_storage::encode_json(&value)
-        .unwrap_or_else(|_error| byte_probe_value(prefix, index, params.value_bytes as usize))
+    encode_probe_json(&value, &params.cf_name, index)
+}
+
+fn encode_probe_json(value: &Value, cf_name: &str, index: u32) -> Result<Vec<u8>, ErrorData> {
+    synapse_storage::encode_json(value).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "SYNAPSE_STORAGE_PROBE_JSON_ENCODE_FAILED cf_name={cf_name} row_index={index} detail={error}; no probe rows were written; repair the JSON value and retry"
+            ),
+        )
+    })
 }
 
 fn gc_response(

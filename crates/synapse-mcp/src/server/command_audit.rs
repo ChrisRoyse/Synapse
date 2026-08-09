@@ -3,16 +3,21 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use rmcp::ErrorData;
+use rmcp::{ErrorData, model::ErrorCode};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use synapse_storage::cf;
+use synapse_storage::{
+    action_log::{
+        ACTION_LOG_KEY_LEN, ActionLogRowDiagnostic, ActionLogRowKind, COMMAND_AUDIT_ROW_KIND,
+        diagnostic_for_invalid_row, validate_action_log_row,
+    },
+    cf,
+};
 
 use super::SynapseService;
 use crate::m1::mcp_error;
 
-const COMMAND_AUDIT_ROW_KIND: &str = "command_audit";
 const COMMAND_AUDIT_SCHEMA_VERSION: u32 = 1;
 const COMMAND_AUDIT_PAYLOAD_MAX_BYTES: usize = 8192;
 const COMMAND_AUDIT_SNAPSHOT_SCAN_LIMIT: usize = 1000;
@@ -22,9 +27,67 @@ const COMMAND_AUDIT_QUERY_MAX_LIMIT: usize = 250;
 const COMMAND_AUDIT_QUERY_DEFAULT_SCAN_LIMIT: usize = 1000;
 const COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT: usize = 5000;
 const COMMAND_AUDIT_QUERY_BATCH_ROWS: usize = 256;
-const COMMAND_AUDIT_KEY_LEN: usize = 12;
+const COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT: usize = 8;
 
 static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
+
+#[derive(Default)]
+struct CommandAuditIntegrityFailures {
+    count: usize,
+    examples: Vec<ActionLogRowDiagnostic>,
+}
+
+impl CommandAuditIntegrityFailures {
+    fn observe(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        error: &synapse_storage::action_log::ActionLogCodecError,
+    ) {
+        self.count = self.count.saturating_add(1);
+        if self.examples.len() < COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT {
+            self.examples
+                .push(diagnostic_for_invalid_row(key, value, error));
+        }
+    }
+
+    fn fail_if_any(&self, scanned_rows: usize, operation: &'static str) -> Result<(), ErrorData> {
+        if self.count == 0 {
+            return Ok(());
+        }
+        let failures_omitted = self.count.saturating_sub(self.examples.len());
+        tracing::error!(
+            code = "COMMAND_AUDIT_INTEGRITY_FAILED",
+            operation,
+            scanned_rows,
+            failure_count = self.count,
+            failures_reported = self.examples.len(),
+            failures_omitted,
+            "CF_ACTION_LOG read refused noncanonical physical rows"
+        );
+        Err(ErrorData::new(
+            ErrorCode(-32099),
+            format!(
+                "audit operation={operation} found noncanonical CF_ACTION_LOG rows; no partial result was returned"
+            ),
+            Some(json!({
+                "code": synapse_core::error_codes::STORAGE_READ_FAILED,
+                "failure_code": "COMMAND_AUDIT_INTEGRITY_FAILED",
+                "operation": operation,
+                "source_id": cf::CF_ACTION_LOG,
+                "source_of_truth": "CF_ACTION_LOG physical rows",
+                "scanned_rows": scanned_rows,
+                "failure_count": self.count,
+                "failure_examples": self.examples,
+                "failure_example_limit": COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT,
+                "failures_omitted": failures_omitted,
+                "raw_key_value_omitted": true,
+                "page_complete": false,
+                "remediation": "stop trusting audit output; identify each row by its key/value SHA-256, restore or revision-guard repair the exact physical row to the schema_version=1 action-log codec, then rerun the complete bounded query",
+            })),
+        ))
+    }
+}
 
 #[derive(Clone, Debug)]
 pub(super) struct CommandAuditInput {
@@ -239,18 +302,23 @@ impl SynapseService {
             .map_err(|error| mcp_error(error.code(), error.to_string()))?;
         let scanned_rows = rows.len();
         let mut parsed = Vec::new();
+        let mut integrity_failures = CommandAuditIntegrityFailures::default();
         for (key, value) in rows.into_iter().rev() {
-            let Ok(row) = synapse_storage::decode_json::<Value>(&value) else {
-                continue;
+            let validated = match validate_action_log_row(&key, &value) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    integrity_failures.observe(&key, &value, &error);
+                    continue;
+                }
             };
-            if row.get("row_kind").and_then(Value::as_str) != Some(COMMAND_AUDIT_ROW_KIND) {
+            if validated.row_kind != ActionLogRowKind::CommandAudit {
                 continue;
             }
-            parsed.push(command_audit_snapshot_row(&key, &row));
-            if parsed.len() >= COMMAND_AUDIT_SNAPSHOT_ROW_LIMIT {
-                break;
+            if parsed.len() < COMMAND_AUDIT_SNAPSHOT_ROW_LIMIT {
+                parsed.push(command_audit_snapshot_row(&key, &validated.value));
             }
         }
+        integrity_failures.fail_if_any(scanned_rows, "command_snapshot")?;
         Ok(CommandAuditSnapshot {
             source_of_truth: cf::CF_ACTION_LOG,
             scanned_rows,
@@ -322,8 +390,7 @@ impl SynapseService {
         let mut cursor = start_key;
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
-        let mut corrupt_row_count = 0_usize;
-        let mut noncanonical_key_count = 0_usize;
+        let mut integrity_failures = CommandAuditIntegrityFailures::default();
         let mut returned = Vec::new();
         let mut next_start_key_hex = None;
         let mut more_after_window = false;
@@ -348,22 +415,15 @@ impl SynapseService {
             for (key, value) in batch {
                 scanned_rows = scanned_rows.saturating_add(1);
                 last_scanned_key = Some(key.clone());
-                let row = match synapse_storage::decode_json::<Value>(&value) {
-                    Ok(row) => row,
-                    Err(_error) => {
-                        corrupt_row_count = corrupt_row_count.saturating_add(1);
+                let validated = match validate_action_log_row(&key, &value) {
+                    Ok(validated) => validated,
+                    Err(error) => {
+                        integrity_failures.observe(&key, &value, &error);
                         continue;
                     }
                 };
-                let Some((key_ts_ns, _key_seq)) = decode_command_audit_key(&key) else {
-                    noncanonical_key_count = noncanonical_key_count.saturating_add(1);
-                    continue;
-                };
-                let ts_ns = audit_row_ts_ns(&row);
-                if ts_ns != key_ts_ns {
-                    corrupt_row_count = corrupt_row_count.saturating_add(1);
-                    continue;
-                }
+                let ts_ns = validated.ts_ns;
+                let row = validated.value;
                 if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
                     stopped_at_end_ts = true;
                     break;
@@ -394,6 +454,8 @@ impl SynapseService {
             }
         }
 
+        integrity_failures.fail_if_any(scanned_rows, "command_query")?;
+
         let scan_budget_exhausted =
             scanned_rows >= scan_limit && more_after_window && !stopped_at_end_ts;
         let partial = scan_budget_exhausted || more_matching_rows;
@@ -410,8 +472,8 @@ impl SynapseService {
             scanned_rows,
             matched_rows,
             returned_count,
-            corrupt_row_count,
-            noncanonical_key_count,
+            corrupt_row_count: 0,
+            noncanonical_key_count: 0,
             partial,
             exhausted: !partial,
             start_key_hex,
@@ -451,29 +513,22 @@ impl SynapseService {
 
         let mut scanned_rows = 0_usize;
         let mut matched_rows = 0_usize;
-        let mut corrupt_row_count = 0_usize;
-        let mut noncanonical_key_count = 0_usize;
+        let mut integrity_failures = CommandAuditIntegrityFailures::default();
         let mut returned = Vec::new();
         let mut has_older = false;
 
         for (key, value) in tail.into_iter().rev() {
             scanned_rows = scanned_rows.saturating_add(1);
-            let row = match synapse_storage::decode_json::<Value>(&value) {
-                Ok(row) => row,
-                Err(_error) => {
-                    corrupt_row_count = corrupt_row_count.saturating_add(1);
+            let validated = match validate_action_log_row(&key, &value) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    integrity_failures.observe(&key, &value, &error);
                     continue;
                 }
             };
-            let Some((key_ts_ns, key_seq)) = decode_command_audit_key(&key) else {
-                noncanonical_key_count = noncanonical_key_count.saturating_add(1);
-                continue;
-            };
-            let ts_ns = audit_row_ts_ns(&row);
-            if ts_ns != key_ts_ns {
-                corrupt_row_count = corrupt_row_count.saturating_add(1);
-                continue;
-            }
+            let ts_ns = validated.ts_ns;
+            let key_seq = validated.seq;
+            let row = validated.value;
             // In newest-first mode end_ts_ns is an upper bound: skip rows newer
             // than it (they are outside the requested window), keep scanning down.
             if filters.end_ts_ns.is_some_and(|end| ts_ns > end) {
@@ -484,11 +539,12 @@ impl SynapseService {
             }
             if returned.len() >= limit {
                 has_older = true;
-                break;
+                continue;
             }
             matched_rows = matched_rows.saturating_add(1);
             returned.push((ts_ns, key_seq, command_audit_query_row(&key, &value, row)));
         }
+        integrity_failures.fail_if_any(scanned_rows, "command_query")?;
         returned.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| right.1.cmp(&left.1)));
         let newest_start_key_hex = returned
             .first()
@@ -514,8 +570,8 @@ impl SynapseService {
             scanned_rows,
             matched_rows,
             returned_count,
-            corrupt_row_count,
-            noncanonical_key_count,
+            corrupt_row_count: 0,
+            noncanonical_key_count: 0,
             partial: false,
             exhausted: !has_older,
             start_key_hex: newest_start_key_hex,
@@ -1003,21 +1059,10 @@ fn next_command_audit_key_parts() -> (u64, u32) {
 }
 
 fn command_audit_key(ts_ns: u64, seq: u32) -> Vec<u8> {
-    let mut key = Vec::with_capacity(COMMAND_AUDIT_KEY_LEN);
+    let mut key = Vec::with_capacity(ACTION_LOG_KEY_LEN);
     key.extend_from_slice(&ts_ns.to_be_bytes());
     key.extend_from_slice(&seq.to_be_bytes());
     key
-}
-
-fn decode_command_audit_key(key: &[u8]) -> Option<(u64, u32)> {
-    if key.len() != COMMAND_AUDIT_KEY_LEN {
-        return None;
-    }
-    let mut ts_ns = [0_u8; 8];
-    ts_ns.copy_from_slice(&key[..8]);
-    let mut seq = [0_u8; 4];
-    seq.copy_from_slice(&key[8..]);
-    Some((u64::from_be_bytes(ts_ns), u32::from_be_bytes(seq)))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
