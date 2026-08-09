@@ -36,7 +36,7 @@ pub const WHISPER_TINY_INT8_EXPECTED_LEN: u64 = WHISPER_TINY_INT8_ONNX_LENGTH;
 
 const SILENCE_RMS_DB: f32 = -70.0;
 const DEFAULT_LANGUAGE: &str = "en";
-/// `auto` (default) | `cuda` | `directml` | `cpu`.
+/// `auto` (default) | `cuda` | `cpu`.
 ///
 /// Mirrors `SYNAPSE_DETECTION_BACKEND` so the two ORT consumers in the daemon
 /// are configured the same way.
@@ -101,8 +101,8 @@ impl TranscriptionConfidenceSource {
 
 /// Execution-provider policy for the pinned Whisper session.
 ///
-/// `Auto` prefers CUDA, then DirectML, then CPU. It advances between providers
-/// only after positive proof that the preceding hardware/provider is absent.
+/// `Auto` prefers CUDA, then CPU. It advances only after positive proof that
+/// CUDA hardware/provider is absent.
 /// A present-but-broken provider, an admission refusal, or any other load
 /// failure is a hard error — never a silent demotion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -220,7 +220,6 @@ impl WhisperTinyStt {
             gpu_reservation_mib,
             device_memory_policy: selected_backend.map(|backend| match backend {
                 ModelBackend::Cuda => "nvml_dedicated_memory_session_lease".to_owned(),
-                ModelBackend::DirectMl => "directml_shared_system_memory_serial_session".to_owned(),
                 ModelBackend::Cpu => "host_memory".to_owned(),
             }),
             fallback_code,
@@ -397,33 +396,13 @@ impl WhisperTinyStt {
             SttBackendPolicy::Auto => match self.load_with_backend(ModelBackend::Cuda) {
                 Ok(state) => Ok(state),
                 Err(cuda_failure) if cuda_failure.proves_gpu_absent => {
-                    let cuda_detail = cuda_failure.error.to_string();
-                    match self.load_with_backend(ModelBackend::DirectMl) {
-                        Ok(state) => {
-                            let code = "SYNAPSE_STT_AUTO_DIRECTML_NO_CUDA_PROVIDER";
-                            tracing::warn!(code, source_error = %cuda_detail,
-                                "STT auto policy selected DirectML after positive CUDA absence proof");
-                            self.record_fallback(code, cuda_detail)?;
-                            Ok(state)
-                        }
-                        Err(dml_failure) if dml_failure.proves_gpu_absent => {
-                            let code = "SYNAPSE_STT_AUTO_CPU_NO_GPU_PROVIDER";
-                            let detail = format!(
-                                "cuda_absent=[{cuda_detail}]; directml_absent=[{}]",
-                                dml_failure.error
-                            );
-                            tracing::warn!(code, source_error = %detail,
-                                "STT auto policy selected CPU after positive CUDA and DirectML absence proof");
-                            self.record_fallback(code, detail)?;
-                            self.load_with_backend(ModelBackend::Cpu)
-                                .map_err(|failure| failure.error)
-                        }
-                        Err(dml_failure) => {
-                            tracing::error!(code = "SYNAPSE_STT_DIRECTML_SESSION_FAILED", error = %dml_failure.error,
-                                "STT refused CPU demotion because DirectML is present or its absence is unproved");
-                            Err(dml_failure.error)
-                        }
-                    }
+                    let code = "SYNAPSE_STT_AUTO_CPU_NO_CUDA_PROVIDER";
+                    let detail = cuda_failure.error.to_string();
+                    tracing::warn!(code, source_error = %detail,
+                        "STT auto policy selected CPU after positive CUDA absence proof");
+                    self.record_fallback(code, detail)?;
+                    self.load_with_backend(ModelBackend::Cpu)
+                        .map_err(|failure| failure.error)
                 }
                 Err(failure) => {
                     tracing::error!(
@@ -484,8 +463,6 @@ impl WhisperTinyStt {
     }
 
     /// Registers CUDA's declared dedicated-memory envelope before ORT allocates.
-    /// DirectML on this host uses integrated shared system memory, not an NVML
-    /// device, and ORT's session mutex serializes its non-concurrent Run calls.
     fn acquire_gpu_reservation(
         &self,
         backend: ModelBackend,
@@ -655,15 +632,12 @@ pub fn stt_backend_policy() -> AudioResult<SttBackendPolicy> {
     if trimmed.eq_ignore_ascii_case("cuda") {
         return Ok(SttBackendPolicy::Pinned(ModelBackend::Cuda));
     }
-    if trimmed.eq_ignore_ascii_case("directml") {
-        return Ok(SttBackendPolicy::Pinned(ModelBackend::DirectMl));
-    }
     if trimmed.eq_ignore_ascii_case("cpu") {
         return Ok(SttBackendPolicy::Pinned(ModelBackend::Cpu));
     }
     Err(AudioError::ModelLoadFailed {
         path: default_model_path(),
-        detail: format!("{STT_BACKEND_ENV} must be auto, cuda, directml, or cpu; got {value:?}"),
+        detail: format!("{STT_BACKEND_ENV} must be auto, cuda, or cpu; got {value:?}"),
     })
 }
 
@@ -691,11 +665,6 @@ fn model_error_proves_backend_absent(error: &ModelError, expected: ModelBackend)
                     || detail.contains("cudaerrornodevice")
                     || detail.contains("onnxruntime_providers_cuda")
                     || (detail.contains("libraries are not found") && detail.contains("cuda"))
-            }
-            ModelBackend::DirectMl => {
-                detail.contains("directml.dll")
-                    || detail.contains("no directx 12 capable adapter")
-                    || detail.contains("no directml capable adapter")
             }
             ModelBackend::Cpu => false,
         }

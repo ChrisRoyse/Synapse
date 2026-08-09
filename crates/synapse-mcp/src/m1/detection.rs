@@ -442,7 +442,6 @@ pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (St
         provider: match backend {
             ModelBackend::Cuda => "cuda",
             ModelBackend::Cpu => "cpu",
-            ModelBackend::DirectMl => "directml",
         },
         model_id: model.id,
         materialized,

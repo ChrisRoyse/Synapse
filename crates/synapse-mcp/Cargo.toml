@@ -81,11 +81,11 @@ sysinfo.workspace = true
 tempfile.workspace = true
 synapse-action = { version = "0.1.0", path = "../synapse-action" }
 synapse-a11y = { version = "0.1.0", path = "../synapse-a11y" }
-synapse-audio = { version = "0.1.0", path = "../synapse-audio", features = ["cuda", "directml"] }
+synapse-audio = { version = "0.1.0", path = "../synapse-audio", features = ["cuda"] }
 synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
-synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["cuda", "directml"] }
+synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["cuda"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
 synapse-reflex = { version = "0.1.0", path = "../synapse-reflex" }

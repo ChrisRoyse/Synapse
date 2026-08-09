@@ -1,19 +1,18 @@
 use serde::{Deserialize, Serialize};
 
-use crate::ModelBackend::{Cpu, Cuda, DirectMl};
+use crate::ModelBackend::{Cpu, Cuda};
 
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelBackend {
     Cuda,
-    DirectMl,
     #[default]
     Cpu,
 }
 
 #[must_use]
 pub fn default_provider_order() -> Vec<ModelBackend> {
-    vec![Cuda, DirectMl, Cpu]
+    vec![Cuda, Cpu]
 }
 
 #[cfg(feature = "ort")]
@@ -30,31 +29,13 @@ pub fn create_ort_session(
         path: descriptor.path.clone(),
         detail: err.to_string(),
     })?;
-    if matches!(provider, Cuda | DirectMl) {
+    if provider == Cuda {
         builder = builder
             .with_optimization_level(GraphOptimizationLevel::Level1)
             .map_err(|err| crate::ModelError::LoadFailed {
                 path: descriptor.path.clone(),
                 detail: format!("failed to bound GPU graph optimization to basic passes: {err}"),
             })?;
-    }
-    // DirectML requires sequential execution and does not support ORT memory
-    // patterns. Configure both requirements explicitly before attaching the
-    // provider so session construction never depends on ORT defaults.
-    if provider == DirectMl {
-        builder = builder.with_parallel_execution(false).map_err(|err| {
-            crate::ModelError::LoadFailed {
-                path: descriptor.path.clone(),
-                detail: format!("failed to require sequential DirectML execution: {err}"),
-            }
-        })?;
-        builder =
-            builder
-                .with_memory_pattern(false)
-                .map_err(|err| crate::ModelError::LoadFailed {
-                    path: descriptor.path.clone(),
-                    detail: format!("failed to disable DirectML memory patterns: {err}"),
-                })?;
     }
     if descriptor.id == "whisper_tiny_int8" {
         let library = crate::download::local_ort_extensions_library()?;
@@ -70,7 +51,6 @@ pub fn create_ort_session(
     }
     let execution_provider = match provider {
         Cuda => ep::CUDA::default().build().error_on_failure(),
-        DirectMl => ep::DirectML::default().build().error_on_failure(),
         Cpu => ep::CPU::default()
             .with_arena_allocator(false)
             .build()

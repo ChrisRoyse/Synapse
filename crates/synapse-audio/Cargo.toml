@@ -15,7 +15,6 @@ default = []
 # declares the provider features it depends on instead of inheriting them by
 # accident from whatever else the workspace build happens to link.
 cuda = ["synapse-models/cuda"]
-directml = ["synapse-models/directml"]
 
 [dependencies]
 # calyx-forge (no `cuda` feature: this crate needs the host GPU reservation
@@ -29,7 +28,7 @@ ort.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
-synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["directml"] }
+synapse-models = { version = "0.1.0", path = "../synapse-models" }
 thiserror.workspace = true
 tracing.workspace = true
 

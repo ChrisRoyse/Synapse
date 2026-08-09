@@ -18,7 +18,6 @@ ort = [
     "ort/std",
 ]
 cuda = ["ort", "ort/cuda"]
-directml = ["ort", "ort/directml"]
 
 [dependencies]
 chrono.workspace = true
