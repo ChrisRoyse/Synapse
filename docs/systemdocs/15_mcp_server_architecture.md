@@ -38,7 +38,7 @@ The MCP server identifies itself (`get_info`, `server/handler.rs`) as:
 
 ## 2. Entry Point Trace
 
-`main()` (`main.rs`) builds a multi-threaded Tokio runtime, calls `run()`, and applies a 5-second `shutdown_timeout`. Top-level errors are recorded into the daemon-lifecycle ledger via `daemon_lifecycle::record_top_level_error` and exit with code 1.
+`main()` (`main.rs`) builds a multi-threaded Tokio runtime, calls `run()`, and applies a 5-second `shutdown_timeout`. Top-level errors are recorded into the daemon-lifecycle ledger via `daemon_lifecycle::record_top_level_error` when lifecycle state has been configured and exit with code 1. Errors before lifecycle configuration emit only their primary cause; the expected absence of a ledger is not reported as a secondary fault.
 
 `run()` dispatch order:
 
@@ -147,9 +147,9 @@ The stdio transport wraps stdin in `CancelOnEofRead<R>`, an `AsyncRead` adapter.
 
 ### 4.2 HTTP server (`http/transport.rs`, axum)
 
-`http::serve(bind, allow_non_loopback, m2_config, m3_config, m4_config)` startup (exit codes in parentheses):
+HTTP startup begins with `http::preflight_bind(bind, allow_non_loopback)` in `main::run` immediately after CLI decoding, before telemetry, process QoS, DPI, action recovery/input release/watchdog, storage, lifecycle, or transport initialization. The validated `SocketAddr` is then passed to `http::serve`; no downstream layer reparses it. Rejections write one structured, code-bearing stderr diagnostic because the logging subsystem has deliberately not been initialized. Startup (exit codes in parentheses):
 
-1. Parse `bind` into a `SocketAddr`.
+1. Parse `bind` into a `SocketAddr`; invalid syntax → `HTTP_BIND_ADDRESS_INVALID`, exit **2**.
 2. **Loopback enforcement** — non-loopback bind without `--allow-non-loopback` → `HTTP_BIND_NON_LOOPBACK_REFUSED`, exit **2** (checked before the lock).
 3. `SingleInstanceGuard::acquire` — `AlreadyRunning` → `MCP_DAEMON_ALREADY_RUNNING`, exit **3**.
 4. `daemon_lifecycle::configure(mode="http", ...)` + panic hook.

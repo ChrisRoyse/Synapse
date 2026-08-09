@@ -287,6 +287,7 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `TOOL_PROFILE_POLICY_DENIED` | Tool denied by profile policy. |
 | `TOOL_PARAMS_INVALID` | Tool params invalid. |
 | `TOOL_INTERNAL_ERROR` | Tool internal error. |
+| `HTTP_BIND_ADDRESS_INVALID` | HTTP bind is not a valid IP socket address. |
 | `HTTP_BIND_NON_LOOPBACK_REFUSED` | Non-loopback HTTP bind refused. |
 | `HTTP_TOKEN_INVALID` | HTTP bearer token invalid. |
 | `HTTP_ORIGIN_REFUSED` | HTTP origin refused. |

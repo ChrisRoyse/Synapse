@@ -128,7 +128,7 @@ mod server;
 mod single_instance;
 mod stdio_eof;
 
-use std::{num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, path::PathBuf, process::ExitCode, time::Duration};
 
 use anyhow::Context;
 use clap::{ArgAction, Parser, ValueEnum};
@@ -171,6 +171,11 @@ enum Mode {
     Doctor,
     /// Run a registry-backed local model as a Synapse MCP client/agent.
     LocalAgent,
+}
+
+enum CliTransportPreflight {
+    NonHttp,
+    Http(SocketAddr),
 }
 
 #[derive(Debug, Parser)]
@@ -426,8 +431,14 @@ fn main() -> ExitCode {
 }
 
 fn top_level_error_exit(err: anyhow::Error) -> ExitCode {
-    if let Err(lifecycle_error) = daemon_lifecycle::record_top_level_error(&format!("{err:#}")) {
-        eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
+    match daemon_lifecycle::record_top_level_error(&format!("{err:#}")) {
+        Ok(
+            daemon_lifecycle::TopLevelErrorRecordOutcome::Recorded
+            | daemon_lifecycle::TopLevelErrorRecordOutcome::NotConfigured,
+        ) => {}
+        Err(lifecycle_error) => {
+            eprintln!("synapse-mcp lifecycle error: {lifecycle_error:#}");
+        }
     }
     eprintln!("synapse-mcp error: {err:#}");
     ExitCode::from(1)
@@ -447,6 +458,22 @@ async fn run() -> anyhow::Result<ExitCode> {
     }
 
     let cli = Cli::parse();
+
+    // Validate the only transport-specific daemon argument immediately after
+    // CLI decoding. This must precede even telemetry initialization: rejected
+    // input is not allowed to register process-global metrics, configure file
+    // logging, or emit anything beyond its one structured stderr diagnostic.
+    let transport_preflight = if matches!(cli.mode, Mode::Http) {
+        match http::preflight_bind(&cli.bind, cli.allow_non_loopback) {
+            Ok(bind_addr) => CliTransportPreflight::Http(bind_addr),
+            Err(error) => {
+                eprintln!("synapse-mcp error: {error}");
+                return Ok(ExitCode::from(2));
+            }
+        }
+    } else {
+        CliTransportPreflight::NonHttp
+    };
 
     let telemetry_guard = configure_telemetry(&cli)?;
 
@@ -527,6 +554,27 @@ async fn run() -> anyhow::Result<ExitCode> {
         drop(telemetry_guard);
         return result;
     }
+
+    // All non-daemon modes returned above. Pair the decoded mode with its typed
+    // preflight result so HTTP cannot continue without its validated address
+    // and no other mode can accidentally consume one.
+    let daemon_transport = match (cli.mode, transport_preflight) {
+        (Mode::Stdio, CliTransportPreflight::NonHttp) => CliTransportPreflight::NonHttp,
+        (Mode::Http, CliTransportPreflight::Http(bind_addr)) => {
+            CliTransportPreflight::Http(bind_addr)
+        }
+        (
+            Mode::Connect
+            | Mode::ChromeNativeHost
+            | Mode::ApprovalProtocol
+            | Mode::DesktopWorker
+            | Mode::DetectionWorker
+            | Mode::Doctor
+            | Mode::LocalAgent,
+            CliTransportPreflight::NonHttp,
+        ) => unreachable!("non-daemon modes are handled before daemon initialization"),
+        _ => unreachable!("CLI transport preflight result does not match the decoded mode"),
+    };
 
     // Declare the daemon's scheduling QoS before any subsystem starts, so every
     // thread this process later spawns inherits the asserted priority class
@@ -622,30 +670,14 @@ async fn run() -> anyhow::Result<ExitCode> {
     // selection is auditable from the log alone (#2082 finding E).
     let _watchdog_started = synapse_action::spawn_synthetic_input_watchdog();
 
-    match cli.mode {
-        Mode::Stdio => run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await,
-        Mode::Http => {
-            let code = http::serve(
-                &cli.bind,
-                cli.allow_non_loopback,
-                &m2_config,
-                m3_config,
-                m4_config,
-            )
-            .await?;
+    match daemon_transport {
+        CliTransportPreflight::NonHttp => {
+            run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await
+        }
+        CliTransportPreflight::Http(bind_addr) => {
+            let code = http::serve(bind_addr, &m2_config, m3_config, m4_config).await?;
             drop(telemetry_guard);
             Ok(code)
-        }
-        Mode::Connect
-        | Mode::ChromeNativeHost
-        | Mode::ApprovalProtocol
-        | Mode::DesktopWorker
-        | Mode::DetectionWorker
-        | Mode::Doctor
-        | Mode::LocalAgent => {
-            unreachable!(
-                "connect, chrome-native-host, approval-protocol, desktop-worker, detection-worker, doctor, and local-agent modes are handled before daemon setup"
-            )
         }
     }
 }

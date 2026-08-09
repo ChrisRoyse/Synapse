@@ -170,6 +170,7 @@ pub const TOOL_PARAMS_INVALID: &str = "TOOL_PARAMS_INVALID";
 /// Autonomous routine arming was refused because grounded eligibility failed.
 pub const ROUTINE_AUTONOMY_NOT_READY: &str = "ROUTINE_AUTONOMY_NOT_READY";
 pub const TOOL_INTERNAL_ERROR: &str = "TOOL_INTERNAL_ERROR";
+pub const HTTP_BIND_ADDRESS_INVALID: &str = "HTTP_BIND_ADDRESS_INVALID";
 pub const HTTP_BIND_NON_LOOPBACK_REFUSED: &str = "HTTP_BIND_NON_LOOPBACK_REFUSED";
 pub const HTTP_TOKEN_INVALID: &str = "HTTP_TOKEN_INVALID";
 pub const HTTP_ORIGIN_REFUSED: &str = "HTTP_ORIGIN_REFUSED";

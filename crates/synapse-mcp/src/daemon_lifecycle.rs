@@ -1561,14 +1561,35 @@ pub(crate) fn record_startup_exit(cause: &'static str, detail: Value) -> anyhow:
     record_exit("daemon_exit", cause, detail)
 }
 
-pub(crate) fn record_top_level_error(detail: &str) -> anyhow::Result<()> {
-    record_exit(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TopLevelErrorRecordOutcome {
+    Recorded,
+    NotConfigured,
+}
+
+/// Record a top-level failure when daemon lifecycle state exists.
+///
+/// Argument, telemetry, runtime, and other preflight failures can occur before
+/// lifecycle configuration by construction. That expected absence is distinct
+/// from a poisoned state lock or a failed durable ledger write, both of which
+/// remain errors so the operator sees the secondary recording fault.
+pub(crate) fn record_top_level_error(detail: &str) -> anyhow::Result<TopLevelErrorRecordOutcome> {
+    let slot = state_slot();
+    let mut guard = slot
+        .lock()
+        .map_err(|_error| anyhow::anyhow!("daemon lifecycle state lock poisoned"))?;
+    let Some(state) = guard.as_mut() else {
+        return Ok(TopLevelErrorRecordOutcome::NotConfigured);
+    };
+    record_exit_for_state(
+        state,
         "daemon_exit",
         "top_level_error",
         json!({
             "error": detail,
         }),
-    )
+    )?;
+    Ok(TopLevelErrorRecordOutcome::Recorded)
 }
 
 pub(crate) fn record_forced_exit_nonblocking(
