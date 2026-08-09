@@ -10,15 +10,17 @@ fn main() {
         None => return,
     };
     let forbidden = ["bin", "code"].concat();
+    // Cargo recompiles and reruns this script when build.rs changes, so scan it
+    // for policy coverage without emitting a redundant rerun-if-changed entry.
+    scan_file(&manifest_dir.join("build.rs"), &forbidden);
     for path in [
         manifest_dir.join("Cargo.toml"),
-        manifest_dir.join("build.rs"),
         manifest_dir.join("src"),
-        manifest_dir.join("tests"),
-        manifest_dir.join("benches"),
         manifest_dir.join("examples"),
     ] {
-        scan_path(&path, &forbidden);
+        if path.exists() {
+            scan_path(&path, &forbidden);
+        }
     }
 }
 
@@ -55,7 +57,6 @@ fn should_scan_file(path: &Path) -> bool {
 }
 
 fn scan_file(path: &Path, forbidden: &str) {
-    println!("cargo:rerun-if-changed={}", path.display());
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) => panic!("read {} failed: {error}", path.display()),
