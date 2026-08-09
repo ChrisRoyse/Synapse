@@ -6,7 +6,10 @@ use std::{
     time::Instant,
 };
 
-use calyx_forge::vram::{HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore};
+use calyx_forge::vram::{
+    HostCudaDeviceVerdict, HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore,
+    probe_host_cuda_device,
+};
 use ort::session::Session;
 use ort::value::{PrimitiveTensorElementType, Tensor};
 use serde::{Deserialize, Serialize};
@@ -98,11 +101,10 @@ impl TranscriptionConfidenceSource {
 
 /// Execution-provider policy for the pinned Whisper session.
 ///
-/// `Auto` mirrors the Calyx math-backend policy (`crates/synapse-calyx/src/
-/// math.rs`): prefer the GPU, and select CPU only when the failure is positive
-/// proof that this host has no usable CUDA execution provider. A GPU that is
-/// present but broken, an admission refusal, or any other load failure is a
-/// hard error — never a silent demotion to CPU.
+/// `Auto` prefers CUDA, then DirectML, then CPU. It advances between providers
+/// only after positive proof that the preceding hardware/provider is absent.
+/// A present-but-broken provider, an admission refusal, or any other load
+/// failure is a hard error — never a silent demotion.
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SttBackendPolicy {
     Auto,
@@ -117,6 +119,7 @@ pub struct SttBackendReadback {
     pub selected_backend: Option<ModelBackend>,
     pub gpu_reservation_id: Option<String>,
     pub gpu_reservation_mib: Option<u64>,
+    pub device_memory_policy: Option<String>,
     /// Set when `Auto` demoted to CPU, with the proof that made it legal.
     pub fallback_code: Option<String>,
     pub fallback_detail: Option<String>,
@@ -167,10 +170,14 @@ impl WhisperTinyStt {
         }
     }
 
-    /// Reports the configured policy and, once a session exists, the provider
-    /// it resolved to plus the GPU ledger row that admitted it.
-    #[must_use]
-    pub fn backend_readback(&self) -> SttBackendReadback {
+    /// Reports the configured policy and, once a session exists, the provider,
+    /// memory policy, demotion evidence, and CUDA ledger row (when applicable).
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured model error if either source-of-truth mutex is
+    /// poisoned, rather than reporting an invented unloaded state.
+    pub fn backend_readback(&self) -> AudioResult<SttBackendReadback> {
         let policy = match stt_backend_policy() {
             Ok(SttBackendPolicy::Auto) => "auto".to_owned(),
             Ok(SttBackendPolicy::Pinned(backend)) => format!("pinned:{backend:?}"),
@@ -189,23 +196,36 @@ impl WhisperTinyStt {
                         state.reservation.as_ref().map(|_| STT_GPU_ADMISSION_MIB),
                     )
                 }),
-                Err(_poisoned) => (false, None, None, None),
+                Err(_poisoned) => {
+                    return Err(AudioError::ModelLoadFailed {
+                        path: self.descriptor.path.clone(),
+                        detail: "STT backend readback model cache lock was poisoned".to_owned(),
+                    });
+                }
             };
         let (fallback_code, fallback_detail) = self
             .fallback
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone())
+            .map_err(|_| AudioError::ModelLoadFailed {
+                path: self.descriptor.path.clone(),
+                detail: "STT backend readback fallback lock was poisoned".to_owned(),
+            })?
+            .clone()
             .map_or((None, None), |(code, detail)| (Some(code), Some(detail)));
-        SttBackendReadback {
+        Ok(SttBackendReadback {
             policy,
             loaded,
             selected_backend,
             gpu_reservation_id,
             gpu_reservation_mib,
+            device_memory_policy: selected_backend.map(|backend| match backend {
+                ModelBackend::Cuda => "nvml_dedicated_memory_session_lease".to_owned(),
+                ModelBackend::DirectMl => "directml_shared_system_memory_serial_session".to_owned(),
+                ModelBackend::Cpu => "host_memory".to_owned(),
+            }),
             fallback_code,
             fallback_detail,
-        }
+        })
     }
 
     #[must_use]
@@ -376,23 +396,34 @@ impl WhisperTinyStt {
             }
             SttBackendPolicy::Auto => match self.load_with_backend(ModelBackend::Cuda) {
                 Ok(state) => Ok(state),
-                Err(failure) if failure.proves_gpu_absent => {
-                    let code = "SYNAPSE_STT_AUTO_CPU_NO_CUDA_PROVIDER";
-                    let detail = failure.error.to_string();
-                    // Loud, recorded, and readable back: an `auto` demotion is
-                    // announced, never silent.
-                    tracing::warn!(
-                        code,
-                        source_code = failure.error.code(),
-                        source_error = %failure.error,
-                        "STT auto policy selected the CPU execution provider because this host \
-                         proves it has no usable CUDA execution provider"
-                    );
-                    if let Ok(mut guard) = self.fallback.lock() {
-                        *guard = Some((code.to_owned(), detail));
+                Err(cuda_failure) if cuda_failure.proves_gpu_absent => {
+                    let cuda_detail = cuda_failure.error.to_string();
+                    match self.load_with_backend(ModelBackend::DirectMl) {
+                        Ok(state) => {
+                            let code = "SYNAPSE_STT_AUTO_DIRECTML_NO_CUDA_PROVIDER";
+                            tracing::warn!(code, source_error = %cuda_detail,
+                                "STT auto policy selected DirectML after positive CUDA absence proof");
+                            self.record_fallback(code, cuda_detail)?;
+                            Ok(state)
+                        }
+                        Err(dml_failure) if dml_failure.proves_gpu_absent => {
+                            let code = "SYNAPSE_STT_AUTO_CPU_NO_GPU_PROVIDER";
+                            let detail = format!(
+                                "cuda_absent=[{cuda_detail}]; directml_absent=[{}]",
+                                dml_failure.error
+                            );
+                            tracing::warn!(code, source_error = %detail,
+                                "STT auto policy selected CPU after positive CUDA and DirectML absence proof");
+                            self.record_fallback(code, detail)?;
+                            self.load_with_backend(ModelBackend::Cpu)
+                                .map_err(|failure| failure.error)
+                        }
+                        Err(dml_failure) => {
+                            tracing::error!(code = "SYNAPSE_STT_DIRECTML_SESSION_FAILED", error = %dml_failure.error,
+                                "STT refused CPU demotion because DirectML is present or its absence is unproved");
+                            Err(dml_failure.error)
+                        }
                     }
-                    self.load_with_backend(ModelBackend::Cpu)
-                        .map_err(|cpu_failure| cpu_failure.error)
                 }
                 Err(failure) => {
                     tracing::error!(
@@ -408,21 +439,40 @@ impl WhisperTinyStt {
         }
     }
 
+    fn record_fallback(&self, code: &str, detail: String) -> AudioResult<()> {
+        let mut guard = self
+            .fallback
+            .lock()
+            .map_err(|_| AudioError::ModelLoadFailed {
+                path: self.descriptor.path.clone(),
+                detail: "STT fallback audit lock was poisoned".to_owned(),
+            })?;
+        *guard = Some((code.to_owned(), detail));
+        Ok(())
+    }
+
     fn load_with_backend(
         &self,
         backend: ModelBackend,
     ) -> Result<LoadedStt, Box<SttBackendFailure>> {
         let reservation = self.acquire_gpu_reservation(backend).map_err(|error| {
+            let proves_gpu_absent = backend == ModelBackend::Cuda
+                && matches!(
+                    probe_host_cuda_device(STT_GPU_DEVICE_INDEX),
+                    HostCudaDeviceVerdict::Absent { .. }
+                );
             Box::new(SttBackendFailure {
                 error,
-                // Admission backpressure is capacity, not absence. Refuse.
-                proves_gpu_absent: false,
+                // Capacity and indeterminate probe failures are never absence.
+                // A separately classified NVML Absent verdict is physical
+                // evidence that CUDA cannot exist on this host.
+                proves_gpu_absent,
             })
         })?;
         match ModelLoader::new(vec![backend]).load(self.descriptor.clone()) {
             Ok(model) => Ok(LoadedStt { model, reservation }),
             Err(error) => {
-                let proves_gpu_absent = model_error_proves_gpu_absent(&error);
+                let proves_gpu_absent = model_error_proves_backend_absent(&error, backend);
                 // `reservation` drops here, releasing the ledger row we did not
                 // end up using.
                 Err(Box::new(SttBackendFailure {
@@ -433,13 +483,14 @@ impl WhisperTinyStt {
         }
     }
 
-    /// Registers the session's declared device envelope with the OS-wide Calyx
-    /// GPU reservation ledger before ORT can allocate anything.
+    /// Registers CUDA's declared dedicated-memory envelope before ORT allocates.
+    /// DirectML on this host uses integrated shared system memory, not an NVML
+    /// device, and ORT's session mutex serializes its non-concurrent Run calls.
     fn acquire_gpu_reservation(
         &self,
         backend: ModelBackend,
     ) -> AudioResult<Option<HostGpuReservation>> {
-        if backend == ModelBackend::Cpu {
+        if backend != ModelBackend::Cuda {
             return Ok(None);
         }
         let store = HostGpuReservationStore::from_env(STT_GPU_DEVICE_INDEX).map_err(|error| {
@@ -624,18 +675,30 @@ pub fn stt_backend_policy() -> AudioResult<SttBackendPolicy> {
 /// reports no CUDA device" are absence. Everything else — an EP that loaded and
 /// then failed, an out-of-memory, a rejected graph — is a present-but-broken
 /// GPU, and uncertainty is not evidence.
-fn model_error_proves_gpu_absent(error: &ModelError) -> bool {
+fn model_error_proves_backend_absent(error: &ModelError, expected: ModelBackend) -> bool {
     let ModelError::BackendUnavailable { failures, .. } = error else {
         return false;
     };
-    failures.iter().any(|(_backend, detail)| {
+    failures.iter().any(|(backend, detail)| {
+        if *backend != expected {
+            return false;
+        }
         let detail = detail.to_ascii_lowercase();
-        detail.contains("no cuda-capable device")
-            || detail.contains("cuda_error_no_device")
-            || detail.contains("cudaerrornodevice")
-            || detail.contains("onnxruntime_providers_cuda")
-            || detail.contains("directml.dll")
-            || (detail.contains("libraries are not found") && detail.contains("cuda"))
+        match expected {
+            ModelBackend::Cuda => {
+                detail.contains("no cuda-capable device")
+                    || detail.contains("cuda_error_no_device")
+                    || detail.contains("cudaerrornodevice")
+                    || detail.contains("onnxruntime_providers_cuda")
+                    || (detail.contains("libraries are not found") && detail.contains("cuda"))
+            }
+            ModelBackend::DirectMl => {
+                detail.contains("directml.dll")
+                    || detail.contains("no directx 12 capable adapter")
+                    || detail.contains("no directml capable adapter")
+            }
+            ModelBackend::Cpu => false,
+        }
     })
 }
 

@@ -1033,6 +1033,20 @@ pub struct SubsystemHealth {
     pub ring_buffer_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_model_loaded: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_backend_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_selected_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_device_memory_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_gpu_reservation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_gpu_reservation_mib: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_fallback_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stt_fallback_detail: Option<String>,
     /// Whether the optional speech-to-text model is packaged in this build
     /// (#1863).
     ///

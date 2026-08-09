@@ -2793,6 +2793,17 @@ impl SynapseService {
                     };
                 };
                 let loopback_status = runtime.loopback_status();
+                let stt_readback = match runtime.stt_backend_readback() {
+                    Ok(readback) => readback,
+                    Err(error) => {
+                        return SubsystemHealth {
+                            status: "error".to_owned(),
+                            detail: Some(format!("STT backend readback failed: {error}")),
+                            stt_model_available: Some(true),
+                            ..SubsystemHealth::default()
+                        };
+                    }
+                };
                 let status = if loopback_status.last_error_code.is_some() {
                     "error"
                 } else {
@@ -2812,6 +2823,15 @@ impl SynapseService {
                     )),
                     ring_buffer_seconds: Some(runtime.config().ring_seconds),
                     stt_model_loaded: Some(runtime.stt_model_loaded()),
+                    stt_backend_policy: Some(stt_readback.policy),
+                    stt_selected_backend: stt_readback
+                        .selected_backend
+                        .map(|backend| format!("{backend:?}")),
+                    stt_device_memory_policy: stt_readback.device_memory_policy,
+                    stt_gpu_reservation_id: stt_readback.gpu_reservation_id,
+                    stt_gpu_reservation_mib: stt_readback.gpu_reservation_mib,
+                    stt_fallback_code: stt_readback.fallback_code,
+                    stt_fallback_detail: stt_readback.fallback_detail,
                     stt_model_available: Some(true),
                     ..SubsystemHealth::default()
                 }

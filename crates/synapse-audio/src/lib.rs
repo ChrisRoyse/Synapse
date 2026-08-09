@@ -233,6 +233,22 @@ impl AudioRuntime {
     pub fn stt_model_loaded(&self) -> bool {
         self.stt.lock().is_ok_and(|stt| stt.is_loaded())
     }
+
+    /// Independently reads the configured and selected STT execution provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured model error if the runtime or STT readback mutex
+    /// is poisoned.
+    pub fn stt_backend_readback(&self) -> AudioResult<SttBackendReadback> {
+        self.stt
+            .lock()
+            .map_err(|_| AudioError::ModelLoadFailed {
+                path: stt::default_model_path(),
+                detail: "STT runtime readback lock was poisoned".to_owned(),
+            })?
+            .backend_readback()
+    }
 }
 
 fn validate_config(config: &AudioConfig) -> AudioResult<()> {
