@@ -435,17 +435,28 @@ impl WhisperTinyStt {
         backend: ModelBackend,
     ) -> Result<LoadedStt, Box<SttBackendFailure>> {
         let reservation = self.acquire_gpu_reservation(backend).map_err(|error| {
-            let proves_gpu_absent = backend == ModelBackend::Cuda
-                && matches!(
-                    probe_host_cuda_device(STT_GPU_DEVICE_INDEX),
-                    HostCudaDeviceVerdict::Absent { .. }
-                );
+            let verdict = (backend == ModelBackend::Cuda)
+                .then(|| probe_host_cuda_device(STT_GPU_DEVICE_INDEX));
+            let absence_basis = match verdict {
+                Some(HostCudaDeviceVerdict::Absent { basis }) => Some(basis),
+                _ => None,
+            };
+            let error = match absence_basis.as_ref() {
+                Some(basis) => AudioError::ModelLoadFailed {
+                    path: self.descriptor.path.clone(),
+                    detail: format!(
+                        "CUDA device absence proved before STT provider selection: {basis}; \
+                         preceding CUDA admission result: {error}"
+                    ),
+                },
+                None => error,
+            };
             Box::new(SttBackendFailure {
                 error,
                 // Capacity and indeterminate probe failures are never absence.
                 // A separately classified NVML Absent verdict is physical
                 // evidence that CUDA cannot exist on this host.
-                proves_gpu_absent,
+                proves_gpu_absent: absence_basis.is_some(),
             })
         })?;
         match ModelLoader::new(vec![backend]).load(self.descriptor.clone()) {
