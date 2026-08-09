@@ -595,56 +595,64 @@ impl SynapseService {
             None
         };
         self.resolve_input_profile_and_hud(&mut input, include.hud);
-        let (mut detection_runtime, detection_config, perception_mode) = {
-            let mut state = self.m1_state()?;
-            let runtime = state.detection_runtime.take().ok_or_else(|| {
-                mcp_error(
+        // Detection is an entities producer, not an observation-wide
+        // prerequisite. In particular, global-only audio/clipboard/fs requests
+        // deliberately carry no window rectangle, so dispatching detection for
+        // them is both unnecessary work and a false DETECTION_NO_FRAME failure
+        // (#2186). Do not take the runtime or spawn uncancellable blocking work
+        // unless the caller requested the entities slot.
+        if include.entities {
+            let (mut detection_runtime, detection_config, perception_mode) = {
+                let mut state = self.m1_state()?;
+                let runtime = state.detection_runtime.take().ok_or_else(|| {
+                    mcp_error(
+                        error_codes::DETECTION_MODEL_INFER_FAILED,
+                        "detection runtime is already serving another observation; source_of_truth=M1 detection_runtime ownership; remediation=wait for the named in-flight observe lifecycle event to terminate before retrying",
+                    )
+                })?;
+                (
+                    runtime,
+                    state.detection_config.clone(),
+                    state.perception_mode,
+                )
+            };
+            let shared_m1_state = std::sync::Arc::clone(&self.m1_state);
+            let detection = tokio::task::spawn_blocking(move || {
+                let detection_result = populate_detection_from_state(
+                    &mut detection_runtime,
+                    &detection_config,
+                    perception_mode,
+                    &mut input,
+                );
+                let mut state = shared_m1_state
+                    .lock()
+                    .map_err(|_error| "M1 state lock poisoned while restoring detection runtime")?;
+                state.detection_runtime = Some(detection_runtime);
+                Ok::<_, &'static str>((detection_result, input))
+            });
+            let (detection_result, returned_input) = tokio::time::timeout(
+                std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
+                detection,
+            )
+            .await
+            .map_err(|_elapsed| {
+                perception_stage_timeout_error(
                     error_codes::DETECTION_MODEL_INFER_FAILED,
-                    "detection runtime is already serving another observation; source_of_truth=M1 detection_runtime ownership; remediation=wait for the named in-flight observe lifecycle event to terminate before retrying",
+                    "observe",
+                    "detection",
+                    PERCEPTION_DETECTION_TIMEOUT_MS,
+                )
+            })?
+            .map_err(|error| perception_join_error("observe", "detection", error))?
+            .map_err(|detail| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    format!("observe detection runtime restore failed: {detail}"),
                 )
             })?;
-            (
-                runtime,
-                state.detection_config.clone(),
-                state.perception_mode,
-            )
-        };
-        let shared_m1_state = std::sync::Arc::clone(&self.m1_state);
-        let detection = tokio::task::spawn_blocking(move || {
-            let detection_result = populate_detection_from_state(
-                &mut detection_runtime,
-                &detection_config,
-                perception_mode,
-                &mut input,
-            );
-            let mut state = shared_m1_state
-                .lock()
-                .map_err(|_error| "M1 state lock poisoned while restoring detection runtime")?;
-            state.detection_runtime = Some(detection_runtime);
-            Ok::<_, &'static str>((detection_result, input))
-        });
-        let (detection_result, returned_input) = tokio::time::timeout(
-            std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
-            detection,
-        )
-        .await
-        .map_err(|_elapsed| {
-            perception_stage_timeout_error(
-                error_codes::DETECTION_MODEL_INFER_FAILED,
-                "observe",
-                "detection",
-                PERCEPTION_DETECTION_TIMEOUT_MS,
-            )
-        })?
-        .map_err(|error| perception_join_error("observe", "detection", error))?
-        .map_err(|detail| {
-            mcp_error(
-                error_codes::OBSERVE_INTERNAL,
-                format!("observe detection runtime restore failed: {detail}"),
-            )
-        })?;
-        detection_result?;
-        input = returned_input;
+            detection_result?;
+            input = returned_input;
+        }
         let mut observation = ObservationAssembler::new()
             .assemble(include, input)
             .map_err(|err| mcp_error(err.code(), err.to_string()))?;
