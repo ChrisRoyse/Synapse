@@ -1281,6 +1281,80 @@ function Wait-SynapsePostExitParent {
     Info "SYNAPSE_POST_EXIT_PARENT_GONE parent_pid=$ParentPid reason=$Reason"
 }
 
+# ---------------------------------------------------------------------------
+# #2092, #2188 -- deploy-scoped restart-authority bookkeeping.
+#
+# PowerShell hoists the top-level trap across this entire scriptblock, but it
+# does not make a script-file function callable before execution reaches that
+# function's definition. Keep every command the trap can call above the trap,
+# including the earliest parameter/contract failures. The deploy drain records
+# the durable revocation in script scope; the trap, post-exit continuation, and
+# section-7 success path all consume the same state.
+#
+# This is the BEST-EFFORT restore used from the trap: it never calls Die
+# (throwing inside a trap loses the original failure). The section-7 restore
+# still uses the fail-closed Clear-/Resume- functions.
+# ---------------------------------------------------------------------------
+$script:SynapseDeployStopRequestPath = $null
+$script:SynapseDeployTaskSuspendedName = $null
+
+function Set-SynapseDeployRestartAuthorityRevocation {
+    param(
+        [Parameter(Mandatory=$true)][string]$StopRequestPath,
+        [Parameter(Mandatory=$true)][string]$TaskName
+    )
+    $script:SynapseDeployStopRequestPath = $StopRequestPath
+    $script:SynapseDeployTaskSuspendedName = $TaskName
+}
+
+function Clear-SynapseDeployRestartAuthorityRevocation {
+    $script:SynapseDeployStopRequestPath = $null
+    $script:SynapseDeployTaskSuspendedName = $null
+}
+
+function Restore-SynapseDeployRestartAuthorityBestEffort {
+    param([Parameter(Mandatory=$true)][string]$Reason)
+
+    $stopRequestPath = $script:SynapseDeployStopRequestPath
+    $taskName = $script:SynapseDeployTaskSuspendedName
+    if ([string]::IsNullOrWhiteSpace($stopRequestPath) -and [string]::IsNullOrWhiteSpace($taskName)) {
+        return
+    }
+    Clear-SynapseDeployRestartAuthorityRevocation
+
+    if (-not [string]::IsNullOrWhiteSpace($stopRequestPath)) {
+        try {
+            if (Test-Path -LiteralPath $stopRequestPath -PathType Leaf) {
+                Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction Stop
+            }
+            $stillPresent = Test-Path -LiteralPath $stopRequestPath -PathType Leaf
+            Info "SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORED reason=$Reason stop_request_path=$stopRequestPath stop_request_present_after=$stillPresent"
+            if ($stillPresent) {
+                Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_INCOMPLETE reason=$Reason path=$stopRequestPath remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
+            }
+        } catch {
+            Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_FAILED reason=$Reason path=$stopRequestPath error=$($_.Exception.Message) remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($taskName)) {
+        try {
+            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            if ($null -eq $task) {
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_SKIPPED reason=$Reason task=$taskName task_present=false"
+            } elseif ([string]$task.State -eq 'Disabled') {
+                Enable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+                $after = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORED reason=$Reason task=$taskName state_after=$($(if ($after) { $after.State } else { '<absent>' }))"
+            } else {
+                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_NOT_NEEDED reason=$Reason task=$taskName state=$($task.State)"
+            }
+        } catch {
+            Info "WARN: SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_FAILED reason=$Reason task=$taskName error=$($_.Exception.Message) remediation=run Enable-ScheduledTask -TaskName $taskName by hand, or rerun setup; autostart stays disabled until it is enabled"
+        }
+    }
+}
+
 trap {
     $errorText = $_ | Out-String
     # #2092: the deploy drain's restart-authority revocation is DURABLE -- it
@@ -1521,82 +1595,6 @@ function Clear-SynapseDaemonSupervisorStopRequest {
     }
     Info "Synapse daemon supervisor restart authority restored: path=$Path reason=$Reason cleared_stop_request=$($before | ConvertTo-Json -Compress -Depth 8)"
     return $before
-}
-
-# ---------------------------------------------------------------------------
-# #2092 -- deploy-scoped restart-authority bookkeeping.
-#
-# The deploy drain now revokes restart authority the same durable way -Stop does
-# (stop-request + Disable-ScheduledTask) instead of Unregister-ScheduledTask.
-# That is strictly more recoverable EXCEPT for one thing: the revocation now
-# outlives this process, so every setup exit path between the drain (section 5)
-# and the restore (section 7) must put it back. #2092 called this fan-out out
-# explicitly as the main risk of writing the stop-request from the deploy path,
-# so the restore is recorded in script scope at revocation time and replayed
-# from the trap, from the post-exit continuation handoff, and from section 7.
-#
-# These two helpers are the BEST-EFFORT form used from the trap: they never call
-# Die (throwing inside a trap loses the original failure) and they never fail the
-# run. The section-7 restore uses the fail-closed Clear-/Resume- functions.
-# ---------------------------------------------------------------------------
-$script:SynapseDeployStopRequestPath = $null
-$script:SynapseDeployTaskSuspendedName = $null
-
-function Set-SynapseDeployRestartAuthorityRevocation {
-    param(
-        [Parameter(Mandatory=$true)][string]$StopRequestPath,
-        [Parameter(Mandatory=$true)][string]$TaskName
-    )
-    $script:SynapseDeployStopRequestPath = $StopRequestPath
-    $script:SynapseDeployTaskSuspendedName = $TaskName
-}
-
-function Clear-SynapseDeployRestartAuthorityRevocation {
-    $script:SynapseDeployStopRequestPath = $null
-    $script:SynapseDeployTaskSuspendedName = $null
-}
-
-function Restore-SynapseDeployRestartAuthorityBestEffort {
-    param([Parameter(Mandatory=$true)][string]$Reason)
-
-    $stopRequestPath = $script:SynapseDeployStopRequestPath
-    $taskName = $script:SynapseDeployTaskSuspendedName
-    if ([string]::IsNullOrWhiteSpace($stopRequestPath) -and [string]::IsNullOrWhiteSpace($taskName)) {
-        return
-    }
-    Clear-SynapseDeployRestartAuthorityRevocation
-
-    if (-not [string]::IsNullOrWhiteSpace($stopRequestPath)) {
-        try {
-            if (Test-Path -LiteralPath $stopRequestPath -PathType Leaf) {
-                Remove-Item -LiteralPath $stopRequestPath -Force -ErrorAction Stop
-            }
-            $stillPresent = Test-Path -LiteralPath $stopRequestPath -PathType Leaf
-            Info "SYNAPSE_DEPLOY_RESTART_AUTHORITY_RESTORED reason=$Reason stop_request_path=$stopRequestPath stop_request_present_after=$stillPresent"
-            if ($stillPresent) {
-                Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_INCOMPLETE reason=$Reason path=$stopRequestPath remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
-            }
-        } catch {
-            Info "WARN: SYNAPSE_DEPLOY_STOP_REQUEST_CLEAR_FAILED reason=$Reason path=$stopRequestPath error=$($_.Exception.Message) remediation=delete this file by hand or run scripts/synapse-setup.ps1 -Start; the hidden supervisor parks at every launch point while it exists"
-        }
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($taskName)) {
-        try {
-            $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-            if ($null -eq $task) {
-                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_SKIPPED reason=$Reason task=$taskName task_present=false"
-            } elseif ([string]$task.State -eq 'Disabled') {
-                Enable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
-                $after = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORED reason=$Reason task=$taskName state_after=$($(if ($after) { $after.State } else { '<absent>' }))"
-            } else {
-                Info "SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_NOT_NEEDED reason=$Reason task=$taskName state=$($task.State)"
-            }
-        } catch {
-            Info "WARN: SYNAPSE_DEPLOY_TASK_AUTHORITY_RESTORE_FAILED reason=$Reason task=$taskName error=$($_.Exception.Message) remediation=run Enable-ScheduledTask -TaskName $taskName by hand, or rerun setup; autostart stays disabled until it is enabled"
-        }
-    }
 }
 
 function New-HiddenDaemonLauncher {
