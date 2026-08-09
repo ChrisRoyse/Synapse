@@ -19,6 +19,7 @@
 use calyx_aster::cf::ColumnFamily;
 use calyx_core::Panel;
 use calyx_oracle::{DomainId, SuperIntelReport, Tier, TierResult};
+use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
 use crate::action_validation::{
@@ -53,7 +54,7 @@ const CORPUS_SOURCE: &str = "Base/panel=2185001,oracle.domain=synapse.action";
 const EVIDENCE_LEASE_MS: u64 = 7 * 24 * 60 * 60 * 1_000;
 
 /// One named admission predicate and everything needed to audit its verdict.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxReadinessPredicate {
     /// Stable predicate identifier, e.g. `evidence_corpus_fresh`.
     pub predicate: String,
@@ -205,6 +206,15 @@ fn evidence_source() -> String {
 impl SynapseCalyxVault {
     /// Measures all six readiness tiers from physical vault evidence and stores
     /// the snapshot so frequent health reads remain O(1) and mutation-free.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when physical evidence cannot be measured,
+    /// encoded, persisted, or independently read back.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "all six tiers must share one measured sequence and one atomic persisted readiness snapshot"
+    )]
     pub fn measure_action_readiness(
         &self,
         panel: &Panel,
@@ -270,7 +280,7 @@ impl SynapseCalyxVault {
             ),
             Err(error) => failed(Tier::Calibrated, calyx_oracle::CALIBRATION_BUDGET, &error),
         };
-        let (goodhart, mistakes, evidence, evidence_admission) = self.action_validation_tiers();
+        let (goodhart, mistakes, evidence, evidence_admission) = self.action_validation_tiers()?;
         let report = SuperIntelReport::new(
             domain,
             vec![
@@ -325,22 +335,25 @@ impl SynapseCalyxVault {
     /// cannot manufacture its own passing evidence.
     fn action_validation_tiers(
         &self,
-    ) -> (
-        TierResult,
-        TierResult,
-        Option<SynapseCalyxReadinessEvidence>,
-        Vec<SynapseCalyxReadinessPredicate>,
-    ) {
+    ) -> Result<
+        (
+            TierResult,
+            TierResult,
+            Option<SynapseCalyxReadinessEvidence>,
+            Vec<SynapseCalyxReadinessPredicate>,
+        ),
+        SynapseCalyxError,
+    > {
         let mut log = Vec::new();
         let mut provenance = None;
         match self.admit_action_evidence(&mut log, &mut provenance) {
             Ok(evidence) => {
-                let (goodhart, mistakes) = derive_action_tiers(&evidence, &mut log);
-                (goodhart, mistakes, provenance, log)
+                let (goodhart, mistakes) = derive_action_tiers(&evidence, &mut log)?;
+                Ok((goodhart, mistakes, provenance, log))
             }
             Err(refusal) => {
                 let (goodhart, mistakes) = refused_action_tiers(&refusal);
-                (goodhart, mistakes, provenance, log)
+                Ok((goodhart, mistakes, provenance, log))
             }
         }
     }
@@ -348,6 +361,10 @@ impl SynapseCalyxVault {
     /// The conjunctive admission gate. Predicates are ordered cheapest-and-most
     /// fundamental first, so the reported failure is the root one rather than a
     /// downstream symptom of it.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the conjunctive admission log must retain its cheapest-first predicate order and exact evidence provenance"
+    )]
     fn admit_action_evidence(
         &self,
         log: &mut Vec<SynapseCalyxReadinessPredicate>,
@@ -720,6 +737,11 @@ impl SynapseCalyxVault {
     }
 
     /// Reads the last persisted readiness snapshot without recomputation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical row cannot be read, decoded,
+    /// or matched to the current readiness schema.
     pub fn read_action_readiness(
         &self,
     ) -> Result<Option<SynapseCalyxReadinessSnapshot>, SynapseCalyxError> {
@@ -751,11 +773,17 @@ impl SynapseCalyxVault {
             report: stored.report,
             measured_at_seq: stored.measured_at_seq,
             persisted_at_seq: None,
-            row_revision_sha256: row
-                .revision_sha256
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect(),
+            row_revision_sha256: {
+                use std::fmt::Write as _;
+
+                row.revision_sha256.iter().fold(
+                    String::with_capacity(row.revision_sha256.len() * 2),
+                    |mut out, byte| {
+                        let _ = write!(out, "{byte:02x}");
+                        out
+                    },
+                )
+            },
             evidence: stored.evidence,
             evidence_admission: stored.evidence_admission,
         }))
@@ -764,13 +792,34 @@ impl SynapseCalyxVault {
 
 /// Derives the two autonomy tiers from admitted evidence, logging each as its
 /// own predicate so the tier value and its source number stay side by side.
+#[expect(
+    clippy::too_many_lines,
+    reason = "both autonomy tiers and their predicate evidence must be derived from one admitted report without splitting provenance"
+)]
 fn derive_action_tiers(
     evidence: &SynapseCalyxActionValidationEvidence,
     log: &mut Vec<SynapseCalyxReadinessPredicate>,
-) -> (TierResult, TierResult) {
+) -> Result<(TierResult, TierResult), SynapseCalyxError> {
     let source = evidence_source();
 
-    let in_region_frac = evidence.goodhart.in_region_frac.unwrap_or(0.0) as f32;
+    let in_region_frac = evidence
+        .goodhart
+        .in_region_frac
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_READINESS_EVIDENCE_METRIC_MISSING",
+                "persisted Goodhart evidence has no in_region_frac measurement",
+                "preserve the evidence row and rerun held-out action validation to produce the required metric",
+            )
+        })?
+        .to_f32()
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_READINESS_EVIDENCE_NUMERIC_OUT_OF_RANGE",
+                "persisted Goodhart in_region_frac cannot be represented as f32",
+                "preserve the evidence row and rerun held-out validation with finite bounded metrics",
+            )
+        })?;
     let goodhart_passed = evidence.goodhart.passed
         && evidence.goodhart.violations.is_empty()
         && in_region_frac.is_finite()
@@ -851,15 +900,25 @@ fn derive_action_tiers(
             mistakes_fix,
         );
     }
+    let regression_count = evidence.mistakes.regression_count.to_f32().ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_READINESS_EVIDENCE_NUMERIC_OUT_OF_RANGE",
+            format!(
+                "persisted regression count {} cannot be represented as f32",
+                evidence.mistakes.regression_count
+            ),
+            "preserve the evidence row and rerun held-out validation with a bounded replay corpus",
+        )
+    })?;
     let mistakes = TierResult::new(
         Tier::MistakeClosed,
         mistakes_passed,
-        evidence.mistakes.regression_count as f32,
+        regression_count,
         0.0,
         (!mistakes_passed).then(|| mistakes_fix.to_owned()),
     );
 
-    (goodhart, mistakes)
+    Ok((goodhart, mistakes))
 }
 
 /// Both autonomy tiers when the evidence itself was refused. They carry the

@@ -353,6 +353,10 @@ pub struct OwnedGenerationRollup {
 
 /// One panel's coverage and grounding row.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the public coverage row preserves independent catalog, denominator, lifecycle, grounding, and reclaim facts"
+)]
 pub struct PanelCoverageRow {
     pub panel_name: String,
     /// The generation new records are written at.
@@ -558,7 +562,7 @@ impl PanelCoverageRow {
     /// True when this panel is short of its source CF and something can be done
     /// about it. This is the maintainer's work predicate (#1927 ask 2).
     #[must_use]
-    pub fn backfill_owed(&self) -> bool {
+    pub const fn backfill_owed(&self) -> bool {
         (self.coverage_below_floor || self.anchors_stranded_on_superseded > 0)
             && self.backfill_source_cf.is_some()
     }
@@ -1050,6 +1054,10 @@ fn probe_orphans(
     clippy::cast_precision_loss,
     reason = "record and row counts are bounded by physical CF sizes"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one catalog/census join must retain all generation ownership, grounding, denominator, and reclaim accounting in one report"
+)]
 pub fn build_panel_coverage_report(
     census: &SynapseCalyxPanelCensus,
     source_cf_rows: &BTreeMap<String, u64>,
@@ -1087,7 +1095,10 @@ pub fn build_panel_coverage_report(
         let active = census.entry(entry.panel_version);
         let active_version_records = active.map_or(0, |row| row.records);
         let grounded_records = active.map_or(0, |row| row.grounded_records);
-        let grounded_fraction = active.map_or(0.0, |row| row.grounded_fraction());
+        let grounded_fraction = active.map_or(
+            0.0,
+            synapse_calyx::SynapseCalyxPanelCensusEntry::grounded_fraction,
+        );
         let anchor_kind_records = active
             .map(|row| row.anchor_kind_records.clone())
             .unwrap_or_default();

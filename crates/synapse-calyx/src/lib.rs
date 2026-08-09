@@ -2898,12 +2898,20 @@ pub struct SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxReadOnlyVault {
-    /// Reads native TimeSeries rows for physical analytics verification.
+    /// Reads native `TimeSeries` rows for physical analytics verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical column family cannot be scanned.
     pub fn scan_timeseries_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
         self.scan_cf_latest(ColumnFamily::TimeSeries)
     }
 
     /// Reads immutable collection descriptors for physical analytics verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical column family cannot be scanned.
     pub fn scan_collections_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
         self.scan_cf_latest(ColumnFamily::Collections)
     }
@@ -2916,6 +2924,10 @@ impl SynapseCalyxReadOnlyVault {
     // from nothing that ships. Call the two general methods directly.
 
     /// Reads content-addressed tuning artifacts for physical Anneal verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical artifact rows cannot be scanned.
     pub fn scan_anneal_tuning_artifacts_latest(
         &self,
     ) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
@@ -2923,6 +2935,10 @@ impl SynapseCalyxReadOnlyVault {
     }
 
     /// Reads native rollback snapshots and live pointers for physical verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical rollback rows cannot be scanned.
     pub fn scan_anneal_rollback_latest(&self) -> Result<SynapseCalyxCfRows, SynapseCalyxError> {
         self.scan_cf_latest(ColumnFamily::AnnealRollback)
     }
@@ -3384,6 +3400,11 @@ impl SynapseCalyxVault {
     /// Reads one latest physical Base row and hydrates every declared Slot CF
     /// vector. Lifecycle workers use this as the independent post-write source
     /// of truth before completing a durable backfill task.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Base row or any declared slot vector
+    /// cannot be read and decoded at the latest snapshot.
     pub fn hydrate_constellation_latest(
         &self,
         cx_id: CxId,
@@ -3580,12 +3601,12 @@ impl SynapseCalyxVault {
         let opened = Self {
             config,
             vault,
-            anneal_ledger_index: Default::default(),
+            anneal_ledger_index: std::sync::Mutex::default(),
             lock,
             math_runtime,
             open_mode,
             lineage,
-            cf_count_memo: std::sync::Mutex::new(BTreeMap::new()),
+            cf_count_memo: std::sync::Mutex::default(),
         };
         opened.initialize_anneal_tuning()?;
         let status = status_from_vault(
@@ -4497,38 +4518,37 @@ impl SynapseCalyxVault {
                 "supply the panel contract for the exact version being rebuilt; an index built from another panel's slot map does not describe the rows it indexed",
             ));
         }
-        let state = match supplied {
-            Some(state) => state.clone(),
-            None => {
-                let active = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
-                    if error.code == CALYX_NO_ACTIVE_PANEL {
-                        SynapseCalyxError::new(
-                            "SYNAPSE_CALYX_NO_ACTIVE_PANEL",
-                            format!(
-                                "no active durable panel is published for search rebuild: {}",
-                                error.message
-                            ),
-                            "publish the active panel for this constellation (publish_active_panel / boot panel publication) before requesting search_rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from backup",
-                        )
-                    } else {
-                        SynapseCalyxError::from_calyx(
-                            "load durable panel state for search rebuild",
-                            &error,
-                        )
-                    }
-                })?;
-                if active.panel.version != expected_panel_version {
-                    return Err(SynapseCalyxError::new(
-                        "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+        let state = if let Some(state) = supplied {
+            state.clone()
+        } else {
+            let active = load_vault_panel_state(&self.config.vault_dir).map_err(|error| {
+                if error.code == CALYX_NO_ACTIVE_PANEL {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_NO_ACTIVE_PANEL",
                         format!(
-                            "requested search rebuild panel {expected_panel_version}, but no definition was supplied for it and the durable active panel is {}",
-                            active.panel.version
+                            "no active durable panel is published for search rebuild: {}",
+                            error.message
                         ),
-                        "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or retry with the active panel's exact version",
-                    ));
+                        "publish the active panel for this constellation (publish_active_panel / boot panel publication) before requesting search_rebuild; this is an expected empty state, not shard corruption \u{2014} do not restore from backup",
+                    )
+                } else {
+                    SynapseCalyxError::from_calyx(
+                        "load durable panel state for search rebuild",
+                        &error,
+                    )
                 }
-                active
+            })?;
+            if active.panel.version != expected_panel_version {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+                    format!(
+                        "requested search rebuild panel {expected_panel_version}, but no definition was supplied for it and the durable active panel is {}",
+                        active.panel.version
+                    ),
+                    "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or retry with the active panel's exact version",
+                ));
             }
+            active
         };
         let panel_root = self
             .config
@@ -4866,6 +4886,11 @@ impl SynapseCalyxVault {
     /// Atomically publishes one new measured constellation, its physical KV
     /// source rows, and one outcome occurrence below an existing recurrence
     /// subject.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when recurrence validation or the atomic
+    /// constellation, source-row, occurrence, and ledger commit fails.
     #[allow(clippy::too_many_arguments)]
     pub fn append_recurrence_occurrence_with_constellation_rows(
         &self,
@@ -4920,6 +4945,11 @@ impl SynapseCalyxVault {
 
     /// Runs honesty-gated Oracle consequence prediction over persisted action
     /// evidence and returns the exact serializable Calyx report.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when inputs are invalid, Oracle refuses the
+    /// persisted evidence, or the report cannot be encoded.
     pub fn oracle_predict_action(
         &self,
         action_id: &str,
@@ -4938,7 +4968,7 @@ impl SynapseCalyxVault {
             calyx_oracle::DomainId::new(domain),
             &SystemClock,
         )
-        .map_err(oracle_error)?;
+        .map_err(|error| oracle_error(&error))?;
         serde_json::to_value(prediction).map_err(|error| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_ORACLE_RESPONSE_ENCODE_FAILED",
@@ -4949,19 +4979,24 @@ impl SynapseCalyxVault {
     }
 
     /// Runs the persisted reverse Oracle walk for one exact outcome value.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when inputs are invalid, the reverse walk
+    /// fails, or the report cannot be encoded.
     pub fn oracle_reverse_action(
         &self,
-        outcome: AnchorValue,
+        outcome: &AnchorValue,
         domain: &str,
     ) -> Result<serde_json::Value, SynapseCalyxError> {
         let domain = nonblank(domain, "Oracle domain")?;
         let causes = calyx_oracle::reverse_query(
             &self.vault,
-            &outcome,
+            outcome,
             calyx_oracle::DomainId::new(domain),
             &SystemClock,
         )
-        .map_err(oracle_error)?;
+        .map_err(|error| oracle_error(&error))?;
         serde_json::to_value(causes).map_err(|error| {
             SynapseCalyxError::new(
                 "SYNAPSE_CALYX_ORACLE_RESPONSE_ENCODE_FAILED",
@@ -4973,6 +5008,11 @@ impl SynapseCalyxVault {
 
     /// Appends one occurrence and, only when it is the subject's first, commits
     /// its exact region outbox row in the same durable batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when recurrence validation or the atomic
+    /// occurrence and first-region commit fails.
     #[allow(clippy::too_many_arguments)]
     pub fn append_recurrence_occurrence_once_with_region(
         &self,
@@ -6479,7 +6519,7 @@ impl SynapseCalyxVault {
     /// walks the same rows through `scan_cf_range_page_latest`, which bounds
     /// both serving layers per page and releases the guard between pages.
     ///
-    /// This is the standard remedy rather than a local trick: RocksDB's own
+    /// This is the standard remedy rather than a local trick: `RocksDB`'s own
     /// guidance is that long-running scans must not pin engine resources, and
     /// it shipped `Iterator::Refresh()` so a long scan can release what it
     /// pinned and re-derive the current state — the same release-between-chunks
@@ -6720,6 +6760,7 @@ impl SynapseCalyxVault {
             if let Some(stored) = memo.get_mut(&cf) {
                 stored.reuses = stored.reuses.saturating_add(1);
             }
+            drop(memo);
             return Ok(MemoizedCfCountReadback {
                 walk: entry.walk.clone(),
                 measured: false,
@@ -6775,6 +6816,7 @@ impl SynapseCalyxVault {
             // A walk that straddled a commit cannot license a later skip.
             memo.remove(&cf);
         }
+        drop(memo);
         Ok(MemoizedCfCountReadback {
             walk,
             measured: true,
@@ -7110,6 +7152,10 @@ impl SynapseCalyxVault {
     ///
     /// Returns an error when flush, the sealed-memtable drain, PID-sidecar
     /// cleanup, lock release, or the re-lock proof fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "close fencing, durable drain, lock release, and re-lock proof are one ordered shutdown transaction"
+    )]
     pub fn close(
         self,
         reason: &'static str,
@@ -7827,7 +7873,7 @@ fn nonblank<'a>(value: &'a str, label: &str) -> Result<&'a str, SynapseCalyxErro
     Ok(value)
 }
 
-fn oracle_error(error: calyx_oracle::OracleError) -> SynapseCalyxError {
+fn oracle_error(error: &calyx_oracle::OracleError) -> SynapseCalyxError {
     SynapseCalyxError::new(error.code(), error.to_string(), error.remediation())
 }
 

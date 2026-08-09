@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 /// `H(anchor)` at matching cardinality — a signature only a lens that **is** the
 /// label can meet. A lens that merely *contains* the label, as one component of
 /// a dense vector or as a field that determines it, meets neither condition and
-/// passes cleanly. Measured on `syn-mcp-usage-v1 @ 1965007` against
+/// passes cleanly. Measured on `syn-mcp-usage-v1 @ 1_965_007` against
 /// `synapse:mcp_tool_call_outcome`, the statistical detector found slot 86 and
 /// missed slots 87 and 93, both of which carry the answer.
 ///
@@ -56,96 +56,96 @@ use std::collections::BTreeSet;
 /// silent pass on a circular measurement, which is the failure this exists to
 /// stop. When in doubt, list it.
 pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
-    (1, 1963001, "syn.timeline.kind_onehot.v1", &["kind"]),
-    (2, 1963001, "syn.timeline.app_hash.v1", &["app"]),
-    (3, 1963001, "syn.timeline.title_sparse.v1", &["payload"]),
-    (4, 1963001, "syn.timeline.hour_cyclic.v1", &["ts_ns"]),
-    (5, 1963001, "syn.timeline.dow_cyclic.v1", &["ts_ns"]),
-    (6, 1963001, "syn.timeline.actor_onehot.v1", &["actor"]),
-    (7, 1963001, "syn.timeline.event_time_rank.v1", &["ts_ns"]),
-    (103, 1963001, "syn.timeline.title_bm25.v1", &["payload"]),
+    (1, 1_963_001, "syn.timeline.kind_onehot.v1", &["kind"]),
+    (2, 1_963_001, "syn.timeline.app_hash.v1", &["app"]),
+    (3, 1_963_001, "syn.timeline.title_sparse.v1", &["payload"]),
+    (4, 1_963_001, "syn.timeline.hour_cyclic.v1", &["ts_ns"]),
+    (5, 1_963_001, "syn.timeline.dow_cyclic.v1", &["ts_ns"]),
+    (6, 1_963_001, "syn.timeline.actor_onehot.v1", &["actor"]),
+    (7, 1_963_001, "syn.timeline.event_time_rank.v1", &["ts_ns"]),
+    (103, 1_963_001, "syn.timeline.title_bm25.v1", &["payload"]),
     // #1963's graded dense lens. A record_vector declares every field its
     // numeric-record builder touches, transitively, because the label being one
     // component of a dense vector is exactly what the statistical leakage
     // detector cannot see.
     (
         104,
-        1963001,
+        1_963_001,
         "syn.timeline.record_vector.v1",
         &["kind", "actor", "ts_ns", "app", "payload"],
     ),
-    (8, 1964001, "syn.episode.app_hash.v1", &["app"]),
-    (9, 1964001, "syn.episode.document_hash.v1", &["document"]),
-    (10, 1964001, "syn.episode.url_host_hash.v1", &["url"]),
+    (8, 1_964_001, "syn.episode.app_hash.v1", &["app"]),
+    (9, 1_964_001, "syn.episode.document_hash.v1", &["document"]),
+    (10, 1_964_001, "syn.episode.url_host_hash.v1", &["url"]),
     (
         11,
-        1964001,
+        1_964_001,
         "syn.episode.title_sparse.v1",
         &["title_first", "title_last"],
     ),
     (
         108,
-        1964001,
+        1_964_001,
         "syn.episode.title_bm25.v1",
         &["title_first", "title_last"],
     ),
     (
         12,
-        1964001,
+        1_964_001,
         "syn.episode.start_hour_cyclic.v1",
         &["start_ts_ns"],
     ),
     (
         13,
-        1964001,
+        1_964_001,
         "syn.episode.start_dow_cyclic.v1",
         &["start_ts_ns"],
     ),
     (
         14,
-        1964001,
+        1_964_001,
         "syn.episode.duration_log1p.v1",
         &["duration_ms"],
     ),
     (
         15,
-        1964001,
+        1_964_001,
         "syn.episode.duration_rank.v1",
         &["duration_ms"],
     ),
     (
         16,
-        1964001,
+        1_964_001,
         "syn.episode.keystrokes_zscore.v1",
         &["keystroke_count"],
     ),
     (
         17,
-        1964001,
+        1_964_001,
         "syn.episode.clicks_zscore.v1",
         &["click_count"],
     ),
     (
         18,
-        1964001,
+        1_964_001,
         "syn.episode.row_count_zscore.v1",
         &["row_count"],
     ),
     (
         19,
-        1964001,
+        1_964_001,
         "syn.episode.started_boundary_onehot.v1",
         &["started_because"],
     ),
     (
         20,
-        1964001,
+        1_964_001,
         "syn.episode.ended_boundary_onehot.v1",
         &["ended_because"],
     ),
     (
         21,
-        1964001,
+        1_964_001,
         "syn.episode.interruption_ratio_raw.v1",
         &["duration_ms", "interrupted_ms"],
     ),
@@ -154,7 +154,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // was only a second copy of the clock.
     (
         113,
-        1964001,
+        1_964_001,
         "syn.episode.record_vector.v2",
         &[
             "click_count",
@@ -167,54 +167,54 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "start_ts_ns",
         ],
     ),
-    (23, 1965001, "syn.agent_event.kind_onehot.v1", &["kind"]),
+    (23, 1_965_001, "syn.agent_event.kind_onehot.v1", &["kind"]),
     (
         24,
-        1965001,
+        1_965_001,
         "syn.agent_event.operation_onehot.v1",
         &["attributes.operation_name"],
     ),
     (
         25,
-        1965001,
+        1_965_001,
         "syn.agent_event.provider_hash.v1",
         &["attributes.provider_name"],
     ),
     (
         26,
-        1965001,
+        1_965_001,
         "syn.agent_event.request_model_hash.v1",
         &["attributes.request_model"],
     ),
     (
         27,
-        1965001,
+        1_965_001,
         "syn.agent_event.response_model_hash.v1",
         &["attributes.response_model"],
     ),
     (
         28,
-        1965001,
+        1_965_001,
         "syn.agent_event.tool_hash.v1",
         &["attributes.tool_name"],
     ),
     (
         29,
-        1965001,
+        1_965_001,
         "syn.agent_event.error_onehot.v1",
         &["attributes.error_type"],
     ),
     (
         30,
-        1965001,
+        1_965_001,
         "syn.agent_event.end_state_onehot.v2",
         &["end_state"],
     ),
-    (31, 1965001, "syn.agent_event.hour_cyclic.v1", &["ts_ns"]),
-    (32, 1965001, "syn.agent_event.dow_cyclic.v1", &["ts_ns"]),
+    (31, 1_965_001, "syn.agent_event.hour_cyclic.v1", &["ts_ns"]),
+    (32, 1_965_001, "syn.agent_event.dow_cyclic.v1", &["ts_ns"]),
     (
         33,
-        1965001,
+        1_965_001,
         "syn.agent_event.usage_total_log1p.v1",
         &[
             "attributes.usage_cache_creation_input_tokens",
@@ -225,55 +225,55 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         114,
-        1965001,
+        1_965_001,
         "syn.agent_event.has_end_state.v1",
         &["end_state"],
     ),
     (
         35,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.role_onehot.v1",
         &["role"],
     ),
     (
         36,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.status_onehot.v2",
         &["status"],
     ),
     (
         37,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.source_onehot.v1",
         &["source"],
     ),
     (
         38,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.event_kind_hash.v1",
         &["event_kind"],
     ),
     (
         39,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.model_hash.v1",
         &["model"],
     ),
     (
         40,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.text_sparse.v1",
         &["content_summary", "parse_error", "source_error"],
     ),
     (
         107,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.text_bm25.v1",
         &["content_summary", "parse_error", "source_error"],
     ),
     (
         109,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.text_full_bm25.v1",
         &[
             "content_summary",
@@ -284,43 +284,43 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         41,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.tool_hash.v1",
         &["tool_calls"],
     ),
     (
         42,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.line_rank.v1",
         &["line_no"],
     ),
     (
         43,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.input_tokens_log1p.v1",
         &["usage"],
     ),
     (
         44,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.output_tokens_log1p.v1",
         &["usage"],
     ),
     (
         45,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.cache_read_log1p.v1",
         &["usage"],
     ),
     (
         46,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.cache_creation_log1p.v1",
         &["usage"],
     ),
     (
         110,
-        1965002,
+        1_965_002,
         "syn.agent_transcript.record_vector.v2",
         &[
             "content_bytes",
@@ -333,16 +333,16 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "usage",
         ],
     ),
-    // The action panel's slots move to generation 2185001 (#2185) together. The
+    // The action panel's slots move to generation 2_185_001 (#2185) together. The
     // version column is load-bearing, not documentary: `syn_anchor_source_
     // provenance` filters this table by `version == panel_version`, so a slot
     // left on the superseded generation is invisible to the leakage check for
     // the live panel — a silent pass, which is the failure mode this whole
     // module exists to remove. The table names the ACTIVE generation of each
-    // panel, exactly as the timeline rows name 1963001 and not 1900001.
+    // panel, exactly as the timeline rows name 1_963_001 and not 1_900_001.
     (
         48,
-        2185001,
+        2_185_001,
         "syn.action.kind_onehot.v2",
         &["row_kind", "tool", "verb"],
     ),
@@ -354,7 +354,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // make impossible.
     (
         49,
-        2185001,
+        2_185_001,
         "syn.action.target_hash.v1",
         &[
             "agent_logical_foreground.target",
@@ -367,7 +367,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // transitively and declares them too.
     (
         50,
-        2185001,
+        2_185_001,
         "syn.action.record_vector.v1",
         &[
             "agent_logical_foreground.target",
@@ -380,8 +380,8 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
-    (51, 2185001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
-    (52, 2185001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
+    (51, 2_185_001, "syn.action.hour_cyclic.v1", &["ts_ns"]),
+    (52, 2_185_001, "syn.action.dow_cyclic.v1", &["ts_ns"]),
     // #2050's dense target-identity lane. It resolves the target through the
     // SAME `ACTION_TARGET_POINTERS` precedence slot 49 uses and then decomposes
     // the resolved value per field, so its declared source set is identical to
@@ -397,7 +397,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // claim in a comment.
     (
         117,
-        2185001,
+        2_185_001,
         "syn.action.target_vector.v1",
         &[
             "agent_logical_foreground.target",
@@ -405,64 +405,69 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "pointer",
         ],
     ),
-    (53, 1965004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
-    (54, 1965004, "syn.reflex.outcome_onehot.v1", &["status"]),
-    (55, 1965004, "syn.reflex.latency_ms_log1p.v1", &["details"]),
-    (56, 1965004, "syn.reflex.step_count_log1p.v1", &["steps"]),
-    (57, 1965004, "syn.reflex.hour_cyclic.v1", &["ts_ns"]),
-    (58, 1965004, "syn.reflex.dow_cyclic.v1", &["ts_ns"]),
-    (60, 1965005, "syn.process.process_hash.v1", &["pointer"]),
+    (53, 1_965_004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
+    (54, 1_965_004, "syn.reflex.outcome_onehot.v1", &["status"]),
+    (
+        55,
+        1_965_004,
+        "syn.reflex.latency_ms_log1p.v1",
+        &["details"],
+    ),
+    (56, 1_965_004, "syn.reflex.step_count_log1p.v1", &["steps"]),
+    (57, 1_965_004, "syn.reflex.hour_cyclic.v1", &["ts_ns"]),
+    (58, 1_965_004, "syn.reflex.dow_cyclic.v1", &["ts_ns"]),
+    (60, 1_965_005, "syn.process.process_hash.v1", &["pointer"]),
     (
         61,
-        1965005,
+        1_965_005,
         "syn.process.event_onehot.v1",
         &["event", "row_kind", "status"],
     ),
     (
         62,
-        1965005,
+        1_965_005,
         "syn.process.hour_cyclic.v1",
         &["launched_at_unix_ms", "ts_ns"],
     ),
     (
         63,
-        1965005,
+        1_965_005,
         "syn.process.dow_cyclic.v1",
         &["launched_at_unix_ms", "ts_ns"],
     ),
     (
         64,
-        1965005,
+        1_965_005,
         "syn.process.uptime_ms_log1p.v1",
         &["duration_ms", "uptime_ms"],
     ),
     (
         65,
-        1965005,
+        1_965_005,
         "syn.process.event_time_rank.v1",
         &["launched_at_unix_ms", "ts_ns"],
     ),
     (
         67,
-        1965006,
+        1_965_006,
         "syn.observation.app_hash.v1",
         &["foreground.process_name"],
     ),
     (
         68,
-        1965006,
+        1_965_006,
         "syn.observation.role_histogram.v1",
         &["elements", "focused"],
     ),
     (
         69,
-        1965006,
+        1_965_006,
         "syn.observation.entity_multi_hot.v1",
         &["entities"],
     ),
     (
         71,
-        1965006,
+        1_965_006,
         "syn.observation.flags_multi_hot.v1",
         &[
             "diagnostics.a11y_status",
@@ -478,18 +483,18 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "redacted",
         ],
     ),
-    (72, 1965006, "syn.observation.hour_cyclic.v1", &["ts_ns"]),
-    (73, 1965006, "syn.observation.dow_cyclic.v1", &["ts_ns"]),
-    (75, 1965008, "syn.outcome.source_cf_onehot.v1", &[]),
+    (72, 1_965_006, "syn.observation.hour_cyclic.v1", &["ts_ns"]),
+    (73, 1_965_006, "syn.observation.dow_cyclic.v1", &["ts_ns"]),
+    (75, 1_965_008, "syn.outcome.source_cf_onehot.v1", &[]),
     (
         76,
-        1965008,
+        1_965_008,
         "syn.outcome.event_onehot.v1",
         &["action", "event", "kind"],
     ),
     (
         77,
-        1965008,
+        1_965_008,
         "syn.outcome.status_onehot.v1",
         &[
             "after_status",
@@ -503,7 +508,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         78,
-        1965008,
+        1_965_008,
         "syn.outcome.target_hash.v1",
         &[
             "approval_id",
@@ -521,7 +526,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         79,
-        1965008,
+        1_965_008,
         "syn.outcome.hour_cyclic.v1",
         &[
             "at_unix_ms",
@@ -534,7 +539,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         80,
-        1965008,
+        1_965_008,
         "syn.outcome.dow_cyclic.v1",
         &[
             "at_unix_ms",
@@ -547,7 +552,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     ),
     (
         116,
-        1965008,
+        1_965_008,
         "syn.outcome.record_vector.v2",
         &[
             "action",
@@ -580,55 +585,55 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "updated_at_unix_ms",
         ],
     ),
-    (82, 1965007, "syn.mcp_usage.tool_onehot.v1", &["tool"]),
+    (82, 1_965_007, "syn.mcp_usage.tool_onehot.v1", &["tool"]),
     (
         83,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.operation_onehot.v1",
         &["operation"],
     ),
-    (84, 1965007, "syn.mcp_usage.route_hash.v1", &["route_id"]),
+    (84, 1_965_007, "syn.mcp_usage.route_hash.v1", &["route_id"]),
     (
         85,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.param_shape_hash.v1",
         &["argument_shape_sha256"],
     ),
-    (86, 1965007, "syn.mcp_usage.status_onehot.v1", &["status"]),
+    (86, 1_965_007, "syn.mcp_usage.status_onehot.v1", &["status"]),
     (
         87,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.error_onehot.v1",
         &["error_type"],
     ),
-    (88, 1965007, "syn.mcp_usage.profile_hash.v1", &["profile"]),
+    (88, 1_965_007, "syn.mcp_usage.profile_hash.v1", &["profile"]),
     (
         89,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.tool_surface_hash.v1",
         &["tool_surface_sha256"],
     ),
     (
         90,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.session_sequence_rank.v1",
         &["session_sequence_position"],
     ),
     (
         91,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.hour_cyclic.v1",
         &["finished_at_unix_ms", "started_at_unix_ms"],
     ),
     (
         92,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.dow_cyclic.v1",
         &["finished_at_unix_ms", "started_at_unix_ms"],
     ),
     (
         115,
-        1965007,
+        1_965_007,
         "syn.mcp_usage.record_vector.v2",
         &[
             "argument_nested_path_count",
@@ -645,15 +650,20 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "tool_surface_sha256",
         ],
     ),
-    (94, 1776007, "syn.recurrence_subject.kind_onehot.v1", &[]),
-    (95, 1776007, "syn.recurrence_subject.identity_hash.v1", &[]),
-    (96, 1685001, "syn.graphpos.signature.v1", &[]),
-    (97, 1685001, "syn.graphpos.neighbor_histogram.v1", &[]),
-    (98, 1685002, "syn.graphpos.signature.v1", &[]),
-    (99, 1685002, "syn.graphpos.neighbor_histogram.v1", &[]),
-    (100, 1685003, "syn.path_hierarchy.signature.v1", &[]),
-    (101, 1685003, "syn.path_hierarchy.ancestor_set.v1", &[]),
-    (102, 1685003, "syn.path_hierarchy.path_hash.v1", &[]),
+    (94, 1_776_007, "syn.recurrence_subject.kind_onehot.v1", &[]),
+    (
+        95,
+        1_776_007,
+        "syn.recurrence_subject.identity_hash.v1",
+        &[],
+    ),
+    (96, 1_685_001, "syn.graphpos.signature.v1", &[]),
+    (97, 1_685_001, "syn.graphpos.neighbor_histogram.v1", &[]),
+    (98, 1_685_002, "syn.graphpos.signature.v1", &[]),
+    (99, 1_685_002, "syn.graphpos.neighbor_histogram.v1", &[]),
+    (100, 1_685_003, "syn.path_hierarchy.signature.v1", &[]),
+    (101, 1_685_003, "syn.path_hierarchy.ancestor_set.v1", &[]),
+    (102, 1_685_003, "syn.path_hierarchy.path_hash.v1", &[]),
 ];
 
 pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
@@ -661,12 +671,12 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (
         "synapse:mcp_tool_call_outcome",
-        1965007,
+        1_965_007,
         &["status", "error_type"],
     ),
-    // NOTE (#1962): there is deliberately no entry for panel 1900001
+    // NOTE (#1962): there is deliberately no entry for panel 1_900_001
     // (`syn-timeline-v1`). It used to carry
-    // `("synapse:mcp_tool_call_outcome", 1900001, &[])`, which contradicted the
+    // `("synapse:mcp_tool_call_outcome", 1_900_001, &[])`, which contradicted the
     // panel catalog's own `outcome_bearing: false` declaration for that panel —
     // a timeline row records that something was *seen*, not how it turned out,
     // and an MCP tool call's outcome is not a property of a focus change. The
@@ -675,38 +685,38 @@ pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // declarations` now refuses any anchor declared on a panel the catalog
     // declares observation-shaped, so this cannot silently reappear.
     // `policy.enabled` on a policy snapshot row. No mcp-usage lens reads it.
-    ("synapse:mcp_steering_enabled", 1965007, &[]),
+    ("synapse:mcp_steering_enabled", 1_965_007, &[]),
     // `state` on a promotion-ledger row. No mcp-usage lens reads it.
-    ("synapse:mcp_default_promotion_state", 1965007, &[]),
+    ("synapse:mcp_default_promotion_state", 1_965_007, &[]),
     // `!tool_call_error_present(record)` — `agent_events.rs` reads all three of
     // these, so all three determine the anchor.
     (
         "synapse:agent_tool_call_success",
-        1965001,
+        1_965_001,
         &["attributes.error_type", "end_state", "payload"],
     ),
     // The spawn's terminal outcome, which `record.end_state` records.
-    ("synapse:agent_end_state", 1965001, &["end_state"]),
+    ("synapse:agent_end_state", 1_965_001, &["end_state"]),
     // Written onto transcript rows from the spawn's outcome; no transcript field
     // determines it.
-    ("synapse:agent_end_state", 1965002, &[]),
+    ("synapse:agent_end_state", 1_965_002, &[]),
     // `episode_segment_outcome` is a function of exactly these three.
     (
         "synapse:episode_segmentation_outcome",
-        1964001,
+        1_964_001,
         &["interruption_count", "interrupted_ms", "ended_because"],
     ),
     // `readback.code_count > 0` on the audit row.
-    ("synapse:verification_outcome", 1965008, &["code_count"]),
+    ("synapse:verification_outcome", 1_965_008, &["code_count"]),
     // `approval_anchor_value(audit.after_status)`.
-    ("synapse:approval_decision", 1965008, &["after_status"]),
+    ("synapse:approval_decision", 1_965_008, &["after_status"]),
     // The escalation `event` recorded on the audit row.
-    ("synapse:escalation_event", 1965008, &["event"]),
+    ("synapse:escalation_event", 1_965_008, &["event"]),
     // `routine_transition_anchor_value(action)`, which the state row records as
     // its lifecycle.
     (
         "synapse:routine_transition",
-        1965008,
+        1_965_008,
         &["lifecycle", "action"],
     ),
 ];

@@ -1271,7 +1271,7 @@ impl CalyxVaultRuntime {
             true,
             |vault| {
                 vault
-                    .oracle_reverse_action(AnchorValue::Bool(outcome), "synapse.action")
+                    .oracle_reverse_action(&AnchorValue::Bool(outcome), "synapse.action")
                     .map_err(|source| {
                         calyx_write_failed("calyx_oracle", "reverse action outcome", &source)
                     })
@@ -1459,6 +1459,10 @@ impl CalyxVaultRuntime {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "source publication, action occurrence, constellation, and independent readback are one atomic evidence transaction"
+    )]
     fn put_action_oracle_publication_inner(
         &self,
         source_key: &[u8],
@@ -1887,6 +1891,7 @@ impl CalyxBackend {
             superseded_versions: superseded.to_vec(),
             by_source_key: Arc::clone(&by_source_key),
         });
+        drop(guard);
         Ok(by_source_key)
     }
 
@@ -2911,6 +2916,10 @@ fn put_observation_with_lifecycle(
     Ok(readbacks.remove(0))
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "source-panel dispatch and exact lifecycle materialization share one validated source identity"
+)]
 fn lifecycle_constellation_from_source(
     vault: &SynapseCalyxVault,
     panel_name: &str,
@@ -3420,6 +3429,10 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "claim, source read, remeasurement, physical verification, and durable completion are one bounded backfill transaction"
+    )]
     fn run_panel_backfill(
         &self,
         panel_version: u32,
@@ -3773,8 +3786,8 @@ impl StorageBackend for CalyxBackend {
                         // a version nothing declares must be investigated before
                         // anything is deleted. The catalog already knows which
                         // is which, so this is a lookup rather than a judgement.
-                        let disposition = match superseded_panel_lineage(panel_version) {
-                            Some(lineage) => {
+                        let disposition =
+                            if let Some(lineage) = superseded_panel_lineage(panel_version) {
                                 tracing::info!(
                                     code = "STORAGE_SEARCH_GENERATION_RETIRABLE_SUPERSEDED",
                                     panel_version,
@@ -3790,8 +3803,7 @@ impl StorageBackend for CalyxBackend {
                                     panel_name: lineage.panel_name,
                                     live_panel_version: lineage.live_panel_version,
                                 }
-                            }
-                            None => {
+                            } else {
                                 tracing::warn!(
                                     code = "STORAGE_SEARCH_GENERATION_UNMAINTAINABLE_NO_CONTRACT",
                                     panel_version,
@@ -3803,8 +3815,7 @@ impl StorageBackend for CalyxBackend {
                                      Investigate before deleting anything"
                                 );
                                 GenerationDisposition::UnmaintainableNoContract
-                            }
-                        };
+                            };
                         generations.push(PanelGenerationMaintenance {
                             panel_version,
                             is_active_panel,
@@ -5009,7 +5020,7 @@ impl StorageBackend for CalyxBackend {
                         )
                     })?;
                 vault
-                    .add_panel_lens(synapse_calyx::panel_lifecycle::SynapseCalyxAddLensRequest {
+                    .add_panel_lens(&synapse_calyx::panel_lifecycle::SynapseCalyxAddLensRequest {
                         panel_name: entry.panel_name,
                         base_panel: contract.panel,
                         operation_id,
@@ -5051,7 +5062,7 @@ impl StorageBackend for CalyxBackend {
                 let now = calyx_clock_now_for_write(vault, "calyx_registry")?;
                 vault
                     .set_panel_lens_state(
-                        synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateRequest {
+                        &synapse_calyx::panel_lifecycle::SynapseCalyxSetLensStateRequest {
                             panel_name: entry.panel_name,
                             operation_id,
                             slot_id,
@@ -6147,9 +6158,7 @@ impl StorageBackend for CalyxBackend {
                         })?;
                     let (identity, temporal) =
                         constellations::temporal_migration_metadata(&expected);
-                    let migration = if !constellations::temporal_migration_eligible(&temporal)? {
-                        None
-                    } else {
+                    let migration = if constellations::temporal_migration_eligible(&temporal)? {
                         Some(
                             vault
                                 .backfill_temporal_metadata(
@@ -6166,6 +6175,8 @@ impl StorageBackend for CalyxBackend {
                                     )
                                 })?,
                         )
+                    } else {
+                        None
                     };
                     Ok((put.disposition, migration, expected.cx_id))
                 },
@@ -6175,7 +6186,11 @@ impl StorageBackend for CalyxBackend {
             }
             if disposition.0.inserted() {
                 inserted_rows = inserted_rows.saturating_add(1);
-            } else if disposition.1.as_ref().is_some_and(|value| value.changed()) {
+            } else if disposition
+                .1
+                .as_ref()
+                .is_some_and(calyx_aster::vault::TemporalMetadataMigration::changed)
+            {
                 backfilled_rows = backfilled_rows.saturating_add(1);
             } else if disposition.1.is_some() {
                 already_current_rows = already_current_rows.saturating_add(1);
@@ -8803,35 +8818,39 @@ fn put_recurrence_subject_occurrence_on_vault(
     identity_hasher.update([0]);
     identity_hasher.update(occurrence_identity);
     let occurrence_identity_sha256: [u8; 32] = identity_hasher.finalize().into();
-    let occurrence = if let Some(trigger_cx_id) = region_trigger_cx_id {
-        vault
-            .append_recurrence_occurrence_once_with_region(
-                cx_id,
-                event_time_secs,
-                observed_at_secs,
-                context.to_vec(),
-                occurrence_identity_sha256,
-                kind.as_str(),
-                &subject_id,
-                trigger_cx_id,
+    let occurrence = region_trigger_cx_id
+        .map_or_else(
+            || {
+                vault.append_recurrence_occurrence_once(
+                    cx_id,
+                    event_time_secs,
+                    observed_at_secs,
+                    context.to_vec(),
+                    occurrence_identity_sha256,
+                )
+            },
+            |trigger_cx_id| {
+                vault
+                    .append_recurrence_occurrence_once_with_region(
+                        cx_id,
+                        event_time_secs,
+                        observed_at_secs,
+                        context.to_vec(),
+                        occurrence_identity_sha256,
+                        kind.as_str(),
+                        &subject_id,
+                        trigger_cx_id,
+                    )
+                    .map(|readback| readback.occurrence)
+            },
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                "calyx_recurrence",
+                "append native Calyx recurrence subject occurrence",
+                &source,
             )
-            .map(|readback| readback.occurrence)
-    } else {
-        vault.append_recurrence_occurrence_once(
-            cx_id,
-            event_time_secs,
-            observed_at_secs,
-            context.to_vec(),
-            occurrence_identity_sha256,
-        )
-    }
-    .map_err(|source| {
-        calyx_write_failed(
-            "calyx_recurrence",
-            "append native Calyx recurrence subject occurrence",
-            &source,
-        )
-    })?;
+        })?;
     Ok(CalyxRecurrenceSubjectReport {
         subject_kind: kind.as_str().to_owned(),
         subject_id,
@@ -12081,7 +12100,7 @@ impl<'vault> CalyxPinnedReader<'vault> {
         self.snapshot
     }
 
-    fn pinned_seq(&self) -> u64 {
+    const fn pinned_seq(&self) -> u64 {
         self.snapshot.seq()
     }
 }
@@ -12151,6 +12170,10 @@ struct CalyxPinnedCfWalk {
 /// resolves a sequence other than the pinned one, when a page reports more rows
 /// without a resume cursor, or when a cursor fails to advance. The visitor's own
 /// error is propagated verbatim.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pinned paged walk must retain cursor progress, sequence proof, and complete accounting across page boundaries"
+)]
 fn walk_cf_pages_pinned<V>(
     reader: &CalyxPinnedReader<'_>,
     cf: ColumnFamily,
@@ -12421,6 +12444,10 @@ fn decode_source_key_hex(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "all per-CF budgets share one reference census and one atomic tombstone publication decision"
+)]
 fn run_calyx_gc_budgets(
     vault: &SynapseCalyxVault,
     budgets: &[CalyxGcBudget],
@@ -13595,8 +13622,8 @@ struct AnchorCarryForward {
 /// anchor is keyed by `(cx_id, kind)`, so a panel-version bump re-keys every
 /// record and orphans every anchor written against the previous generation. The
 /// re-measured corpus is then born ungrounded — measured on this vault as
-/// `syn-episode-v1` going from 171-of-171 grounded at 1_904_002 to 0-of-171 at
-/// 1_964_001, off the same 171 source rows.
+/// `syn-episode-v1` going from 171-of-171 grounded at `1_904_002` to 0-of-171 at
+/// `1_964_001`, off the same 171 source rows.
 ///
 /// That is a silent loss of the one thing the whole intelligence stack is
 /// defined against: bits are measured ABOUT anchors, and a panel with no anchor

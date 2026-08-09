@@ -8,12 +8,13 @@ use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{AnchorKind, AnchorValue, CxId, SlotId, SlotVector};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_ward::GuardProfile;
+use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::{SynapseCalyxError, SynapseCalyxVault, SynapseCalyxWalkStep};
 
-pub(crate) const ACTION_DOMAIN: &str = "synapse.action";
+pub const ACTION_DOMAIN: &str = "synapse.action";
 /// Physical `AnnealReport` row holding the held-out action validation report.
 ///
 /// `v2` because the evidence now binds the exact Ward profile revision it was
@@ -21,19 +22,19 @@ pub(crate) const ACTION_DOMAIN: &str = "synapse.action";
 /// Goodhart boundary recalibrated after this was measured", so it is not
 /// upgraded in place: it is simply not read, and readiness reports absent
 /// evidence with a rerun remediation instead of a false pass.
-pub(crate) const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v2/synapse.action";
-pub(crate) const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
+pub const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v2/synapse.action";
+pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
 /// Must track `SYN_ACTION_PANEL_VERSION` in
 /// `synapse-storage/src/constellations.rs` (no dependency edge exists in this
 /// direction, so the value is duplicated by hand). A mismatch fails loud
 /// (`SYNAPSE_CALYX_ACTION_VALIDATION_PANEL_MISMATCH`) rather than reading
-/// evidence measured under a different frozen slot layout: bumped 2_020_001 ->
-/// 2_185_001 with #2185's uncontaminated copy of #2050's dense target lens,
+/// evidence measured under a different frozen slot layout: bumped `2_020_001` ->
+/// `2_185_001` with #2185's uncontaminated copy of #2050's dense target lens,
 /// which deliberately re-arms
 /// readiness — held-out evidence must be re-measured on the new generation.
-pub(crate) const ACTION_PANEL_VERSION: u32 = 2_185_001;
+pub const ACTION_PANEL_VERSION: u32 = 2_185_001;
 const MIN_ACTION_RECORDS: usize = 50;
-pub(crate) const MIN_HELD_OUT_RECORDS: usize = 10;
+pub const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
 const MAX_HELD_OUT_RECORDS: usize = 200;
 const MAX_GUARD_TRAINING_RECORDS: usize = 1_000;
@@ -80,6 +81,15 @@ struct ActionObservation {
 impl SynapseCalyxVault {
     /// Builds and atomically persists held-out action validation plus its native
     /// Anneal ledger binding. Readiness never generates this evidence itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the requested panel is invalid, the held-out
+    /// corpus cannot be measured, or the committed evidence cannot be read back.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validation, atomic persistence, and independent readback form one ordered evidence transaction"
+    )]
     pub fn validate_action_readiness(
         &self,
         panel_version: u32,
@@ -148,7 +158,7 @@ impl SynapseCalyxVault {
             "mistakes_passed": draft.mistakes.passed,
             "mistake_count": mistake_count,
         }))
-        .map_err(|error| validation_encode_error("ledger payload", error))?;
+        .map_err(|error| validation_encode_error("ledger payload", &error))?;
         let mut persisted: Option<SynapseCalyxActionValidationEvidence> = None;
         self.vault
             .append_ledger_entry_with_rows(
@@ -212,6 +222,11 @@ impl SynapseCalyxVault {
         Ok(actual)
     }
 
+    /// Reads the latest durable held-out action validation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the physical evidence row cannot be read or decoded.
     pub fn read_action_validation(
         &self,
     ) -> Result<Option<SynapseCalyxActionValidationEvidence>, SynapseCalyxError> {
@@ -241,7 +256,7 @@ impl SynapseCalyxVault {
             )
         })?;
         let evidence_bytes = serde_json::to_vec(&stored.evidence)
-            .map_err(|error| validation_encode_error("readback evidence", error))?;
+            .map_err(|error| validation_encode_error("readback evidence", &error))?;
         let actual_hash = hex(&Sha256::digest(&evidence_bytes));
         if actual_hash != stored.evidence_sha256 {
             return Err(validation_error(
@@ -336,6 +351,10 @@ impl SynapseCalyxVault {
         Ok(observations)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one held-out measurement must retain its calibrated profile, corpus split, violations, and exact profile revision"
+    )]
     fn action_goodhart_report(
         &self,
         panel_version: u32,
@@ -411,7 +430,24 @@ impl SynapseCalyxVault {
             });
             accepted += usize::from(passes);
         }
-        let in_region_frac = accepted as f64 / held_out_good.len() as f64;
+        let accepted = accepted.to_f64().ok_or_else(|| {
+            validation_error(
+                "SYNAPSE_CALYX_ACTION_VALIDATION_COUNT_OUT_OF_RANGE",
+                format!("accepted held-out count {accepted} cannot be represented as f64"),
+                "reduce the held-out corpus below the platform floating-point conversion limit",
+            )
+        })?;
+        let held_out_count = held_out_good.len().to_f64().ok_or_else(|| {
+            validation_error(
+                "SYNAPSE_CALYX_ACTION_VALIDATION_COUNT_OUT_OF_RANGE",
+                format!(
+                    "held-out corpus count {} cannot be represented as f64",
+                    held_out_good.len()
+                ),
+                "reduce the held-out corpus below the platform floating-point conversion limit",
+            )
+        })?;
+        let in_region_frac = accepted / held_out_count;
         let mut violations = Vec::new();
         if in_region_frac < f64::from(calyx_oracle::GOODHART_THRESHOLD) {
             violations.push(GoodhartViolation::GtauViolation {
@@ -538,7 +574,7 @@ fn outcome_counts(rows: &[ActionObservation]) -> BTreeMap<String, (usize, usize)
 }
 
 // Oracle outcome labels sort `bool:false` before `bool:true`, so ties resolve false.
-fn majority((failed, succeeded): (usize, usize)) -> bool {
+const fn majority((failed, succeeded): (usize, usize)) -> bool {
     succeeded > failed
 }
 
@@ -570,17 +606,19 @@ fn dense_cosine(left: &[f32], right: &[f32]) -> Option<f32> {
     let mut left_norm = 0.0f64;
     let mut right_norm = 0.0f64;
     for (&a, &b) in left.iter().zip(right) {
-        dot += f64::from(a) * f64::from(b);
-        left_norm += f64::from(a) * f64::from(a);
-        right_norm += f64::from(b) * f64::from(b);
+        dot = f64::from(a).mul_add(f64::from(b), dot);
+        left_norm = f64::from(a).mul_add(f64::from(a), left_norm);
+        right_norm = f64::from(b).mul_add(f64::from(b), right_norm);
     }
     if left_norm <= 0.0 || right_norm <= 0.0 {
         return None;
     }
-    Some((dot / (left_norm.sqrt() * right_norm.sqrt())).clamp(-1.0, 1.0) as f32)
+    (dot / (left_norm.sqrt() * right_norm.sqrt()))
+        .clamp(-1.0, 1.0)
+        .to_f32()
 }
 
-fn validation_encode_error(context: &str, error: serde_json::Error) -> SynapseCalyxError {
+fn validation_encode_error(context: &str, error: &serde_json::Error) -> SynapseCalyxError {
     validation_error(
         "SYNAPSE_CALYX_ACTION_VALIDATION_ENCODE_FAILED",
         format!("encode action validation {context}: {error}"),
@@ -597,5 +635,12 @@ fn validation_error(
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    use std::fmt::Write as _;
+
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }

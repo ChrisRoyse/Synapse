@@ -27,6 +27,10 @@ use synapse_storage::Db;
 
 const SCHEMA_VERSION: u32 = 1;
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the inspector reports an approximate ratio of two physical u64 row counters"
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     let parent = args

@@ -538,6 +538,10 @@ impl SynapseCalyxVault {
     /// bytes. The Base row is the source of truth for the historical id and the
     /// anchor observation, so a panel-bump carry must join by stable source key
     /// and read the old anchor from that row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Base rows cannot be scanned or decoded.
     pub fn grounded_anchor_lineage_by_source_key(
         &self,
         source_cf: &str,
@@ -628,6 +632,10 @@ impl SynapseCalyxVault {
     /// and does not abort the pass: one unreadable row must not cost the census
     /// of every other generation, and a silently-dropped row would be worse than
     /// either.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one paged physical scan must retain all generation counters and first-failure evidence in a single pass"
+    )]
     pub fn panel_census(&self) -> Result<SynapseCalyxPanelCensus, SynapseCalyxError> {
         // Hot-path boundary (#1686): a whole-Base scan is off-runtime
         // maintenance work and must never be driven from a tagged reflex tick.
@@ -778,6 +786,7 @@ fn grounded_anchor_kinds(anchors: &[Anchor]) -> BTreeSet<String> {
 
 /// Stable string label for an anchor kind, matching the `snake_case` serde names
 /// the assay path parses back (`Label(name)` reports the bare name).
+#[must_use]
 pub fn anchor_kind_label(kind: &AnchorKind) -> String {
     match kind {
         AnchorKind::TestPass => "test_pass".to_owned(),

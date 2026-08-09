@@ -552,6 +552,10 @@ struct GcDeferral {
     escalated: bool,
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one tick completion must atomically classify success, deferral escalation, counters, and operator-visible readback"
+)]
 fn mark_gc_tick_completed(
     state: &GcTaskState,
     started: TickStarted,

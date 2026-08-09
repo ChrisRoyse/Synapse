@@ -530,7 +530,7 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxFindParams,
         supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
-        self.find_similar_in_panel_with_tuning(params, supplied, self.effective_tuning()?)
+        self.find_similar_in_panel_with_tuning(params, supplied, &self.effective_tuning()?)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -538,7 +538,7 @@ impl SynapseCalyxVault {
         &self,
         params: &SynapseCalyxFindParams,
         supplied: Option<&VaultPanelState>,
-        tuning: SynapseCalyxTuningConfig,
+        tuning: &SynapseCalyxTuningConfig,
     ) -> Result<SynapseCalyxFindReport, SynapseCalyxError> {
         // Hot-path boundary (#1686): fused find is an off-runtime intelligence
         // query and must never be driven from a tagged reflex/capture tick.

@@ -78,6 +78,29 @@ const fn slot_in_episode_block(slot: u16) -> bool {
     clippy::too_many_lines,
     reason = "example CLI dispatch keeps each mode visible in one small executable entry point"
 )]
+#[derive(Default)]
+struct SlotCensus {
+    declared_rows: u64,
+    dense: u64,
+    sparse: u64,
+    multi: u64,
+    absent: u64,
+    missing_cf_row: u64,
+    undecodable: u64,
+    dims: BTreeSet<u32>,
+    /// Distinct occupied indices across the corpus — the width a lossless
+    /// densification would need.
+    observed_support: BTreeSet<u32>,
+    /// Distinct whole-vector identities: what a discrete estimator would
+    /// see as the column's cardinality.
+    distinct_values: BTreeSet<Vec<u8>>,
+    nnz_max: usize,
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the offline inspector's explicit fail-closed CLI dispatch keeps every read/repair mode and usage error visible in one entry point"
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     // Off by default so the row dumps stay machine-readable; set RUST_LOG to
     // read the engine's own structured log as evidence (e.g. the commit
@@ -138,7 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("{USAGE}; unexpected extra argument {extra:?}").into());
         }
         return count_key_prefix(
-            PathBuf::from(db_path),
+            &PathBuf::from(db_path),
             &cf_name,
             &prefix,
             contains.as_deref(),
@@ -341,13 +364,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Expired rows are included: a row past its TTL is still physically present,
 /// and for a "did the write land" question that is the honest answer.
 fn count_key_prefix(
-    db_path: PathBuf,
+    db_path: &Path,
     cf_name: &str,
     prefix: &str,
     contains: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let rows = scan_cf_read_only_with_expired(
-        &db_path,
+        db_path,
         synapse_core::SCHEMA_VERSION,
         StorageBackendKind::Calyx,
         cf_name,
@@ -873,25 +896,6 @@ fn slot_kind_census(db_path: PathBuf, panel_version: u32) -> Result<(), Box<dyn 
             vault.vault_id(),
         ),
     )?;
-
-    #[derive(Default)]
-    struct SlotCensus {
-        declared_rows: u64,
-        dense: u64,
-        sparse: u64,
-        multi: u64,
-        absent: u64,
-        missing_cf_row: u64,
-        undecodable: u64,
-        dims: BTreeSet<u32>,
-        /// Distinct occupied indices across the corpus — the width a lossless
-        /// densification would need.
-        observed_support: BTreeSet<u32>,
-        /// Distinct whole-vector identities: what a discrete estimator would
-        /// see as the column's cardinality.
-        distinct_values: BTreeSet<Vec<u8>>,
-        nnz_max: usize,
-    }
 
     let mut per_slot: BTreeMap<u16, SlotCensus> = BTreeMap::new();
     let mut panel_rows = 0_u64;

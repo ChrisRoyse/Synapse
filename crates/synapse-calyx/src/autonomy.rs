@@ -16,6 +16,11 @@ pub struct SynapseCalyxAutonomyDecisionReadback {
 impl SynapseCalyxVault {
     /// Appends one proactive-autonomy decision to the native provenance chain.
     /// No decision may be released or applied unless this append succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the decision is invalid or its provenance
+    /// payload cannot be encoded and durably appended.
     pub fn append_autonomy_decision(
         &self,
         routine_id: &str,
@@ -68,5 +73,12 @@ impl SynapseCalyxVault {
 }
 
 fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    use std::fmt::Write as _;
+
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }

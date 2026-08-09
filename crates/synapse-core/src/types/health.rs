@@ -127,7 +127,7 @@ pub struct CalyxRowGuardSiteStatus {
 /// Every field here is carried out of the sweep the daemon already ran. Nothing
 /// in this struct re-measures a corpus, so publishing per-panel truth costs a
 /// `health` call nothing.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct CalyxSearchGenerationPanel {
     pub panel_version: u32,

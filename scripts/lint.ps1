@@ -55,7 +55,7 @@
        sources. FAILS CLOSED when the binary is absent rather than skipping — a
        gate that reports success while checking nothing is the exact failure mode
        this script exists to end.
-    6. `cargo clippy --workspace --all-targets`, per workspace.
+    6. `cargo clippy --workspace --all-targets -- -D warnings`, per workspace.
 
   It also REPORTS (does not fail on) the `[workspace.lints]` policy divergence
   between the two workspaces, so "I ran lint" never implies the two trees are
@@ -886,14 +886,17 @@ else {
 
 if (-not $SkipClippy) {
     Write-Gate 'Gate 6/7  cargo clippy, both workspaces'
-    $clippyArgs = @('clippy', '--workspace', '--all-targets')
+    # Denying only clippy::all in Cargo.toml leaves rustc, pedantic, nursery,
+    # and future toolchain warnings non-fatal. The two workspaces pin the exact
+    # same toolchain, so make the entire warning surface fail closed (#2175).
+    $clippyArgs = @('clippy', '--workspace', '--all-targets', '--', '-D', 'warnings')
     [void](Invoke-CargoGate -WorkspaceLabel 'root' -WorkingDirectory $RepoRoot -CargoArgs $clippyArgs `
-            -Code 'SYNAPSE_LINT_CLIPPY_ROOT_FAILED' -Remediation 'fix the reported lints; the root workspace denies clippy::all')
+            -Code 'SYNAPSE_LINT_CLIPPY_ROOT_FAILED' -Remediation 'fix every reported rustc/Clippy warning at the source; do not lower severity or add a blanket allow. A narrow #[expect(lint, reason = "...")] is acceptable only for a named architectural invariant, and stale expectations are fatal.')
     # NOT `-p calyx-*` from the repo root: that compiles without linting, because
     # calyx crates are excluded path dependencies rather than workspace members.
     # This must run with calyx/ as the current directory (#1928).
     [void](Invoke-CargoGate -WorkspaceLabel 'calyx' -WorkingDirectory $CalyxRoot -CargoArgs $clippyArgs `
-            -Code 'SYNAPSE_LINT_CLIPPY_CALYX_FAILED' -Remediation 'fix the reported lints; the calyx workspace denies clippy::all')
+            -Code 'SYNAPSE_LINT_CLIPPY_CALYX_FAILED' -Remediation 'fix every reported rustc/Clippy warning at the source; do not lower severity or add a blanket allow. A narrow #[expect(lint, reason = "...")] is acceptable only for a named architectural invariant, and stale expectations are fatal.')
 }
 else {
     Write-Gate 'Gate 6/7  cargo clippy — SKIPPED by -SkipClippy'

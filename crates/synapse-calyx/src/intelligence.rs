@@ -1039,7 +1039,7 @@ impl SynapseCalyxVault {
                             ));
                         }
                         let value = f64::from(*value);
-                        Ok(sum + value * value)
+                        Ok(value.mul_add(value, sum))
                     })?;
                     if norm_squared == 0.0 {
                         excluded.push(cx_id);
@@ -1092,7 +1092,7 @@ pub enum SynapseCalyxSlotKind {
 }
 
 impl SynapseCalyxSlotKind {
-    fn of(vector: &SlotVector) -> Self {
+    const fn of(vector: &SlotVector) -> Self {
         match vector {
             SlotVector::Dense { .. } => Self::Dense,
             SlotVector::Sparse { .. } => Self::Sparse,
@@ -1187,6 +1187,15 @@ impl SynapseCalyxVault {
     /// Completes selected action-panel slots from the bounded persisted trusted
     /// region and records both the measured self-consistency and completion in
     /// the append-only ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the request or panel is invalid, the trusted
+    /// corpus cannot be read, completion fails, or its ledger evidence cannot be appended.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "corpus selection, completion, self-consistency measurement, and ledger evidence form one ordered operation"
+    )]
     pub fn oracle_complete(
         &self,
         cx_id: CxId,
@@ -1702,7 +1711,7 @@ impl SynapseCalyxAssayParams {
     /// Caps the records one pass reads. Each pass clamps this to its own
     /// budget; the clamp is a property of the pass, not of the request.
     #[must_use]
-    pub fn with_max_records(mut self, max_records: usize) -> Self {
+    pub const fn with_max_records(mut self, max_records: usize) -> Self {
         self.max_records = max_records;
         self
     }
@@ -1915,6 +1924,10 @@ pub struct SynapseCalyxSlotBits {
 
 /// Result of one Assay bits pass with the physical Assay CF readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the public assay readback preserves independent measured/provisional/grounded state instead of collapsing them into an ambiguous mode"
+)]
 pub struct SynapseCalyxBitsReport {
     pub panel_version: u32,
     pub anchor_kind: String,
@@ -1977,6 +1990,10 @@ pub struct SynapseCalyxSufficiencyDeficit {
 
 /// Result of one Assay panel-sufficiency pass with the physical Assay readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the public sufficiency readback preserves independent estimator, carrier, grounding, and verdict facts"
+)]
 pub struct SynapseCalyxSufficiencyReport {
     pub panel_version: u32,
     pub anchor_kind: String,
@@ -2088,7 +2105,7 @@ pub struct SynapseCalyxPanelLensCoverage {
 ///
 /// Neither can see a graded encoder fed an input this corpus never populates.
 /// `syn.agent_event.usage_total_log1p.v1` is the worked example: `syn_scalar_log1p`
-/// is graded by construction, but all four GenAI token fields it sums are absent
+/// is graded by construction, but all four `GenAI` token fields it sums are absent
 /// on every one of the 8,241 rows in `CF_AGENT_EVENTS` — that CF is Synapse's
 /// agent *lifecycle* log, not model-completion telemetry — so the lane emits one
 /// value forever and contributes no bits about any anchor.
@@ -2258,6 +2275,10 @@ fn degenerate_lanes(panel_version: u32, corpus: &DenseCorpus) -> Vec<SynapseCaly
     lanes
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "doctor corpus counts are bounded by SYNAPSE_INTELLIGENCE_MAX_RECORDS, far below f64's exact integer range"
+)]
 fn distribution_evidence(
     counts: &BTreeMap<Vec<u32>, usize>,
     records_present: usize,
@@ -2370,6 +2391,10 @@ fn absent_by_corpus_lanes(
 /// `syn-observation-v1` slot 67 as dead from a corpus of **one** record — where
 /// a support of 1 is arithmetically unavoidable and says nothing whatsoever
 /// about the lens. A degeneracy claim needs a corpus to be a claim about.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "doctor corpus widths and record counts are bounded by SYNAPSE_INTELLIGENCE_MAX_RECORDS, far below f64's exact integer range"
+)]
 fn single_support_lanes(
     panel_version: u32,
     corpus: &DenseCorpus,
@@ -2524,6 +2549,10 @@ impl SynapseCalyxVault {
     /// Returns a structured Calyx-backed error when the Base CF cannot be
     /// scanned, a constellation fails to decode, the KSG estimator rejects the
     /// samples, or the Assay CF write/readback fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one physical corpus pass must retain estimator refusals, carrier annotations, persistence, and readback evidence together"
+    )]
     pub fn assay_bits(
         &self,
         params: &SynapseCalyxAssayParams,
@@ -3452,7 +3481,7 @@ impl SynapseCalyxVault {
             // categorical lens aborted the entire synergy report — the same
             // whole-pass-abort shape #1915 removed from `bits`, still standing
             // on this path.
-            match mi_about_labels(
+            if let Some(estimate) = mi_about_labels(
                 MiEstimatorChoice::Auto,
                 &samples.x,
                 &samples.labels,
@@ -3462,8 +3491,7 @@ impl SynapseCalyxVault {
             .ok()
             .and_then(|outcome| outcome.estimate.ok())
             {
-                Some(estimate) => ranked.push((*slot, estimate.bits)),
-                None => continue,
+                ranked.push((*slot, estimate.bits));
             }
         }
         ranked.sort_by(|left, right| {
@@ -3641,6 +3669,10 @@ impl SynapseCalyxVault {
     /// two-outcome anchor, [`SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES`] when too few
     /// lenses are present on every anchored record, and the underlying Calyx
     /// error for any refusal inside the assay itself.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the ensemble card is one fail-closed paired assay whose shared corpus and estimator provenance must remain co-located"
+    )]
     pub fn assay_ensemble_card(
         &self,
         params: &SynapseCalyxAssayParams,
@@ -4039,6 +4071,10 @@ pub struct SynapseCalyxExcludedLens {
 /// Zero means every row is the same vector: the column is constant, and linear
 /// CKA, normalized MI and the logistic probe are all undefined on it. Computed
 /// in `f64` because the sum runs over every row and every dimension.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "assay corpus rows are bounded by SYNAPSE_INTELLIGENCE_MAX_RECORDS, far below f64's exact integer range"
+)]
 fn centered_energy(vectors: &[Vec<f32>]) -> f64 {
     let Some(width) = vectors.first().map(Vec::len) else {
         return 0.0;
@@ -4060,7 +4096,7 @@ fn centered_energy(vectors: &[Vec<f32>]) -> f64 {
     for vector in vectors {
         for (value, centre) in vector.iter().zip(&mean) {
             let delta = f64::from(*value) - centre;
-            energy += delta * delta;
+            energy = delta.mul_add(delta, energy);
         }
     }
     energy
@@ -4081,7 +4117,7 @@ struct JointAnchoredSamples {
 /// A slot the estimator did not measure. `marginal_bits` is a placeholder zero
 /// and `state`/`unmeasured_reason` say so, so nothing downstream can mistake it
 /// for a measured zero (#1915).
-fn unmeasured_slot_bits(
+const fn unmeasured_slot_bits(
     slot: u16,
     n_samples: usize,
     state: SynapseCalyxSlotBitsState,
@@ -5907,7 +5943,7 @@ enum KernelContentRows {
 }
 
 impl KernelContentRows {
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         match self {
             Self::Dense(rows) => rows.len(),
             Self::Sparse(index) => index.rows.len(),
@@ -5943,7 +5979,7 @@ impl SparseCosineIndex {
         for (cx_id, entries) in source {
             let ordinal = rows.len();
             let norm_sq = entries.iter().try_fold(0.0_f32, |sum, entry| {
-                let next = sum + entry.val * entry.val;
+                let next = entry.val.mul_add(entry.val, sum);
                 next.is_finite().then_some(next).ok_or_else(|| {
                     SynapseCalyxError::new(
                         "SYNAPSE_CALYX_KERNEL_SPARSE_NORM_INVALID",
@@ -6002,7 +6038,7 @@ impl SparseCosineIndex {
                         continue;
                     }
                     let score = dots.entry(candidate).or_default();
-                    *score += query_entry.val * value;
+                    *score = query_entry.val.mul_add(value, *score);
                     if !score.is_finite() {
                         return Err(SynapseCalyxError::new(
                             "SYNAPSE_CALYX_KERNEL_SPARSE_SCORE_INVALID",
@@ -6739,7 +6775,7 @@ fn corpus_hash_bytes(rows: &KernelContentRows) -> [u8; 32] {
     let mut ids: Vec<[u8; 16]> = rows
         .ids()
         .into_iter()
-        .map(|cx_id| cx_id.to_bytes())
+        .map(calyx_core::CxId::to_bytes)
         .collect();
     ids.sort_unstable();
     let mut hasher = Sha256::new();

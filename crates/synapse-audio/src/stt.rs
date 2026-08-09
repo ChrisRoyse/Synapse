@@ -427,6 +427,7 @@ impl WhisperTinyStt {
                 detail: "STT fallback audit lock was poisoned".to_owned(),
             })?;
         *guard = Some((code.to_owned(), detail));
+        drop(guard);
         Ok(())
     }
 

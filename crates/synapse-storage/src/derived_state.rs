@@ -78,9 +78,10 @@ pub const LENS_COVERAGE_SAMPLE_RECORDS: usize = 256;
 /// per-call overhead to the same total work.
 pub const PANEL_BACKFILL_PAGE_ROWS: usize = 1_000;
 
-/// Lifecycle tasks claimed per five-minute maintenance tick. Each task fully
-/// decodes and re-measures an authoritative row, so the bound controls both IO
-/// and CPU independently of the older temporal-metadata page size.
+/// Lifecycle tasks claimed per five-minute maintenance tick.
+///
+/// Each task fully decodes and re-measures an authoritative row, so the bound
+/// controls both IO and CPU independently of the older temporal-metadata page size.
 pub const LIFECYCLE_BACKFILL_BATCH_ROWS: usize = 64;
 
 /// Wall-clock the maintainer will spend driving backfill pages in one tick.
@@ -94,7 +95,7 @@ pub const LIFECYCLE_BACKFILL_BATCH_ROWS: usize = 64;
 /// lens-coverage sample. It runs on the dedicated blocking maintenance pool under
 /// an admission permit, so it can never park a runtime worker serving MCP
 /// requests.
-pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+pub const PANEL_BACKFILL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// Wall clock guaranteed to **every** owed coverage target on every tick
 /// (#2061 ask 3).
@@ -887,6 +888,7 @@ pub fn derived_state_readback() -> DerivedStateReadback {
 /// the `Err` that [`run_derived_state_maintenance`] hands the maintenance task
 /// is derived from those same two fields — one ledger, two renderings of it.
 /// A caller that needs the task's exact return value calls the pass directly.
+#[must_use]
 pub fn run_derived_state_maintenance_once() -> DerivedStateReadback {
     let _ = run_derived_state_maintenance();
     derived_state_readback()
@@ -1623,17 +1625,19 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
         guard.last_skip_code = None;
         guard.last_skip_detail = None;
     }
+    let subpass_failures = guard.last_tick_subpass_failures.clone();
+    drop(guard);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_TICK_COMPLETED",
         tick_failed,
-        subpass_failures = guard.last_tick_subpass_failures.len(),
+        subpass_failures = subpass_failures.len(),
         attempts_total = DERIVED_STATE_ATTEMPTS.load(Ordering::Relaxed),
         success_total = DERIVED_STATE_SUCCESS.load(Ordering::Relaxed),
         failure_total = DERIVED_STATE_FAILURE.load(Ordering::Relaxed),
         skipped_total = DERIVED_STATE_SKIPPED.load(Ordering::Relaxed),
         subpass_failures_total = DERIVED_STATE_SUBPASS_FAILURES.load(Ordering::Relaxed),
         advisories_total = DERIVED_STATE_ADVISORIES.load(Ordering::Relaxed),
-        subpass_failure_codes = ?guard.last_tick_subpass_failures,
+        subpass_failure_codes = ?subpass_failures,
         "completed one unattended derived-state tick and published its outcome at tick granularity"
     );
     // The maintenance task's return value, taken from the same ledger the log
@@ -1649,8 +1653,8 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
                  whatever state they were already in: {:?}. This tick is not retried in place — \
                  see run_derived_state_maintenance's retry decision — and the next five-minute \
                  tick reattempts every sub-pass from a fresh coherent snapshot",
-                guard.last_tick_subpass_failures.len(),
-                guard.last_tick_subpass_failures,
+                subpass_failures.len(),
+                subpass_failures,
             ),
         });
     }
@@ -1773,7 +1777,7 @@ fn publish_app_transition_graph(db: &Db, lane: AppFocusLaneScan) -> crate::Stora
         read_at_unix_ms,
         lane_yield: _,
     } = scan;
-    drive_path_hierarchy(db, source_seq, read_at_unix_ms, hierarchy_paths)?;
+    drive_path_hierarchy(db, source_seq, read_at_unix_ms, &hierarchy_paths)?;
     if counts.is_empty() {
         tracing::debug!(
             code = "STORAGE_DERIVED_STATE_APP_GRAPH_INELIGIBLE",
@@ -1832,7 +1836,7 @@ fn drive_path_hierarchy(
     db: &Db,
     source_seq: u64,
     read_at_unix_ms: u64,
-    paths: Vec<String>,
+    paths: &[String],
 ) -> crate::StorageResult<()> {
     if paths.is_empty() {
         tracing::debug!(
@@ -1842,7 +1846,7 @@ fn drive_path_hierarchy(
         );
         return Ok(());
     }
-    let transitions = crate::constellations::path_hierarchy_transitions(&paths)?;
+    let transitions = crate::constellations::path_hierarchy_transitions(paths)?;
     let fingerprint = crate::constellations::graph_snapshot_fingerprint(&transitions);
     if lifecycle_has_snapshot(db, SYN_PATH_HIERARCHY_PANEL_VERSION, fingerprint)? {
         return Ok(());
@@ -1851,7 +1855,7 @@ fn drive_path_hierarchy(
         .publish_path_hierarchy_snapshot(
             source_seq,
             now_unix_ms().unwrap_or(read_at_unix_ms),
-            &paths,
+            paths,
         )
         .inspect_err(|error| {
             name_orphaned_derived_generation(
@@ -2577,6 +2581,10 @@ fn exact_json_u64(
         })
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scheduled pass must preserve shared coverage eligibility, per-panel actions, and aggregate failure evidence"
+)]
 fn drive_scheduled_kernels(
     db: &Arc<Db>,
     coverage: Option<&crate::panel_coverage::PanelCoverageReport>,
@@ -2631,6 +2639,7 @@ fn drive_scheduled_kernels(
                     panel.anchor_kind_records.len()
                 ),
             );
+            drop(readback);
             continue;
         }
         eligible_targets += 1;
@@ -2770,7 +2779,9 @@ fn record_weave_backlog(panel_version: u32, backlog_ns: i64) -> WeaveBacklogTren
         0
     };
     entry.backlog_ns = backlog_ns;
-    *entry
+    let trend = *entry;
+    drop(trends);
+    trend
 }
 
 /// Commits the frontier of contiguously woven time for one panel (#2085).
@@ -2815,6 +2826,7 @@ fn commit_weave_frontier(
         ));
     }
     *watermark = frontier_ns;
+    drop(watermarks);
     Ok(())
 }
 
@@ -3236,6 +3248,7 @@ fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), Strin
     readback
         .last_reactive_notifications_dropped
         .insert(panel_version, delivery.dropped);
+    drop(readback);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_REACTIVE_DRIFT_PASS",
         panel_version,
@@ -3303,6 +3316,7 @@ fn drive_region_relay(db: &Arc<Db>) -> Result<(), String> {
     state.last_region_notifications_queued = delivery.queued;
     state.last_region_notifications_dropped = delivery.dropped;
     state.last_region_delivery_watermark = watermark;
+    drop(state);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_REACTIVE_REGION_PASS",
         rows_read = findings.len(),
@@ -3380,12 +3394,18 @@ fn drive_novelty_relay(db: &Arc<Db>) -> Result<(), String> {
     state.last_novelty_notifications_dropped = aggregate.dropped;
     state.last_novelty_delivery_watermark = watermark;
     state.last_novelty_quarantines_escalated = escalated;
+    drop(state);
     Ok(())
 }
 
 /// Runs only the Ward novelty outbox relay and returns its physical-delivery
 /// counters. This is used by the synchronous guard facade so its response does
 /// not race the background maintenance interval.
+///
+/// # Errors
+///
+/// Returns the structured relay failure when physical outbox read, delivery,
+/// escalation, cursor persistence, or readback fails.
 pub fn run_novelty_relay_once(db: &Arc<Db>) -> Result<DerivedStateReadback, String> {
     drive_novelty_relay(db)?;
     Ok(derived_state_readback())
@@ -4741,21 +4761,20 @@ fn sweep_coverage_target(
         anchors_carried += page.anchors_carried_forward;
 
         if page.more {
-            match page.resume_after_physical {
-                Some(resume) => after_physical = Some(resume),
-                None => {
-                    // `more` without a resume cursor would make the next page
-                    // restart from the beginning and loop forever.
-                    record_failure(
-                        "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_ABSENT",
-                        format!(
-                            "backfill page for {source_cf} reported more=true with no \
-                             resume_after_physical; the sweep cannot advance"
-                        ),
-                    );
-                    action = "cursor_absent";
-                    break;
-                }
+            if let Some(resume) = page.resume_after_physical {
+                after_physical = Some(resume);
+            } else {
+                // `more` without a resume cursor would make the next page
+                // restart from the beginning and loop forever.
+                record_failure(
+                    "STORAGE_DERIVED_STATE_BACKFILL_CURSOR_ABSENT",
+                    format!(
+                        "backfill page for {source_cf} reported more=true with no \
+                         resume_after_physical; the sweep cannot advance"
+                    ),
+                );
+                action = "cursor_absent";
+                break;
             }
         } else {
             sweep_complete = true;

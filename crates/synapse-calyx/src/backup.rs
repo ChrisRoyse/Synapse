@@ -341,6 +341,11 @@ pub fn verify_vault_restore(
 /// anchored tip's continuation rather than a false `corrupt` verdict. Restore
 /// and backup verification keep the strict exact-head discipline — a quiescent
 /// vault whose anchor disagrees with its rows IS damaged.
+///
+/// # Errors
+///
+/// Returns a structured error when the live vault cannot be opened or its anchored
+/// physical rows fail integrity verification.
 pub fn verify_vault_restore_live(
     vault_path: &Path,
 ) -> Result<SynapseCalyxVerifyReport, SynapseCalyxError> {

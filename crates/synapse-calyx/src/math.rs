@@ -778,15 +778,20 @@ fn run_startup_probe(
 /// two paths disagree has a broken reduction contract and must not open a vault
 /// whose derived artifacts would then depend on which kernel happened to run.
 fn assert_reduction_paths_agree() -> Result<&'static str, SynapseCalyxError> {
-    let left: Vec<f32> = (0..REDUCTION_PROBE_LEN)
-        .map(|index| (index as f32).mul_add(0.37, -2.5))
+    let probe_len = u16::try_from(REDUCTION_PROBE_LEN).map_err(|error| {
+        probe_mismatch(format!(
+            "fixed reduction probe length {REDUCTION_PROBE_LEN} exceeds the exact u16/f32 construction range: {error}"
+        ))
+    })?;
+    let left: Vec<f32> = (0..probe_len)
+        .map(|index| f32::from(index).mul_add(0.37, -2.5))
         .collect();
-    let right: Vec<f32> = (0..REDUCTION_PROBE_LEN)
-        .map(|index| (index as f32).mul_add(-0.11, 1.75))
+    let right: Vec<f32> = (0..probe_len)
+        .map(|index| f32::from(index).mul_add(-0.11, 1.75))
         .collect();
-    match calyx_forge::cpu::simd::reduction_paths_agree(&left, &right) {
-        None => Ok(calyx_forge::cpu::simd::backend_name()),
-        Some(kernel) => Err(probe_mismatch(format!(
+    calyx_forge::cpu::simd::reduction_paths_agree(&left, &right).map_or_else(
+        || Ok(calyx_forge::cpu::simd::backend_name()),
+        |kernel| Err(probe_mismatch(format!(
             "cpu reduction kernel `{kernel}` disagrees bit-for-bit between the runtime-dispatched \
              backend `{}` and the portable f32x8 backend over {REDUCTION_PROBE_LEN} elements; the \
              two paths are required to fold identically (calyx-forge cpu::simd), so a mismatch \
@@ -794,7 +799,7 @@ fn assert_reduction_paths_agree() -> Result<&'static str, SynapseCalyxError> {
              would depend on which kernel ran",
             calyx_forge::cpu::simd::backend_name()
         ))),
-    }
+    )
 }
 
 fn assert_close_vec(

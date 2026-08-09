@@ -65,17 +65,32 @@ const FIELDS: &[Field] = &[
     },
 ];
 
-fn quantile(sorted: &[u64], q: f64) -> u64 {
+fn quantile(sorted: &[u64], numerator: usize, denominator: usize) -> Result<u64, &'static str> {
     if sorted.is_empty() {
-        return 0;
+        return Ok(0);
     }
-    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    if denominator == 0 || numerator > denominator {
+        return Err("quantile ratio must satisfy numerator <= denominator and denominator > 0");
+    }
+    let idx = (sorted.len() - 1)
+        .checked_mul(numerator)
+        .and_then(|product| product.checked_add(denominator / 2))
+        .ok_or("quantile index arithmetic overflowed")?
+        / denominator;
+    Ok(sorted[idx])
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "this read-only distribution inspector intentionally represents observed integer magnitudes as approximate f64 values"
+)]
+const fn observed_u64_as_f64(value: u64) -> f64 {
+    value as f64
 }
 
 /// `ln(1+v)/ln(1+scale)` clamped — the exact transform the rebuilt lens applies.
 fn count_norm(value: u64, scale: f64) -> f64 {
-    ((1.0 + value as f64).ln() / (1.0 + scale).ln()).clamp(0.0, 1.0)
+    (observed_u64_as_f64(value).ln_1p() / scale.ln_1p()).clamp(0.0, 1.0)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -121,9 +136,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         let present = values.len();
         let (min, med, p90, p99, max) = (
             values.first().copied().unwrap_or(0),
-            quantile(&values, 0.50),
-            quantile(&values, 0.90),
-            quantile(&values, 0.99),
+            quantile(&values, 50, 100)?,
+            quantile(&values, 90, 100)?,
+            quantile(&values, 99, 100)?,
             values.last().copied().unwrap_or(0),
         );
         println!(
@@ -136,7 +151,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let scale = if p99 == 0 {
             1.0
         } else {
-            10f64.powf((p99 as f64).log10().ceil())
+            10f64.powf(observed_u64_as_f64(p99).log10().ceil())
         };
         chosen.push((field.name, p99, scale, med, p90, max));
     }
@@ -182,13 +197,15 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     println!(
         "  magnitude ratio against the largest token p99: {:.3e}",
-        ts.last().copied().unwrap_or(0) as f64
-            / chosen
-                .iter()
-                .map(|(_, p99, ..)| *p99)
-                .max()
-                .unwrap_or(1)
-                .max(1) as f64
+        observed_u64_as_f64(ts.last().copied().unwrap_or(0))
+            / observed_u64_as_f64(
+                chosen
+                    .iter()
+                    .map(|(_, p99, ..)| *p99)
+                    .max()
+                    .unwrap_or(1)
+                    .max(1),
+            )
     );
 
     Ok(())

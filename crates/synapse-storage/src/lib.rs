@@ -974,17 +974,29 @@ impl Db {
 
     /// Predicts one action's grounded terminal outcome through Calyx Oracle's
     /// persisted sufficiency and provenance gates.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when validation or Oracle prediction fails.
     pub fn oracle_predict_action(&self, action_id: &str) -> StorageResult<serde_json::Value> {
         self.backend.oracle_predict_action(action_id)
     }
 
     /// Walks backward from a terminal success/failure outcome to grounded
     /// action causes in the persisted Oracle corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the persisted reverse walk fails.
     pub fn oracle_reverse_action(&self, outcome: bool) -> StorageResult<serde_json::Value> {
         self.backend.oracle_reverse_action(outcome)
     }
 
     /// Completes explicitly selected action slots from grounded persisted peers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when inputs, evidence, completion, or ledger append fail.
     pub fn oracle_complete_action(
         &self,
         cx_id: &str,
@@ -993,19 +1005,38 @@ impl Db {
         self.backend.oracle_complete_action(cx_id, free_slots)
     }
 
+    /// Measures and persists the six-tier action readiness report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when measurement, persistence, or readback fails.
     pub fn oracle_measure_readiness(&self) -> StorageResult<serde_json::Value> {
         self.backend.oracle_measure_readiness()
     }
 
+    /// Measures and persists held-out action validation evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the corpus, measurement, commit, or readback fails.
     pub fn oracle_validate_action(&self) -> StorageResult<serde_json::Value> {
         self.backend.oracle_validate_action()
     }
 
+    /// Reads the latest physically persisted action readiness report.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the report row cannot be read or decoded.
     pub fn oracle_readiness(&self) -> StorageResult<Option<serde_json::Value>> {
         self.backend.oracle_readiness()
     }
 
     /// Appends a proactive-autonomy decision to the native Calyx Policy ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when validation, encoding, or ledger append fails.
     pub fn append_autonomy_decision(
         &self,
         routine_id: &str,
@@ -1015,6 +1046,10 @@ impl Db {
     }
 
     /// Reads the authoritative source-row pointer stored on a physical Calyx Base row.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the Base row cannot be read or decoded.
     pub fn read_calyx_base_source_pointer(
         &self,
         cx_id: &str,
@@ -1037,6 +1072,10 @@ impl Db {
 
     /// Commits one Ward novelty disposition to Calyx `Reactive` and reads the
     /// exact bytes back before returning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when commit, flush, or physical readback fails.
     pub fn persist_novelty_finding(
         &self,
         finding: &synapse_calyx::SynapseCalyxPersistedNoveltyFinding,
@@ -1044,6 +1083,11 @@ impl Db {
         self.backend.persist_novelty_finding(finding)
     }
 
+    /// Reads a bounded prefix of durable Ward-novelty outbox rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the range cannot be read or a row is corrupt.
     pub fn persisted_novelty_findings(
         &self,
         after_ledger_seq: u64,
@@ -1053,15 +1097,29 @@ impl Db {
             .persisted_novelty_findings(after_ledger_seq, max_rows)
     }
 
+    /// Reads the durable Ward-novelty delivery cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the Registry row cannot be read or decoded.
     pub fn novelty_delivery_cursor(&self) -> StorageResult<u64> {
         self.backend.novelty_delivery_cursor()
     }
 
+    /// Advances and independently reads back the Ward-novelty delivery cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error on regression or failed commit and readback.
     pub fn persist_novelty_delivery_cursor(&self, ledger_seq: u64) -> StorageResult<u64> {
         self.backend.persist_novelty_delivery_cursor(ledger_seq)
     }
 
     /// Reads a bounded set of typed exact-identity new-region outbox rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the range cannot be read or a row is corrupt.
     pub fn persisted_region_findings(
         &self,
         after_observed_seq: u64,
@@ -1071,10 +1129,20 @@ impl Db {
             .persisted_region_findings(after_observed_seq, max_rows)
     }
 
+    /// Reads the durable exact-region delivery cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the Registry row cannot be read or decoded.
     pub fn region_delivery_cursor(&self) -> StorageResult<u64> {
         self.backend.region_delivery_cursor()
     }
 
+    /// Advances and independently reads back the exact-region delivery cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error on regression or failed commit and readback.
     pub fn persist_region_delivery_cursor(&self, observed_seq: u64) -> StorageResult<u64> {
         self.backend.persist_region_delivery_cursor(observed_seq)
     }
@@ -1107,6 +1175,11 @@ impl Db {
 
     /// Adds one frozen deterministic lens to an active built-in panel and
     /// durably enqueues its existing constellation ids for backfill.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when validation, CAS publication,
+    /// backfill enqueue, or physical readback fails.
     pub fn add_panel_lens(
         &self,
         panel_version: u32,
@@ -1125,6 +1198,10 @@ impl Db {
     }
 
     /// Parks, unparks, or irreversibly retires one dynamically added panel slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when transition validation, CAS publication, or readback fails.
     pub fn set_panel_lens_state(
         &self,
         panel_version: u32,
@@ -1137,6 +1214,10 @@ impl Db {
     }
 
     /// Reads the physical Registry CF lifecycle row for one active panel.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when the row cannot be read or decoded.
     pub fn read_panel_lifecycle(
         &self,
         panel_version: u32,
@@ -1147,6 +1228,11 @@ impl Db {
 
     /// Claims, re-measures, physically verifies, and completes one bounded
     /// pressure-aware lifecycle backfill batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when claiming, measurement, physical
+    /// verification, or durable completion fails.
     pub fn run_panel_backfill(
         &self,
         panel_version: u32,
@@ -1215,6 +1301,11 @@ impl Db {
         self.backend.measure_panel_coverage()
     }
 
+    /// Writes one point to a native `TimeSeries` collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when collection verification or the write fails.
     pub fn timeseries_write(
         &self,
         collection_name: &str,
@@ -1226,10 +1317,20 @@ impl Db {
             .timeseries_write(collection_name, series, timestamp_ns, value)
     }
 
+    /// Ensures a native `TimeSeries` collection has the exact immutable descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error on descriptor conflict or failed create/readback.
     pub fn ensure_timeseries_collection(&self, collection_name: &str) -> StorageResult<()> {
         self.backend.ensure_timeseries_collection(collection_name)
     }
 
+    /// Runs a bounded native OLAP aggregation over one persisted panel slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error for invalid bounds or a failed physical scan.
     pub fn olap_aggregate_slot(
         &self,
         panel_version: u32,
@@ -1249,6 +1350,11 @@ impl Db {
         )
     }
 
+    /// Reads one native `TimeSeries` rollup bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error on descriptor or rollup-read failure.
     pub fn timeseries_rollup(
         &self,
         collection_name: &str,
@@ -1260,6 +1366,11 @@ impl Db {
             .timeseries_rollup(collection_name, series, window, timestamp_ns)
     }
 
+    /// Reads a timestamp range from one native `TimeSeries` series.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error on descriptor or range-read failure.
     pub fn timeseries_range(
         &self,
         collection_name: &str,
@@ -1417,6 +1528,11 @@ impl Db {
     /// Builds an isolated persisted-search generation, replays real vault
     /// records through candidate and incumbent, then publishes only a passing
     /// tuning+manifest pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when build, paired measurement,
+    /// promotion, or physical artifact readback fails.
     pub fn propose_calyx_search_tuning(
         &self,
         expected_panel_version: u32,
@@ -1429,6 +1545,10 @@ impl Db {
 
     /// Restores the prior native Anneal artifact and its exact bound search
     /// manifests, with independent physical readback.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when rollback, publication, or readback fails.
     pub fn rollback_calyx_anneal(
         &self,
         change_id: u64,
@@ -1840,6 +1960,10 @@ impl Db {
 
     /// Atomically publishes structural positions computed from one coherent
     /// source snapshot into Graph, Registry, Base, Slot, and Ledger families.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when projection, atomic publication, or readback fails.
     pub fn publish_graph_position_snapshot(
         &self,
         kind: constellations::GraphPositionKind,
@@ -1852,6 +1976,10 @@ impl Db {
     }
 
     /// Atomically publishes a hierarchy derived from one coherent source cut.
+    ///
+    /// # Errors
+    ///
+    /// Returns the structured backend error when projection, atomic publication, or readback fails.
     pub fn publish_path_hierarchy_snapshot(
         &self,
         source_seq: u64,

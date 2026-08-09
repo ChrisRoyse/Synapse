@@ -100,8 +100,9 @@ pub struct SynapseCalyxPersistedNoveltyFinding {
     pub ledger_hash: String,
 }
 
-/// Exact first-observation cause for a discrete region such as an application
-/// identity. This is separate from Ward cosine novelty: the acceptance fact is
+/// Exact first-observation cause for a discrete region such as an application identity.
+///
+/// This is separate from Ward cosine novelty: the acceptance fact is
 /// that an exact frozen identity has never occurred before.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxPersistedRegionFinding {
@@ -115,6 +116,11 @@ pub struct SynapseCalyxPersistedRegionFinding {
 }
 
 impl SynapseCalyxVault {
+    /// Reads the durable Ward-novelty relay cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Registry row cannot be read or decoded.
     pub fn novelty_delivery_cursor(&self) -> Result<u64, SynapseCalyxError> {
         self.read_cf_latest(ColumnFamily::Registry, REACTIVE_NOVELTY_DELIVERY_CURSOR_KEY)?
             .map_or(Ok(0), |bytes| {
@@ -128,6 +134,11 @@ impl SynapseCalyxVault {
             })
     }
 
+    /// Advances and independently reads back the durable Ward-novelty relay cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error on cursor regression or when commit, flush, or readback fails.
     pub fn persist_novelty_delivery_cursor(
         &self,
         ledger_seq: u64,
@@ -159,6 +170,11 @@ impl SynapseCalyxVault {
         Ok(readback)
     }
 
+    /// Reads a bounded prefix of durable Ward-novelty outbox rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Reactive range cannot be read or a row is corrupt.
     pub fn persisted_novelty_findings(
         &self,
         after_ledger_seq: u64,
@@ -189,6 +205,10 @@ impl SynapseCalyxVault {
     }
 
     /// Reads the durable event-bus relay cursor for exact region findings.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Registry row cannot be read or decoded.
     pub fn region_delivery_cursor(&self) -> Result<u64, SynapseCalyxError> {
         self.read_cf_latest(ColumnFamily::Registry, REACTIVE_REGION_DELIVERY_CURSOR_KEY)?
             .map_or(Ok(0), |bytes| {
@@ -203,6 +223,10 @@ impl SynapseCalyxVault {
     }
 
     /// Advances and independently reads back the durable region relay cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error on cursor regression or when commit, flush, or readback fails.
     pub fn persist_region_delivery_cursor(
         &self,
         observed_seq: u64,
@@ -234,6 +258,10 @@ impl SynapseCalyxVault {
 
     /// Persists one exact first-observation region event and proves its bytes by
     /// an independent point read before returning it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when encoding, commit, flush, or independent readback fails.
     pub fn persist_region_finding(
         &self,
         finding: &SynapseCalyxPersistedRegionFinding,
@@ -269,6 +297,10 @@ impl SynapseCalyxVault {
 
     /// Reads a bounded prefix of exact first-observation region rows from the
     /// durable Reactive outbox. A corrupt matching row fails the whole read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Reactive range cannot be read or a row is corrupt.
     pub fn persisted_region_findings(
         &self,
         after_observed_seq: u64,
@@ -298,6 +330,11 @@ impl SynapseCalyxVault {
         Ok(findings)
     }
 
+    /// Persists one Ward novelty finding and proves its committed bytes by point read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when key construction, encoding, commit, flush, or readback fails.
     pub fn persist_novelty_finding(
         &self,
         finding: &SynapseCalyxPersistedNoveltyFinding,
@@ -333,6 +370,10 @@ impl SynapseCalyxVault {
 
     /// Persists one caller-validated recurrence as a replay-stable outbox row
     /// and proves the committed bytes by an independent point read.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when encoding, commit, flush, or independent readback fails.
     pub fn persist_recurrence_finding(
         &self,
         finding: &SynapseCalyxPersistedRecurrenceFinding,
@@ -367,7 +408,7 @@ impl SynapseCalyxVault {
     }
 }
 
-pub(crate) fn reactive_novelty_key(
+pub fn reactive_novelty_key(
     finding: &SynapseCalyxPersistedNoveltyFinding,
 ) -> Result<Vec<u8>, SynapseCalyxError> {
     let mut key = Vec::with_capacity(32);
@@ -392,7 +433,7 @@ fn reactive_recurrence_key(finding: &SynapseCalyxPersistedRecurrenceFinding) -> 
     key
 }
 
-pub(crate) fn reactive_region_key(finding: &SynapseCalyxPersistedRegionFinding) -> Vec<u8> {
+pub fn reactive_region_key(finding: &SynapseCalyxPersistedRegionFinding) -> Vec<u8> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(finding.region_kind.as_bytes());
     hasher.update([0]);
@@ -670,7 +711,7 @@ impl SynapseCalyxVault {
                     } else {
                         (slot_two, slot_one)
                     };
-                    match self.evaluate_blind_spot_direction(
+                    match Self::evaluate_blind_spot_direction(
                         backend,
                         &group,
                         forward,
@@ -740,7 +781,6 @@ impl SynapseCalyxVault {
     /// cannot discriminate is what keeps an alert a finding (#1961).
     #[allow(clippy::too_many_arguments)]
     fn evaluate_blind_spot_direction(
-        &self,
         backend: &dyn Backend,
         group: &[PairedMember<'_>],
         forward: bool,

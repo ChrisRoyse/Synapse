@@ -5,6 +5,8 @@ use calyx_aster::cf::ColumnFamily;
 use sha2::{Digest as _, Sha256};
 use synapse_calyx::{SynapseCalyxConfig, SynapseCalyxReadOnlyVault};
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
 fn main() -> Result<(), Box<dyn Error>> {
     let vault_dir = std::env::args_os()
         .nth(1)
@@ -30,7 +32,6 @@ fn print_rows(label: &str, rows: &[(Vec<u8>, Vec<u8>)]) {
         bytes = bytes.saturating_add(key.len()).saturating_add(value.len());
     }
     let digest = digest.finalize();
-    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(digest.len() * 2);
     for byte in digest {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));

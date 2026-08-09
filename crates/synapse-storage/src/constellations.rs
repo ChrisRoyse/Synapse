@@ -276,6 +276,7 @@ pub fn outcome_backfill_prefixes_display() -> String {
         .join(", ")
 }
 /// Logical backfill source for the MCP-usage subset of the shared KV family.
+///
 /// This is deliberately not `CF_KV`: using the whole family would reinterpret
 /// unrelated outcome rows as MCP usage and make a bounded migration impossible.
 pub const SYN_MCP_USAGE_BACKFILL_SOURCE: &str = "CF_KV:mcp-usage/v1/";
@@ -324,7 +325,7 @@ const MAX_DAY_DURATION_MS_MICROS: i64 = MAX_DAY_DURATION_MS * RANK_BOUND_MICROS_
 /// retrieval-only ordering ordinate, so inputs above it saturate here rather
 /// than failing measurement — see [`saturating_rank_input`] (#2030).
 ///
-/// The value is byte-identical to the literal it replaced (10_000_000_000
+/// The value is byte-identical to the literal it replaced (`10_000_000_000`
 /// micros), because it is part of the lens id `syn_scalar_rank:0:10000000000`
 /// and therefore of the frozen panel contract. Changing it is a panel version
 /// bump and a full re-measure, never an edit here alone.
@@ -1219,6 +1220,11 @@ pub fn temporal_migration_metadata(
 /// An explicitly inactive lane is valid only when it carries a non-empty
 /// reason and no event-time coordinates. Every other non-active shape is a
 /// contract error rather than an ineligible-row shortcut.
+///
+/// # Errors
+///
+/// Returns a structured error when the temporal lane state is missing,
+/// contradictory, or carries invalid event-time coordinates.
 pub fn temporal_migration_eligible(temporal: &BTreeMap<String, String>) -> StorageResult<bool> {
     match temporal
         .get(METADATA_TEMPORAL_LANE_STATE)
@@ -1339,12 +1345,7 @@ pub fn anchor_panel_for_source_cf(cf_name: &str) -> StorageResult<CalyxAnchorPan
             panel_version: SYN_MCP_USAGE_PANEL_VERSION,
             input_mode: CalyxConstellationInputMode::McpUsageFramedSourceRow,
         },
-        SYN_OUTCOME_BACKFILL_SOURCE => CalyxAnchorPanel {
-            panel_name: SYN_OUTCOME_PANEL_NAME,
-            panel_version: SYN_OUTCOME_PANEL_VERSION,
-            input_mode: CalyxConstellationInputMode::FramedSourceRow,
-        },
-        cf::CF_KV | cf::CF_ROUTINE_STATE => CalyxAnchorPanel {
+        SYN_OUTCOME_BACKFILL_SOURCE | cf::CF_KV | cf::CF_ROUTINE_STATE => CalyxAnchorPanel {
             panel_name: SYN_OUTCOME_PANEL_NAME,
             panel_version: SYN_OUTCOME_PANEL_VERSION,
             input_mode: CalyxConstellationInputMode::FramedSourceRow,
@@ -2684,6 +2685,10 @@ pub fn superseded_panel_lineage(panel_version: u32) -> Option<SupersededPanelLin
 /// (#1920's census comment found this). It is now the single source of truth the
 /// panel-coverage readback joins the physical census against.
 #[must_use]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the catalog is one exhaustive static declaration whose source, anchor, retrieval, and lifecycle contracts must remain co-located"
+)]
 pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
     vec![
         // --- observation-shaped: correctly unanchored (#1920 ask 3) ---
@@ -2966,7 +2971,7 @@ pub fn panel_catalog_entry_for_version(panel_version: u32) -> Option<PanelCatalo
 /// generation is born ungrounded, and nothing reads the old one.
 ///
 /// That is not a hypothesis. On this vault `syn-episode-v1` bumped
-/// 1_904_002 -> 1_964_001 and the `Base` census reads 171 records grounded at
+/// `1_904_002` -> `1_964_001` and the `Base` census reads 171 records grounded at
 /// the superseded generation and **0 of the same 171** at the active one, from
 /// the identical 171 `CF_EPISODES` source rows at coverage 1.0.
 ///
@@ -3032,6 +3037,10 @@ fn panel_lifecycle_error(code: &str, message: &str, remediation: &str) -> Storag
 ///
 /// Returns an error when enum serialization, lens measurement, JSON encoding,
 /// or exact integer scalar conversion fails.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the frozen timeline panel's complete ordered slot measurement is one schema contract"
+)]
 pub fn build_timeline_constellation(
     context: NativeConstellationContext,
     source_key: &[u8],
@@ -3060,7 +3069,7 @@ pub fn build_timeline_constellation(
         TL_SLOT_TITLE_SPARSE,
         measure_text_or_absent(
             SYN_TIMELINE_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text(
+            &AlgorithmicLens::syn_sparse_text(
                 "syn.timeline.title_sparse.v1",
                 Modality::Structured,
                 2048,
@@ -3112,7 +3121,7 @@ pub fn build_timeline_constellation(
         TL_SLOT_TITLE_BM25,
         measure_text_or_absent(
             SYN_TIMELINE_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text_tf(
+            &AlgorithmicLens::syn_sparse_text_tf(
                 "syn.timeline.title_bm25.v1",
                 Modality::Structured,
                 2048,
@@ -3197,7 +3206,7 @@ pub fn build_episode_constellation(
         EP_SLOT_TITLE_SPARSE,
         measure_text_or_absent(
             SYN_EPISODE_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text(
+            &AlgorithmicLens::syn_sparse_text(
                 "syn.episode.title_sparse.v1",
                 Modality::Structured,
                 4096,
@@ -3209,7 +3218,7 @@ pub fn build_episode_constellation(
         EP_SLOT_TITLE_BM25,
         measure_text_or_absent(
             SYN_EPISODE_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text_tf(
+            &AlgorithmicLens::syn_sparse_text_tf(
                 "syn.episode.title_bm25.v1",
                 Modality::Structured,
                 EP_TITLE_BM25_DIM,
@@ -3530,6 +3539,11 @@ pub fn syn_panel_cosine_grading(
 ///
 /// Public so the gate itself is verifiable: a fail-closed rule that cannot be
 /// driven from a harness is a rule nobody has watched fail.
+///
+/// # Errors
+///
+/// Returns a structured error when an active content slot has no declared
+/// runtime grading or when the panel carries no graded dense lens.
 pub fn assert_panel_carries_graded_dense_lens(
     panel_version: u32,
     slots: &[Slot],
@@ -3588,9 +3602,10 @@ pub fn assert_panel_carries_graded_dense_lens(
     Ok(())
 }
 
-/// Builds one `Active`, content (non-retrieval-only) panel slot from the same
-/// frozen lens the ingest path measures with, so the slot's `lens_id`/`shape`/
-/// `modality` are authoritative rather than reconstructed.
+/// Builds one authoritative `Active`, content panel slot.
+///
+/// The frozen lens is the same one the ingest path measures with, so the slot's
+/// `lens_id`, `shape`, and `modality` are not reconstructed.
 ///
 /// **Fail-closed on a constant cosine lane (#1963).** A content slot is, by
 /// definition, offered to every similarity surface: find-similar ranking, the
@@ -3604,6 +3619,11 @@ pub fn assert_panel_carries_graded_dense_lens(
 /// [`syn_retrieval_only_slot`] is the declaration that keeps it.
 ///
 /// Public so the refusal is verifiable from a harness.
+///
+/// # Errors
+///
+/// Returns a structured error when the encoder cannot grade cosine, is constant,
+/// has a magnitude-weighted record-vector contract, or cannot be frozen exactly.
 pub fn syn_content_slot(
     slot_id: SlotId,
     slot_key: &str,
@@ -4066,6 +4086,10 @@ fn agent_transcript_panel_slots(
     ])
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the frozen timeline panel's complete ordered slot declarations are one schema contract"
+)]
 fn timeline_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
     Ok(vec![
         syn_content_slot(
@@ -4765,7 +4789,7 @@ pub fn build_agent_transcript_constellation(
         AT_SLOT_TEXT_SPARSE,
         measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text(
+            &AlgorithmicLens::syn_sparse_text(
                 "syn.agent_transcript.text_sparse.v1",
                 Modality::Structured,
                 4096,
@@ -4777,7 +4801,7 @@ pub fn build_agent_transcript_constellation(
         AT_SLOT_TEXT_BM25,
         measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text_tf(
+            &AlgorithmicLens::syn_sparse_text_tf(
                 "syn.agent_transcript.text_bm25.v1",
                 Modality::Structured,
                 AT_TEXT_BM25_DIM,
@@ -4789,7 +4813,7 @@ pub fn build_agent_transcript_constellation(
         AT_SLOT_TEXT_FULL_BM25,
         measure_text_or_absent(
             SYN_AGENT_TRANSCRIPT_PANEL_NAME,
-            AlgorithmicLens::syn_sparse_text_tf(
+            &AlgorithmicLens::syn_sparse_text_tf(
                 "syn.agent_transcript.text_full_bm25.v1",
                 Modality::Structured,
                 AT_TEXT_FULL_BM25_DIM,
@@ -6514,6 +6538,11 @@ fn action_metadata(
 
 /// Derives the one declared terminal action outcome. Nonterminal audit rows
 /// remain measurable but ungrounded; no other status is assigned a polarity.
+///
+/// # Errors
+///
+/// Returns a structured error when a purported terminal row has an unknown,
+/// contradictory, or malformed outcome contract.
 pub fn action_outcome_anchor(
     source_key: &[u8],
     record: &Value,
@@ -7007,6 +7036,15 @@ fn optional_onehot_slot(
 /// `transitions`. Empty graphs and zero-count edges fail before generation
 /// allocation. Publication independently reads Registry, Graph, Base, and Slot
 /// rows before returning.
+///
+/// # Errors
+///
+/// Returns a structured error when transitions are invalid, graph measurement
+/// fails, or atomic publication and independent readback cannot be completed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "graph validation, measurement, generation allocation, atomic publication, and readback form one snapshot transaction"
+)]
 pub fn publish_graph_position_snapshot(
     vault: &SynapseCalyxVault,
     kind: GraphPositionKind,
@@ -7027,6 +7065,17 @@ pub fn publish_graph_position_snapshot(
         return Err(measurement_error(
             "graph-position transitions require non-blank endpoints and positive counts",
             kind.panel_name(),
+        ));
+    }
+    if let Some((src, dst, count)) = transitions
+        .iter()
+        .find(|(_, _, count)| *count > MAX_EXACT_F64_INT)
+    {
+        return Err(measurement_error(
+            "graph-position transition count",
+            format!(
+                "transition {src:?}->{dst:?} count {count} exceeds f64's exact integer range {MAX_EXACT_F64_INT}"
+            ),
         ));
     }
     let snapshot = graph_snapshot_fingerprint(transitions);
@@ -7053,7 +7102,7 @@ pub fn publish_graph_position_snapshot(
         .map(|(src, dst, count)| TransitionEdge {
             src: ids[src],
             dst: ids[dst],
-            count: *count as f64,
+            count: exact_u64_as_f64(*count),
         })
         .collect::<Vec<_>>();
     let graph = build_transition_graph(&edges)
@@ -7155,7 +7204,7 @@ pub fn publish_graph_position_snapshot(
         });
     }
     vault
-        .publish_derived_snapshot(SynapseCalyxDerivedSnapshotRequest {
+        .publish_derived_snapshot(&SynapseCalyxDerivedSnapshotRequest {
             panel_name: kind.panel_name(),
             operation_id: &operation_id,
             panel: contract.panel,
@@ -7173,6 +7222,15 @@ pub fn publish_graph_position_snapshot(
 /// Every supplied path contributes all of its ancestor prefixes. The persisted
 /// records therefore describe both leaves and internal hierarchy nodes, making
 /// subtree size and sibling position independently inspectable.
+///
+/// # Errors
+///
+/// Returns a structured error when a path is invalid, hierarchy measurement
+/// fails, or atomic publication and independent readback cannot be completed.
+#[expect(
+    clippy::too_many_lines,
+    reason = "path expansion, measurement, generation allocation, atomic publication, and readback form one snapshot transaction"
+)]
 pub fn publish_path_hierarchy_snapshot(
     vault: &SynapseCalyxVault,
     source_seq: u64,
@@ -7306,7 +7364,7 @@ pub fn publish_path_hierarchy_snapshot(
         });
     }
     vault
-        .publish_derived_snapshot(SynapseCalyxDerivedSnapshotRequest {
+        .publish_derived_snapshot(&SynapseCalyxDerivedSnapshotRequest {
             panel_name: SYN_PATH_HIERARCHY_PANEL_NAME,
             operation_id: &operation_id,
             panel: contract.panel,
@@ -7338,6 +7396,10 @@ fn derived_snapshot_base_generations() -> Vec<(String, u32)> {
 
 /// Returns the canonical parent/child edge set used to fingerprint a path
 /// hierarchy snapshot.
+///
+/// # Errors
+///
+/// Returns a structured error when any supplied path is blank or has no hierarchy components.
 pub fn path_hierarchy_transitions(paths: &[String]) -> StorageResult<Vec<(String, String, u64)>> {
     let mut transitions = BTreeSet::new();
     for path in paths {
@@ -7400,6 +7462,11 @@ fn derived_graph_key(kind: GraphPositionKind, snapshot: u64, suffix: &[u8]) -> V
 /// whole-graph snapshot is published. The snapshot fingerprint is part of the
 /// signature lens id, so callers must persist this exact contract beside the
 /// derived rows and must never infer it from the logical panel name.
+///
+/// # Errors
+///
+/// Returns a structured error when either frozen content slot cannot be
+/// registered or the resulting panel lacks a graded dense lens.
 pub fn syn_graph_position_panel_contract(
     kind: GraphPositionKind,
     panel_version: u32,
@@ -7445,6 +7512,11 @@ pub fn syn_graph_position_panel_contract(
 }
 
 /// Builds the immutable contract for one derived hierarchy snapshot.
+///
+/// # Errors
+///
+/// Returns a structured error when either frozen content slot cannot be
+/// registered or the resulting panel lacks a graded dense lens.
 pub fn syn_path_hierarchy_panel_contract(
     panel_version: u32,
     snapshot: u64,
@@ -7708,7 +7780,7 @@ pub const SLOT_REFUSED_ABSENT_PREFIX: &str = "lens_refused:";
 /// anything from logs.
 fn measure_text_or_absent(
     panel_name: &'static str,
-    lens: AlgorithmicLens,
+    lens: &AlgorithmicLens,
     text: &str,
 ) -> StorageResult<SlotVector> {
     if non_empty(text).is_none() {
@@ -7914,6 +7986,10 @@ const fn interruption_ratio(record: &EpisodeRecord) -> f64 {
 ///
 /// Every field read here is declared in
 /// `synapse_calyx::lens_provenance::SYN_SLOT_SOURCE_FIELDS` for slot 104.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "day/week modulo values are below 604800 and exactly representable as f64"
+)]
 fn timeline_numeric_record(record: &TimelineRecord, raw_bytes: &[u8]) -> Value {
     let secs = record.ts_ns / NS_PER_SEC;
     let app = record.app.as_deref().unwrap_or("");
@@ -7995,9 +8071,13 @@ fn log_len_norm(value: &str, scale: f64) -> f64 {
 /// miniature. Clamping is deliberate winsorization: above `scale` the field
 /// saturates and stops discriminating, which is an explicit, documented loss at
 /// the tail rather than a silent takeover of every other field.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "log normalization intentionally maps an integer magnitude into an approximate continuous feature before clamping"
+)]
 fn count_norm(value: u64, scale: f64) -> f64 {
     debug_assert!(scale > 0.0, "count_norm scale must be positive");
-    ((1.0 + value as f64).ln() / (1.0 + scale).ln()).clamp(0.0, 1.0)
+    ((value as f64).ln_1p() / scale.ln_1p()).clamp(0.0, 1.0)
 }
 
 /// Position within the day, in `[0, 1)`.
@@ -8006,11 +8086,19 @@ fn count_norm(value: u64, scale: f64) -> f64 {
 /// not: it is a serial number seven orders of magnitude above every other field,
 /// and #1964 measured what that does. Time-of-day is a genuine property of the
 /// activity; the epoch offset is a property of the clock.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the modulo is below 86400 and exactly representable as f64"
+)]
 fn day_fraction_of(ts_ns: u64) -> f64 {
     ((ts_ns / NS_PER_SEC) % SECS_PER_DAY) as f64 / SECS_PER_DAY as f64
 }
 
 /// Position within the week, in `[0, 1)`. See [`day_fraction_of`].
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the modulo is below 604800 and exactly representable as f64"
+)]
 fn week_fraction_of(ts_ns: u64) -> f64 {
     const SECS_PER_WEEK: u64 = 7 * SECS_PER_DAY;
     ((ts_ns / NS_PER_SEC) % SECS_PER_WEEK) as f64 / SECS_PER_WEEK as f64
@@ -8057,6 +8145,10 @@ const EP_DISTINCT_TITLE_SCALE: f64 = 50.0;
 /// `syn_record_vector_unit_fields` refuses the record outright if any field
 /// leaves `[-1, 1]` — so a future edit that reintroduces a raw magnitude fails
 /// at measure time instead of quietly flattening the panel.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "duration and event-count ratios are intentionally approximate continuous normalized features"
+)]
 fn episode_numeric_record(record: &EpisodeRecord) -> Value {
     let duration_ms = record.duration_ms();
     json!({
@@ -8679,6 +8771,10 @@ fn action_target_components(value: &str) -> Vec<String> {
 /// feature, or carries more than [`ACT_TARGET_MAX_FIELDS`] fields. Both are
 /// refused loudly rather than measured as a degenerate or truncated vector: a
 /// silently-dropped target is exactly the corpus loss #2050 was opened for.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "component count is bounded by ACT_TARGET_MAX_COMPONENTS before conversion"
+)]
 fn action_target_features(target: &Value) -> StorageResult<serde_json::Map<String, Value>> {
     let mut features = serde_json::Map::new();
     let mut components_emitted = 0_usize;
@@ -9088,6 +9184,10 @@ fn mcp_usage_ts_ns(record: &Value) -> Option<u64> {
         .map(|ms| ms.saturating_mul(NS_PER_MS))
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "each value is clamped to a small declared ceiling before conversion"
+)]
 fn outcome_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
     let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
     json!({
@@ -9101,6 +9201,10 @@ fn outcome_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
     })
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "each value is clamped to a small declared ceiling before conversion"
+)]
 fn mcp_usage_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
     let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
     json!({
@@ -9122,6 +9226,10 @@ fn mcp_usage_numeric_record_v2(record: &Value, raw_bytes: &[u8]) -> Value {
     })
 }
 
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "scaled values are ceiling-clamped and week phase is below f64's exact integer range"
+)]
 fn action_numeric_record(record: &Value) -> Value {
     let scaled = |value: u64, ceiling: u64| (value.min(ceiling) as f64) / (ceiling as f64);
     let ts_ns = json_u64(record, &["ts_ns"]).unwrap_or(0);

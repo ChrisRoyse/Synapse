@@ -15,6 +15,7 @@ use calyx_registry::VaultPanelState;
 use calyx_search::{
     PersistedSearchGeneration, PersistedSearchIndexes, PersistedSearchManifestArtifact,
 };
+use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
@@ -96,7 +97,7 @@ pub struct SynapseCalyxAnnealChangeReport {
     pub rollback_rows_after: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct SynapseCalyxAnnealRollbackReport {
     pub change_id: u64,
     pub candidate_artifact_sha256: String,
@@ -240,6 +241,12 @@ impl SynapseCalyxVault {
         self.read_live_tuning().map(|(_, _, tuning)| tuning)
     }
 
+    /// Reads the effective tuning, resource budget, tripwires, and recent durable changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when any live artifact, registry, budget, or ledger row
+    /// cannot be opened and read consistently.
     pub fn anneal_status(&self) -> Result<SynapseCalyxAnnealStatus, SynapseCalyxError> {
         let (hash, bytes, effective_tuning) = self.read_live_tuning()?;
         let clock = self.anneal_clock()?;
@@ -258,7 +265,7 @@ impl SynapseCalyxVault {
             })?;
         let appender = LedgerAppender::open(
             AsterAnnealLedgerStore::with_index(&self.vault, &self.anneal_ledger_index),
-            clock.clone(),
+            clock,
         )
         .map_err(|error| SynapseCalyxError::from_calyx("open Anneal ledger", &error))?;
         let ledger = AnnealLedger::new(appender, ActorId::Service("synapse-anneal".to_owned()))
@@ -288,6 +295,11 @@ impl SynapseCalyxVault {
     /// The actions must measure the actual candidate and incumbent. This API
     /// deliberately accepts no metric values or predeclared verdict, so callers
     /// cannot promote by asserting that a candidate was healthy.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the candidate or replay is invalid, measurement
+    /// fails, or the promoted artifact cannot be durably committed and read back.
     pub fn anneal_propose_tuning<Candidate, Incumbent>(
         &self,
         candidate_tuning: SynapseCalyxTuningConfig,
@@ -316,6 +328,15 @@ impl SynapseCalyxVault {
     /// Builds and measures an immutable persisted-search candidate from the
     /// same pinned Base cut as the incumbent, then promotes only the measured
     /// tuning+manifest pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when snapshotting, candidate construction, paired
+    /// measurement, promotion, or the final artifact readback fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "candidate and incumbent must remain bound to one pinned cut through the ordered promotion transaction"
+    )]
     pub fn anneal_propose_search_tuning(
         &self,
         candidate_tuning: SynapseCalyxTuningConfig,
@@ -338,10 +359,10 @@ impl SynapseCalyxVault {
             incumbent_tuning.dense_index_config(),
             snapshot,
         )
-        .map_err(|error| search_shadow_error("rebuild incumbent generation", error))?;
+        .map_err(|error| search_shadow_error("rebuild incumbent generation", &error))?;
         let incumbent_artifact =
             calyx_search::read_live_manifest_artifact(&self.config.vault_dir, panel.panel.version)
-                .map_err(|error| search_shadow_error("read incumbent manifest artifact", error))?;
+                .map_err(|error| search_shadow_error("read incumbent manifest artifact", &error))?;
 
         let candidate_bytes = serde_json::to_vec(&candidate_tuning).map_err(|error| {
             anneal_error(
@@ -360,7 +381,7 @@ impl SynapseCalyxVault {
                 candidate_hash,
                 snapshot,
             )
-            .map_err(|error| search_shadow_error("build candidate search generation", error))?;
+            .map_err(|error| search_shadow_error("build candidate search generation", &error))?;
         if built.generation.base_seq != incumbent_artifact.base_seq {
             return Err(anneal_error(
                 "SYNAPSE_CALYX_ANNEAL_SEARCH_CUT_CHANGED",
@@ -377,18 +398,18 @@ impl SynapseCalyxVault {
             candidate_hash,
             built.generation.base_seq,
         )
-        .map_err(|error| search_shadow_error("read candidate manifest artifact", error))?;
+        .map_err(|error| search_shadow_error("read candidate manifest artifact", &error))?;
 
         let incumbent_indexes =
             PersistedSearchIndexes::open(&self.config.vault_dir, panel.panel.version)
-                .map_err(|error| search_shadow_error("open incumbent search generation", error))?;
+                .map_err(|error| search_shadow_error("open incumbent search generation", &error))?;
         let candidate_indexes = PersistedSearchIndexes::open_candidate(
             &self.config.vault_dir,
             panel.panel.version,
             candidate_hash,
             built.generation.base_seq,
         )
-        .map_err(|error| search_shadow_error("open candidate search generation", error))?;
+        .map_err(|error| search_shadow_error("open candidate search generation", &error))?;
         let (replay, query_slots) =
             self.build_search_replay(&candidate_indexes, &built.generation, snapshot)?;
         let (candidate_action, candidate_slot_metrics, incumbent_action, incumbent_slot_metrics) =
@@ -433,7 +454,7 @@ impl SynapseCalyxVault {
         let live =
             calyx_search::read_live_manifest_artifact(&self.config.vault_dir, panel.panel.version)
                 .map_err(|error| {
-                    search_shadow_error("read live manifest after search proposal", error)
+                    search_shadow_error("read live manifest after search proposal", &error)
                 })?;
         let expected_live = if matches!(change.outcome, ChangeOutcome::Promoted(_)) {
             &candidate_artifact
@@ -598,7 +619,7 @@ impl SynapseCalyxVault {
             let mut query_id = 1_u64;
             for slot in dense_slots {
                 let ids = indexes.dense_ids(slot).map_err(|error| {
-                    search_shadow_error(&format!("read candidate ids for slot {slot}"), error)
+                    search_shadow_error(&format!("read candidate ids for slot {slot}"), &error)
                 })?;
                 for cx_id in ids.into_iter().take(SEARCH_REPLAY_QUERIES_PER_SLOT) {
                     let constellation = self
@@ -629,7 +650,7 @@ impl SynapseCalyxVault {
                         .map_err(|error| {
                             search_shadow_error(
                                 &format!("derive exact replay rank for slot {slot}"),
-                                error,
+                                &error,
                             )
                         })?;
                     if expected.is_empty() {
@@ -780,7 +801,7 @@ impl SynapseCalyxVault {
                     &binding.manifest,
                 )
                 .map_err(|error| {
-                    search_shadow_error("reconcile live Anneal search manifest", error)
+                    search_shadow_error("reconcile live Anneal search manifest", &error)
                 })?;
                 tracing::warn!(
                     code = "SYNAPSE_CALYX_ANNEAL_SEARCH_MANIFEST_RECONCILED",
@@ -795,7 +816,7 @@ impl SynapseCalyxVault {
                 binding.manifest.panel_version,
             )
             .and_then(|indexes| indexes.generation())
-            .map_err(|error| search_shadow_error("reopen reconciled search manifest", error))?;
+            .map_err(|error| search_shadow_error("reopen reconciled search manifest", &error))?;
             if generation.dense_index_config != tuning.dense_index_config() {
                 return Err(anneal_error(
                     "SYNAPSE_CALYX_ANNEAL_SEARCH_CONFIG_MISMATCH",
@@ -813,6 +834,16 @@ impl SynapseCalyxVault {
         Ok(())
     }
 
+    /// Restores a prior Anneal change and independently verifies the restored live state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the rollback record cannot be read, restored,
+    /// durably committed, or verified against the live artifact.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "rollback and independent live-artifact verification are one ordered recovery transaction"
+    )]
     pub fn anneal_rollback(
         &self,
         change_id: u64,
@@ -858,7 +889,7 @@ impl SynapseCalyxVault {
                 binding.manifest.panel_version,
                 &binding.manifest,
             )
-            .map_err(|error| search_shadow_error("restore prior search manifest", error))?;
+            .map_err(|error| search_shadow_error("restore prior search manifest", &error))?;
         }
         let ledger = self.anneal_ledger(clock.clone())?;
         let tripwires =
@@ -1186,6 +1217,10 @@ fn ensure_index_only_candidate(
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "paired candidate/incumbent measurement shares one replay order and aggregation pass to prevent comparison drift"
+)]
 fn measure_search_actions_paired(
     candidate_indexes: &PersistedSearchIndexes,
     incumbent_indexes: &PersistedSearchIndexes,
@@ -1250,7 +1285,7 @@ fn measure_search_actions_paired(
                 .map_err(|error| {
                     search_shadow_error(
                         &format!("warm {label} replay query {} slot {slot}", query.query_id),
-                        error,
+                        &error,
                     )
                 })?;
         }
@@ -1300,7 +1335,7 @@ fn measure_search_actions_paired(
                                 "measure {label} replay query {} slot {slot}",
                                 query.query_id
                             ),
-                            error,
+                            &error,
                         )
                     })?;
                 elapsed.push(started.elapsed().as_secs_f64() * 1_000.0);
@@ -1331,7 +1366,24 @@ fn measure_search_actions_paired(
                     expected.contains(&hit.cx_id) || hit.score + f32::EPSILON >= kth_similarity
                 })
                 .count();
-            let recall = matched as f64 / expected.len() as f64;
+            let matched = matched.to_f64().ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_SEARCH_COUNT_OUT_OF_RANGE",
+                    format!("matched result count {matched} cannot be represented as f64"),
+                    "reduce the held-out replay below the platform floating-point conversion limit",
+                )
+            })?;
+            let expected_count = expected.len().to_f64().ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_SEARCH_COUNT_OUT_OF_RANGE",
+                    format!(
+                        "expected result count {} cannot be represented as f64",
+                        expected.len()
+                    ),
+                    "reduce the held-out replay below the platform floating-point conversion limit",
+                )
+            })?;
+            let recall = matched / expected_count;
             let p99 = *elapsed.last().ok_or_else(|| {
                 anneal_error(
                     "SYNAPSE_CALYX_ANNEAL_SEARCH_MEASUREMENT_EMPTY",
@@ -1361,27 +1413,36 @@ fn measure_search_actions_paired(
             .into_iter()
             .map(
                 |(slot, (query_count, recall_sum, recall_min, p99_sum, p99_max))| {
-                    SynapseCalyxAnnealSearchSlotMetrics {
+                    let query_count_f64 = query_count.to_f64().ok_or_else(|| {
+                        anneal_error(
+                            "SYNAPSE_CALYX_ANNEAL_SEARCH_COUNT_OUT_OF_RANGE",
+                            format!(
+                                "slot {slot} query count {query_count} cannot be represented as f64"
+                            ),
+                            "reduce the held-out replay below the platform floating-point conversion limit",
+                        )
+                    })?;
+                    Ok(SynapseCalyxAnnealSearchSlotMetrics {
                         slot,
                         query_count,
-                        recall_mean: recall_sum / query_count as f64,
+                        recall_mean: recall_sum / query_count_f64,
                         recall_min,
-                        search_p99_ms_mean: p99_sum / query_count as f64,
+                        search_p99_ms_mean: p99_sum / query_count_f64,
                         search_p99_ms_max: p99_max,
-                    }
+                    })
                 },
             )
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>, SynapseCalyxError>>()
     };
     Ok((
         MeasuredSearchAction {
             by_query: candidate_by_query,
         },
-        summarize(candidate_by_slot),
+        summarize(candidate_by_slot)?,
         MeasuredSearchAction {
             by_query: incumbent_by_query,
         },
-        summarize(incumbent_by_slot),
+        summarize(incumbent_by_slot)?,
     ))
 }
 
@@ -1446,7 +1507,7 @@ fn decode_search_binding(
     Ok(binding)
 }
 
-fn search_shadow_error(action: &str, error: calyx_search::SearchError) -> SynapseCalyxError {
+fn search_shadow_error(action: &str, error: &calyx_search::SearchError) -> SynapseCalyxError {
     SynapseCalyxError::new(
         error.code(),
         format!("{action}: {}", error.message()),
@@ -1484,7 +1545,13 @@ fn tuning_artifact_row_key(hash: [u8; 32]) -> Vec<u8> {
 }
 
 fn hex32(hash: [u8; 32]) -> String {
-    hash.iter().map(|byte| format!("{byte:02x}")).collect()
+    use std::fmt::Write as _;
+
+    hash.iter()
+        .fold(String::with_capacity(hash.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn anneal_error(

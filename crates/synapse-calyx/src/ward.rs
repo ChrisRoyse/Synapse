@@ -418,6 +418,11 @@ struct AdjudicatedCorpus {
 impl SynapseCalyxVault {
     /// Reads the worst per-slot false-accept rate from the persisted calibrated
     /// guard for a panel. This is a read-only readiness input.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the guard row is absent, corrupt, or has
+    /// no finite per-slot calibration evidence.
     pub fn guard_calibration_far(&self, panel_version: u32) -> Result<f32, SynapseCalyxError> {
         let panel_key = Self::guard_profile_key(panel_version);
         let row = self

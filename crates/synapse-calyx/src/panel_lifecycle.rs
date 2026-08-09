@@ -95,7 +95,7 @@ pub struct SynapseCalyxDerivedSnapshotRequest<'a> {
     pub snapshot: u64,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxDerivedSnapshotReadback {
     pub panel_name: String,
     pub panel_version: u32,
@@ -182,9 +182,18 @@ pub struct SynapseCalyxBackfillCompleteReadback {
 impl SynapseCalyxVault {
     /// Atomically publishes a fingerprinted graph snapshot, its exact frozen
     /// panel contract, all derived constellations, and one ledger entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when validation, generation allocation, the
+    /// atomic publication, or its independent physical readback fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "validation, generation allocation, atomic publication, and readback are one ordered snapshot transaction"
+    )]
     pub fn publish_derived_snapshot(
         &self,
-        request: SynapseCalyxDerivedSnapshotRequest<'_>,
+        request: &SynapseCalyxDerivedSnapshotRequest<'_>,
     ) -> Result<SynapseCalyxDerivedSnapshotReadback, SynapseCalyxError> {
         lifecycle_key(request.panel_name)?;
         validate_operation_id(request.operation_id)?;
@@ -246,7 +255,7 @@ impl SynapseCalyxVault {
         let expected_revision = existing.as_deref().map(sha256_array);
         if let Some(existing) = existing.as_ref() {
             if existing.as_slice() == lifecycle_value {
-                return derived_snapshot_readback(self, &request, &lifecycle_value);
+                return derived_snapshot_readback(self, request, &lifecycle_value);
             }
             let prior: SynapseCalyxPanelLifecycleState =
                 serde_json::from_slice(existing).map_err(|error| {
@@ -305,7 +314,7 @@ impl SynapseCalyxVault {
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("publish atomic derived graph snapshot", &error)
             })?;
-        derived_snapshot_readback(self, &request, &lifecycle_value)
+        derived_snapshot_readback(self, request, &lifecycle_value)
     }
     /// Lists every physical Base id in one panel, bounded before allocation.
     ///
@@ -349,6 +358,10 @@ impl SynapseCalyxVault {
     }
 
     /// Reads one panel's lifecycle row from the physical Registry CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the Registry row cannot be read or decoded.
     pub fn read_panel_lifecycle(
         &self,
         panel_name: &str,
@@ -361,6 +374,11 @@ impl SynapseCalyxVault {
 
     /// Reconstructs every dynamically added frozen lens into a supplied base
     /// registry and returns the durable lifecycle panel definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the lifecycle row is corrupt or any
+    /// frozen lens cannot be reconstructed with its exact stored identity.
     pub fn reconstruct_panel_lifecycle_contract(
         &self,
         panel_name: &str,
@@ -397,11 +415,20 @@ impl SynapseCalyxVault {
     /// The generation allocation and operation id are idempotent. The panel
     /// row itself is CAS guarded, so concurrent mutations are retried from the
     /// winning physical state and never overwrite one another.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when validation, allocation, registry
+    /// reconstruction, CAS publication, or physical readback fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "generation allocation, CAS mutation, backfill enqueue, and physical readback are one ordered lifecycle transaction"
+    )]
     pub fn add_panel_lens(
         &self,
-        request: SynapseCalyxAddLensRequest<'_>,
+        request: &SynapseCalyxAddLensRequest<'_>,
     ) -> Result<SynapseCalyxAddLensReadback, SynapseCalyxError> {
-        validate_request(&request)?;
+        validate_request(request)?;
         let panel_name = request.panel_name.to_owned();
         let key = lifecycle_key(&panel_name)?;
         let (lens, frozen_contract) = runtime_lens(&request.lens_spec)?;
@@ -540,9 +567,18 @@ impl SynapseCalyxVault {
     }
 
     /// Parks, unparks, or irreversibly retires one durable panel slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when validation, CAS mutation, ledger
+    /// publication, or physical readback fails.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "slot transition validation, CAS mutation, ledger publication, and readback are one ordered lifecycle transaction"
+    )]
     pub fn set_panel_lens_state(
         &self,
-        request: SynapseCalyxSetLensStateRequest<'_>,
+        request: &SynapseCalyxSetLensStateRequest<'_>,
     ) -> Result<SynapseCalyxSetLensStateReadback, SynapseCalyxError> {
         lifecycle_key(request.panel_name)?;
         validate_operation_id(request.operation_id)?;
@@ -728,6 +764,11 @@ impl SynapseCalyxVault {
     /// Returns `None` when the panel has never been mutated. Active added
     /// lenses are measured immediately; parked and retired slots are carried as
     /// explicit inactive absences so a zero vector can never be inferred.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when lifecycle state cannot be read, an active
+    /// added lens cannot be measured, or the materialized schema is invalid.
     pub fn materialize_panel_lifecycle_generation(
         &self,
         panel_name: &str,
@@ -776,6 +817,11 @@ impl SynapseCalyxVault {
     }
 
     /// Atomically recovers abandoned claims and claims a bounded next batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an invalid limit, abandoned work without
+    /// explicit recovery, CAS exhaustion, or a failed physical readback.
     pub fn claim_panel_backfill(
         &self,
         panel_name: &str,
@@ -862,6 +908,11 @@ impl SynapseCalyxVault {
     }
 
     /// Marks one physically verified task complete in the durable queue.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the task is absent or unverified, or when
+    /// CAS publication and physical readback fail.
     pub fn complete_panel_backfill_task(
         &self,
         panel_name: &str,
@@ -1222,8 +1273,14 @@ fn conflict(message: impl Into<String>) -> SynapseCalyxError {
 
 fn hex_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest as _, Sha256};
+    use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
-    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    digest
+        .iter()
+        .fold(String::with_capacity(digest.len() * 2), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 fn sha256_array(bytes: &[u8]) -> [u8; 32] {

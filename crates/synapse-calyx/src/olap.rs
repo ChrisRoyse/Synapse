@@ -5,6 +5,12 @@ use calyx_core::{PanelSlotId, SlotId};
 use crate::{SynapseCalyxError, SynapseCalyxVault};
 
 impl SynapseCalyxVault {
+    /// Runs a bounded native OLAP aggregation over one persisted panel slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an invalid slot or when the physical slot
+    /// artifact cannot be built, opened, scanned, or aggregated.
     pub fn olap_aggregate_slot(
         &self,
         panel_version: u32,

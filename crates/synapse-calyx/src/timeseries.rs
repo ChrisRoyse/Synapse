@@ -34,6 +34,12 @@ pub struct SynapseCalyxRollupValue {
 }
 
 impl SynapseCalyxVault {
+    /// Ensures an immutable native `TimeSeries` collection exists with the exact descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the descriptor conflicts or create and
+    /// independent readback cannot establish the required collection.
     pub fn ensure_timeseries_collection(&self, name: &str) -> Result<(), SynapseCalyxError> {
         let expected = timeseries_collection(name);
         match get_collection(&self.vault, name) {
@@ -79,6 +85,11 @@ impl SynapseCalyxVault {
         }
     }
 
+    /// Writes one point to a native `TimeSeries` collection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when collection verification or the durable point write fails.
     pub fn timeseries_write(
         &self,
         collection_name: &str,
@@ -97,6 +108,11 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("write native TimeSeries point", &error))
     }
 
+    /// Reads one native `TimeSeries` rollup bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the collection descriptor is invalid or the rollup read fails.
     pub fn timeseries_rollup(
         &self,
         collection_name: &str,
@@ -118,6 +134,11 @@ impl SynapseCalyxVault {
             .map_err(|error| SynapseCalyxError::from_calyx("read native TimeSeries rollup", &error))
     }
 
+    /// Reads a bounded timestamp range from one native `TimeSeries` series.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the collection descriptor is invalid or the range read fails.
     pub fn timeseries_range(
         &self,
         collection_name: &str,

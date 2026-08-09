@@ -28,18 +28,37 @@ const FIELDS: &[&str] = &[
     "finished_at_unix_ms",
 ];
 
-fn quantile(sorted: &[u64], q: f64) -> u64 {
+fn quantile(sorted: &[u64], numerator: usize, denominator: usize) -> Result<u64, &'static str> {
     if sorted.is_empty() {
-        return 0;
+        return Ok(0);
     }
-    let idx = ((sorted.len() - 1) as f64 * q).round() as usize;
-    sorted[idx.min(sorted.len() - 1)]
+    if denominator == 0 || numerator > denominator {
+        return Err("quantile ratio must satisfy numerator <= denominator and denominator > 0");
+    }
+    let idx = (sorted.len() - 1)
+        .checked_mul(numerator)
+        .and_then(|product| product.checked_add(denominator / 2))
+        .ok_or("quantile index arithmetic overflowed")?
+        / denominator;
+    Ok(sorted[idx])
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "this read-only distribution inspector intentionally represents observed integer magnitudes as approximate f64 values"
+)]
+const fn observed_u64_as_f64(value: u64) -> f64 {
+    value as f64
 }
 
 fn count_norm(value: u64, scale: f64) -> f64 {
-    ((1.0 + value as f64).ln() / (1.0 + scale).ln()).clamp(0.0, 1.0)
+    (observed_u64_as_f64(value).ln_1p() / scale.ln_1p()).clamp(0.0, 1.0)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "one read-only corpus inspection prints the source census, field distributions, and measured discrimination verdict together"
+)]
 fn main() -> Result<(), Box<dyn Error>> {
     let vault_dir = std::env::args()
         .nth(1)
@@ -93,14 +112,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             })
             .collect();
         values.sort_unstable();
-        let median = quantile(&values, 0.5);
-        let p90 = quantile(&values, 0.9);
-        let p99 = quantile(&values, 0.99);
+        let median = quantile(&values, 50, 100)?;
+        let p90 = quantile(&values, 90, 100)?;
+        let p99 = quantile(&values, 99, 100)?;
         let max = values.last().copied().unwrap_or(0);
         let scale = if p99 == 0 {
             1.0
         } else {
-            10f64.powf((p99 as f64).log10().ceil())
+            10f64.powf(observed_u64_as_f64(p99).log10().ceil())
         };
         println!(
             "{field:<32} {:>8} {:>8} {median:>10} {p90:>10} {p99:>12} {max:>14} {scale:>12.0}",
@@ -142,19 +161,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("candidate record vector did not measure the authoritative corpus".into());
     }
     let nearest = nearest_neighbour_sims(&vectors);
-    let mut buckets: Vec<i64> = nearest
-        .iter()
-        .map(|value| (f64::from(*value) * 1_000_000.0).round() as i64)
-        .collect();
-    buckets.sort_unstable();
-    buckets.dedup();
+    let mut buckets = nearest.clone();
+    buckets.sort_by(f32::total_cmp);
+    buckets.dedup_by(|left, right| (*left - *right).abs() <= 0.000_001);
     let min = nearest.iter().copied().fold(f32::INFINITY, f32::min);
     let max = nearest.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     println!(
         "candidate_nearest_neighbor_cosine distinct={} range=[{min:.6},{max:.6}]",
         buckets.len()
     );
-    if buckets.len() <= 1 || min == 1.0 {
+    if buckets.len() <= 1 || min >= 1.0 - f32::EPSILON {
         return Err(
             "candidate slot remains geometrically constant and may not be published".into(),
         );
