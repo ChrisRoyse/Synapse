@@ -247,8 +247,113 @@ pwsh -File scripts/lint.ps1 -> PASS (153.6s after final evidence-schema edit)
 No automated tests, mock data, branch, worktree, fallback, or permanent FSV
 surface was created.
 
-## Remaining deployment gate
+## Production installed-daemon FSV
 
-Production setup/deployment evidence is added below only after the exact commit
-is built and the installed daemon is manually exercised under temporary
-`WRITE_REFLEX`, then restored to the final least-privilege grant.
+The supported setup path built and installed commit
+`8819ee37e383a6c76078e4182559bb5088695f83` from a clean `main` checkout. The
+shipping image was `C:\Users\hotra\.cargo\bin\synapse-mcp.exe`, length
+257,312,073 bytes, SHA-256
+`AB1585F3F45ED598A522A7813F243338BFB1D1A9588FF10E8F9870F467A8AF65`.
+Authenticated health independently reported the same commit, image path,
+length, clean build-input manifest, and exact source directory. The daemon used
+the host's AVX2 implementation; NVML proved this host has no CUDA device, so
+there was no faster GPU backend to select.
+
+Temporary mutation grant:
+
+```text
+READ_EVENTS READ_REFLEX WRITE_REFLEX READ_PROFILE
+READ_STORAGE WRITE_STORAGE READ_AUDIO
+```
+
+Before the trigger, production physical counts were
+`CF_REFLEX_AUDIT=8, CF_REFLEX_AUDIT_ORDER=8`. Two inert, zero-action
+`on_event` reflexes were registered through the public facade:
+
+```text
+id = 019feb4a-f6ed-7ce3-93e8-d3486c089ff9
+priority = 931, exclusive = false
+registered_at = 2026-08-10T10:49:46.477348Z
+audit ts_ns = 1786358986477348000
+audit id = 019feb4a-f6ee-7f41-be2a-148c696fe76d
+source value bytes/SHA-256 = 780 / ac7cdcc92c541ef3e12d8cc0207918371242ee0be6d091ab44a14a06bf214b61
+anchor CxID = c88af6b898e9d09263363bec99143503
+
+id = 019feb4b-a287-75b2-9279-31be70e29690
+priority = 932, exclusive = true
+registered_at = 2026-08-10T10:50:30.407708900Z
+audit ts_ns = 1786359030407708900
+audit id = 019feb4b-a288-7ce3-ba32-4e9555bd53ff
+source value bytes/SHA-256 = 779 / c7fb567074c44b05b180a64202253b19836d71b2c750c5fd32f36e592fd86750
+anchor CxID = bf3d27c5a511d4ea14c84156fc712dd6
+```
+
+After the first registration, an independent list/history read and exact
+physical anchor decode returned the same first timestamp and an active
+`label:reflex_registration_state` anchor. After the second registration, the
+first timestamp remained byte-for-byte unchanged and both independently read
+histories held exactly one active event. Physical source/order counts were
+`10/10`. The exact registered schema and `publication_row_count` field were
+found in two physical Ledger SST files; `source_row_count` had zero matches in
+the Ledger CF.
+
+A whole-vault production verification then read the live SST/WAL bytes and
+reported:
+
+```text
+vault id = 01KYJPGWATPD4XNMZY3ERGTKQW
+verdict = verified, green = true
+restore_success = true
+scan_mode = full_chain
+Ledger entries re-hashed = 342,260
+chain_intact = true
+raw_commitments_intact = true
+tail_entries = 0
+failure_reasons = []
+tip = e598dde287dd00d5876ea6b8b5d687413226e20a389b7192f47923defdb1c6e5
+```
+
+### Real process boundary and newly isolated defect #2204
+
+Setup changed only the declared permission contract and gracefully replaced
+PID 4276 with PID 19024. Calyx reopened the same vault id at recovered sequence
+1,306,320. Both exact audit histories and timestamps survived. However, the new
+runtime reported `active_count=0` and omitted both ids while their durable audit
+and anchor states remained active. Cancelling either id returned
+`cancelled=false, reason=not_found` and did not invent terminal rows.
+
+That contradiction is outside the fixed transactional-registration boundary
+and is tracked fail-closed as #2204. The evidence rows were deliberately not
+rewritten or deleted: doing so would hide the fact that restart recovery cannot
+reconstruct an executable definition from the partial durable metadata.
+
+### Final least privilege, denial boundary, and hardware readback
+
+The daemon was left with exactly:
+
+```text
+READ_EVENTS READ_REFLEX READ_PROFILE READ_STORAGE WRITE_STORAGE READ_AUDIO
+```
+
+A third valid inert registration trigger then failed as
+`SAFETY_PERMISSION_DENIED missing WRITE_REFLEX`. Separate before/after physical
+counts stayed `CF_REFLEX_AUDIT=11, CF_REFLEX_AUDIT_ORDER=11`; an independent
+global-history read identified the extra row as the pre-existing
+`__scheduler__ / REFLEX_TICK_LATE` audit at `1786359232158204800` ns, not a
+partial registration.
+
+Audio was enabled but lazy before first use. A real one-second loopback
+observation measured silence at -120 dB, completed the audio sensor in 182 ms,
+reported `audio_status=healthy`, and persisted observation
+`observe-01786359618782730300-0000000000`. A separate
+`storage operation=row_read` decoded exact key
+`18ca6c9bd6a5983c00000000`, 1,079 stored bytes, and SHA-256
+`02458efe256cd0ec17312d47ff8bd5ba17e5a0d0fe4222ee11ac5b977edca965`.
+Health then reported audio `ok`, the same vault id, and AVX2 CPU math.
+
+The three scratch vaults and their three sibling lineage journals (382 KB)
+were moved to the Windows Recycle Bin and separately confirmed absent from
+`%TEMP%`. They remain recoverable until the Recycle Bin is emptied. The closing
+issue comments record the final evidence-only commit, rebuilt installed-image
+SHA-256, live PID, and authenticated provenance so the running binary exactly
+matches the final `main` state without another tracked edit.
