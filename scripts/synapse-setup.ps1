@@ -454,11 +454,16 @@ $script:SynapseSetupPhaseLedger = [System.Collections.Generic.List[object]]::new
 $script:SynapseSetupCurrentPhase = $null
 $script:SynapseSetupCurrentPhaseStartedAt = $null
 $script:SynapseSetupPhaseLedgerWritten = $false
+$script:SynapseSetupPhaseLedgerWriteError = $null
 
 function Stop-SynapseSetupPhaseTimer {
     if ($null -eq $script:SynapseSetupCurrentPhase) { return }
     $endedAt = Get-Date
-    $script:SynapseSetupPhaseLedger.Add([ordered]@{
+    # A phase is an object with schema fields, not a dictionary whose keys only
+    # happen to look like properties. Sort-Object resolves properties; an
+    # OrderedDictionary therefore turns every named sort key into $null and
+    # silently preserves insertion order (#2208).
+    $script:SynapseSetupPhaseLedger.Add([pscustomobject][ordered]@{
         index = $script:SynapseSetupPhaseLedger.Count + 1
         phase = $script:SynapseSetupCurrentPhase
         started_at_utc = $script:SynapseSetupCurrentPhaseStartedAt.ToUniversalTime().ToString('o')
@@ -489,6 +494,14 @@ function Write-SynapseSetupPhaseLedger {
     )
 
     if ($script:SynapseSetupPhaseLedgerWritten) { return $null }
+    $script:SynapseSetupPhaseLedgerWriteError = $null
+    $ledgerPath = $null
+    $temporaryPath = $null
+    $replacementBackupPath = $null
+    $publishPhase = 'not_started'
+    $publishCompleted = $false
+    $readbackValidated = $false
+    $expectedBytes = $null
     try {
         # Close whatever phase was open so a failed run still accounts for the
         # phase it died in rather than dropping it.
@@ -496,10 +509,22 @@ function Write-SynapseSetupPhaseLedger {
         $script:SynapseSetupPhaseLedgerWritten = $true
         $endedAt = Get-Date
         $ledgerDir = $LogDir
-        if ([string]::IsNullOrWhiteSpace($ledgerDir)) { return $null }
+        if ([string]::IsNullOrWhiteSpace($ledgerDir)) {
+            throw 'LogDir is empty; no phase-ledger target can be resolved'
+        }
         New-Item -ItemType Directory -Force -Path $ledgerDir -ErrorAction Stop | Out-Null
+        $ledgerPath = Join-Path $ledgerDir 'setup-phase-timings.json'
         $phases = @($script:SynapseSetupPhaseLedger)
-        $slowest = @($phases | Sort-Object -Property elapsed_seconds -Descending | Select-Object -First 5)
+        # Numeric conversion makes the ordering independent of formatting, and
+        # -Stable keeps the original phase order when durations tie.
+        $slowest = @(
+            $phases |
+                Sort-Object -Stable -Property @{
+                    Expression = { [double]$_.elapsed_seconds }
+                    Descending = $true
+                } |
+                Select-Object -First 5
+        )
         $ledger = [ordered]@{
             schema = 'synapse_setup_phase_timing_ledger/v1'
             outcome = $Outcome
@@ -519,12 +544,140 @@ function Write-SynapseSetupPhaseLedger {
             phases = $phases
             slowest_phases = $slowest
         }
-        $ledgerPath = Join-Path $ledgerDir 'setup-phase-timings.json'
         $json = ($ledger | ConvertTo-Json -Depth 12) + "`n"
-        [System.IO.File]::WriteAllText($ledgerPath, $json, [System.Text.UTF8Encoding]::new($false))
+        $expectedBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json)
+        $expectedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($expectedBytes))
+        $temporaryPath = "$ledgerPath.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
+        $replacementBackupPath = "$ledgerPath.replace-backup.$PID.$([guid]::NewGuid().ToString('N'))"
+
+        $publishPhase = 'temporary_write'
+        $temporaryStream = [System.IO.FileStream]::new(
+            $temporaryPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4096,
+            [System.IO.FileOptions]::WriteThrough
+        )
+        try {
+            $temporaryStream.Write($expectedBytes, 0, $expectedBytes.Length)
+            $temporaryStream.Flush($true)
+        } finally {
+            $temporaryStream.Dispose()
+        }
+
+        if (Test-Path -LiteralPath $ledgerPath -PathType Leaf) {
+            $publishPhase = 'replace'
+            [System.IO.File]::Replace($temporaryPath, $ledgerPath, $replacementBackupPath, $false)
+        } else {
+            $publishPhase = 'create'
+            [System.IO.File]::Move($temporaryPath, $ledgerPath)
+        }
+        $publishCompleted = $true
+
+        $publishPhase = 'readback'
+        $actualBytes = [System.IO.File]::ReadAllBytes($ledgerPath)
+        $actualSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($actualBytes))
+        if ($actualBytes.Length -ne $expectedBytes.Length -or
+            $actualSha256 -cne $expectedSha256 -or
+            -not [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualBytes, $expectedBytes)) {
+            throw "published bytes differ from the exact serialized ledger expected_length=$($expectedBytes.Length) actual_length=$($actualBytes.Length) expected_sha256=$expectedSha256 actual_sha256=$actualSha256"
+        }
+        $readback = [System.Text.Encoding]::UTF8.GetString($actualBytes) | ConvertFrom-Json -ErrorAction Stop
+        if ([string]$readback.schema -ne 'synapse_setup_phase_timing_ledger/v1' -or
+            [string]$readback.outcome -ne $Outcome -or
+            [int]$readback.pid -ne $PID) {
+            throw ("published JSON identity mismatch expected_schema={0} actual_schema={1} expected_outcome={2} actual_outcome={3} expected_pid={4} actual_pid={5}" -f `
+                    'synapse_setup_phase_timing_ledger/v1',
+                    $readback.schema,
+                    $Outcome,
+                    $readback.outcome,
+                    $PID,
+                    $readback.pid)
+        }
+        $readbackValidated = $true
+
+        $publishPhase = 'cleanup'
+        if (Test-Path -LiteralPath $replacementBackupPath -PathType Leaf) {
+            [System.IO.File]::Delete($replacementBackupPath)
+        }
+        if ((Test-Path -LiteralPath $temporaryPath) -or (Test-Path -LiteralPath $replacementBackupPath)) {
+            throw "owned atomic-publish artifact remains temp=$temporaryPath backup=$replacementBackupPath"
+        }
+        $publishPhase = 'completed'
         return $ledgerPath
     } catch {
+        $detail = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        $target = if ([string]::IsNullOrWhiteSpace($ledgerPath)) { '<unresolved>' } else { $ledgerPath }
+        $targetState = '<unresolved>'
+        if (-not [string]::IsNullOrWhiteSpace($ledgerPath)) {
+            if (Test-Path -LiteralPath $ledgerPath -PathType Leaf) {
+                try {
+                    $failureTargetBytes = [System.IO.File]::ReadAllBytes($ledgerPath)
+                    $failureTargetSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($failureTargetBytes))
+                    $exactExpected = (
+                        $null -ne $expectedBytes -and
+                        $failureTargetBytes.Length -eq $expectedBytes.Length -and
+                        [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($failureTargetBytes, $expectedBytes)
+                    )
+                    $targetState = "file length=$($failureTargetBytes.Length) sha256=$failureTargetSha256 exact_expected=$exactExpected"
+                    if ($exactExpected) {
+                        $publishCompleted = $true
+                        try {
+                            $failureReadback = [System.Text.Encoding]::UTF8.GetString($failureTargetBytes) | ConvertFrom-Json -ErrorAction Stop
+                            $readbackValidated = (
+                                [string]$failureReadback.schema -eq 'synapse_setup_phase_timing_ledger/v1' -and
+                                [string]$failureReadback.outcome -eq $Outcome -and
+                                [int]$failureReadback.pid -eq $PID
+                            )
+                        } catch {
+                            $targetState += " json_identity_error=$(($_.Exception.Message -replace '\s+', ' ').Trim())"
+                        }
+                    }
+                } catch {
+                    $targetState = "file_unreadable detail=$(($_.Exception.Message -replace '\s+', ' ').Trim())"
+                }
+            } elseif (Test-Path -LiteralPath $ledgerPath -PathType Container) {
+                $targetState = 'directory'
+            } else {
+                $targetState = 'absent'
+            }
+        }
+        $publicationTruth = if ($readbackValidated) {
+            'the ledger was published and exact readback passed, but owned-artifact cleanup failed; preserve the named paths and remove only the named temp/backup after inspection'
+        } elseif ($publishCompleted) {
+            'the target replacement completed but exact readback did not pass; preserve the named recovery backup and inspect or restore it before trusting the target'
+        } else {
+            'an exact new ledger was not observed; inspect the reported target state and named recovery paths before deciding which prior bytes are authoritative; no fallback path was used'
+        }
+        $script:SynapseSetupPhaseLedgerWriteError = (
+            'SYNAPSE_SETUP_PHASE_LEDGER_WRITE_FAILED outcome={0} phase={1} published={2} readback_validated={3} log_dir=[{4}] target=[{5}] target_state=[{6}] temp=[{7}] recovery_backup=[{8}] detail=[{9}] remediation={10}; this diagnostic does not replace the primary setup outcome' -f `
+                $Outcome,
+                $publishPhase,
+                $publishCompleted,
+                $readbackValidated,
+                $LogDir,
+                $target,
+                $targetState,
+                $(if ([string]::IsNullOrWhiteSpace($temporaryPath)) { '<unresolved>' } else { $temporaryPath }),
+                $(if ([string]::IsNullOrWhiteSpace($replacementBackupPath)) { '<unresolved>' } else { $replacementBackupPath }),
+                $detail,
+                $publicationTruth
+        )
         return $null
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryPath) -and (Test-Path -LiteralPath $temporaryPath -PathType Leaf)) {
+            try {
+                [System.IO.File]::Delete($temporaryPath)
+            } catch {
+                $cleanupDetail = ($_.Exception.Message -replace '\s+', ' ').Trim()
+                if ([string]::IsNullOrWhiteSpace($script:SynapseSetupPhaseLedgerWriteError)) {
+                    $script:SynapseSetupPhaseLedgerWriteError = "SYNAPSE_SETUP_PHASE_LEDGER_WRITE_FAILED outcome=$Outcome phase=finally_cleanup published=$publishCompleted readback_validated=$readbackValidated target=[$ledgerPath] temp=[$temporaryPath] recovery_backup=[$replacementBackupPath] detail=[owned temporary-file cleanup failed: $cleanupDetail] remediation=preserve and inspect the exact named temporary file; remove only that file after proving no setup process owns it; this diagnostic does not replace the primary setup outcome"
+                } else {
+                    $script:SynapseSetupPhaseLedgerWriteError += " cleanup_error=[owned temporary-file cleanup failed path=$temporaryPath detail=$cleanupDetail]"
+                }
+            }
+        }
     }
 }
 function Die($m)   {
@@ -533,6 +686,8 @@ function Die($m)   {
     $failureLedgerPath = Write-SynapseSetupPhaseLedger -Outcome 'failed' -Message $m
     if ($failureLedgerPath) {
         Write-Host "[synapse-setup] phase timing ledger -> $failureLedgerPath" -ForegroundColor Yellow
+    } elseif (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupPhaseLedgerWriteError)) {
+        Write-Host "[synapse-setup] WARNING: $script:SynapseSetupPhaseLedgerWriteError" -ForegroundColor Yellow
     }
     if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupRepairManifestPath)) {
         $state = 'failed'
@@ -1408,6 +1563,23 @@ function Restore-SynapseDeployRestartAuthorityBestEffort {
 
 trap {
     $errorText = $_ | Out-String
+    # Raw PowerShell/.NET failures do not pass through Die(). Record the same
+    # phase failure here, but never let this secondary diagnostic replace the
+    # primary error which caused the trap (#2209).
+    try {
+        $trapPhaseLedgerPath = Write-SynapseSetupPhaseLedger `
+            -Outcome 'failed' `
+            -Message (($errorText -replace '\s+', ' ').Trim())
+        if ($trapPhaseLedgerPath) {
+            Write-Host "[synapse-setup] phase timing ledger -> $trapPhaseLedgerPath" -ForegroundColor Yellow
+        } elseif (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupPhaseLedgerWriteError)) {
+            Write-Host "[synapse-setup] WARNING: $script:SynapseSetupPhaseLedgerWriteError" -ForegroundColor Yellow
+        }
+    } catch {
+        try {
+            Info "WARN: SYNAPSE_SETUP_PHASE_LEDGER_TRAP_REPORT_FAILED detail=$($_.Exception.Message) remediation=preserve the primary setup error and inspect LogDir manually"
+        } catch {}
+    }
     # #2092: the deploy drain's restart-authority revocation is DURABLE -- it
     # outlives this process by design, which is exactly what makes it safe
     # against the install-handoff race and exactly what would strand the host if
@@ -15807,5 +15979,9 @@ if ($phaseLedgerPath) {
         Info ("  slowest_phase elapsed_s={0} phase={1}" -f $slow.elapsed_seconds, $slow.phase)
     }
 } else {
-    Warn "SYNAPSE_SETUP_PHASE_LEDGER_UNWRITTEN log_dir=$LogDir remediation=setup completed but its phase timing ledger could not be written; inspect LogDir permissions"
+    if (-not [string]::IsNullOrWhiteSpace($script:SynapseSetupPhaseLedgerWriteError)) {
+        Warn $script:SynapseSetupPhaseLedgerWriteError
+    } else {
+        Warn "SYNAPSE_SETUP_PHASE_LEDGER_UNWRITTEN log_dir=$LogDir remediation=setup completed but its phase timing ledger could not be written; inspect LogDir permissions"
+    }
 }
