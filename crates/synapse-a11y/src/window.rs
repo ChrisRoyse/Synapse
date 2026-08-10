@@ -120,6 +120,29 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
     platform::focus_window_with_intent(hwnd, intent)
 }
 
+/// Issues one ordinary `SetForegroundWindow` call for the exact HWND without
+/// thread-input attachment, alternate targets, or implicit retries.
+///
+/// # Errors
+///
+/// Returns a structured error when the HWND is invalid.
+#[cfg(windows)]
+pub fn set_foreground_window_exact(hwnd: i64) -> A11yResult<bool> {
+    platform::set_foreground_window_exact(hwnd)
+}
+
+/// Emits a fully paired ALT press/release for one explicitly authorized
+/// foreground-lock retry.
+///
+/// # Errors
+///
+/// Returns a structured error if Windows does not insert the complete pair;
+/// the release is reissued before the error is returned.
+#[cfg(windows)]
+pub fn send_foreground_activation_nudge_exact() -> A11yResult<()> {
+    platform::send_foreground_activation_nudge_exact()
+}
+
 /// Returns whether a top-level native HWND is minimized/iconic.
 ///
 /// # Errors

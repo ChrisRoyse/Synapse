@@ -694,24 +694,40 @@ pub struct BrowserScreenshotResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_os_foreground_after_restore_hwnd: Option<i64>,
     pub restored_human_os_foreground: bool,
+    pub foreground_transaction: BrowserScreenshotForegroundTransactionReadback,
     pub backend_tier_used: String,
     pub source_of_truth: String,
-    /// Stable machine-readable code when the screenshot was degraded from the
-    /// normal page-screenshot lane. Absent on a full-fidelity bridge capture.
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScreenshotForegroundIdentityReadback {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub degradation_code: Option<String>,
-    /// Physical readback source used to preserve target metadata during a
-    /// degraded capture. Absent on a full-fidelity bridge capture.
+    pub hwnd: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_metadata_source: Option<String>,
-    /// #1341/#1343: set when the normal Chrome bridge `captureVisibleTab` lane
-    /// disconnected mid-capture (the MV3 service worker drops the WebSocket on
-    /// some GPU/WebGL-heavy pages) and the screenshot was instead produced by a
-    /// passive WGC capture of the owning Chrome window. Carries the original
-    /// bridge error so the caller knows the image is a whole-window fallback,
-    /// not a viewport/clip/element capture. Absent on a normal bridge capture.
+    pub pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fallback_reason: Option<String>,
+    pub process_started_at_100ns: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserScreenshotForegroundTransactionReadback {
+    pub required: bool,
+    pub attempted: bool,
+    pub restored: bool,
+    pub operator_superseded: bool,
+    pub outcome: String,
+    pub restore_method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_set_foreground_window_result: Option<bool>,
+    pub alt_unlock_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_unlock_set_foreground_window_result: Option<bool>,
+    pub prior_foreground: BrowserScreenshotForegroundIdentityReadback,
+    pub acquired_chrome_foreground: BrowserScreenshotForegroundIdentityReadback,
+    pub current_before_restore: BrowserScreenshotForegroundIdentityReadback,
+    pub final_foreground: BrowserScreenshotForegroundIdentityReadback,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -1815,6 +1831,102 @@ pub struct CdpBridgeReloadAckReadback {
     pub ui_after_reload_button_present: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_after_enable_toggle_on: Option<bool>,
+    pub maintenance_tab: CdpBridgeMaintenanceTabReadback,
+    pub maintenance_cleanup: CdpBridgeMaintenanceCleanupReadback,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable_profile_readback: Option<CdpBridgeDurableProfileReadback>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeForegroundIdentityReadback {
+    pub hwnd: i64,
+    pub pid: u32,
+    pub process_started_at_100ns: u64,
+    pub executable_path_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeForegroundTransactionReadback {
+    pub required: bool,
+    pub attempted: bool,
+    pub restored: bool,
+    pub operator_superseded: bool,
+    pub outcome: String,
+    pub restore_method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_set_foreground_window_result: Option<bool>,
+    pub alt_unlock_attempted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alt_unlock_set_foreground_window_result: Option<bool>,
+    pub prior_foreground: CdpBridgeForegroundIdentityReadback,
+    pub acquired_chrome_foreground: CdpBridgeForegroundIdentityReadback,
+    pub current_before_restore: CdpBridgeForegroundIdentityReadback,
+    pub final_foreground: CdpBridgeForegroundIdentityReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeMaintenanceTabReadback {
+    pub ownership_source: String,
+    pub preexisting_tab_count: usize,
+    pub owned_tab_runtime_id: String,
+    pub chrome_window_hwnd: i64,
+    pub chrome_window_pid: u32,
+    pub tab_count_after_marker: usize,
+    pub navigation_method: String,
+    pub navigation_destination: String,
+    pub prior_foreground: CdpBridgeForegroundIdentityReadback,
+    pub acquired_chrome_foreground: CdpBridgeForegroundIdentityReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgePriorSelectionReadback {
+    pub attempted: bool,
+    pub restored: bool,
+    pub reason: String,
+    pub expected_runtime_id: String,
+    pub before_runtime_id: String,
+    pub after_runtime_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgePostCleanupReadback {
+    pub source_of_truth: String,
+    pub token_absent: bool,
+    pub preexisting_tab_count: usize,
+    pub missing_preexisting_count: usize,
+    pub concurrent_tab_count: usize,
+    pub post_cleanup_tab_count: usize,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeMaintenanceCleanupReadback {
+    pub attempted: bool,
+    pub closed: bool,
+    pub absent_verified: bool,
+    pub method: String,
+    pub tab_count_before_cleanup: usize,
+    pub tab_count_after_cleanup: usize,
+    pub missing_baseline_count: usize,
+    pub concurrent_tab_count: usize,
+    pub prior_selection_restore: CdpBridgePriorSelectionReadback,
+    pub foreground_transaction: CdpBridgeForegroundTransactionReadback,
+    pub bridge_post_cleanup: CdpBridgePostCleanupReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeDurableProfileReadback {
+    pub attempts: u32,
+    pub elapsed_ms: u64,
+    pub source_of_truth_sha256: String,
+    pub permission_activation_pending_before: bool,
+    pub permission_activation_complete_after: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

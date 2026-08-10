@@ -178,7 +178,7 @@ pub struct BrowserDebuggerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_messages: Option<BrowserConsoleMessagesResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reload_bridge: Option<CdpBridgeReloadResponse>,
+    pub reload_bridge: Option<Box<CdpBridgeReloadResponse>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pdf: Option<BrowserPdfResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -432,7 +432,7 @@ impl SynapseService {
                         response.command_ack.control_surface,
                         response.command_ack.active_profile
                     ),
-                    |out| out.reload_bridge = Some(response),
+                    |out| out.reload_bridge = Some(Box::new(response)),
                 )))
             }
             BrowserDebuggerOperation::Pdf => {

@@ -1078,6 +1078,9 @@ if (-not ($requiredPermissions -contains 'webRequest')) {
 if (-not ($requiredPermissions -contains 'downloads')) {
     throw "SYNAPSE_CHROME_EXTENSION_DOWNLOADS_PERMISSION_MISSING path=$manifestPath remediation=normal bridge requires chrome.downloads for real download event/readback capture and browser_downloads save/move verification"
 }
+if (-not ($requiredPermissions -contains 'unlimitedStorage')) {
+    throw "SYNAPSE_CHROME_EXTENSION_UNLIMITED_STORAGE_PERMISSION_MISSING path=$manifestPath remediation=the durable MV3 reconnect/mutation ledger must not be evicted or quota-blocked at chrome.storage.local's default limit; declare unlimitedStorage as a required messageless permission"
+}
 if ($optionalPermissions -contains 'alarms') {
     throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_ALARMS_PERMISSION_FORBIDDEN path=$manifestPath remediation=alarms must be a required permission for deterministic bridge wake/readback, not an optional runtime prompt"
 }
@@ -1096,7 +1099,9 @@ function Initialize-SynapseChromeBridgeAutoInstallInterop {
     if (-not ('SynapseChromeBridgeAutoInstall.Win32' -as [type])) {
         Add-Type -TypeDefinition @'
 using System;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace SynapseChromeBridgeAutoInstall {
     public sealed class ForegroundAttachAttemptResult {
@@ -1112,6 +1117,22 @@ namespace SynapseChromeBridgeAutoInstall {
         public long SetFocusResultHwnd { get; set; }
     }
 
+    public sealed class WindowProcessIdentityResult {
+        public bool Valid { get; set; }
+        public long Hwnd { get; set; }
+        public uint ProcessId { get; set; }
+        public ulong ProcessStartedAt100ns { get; set; }
+        public string ExecutablePath { get; set; }
+        public string ErrorCode { get; set; }
+        public int Win32Error { get; set; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct FileTime {
+        public uint LowDateTime;
+        public uint HighDateTime;
+    }
+
     public static class Win32 {
         [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll")] public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
@@ -1124,6 +1145,67 @@ namespace SynapseChromeBridgeAutoInstall {
         [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
         [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
         [DllImport("user32.dll")] public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern IntPtr OpenProcess(uint processAccess, bool inheritHandle, uint processId);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetProcessTimes(IntPtr process, out FileTime creation, out FileTime exit, out FileTime kernel, out FileTime user);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool QueryFullProcessImageName(IntPtr process, uint flags, StringBuilder path, ref uint size);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr handle);
+
+        public static WindowProcessIdentityResult ReadWindowProcessIdentity(IntPtr hwnd) {
+            WindowProcessIdentityResult result = new WindowProcessIdentityResult {
+                Hwnd = hwnd.ToInt64(),
+                ExecutablePath = String.Empty,
+                ErrorCode = String.Empty,
+            };
+            if (hwnd == IntPtr.Zero) {
+                result.ErrorCode = "foreground_window_null";
+                return result;
+            }
+            uint pid = 0;
+            uint threadId = GetWindowThreadProcessId(hwnd, out pid);
+            result.ProcessId = pid;
+            if (threadId == 0 || pid == 0) {
+                result.ErrorCode = "window_process_owner_unavailable";
+                result.Win32Error = Marshal.GetLastWin32Error();
+                return result;
+            }
+            const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (process == IntPtr.Zero) {
+                result.ErrorCode = "process_open_failed";
+                result.Win32Error = Marshal.GetLastWin32Error();
+                return result;
+            }
+            try {
+                FileTime creation;
+                FileTime exit;
+                FileTime kernel;
+                FileTime user;
+                if (!GetProcessTimes(process, out creation, out exit, out kernel, out user)) {
+                    result.ErrorCode = "process_times_read_failed";
+                    result.Win32Error = Marshal.GetLastWin32Error();
+                    return result;
+                }
+                uint capacity = 32768;
+                StringBuilder path = new StringBuilder((int)capacity);
+                if (!QueryFullProcessImageName(process, 0, path, ref capacity)) {
+                    result.ErrorCode = "process_image_path_read_failed";
+                    result.Win32Error = Marshal.GetLastWin32Error();
+                    return result;
+                }
+                result.ProcessStartedAt100ns = ((ulong)creation.HighDateTime << 32) | creation.LowDateTime;
+                result.ExecutablePath = path.ToString();
+            } finally {
+                if (!CloseHandle(process) && String.IsNullOrEmpty(result.ErrorCode)) {
+                    result.ErrorCode = "process_handle_close_failed";
+                    result.Win32Error = Marshal.GetLastWin32Error();
+                }
+            }
+            result.Valid = String.IsNullOrEmpty(result.ErrorCode)
+                && result.ProcessId != 0
+                && result.ProcessStartedAt100ns != 0
+                && !String.IsNullOrWhiteSpace(result.ExecutablePath);
+            return result;
+        }
 
         public static ForegroundAttachAttemptResult AttachThreadInputBringToTopSetForeground(IntPtr targetHwnd, IntPtr foregroundHwnd) {
             ForegroundAttachAttemptResult result = new ForegroundAttachAttemptResult();
@@ -1321,6 +1403,7 @@ function Test-SynapseChromeBridgeProfileRow {
         # path does not make a working bridge any less the Synapse bridge.
         $enabledAndPermissioned = ($disableReasons.Count -eq 0) -and
             ($missingActiveApiPermissions.Count -eq 0)
+        $enabled = ($disableReasons.Count -eq 0)
         # manifest_dir_exists confirms the directory Chrome loaded the unpacked
         # extension from is still present on disk with a manifest. If a prior install's
         # directory was deleted, the row is stale and a genuine reinstall is required.
@@ -1328,6 +1411,8 @@ function Test-SynapseChromeBridgeProfileRow {
             (Test-Path -LiteralPath $manifestPath -PathType Container) -and
             (Test-Path -LiteralPath (Join-Path $manifestPath 'manifest.json') -PathType Leaf)
         $ready = $manifestMatches -and $enabledAndPermissioned
+        $permissionActivationPending = $manifestMatches -and $manifestDirExists -and
+            $enabled -and ($missingActiveApiPermissions.Count -gt 0)
         return [pscustomobject]@{
             installed = $true
             profile = $ProfileName
@@ -1341,7 +1426,9 @@ function Test-SynapseChromeBridgeProfileRow {
             disable_reasons = $disableReasons
             required_api_permissions = $requiredApiPermissions
             missing_active_api_permissions = $missingActiveApiPermissions
+            enabled = $enabled
             enabled_and_permissioned = $enabledAndPermissioned
+            permission_activation_pending = $permissionActivationPending
             ready = $ready
         }
     }
@@ -1359,7 +1446,9 @@ function Test-SynapseChromeBridgeProfileRow {
         disable_reasons = @()
         required_api_permissions = Get-SynapseChromeBridgeManifestApiPermissions -ExtensionDir $ExtensionDir
         missing_active_api_permissions = Get-SynapseChromeBridgeManifestApiPermissions -ExtensionDir $ExtensionDir
+        enabled = $false
         enabled_and_permissioned = $false
+        permission_activation_pending = $false
         ready = $false
     }
 }
@@ -1691,10 +1780,16 @@ function Get-SynapseChromeTopLevelWindows {
         if ($hwnd -eq 0 -or [string]::IsNullOrWhiteSpace($title)) {
             continue
         }
+        $windowIdentity = [SynapseChromeBridgeAutoInstall.Win32]::ReadWindowProcessIdentity([IntPtr]$hwnd)
         $processInfo = $chromeProcessByPid[$processId]
         $windows += [pscustomobject]@{
             hwnd = $hwnd
             pid = $processId
+            process_started_at_100ns = [uint64]$windowIdentity.ProcessStartedAt100ns
+            executable_path = [string]$windowIdentity.ExecutablePath
+            identity_valid = [bool]$windowIdentity.Valid
+            identity_error = [string]$windowIdentity.ErrorCode
+            identity_win32_error = [int]$windowIdentity.Win32Error
             title = $title
             class_name = [string]$current.ClassName
             is_foreground = ($hwnd -eq $foreground)
@@ -1828,10 +1923,16 @@ function Set-SynapseAutomationEditValue {
 function Read-SynapseForegroundWindow {
     Initialize-SynapseChromeBridgeAutoInstallInterop
     $foregroundHwnd = [SynapseChromeBridgeAutoInstall.Win32]::GetForegroundWindow().ToInt64()
+    $nativeIdentity = [SynapseChromeBridgeAutoInstall.Win32]::ReadWindowProcessIdentity([IntPtr]$foregroundHwnd)
     if ($foregroundHwnd -eq 0) {
         return [pscustomobject]@{
             hwnd = 0
             pid = 0
+            process_started_at_100ns = 0
+            executable_path = ''
+            identity_valid = $false
+            identity_error = [string]$nativeIdentity.ErrorCode
+            identity_win32_error = [int]$nativeIdentity.Win32Error
             title = '<none>'
             class_name = '<none>'
         }
@@ -1850,7 +1951,12 @@ function Read-SynapseForegroundWindow {
             }
             return [pscustomobject]@{
                 hwnd = $foregroundHwnd
-                pid = [int]$current.ProcessId
+                pid = [int]$nativeIdentity.ProcessId
+                process_started_at_100ns = [uint64]$nativeIdentity.ProcessStartedAt100ns
+                executable_path = [string]$nativeIdentity.ExecutablePath
+                identity_valid = [bool]$nativeIdentity.Valid
+                identity_error = [string]$nativeIdentity.ErrorCode
+                identity_win32_error = [int]$nativeIdentity.Win32Error
                 title = [string]$current.Name
                 class_name = [string]$current.ClassName
             }
@@ -1858,7 +1964,12 @@ function Read-SynapseForegroundWindow {
     } catch {
         return [pscustomobject]@{
             hwnd = $foregroundHwnd
-            pid = 0
+            pid = [int]$nativeIdentity.ProcessId
+            process_started_at_100ns = [uint64]$nativeIdentity.ProcessStartedAt100ns
+            executable_path = [string]$nativeIdentity.ExecutablePath
+            identity_valid = [bool]$nativeIdentity.Valid
+            identity_error = [string]$nativeIdentity.ErrorCode
+            identity_win32_error = [int]$nativeIdentity.Win32Error
             title = '<uia-read-failed>'
             class_name = $_.Exception.Message
         }
@@ -1866,9 +1977,57 @@ function Read-SynapseForegroundWindow {
 
     [pscustomobject]@{
         hwnd = $foregroundHwnd
-        pid = 0
+        pid = [int]$nativeIdentity.ProcessId
+        process_started_at_100ns = [uint64]$nativeIdentity.ProcessStartedAt100ns
+        executable_path = [string]$nativeIdentity.ExecutablePath
+        identity_valid = [bool]$nativeIdentity.Valid
+        identity_error = [string]$nativeIdentity.ErrorCode
+        identity_win32_error = [int]$nativeIdentity.Win32Error
         title = '<not-found>'
         class_name = '<not-found>'
+    }
+}
+
+function Test-SynapseForegroundIdentityExact {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Actual
+    )
+    return (
+        $Expected.identity_valid -eq $true -and
+        $Actual.identity_valid -eq $true -and
+        [int64]$Expected.hwnd -eq [int64]$Actual.hwnd -and
+        [int]$Expected.pid -eq [int]$Actual.pid -and
+        [uint64]$Expected.process_started_at_100ns -eq [uint64]$Actual.process_started_at_100ns -and
+        [string]$Expected.executable_path -ieq [string]$Actual.executable_path
+    )
+}
+
+function ConvertTo-SynapseForegroundIdentityEvidence {
+    param([Parameter(Mandatory = $true)]$Identity)
+    [pscustomobject]@{
+        hwnd = [int64]$Identity.hwnd
+        pid = [int]$Identity.pid
+        process_started_at_100ns = [uint64]$Identity.process_started_at_100ns
+        executable_path = [string]$Identity.executable_path
+        identity_valid = [bool]$Identity.identity_valid
+        identity_error = [string]$Identity.identity_error
+        identity_win32_error = [int]$Identity.identity_win32_error
+    }
+}
+
+function Read-SynapseWindowProcessIdentity {
+    param([Parameter(Mandatory = $true)][int64]$Hwnd)
+    Initialize-SynapseChromeBridgeAutoInstallInterop
+    $identity = [SynapseChromeBridgeAutoInstall.Win32]::ReadWindowProcessIdentity([IntPtr]$Hwnd)
+    [pscustomobject]@{
+        hwnd = [int64]$Hwnd
+        pid = [int]$identity.ProcessId
+        process_started_at_100ns = [uint64]$identity.ProcessStartedAt100ns
+        executable_path = [string]$identity.ExecutablePath
+        identity_valid = [bool]$identity.Valid
+        identity_error = [string]$identity.ErrorCode
+        identity_win32_error = [int]$identity.Win32Error
     }
 }
 
@@ -1941,7 +2100,7 @@ function Read-SynapseChromeNavigationState {
 function Wait-SynapseChromeForegroundReadback {
     param(
         [Parameter(Mandatory = $true)]
-        [int64]$TargetHwnd,
+        $TargetIdentity,
         [Parameter(Mandatory = $true)]
         [datetime]$Deadline,
         [Parameter(Mandatory = $true)]
@@ -1954,7 +2113,7 @@ function Wait-SynapseChromeForegroundReadback {
     }
     do {
         $foregroundNow = Read-SynapseForegroundWindow
-        if ($foregroundNow.hwnd -eq $TargetHwnd) {
+        if (Test-SynapseForegroundIdentityExact -Expected $TargetIdentity -Actual $foregroundNow) {
             return $foregroundNow
         }
         if ((Get-Date) -ge $waitDeadline) {
@@ -1976,7 +2135,23 @@ function Wait-SynapseChromeForegroundAcquisition {
     try {
         $stage = 'convert_target_hwnd'
         $targetHwnd = [IntPtr]$Window.hwnd
-        $targetHwndInt = [int64]$Window.hwnd
+        $targetIdentity = [pscustomobject]@{
+            hwnd = [int64]$Window.hwnd
+            pid = [int]$Window.pid
+            process_started_at_100ns = [uint64]$Window.process_started_at_100ns
+            executable_path = [string]$Window.executable_path
+            identity_valid = [bool]$Window.identity_valid
+        }
+        if ($targetIdentity.identity_valid -ne $true -or
+            $targetIdentity.pid -le 0 -or
+            $targetIdentity.process_started_at_100ns -eq 0 -or
+            [string]::IsNullOrWhiteSpace($targetIdentity.executable_path)) {
+            throw 'target_exact_process_identity_invalid'
+        }
+        $foregroundBefore = Read-SynapseForegroundWindow
+        if ($foregroundBefore.identity_valid -ne $true) {
+            throw 'prior_foreground_exact_process_identity_invalid'
+        }
         $attempts = New-Object System.Collections.Generic.List[object]
         $stage = 'show_window_async'
         $showResult = [SynapseChromeBridgeAutoInstall.Win32]::ShowWindowAsync($targetHwnd, 9)
@@ -1991,7 +2166,7 @@ function Wait-SynapseChromeForegroundAcquisition {
             foreground_after = Read-SynapseForegroundWindow
         }) | Out-Null
         $stage = 'wait_initial_foreground'
-        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 900
+        $acquired = Wait-SynapseChromeForegroundReadback -TargetIdentity $targetIdentity -Deadline $Deadline -MaxWaitMilliseconds 900
         if ($acquired) {
             return [pscustomobject]@{
                 acquired = $true
@@ -2003,50 +2178,48 @@ function Wait-SynapseChromeForegroundAcquisition {
             }
         }
 
-        $stage = 'read_foreground_before_attach'
-        $foregroundBeforeAttach = Read-SynapseForegroundWindow
-        $foregroundHwnd = [IntPtr]::Zero
-        if ($foregroundBeforeAttach.hwnd -ne 0) {
-            $stage = 'convert_foreground_hwnd'
-            $foregroundHwnd = [IntPtr]$foregroundBeforeAttach.hwnd
+        $stage = 'read_foreground_before_alt_unlock'
+        $foregroundBeforeAlt = Read-SynapseForegroundWindow
+        if ($foregroundBeforeAlt.identity_valid -ne $true) {
+            throw 'foreground_before_alt_unlock_identity_invalid'
         }
-        $stage = 'attach_thread_input_set_foreground'
-        $nativeAttempt = [SynapseChromeBridgeAutoInstall.Win32]::AttachThreadInputBringToTopSetForeground(
-            $targetHwnd,
-            $foregroundHwnd
-        )
-        $stage = 'record_attach_attempt'
-        $attempts.Add([pscustomobject]@{
-            method = 'attach_thread_input_bring_to_top_set_foreground'
-            current_thread = [uint32]$nativeAttempt.CurrentThread
-            target_thread = [uint32]$nativeAttempt.TargetThread
-            target_pid = [uint32]$nativeAttempt.TargetPid
-            foreground_thread = [uint32]$nativeAttempt.ForegroundThread
-            foreground_pid = [uint32]$nativeAttempt.ForegroundPid
-            attached_target = [bool]$nativeAttempt.AttachedTarget
-            attached_foreground = [bool]$nativeAttempt.AttachedForeground
-            bring_window_to_top_result = [bool]$nativeAttempt.BringWindowToTopResult
-            set_foreground_window_result = [bool]$nativeAttempt.SetForegroundWindowResult
-            set_focus_result_hwnd = [int64]$nativeAttempt.SetFocusResultHwnd
-            foreground_before = $foregroundBeforeAttach
-            foreground_after = Read-SynapseForegroundWindow
-        }) | Out-Null
-        $stage = 'wait_attach_foreground'
-        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 1200
-        if ($acquired) {
+        if (-not (Test-SynapseForegroundIdentityExact -Expected $foregroundBefore -Actual $foregroundBeforeAlt)) {
             return [pscustomobject]@{
-                acquired = $true
-                method = 'attach_thread_input_bring_to_top_set_foreground'
+                acquired = $false
+                operator_superseded = $true
+                method = 'none_operator_superseded'
                 show_window_async_result = [bool]$showResult
                 initial_set_foreground_window_result = [bool]$initialSetForeground
+                alt_unlock_attempted = $false
+                alt_unlock_set_foreground_window_result = $null
                 attempts = @($attempts.ToArray())
-                foreground = $acquired
+                foreground = $null
+                final_foreground = $foregroundBeforeAlt
             }
         }
 
         $stage = 'alt_unlock_key'
-        Send-SynapseNativeKeyTap -VirtualKey 0x12
+        Send-SynapseNativeAltUnlock
         Start-Sleep -Milliseconds 80
+        $stage = 'read_foreground_before_alt_retry'
+        $foregroundBeforeAltRetry = Read-SynapseForegroundWindow
+        if ($foregroundBeforeAltRetry.identity_valid -ne $true) {
+            throw 'foreground_before_alt_retry_identity_invalid'
+        }
+        if (-not (Test-SynapseForegroundIdentityExact -Expected $foregroundBefore -Actual $foregroundBeforeAltRetry)) {
+            return [pscustomobject]@{
+                acquired = $false
+                operator_superseded = $true
+                method = 'none_operator_superseded'
+                show_window_async_result = [bool]$showResult
+                initial_set_foreground_window_result = [bool]$initialSetForeground
+                alt_unlock_attempted = $true
+                alt_unlock_set_foreground_window_result = $null
+                attempts = @($attempts.ToArray())
+                foreground = $null
+                final_foreground = $foregroundBeforeAltRetry
+            }
+        }
         $stage = 'alt_unlock_set_foreground'
         $altUnlockSetForeground = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow($targetHwnd)
         $stage = 'record_alt_attempt'
@@ -2056,13 +2229,15 @@ function Wait-SynapseChromeForegroundAcquisition {
             foreground_after = Read-SynapseForegroundWindow
         }) | Out-Null
         $stage = 'wait_alt_foreground'
-        $acquired = Wait-SynapseChromeForegroundReadback -TargetHwnd $targetHwndInt -Deadline $Deadline -MaxWaitMilliseconds 1500
+        $acquired = Wait-SynapseChromeForegroundReadback -TargetIdentity $targetIdentity -Deadline $Deadline -MaxWaitMilliseconds 1500
         if ($acquired) {
             return [pscustomobject]@{
                 acquired = $true
                 method = 'alt_key_foreground_unlock_set_foreground'
                 show_window_async_result = [bool]$showResult
                 initial_set_foreground_window_result = [bool]$initialSetForeground
+                alt_unlock_attempted = $true
+                alt_unlock_set_foreground_window_result = [bool]$altUnlockSetForeground
                 attempts = @($attempts.ToArray())
                 foreground = $acquired
             }
@@ -2073,6 +2248,8 @@ function Wait-SynapseChromeForegroundAcquisition {
             method = 'unacquired'
             show_window_async_result = [bool]$showResult
             initial_set_foreground_window_result = [bool]$initialSetForeground
+            alt_unlock_attempted = $true
+            alt_unlock_set_foreground_window_result = [bool]$altUnlockSetForeground
             attempts = @($attempts.ToArray())
             foreground = $null
         }
@@ -2132,7 +2309,7 @@ function Invoke-SynapseChromeAddressBarNavigation {
             foreground_after = $foregroundAfter
             navigation_before = $before
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the selected Chrome window the foreground keyboard target after ordinary, attached-thread, and Alt-unlock foreground attempts; setup refuses to send browser navigation keys to an unverified foreground window"
+        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the exact Chrome HWND/PID/process-start/image identity the foreground keyboard target after the ordinary and sole paired-Alt-unlock retry; setup refuses to send browser navigation keys to an unverified or superseded window"
     }
 
     $foregroundWindow = Get-SynapseChromeWindowByHwnd `
@@ -2308,6 +2485,255 @@ function Send-SynapseNativeKeyTap {
     Send-SynapseNativeKeyDown -VirtualKey $VirtualKey
     Start-Sleep -Milliseconds 60
     Send-SynapseNativeKeyUp -VirtualKey $VirtualKey
+}
+
+function Send-SynapseNativeAltUnlock {
+    $pressed = $false
+    try {
+        Send-SynapseNativeKeyDown -VirtualKey 0x12
+        $pressed = $true
+    } finally {
+        # The release is a finally obligation. A stranded ALT key changes every
+        # later keystroke into a menu accelerator and is never acceptable.
+        Send-SynapseNativeKeyUp -VirtualKey 0x12
+        if (-not $pressed) {
+            # A redundant release is safe and makes the pre-down failure path
+            # explicit in the physical input stream as well.
+            Send-SynapseNativeKeyUp -VirtualKey 0x12
+        }
+    }
+}
+
+function Wait-SynapseForegroundIdentityReadback {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)][datetime]$Deadline,
+        [int]$MaxWaitMilliseconds = 1200
+    )
+    $waitDeadline = (Get-Date).AddMilliseconds($MaxWaitMilliseconds)
+    if ($waitDeadline -gt $Deadline) {
+        $waitDeadline = $Deadline
+    }
+    do {
+        $current = Read-SynapseForegroundWindow
+        if (Test-SynapseForegroundIdentityExact -Expected $Expected -Actual $current) {
+            return $current
+        }
+        if ((Get-Date) -ge $waitDeadline) {
+            return $null
+        }
+        Start-Sleep -Milliseconds 50
+    } while ($true)
+}
+
+function Restore-SynapseChromeMaintenanceForeground {
+    param(
+        [Parameter(Mandatory = $true)]$ForegroundLease,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+
+    $prior = $ForegroundLease.prior_foreground
+    $chrome = $ForegroundLease.acquired_chrome_foreground
+    if (-not $prior -or -not $chrome -or $prior.identity_valid -ne $true -or $chrome.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_LEASE_INVALID detail=$detail remediation=maintenance must capture exact HWND/PID/process-start/image identities before and after Chrome foreground acquisition"
+    }
+
+    $current = Read-SynapseForegroundWindow
+    if ($current.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ current = $current }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_READ_FAILED phase=before_restore detail=$detail remediation=GetForegroundWindow and its exact process identity must be readable before cleanup may change focus"
+    }
+    $required = -not (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $chrome)
+    if (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $current) {
+        return [pscustomobject]@{
+            required = $required
+            attempted = $false
+            restored = $true
+            operator_superseded = $false
+            outcome = if ($required) { 'already_restored' } else { 'chrome_already_foreground_noop' }
+            restore_method = 'none_already_current'
+            initial_set_foreground_window_result = $null
+            alt_unlock_attempted = $false
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $current
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $current
+        }
+    }
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $chrome -Actual $current)) {
+        return [pscustomobject]@{
+            required = $required
+            attempted = $false
+            restored = $false
+            operator_superseded = $true
+            outcome = 'operator_superseded'
+            restore_method = 'none_operator_superseded'
+            initial_set_foreground_window_result = $null
+            alt_unlock_attempted = $false
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $current
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $current
+        }
+    }
+
+    $priorNow = Read-SynapseWindowProcessIdentity -Hwnd ([int64]$prior.hwnd)
+    if ($priorNow.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ expected = $prior; actual = $priorNow }) -Depth 8
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_TARGET_MISSING detail=$detail remediation=the exact pre-operation window/process no longer exists; cleanup refuses to focus any substitute"
+    }
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $priorNow)) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ expected = $prior; actual = $priorNow }) -Depth 8
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_IDENTITY_CHANGED detail=$detail remediation=the prior HWND/PID/process-start/image identity was reused or replaced; cleanup refuses to focus the unrelated window"
+    }
+
+    # Re-read immediately before the focus mutation. A human-selected third
+    # window wins this race and is never overwritten.
+    $commitCurrent = Read-SynapseForegroundWindow
+    if ($commitCurrent.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ current = $commitCurrent }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_READ_FAILED phase=commit detail=$detail remediation=repair foreground identity readback; cleanup refuses a focus write without current authority"
+    }
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $chrome -Actual $commitCurrent)) {
+        return [pscustomobject]@{
+            required = $required
+            attempted = $false
+            restored = $false
+            operator_superseded = $true
+            outcome = 'operator_superseded_during_restore'
+            restore_method = 'none_operator_superseded'
+            initial_set_foreground_window_result = $null
+            alt_unlock_attempted = $false
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+        }
+    }
+
+    $initialSet = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$prior.hwnd)
+    $restored = Wait-SynapseForegroundIdentityReadback -Expected $prior -Deadline $Deadline -MaxWaitMilliseconds 900
+    if ($restored) {
+        return [pscustomobject]@{
+            required = $required
+            attempted = $true
+            restored = $true
+            operator_superseded = $false
+            outcome = 'restored'
+            restore_method = 'set_foreground_window'
+            initial_set_foreground_window_result = [bool]$initialSet
+            alt_unlock_attempted = $false
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $restored
+        }
+    }
+
+    $afterInitial = Read-SynapseForegroundWindow
+    if ($afterInitial.identity_valid -eq $true -and -not (Test-SynapseForegroundIdentityExact -Expected $chrome -Actual $afterInitial)) {
+        $operatorSuperseded = -not (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $afterInitial)
+        return [pscustomobject]@{
+            required = $required
+            attempted = $true
+            restored = -not $operatorSuperseded
+            operator_superseded = $operatorSuperseded
+            outcome = if ($operatorSuperseded) { 'operator_superseded_during_restore' } else { 'restored_after_false_return' }
+            restore_method = if ($operatorSuperseded) { 'none_operator_superseded' } else { 'set_foreground_window_readback' }
+            initial_set_foreground_window_result = [bool]$initialSet
+            alt_unlock_attempted = $false
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $afterInitial
+        }
+    }
+    if ($afterInitial.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ after_initial = $afterInitial; initial_result = [bool]$initialSet }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_READ_FAILED phase=after_initial_set detail=$detail remediation=repair physical GetForegroundWindow readback before retrying maintenance"
+    }
+
+    Send-SynapseNativeAltUnlock
+    Start-Sleep -Milliseconds 80
+    $beforeAltRetry = Read-SynapseForegroundWindow
+    if ($beforeAltRetry.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ before_alt_retry = $beforeAltRetry }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_READ_FAILED phase=before_alt_retry detail=$detail remediation=repair physical foreground readback; no retry was issued"
+    }
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $chrome -Actual $beforeAltRetry)) {
+        $operatorSuperseded = -not (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $beforeAltRetry)
+        return [pscustomobject]@{
+            required = $required
+            attempted = $true
+            restored = -not $operatorSuperseded
+            operator_superseded = $operatorSuperseded
+            outcome = if ($operatorSuperseded) { 'operator_superseded_during_restore' } else { 'restored_after_alt_unlock' }
+            restore_method = if ($operatorSuperseded) { 'none_operator_superseded' } else { 'alt_unlock_readback' }
+            initial_set_foreground_window_result = [bool]$initialSet
+            alt_unlock_attempted = $true
+            alt_unlock_set_foreground_window_result = $null
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $beforeAltRetry
+        }
+    }
+    $altSet = [SynapseChromeBridgeAutoInstall.Win32]::SetForegroundWindow([IntPtr]$prior.hwnd)
+    $restoredAfterAlt = Wait-SynapseForegroundIdentityReadback -Expected $prior -Deadline $Deadline -MaxWaitMilliseconds 1500
+    if ($restoredAfterAlt) {
+        return [pscustomobject]@{
+            required = $required
+            attempted = $true
+            restored = $true
+            operator_superseded = $false
+            outcome = 'restored'
+            restore_method = 'alt_unlock_set_foreground_window'
+            initial_set_foreground_window_result = [bool]$initialSet
+            alt_unlock_attempted = $true
+            alt_unlock_set_foreground_window_result = [bool]$altSet
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $restoredAfterAlt
+        }
+    }
+    $final = Read-SynapseForegroundWindow
+    if ($final.identity_valid -eq $true -and -not (Test-SynapseForegroundIdentityExact -Expected $chrome -Actual $final)) {
+        $operatorSuperseded = -not (Test-SynapseForegroundIdentityExact -Expected $prior -Actual $final)
+        return [pscustomobject]@{
+            required = $required
+            attempted = $true
+            restored = -not $operatorSuperseded
+            operator_superseded = $operatorSuperseded
+            outcome = if ($operatorSuperseded) { 'operator_superseded_during_restore' } else { 'restored_after_false_alt_return' }
+            restore_method = if ($operatorSuperseded) { 'none_operator_superseded' } else { 'alt_unlock_set_foreground_window_readback' }
+            initial_set_foreground_window_result = [bool]$initialSet
+            alt_unlock_attempted = $true
+            alt_unlock_set_foreground_window_result = [bool]$altSet
+            prior_foreground = $prior
+            acquired_chrome_foreground = $chrome
+            current_before_restore = ConvertTo-SynapseForegroundIdentityEvidence -Identity $commitCurrent
+            final_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $final
+        }
+    }
+    $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+        prior = $prior
+        acquired_chrome = $chrome
+        current_before_restore = $commitCurrent
+        final = $final
+        initial_set_foreground_window_result = [bool]$initialSet
+        alt_unlock_set_foreground_window_result = [bool]$altSet
+    }) -Depth 8
+    throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_REFUSED detail=$detail remediation=Windows refused both exact foreground restoration attempts while the operation still owned Chrome; inspect the named HWND/process identities and foreground-lock policy, then retry"
 }
 
 function Wait-SynapseUntil {
@@ -2581,6 +3007,46 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
     }
 
     $chromeWindow = @($eligibleWindows | Sort-Object @{ Expression = 'is_foreground'; Descending = $true }, @{ Expression = 'title'; Descending = $false } | Select-Object -First 1)[0]
+    if ($chromeWindow.identity_valid -ne $true) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            hwnd = $chromeWindow.hwnd
+            pid = $chromeWindow.pid
+            identity_error = $chromeWindow.identity_error
+            identity_win32_error = $chromeWindow.identity_win32_error
+        }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_CHROME_IDENTITY_UNREADABLE detail=$detail remediation=the selected Chrome HWND must expose exact PID, process creation time, and executable path before any foreground mutation"
+    }
+    $captureDeadline = (Get-Date).AddMilliseconds(1200)
+    if ($captureDeadline -gt $Deadline) {
+        $captureDeadline = $Deadline
+    }
+    $priorForeground = Wait-SynapseUntil -Deadline $captureDeadline -SleepMilliseconds 50 -Probe {
+        $candidate = Read-SynapseForegroundWindow
+        if ($candidate.identity_valid -eq $true) { return $candidate }
+        return $null
+    }
+    if (-not $priorForeground) {
+        $lastForeground = Read-SynapseForegroundWindow
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{ last_foreground = $lastForeground }) -Depth 6
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_CAPTURE_FAILED detail=$detail remediation=GetForegroundWindow and the owning process identity must settle before maintenance may acquire Chrome"
+    }
+    $chromeIdentity = [pscustomobject]@{
+        hwnd = [int64]$chromeWindow.hwnd
+        pid = [int]$chromeWindow.pid
+        process_started_at_100ns = [uint64]$chromeWindow.process_started_at_100ns
+        executable_path = [string]$chromeWindow.executable_path
+        identity_valid = [bool]$chromeWindow.identity_valid
+        identity_error = [string]$chromeWindow.identity_error
+        identity_win32_error = [int]$chromeWindow.identity_win32_error
+    }
+    $foregroundLease = [pscustomobject]@{
+        prior_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $priorForeground
+        acquired_chrome_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $chromeIdentity
+    }
+    # Publish foreground ownership before the first focus attempt. Even a failure
+    # between acquisition and tab creation must restore or explicitly preserve a
+    # superseding operator window.
+    $script:SynapseChromeMaintenanceForegroundLease = $foregroundLease
     $foregroundDeadline = (Get-Date).AddSeconds(5)
     if ($foregroundDeadline -gt $Deadline) {
         $foregroundDeadline = $Deadline
@@ -2595,6 +3061,16 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         }) -Depth 10
         throw "SYNAPSE_CHROME_MAINTENANCE_TAB_CREATE_FOREGROUND_FAILED detail=$detail remediation=Windows did not grant verified foreground ownership needed to realize and read the exact Chrome UIA tab strip before New Tab invocation"
     }
+    $acquiredForeground = Read-SynapseForegroundWindow
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $chromeIdentity -Actual $acquiredForeground)) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            expected_chrome = $chromeIdentity
+            actual_foreground = $acquiredForeground
+            foreground_acquisition = $foreground
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_IDENTITY_MISMATCH_AFTER_ACQUIRE detail=$detail remediation=the exact Chrome HWND/PID/process-start/image identity must own foreground before any tab mutation"
+    }
+    $foregroundLease.acquired_chrome_foreground = ConvertTo-SynapseForegroundIdentityEvidence -Identity $acquiredForeground
 
     # UIA elements are provider-backed snapshots, not durable window handles.
     # The failed Chrome 150 setup captured the element while its HWND was in the
@@ -2612,14 +3088,23 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         throw "SYNAPSE_CHROME_MAINTENANCE_WINDOW_LOST_AFTER_FOREGROUND hwnd=$($chromeWindow.hwnd) expected_pid=$($chromeWindow.pid) remediation=the exact Chrome window disappeared after foreground acquisition; setup refuses to create a tab in another window"
     }
     if ([int]$foregroundWindow.pid -ne [int]$chromeWindow.pid -or
+        [uint64]$foregroundWindow.process_started_at_100ns -ne [uint64]$chromeWindow.process_started_at_100ns -or
+        [string]$foregroundWindow.executable_path -ine [string]$chromeWindow.executable_path -or
+        $foregroundWindow.identity_valid -ne $true -or
         $foregroundWindow.chrome_profile_eligible -ne $true -or
         [string]$foregroundWindow.chrome_user_data_dir_normalized -cne [string]$chromeWindow.chrome_user_data_dir_normalized) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             expected_hwnd = $chromeWindow.hwnd
             expected_pid = $chromeWindow.pid
+            expected_process_started_at_100ns = $chromeWindow.process_started_at_100ns
+            expected_executable_path = $chromeWindow.executable_path
             expected_user_data_dir = $chromeWindow.chrome_user_data_dir_normalized
             actual_hwnd = $foregroundWindow.hwnd
             actual_pid = $foregroundWindow.pid
+            actual_process_started_at_100ns = $foregroundWindow.process_started_at_100ns
+            actual_executable_path = $foregroundWindow.executable_path
+            actual_identity_valid = $foregroundWindow.identity_valid
+            actual_identity_error = $foregroundWindow.identity_error
             actual_user_data_dir = $foregroundWindow.chrome_user_data_dir_normalized
             actual_profile_eligible = $foregroundWindow.chrome_profile_eligible
             actual_profile_match_reason = $foregroundWindow.chrome_profile_match_reason
@@ -2767,6 +3252,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         tab_strip_after_marker = $null
         expected_tab_count_after_cleanup = $tabStripBefore.count
         created_via_ui = $true
+        foreground_lease = $foregroundLease
     }
     # Publish ownership before navigation so every later failure, including
     # concurrent address-bar input, is cleaned by exact UIA runtime identity.
@@ -2814,7 +3300,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
     }
 }
 
-function Close-SynapseOwnedChromeMaintenanceTabViaUi {
+function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
     param(
         [Parameter(Mandatory = $true)]
         $Lease,
@@ -3110,8 +3596,59 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         navigation_before = $navigationBefore
         navigation_after = $after.navigation
         concurrent_runtime_ids = @($after.concurrent_runtime_ids)
+        missing_baseline_runtime_ids = @($after.missing_baseline_runtime_ids)
         prior_selection_restore = $selectionRestore
     }
+}
+
+function Close-SynapseOwnedChromeMaintenanceTabViaUi {
+    param(
+        [Parameter(Mandatory = $true)]$Lease,
+        [Parameter(Mandatory = $true)][string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+
+    $cleanup = $null
+    $cleanupError = $null
+    try {
+        $cleanup = Close-SynapseOwnedChromeMaintenanceTabViaUiCore `
+            -Lease $Lease `
+            -ChromeUserDataRoot $ChromeUserDataRoot `
+            -Deadline $Deadline
+    } catch {
+        $cleanupError = $_.Exception.Message
+    }
+
+    $foregroundLease = $Lease.foreground_lease
+    if (-not $foregroundLease) {
+        $foregroundLease = $script:SynapseChromeMaintenanceForegroundLease
+    }
+    $foreground = $null
+    $foregroundError = $null
+    if ($foregroundLease) {
+        try {
+            $foreground = Restore-SynapseChromeMaintenanceForeground `
+                -ForegroundLease $foregroundLease `
+                -Deadline $Deadline
+        } catch {
+            $foregroundError = $_.Exception.Message
+        }
+    } else {
+        $foregroundError = 'SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_LEASE_MISSING remediation=cleanup cannot prove whether it still owns the foreground without the pre-operation and acquired-Chrome identities'
+    }
+
+    if ($cleanupError -and $foregroundError) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_AND_FOREGROUND_RESTORE_FAILED cleanup_error=$cleanupError foreground_error=$foregroundError remediation=repair both exact tab cleanup and foreground transaction conditions; neither failure is hidden"
+    }
+    if ($cleanupError) {
+        $foregroundJson = ConvertTo-CompressedJson -Value $foreground -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_FAILED cleanup_error=$cleanupError foreground_transaction=$foregroundJson remediation=the exact foreground transaction completed, but tab cleanup did not prove its postconditions"
+    }
+    if ($foregroundError) {
+        throw $foregroundError
+    }
+    $cleanup | Add-Member -NotePropertyName foreground_transaction -NotePropertyValue $foreground -Force
+    return $cleanup
 }
 
 function Get-SynapseChromeDaemonBridgeHealth {
@@ -3346,10 +3883,18 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
 
     $expectedReady = ($Before.installed -and $Before.manifest_path_matches -and $Before.ready)
     $nonstableReady = ($Before.installed -and $Before.enabled_and_permissioned -and $Before.manifest_dir_exists)
-    if (-not $expectedReady -and -not $nonstableReady) {
+    $permissionActivationEligible = (
+        $Before.installed -and
+        $Before.manifest_path_matches -and
+        $Before.manifest_dir_exists -and
+        $Before.enabled -eq $true -and
+        $Before.disable_reasons.Count -eq 0 -and
+        $Before.missing_active_api_permissions.Count -gt 0
+    )
+    if (-not $expectedReady -and -not $nonstableReady -and -not $permissionActivationEligible) {
         $missing = if ($Before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $Before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($Before.disable_reasons.Count -eq 0) { '<none>' } else { $Before.disable_reasons -join ',' }
-        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_ROW_NOT_READY active_profile=$ActiveProfile installed=$($Before.installed) manifest_path_matches=$($Before.manifest_path_matches) ready=$($Before.ready) enabled_and_permissioned=$($Before.enabled_and_permissioned) manifest_dir_exists=$($Before.manifest_dir_exists) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=UI reload is only valid for an already-installed, enabled Synapse bridge row; repair the profile row before trying to reload it"
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_ROW_NOT_ELIGIBLE active_profile=$ActiveProfile installed=$($Before.installed) manifest_path_matches=$($Before.manifest_path_matches) ready=$($Before.ready) enabled=$($Before.enabled) enabled_and_permissioned=$($Before.enabled_and_permissioned) manifest_dir_exists=$($Before.manifest_dir_exists) permission_activation_eligible=$permissionActivationEligible missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=UI reload requires an installed enabled row from the exact expected path (or an enabled fully-permissioned extant nonstable path); disabled, missing-path, and ambiguous rows are never reloaded"
     }
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
@@ -3412,7 +3957,6 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
     }
 
     Invoke-SynapseAutomationElement -Element $details.reload_button -Description 'Synapse Chrome Bridge Reload'
-    Start-Sleep -Milliseconds 1500
     # Reloading an unpacked extension can briefly rebuild Chrome's UIA tree
     # while the physical HWND and process remain alive. Require the same HWND
     # to reappear within the existing bounded operation deadline.
@@ -3423,17 +3967,44 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
         throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_WINDOW_LOST active_profile=$ActiveProfile chrome_window_hwnd=$($chromeWindow.hwnd) chrome_window_pid=$($chromeWindow.pid) remediation=Chrome window disappeared after reload; keep the already-open authenticated profile available and rerun setup"
     }
     $uiAfter = Read-SynapseChromeExtensionDetailsUiState -Window $afterWindow
-    $after = Test-SynapseChromeBridgeProfileRow `
-        -ChromeUserDataRoot $ChromeUserDataRoot `
-        -ProfileName $ActiveProfile `
-        -ExtensionId $ExtensionId `
-        -ExtensionDir $ExtensionDir
+    # Extension activation and Chrome's durable Preferences flush are distinct
+    # transitions. Poll the physical profile row to the existing operation
+    # deadline instead of sampling once after a fixed sleep.
+    $profileReadStarted = Get-Date
+    $profileReadAttempts = 0
+    $profileReadDelayMs = 100
+    $after = $null
+    $lastAfter = $null
+    do {
+        $profileReadAttempts += 1
+        $lastAfter = Test-SynapseChromeBridgeProfileRow `
+            -ChromeUserDataRoot $ChromeUserDataRoot `
+            -ProfileName $ActiveProfile `
+            -ExtensionId $ExtensionId `
+            -ExtensionDir $ExtensionDir
+        $afterExpectedReady = ($lastAfter.installed -and $lastAfter.manifest_path_matches -and $lastAfter.ready)
+        $afterNonstableReady = ($lastAfter.installed -and $lastAfter.enabled_and_permissioned -and $lastAfter.manifest_dir_exists)
+        if ($afterExpectedReady -or $afterNonstableReady) {
+            $after = $lastAfter
+            break
+        }
+        if ((Get-Date) -ge $deadline) {
+            break
+        }
+        $remainingMs = [Math]::Max(1, [int](($deadline - (Get-Date)).TotalMilliseconds))
+        Start-Sleep -Milliseconds ([Math]::Min($profileReadDelayMs, $remainingMs))
+        $profileReadDelayMs = [Math]::Min(1000, $profileReadDelayMs * 2)
+    } while ((Get-Date) -lt $deadline)
+    $profileReadElapsedMs = [Math]::Max(0, [int](((Get-Date) - $profileReadStarted).TotalMilliseconds))
+    if (-not $after) {
+        $after = $lastAfter
+    }
     $afterExpectedReady = ($after.installed -and $after.manifest_path_matches -and $after.ready)
     $afterNonstableReady = ($after.installed -and $after.enabled_and_permissioned -and $after.manifest_dir_exists)
     if (-not $afterExpectedReady -and -not $afterNonstableReady) {
         $missingAfter = if ($after.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $after.missing_active_api_permissions -join ',' }
         $disableAfter = if ($after.disable_reasons.Count -eq 0) { '<none>' } else { $after.disable_reasons -join ',' }
-        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_PROFILE_ROW_NOT_READY_AFTER active_profile=$ActiveProfile installed=$($after.installed) manifest_path_matches=$($after.manifest_path_matches) ready=$($after.ready) enabled_and_permissioned=$($after.enabled_and_permissioned) manifest_dir_exists=$($after.manifest_dir_exists) missing_active_api_permissions=$missingAfter disable_reasons=$disableAfter remediation=Chrome Reload changed the physical profile row unexpectedly; inspect the active profile Preferences/Secure Preferences before accepting bridge setup"
+        throw "SYNAPSE_CHROME_BRIDGE_UI_RELOAD_PROFILE_ROW_NOT_READY_AFTER active_profile=$ActiveProfile attempts=$profileReadAttempts elapsed_ms=$profileReadElapsedMs installed=$($after.installed) manifest_path_matches=$($after.manifest_path_matches) ready=$($after.ready) enabled=$($after.enabled) enabled_and_permissioned=$($after.enabled_and_permissioned) manifest_dir_exists=$($after.manifest_dir_exists) missing_active_api_permissions=$missingAfter disable_reasons=$disableAfter remediation=the bounded durable Chrome Preferences read never reached exact path/permission parity after Reload; inspect the active profile row and any permission-warning disable reason before retrying"
     }
     $daemonBridgeAfter = $null
     if ($OutputJson) {
@@ -3446,7 +4017,13 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
             -Deadline $deadline
     }
 
-    $reloadReason = if ($Before.manifest_path_matches) { 'existing_ready_extension_ui_reload_invoked' } else { 'existing_ready_extension_nonstable_path_ui_reload_invoked' }
+    $reloadReason = if ($permissionActivationEligible) {
+        'existing_extension_permission_activation_ui_reload_invoked'
+    } elseif ($Before.manifest_path_matches) {
+        'existing_ready_extension_ui_reload_invoked'
+    } else {
+        'existing_ready_extension_nonstable_path_ui_reload_invoked'
+    }
     return [pscustomobject]@{
         attempted = $true
         changed = $true
@@ -3462,6 +4039,13 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
         navigation = $navigation
         ui_before = $details.ui_before
         ui_after = $uiAfter
+        durable_profile_readback = [pscustomobject]@{
+            attempts = $profileReadAttempts
+            elapsed_ms = $profileReadElapsedMs
+            source_of_truth = [string]$after.pref_path
+            permission_activation_pending_before = [bool]$permissionActivationEligible
+            permission_activation_complete_after = [bool]$after.ready
+        }
         daemon_bridge_before = $daemonBridgeBefore
         daemon_bridge_after = $daemonBridgeAfter
         before = $Before
@@ -3505,16 +4089,17 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     }
 
     if ($before.installed -and $before.manifest_path_matches) {
+        $reloadEligible = $before.ready -or $before.permission_activation_pending
+        if ($ReloadExistingExtensionViaUi -and $reloadEligible) {
+            return Invoke-SynapseChromeBridgeExistingUiReload `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -ExtensionId $ExtensionId `
+                -ExtensionDir $ExtensionDir `
+                -ActiveProfile $activeProfile `
+                -Before $before `
+                -TimeoutSeconds $TimeoutSeconds
+        }
         if ($before.ready) {
-            if ($ReloadExistingExtensionViaUi) {
-                return Invoke-SynapseChromeBridgeExistingUiReload `
-                    -ChromeUserDataRoot $ChromeUserDataRoot `
-                    -ExtensionId $ExtensionId `
-                    -ExtensionDir $ExtensionDir `
-                    -ActiveProfile $activeProfile `
-                    -Before $before `
-                    -TimeoutSeconds $TimeoutSeconds
-            }
             return [pscustomobject]@{
                 attempted = $true
                 changed = $false
@@ -3526,10 +4111,27 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 after = $before
             }
         }
+        if ($before.permission_activation_pending -and -not $ReloadExistingExtensionViaUi) {
+            return [pscustomobject]@{
+                attempted = $true
+                changed = $false
+                reason = 'existing_extension_permission_activation_host_ui_reload_deferred'
+                active_profile = $activeProfile
+                required_foreground = $false
+                bridge_host_reload_command = 'browser_debugger.reload_bridge'
+                before = $before
+                after = $before
+            }
+        }
 
         $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
-        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=existing Synapse Chrome Bridge row is installed from the expected path but is not active/permissioned; invoke browser_debugger operation=reload_bridge so the host-controlled exact extension management path can fail with the physical UI/profile condition, or repair that named condition before retrying setup."
+        $remediation = if ($before.permission_activation_pending) {
+            'invoke browser_debugger operation=reload_bridge against the handed-off daemon; the exact enabled/path-matching row is eligible for UI Reload and strict durable permission readback'
+        } else {
+            'repair the named disabled/missing-path profile condition before retrying; setup never reloads an ineligible extension row'
+        }
+        throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) enabled=$($before.enabled) permission_activation_pending=$($before.permission_activation_pending) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=$remediation"
     }
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
@@ -3763,7 +4365,20 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
         $cleanupLease.created_via_ui -ne $true -or
         [int64]$cleanupLease.chrome_window_hwnd -le 0 -or
         [int]$cleanupLease.chrome_window_pid -le 0 -or
-        [int]$cleanupLease.expected_tab_count_after_cleanup -lt 0
+        [int]$cleanupLease.expected_tab_count_after_cleanup -lt 0 -or
+        $null -eq $cleanupLease.foreground_lease -or
+        $null -eq $cleanupLease.foreground_lease.prior_foreground -or
+        $cleanupLease.foreground_lease.prior_foreground.identity_valid -ne $true -or
+        [int64]$cleanupLease.foreground_lease.prior_foreground.hwnd -le 0 -or
+        [int]$cleanupLease.foreground_lease.prior_foreground.pid -le 0 -or
+        [uint64]$cleanupLease.foreground_lease.prior_foreground.process_started_at_100ns -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$cleanupLease.foreground_lease.prior_foreground.executable_path) -or
+        $null -eq $cleanupLease.foreground_lease.acquired_chrome_foreground -or
+        $cleanupLease.foreground_lease.acquired_chrome_foreground.identity_valid -ne $true -or
+        [int64]$cleanupLease.foreground_lease.acquired_chrome_foreground.hwnd -ne [int64]$cleanupLease.chrome_window_hwnd -or
+        [int]$cleanupLease.foreground_lease.acquired_chrome_foreground.pid -ne [int]$cleanupLease.chrome_window_pid -or
+        [uint64]$cleanupLease.foreground_lease.acquired_chrome_foreground.process_started_at_100ns -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$cleanupLease.foreground_lease.acquired_chrome_foreground.executable_path)
     ) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             supplied_token = $MaintenanceTabToken
@@ -3771,7 +4386,7 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
             supplied_marker_title = $MaintenanceMarkerTitle
             lease = $cleanupLease
         }) -Depth 12
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_LEASE_MISMATCH detail=$detail remediation=cleanup-only refuses any lease whose token, marker, UI ownership source, or physical HWND/PID/count identity differs"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_LEASE_MISMATCH detail=$detail remediation=cleanup-only refuses any lease whose token, marker, UI ownership source, tab count, or exact prior/acquired HWND/PID/process-start/image identity differs"
     }
     $cleanupDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
     $cleanup = Close-SynapseOwnedChromeMaintenanceTabViaUi `
@@ -3795,6 +4410,7 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
 }
 
 $script:SynapseChromeMaintenanceTabLease = $null
+$script:SynapseChromeMaintenanceForegroundLease = $null
 try {
     $chromeBridgeAutoInstall = Invoke-SynapseChromeBridgeAutoInstall `
         -ChromeUserDataRoot $chromeUserDataRoot `
@@ -3817,6 +4433,21 @@ try {
             }
             $cleanupError = $_.Exception.Message
             throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_CLEANUP_FAILED operation_error=$operationError cleanup_error=$cleanupError token=$($script:SynapseChromeMaintenanceTabLease.token) hwnd=$($script:SynapseChromeMaintenanceTabLease.chrome_window_hwnd) chrome_tab_id=$($script:SynapseChromeMaintenanceTabLease.chrome_tab_id) remediation=inspect the exact ownership identity and remove only that tab after proving its marker/token URL"
+        }
+    }
+    if ($script:SynapseChromeMaintenanceForegroundLease) {
+        $foregroundDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
+        try {
+            $foreground = Restore-SynapseChromeMaintenanceForeground `
+                -ForegroundLease $script:SynapseChromeMaintenanceForegroundLease `
+                -Deadline $foregroundDeadline
+            $foregroundJson = ConvertTo-CompressedJson -Value $foreground -Depth 10
+            throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED operation_error=$operationError foreground_transaction=$foregroundJson"
+        } catch {
+            if ($_.Exception.Message -like 'SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED *') {
+                throw
+            }
+            throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_FOREGROUND_RESTORE_FAILED operation_error=$operationError foreground_error=$($_.Exception.Message) remediation=repair the named operation error and exact foreground transaction error; no substitute window was focused"
         }
     }
     throw

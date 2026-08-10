@@ -13,6 +13,7 @@
     "management",
     "scripting",
     "storage",
+    "unlimitedStorage",
     "tabs",
     "webRequest",
     "webNavigation"

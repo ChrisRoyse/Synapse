@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-07-durable-ledger-repair-v1";
+    "synapse-chrome-bridge-2026-08-10-exact-maintenance-foreground-v2";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "be6ecbf7df3da851af634133e08604704c885de504c12340be6b3fb728f093bf";
+    "35908d1a0237fe49181794c18ba3e7e4df04d2322ce281cbd093f8e45e897aa6";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -4305,6 +4305,13 @@ pub struct ChromeBridgeReloadCommandAck {
     pub ui_after_enable_toggle_on: Option<bool>,
     pub maintenance_tab: Value,
     pub maintenance_cleanup: Value,
+    pub durable_profile_readback: Value,
+}
+
+#[derive(Debug)]
+struct ChromeBridgeHostUiReloadAttempt {
+    ack: ChromeBridgeReloadCommandAck,
+    postcondition_error: Option<ChromeDebuggerBridgeError>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5526,7 +5533,7 @@ fn process_diagnostic(bytes: &[u8]) -> String {
 #[cfg(windows)]
 async fn run_chrome_bridge_host_ui_reload(
     maintenance: &ChromeBridgeMaintenanceTabLease,
-) -> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+) -> Result<ChromeBridgeHostUiReloadAttempt, ChromeDebuggerBridgeError> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5738,12 +5745,13 @@ async fn run_chrome_bridge_host_ui_reload(
     )?;
     let reason_accepted = matches!(
         reason.as_str(),
-        "existing_ready_extension_ui_reload_invoked"
+        "existing_extension_permission_activation_ui_reload_invoked"
+            | "existing_ready_extension_ui_reload_invoked"
             | "existing_ready_extension_nonstable_path_ui_reload_invoked"
             | "migrated_existing_extension_to_credentialed_stable_path"
             | "installed_unpacked_extension_in_active_profile"
     );
-    if !ok
+    let postcondition_error = if !ok
         || extension_id != EXTENSION_ID
         || extension_service_worker_sha256.len() != 64
         || !attempted
@@ -5762,7 +5770,7 @@ async fn run_chrome_bridge_host_ui_reload(
         || daemon_bridge_after_stale
         || !reason_accepted
     {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+        Some(ChromeDebuggerBridgeError::host_reload_failed(format!(
             "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} service_worker_sha256={} attempted={} changed={} required_foreground={} active_profile={} active_profile_installed={} profile_after_installed={} profile_after_ready={} daemon_bridge_after_pid={} expected_daemon_pid={} daemon_bridge_after_host_id={} daemon_bridge_after_host_count={} daemon_bridge_after_tab_control={} daemon_bridge_after_extension_id={} daemon_bridge_after_build_id={} daemon_bridge_after_worker_sha256={} daemon_bridge_after_stale={} reason={} reason_accepted={} installer={} installer_sha256={} remediation=inspect the physical Chrome profile row, replacement host, and exact extension management UI state; the daemon refuses to accept a partial or no-op repair",
             ok,
             extension_id,
@@ -5788,10 +5796,12 @@ async fn run_chrome_bridge_host_ui_reload(
             reason_accepted,
             installer_path.display(),
             installer_sha256
-        )));
-    }
+        )))
+    } else {
+        None
+    };
 
-    Ok(ChromeBridgeReloadCommandAck {
+    let ack = ChromeBridgeReloadCommandAck {
         ok,
         control_surface: "chrome_extensions_exact_reload_or_load_unpacked_control".to_owned(),
         required_foreground,
@@ -5841,12 +5851,21 @@ async fn run_chrome_bridge_host_ui_reload(
             "ownership_source": "verified_uia_new_tab_marker_then_exact_chrome_tabs_token_resolution",
             "preexisting_tab_count": maintenance.tabs_before.len(),
             "script_lease": readback.pointer("/synapse_chrome_auto_install/maintenance_tab"),
+            "operation_navigation": readback.pointer("/synapse_chrome_auto_install/navigation"),
         }),
         maintenance_cleanup: json!({
             "attempted": false,
             "absent_verified": false,
             "reason": "pending_replacement_host_readback",
         }),
+        durable_profile_readback: readback
+            .pointer("/synapse_chrome_auto_install/durable_profile_readback")
+            .cloned()
+            .unwrap_or(Value::Null),
+    };
+    Ok(ChromeBridgeHostUiReloadAttempt {
+        ack,
+        postcondition_error,
     })
 }
 
@@ -5942,6 +5961,49 @@ async fn run_chrome_bridge_host_ui_cleanup(
         .and_then(|tab| tab.get("runtime_id"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let foreground_lease = lease
+        .get("foreground_lease")
+        .filter(|value| value.is_object());
+    let prior_foreground_valid = foreground_lease
+        .and_then(|value| value.pointer("/prior_foreground/identity_valid"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let prior_foreground_hwnd = foreground_lease
+        .and_then(|value| value.pointer("/prior_foreground/hwnd"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let prior_foreground_pid = foreground_lease
+        .and_then(|value| value.pointer("/prior_foreground/pid"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let prior_foreground_started = foreground_lease
+        .and_then(|value| value.pointer("/prior_foreground/process_started_at_100ns"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let prior_foreground_path = foreground_lease
+        .and_then(|value| value.pointer("/prior_foreground/executable_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let acquired_foreground_valid = foreground_lease
+        .and_then(|value| value.pointer("/acquired_chrome_foreground/identity_valid"))
+        .and_then(Value::as_bool)
+        == Some(true);
+    let acquired_foreground_hwnd = foreground_lease
+        .and_then(|value| value.pointer("/acquired_chrome_foreground/hwnd"))
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    let acquired_foreground_pid = foreground_lease
+        .and_then(|value| value.pointer("/acquired_chrome_foreground/pid"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let acquired_foreground_started = foreground_lease
+        .and_then(|value| value.pointer("/acquired_chrome_foreground/process_started_at_100ns"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let acquired_foreground_path = foreground_lease
+        .and_then(|value| value.pointer("/acquired_chrome_foreground/executable_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if ownership_source != "verified_uia_new_tab_marker"
         || !created_via_ui
         || chrome_window_hwnd <= 0
@@ -5950,9 +6012,20 @@ async fn run_chrome_bridge_host_ui_cleanup(
         || owned_tab_runtime_id.is_empty()
         || selected_before.len() != 1
         || selected_runtime_id.is_empty()
+        || foreground_lease.is_none()
+        || !prior_foreground_valid
+        || prior_foreground_hwnd <= 0
+        || prior_foreground_pid == 0
+        || prior_foreground_started == 0
+        || prior_foreground_path.is_empty()
+        || !acquired_foreground_valid
+        || acquired_foreground_hwnd != chrome_window_hwnd
+        || acquired_foreground_pid != chrome_window_pid
+        || acquired_foreground_started == 0
+        || acquired_foreground_path.is_empty()
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} owned_runtime_id_present={} selected_before_count={} selected_runtime_id_present={} remediation=the first installer must return one exact UI-created lease plus the pre-operation selected-tab runtime identity",
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} owned_runtime_id_present={} selected_before_count={} selected_runtime_id_present={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} remediation=the first installer must return one exact UI-created lease, pre-operation selected-tab runtime identity, and exact prior/acquired HWND/PID/process-start/image foreground identities",
             ownership_source,
             created_via_ui,
             chrome_window_hwnd,
@@ -5961,6 +6034,17 @@ async fn run_chrome_bridge_host_ui_cleanup(
             !owned_tab_runtime_id.is_empty(),
             selected_before.len(),
             !selected_runtime_id.is_empty(),
+            foreground_lease.is_some(),
+            prior_foreground_valid,
+            prior_foreground_hwnd,
+            prior_foreground_pid,
+            prior_foreground_started,
+            !prior_foreground_path.is_empty(),
+            acquired_foreground_valid,
+            acquired_foreground_hwnd,
+            acquired_foreground_pid,
+            acquired_foreground_started,
+            !acquired_foreground_path.is_empty(),
         )));
     }
     let cleanup_lease = json!({
@@ -5981,6 +6065,7 @@ async fn run_chrome_bridge_host_ui_cleanup(
                 "runtime_id": selected_runtime_id,
             }],
         },
+        "foreground_lease": foreground_lease.cloned().unwrap_or(Value::Null),
     });
     let lease_json = serde_json::to_vec(&cleanup_lease).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
@@ -6101,6 +6186,24 @@ async fn run_chrome_bridge_host_ui_cleanup(
             error
         ))
     })?;
+    let foreground_restored = readback
+        .pointer("/maintenance_cleanup/foreground_transaction/restored")
+        .and_then(Value::as_bool);
+    let operator_superseded = readback
+        .pointer("/maintenance_cleanup/foreground_transaction/operator_superseded")
+        .and_then(Value::as_bool);
+    let foreground_outcome = readback
+        .pointer("/maintenance_cleanup/foreground_transaction/outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let foreground_method = readback
+        .pointer("/maintenance_cleanup/foreground_transaction/restore_method")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let missing_baseline_count = readback
+        .pointer("/maintenance_cleanup/missing_baseline_runtime_ids")
+        .and_then(Value::as_array)
+        .map(Vec::len);
     if readback.get("ok").and_then(Value::as_bool) != Some(true)
         || readback.get("operation").and_then(Value::as_str)
             != Some("cleanup_owned_maintenance_tab_via_ui")
@@ -6112,10 +6215,22 @@ async fn run_chrome_bridge_host_ui_cleanup(
             .pointer("/maintenance_cleanup/token")
             .and_then(Value::as_str)
             != Some(maintenance.token.as_str())
+        || missing_baseline_count != Some(0)
+        || foreground_method.is_empty()
+        || foreground_outcome.is_empty()
+        || !matches!(
+            (foreground_restored, operator_superseded),
+            (Some(true), Some(false)) | (Some(false), Some(true))
+        )
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} remediation=cleanup-only must prove exact token absence through independent tab-strip/address readback",
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} missing_baseline_count={:?} foreground_restored={:?} operator_superseded={:?} foreground_outcome={} foreground_method={} remediation=cleanup-only must prove exact token/runtime-id absence, every baseline tab present, and either exact prior foreground restoration or explicit operator supersession",
             sha256_hex_lower(&payload),
+            missing_baseline_count,
+            foreground_restored,
+            operator_superseded,
+            foreground_outcome,
+            foreground_method,
         )));
     }
     Ok(readback
@@ -6127,7 +6242,7 @@ async fn run_chrome_bridge_host_ui_cleanup(
 #[cfg(not(windows))]
 async fn run_chrome_bridge_host_ui_reload(
     _maintenance: &ChromeBridgeMaintenanceTabLease,
-) -> Result<ChromeBridgeReloadCommandAck, ChromeDebuggerBridgeError> {
+) -> Result<ChromeBridgeHostUiReloadAttempt, ChromeDebuggerBridgeError> {
     Err(ChromeDebuggerBridgeError::host_reload_failed(
         "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_UNSUPPORTED_OS os=non_windows remediation=run the Chrome bridge host-control operation on the configured Windows Synapse host",
     ))
@@ -6779,28 +6894,68 @@ impl ChromeDebuggerBridge {
         maintenance: &ChromeBridgeMaintenanceTabLease,
         ack: &ChromeBridgeReloadCommandAck,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
-        match self.cleanup_reload_maintenance_tab(maintenance).await {
-            Ok(readback) => Ok(readback),
-            Err(bridge_error) => match run_chrome_bridge_host_ui_cleanup(maintenance, ack).await {
-                Ok(ui_readback) => Ok(json!({
-                    "attempted": true,
-                    "closed": true,
-                    "absent_verified": true,
-                    "reason": "exact_installer_ui_lease_cleanup_after_bridge_cleanup_failure",
-                    "bridge_cleanup_error_code": bridge_error.code(),
-                    "bridge_cleanup_error_detail_sha256":
-                        sha256_hex_lower(bridge_error.detail().as_bytes()),
-                    "ui_cleanup": ui_readback,
-                })),
-                Err(ui_error) => Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_MAINTENANCE_BRIDGE_AND_UI_CLEANUP_FAILED bridge_cleanup_code={} bridge_cleanup_detail={} ui_cleanup_code={} ui_cleanup_detail={} remediation=inspect the exact token/HWND lease; neither Chrome tab API nor independent UIA cleanup proved the operation-created maintenance tab absent",
-                    bridge_error.code(),
-                    bridge_error.detail(),
-                    ui_error.code(),
-                    ui_error.detail(),
-                ))),
-            },
+        // The UIA lease is the sole mutation authority after the installer has
+        // returned an ACK. It alone owns both the exact runtime-id tab close and
+        // the OS foreground transaction. The replacement bridge is used only
+        // for an independent read after that transaction; it is never a mutating
+        // fallback that can bypass foreground restoration.
+        let mut ui_readback = run_chrome_bridge_host_ui_cleanup(maintenance, ack).await?;
+        let after_cleanup = self.list_tabs_for_reload_maintenance().await?;
+        let token_fragment = format!("synapse_maintenance_token={}", maintenance.token);
+        let token_absent = !after_cleanup
+            .tabs
+            .iter()
+            .any(|tab| tab.url.contains(&token_fragment));
+        let missing_preexisting = maintenance
+            .tabs_before
+            .iter()
+            .filter(|before| {
+                !after_cleanup.tabs.iter().any(|after| {
+                    before.target_id == after.target_id
+                        && before.tab_id == after.tab_id
+                        && before.chrome_window_id == after.chrome_window_id
+                        && before.index == after.index
+                        && before.target_type == after.target_type
+                        && before.url == after.url
+                        && before.pinned == after.pinned
+                })
+            })
+            .count();
+        let concurrent_count = after_cleanup
+            .tabs
+            .iter()
+            .filter(|after| {
+                !maintenance.tabs_before.iter().any(|before| {
+                    before.tab_id == after.tab_id && before.target_id == after.target_id
+                })
+            })
+            .count();
+        if !token_absent || missing_preexisting != 0 {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_MAINTENANCE_POST_UI_BRIDGE_READBACK_FAILED token_absent={} missing_preexisting_count={} preexisting_count={} after_count={} remediation=the exact UIA cleanup returned success, but the replacement bridge's independent chrome.tabs read did not prove token absence and preservation of every pre-operation tab",
+                token_absent,
+                missing_preexisting,
+                maintenance.tabs_before.len(),
+                after_cleanup.tabs.len(),
+            )));
         }
+        let object = ui_readback.as_object_mut().ok_or_else(|| {
+            ChromeDebuggerBridgeError::host_reload_failed(
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_EVIDENCE_INVALID expected=object remediation=the cleanup process must return structured UIA/foreground evidence",
+            )
+        })?;
+        object.insert(
+            "bridge_post_cleanup".to_owned(),
+            json!({
+                "source_of_truth": "replacement_bridge_chrome_tabs_query",
+                "token_absent": token_absent,
+                "preexisting_tab_count": maintenance.tabs_before.len(),
+                "missing_preexisting_count": missing_preexisting,
+                "concurrent_tab_count": concurrent_count,
+                "post_cleanup_tab_count": after_cleanup.tabs.len(),
+            }),
+        );
+        Ok(ui_readback)
     }
 
     async fn reload_via_host_ui(
@@ -6813,8 +6968,8 @@ impl ChromeDebuggerBridge {
         let maintenance = self
             .prepare_reload_maintenance_tab(before.is_some())
             .await?;
-        let mut ack = match run_chrome_bridge_host_ui_reload(&maintenance).await {
-            Ok(ack) => ack,
+        let attempt = match run_chrome_bridge_host_ui_reload(&maintenance).await {
+            Ok(attempt) => attempt,
             Err(error) => {
                 let installer_verified_cleanup = error.detail().contains("cleanup=verified_absent");
                 let cleanup = self.cleanup_reload_maintenance_tab(&maintenance).await;
@@ -6848,6 +7003,18 @@ impl ChromeDebuggerBridge {
                 };
             }
         };
+        let mut ack = attempt.ack;
+        if let Some(postcondition_error) = attempt.postcondition_error {
+            let maintenance_cleanup = self
+                .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
+                .await?;
+            ack.maintenance_cleanup = maintenance_cleanup;
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "{} maintenance_cleanup={} remediation=the installer mutated Chrome and returned its exact UIA/foreground lease; cleanup was completed and independently read before this postcondition error was propagated",
+                postcondition_error.detail(),
+                ack.maintenance_cleanup,
+            )));
+        }
         invalidate_chrome_profile_scan_cache("host_ui_reload_after_control");
         let started = Instant::now();
         let mut last_observed = "no_active_chrome_bridge_host".to_owned();

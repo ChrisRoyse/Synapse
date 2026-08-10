@@ -39,8 +39,12 @@ use super::{
     set_target_input_schema, tool, tool_router,
 };
 use crate::m1::{
+    BrowserScreenshotForegroundIdentityReadback, BrowserScreenshotForegroundTransactionReadback,
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
-    CaptureRetryEvidence, ClipboardTimelineSample, FsTimelineEvent, M1ObservationSnapshot,
+    CaptureRetryEvidence, CdpBridgeDurableProfileReadback, CdpBridgeForegroundIdentityReadback,
+    CdpBridgeForegroundTransactionReadback, CdpBridgeMaintenanceCleanupReadback,
+    CdpBridgeMaintenanceTabReadback, CdpBridgePostCleanupReadback, CdpBridgePriorSelectionReadback,
+    ClipboardTimelineSample, FsTimelineEvent, M1ObservationSnapshot,
     build_find_input_from_snapshot, effective_ocr_backend, global_only_input_from_snapshot,
     hidden_desktop_input_from_worker_snapshot, observe_input_from_snapshot,
 };
@@ -111,7 +115,6 @@ const BROWSER_WAIT_FACADE_SOURCE_OF_TRUTH: &str =
     "target-scoped browser wait predicate readback from DOM/URL/load/network/function state";
 const BROWSER_WAIT_FACADE_READBACK_SOURCE_OF_TRUTH: &str =
     "browser_wait_for condition response plus daemon-tool-events.jsonl";
-const BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS: u64 = 3_000;
 const PERCEPTION_BLOCKING_GATHER_TIMEOUT_MS: u64 = 10_000;
 const PERCEPTION_CDP_ENRICH_TIMEOUT_MS: u64 = 10_000;
 const PERCEPTION_BROWSER_OCR_TIMEOUT_MS: u64 = 10_000;
@@ -2298,13 +2301,13 @@ impl SynapseService {
             "browser_screenshot_before_foreground_activation",
         )?;
         let foreground_guard = prepare_browser_screenshot_foreground(window_hwnd)?;
-        let mut captured_result = match super::operator_panic_boundary::ensure_mcp_mutation(
+        let captured_result = match super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_screenshot_before_bridge_capture",
         ) {
             Ok(()) => crate::chrome_debugger_bridge::page_screenshot(
                 window_hwnd,
                 cdp_target_id,
-                bridge_payload.clone(),
+                bridge_payload,
             )
             .await
             .map_err(|error| {
@@ -2318,24 +2321,6 @@ impl SynapseService {
             }),
             Err(panic_error) => Err(panic_error),
         };
-        if let Err(error) = &captured_result
-            && browser_screenshot_bridge_disconnected(error)
-        {
-            match super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_screenshot_before_bridge_retry",
-            ) {
-                Ok(()) => {
-                    captured_result = browser_screenshot_retry_after_bridge_disconnect(
-                        window_hwnd,
-                        cdp_target_id,
-                        bridge_payload.clone(),
-                        error,
-                    )
-                    .await;
-                }
-                Err(panic_error) => captured_result = Err(panic_error),
-            }
-        }
         let foreground_readback = match finish_browser_screenshot_foreground(
             window_hwnd,
             foreground_guard,
@@ -2379,11 +2364,11 @@ impl SynapseService {
             before_active = captured.before_active,
             active_for_capture = captured.active_for_capture,
             restored_previous_active = captured.restored_previous_active,
-            required_foreground = foreground_readback.required_foreground || captured.required_foreground,
-            human_os_foreground_before_hwnd = foreground_readback.before_hwnd.unwrap_or_default(),
-            human_os_foreground_capture_hwnd = foreground_readback.capture_hwnd.unwrap_or_default(),
-            human_os_foreground_after_restore_hwnd = foreground_readback.after_restore_hwnd.unwrap_or_default(),
-            restored_human_os_foreground = foreground_readback.restored_human_os_foreground,
+            required_foreground = foreground_readback.required || captured.required_foreground,
+            human_os_foreground_before_hwnd = foreground_readback.prior_foreground.hwnd.unwrap_or_default(),
+            human_os_foreground_capture_hwnd = foreground_readback.acquired_chrome_foreground.hwnd.unwrap_or_default(),
+            human_os_foreground_after_restore_hwnd = foreground_readback.final_foreground.hwnd.unwrap_or_default(),
+            restored_human_os_foreground = foreground_readback.restored,
             capture_attempt_count = captured.capture_attempt_count,
             capture_attempts = ?captured.capture_attempts,
             tile_count = captured.tile_count,
@@ -2452,12 +2437,12 @@ impl SynapseService {
             tile_count: captured.tile_count,
             mask_count: captured.mask_count,
             omit_background: captured.omit_background,
-            required_foreground: foreground_readback.required_foreground
-                || captured.required_foreground,
-            human_os_foreground_before_hwnd: foreground_readback.before_hwnd,
-            human_os_foreground_capture_hwnd: foreground_readback.capture_hwnd,
-            human_os_foreground_after_restore_hwnd: foreground_readback.after_restore_hwnd,
-            restored_human_os_foreground: foreground_readback.restored_human_os_foreground,
+            required_foreground: foreground_readback.required || captured.required_foreground,
+            human_os_foreground_before_hwnd: foreground_readback.prior_foreground.hwnd,
+            human_os_foreground_capture_hwnd: foreground_readback.acquired_chrome_foreground.hwnd,
+            human_os_foreground_after_restore_hwnd: foreground_readback.final_foreground.hwnd,
+            restored_human_os_foreground: foreground_readback.restored,
+            foreground_transaction: foreground_readback,
             backend_tier_used: captured.backend_tier_used,
             source_of_truth: if used_emulated_page_surface {
                 "normal Chrome bridge MAIN-world page metrics plus chrome.debugger Page.captureScreenshot page-surface pixels, independently geometry-checked before write"
@@ -2466,9 +2451,6 @@ impl SynapseService {
                 "human OS foreground readback plus normal Chrome bridge MAIN-world page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched and independently geometry-checked by synapse-mcp"
                     .to_owned()
             },
-            degradation_code: None,
-            fallback_metadata_source: None,
-            fallback_reason: None,
         })
     }
 
@@ -3074,10 +3056,10 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "cdp_bridge_reload_before_host_ui_control",
         )?;
-        let mut result = crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms)
-            .await
-            .map(|reload| chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload))
-            .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
+        let mut result = match crate::chrome_debugger_bridge::reload_bridge(wait_timeout_ms).await {
+            Ok(reload) => chrome_bridge_reload_response(&session_id, wait_timeout_ms, reload),
+            Err(error) => Err(mcp_error(error.code(), error.detail().to_owned())),
+        };
         if result.is_ok()
             && let Err(panic_error) = super::operator_panic_boundary::ensure_mcp_mutation(
                 "cdp_bridge_reload_after_host_ui_control",
@@ -16261,15 +16243,6 @@ fn browser_tab_window_title_matches_target(
     )
 }
 
-#[derive(Clone, Debug, Default)]
-struct BrowserScreenshotForegroundReadback {
-    required_foreground: bool,
-    before_hwnd: Option<i64>,
-    capture_hwnd: Option<i64>,
-    after_restore_hwnd: Option<i64>,
-    restored_human_os_foreground: bool,
-}
-
 /// #1359: process-wide serialization of browser_screenshot's foreground-capture
 /// critical section. Concurrent captures otherwise interleave their Chrome-window
 /// activation/restore and one observes the other's foreground change as a
@@ -16281,8 +16254,33 @@ static BROWSER_SCREENSHOT_FOREGROUND_LOCK: tokio::sync::Mutex<()> =
 #[cfg(windows)]
 #[derive(Clone, Debug)]
 struct BrowserScreenshotForegroundGuard {
-    before: ForegroundContext,
-    readback: BrowserScreenshotForegroundReadback,
+    before: BrowserScreenshotForegroundIdentity,
+    acquired_chrome: BrowserScreenshotForegroundIdentity,
+    readback: BrowserScreenshotForegroundTransactionReadback,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug)]
+struct BrowserScreenshotForegroundIdentity {
+    context: ForegroundContext,
+    process_started_at_100ns: u64,
+}
+
+#[cfg(windows)]
+impl BrowserScreenshotForegroundIdentity {
+    fn matches(&self, other: &Self) -> bool {
+        self.context.hwnd == other.context.hwnd
+            && self.context.pid == other.context.pid
+            && self.process_started_at_100ns == other.process_started_at_100ns
+    }
+
+    fn public_readback(&self) -> BrowserScreenshotForegroundIdentityReadback {
+        BrowserScreenshotForegroundIdentityReadback {
+            hwnd: Some(self.context.hwnd),
+            pid: Some(self.context.pid),
+            process_started_at_100ns: Some(self.process_started_at_100ns),
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -16293,126 +16291,164 @@ struct BrowserScreenshotForegroundGuard;
 fn prepare_browser_screenshot_foreground(
     window_hwnd: i64,
 ) -> Result<BrowserScreenshotForegroundGuard, ErrorData> {
-    const TOOL: &str = "browser_screenshot";
     let before = read_browser_screenshot_current_foreground("before_capture")?;
-    let target = synapse_a11y::foreground_context(window_hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::TARGET_WINDOW_NOT_FOUND,
-            format!(
-                "browser_screenshot target HWND {window_hwnd:#x} is not inspectable before capture: {error}"
-            ),
-        )
-    })?;
-    let required_foreground = before.hwnd != window_hwnd;
+    let target = read_browser_screenshot_window_identity(window_hwnd, "target_preflight")?;
+    let required_foreground = !before.matches(&target);
+    let mut readback = BrowserScreenshotForegroundTransactionReadback {
+        required: required_foreground,
+        attempted: false,
+        restored: !required_foreground,
+        operator_superseded: false,
+        outcome: if required_foreground {
+            "capture_foreground_pending".to_owned()
+        } else {
+            "chrome_already_foreground_noop".to_owned()
+        },
+        restore_method: if required_foreground {
+            "pending".to_owned()
+        } else {
+            "none_already_current".to_owned()
+        },
+        initial_set_foreground_window_result: None,
+        alt_unlock_attempted: false,
+        alt_unlock_set_foreground_window_result: None,
+        prior_foreground: before.public_readback(),
+        acquired_chrome_foreground: target.public_readback(),
+        current_before_restore: before.public_readback(),
+        final_foreground: before.public_readback(),
+    };
     tracing::info!(
         code = "BROWSER_SCREENSHOT_FOREGROUND_PREFLIGHT",
         hwnd = window_hwnd,
-        human_os_foreground_before_hwnd = before.hwnd,
-        human_os_foreground_before_pid = before.pid,
-        human_os_foreground_before_process = %before.process_name,
-        human_os_foreground_before_title = %before.window_title,
-        target_hwnd = target.hwnd,
-        target_pid = target.pid,
-        target_process = %target.process_name,
-        target_title = %target.window_title,
+        human_os_foreground_before_hwnd = before.context.hwnd,
+        human_os_foreground_before_pid = before.context.pid,
+        human_os_foreground_before_process_started_at_100ns = before.process_started_at_100ns,
+        target_hwnd = target.context.hwnd,
+        target_pid = target.context.pid,
+        target_process_started_at_100ns = target.process_started_at_100ns,
         required_foreground,
         "readback=GetForegroundWindow outcome=foreground_precondition_evaluated"
     );
 
-    if required_foreground {
-        synapse_a11y::focus_window_with_intent(
-            window_hwnd,
-            synapse_a11y::ForegroundActivationIntent::OperatorRequested { caller: TOOL },
-        )
-        .map_err(|error| {
+    if !required_foreground {
+        return Ok(BrowserScreenshotForegroundGuard {
+            before,
+            acquired_chrome: target,
+            readback,
+        });
+    }
+
+    let guard_for_failure = BrowserScreenshotForegroundGuard {
+        before: before.clone(),
+        acquired_chrome: target.clone(),
+        readback: readback.clone(),
+    };
+    readback.attempted = true;
+    readback.initial_set_foreground_window_result = Some(
+        synapse_a11y::set_foreground_window_exact(window_hwnd).map_err(|error| {
             mcp_error(
                 error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
                 format!(
-                    "browser_screenshot could not foreground Chrome HWND {window_hwnd:#x} before captureVisibleTab; before foreground was {}; focus error: {error}",
-                    browser_screenshot_foreground_summary(&before)
+                    "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_SET_FAILED hwnd={window_hwnd:#x} error={error} remediation=the exact Chrome HWND must accept the ordinary SetForegroundWindow transaction before capture"
                 ),
             )
-        })?;
-    }
-
-    let capture_foreground = match read_browser_screenshot_current_foreground("capture_ready") {
-        Ok(capture_foreground) => capture_foreground,
-        Err(error) => {
-            let guard = BrowserScreenshotForegroundGuard {
-                readback: BrowserScreenshotForegroundReadback {
-                    required_foreground,
-                    before_hwnd: Some(before.hwnd),
-                    capture_hwnd: None,
-                    after_restore_hwnd: None,
-                    restored_human_os_foreground: !required_foreground,
-                },
-                before,
-            };
+        })?,
+    );
+    let mut capture_foreground = wait_browser_screenshot_foreground_identity(&target, 900)?;
+    if capture_foreground.is_none() {
+        let current = read_browser_screenshot_current_foreground("after_initial_acquire")?;
+        if target.matches(&current) {
+            capture_foreground = Some(current);
+        } else if !before.matches(&current) {
+            let error = mcp_error(
+                error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+                format!(
+                    "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_OPERATOR_SUPERSEDED expected_prior={} actual={} remediation=retry after the operator finishes changing windows; no further focus write was issued",
+                    browser_screenshot_foreground_summary(&before),
+                    browser_screenshot_foreground_summary(&current)
+                ),
+            );
             return Err(browser_screenshot_prepare_failure_with_restore(
                 window_hwnd,
-                guard,
+                guard_for_failure,
                 error,
             ));
+        } else {
+            synapse_a11y::send_foreground_activation_nudge_exact().map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+                    format!(
+                        "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_ALT_UNLOCK_FAILED hwnd={window_hwnd:#x} error={error} remediation=repair paired ALT SendInput; no retry SetForegroundWindow was issued"
+                    ),
+                )
+            })?;
+            readback.alt_unlock_attempted = true;
+            let commit = read_browser_screenshot_current_foreground("before_alt_acquire_retry")?;
+            if !before.matches(&commit) {
+                let error = mcp_error(
+                    error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+                    format!(
+                        "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_OPERATOR_SUPERSEDED_AFTER_ALT expected_prior={} actual={} remediation=retry after the operator finishes changing windows; no retry focus write was issued",
+                        browser_screenshot_foreground_summary(&before),
+                        browser_screenshot_foreground_summary(&commit)
+                    ),
+                );
+                return Err(browser_screenshot_prepare_failure_with_restore(
+                    window_hwnd,
+                    guard_for_failure,
+                    error,
+                ));
+            }
+            readback.alt_unlock_set_foreground_window_result = Some(
+                synapse_a11y::set_foreground_window_exact(window_hwnd).map_err(|error| {
+                    mcp_error(
+                        error_codes::ACTION_LAUNCH_FOREGROUND_FAILED,
+                        format!(
+                            "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_ALT_RETRY_SET_FAILED hwnd={window_hwnd:#x} error={error} remediation=the exact Chrome HWND must accept the sole bounded retry"
+                        ),
+                    )
+                })?,
+            );
+            capture_foreground = wait_browser_screenshot_foreground_identity(&target, 1_500)?;
         }
-    };
-    if capture_foreground.hwnd != window_hwnd {
-        tracing::error!(
-            code = error_codes::ACTION_POSTCONDITION_FAILED,
-            hwnd = window_hwnd,
-            before_hwnd = before.hwnd,
-            before_pid = before.pid,
-            before_process = %before.process_name,
-            capture_hwnd = capture_foreground.hwnd,
-            capture_pid = capture_foreground.pid,
-            capture_process = %capture_foreground.process_name,
-            capture_title = %capture_foreground.window_title,
-            required_foreground,
-            "browser_screenshot foreground precondition failed after explicit activation"
-        );
+    }
+    let Some(capture_foreground) = capture_foreground else {
         let error = mcp_error(
             error_codes::ACTION_POSTCONDITION_FAILED,
             format!(
-                "browser_screenshot refused captureVisibleTab because Chrome HWND {window_hwnd:#x} was not the physical OS foreground after activation; actual foreground was {}",
-                browser_screenshot_foreground_summary(&capture_foreground)
+                "BROWSER_SCREENSHOT_FOREGROUND_ACQUIRE_REFUSED hwnd={window_hwnd:#x} prior={} remediation=Windows refused the ordinary and paired-ALT-unlock SetForegroundWindow attempts; inspect foreground-lock policy and retry without changing the target",
+                browser_screenshot_foreground_summary(&before)
             ),
         );
-        let guard = BrowserScreenshotForegroundGuard {
-            readback: BrowserScreenshotForegroundReadback {
-                required_foreground,
-                before_hwnd: Some(before.hwnd),
-                capture_hwnd: Some(capture_foreground.hwnd),
-                after_restore_hwnd: None,
-                restored_human_os_foreground: !required_foreground,
-            },
-            before,
-        };
         return Err(browser_screenshot_prepare_failure_with_restore(
             window_hwnd,
-            guard,
+            guard_for_failure,
             error,
         ));
-    }
+    };
+    readback.acquired_chrome_foreground = capture_foreground.public_readback();
+    readback.current_before_restore = capture_foreground.public_readback();
+    readback.final_foreground = capture_foreground.public_readback();
+    readback.restored = false;
+    readback.outcome = "capture_foreground_acquired".to_owned();
+    readback.restore_method = "pending".to_owned();
 
     tracing::info!(
         code = "BROWSER_SCREENSHOT_FOREGROUND_VERIFIED",
         hwnd = window_hwnd,
-        human_os_foreground_before_hwnd = before.hwnd,
-        human_os_foreground_capture_hwnd = capture_foreground.hwnd,
-        human_os_foreground_capture_pid = capture_foreground.pid,
-        human_os_foreground_capture_process = %capture_foreground.process_name,
+        human_os_foreground_before_hwnd = before.context.hwnd,
+        human_os_foreground_capture_hwnd = capture_foreground.context.hwnd,
+        human_os_foreground_capture_pid = capture_foreground.context.pid,
+        human_os_foreground_capture_process_started_at_100ns =
+            capture_foreground.process_started_at_100ns,
         required_foreground,
         "readback=GetForegroundWindow outcome=target_chrome_foreground_verified"
     );
 
     Ok(BrowserScreenshotForegroundGuard {
-        readback: BrowserScreenshotForegroundReadback {
-            required_foreground,
-            before_hwnd: Some(before.hwnd),
-            capture_hwnd: Some(capture_foreground.hwnd),
-            after_restore_hwnd: None,
-            restored_human_os_foreground: !required_foreground,
-        },
         before,
+        acquired_chrome: capture_foreground,
+        readback,
     })
 }
 
@@ -16428,156 +16464,186 @@ fn finish_browser_screenshot_foreground(
     window_hwnd: i64,
     guard: BrowserScreenshotForegroundGuard,
     capture_error: Option<&ErrorData>,
-) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
-    const TOOL: &str = "browser_screenshot";
+) -> Result<BrowserScreenshotForegroundTransactionReadback, ErrorData> {
     let mut readback = guard.readback;
     let before = guard.before;
+    let acquired_chrome = guard.acquired_chrome;
     let current = read_browser_screenshot_current_foreground("after_bridge_capture")?;
-    readback.after_restore_hwnd = Some(current.hwnd);
+    readback.current_before_restore = current.public_readback();
+    readback.final_foreground = current.public_readback();
 
-    if !readback.required_foreground {
-        if current.hwnd == before.hwnd && current.pid == before.pid {
-            readback.restored_human_os_foreground = true;
+    if !readback.required {
+        if current.matches(&before) {
+            readback.restored = true;
+            readback.outcome = "chrome_already_foreground_noop".to_owned();
+            readback.restore_method = "none_already_current".to_owned();
             return Ok(readback);
         }
-        tracing::error!(
-            code = error_codes::ACTION_POSTCONDITION_FAILED,
-            hwnd = window_hwnd,
-            before_hwnd = before.hwnd,
-            before_pid = before.pid,
-            current_hwnd = current.hwnd,
-            current_pid = current.pid,
-            current_process = %current.process_name,
-            current_title = %current.window_title,
-            capture_error = ?capture_error,
-            "browser_screenshot detected unexpected physical foreground drift while target was already foreground"
-        );
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            format!(
-                "browser_screenshot physical foreground drifted from {} to {} during capture",
-                browser_screenshot_foreground_summary(&before),
-                browser_screenshot_foreground_summary(&current)
-            ),
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &current,
+            "operator_superseded_during_capture",
         ));
     }
 
-    if current.hwnd == before.hwnd && current.pid == before.pid {
-        readback.restored_human_os_foreground = true;
+    if current.matches(&before) {
+        readback.restored = true;
+        readback.outcome = "already_restored".to_owned();
+        readback.restore_method = "none_already_current".to_owned();
         tracing::info!(
             code = "BROWSER_SCREENSHOT_FOREGROUND_ALREADY_RESTORED",
             hwnd = window_hwnd,
-            human_os_foreground_before_hwnd = before.hwnd,
-            human_os_foreground_after_restore_hwnd = current.hwnd,
+            human_os_foreground_before_hwnd = before.context.hwnd,
+            human_os_foreground_after_restore_hwnd = current.context.hwnd,
             capture_error = ?capture_error,
             "readback=GetForegroundWindow outcome=foreground_already_back_at_pre_capture_hwnd"
         );
         return Ok(readback);
     }
 
-    if current.hwnd != window_hwnd {
-        tracing::error!(
-            code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
-            hwnd = window_hwnd,
-            before_hwnd = before.hwnd,
-            before_pid = before.pid,
-            current_hwnd = current.hwnd,
-            current_pid = current.pid,
-            current_process = %current.process_name,
-            current_title = %current.window_title,
-            capture_error = ?capture_error,
-            "browser_screenshot refused to restore because physical foreground changed away from the capture HWND"
-        );
+    if !current.matches(&acquired_chrome) {
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &current,
+            "operator_superseded_during_capture",
+        ));
+    }
+
+    let prior = read_browser_screenshot_window_identity(before.context.hwnd, "restore_target")?;
+    if !prior.matches(&before) {
         return Err(mcp_error(
-            error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
             format!(
-                "browser_screenshot captured with Chrome HWND {window_hwnd:#x}, but physical foreground changed to {} before restore; refusing to overwrite that foreground state",
-                browser_screenshot_foreground_summary(&current)
+                "BROWSER_SCREENSHOT_FOREGROUND_RESTORE_IDENTITY_CHANGED expected={} actual={} remediation=the prior HWND/PID/process-start identity was replaced or reused; no substitute window was focused",
+                browser_screenshot_foreground_summary(&before),
+                browser_screenshot_foreground_summary(&prior)
             ),
         ));
     }
 
-    let prior = synapse_a11y::foreground_context(before.hwnd).map_err(|error| {
-        mcp_error(
-            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-            format!(
-                "browser_screenshot could not inspect prior foreground HWND {:#x} before restore: {error}",
-                before.hwnd
-            ),
-        )
-    })?;
-    if prior.pid != before.pid {
-        tracing::error!(
-            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-            hwnd = window_hwnd,
-            before_hwnd = before.hwnd,
-            before_pid = before.pid,
-            prior_actual_pid = prior.pid,
-            prior_actual_process = %prior.process_name,
-            prior_actual_title = %prior.window_title,
-            capture_error = ?capture_error,
-            "browser_screenshot refused foreground restore because the prior HWND now belongs to another process"
-        );
-        return Err(mcp_error(
-            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-            format!(
-                "browser_screenshot refused to restore prior foreground HWND {:#x}: expected pid {}, actual pid {}",
-                before.hwnd, before.pid, prior.pid
-            ),
+    let commit = read_browser_screenshot_current_foreground("restore_commit")?;
+    readback.current_before_restore = commit.public_readback();
+    if !commit.matches(&acquired_chrome) {
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &commit,
+            "operator_superseded_during_restore",
         ));
     }
 
-    synapse_a11y::focus_window_with_intent(
-        before.hwnd,
-        synapse_a11y::ForegroundActivationIntent::LeaseContextRestore { caller: TOOL },
-    )
-    .map_err(|error| {
+    readback.attempted = true;
+    readback.initial_set_foreground_window_result = Some(
+        synapse_a11y::set_foreground_window_exact(before.context.hwnd).map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                format!(
+                    "BROWSER_SCREENSHOT_FOREGROUND_RESTORE_SET_FAILED target={} error={error} remediation=the exact prior HWND must accept the ordinary SetForegroundWindow transaction",
+                    browser_screenshot_foreground_summary(&before)
+                ),
+            )
+        })?,
+    );
+    if let Some(restored) = wait_browser_screenshot_foreground_identity(&before, 900)? {
+        readback.restored = true;
+        readback.outcome = "restored".to_owned();
+        readback.restore_method = "set_foreground_window".to_owned();
+        readback.final_foreground = restored.public_readback();
+        tracing::info!(
+            code = "BROWSER_SCREENSHOT_FOREGROUND_RESTORED",
+            hwnd = window_hwnd,
+            human_os_foreground_before_hwnd = before.context.hwnd,
+            human_os_foreground_before_pid = before.context.pid,
+            human_os_foreground_after_restore_hwnd = restored.context.hwnd,
+            human_os_foreground_after_restore_pid = restored.context.pid,
+            capture_error = ?capture_error,
+            "readback=GetForegroundWindow outcome=foreground_restored_to_pre_capture_hwnd"
+        );
+        return Ok(readback);
+    }
+
+    let after_initial = read_browser_screenshot_current_foreground("after_initial_restore")?;
+    readback.final_foreground = after_initial.public_readback();
+    if before.matches(&after_initial) {
+        readback.restored = true;
+        readback.outcome = "restored_after_false_return".to_owned();
+        readback.restore_method = "set_foreground_window_readback".to_owned();
+        return Ok(readback);
+    }
+    if !after_initial.matches(&acquired_chrome) {
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &after_initial,
+            "operator_superseded_during_restore",
+        ));
+    }
+
+    synapse_a11y::send_foreground_activation_nudge_exact().map_err(|error| {
         mcp_error(
             error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
             format!(
-                "browser_screenshot captured with Chrome HWND {window_hwnd:#x} but failed to restore prior foreground {}; restore error: {error}",
+                "BROWSER_SCREENSHOT_FOREGROUND_RESTORE_ALT_UNLOCK_FAILED target={} error={error} remediation=repair paired ALT SendInput; the retry focus write was not issued",
                 browser_screenshot_foreground_summary(&before)
             ),
         )
     })?;
-
-    let restored = read_browser_screenshot_current_foreground("after_restore")?;
-    readback.after_restore_hwnd = Some(restored.hwnd);
-    if restored.hwnd == before.hwnd && restored.pid == before.pid {
-        readback.restored_human_os_foreground = true;
-        tracing::info!(
-            code = "BROWSER_SCREENSHOT_FOREGROUND_RESTORED",
-            hwnd = window_hwnd,
-            human_os_foreground_before_hwnd = before.hwnd,
-            human_os_foreground_before_pid = before.pid,
-            human_os_foreground_after_restore_hwnd = restored.hwnd,
-            human_os_foreground_after_restore_pid = restored.pid,
-            capture_error = ?capture_error,
-            "readback=GetForegroundWindow outcome=foreground_restored_to_pre_capture_hwnd"
-        );
-        Ok(readback)
-    } else {
-        tracing::error!(
-            code = error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-            hwnd = window_hwnd,
-            before_hwnd = before.hwnd,
-            before_pid = before.pid,
-            restored_hwnd = restored.hwnd,
-            restored_pid = restored.pid,
-            restored_process = %restored.process_name,
-            restored_title = %restored.window_title,
-            capture_error = ?capture_error,
-            "browser_screenshot foreground restore readback did not match the pre-capture foreground"
-        );
-        Err(mcp_error(
-            error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
-            format!(
-                "browser_screenshot restore readback mismatch: expected {}, actual {}",
-                browser_screenshot_foreground_summary(&before),
-                browser_screenshot_foreground_summary(&restored)
-            ),
-        ))
+    readback.alt_unlock_attempted = true;
+    let before_alt_retry = read_browser_screenshot_current_foreground("before_alt_restore_retry")?;
+    readback.final_foreground = before_alt_retry.public_readback();
+    if before.matches(&before_alt_retry) {
+        readback.restored = true;
+        readback.outcome = "restored_after_alt_unlock".to_owned();
+        readback.restore_method = "alt_unlock_readback".to_owned();
+        return Ok(readback);
     }
+    if !before_alt_retry.matches(&acquired_chrome) {
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &before_alt_retry,
+            "operator_superseded_during_restore",
+        ));
+    }
+    readback.alt_unlock_set_foreground_window_result = Some(
+        synapse_a11y::set_foreground_window_exact(before.context.hwnd).map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+                format!(
+                    "BROWSER_SCREENSHOT_FOREGROUND_RESTORE_ALT_RETRY_SET_FAILED target={} error={error} remediation=the exact prior HWND must accept the sole bounded retry",
+                    browser_screenshot_foreground_summary(&before)
+                ),
+            )
+        })?,
+    );
+    if let Some(restored) = wait_browser_screenshot_foreground_identity(&before, 1_500)? {
+        readback.restored = true;
+        readback.outcome = "restored".to_owned();
+        readback.restore_method = "alt_unlock_set_foreground_window".to_owned();
+        readback.final_foreground = restored.public_readback();
+        return Ok(readback);
+    }
+    let final_foreground = read_browser_screenshot_current_foreground("restore_final")?;
+    readback.final_foreground = final_foreground.public_readback();
+    if before.matches(&final_foreground) {
+        readback.restored = true;
+        readback.outcome = "restored_after_false_alt_return".to_owned();
+        readback.restore_method = "alt_unlock_set_foreground_window_readback".to_owned();
+        return Ok(readback);
+    }
+    if !final_foreground.matches(&acquired_chrome) {
+        return Ok(browser_screenshot_operator_superseded_readback(
+            readback,
+            &final_foreground,
+            "operator_superseded_during_restore",
+        ));
+    }
+    Err(mcp_error(
+        error_codes::ACTION_FOREGROUND_CONTEXT_RESTORE_FAILED,
+        format!(
+            "BROWSER_SCREENSHOT_FOREGROUND_RESTORE_REFUSED prior={} acquired_chrome={} final={} remediation=Windows refused both exact restore attempts while the transaction still owned Chrome; inspect foreground-lock policy and retry",
+            browser_screenshot_foreground_summary(&before),
+            browser_screenshot_foreground_summary(&acquired_chrome),
+            browser_screenshot_foreground_summary(&final_foreground)
+        ),
+    ))
 }
 
 #[cfg(windows)]
@@ -16606,29 +16672,159 @@ fn finish_browser_screenshot_foreground(
     _window_hwnd: i64,
     _guard: BrowserScreenshotForegroundGuard,
     _capture_error: Option<&ErrorData>,
-) -> Result<BrowserScreenshotForegroundReadback, ErrorData> {
-    Ok(BrowserScreenshotForegroundReadback::default())
+) -> Result<BrowserScreenshotForegroundTransactionReadback, ErrorData> {
+    Ok(BrowserScreenshotForegroundTransactionReadback::default())
 }
 
 #[cfg(windows)]
 fn read_browser_screenshot_current_foreground(
     phase: &'static str,
-) -> Result<ForegroundContext, ErrorData> {
-    synapse_a11y::current_foreground_context().map_err(|error| {
+) -> Result<BrowserScreenshotForegroundIdentity, ErrorData> {
+    let context = synapse_a11y::current_foreground_context().map_err(|error| {
         mcp_error(
             error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
             format!(
                 "browser_screenshot could not read physical OS foreground during {phase}: {error}"
             ),
         )
+    })?;
+    browser_screenshot_foreground_identity_from_context(context, phase)
+}
+
+#[cfg(windows)]
+fn read_browser_screenshot_window_identity(
+    hwnd: i64,
+    phase: &'static str,
+) -> Result<BrowserScreenshotForegroundIdentity, ErrorData> {
+    let context = synapse_a11y::foreground_context(hwnd).map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "BROWSER_SCREENSHOT_FOREGROUND_IDENTITY_READ_FAILED phase={phase} hwnd={hwnd:#x} error={error} remediation=the exact HWND and owning process must remain inspectable"
+            ),
+        )
+    })?;
+    browser_screenshot_foreground_identity_from_context(context, phase)
+}
+
+#[cfg(windows)]
+fn browser_screenshot_foreground_identity_from_context(
+    context: ForegroundContext,
+    phase: &'static str,
+) -> Result<BrowserScreenshotForegroundIdentity, ErrorData> {
+    use windows::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, context.pid) }
+        .map_err(|error| {
+            mcp_error(
+                error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+                format!(
+                    "BROWSER_SCREENSHOT_FOREGROUND_PROCESS_OPEN_FAILED phase={phase} hwnd={:#x} pid={} error={error} remediation=the foreground owner must permit process identity readback",
+                    context.hwnd, context.pid
+                ),
+            )
+        })?;
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    let read = unsafe {
+        GetProcessTimes(
+            handle,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    };
+    let close = unsafe { CloseHandle(handle) };
+    if let Err(error) = close {
+        return Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "BROWSER_SCREENSHOT_FOREGROUND_PROCESS_HANDLE_CLOSE_FAILED phase={phase} hwnd={:#x} pid={} error={error} remediation=repair Win32 process identity handle lifecycle before retrying",
+                context.hwnd, context.pid
+            ),
+        ));
+    }
+    read.map_err(|error| {
+        mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "BROWSER_SCREENSHOT_FOREGROUND_PROCESS_TIMES_FAILED phase={phase} hwnd={:#x} pid={} error={error} remediation=GetProcessTimes must return the exact process creation identity",
+                context.hwnd, context.pid
+            ),
+        )
+    })?;
+    let process_started_at_100ns =
+        (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+    if process_started_at_100ns == 0 {
+        return Err(mcp_error(
+            error_codes::ACTION_FOREGROUND_CONTEXT_CAPTURE_FAILED,
+            format!(
+                "BROWSER_SCREENSHOT_FOREGROUND_PROCESS_START_INVALID phase={phase} hwnd={:#x} pid={} remediation=GetProcessTimes returned a zero creation identity",
+                context.hwnd, context.pid
+            ),
+        ));
+    }
+    Ok(BrowserScreenshotForegroundIdentity {
+        context,
+        process_started_at_100ns,
     })
 }
 
 #[cfg(windows)]
-fn browser_screenshot_foreground_summary(context: &ForegroundContext) -> String {
+fn wait_browser_screenshot_foreground_identity(
+    expected: &BrowserScreenshotForegroundIdentity,
+    max_wait_ms: u64,
+) -> Result<Option<BrowserScreenshotForegroundIdentity>, ErrorData> {
+    let started = Instant::now();
+    loop {
+        match read_browser_screenshot_current_foreground("bounded_identity_readback") {
+            Ok(current) if expected.matches(&current) => return Ok(Some(current)),
+            Ok(_) | Err(_) if started.elapsed().as_millis() < u128::from(max_wait_ms) => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(_) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn browser_screenshot_operator_superseded_readback(
+    mut readback: BrowserScreenshotForegroundTransactionReadback,
+    current: &BrowserScreenshotForegroundIdentity,
+    outcome: &'static str,
+) -> BrowserScreenshotForegroundTransactionReadback {
+    readback.restored = false;
+    readback.operator_superseded = true;
+    readback.outcome = outcome.to_owned();
+    readback.restore_method = "none_operator_superseded".to_owned();
+    readback.final_foreground = current.public_readback();
+    tracing::info!(
+        code = error_codes::FOREGROUND_RESTORE_SKIPPED_HUMAN_MOVED,
+        outcome,
+        current_hwnd = current.context.hwnd,
+        current_pid = current.context.pid,
+        current_process_started_at_100ns = current.process_started_at_100ns,
+        "browser_screenshot exact foreground transaction yielded to an operator-selected window"
+    );
+    readback
+}
+
+#[cfg(windows)]
+fn browser_screenshot_foreground_summary(context: &BrowserScreenshotForegroundIdentity) -> String {
     format!(
-        "hwnd={:#x} pid={} process={:?} title={:?}",
-        context.hwnd, context.pid, context.process_name, context.window_title
+        "hwnd={:#x} pid={} process_started_at_100ns={} process={:?} title={:?}",
+        context.context.hwnd,
+        context.context.pid,
+        context.process_started_at_100ns,
+        context.context.process_name,
+        context.context.window_title
     )
 }
 
@@ -17251,73 +17447,6 @@ fn capture_context_looks_like_transient_startup_hwnd(context: &ForegroundContext
     context.window_title.trim().is_empty()
         || context.window_bounds.w <= TRANSIENT_HWND_MAX_EDGE_PX
         || context.window_bounds.h <= TRANSIENT_HWND_MAX_EDGE_PX
-}
-
-/// #1341/#1343/#1517: true when a browser_screenshot bridge capture failed
-/// because the normal Chrome bridge direct-HTTP host disconnected mid-command.
-/// The only accepted recovery is a primary-lane retry after the bridge host
-/// reconnects; passive HWND capture is not an equivalent substitute.
-fn browser_screenshot_bridge_disconnected(error: &ErrorData) -> bool {
-    error
-        .message
-        .contains("disconnected before command response")
-        || error
-            .message
-            .contains("client closed direct HTTP WebSocket")
-}
-
-async fn browser_screenshot_retry_after_bridge_disconnect(
-    window_hwnd: i64,
-    cdp_target_id: &str,
-    bridge_payload: Value,
-    first_error: &ErrorData,
-) -> Result<crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult, ErrorData> {
-    tracing::warn!(
-        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY",
-        hwnd = window_hwnd,
-        cdp_target_id = %cdp_target_id,
-        wait_timeout_ms = BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
-        first_error = %first_error.message,
-        "browser_screenshot primary Chrome bridge disconnected mid-capture; waiting for bridge reconnect before one primary-lane retry"
-    );
-    let reconnect = crate::chrome_debugger_bridge::wait_for_active_bridge_host(
-        BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS,
-    )
-    .await
-    .map_err(|error| {
-        mcp_error(
-            error.code(),
-            format!(
-                "browser_screenshot Chrome bridge disconnected during capture and did not expose a usable reconnected host within {BROWSER_SCREENSHOT_BRIDGE_RECONNECT_RETRY_WAIT_MS} ms; first_error={}; reconnect_error={}. remediation=check health chrome_bridge last_disconnect_detail, reload the installed Synapse Chrome Bridge, then retry the same target-scoped browser_capture. No passive WGC fallback was used.",
-                first_error.message,
-                error.detail()
-            ),
-        )
-    })?;
-    tracing::info!(
-        code = "BROWSER_SCREENSHOT_BRIDGE_RECONNECTED_FOR_RETRY",
-        hwnd = window_hwnd,
-        cdp_target_id = %cdp_target_id,
-        host_id = %reconnect.host_id,
-        registered_unix_ms = reconnect.registered_unix_ms,
-        last_seen_unix_ms = reconnect.last_seen_unix_ms,
-        "readback=chrome_bridge_active_host_snapshot outcome=reconnected_before_screenshot_retry"
-    );
-    crate::chrome_debugger_bridge::page_screenshot(window_hwnd, cdp_target_id, bridge_payload)
-        .await
-        .map_err(|retry_error| {
-            let retry_detail = retry_error.detail().to_owned();
-            let retry_code = retry_error.code().to_owned();
-            let code = retry_error.code();
-            mcp_error(
-                code,
-                format!(
-                    "browser_screenshot Chrome bridge capture failed after reconnect retry; first_error={}; retry_code={retry_code}; retry_error={retry_detail}; host_id={}. No passive WGC fallback was used; the screenshot artifact was not written from a substitute capture lane.",
-                    first_error.message,
-                    reconnect.host_id
-                ),
-            )
-        })
 }
 
 #[cfg(windows)]
@@ -19854,17 +19983,17 @@ fn chrome_bridge_reload_response(
     session_id: &str,
     wait_timeout_ms: u64,
     reload: crate::chrome_debugger_bridge::ChromeBridgeReloadResult,
-) -> CdpBridgeReloadResponse {
-    CdpBridgeReloadResponse {
+) -> Result<CdpBridgeReloadResponse, ErrorData> {
+    Ok(CdpBridgeReloadResponse {
         session_id: session_id.to_owned(),
         required_foreground: true,
         wait_timeout_ms,
         before: reload.before.map(chrome_bridge_host_readback),
-        command_ack: chrome_bridge_reload_ack_readback(reload.command_ack),
+        command_ack: chrome_bridge_reload_ack_readback(reload.command_ack)?,
         after: chrome_bridge_host_readback(reload.after),
         reconnected: reload.reconnected,
         waited_ms: reload.waited_ms,
-    }
+    })
 }
 
 fn chrome_bridge_host_readback(
@@ -19903,8 +20032,20 @@ fn chrome_bridge_host_readback(
 
 fn chrome_bridge_reload_ack_readback(
     ack: crate::chrome_debugger_bridge::ChromeBridgeReloadCommandAck,
-) -> CdpBridgeReloadAckReadback {
-    CdpBridgeReloadAckReadback {
+) -> Result<CdpBridgeReloadAckReadback, ErrorData> {
+    let maintenance_tab = chrome_bridge_maintenance_tab_readback(&ack.maintenance_tab)?;
+    let maintenance_cleanup = chrome_bridge_maintenance_cleanup_readback(&ack.maintenance_cleanup)?;
+    let durable_profile_readback =
+        chrome_bridge_durable_profile_readback(&ack.durable_profile_readback)?;
+    if ack.reason == "existing_extension_permission_activation_ui_reload_invoked"
+        && durable_profile_readback.is_none()
+    {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/durable_profile_readback",
+            "a physical Chrome Preferences row poll for permission activation",
+        ));
+    }
+    Ok(CdpBridgeReloadAckReadback {
         ok: ack.ok,
         control_surface: ack.control_surface,
         required_foreground: ack.required_foreground,
@@ -19929,7 +20070,344 @@ fn chrome_bridge_reload_ack_readback(
         ui_before_enable_toggle_on: ack.ui_before_enable_toggle_on,
         ui_after_reload_button_present: ack.ui_after_reload_button_present,
         ui_after_enable_toggle_on: ack.ui_after_enable_toggle_on,
+        maintenance_tab,
+        maintenance_cleanup,
+        durable_profile_readback,
+    })
+}
+
+fn chrome_bridge_reload_evidence_error(pointer: &str, expected: &str) -> ErrorData {
+    mcp_error(
+        error_codes::CHROME_BRIDGE_HOST_RELOAD_FAILED,
+        format!(
+            "SYNAPSE_CHROME_BRIDGE_RELOAD_PUBLIC_EVIDENCE_INVALID field={pointer:?} expected={expected:?} remediation=the host-UI installer and daemon cleanup must return complete bounded typed ownership/readback evidence; inspect the installer structured payload and repair the named producer field"
+        ),
+    )
+}
+
+fn reload_evidence_value<'a>(
+    value: &'a Value,
+    pointer: &str,
+    expected: &str,
+) -> Result<&'a Value, ErrorData> {
+    value
+        .pointer(pointer)
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, expected))
+}
+
+fn reload_evidence_bool(value: &Value, pointer: &str) -> Result<bool, ErrorData> {
+    reload_evidence_value(value, pointer, "boolean")?
+        .as_bool()
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "boolean"))
+}
+
+fn reload_evidence_optional_bool(value: &Value, pointer: &str) -> Result<Option<bool>, ErrorData> {
+    let raw = reload_evidence_value(value, pointer, "boolean or null")?;
+    if raw.is_null() {
+        Ok(None)
+    } else {
+        raw.as_bool()
+            .map(Some)
+            .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "boolean or null"))
     }
+}
+
+fn reload_evidence_u64(value: &Value, pointer: &str) -> Result<u64, ErrorData> {
+    reload_evidence_value(value, pointer, "nonnegative integer")?
+        .as_u64()
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "nonnegative integer"))
+}
+
+fn reload_evidence_u32(value: &Value, pointer: &str) -> Result<u32, ErrorData> {
+    u32::try_from(reload_evidence_u64(value, pointer)?)
+        .map_err(|_| chrome_bridge_reload_evidence_error(pointer, "32-bit nonnegative integer"))
+}
+
+fn reload_evidence_usize(value: &Value, pointer: &str) -> Result<usize, ErrorData> {
+    usize::try_from(reload_evidence_u64(value, pointer)?)
+        .map_err(|_| chrome_bridge_reload_evidence_error(pointer, "platform-sized count"))
+}
+
+fn reload_evidence_i64(value: &Value, pointer: &str) -> Result<i64, ErrorData> {
+    reload_evidence_value(value, pointer, "signed integer")?
+        .as_i64()
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "signed integer"))
+}
+
+fn reload_evidence_string(
+    value: &Value,
+    pointer: &str,
+    max_chars: usize,
+) -> Result<String, ErrorData> {
+    let text = reload_evidence_value(value, pointer, "nonempty bounded string")?
+        .as_str()
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "nonempty bounded string"))?
+        .trim();
+    let len = text.chars().count();
+    if text.is_empty() || len > max_chars {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "nonempty bounded string",
+        ));
+    }
+    Ok(text.to_owned())
+}
+
+fn reload_evidence_array_len(value: &Value, pointer: &str) -> Result<usize, ErrorData> {
+    reload_evidence_value(value, pointer, "array")?
+        .as_array()
+        .map(Vec::len)
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "array"))
+}
+
+fn chrome_bridge_foreground_identity_readback(
+    value: &Value,
+    pointer: &str,
+) -> Result<CdpBridgeForegroundIdentityReadback, ErrorData> {
+    let identity_valid_pointer = format!("{pointer}/identity_valid");
+    if !reload_evidence_bool(value, &identity_valid_pointer)? {
+        return Err(chrome_bridge_reload_evidence_error(
+            &identity_valid_pointer,
+            "true exact HWND process identity",
+        ));
+    }
+    let hwnd_pointer = format!("{pointer}/hwnd");
+    let pid_pointer = format!("{pointer}/pid");
+    let started_pointer = format!("{pointer}/process_started_at_100ns");
+    let path_pointer = format!("{pointer}/executable_path");
+    let hwnd = reload_evidence_i64(value, &hwnd_pointer)?;
+    let pid = reload_evidence_u32(value, &pid_pointer)?;
+    let process_started_at_100ns = reload_evidence_u64(value, &started_pointer)?;
+    let executable_path = reload_evidence_string(value, &path_pointer, 32_768)?;
+    if hwnd <= 0 || pid == 0 || process_started_at_100ns == 0 {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "positive HWND/PID/process-start exact identity",
+        ));
+    }
+    Ok(CdpBridgeForegroundIdentityReadback {
+        hwnd,
+        pid,
+        process_started_at_100ns,
+        executable_path_sha256: sha256_hex(executable_path.as_bytes()),
+    })
+}
+
+fn chrome_bridge_maintenance_tab_readback(
+    value: &Value,
+) -> Result<CdpBridgeMaintenanceTabReadback, ErrorData> {
+    let ownership_source = reload_evidence_string(value, "/ownership_source", 160)?;
+    if ownership_source != "verified_uia_new_tab_marker_then_exact_chrome_tabs_token_resolution" {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/ownership_source",
+            "verified UIA-created tab ownership",
+        ));
+    }
+    let navigation_method = reload_evidence_string(value, "/operation_navigation/method", 160)?;
+    if navigation_method != "foreground_uia_value_set_enter_exact_readback" {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/operation_navigation/method",
+            "foreground_uia_value_set_enter_exact_readback",
+        ));
+    }
+    let navigation_purpose = reload_evidence_string(value, "/operation_navigation/purpose", 160)?;
+    let navigation_destination = match navigation_purpose.as_str() {
+        "existing_bridge_extension_details" => "chrome_extension_details",
+        "load_unpacked_extensions_page" => "chrome_extensions_load_unpacked",
+        _ => {
+            return Err(chrome_bridge_reload_evidence_error(
+                "/operation_navigation/purpose",
+                "an exact extension-management destination",
+            ));
+        }
+    };
+    Ok(CdpBridgeMaintenanceTabReadback {
+        ownership_source,
+        preexisting_tab_count: reload_evidence_usize(value, "/preexisting_tab_count")?,
+        owned_tab_runtime_id: reload_evidence_string(
+            value,
+            "/script_lease/owned_tab_runtime_id",
+            512,
+        )?,
+        chrome_window_hwnd: reload_evidence_i64(value, "/script_lease/chrome_window_hwnd")?,
+        chrome_window_pid: reload_evidence_u32(value, "/script_lease/chrome_window_pid")?,
+        tab_count_after_marker: reload_evidence_usize(
+            value,
+            "/script_lease/tab_strip_after_marker/count",
+        )?,
+        navigation_method,
+        navigation_destination: navigation_destination.to_owned(),
+        prior_foreground: chrome_bridge_foreground_identity_readback(
+            value,
+            "/script_lease/foreground_lease/prior_foreground",
+        )?,
+        acquired_chrome_foreground: chrome_bridge_foreground_identity_readback(
+            value,
+            "/script_lease/foreground_lease/acquired_chrome_foreground",
+        )?,
+    })
+}
+
+fn chrome_bridge_foreground_transaction_readback(
+    value: &Value,
+    pointer: &str,
+) -> Result<CdpBridgeForegroundTransactionReadback, ErrorData> {
+    let outcome_pointer = format!("{pointer}/outcome");
+    let method_pointer = format!("{pointer}/restore_method");
+    let outcome = reload_evidence_string(value, &outcome_pointer, 96)?;
+    let restore_method = reload_evidence_string(value, &method_pointer, 96)?;
+    let restored = reload_evidence_bool(value, &format!("{pointer}/restored"))?;
+    let operator_superseded =
+        reload_evidence_bool(value, &format!("{pointer}/operator_superseded"))?;
+    if restored == operator_superseded {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "exactly one of restored or operator_superseded",
+        ));
+    }
+    Ok(CdpBridgeForegroundTransactionReadback {
+        required: reload_evidence_bool(value, &format!("{pointer}/required"))?,
+        attempted: reload_evidence_bool(value, &format!("{pointer}/attempted"))?,
+        restored,
+        operator_superseded,
+        outcome,
+        restore_method,
+        initial_set_foreground_window_result: reload_evidence_optional_bool(
+            value,
+            &format!("{pointer}/initial_set_foreground_window_result"),
+        )?,
+        alt_unlock_attempted: reload_evidence_bool(
+            value,
+            &format!("{pointer}/alt_unlock_attempted"),
+        )?,
+        alt_unlock_set_foreground_window_result: reload_evidence_optional_bool(
+            value,
+            &format!("{pointer}/alt_unlock_set_foreground_window_result"),
+        )?,
+        prior_foreground: chrome_bridge_foreground_identity_readback(
+            value,
+            &format!("{pointer}/prior_foreground"),
+        )?,
+        acquired_chrome_foreground: chrome_bridge_foreground_identity_readback(
+            value,
+            &format!("{pointer}/acquired_chrome_foreground"),
+        )?,
+        current_before_restore: chrome_bridge_foreground_identity_readback(
+            value,
+            &format!("{pointer}/current_before_restore"),
+        )?,
+        final_foreground: chrome_bridge_foreground_identity_readback(
+            value,
+            &format!("{pointer}/final_foreground"),
+        )?,
+    })
+}
+
+fn chrome_bridge_maintenance_cleanup_readback(
+    value: &Value,
+) -> Result<CdpBridgeMaintenanceCleanupReadback, ErrorData> {
+    let attempted = reload_evidence_bool(value, "/attempted")?;
+    let closed = reload_evidence_bool(value, "/closed")?;
+    let absent_verified = reload_evidence_bool(value, "/absent_verified")?;
+    let missing_baseline_count = reload_evidence_array_len(value, "/missing_baseline_runtime_ids")?;
+    if !attempted || !closed || !absent_verified || missing_baseline_count != 0 {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/maintenance_cleanup",
+            "attempted exact close with absence proven and every baseline tab retained",
+        ));
+    }
+    let selection_pointer = "/prior_selection_restore";
+    let prior_selection_restore = CdpBridgePriorSelectionReadback {
+        attempted: reload_evidence_bool(value, &format!("{selection_pointer}/attempted"))?,
+        restored: reload_evidence_bool(value, &format!("{selection_pointer}/restored"))?,
+        reason: reload_evidence_string(value, &format!("{selection_pointer}/reason"), 128)?,
+        expected_runtime_id: reload_evidence_string(
+            value,
+            &format!("{selection_pointer}/expected_runtime_id"),
+            512,
+        )?,
+        before_runtime_id: reload_evidence_string(
+            value,
+            &format!("{selection_pointer}/before_runtime_id"),
+            512,
+        )?,
+        after_runtime_id: reload_evidence_string(
+            value,
+            &format!("{selection_pointer}/after_runtime_id"),
+            512,
+        )?,
+    };
+    if !prior_selection_restore.restored {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/prior_selection_restore/restored",
+            "true exact prior-tab selection readback",
+        ));
+    }
+    let bridge = "/bridge_post_cleanup";
+    let bridge_post_cleanup = CdpBridgePostCleanupReadback {
+        source_of_truth: reload_evidence_string(value, &format!("{bridge}/source_of_truth"), 128)?,
+        token_absent: reload_evidence_bool(value, &format!("{bridge}/token_absent"))?,
+        preexisting_tab_count: reload_evidence_usize(
+            value,
+            &format!("{bridge}/preexisting_tab_count"),
+        )?,
+        missing_preexisting_count: reload_evidence_usize(
+            value,
+            &format!("{bridge}/missing_preexisting_count"),
+        )?,
+        concurrent_tab_count: reload_evidence_usize(
+            value,
+            &format!("{bridge}/concurrent_tab_count"),
+        )?,
+        post_cleanup_tab_count: reload_evidence_usize(
+            value,
+            &format!("{bridge}/post_cleanup_tab_count"),
+        )?,
+    };
+    if !bridge_post_cleanup.token_absent || bridge_post_cleanup.missing_preexisting_count != 0 {
+        return Err(chrome_bridge_reload_evidence_error(
+            bridge,
+            "independent chrome.tabs token absence and baseline preservation",
+        ));
+    }
+    Ok(CdpBridgeMaintenanceCleanupReadback {
+        attempted,
+        closed,
+        absent_verified,
+        method: reload_evidence_string(value, "/method", 160)?,
+        tab_count_before_cleanup: reload_evidence_usize(value, "/tabs_before/count")?,
+        tab_count_after_cleanup: reload_evidence_usize(value, "/tabs_after/count")?,
+        missing_baseline_count,
+        concurrent_tab_count: reload_evidence_array_len(value, "/concurrent_runtime_ids")?,
+        prior_selection_restore,
+        foreground_transaction: chrome_bridge_foreground_transaction_readback(
+            value,
+            "/foreground_transaction",
+        )?,
+        bridge_post_cleanup,
+    })
+}
+
+fn chrome_bridge_durable_profile_readback(
+    value: &Value,
+) -> Result<Option<CdpBridgeDurableProfileReadback>, ErrorData> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let source_of_truth = reload_evidence_string(value, "/source_of_truth", 32_768)?;
+    Ok(Some(CdpBridgeDurableProfileReadback {
+        attempts: reload_evidence_u32(value, "/attempts")?,
+        elapsed_ms: reload_evidence_u64(value, "/elapsed_ms")?,
+        source_of_truth_sha256: sha256_hex(source_of_truth.as_bytes()),
+        permission_activation_pending_before: reload_evidence_bool(
+            value,
+            "/permission_activation_pending_before",
+        )?,
+        permission_activation_complete_after: reload_evidence_bool(
+            value,
+            "/permission_activation_complete_after",
+        )?,
+    }))
 }
 
 fn non_empty_text_sha256(value: &str) -> Option<String> {

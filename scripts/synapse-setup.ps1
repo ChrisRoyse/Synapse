@@ -1208,6 +1208,7 @@ function Invoke-SynapseChromeBridgeUiRepair {
         Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_READBACK_MISSING path=$InstallerPath remediation=installer did not return synapse_chrome_auto_install readback for the UI repair path"
     }
     $allowedReasons = @(
+        'existing_extension_permission_activation_ui_reload_invoked',
         'existing_ready_extension_ui_reload_invoked',
         'existing_ready_extension_nonstable_path_ui_reload_invoked',
         'migrated_existing_extension_to_credentialed_stable_path',

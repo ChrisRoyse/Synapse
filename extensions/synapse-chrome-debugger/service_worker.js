@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-07-durable-ledger-repair-v1";
-const BRIDGE_DECLARED_BUILD_SHA256 = "be6ecbf7df3da851af634133e08604704c885de504c12340be6b3fb728f093bf";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-exact-maintenance-foreground-v2";
+const BRIDGE_DECLARED_BUILD_SHA256 = "35908d1a0237fe49181794c18ba3e7e4df04d2322ce281cbd093f8e45e897aa6";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -5103,14 +5103,13 @@ async function handlePageScreenshot(params) {
     : null;
   const previousActiveTabId = Number.isInteger(previousActive?.id) ? previousActive.id : null;
   const beforeWindow = await chromeWindowState(before.chrome_window_id);
-  const previousFocusedWindow = await focusedChromeWindow();
-  const previousFocusedWindowId = Number.isInteger(previousFocusedWindow?.id)
-    ? previousFocusedWindow.id
-    : null;
+  if (!beforeWindow?.focused) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `pageScreenshot refused before page mutation because Chrome window ${before.chrome_window_id} is not focused; synapse-mcp must own and physically verify the OS foreground transaction`
+    );
+  }
   let activeForCapture = Boolean(before.active);
-  let focusedWindowForCapture = Boolean(beforeWindow?.focused);
-  let restoredPreviousWindowFocus = focusedWindowForCapture;
-  let requiredForeground = !focusedWindowForCapture;
   let restoredPreviousActive = false;
   let setup = null;
   let captureBackend = "chrome_tabs_extension";
@@ -5149,16 +5148,6 @@ async function handlePageScreenshot(params) {
         remainingPageScreenshotBudgetMs(commandDeadlineMs, "activate_tab")
       );
       activeForCapture = true;
-    }
-    if (!focusedWindowForCapture) {
-      await chrome.windows.update(before.chrome_window_id, { focused: true });
-      await waitForChromeWindowFocused(
-        before.chrome_window_id,
-        true,
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, "focus_window")
-      );
-      focusedWindowForCapture = true;
-      restoredPreviousWindowFocus = false;
     }
     const emulatedPageSurface =
       VIEWPORT_BASELINE_BY_TAB.has(selected.tabId) ||
@@ -5290,21 +5279,6 @@ async function handlePageScreenshot(params) {
     } else if (before.active) {
       restoredPreviousActive = true;
     }
-    if (
-      previousFocusedWindowId !== null &&
-      previousFocusedWindowId !== before.chrome_window_id &&
-      focusedWindowForCapture
-    ) {
-      try {
-        await chrome.windows.update(previousFocusedWindowId, { focused: true });
-        await waitForChromeWindowFocused(previousFocusedWindowId, true, 2000);
-        restoredPreviousWindowFocus = true;
-      } catch (error) {
-        console.warn(`Synapse pageScreenshot Chrome window focus restore failed for window ${previousFocusedWindowId}: ${errorMessage(error)}`);
-      }
-    } else if (beforeWindow?.focused) {
-      restoredPreviousWindowFocus = true;
-    }
   }
   const after = await tabPageState(selected.tabId, selected.target);
   return {
@@ -5323,9 +5297,8 @@ async function handlePageScreenshot(params) {
     previous_active_tab_id: previousActiveTabId,
     restored_previous_active: restoredPreviousActive,
     before_window: beforeWindow,
-    previous_focused_window_id: previousFocusedWindowId,
-    focused_window_for_capture: focusedWindowForCapture,
-    restored_previous_window_focus: restoredPreviousWindowFocus,
+    foreground_owner: "synapse_mcp_exact_os_foreground_transaction",
+    foreground_precondition_verified: true,
     image_format: request.format,
     quality: request.quality,
     omit_background: request.omitBackground,
@@ -5348,7 +5321,7 @@ async function handlePageScreenshot(params) {
       ? "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot"
       : "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
     backend_tier_used: captureBackend,
-    required_foreground: requiredForeground,
+    required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -15210,32 +15183,6 @@ async function chromeWindowState(windowId) {
       `chrome.windows.get(${windowId}) failed: ${errorMessage(error)}`
     );
   }
-}
-
-async function focusedChromeWindow() {
-  let windows;
-  try {
-    windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
-  } catch (error) {
-    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.windows.getAll(normal): ${errorMessage(error)}`);
-  }
-  return windows.find((windowInfo) => Boolean(windowInfo.focused)) || null;
-}
-
-async function waitForChromeWindowFocused(windowId, expected, waitTimeoutMs) {
-  const started = Date.now();
-  let last = null;
-  while (Date.now() - started <= waitTimeoutMs) {
-    last = await chromeWindowState(windowId);
-    if (Boolean(last?.focused) === expected) {
-      return last;
-    }
-    await sleep(50);
-  }
-  throw bridgeError(
-    ERROR_EXTENSION_TIMEOUT,
-    `Chrome window ${windowId} focused=${expected} readback did not settle within ${waitTimeoutMs}ms; last_focused=${Boolean(last?.focused)}`
-  );
 }
 
 async function tabTargets() {

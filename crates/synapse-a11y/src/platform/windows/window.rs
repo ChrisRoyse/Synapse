@@ -129,6 +129,21 @@ pub fn focus_window_with_intent(hwnd: i64, intent: ForegroundActivationIntent) -
     }
 }
 
+/// Issues one ordinary `SetForegroundWindow` call for the exact supplied HWND.
+/// The caller must independently verify the physical foreground identity and
+/// decide whether a bounded ALT-unlock retry is authorized.
+pub fn set_foreground_window_exact(hwnd: i64) -> A11yResult<bool> {
+    let hwnd = hwnd_from_wire_value(hwnd)?;
+    Ok(unsafe { SetForegroundWindow(hwnd) }.as_bool())
+}
+
+/// Emits the fully paired ALT press/release used by Windows' documented
+/// foreground-lock protocol. Partial insertion is an error and the release is
+/// reissued before returning so ALT cannot remain stranded.
+pub fn send_foreground_activation_nudge_exact() -> A11yResult<()> {
+    send_foreground_activation_nudge()
+}
+
 /// RAII attachment of this thread's input queue to another thread's.
 ///
 /// `AttachThreadInput(a, b, true)` joins the two threads' input queues; until it
