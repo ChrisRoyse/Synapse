@@ -1092,6 +1092,7 @@ $script:SynapseMcpSessionDeleteTimeoutSec = 120
 $script:SynapseSetupMaintenanceLockStream = $null
 $script:SynapseSetupMaintenanceLockPath = $null
 $script:SynapseSetupMaintenanceLockReason = $null
+$script:SynapseSetupMaintenanceLockToken = $null
 
 function Get-ProcessLineage {
     param([int]$StartPid = $PID)
@@ -1183,11 +1184,13 @@ function Acquire-SynapseSetupMaintenanceLock {
     $script:SynapseSetupMaintenanceLockStream = $stream
     $script:SynapseSetupMaintenanceLockPath = $Path
     $script:SynapseSetupMaintenanceLockReason = $Reason
+    $script:SynapseSetupMaintenanceLockToken = [Guid]::NewGuid().ToString('D')
     $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
     $lineageText = (Get-ProcessLineage | ForEach-Object { "{0}:{1}" -f $_.ProcessId, $_.Name }) -join ' <- '
     $owner = [ordered]@{
-        schema = 'synapse_setup_maintenance_lock/v1'
+        schema = 'synapse_setup_maintenance_lock/v2'
         state = 'held'
+        lock_token = $script:SynapseSetupMaintenanceLockToken
         reason = $Reason
         pid = $PID
         parent_pid = $self.ParentProcessId
@@ -1210,7 +1213,8 @@ function Acquire-SynapseSetupMaintenanceLock {
 function Release-SynapseSetupMaintenanceLock {
     param(
         [Parameter(Mandatory=$true)][ValidateSet('released','failed','bridge_pending')][string]$State,
-        [string]$ErrorMessage
+        [string]$ErrorMessage,
+        [switch]$BestEffort
     )
 
     if ($null -eq $script:SynapseSetupMaintenanceLockStream) {
@@ -1218,12 +1222,33 @@ function Release-SynapseSetupMaintenanceLock {
     }
 
     $stream = $script:SynapseSetupMaintenanceLockStream
+    $lockPath = $script:SynapseSetupMaintenanceLockPath
+    $lockReason = $script:SynapseSetupMaintenanceLockReason
+    $lockToken = $script:SynapseSetupMaintenanceLockToken
+    $releaseFailure = $null
     try {
+        $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 4096, $true)
+        try {
+            $heldText = $reader.ReadToEnd().Trim()
+        } finally {
+            $reader.Dispose()
+        }
+        try {
+            $held = $heldText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_SETUP_MAINTENANCE_LOCK_RELEASE_OWNER_INVALID phase=owner_readback path=$lockPath pid=$PID token=$lockToken detail=$($_.Exception.Message) remediation=preserve the lock record and inspect which setup invocation last wrote it"
+        }
+        if ([string]$held.state -ne 'held' -or [int]$held.pid -ne $PID -or [string]$held.lock_token -ne $lockToken) {
+            throw ("SYNAPSE_SETUP_MAINTENANCE_LOCK_RELEASE_OWNER_MISMATCH phase=owner_validation path={0} expected_pid={1} actual_pid={2} expected_token={3} actual_token={4} actual_state={5} remediation=do not overwrite another setup invocation; inspect the exact record and live process table" -f `
+                $lockPath, $PID, $held.pid, $lockToken, $held.lock_token, $held.state)
+        }
         $self = Get-CimInstance Win32_Process -Filter "ProcessId=$PID" -ErrorAction SilentlyContinue
         $owner = [ordered]@{
-            schema = 'synapse_setup_maintenance_lock/v1'
+            schema = 'synapse_setup_maintenance_lock/v2'
             state = $State
-            reason = $script:SynapseSetupMaintenanceLockReason
+            lock_token = $lockToken
+            reason = $lockReason
             pid = $PID
             parent_pid = if ($self) { $self.ParentProcessId } else { $null }
             process_name = if ($self) { $self.Name } else { $null }
@@ -1238,18 +1263,44 @@ function Release-SynapseSetupMaintenanceLock {
         }
         $json = $owner | ConvertTo-Json -Depth 6
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($json + "`n")
+        $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
         $stream.SetLength(0)
         $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
-        Info "Maintenance lock $State path=$script:SynapseSetupMaintenanceLockPath pid=$PID"
+
+        $stream.Seek(0, [System.IO.SeekOrigin]::Begin) | Out-Null
+        $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true, 4096, $true)
+        try {
+            $releasedText = $reader.ReadToEnd().Trim()
+        } finally {
+            $reader.Dispose()
+        }
+        try {
+            $released = $releasedText | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_SETUP_MAINTENANCE_LOCK_RELEASE_READBACK_INVALID phase=release_readback path=$lockPath pid=$PID token=$lockToken detail=$($_.Exception.Message) remediation=preserve the record and repair storage before running another setup"
+        }
+        if ([string]$released.state -ne $State -or [int]$released.pid -ne $PID -or [string]$released.lock_token -ne $lockToken) {
+            throw ("SYNAPSE_SETUP_MAINTENANCE_LOCK_RELEASE_READBACK_MISMATCH phase=release_readback path={0} expected_state={1} actual_state={2} expected_pid={3} actual_pid={4} expected_token={5} actual_token={6} remediation=preserve the record and repair storage before running another setup" -f `
+                $lockPath, $State, $released.state, $PID, $released.pid, $lockToken, $released.lock_token)
+        }
     } catch {
-        Info "WARN: could not write maintenance lock release state path=$script:SynapseSetupMaintenanceLockPath error=$($_.Exception.Message)"
+        $releaseFailure = "SYNAPSE_SETUP_MAINTENANCE_LOCK_RELEASE_FAILED phase=release state=$State path=$lockPath pid=$PID token=$lockToken detail=$($_.Exception.Message) remediation=preserve and inspect the exact lock record plus process table; do not start another setup until the OS handle is free and ownership is understood"
     } finally {
         $stream.Dispose()
         $script:SynapseSetupMaintenanceLockStream = $null
         $script:SynapseSetupMaintenanceLockPath = $null
         $script:SynapseSetupMaintenanceLockReason = $null
+        $script:SynapseSetupMaintenanceLockToken = $null
     }
+    if ($releaseFailure) {
+        if ($BestEffort) {
+            try { Info "WARN: $releaseFailure" } catch {}
+            return
+        }
+        throw $releaseFailure
+    }
+    try { Info "Maintenance lock $State path=$lockPath pid=$PID token=$lockToken" } catch {}
 }
 
 function Wait-SynapsePostExitParent {
@@ -1386,7 +1437,7 @@ trap {
         } catch {
             Info "WARN: could not write setup repair manifest bridge-pending state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
         }
-        Release-SynapseSetupMaintenanceLock -State bridge_pending -ErrorMessage $errorText
+        Release-SynapseSetupMaintenanceLock -State bridge_pending -ErrorMessage $errorText -BestEffort
         break
     }
     try {
@@ -1401,7 +1452,7 @@ trap {
     } catch {
         Info "WARN: could not write setup repair manifest failure state path=$script:SynapseSetupRepairManifestPath error=$($_.Exception.Message)"
     }
-    Release-SynapseSetupMaintenanceLock -State failed -ErrorMessage $errorText
+    Release-SynapseSetupMaintenanceLock -State failed -ErrorMessage $errorText -BestEffort
     break
 }
 
@@ -15735,11 +15786,16 @@ Write-SynapseSetupRepairManifestState `
     -ExitCode 0 `
     -Readback $setupRepairCompletionReadback
 
+# The maintenance record and completion ledger are the durable success
+# authorities. Publish them before any informational output: a setup child may
+# legitimately outlive a bounded caller, whose stdout pipe is no longer a
+# dependency the transaction can trust (#2207).
+Release-SynapseSetupMaintenanceLock -State released
+$phaseLedgerPath = Write-SynapseSetupPhaseLedger -Outcome 'completed' -Message 'setup completed'
 Step "Done"
 Info "Synapse daemon is live on http://$Bind (MCP: http://$Bind/mcp)."
 Info "Token: $TokenPath   DB: $DbPath   Profiles: $ProfilesDir"
 Info "WSL clients: run scripts/synapse-install.sh from WSL to wire Claude Code + Codex there."
-$phaseLedgerPath = Write-SynapseSetupPhaseLedger -Outcome 'completed' -Message 'setup completed'
 if ($phaseLedgerPath) {
     $ledgerReadback = Get-Content -LiteralPath $phaseLedgerPath -Raw | ConvertFrom-Json
     Info ("Setup wall clock: total={0}s phases={1} cargo_build_jobs={2} ledger={3}" -f `
@@ -15753,4 +15809,3 @@ if ($phaseLedgerPath) {
 } else {
     Warn "SYNAPSE_SETUP_PHASE_LEDGER_UNWRITTEN log_dir=$LogDir remediation=setup completed but its phase timing ledger could not be written; inspect LogDir permissions"
 }
-Release-SynapseSetupMaintenanceLock -State released
