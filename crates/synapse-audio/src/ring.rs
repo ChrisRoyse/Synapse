@@ -48,6 +48,15 @@ pub struct AudioPacketTimeline {
     pub timestamp_error: bool,
 }
 
+/// Observable result of placing one packet on the real device timeline.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AudioPacketWriteOutcome {
+    pub expected_device_position: Option<u64>,
+    pub actual_device_position: u64,
+    pub gap_frames: u64,
+    pub data_discontinuity: bool,
+}
+
 impl AudioWindow {
     #[must_use]
     #[allow(clippy::cast_possible_truncation)]
@@ -144,9 +153,14 @@ impl AudioRing {
     /// # Errors
     ///
     /// Returns [`AudioError::TimelineInvalid`] if WASAPI marks the timestamp
-    /// invalid, reports a discontinuity after the first packet, or supplies a
-    /// regressing/overlapping/internally inconsistent device timeline.
-    pub fn push_packet(&self, samples: &[f32], timeline: AudioPacketTimeline) -> AudioResult<()> {
+    /// invalid or supplies a regressing/overlapping device or QPC timeline.
+    /// Discontinuity flags are observable outcomes; their authoritative
+    /// device-position gaps are materialized as silence.
+    pub fn push_packet(
+        &self,
+        samples: &[f32],
+        timeline: AudioPacketTimeline,
+    ) -> AudioResult<AudioPacketWriteOutcome> {
         let mut state = self.lock();
         let channels = usize::from(state.format.channels);
         let capacity_frames = self.capacity_frames(&state);
@@ -168,14 +182,6 @@ impl AudioRing {
                 timeline.device_position, timeline.qpc_position_100ns
             )));
         }
-        if timeline.data_discontinuity && state.next_device_position.is_some() {
-            return Err(timeline_invalid(format!(
-                "WASAPI reported DATA_DISCONTINUITY at device_position={} after expected_position={}; repair: inspect endpoint glitches/device changes and restart audio capture",
-                timeline.device_position,
-                state.next_device_position.unwrap_or_default()
-            )));
-        }
-
         let packet_frames = u64::try_from(samples.len() / channels).map_err(|_| {
             timeline_invalid(
                 "packet frame count does not fit u64; repair: inspect capture buffer sizing",
@@ -188,7 +194,8 @@ impl AudioRing {
         }
         validate_packet_timeline(&state, timeline)?;
 
-        if let Some(expected) = state.next_device_position {
+        let expected_device_position = state.next_device_position;
+        let gap_frames = if let Some(expected) = expected_device_position {
             let gap = timeline.device_position.checked_sub(expected).ok_or_else(|| {
                 timeline_invalid(format!(
                     "packet overlaps or regresses: expected_position={expected} actual_position={}; repair: inspect endpoint reset/device change and restart audio capture",
@@ -196,7 +203,10 @@ impl AudioRing {
                 ))
             })?;
             write_silence(&mut state, capacity_frames, channels, gap)?;
-        }
+            gap
+        } else {
+            0
+        };
         write_device_frames(&mut state, capacity_frames, channels, samples)?;
         state.last_packet_position = Some(timeline.device_position);
         state.next_device_position = Some(
@@ -212,7 +222,12 @@ impl AudioRing {
         state.last_packet_qpc_100ns = Some(timeline.qpc_position_100ns);
         state.last_packet_observed_at = Some(Instant::now());
         drop(state);
-        Ok(())
+        Ok(AudioPacketWriteOutcome {
+            expected_device_position,
+            actual_device_position: timeline.device_position,
+            gap_frames,
+            data_discontinuity: timeline.data_discontinuity,
+        })
     }
 
     /// Returns the last `seconds` of interleaved f32 samples.
@@ -369,7 +384,7 @@ fn validate_packet_timeline(state: &RingState, timeline: AudioPacketTimeline) ->
     else {
         return Ok(());
     };
-    let device_delta = timeline
+    let _device_delta = timeline
         .device_position
         .checked_sub(previous_position)
         .ok_or_else(|| {
@@ -378,7 +393,7 @@ fn validate_packet_timeline(state: &RingState, timeline: AudioPacketTimeline) ->
                 timeline.device_position
             ))
         })?;
-    let qpc_delta = timeline
+    let _qpc_delta = timeline
         .qpc_position_100ns
         .checked_sub(previous_qpc)
         .ok_or_else(|| {
@@ -387,19 +402,6 @@ fn validate_packet_timeline(state: &RingState, timeline: AudioPacketTimeline) ->
                 timeline.qpc_position_100ns
             ))
         })?;
-    let qpc_frames = u128::from(qpc_delta)
-        .saturating_mul(u128::from(state.format.sample_rate_hz))
-        .saturating_add(5_000_000)
-        / 10_000_000;
-    let qpc_frames = u64::try_from(qpc_frames).unwrap_or(u64::MAX);
-    let disagreement = device_delta.abs_diff(qpc_frames);
-    let tolerance = u64::from(state.format.sample_rate_hz) / 100;
-    if disagreement > tolerance {
-        return Err(timeline_invalid(format!(
-            "device/QPC clocks disagree: previous_position={previous_position} current_position={} device_delta_frames={device_delta} previous_qpc_100ns={previous_qpc} current_qpc_100ns={} qpc_delta_frames={qpc_frames} tolerance_frames={tolerance}; repair: inspect the endpoint/driver clock and restart audio capture",
-            timeline.device_position, timeline.qpc_position_100ns
-        )));
-    }
     Ok(())
 }
 

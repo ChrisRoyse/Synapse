@@ -222,6 +222,9 @@ impl AudioRuntime {
             || LoopbackStatus {
                 running: false,
                 frames_captured: 0,
+                timeline_discontinuities: 0,
+                timeline_gap_frames: 0,
+                last_timeline_discontinuity: None,
                 last_error_code: None,
             },
             loopback::LoopbackHandle::status,

@@ -189,6 +189,8 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `AUDIO_DEVICE_LOST` | Audio device lost. |
 | `AUDIO_LOOPBACK_INIT_FAILED` | Audio loopback init failed. |
 | `AUDIO_TIMELINE_INVALID` | WASAPI packet positions/timestamps cannot form one trustworthy capture timeline. |
+| `AUDIO_TIMELINE_DISCONTINUITY` | Observable WASAPI capture gap; exact missed frames were preserved as silence and counted in audio health. |
+| `AUDIO_TIMELINE_GAP` | Device-position delta exposed missed capture frames without a discontinuity flag; exact gap was preserved as silence and counted. |
 | `AUDIO_STT_MODEL_NOT_LOADED` | STT model not loaded. |
 
 #### Action (§8.2)

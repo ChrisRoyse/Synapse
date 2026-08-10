@@ -2903,6 +2903,11 @@ impl SynapseService {
                         |code| format!("audio loopback error: {code}"),
                     )),
                     ring_buffer_seconds: Some(runtime.config().ring_seconds),
+                    audio_timeline_discontinuities_total: Some(
+                        loopback_status.timeline_discontinuities,
+                    ),
+                    audio_timeline_gap_frames_total: Some(loopback_status.timeline_gap_frames),
+                    audio_timeline_last_discontinuity: loopback_status.last_timeline_discontinuity,
                     stt_model_loaded: Some(runtime.stt_model_loaded()),
                     stt_backend_policy: Some(stt_readback.policy),
                     stt_selected_backend: stt_readback

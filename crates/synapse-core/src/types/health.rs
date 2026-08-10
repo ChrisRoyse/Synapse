@@ -1094,6 +1094,12 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ring_buffer_seconds: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_timeline_discontinuities_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_timeline_gap_frames_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_timeline_last_discontinuity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_model_loaded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stt_backend_policy: Option<String>,

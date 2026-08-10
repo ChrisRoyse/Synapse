@@ -142,9 +142,13 @@ re-sized when `set_format` changes the format.
 | `tail_seconds(&self, seconds: f32) -> AudioResult<AudioWindow>` | Returns last `seconds` of samples |
 
 **Write/overwrite behavior.** `push_packet` refuses partial frames, timestamp-error
-packets, post-start discontinuity flags, regressing/overlapping device positions, and
-device/QPC clock disagreement beyond 10 ms. Its errors name both timing coordinates and
-the operator repair. Valid gaps are written as zero-valued, non-device frames. A gap at
+packets, regressing/overlapping device positions, and regressing QPC timestamps. Its
+errors name both timing coordinates and the operator repair. A WASAPI
+`DATA_DISCONTINUITY` is an observable capture-gap signal, not a fatal stream error:
+the exact missed-frame count is derived from consecutive device positions, written as
+zero-valued non-device frames, counted in loopback status/metrics, and logged with both
+positions. This follows Microsoft's capture guidance and never stitches prior samples
+across an unrepresented gap. Any valid gap is handled the same way. A gap at
 least as large as the ring capacity clears both backing arrays and advances the logical
 cursor in O(capacity), so long idle periods do not cause work proportional to idle time.
 Packet frames then overwrite the oldest slots modulo `capacity_frames`.
@@ -178,6 +182,9 @@ incremented per captured frame batch).
 |---|---|---|
 | `running` | `bool` | Capture thread active |
 | `frames_captured` | `u64` | Lifetime captured frames |
+| `timeline_discontinuities` | `u64` | Count of WASAPI discontinuity signals preserved as explicit gaps |
+| `timeline_gap_frames` | `u64` | Cumulative device-position gap frames inserted as silence |
+| `last_timeline_discontinuity` | `Option<String>` | Exact expected/actual position and gap for the latest discontinuity |
 | `last_error_code` | `Option<String>` | Last `AudioError::code()`, omitted when `None` |
 
 ### 3.2 Public API
