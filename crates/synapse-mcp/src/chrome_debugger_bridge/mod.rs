@@ -5947,20 +5947,34 @@ async fn run_chrome_bridge_host_ui_cleanup(
         .get("owned_tab_runtime_id")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let selected_before = lease
+    let baseline_tabs = lease
         .pointer("/tab_strip_before_create/tabs")
         .and_then(Value::as_array)
-        .map(|tabs| {
-            tabs.iter()
-                .filter(|tab| tab.get("selected").and_then(Value::as_bool) == Some(true))
-                .collect::<Vec<_>>()
-        })
+        .cloned()
         .unwrap_or_default();
-    let selected_runtime_id = selected_before
-        .first()
-        .and_then(|tab| tab.get("runtime_id"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let mut sanitized_baseline_tabs = Vec::with_capacity(baseline_tabs.len());
+    let mut baseline_runtime_ids = std::collections::HashSet::new();
+    let mut selected_before_count = 0_usize;
+    let mut baseline_invalid_count = 0_usize;
+    for tab in &baseline_tabs {
+        let runtime_id = tab.get("runtime_id").and_then(Value::as_str).unwrap_or("");
+        let selected = tab.get("selected").and_then(Value::as_bool);
+        if runtime_id.is_empty()
+            || runtime_id.chars().count() > 512
+            || selected.is_none()
+            || !baseline_runtime_ids.insert(runtime_id.to_owned())
+        {
+            baseline_invalid_count = baseline_invalid_count.saturating_add(1);
+            continue;
+        }
+        if selected == Some(true) {
+            selected_before_count = selected_before_count.saturating_add(1);
+        }
+        sanitized_baseline_tabs.push(json!({
+            "selected": selected,
+            "runtime_id": runtime_id,
+        }));
+    }
     let foreground_lease = lease
         .get("foreground_lease")
         .filter(|value| value.is_object());
@@ -6010,8 +6024,12 @@ async fn run_chrome_bridge_host_ui_cleanup(
         || chrome_window_pid == 0
         || expected_tab_count_after_cleanup.is_none()
         || owned_tab_runtime_id.is_empty()
-        || selected_before.len() != 1
-        || selected_runtime_id.is_empty()
+        || baseline_tabs.is_empty()
+        || baseline_tabs.len() > 512
+        || expected_tab_count_after_cleanup != u64::try_from(baseline_tabs.len()).ok()
+        || baseline_invalid_count != 0
+        || selected_before_count != 1
+        || baseline_runtime_ids.contains(owned_tab_runtime_id)
         || foreground_lease.is_none()
         || !prior_foreground_valid
         || prior_foreground_hwnd <= 0
@@ -6025,15 +6043,18 @@ async fn run_chrome_bridge_host_ui_cleanup(
         || acquired_foreground_path.is_empty()
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} owned_runtime_id_present={} selected_before_count={} selected_runtime_id_present={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} remediation=the first installer must return one exact UI-created lease, pre-operation selected-tab runtime identity, and exact prior/acquired HWND/PID/process-start/image foreground identities",
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} expected_count_matches_baseline={} owned_runtime_id_present={} baseline_count={} baseline_invalid_count={} selected_before_count={} owned_absent_from_baseline={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} remediation=the first installer must return the complete bounded unique pre-operation UIA runtime-id set with one selected tab, plus exact prior/acquired HWND/PID/process-start/image foreground identities",
             ownership_source,
             created_via_ui,
             chrome_window_hwnd,
             chrome_window_pid,
             expected_tab_count_after_cleanup.is_some(),
+            expected_tab_count_after_cleanup == u64::try_from(baseline_tabs.len()).ok(),
             !owned_tab_runtime_id.is_empty(),
-            selected_before.len(),
-            !selected_runtime_id.is_empty(),
+            baseline_tabs.len(),
+            baseline_invalid_count,
+            selected_before_count,
+            !baseline_runtime_ids.contains(owned_tab_runtime_id),
             foreground_lease.is_some(),
             prior_foreground_valid,
             prior_foreground_hwnd,
@@ -6060,10 +6081,8 @@ async fn run_chrome_bridge_host_ui_cleanup(
         "marker_title": lease_marker_title,
         "expected_tab_count_after_cleanup": expected_tab_count_after_cleanup,
         "tab_strip_before_create": {
-            "tabs": [{
-                "selected": true,
-                "runtime_id": selected_runtime_id,
-            }],
+            "count": sanitized_baseline_tabs.len(),
+            "tabs": sanitized_baseline_tabs,
         },
         "foreground_lease": foreground_lease.cloned().unwrap_or(Value::Null),
     });

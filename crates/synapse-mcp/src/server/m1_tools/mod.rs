@@ -20035,6 +20035,43 @@ fn chrome_bridge_reload_ack_readback(
 ) -> Result<CdpBridgeReloadAckReadback, ErrorData> {
     let maintenance_tab = chrome_bridge_maintenance_tab_readback(&ack.maintenance_tab)?;
     let maintenance_cleanup = chrome_bridge_maintenance_cleanup_readback(&ack.maintenance_cleanup)?;
+    let expected_during_maintenance = maintenance_tab
+        .preexisting_tab_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            chrome_bridge_reload_evidence_error(
+                "/maintenance_tab/preexisting_tab_count",
+                "a bounded count that admits one owned maintenance tab",
+            )
+        })?;
+    let expected_post_cleanup = maintenance_tab
+        .preexisting_tab_count
+        .checked_add(maintenance_cleanup.concurrent_tab_count)
+        .ok_or_else(|| {
+            chrome_bridge_reload_evidence_error(
+                "/maintenance_cleanup/concurrent_tab_count",
+                "a bounded post-cleanup tab count",
+            )
+        })?;
+    if maintenance_tab.tab_count_after_marker != expected_during_maintenance
+        || maintenance_cleanup.tab_count_before_cleanup != expected_during_maintenance
+        || maintenance_cleanup.tab_count_after_cleanup != expected_post_cleanup
+        || maintenance_cleanup
+            .bridge_post_cleanup
+            .preexisting_tab_count
+            != maintenance_tab.preexisting_tab_count
+        || maintenance_cleanup.bridge_post_cleanup.concurrent_tab_count
+            != maintenance_cleanup.concurrent_tab_count
+        || maintenance_cleanup
+            .bridge_post_cleanup
+            .post_cleanup_tab_count
+            != maintenance_cleanup.tab_count_after_cleanup
+    {
+        return Err(chrome_bridge_reload_evidence_error(
+            "/maintenance_cleanup",
+            "mutually consistent UIA and independent chrome.tabs baseline/concurrent/pre/post counts",
+        ));
+    }
     let durable_profile_readback =
         chrome_bridge_durable_profile_readback(&ack.durable_profile_readback)?;
     if ack.reason == "existing_extension_permission_activation_ui_reload_invoked"
