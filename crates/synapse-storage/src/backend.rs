@@ -69,11 +69,11 @@ use crate::constellations::{
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
-    OwnedCfWriteBatch, PhysicalScanPage, RawRow, RevisionGuard, RevisionGuardConflict,
-    RevisionGuardedMutationOutcome, RevisionGuardedWriteOutcome, RevisionedRawValue,
-    STORAGE_REVISION_GUARD_INVALID, STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE,
-    STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow, StorageError, StorageResult, cf,
-    constellations, gc, pressure,
+    OwnedCfWriteBatch, OwnedCfWriteBatchWithExpiry, PhysicalScanPage, RawRow, RawRowWithExpiry,
+    RevisionGuard, RevisionGuardConflict, RevisionGuardedMutationOutcome,
+    RevisionGuardedWriteOutcome, RevisionedRawValue, STORAGE_REVISION_GUARD_INVALID,
+    STORAGE_REVISION_GUARDED_BATCH_TOO_LARGE, STORAGE_REVISION_GUARDED_OUTCOME_INVALID, ScanWindow,
+    StorageError, StorageResult, cf, constellations, gc, pressure,
 };
 
 const MIB: usize = 1024 * 1024;
@@ -526,6 +526,11 @@ pub trait StorageBackend: Send + Sync {
         &self,
         guards: Vec<CfRevisionGuard>,
         batches: Vec<OwnedCfWriteBatch>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome>;
+    fn put_cf_batches_with_expiry_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatchWithExpiry>,
     ) -> StorageResult<RevisionGuardedMutationOutcome>;
     fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>>;
     fn get_cf_revisioned(
@@ -3199,6 +3204,57 @@ impl StorageBackend for CalyxBackend {
         )
     }
 
+    fn put_cf_batches_with_expiry_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatchWithExpiry>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome> {
+        let validation_batches = batches
+            .iter()
+            .map(|(cf_name, rows)| {
+                (
+                    cf_name.clone(),
+                    rows.iter()
+                        .map(|row| (row.key.clone(), row.value.clone()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        validate_cross_cf_revision_guarded_put(&guards, &validation_batches)?;
+        self.with_vault(
+            "<multi-cf>",
+            "write revision-guarded Calyx multi-CF KV batch with preserved expiry",
+            true,
+            |vault| {
+                let now_ms = calyx_clock_now_for_write(vault, "<multi-cf>")?;
+                let mut physical_guards = Vec::with_capacity(guards.len());
+                for guard in &guards {
+                    let collection_id = calyx_collection_id_for_cf_write(&guard.cf_name)?;
+                    let physical_key =
+                        encode_calyx_key_for_write(&guard.cf_name, collection_id, &guard.key)?;
+                    physical_guards.push(SynapseCalyxRevisionGuard::new(
+                        ColumnFamily::Kv,
+                        physical_key,
+                        guard.expected_revision_sha256,
+                    ));
+                }
+                let mut writes = Vec::new();
+                for (cf_name, rows) in &batches {
+                    let collection_id = calyx_collection_id_for_cf_write(cf_name)?;
+                    for row in rows {
+                        writes.push(calyx_put_row_with_expiry(
+                            cf_name,
+                            collection_id,
+                            row,
+                            now_ms,
+                        )?);
+                    }
+                }
+                commit_calyx_cross_cf_rows_if_revisions(vault, &guards, &physical_guards, writes)
+            },
+        )
+    }
+
     fn get_cf(&self, cf_name: &str, key: &[u8]) -> StorageResult<Option<Vec<u8>>> {
         self.with_vault(cf_name, "read Calyx KV row", false, |vault| {
             let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
@@ -3246,6 +3302,8 @@ impl StorageBackend for CalyxBackend {
                     value: (!calyx_value_is_expired(envelope.expires_at_ms, now_ms))
                         .then(|| envelope.payload.to_vec()),
                     revision_sha256: physical.revision_sha256,
+                    expires_at_ms: envelope.expires_at_ms,
+                    written_at_ms: envelope.written_at_ms,
                 }))
             })
         })
@@ -13248,6 +13306,50 @@ fn calyx_put_row(
         ColumnFamily::Kv,
         encode_calyx_key_for_write(cf_name, collection_id, key)?,
         encode_calyx_value(expires_at_ms, now_ms, value),
+    ))
+}
+
+fn calyx_put_row_with_expiry(
+    cf_name: &str,
+    collection_id: u64,
+    row: &RawRowWithExpiry,
+    now_ms: u64,
+) -> StorageResult<SynapseCalyxCfWrite> {
+    let default_expires_at_ms = calyx_expires_at_ms_for_write(cf_name, now_ms)?;
+    let expires_at_ms = match row.expires_at_ms {
+        None => default_expires_at_ms,
+        Some(explicit) => {
+            if default_expires_at_ms == 0 {
+                return Err(calyx_write_failed_detail(
+                    cf_name,
+                    format!(
+                        "CALYX_EXPLICIT_EXPIRY_FOR_UNRETAINED_CF: explicit={explicit}; remediation=use the destination's normal no-TTL write or choose a TTL-bound derived-index CF"
+                    ),
+                ));
+            }
+            if explicit <= now_ms {
+                return Err(calyx_write_failed_detail(
+                    cf_name,
+                    format!(
+                        "CALYX_EXPLICIT_EXPIRY_ELAPSED: explicit={explicit} now_ms={now_ms}; remediation=omit the already-expired source from the backfill chunk"
+                    ),
+                ));
+            }
+            if explicit > default_expires_at_ms {
+                return Err(calyx_write_failed_detail(
+                    cf_name,
+                    format!(
+                        "CALYX_EXPLICIT_EXPIRY_EXTENDS_RETENTION: explicit={explicit} maximum={default_expires_at_ms}; remediation=preserve the source expiry exactly and never extend a derived pointer beyond destination policy"
+                    ),
+                ));
+            }
+            explicit
+        }
+    };
+    Ok(SynapseCalyxCfWrite::new(
+        ColumnFamily::Kv,
+        encode_calyx_key_for_write(cf_name, collection_id, &row.key)?,
+        encode_calyx_value(expires_at_ms, now_ms, &row.value),
     ))
 }
 

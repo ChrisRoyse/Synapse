@@ -1,9 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     time::{Duration, UNIX_EPOCH},
 };
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use synapse_core::{ReflexId, ReflexLifetime, ReflexState, ReflexStatus, StoredReflexAudit};
 use synapse_storage::{cf, decode_json};
 
@@ -72,14 +73,12 @@ impl ReflexRuntime {
                 detail: format!("reflex audit flush before scan failed: {error}"),
             })?;
 
-        let rows = reflex_id
-            .map_or_else(
-                || self.db.scan_cf(cf::CF_REFLEX_AUDIT),
-                |reflex_id| {
-                    self.db
-                        .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
-                },
-            )
+        let Some(reflex_id) = reflex_id else {
+            return crate::audit_projection::global_history(&self.db, limit);
+        };
+        let rows = self
+            .db
+            .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
             .map_err(|error| ReflexError::ParamsInvalid {
                 detail: format!("reflex audit scan failed: {error}"),
             })?;
@@ -106,65 +105,14 @@ impl ReflexRuntime {
     }
 
     pub(crate) fn terminal_statuses_from_audit(&self) -> ReflexResult<Vec<ReflexStatus>> {
-        let rows =
-            self.db
-                .scan_cf(cf::CF_REFLEX_AUDIT)
-                .map_err(|error| ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit scan failed: {error}"),
-                })?;
-        let mut audits = rows
-            .into_iter()
-            .map(|(_key, value)| {
-                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                    ReflexError::ParamsInvalid {
-                        detail: format!("reflex audit decode failed: {error}"),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        audits.sort_by_key(|audit| (audit.reflex_id.clone(), audit.ts_ns, audit.audit_id.clone()));
-
-        let mut accumulators = BTreeMap::<String, AuditStatusAccumulator>::new();
-        for audit in audits {
-            accumulators
-                .entry(audit.reflex_id.clone())
-                .or_insert_with(|| AuditStatusAccumulator::new(audit.reflex_id.clone()))
-                .record(audit);
-        }
-
-        Ok(accumulators
-            .into_values()
-            .filter_map(AuditStatusAccumulator::into_terminal_status)
-            .collect())
+        crate::audit_projection::terminal_statuses(&self.db)
     }
 
     pub(crate) fn terminal_status_from_audit(
         &self,
         reflex_id: &str,
     ) -> ReflexResult<Option<ReflexStatus>> {
-        let rows = self
-            .db
-            .scan_cf_prefix(cf::CF_REFLEX_AUDIT, audit_key_prefix(reflex_id).as_bytes())
-            .map_err(|error| ReflexError::ParamsInvalid {
-                detail: format!("reflex audit scan failed: {error}"),
-            })?;
-        let mut audits = rows
-            .into_iter()
-            .map(|(_key, value)| {
-                decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                    ReflexError::ParamsInvalid {
-                        detail: format!("reflex audit decode failed: {error}"),
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        audits.sort_by_key(|audit| (audit.ts_ns, audit.audit_id.clone()));
-
-        let mut accumulator = AuditStatusAccumulator::new(reflex_id.to_owned());
-        for audit in audits {
-            accumulator.record(audit);
-        }
-        Ok(accumulator.into_terminal_status())
+        crate::audit_projection::terminal_status(&self.db, reflex_id)
     }
 }
 
@@ -175,8 +123,9 @@ const fn is_non_terminal(state: ReflexState) -> bool {
     )
 }
 
-#[derive(Clone, Debug)]
-struct AuditStatusAccumulator {
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditStatusAccumulator {
     reflex_id: ReflexId,
     registered_at: Option<DateTime<Utc>>,
     kind_summary: Option<String>,
@@ -189,7 +138,7 @@ struct AuditStatusAccumulator {
 }
 
 impl AuditStatusAccumulator {
-    const fn new(reflex_id: String) -> Self {
+    pub const fn new(reflex_id: String) -> Self {
         Self {
             reflex_id,
             registered_at: None,
@@ -203,7 +152,7 @@ impl AuditStatusAccumulator {
         }
     }
 
-    fn record(&mut self, audit: StoredReflexAudit) {
+    pub fn record(&mut self, audit: StoredReflexAudit) {
         let at = datetime_from_ts_ns(audit.ts_ns);
         let details_kind = audit
             .details
@@ -211,7 +160,12 @@ impl AuditStatusAccumulator {
             .and_then(serde_json::Value::as_str);
 
         if details_kind == Some(REFLEX_REGISTERED_KIND) {
+            // A reused id is a new chronological registration, not a
+            // resurrection of an older terminal lifecycle (#2190).
             self.registered_at = Some(at);
+            self.last_fired_at = None;
+            self.fire_count = 0;
+            self.terminal = None;
             self.update_common_fields(&audit);
         } else if details_kind == Some(REFLEX_FIRED_KIND) {
             self.last_fired_at = Some(at);
@@ -257,7 +211,7 @@ impl AuditStatusAccumulator {
         }
     }
 
-    fn into_terminal_status(self) -> Option<ReflexStatus> {
+    pub fn into_terminal_status(self) -> Option<ReflexStatus> {
         let terminal = self.terminal?;
         let terminal_at = datetime_from_ts_ns(terminal.ts_ns);
         Some(ReflexStatus {

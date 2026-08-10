@@ -517,16 +517,13 @@ impl SynapseService {
         limit: usize,
     ) -> Result<Vec<AgentTranscriptSnapshotRow>, ErrorData> {
         let db = self.m3_storage()?;
-        let rows = db
-            .scan_cf(synapse_storage::cf::CF_AGENT_TRANSCRIPTS)
-            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-        let mut decoded = Vec::new();
-        for (key, value) in rows {
+        let rows = super::transcript_order::newest_rows(&db, limit)
+            .map_err(|detail| mcp_error(synapse_core::error_codes::STORAGE_READ_FAILED, detail))?;
+        let mut decoded = Vec::with_capacity(rows.len());
+        for (key, record) in rows {
             let (spawn_id, line_no) =
                 synapse_storage::agent_transcripts::decode_agent_transcript_key(&key)
                     .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-            let record = synapse_storage::decode_json::<AgentTranscriptRecord>(&value)
-                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
             decoded.push(AgentTranscriptSnapshotRow {
                 key_hex: hex_encode(&key),
                 spawn_id,
@@ -534,15 +531,6 @@ impl SynapseService {
                 record,
             });
         }
-        decoded.sort_by(|left, right| {
-            right
-                .record
-                .ts_ns
-                .cmp(&left.record.ts_ns)
-                .then_with(|| right.spawn_id.cmp(&left.spawn_id))
-                .then_with(|| right.line_no.cmp(&left.line_no))
-        });
-        decoded.truncate(limit);
         Ok(decoded)
     }
 

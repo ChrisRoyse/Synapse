@@ -3,14 +3,13 @@ use std::{collections::BTreeMap, path::Path};
 use synapse_core::types::{
     AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, StoredObservation, TimelineRecord,
 };
-use synapse_core::{StoredReflexAudit, error_codes};
 use synapse_storage::{
     CalyxAnchorBatchWriteReport, CalyxAnchorScanReport, CalyxAnchorWriteReport, CalyxVaultInspect,
     ConstellationPutReport, DiskPressureLevel, GcReport, GroundingAnchor, GroundingAnchorSource,
     PressureReport, StorageResult, cf, decode_json,
 };
 
-use crate::{ReflexError, ReflexResult, ReflexRuntime};
+use crate::{ReflexResult, ReflexRuntime};
 
 impl ReflexRuntime {
     /// Returns the storage path backing this runtime.
@@ -672,23 +671,6 @@ impl ReflexRuntime {
     /// Returns a reflex error when audit rows cannot be scanned or decoded.
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]
     pub fn recursion_clamps_total(&self) -> ReflexResult<u64> {
-        let rows =
-            self.db
-                .scan_cf(cf::CF_REFLEX_AUDIT)
-                .map_err(|error| ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit scan failed: {error}"),
-                })?;
-        let mut total = 0_u64;
-        for (_key, value) in rows {
-            let audit = decode_json::<StoredReflexAudit>(&value).map_err(|error| {
-                ReflexError::ParamsInvalid {
-                    detail: format!("reflex audit decode failed: {error}"),
-                }
-            })?;
-            if audit.error_code.as_deref() == Some(error_codes::REFLEX_RECURSION_LIMIT) {
-                total = total.saturating_add(1);
-            }
-        }
-        Ok(total)
+        crate::audit_projection::recursion_clamps_total(&self.db)
     }
 }

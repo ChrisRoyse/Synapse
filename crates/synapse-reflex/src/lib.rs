@@ -2,6 +2,7 @@ mod action_combo_bridge;
 pub mod audit;
 mod audit_migration;
 pub mod audit_offload;
+mod audit_projection;
 mod audit_state;
 pub mod bus;
 pub mod conflict;

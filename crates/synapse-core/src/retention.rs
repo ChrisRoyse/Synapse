@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 17] = [
+pub const DEFAULTS: [RetentionDefault; 19] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -141,5 +141,22 @@ pub const DEFAULTS: [RetentionDefault; 17] = [
         ttl: RetentionTtl::Days(30),
         soft_cap_mb: 512,
         hard_cap_mb: 1024,
+    },
+    // Exact timestamp-order pointer index for transcript health/dashboard
+    // reads (#2189). Its retention must remain identical to the source CF so
+    // source and index disappear at the same logical boundary.
+    RetentionDefault {
+        cf: "CF_AGENT_TRANSCRIPT_ORDER",
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
+    },
+    // Exact timestamp-order pointer index for global reflex history (#2190).
+    // Keep this in lockstep with CF_REFLEX_AUDIT's seven-day contract.
+    RetentionDefault {
+        cf: "CF_REFLEX_AUDIT_ORDER",
+        ttl: RetentionTtl::Days(7),
+        soft_cap_mb: 32,
+        hard_cap_mb: 64,
     },
 ];

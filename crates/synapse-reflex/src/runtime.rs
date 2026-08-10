@@ -71,6 +71,7 @@ impl ReflexRuntime {
         scheduler_config: SchedulerConfig,
     ) -> ReflexResult<Self> {
         crate::audit_migration::repair_reflex_audit_retention_corruption(&db)?;
+        crate::audit_projection::ensure(&db)?;
         Ok(Self {
             db,
             action_handle,

@@ -400,8 +400,12 @@ fn permits_write_at(level: DiskPressureLevel, cf_name: &str) -> bool {
                 | cf::CF_EPISODES
                 | cf::CF_ROUTINES
                 | cf::CF_AGENT_TRANSCRIPTS
+                | cf::CF_AGENT_TRANSCRIPT_ORDER
         ),
-        DiskPressureLevel::Level4 => matches!(cf_name, cf::CF_REFLEX_AUDIT | cf::CF_SESSIONS),
+        DiskPressureLevel::Level4 => matches!(
+            cf_name,
+            cf::CF_REFLEX_AUDIT | cf::CF_REFLEX_AUDIT_ORDER | cf::CF_SESSIONS
+        ),
     }
 }
 

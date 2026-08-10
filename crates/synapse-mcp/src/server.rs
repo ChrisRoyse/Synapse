@@ -226,6 +226,7 @@ mod audit_replay_facades;
 pub(crate) mod codex_app_server_bridge;
 pub(crate) mod command_audit;
 mod context;
+pub(crate) mod transcript_order;
 pub(crate) use context::AgentTranscriptSnapshotRow;
 pub(crate) use context::{
     APPROVAL_DECISION_EVENT_KIND, APPROVAL_REQUEST_EVENT_KIND, APPROVAL_TIMEOUT_EVENT_KIND,

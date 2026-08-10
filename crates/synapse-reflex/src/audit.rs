@@ -1,5 +1,5 @@
 use synapse_core::StoredReflexAudit;
-use synapse_storage::{Db, StorageResult, cf, encode_json};
+use synapse_storage::{Db, StorageResult, encode_json};
 
 /// Writes one reflex audit row to `CF_REFLEX_AUDIT`.
 ///
@@ -26,7 +26,7 @@ pub fn write_audit(db: &Db, audit: &StoredReflexAudit) -> StorageResult<()> {
     crate::hot_path::guard_cold("reflex_write_audit");
     let key = audit_key(audit).into_bytes();
     let value = encode_json(audit)?;
-    db.put_batch(cf::CF_REFLEX_AUDIT, [(key.clone(), value.clone())])?;
+    crate::audit_projection::write_projected_audit(db, audit, &key, &value)?;
     db.put_reflex_audit_constellation(&key, &value, audit)
         .inspect_err(|error| {
             tracing::error!(

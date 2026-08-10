@@ -968,7 +968,15 @@ pub(super) fn commit_transcript_chunk(
         ));
     }
 
-    let mut guards = Vec::with_capacity(rows.len());
+    // #2189: the source and its exact timestamp-order projection have one
+    // writer and one serialization boundary. The first call in a process also
+    // reconciles/backfills the complete retained corpus before any new source
+    // mutation can commit.
+    let _order_projection_guard = super::transcript_order::lock_projection()?;
+    super::transcript_order::ensure_projection_locked(db)?;
+
+    let mut guards = Vec::with_capacity(rows.len() * 2);
+    let mut order_rows = Vec::with_capacity(rows.len());
     for row in rows {
         let source_revision = db
             .get_cf_revisioned(cf::CF_AGENT_TRANSCRIPTS, &row.source_key)
@@ -1006,6 +1014,42 @@ pub(super) fn commit_transcript_chunk(
             row.source_key.clone(),
             expected_source_revision,
         ));
+        let (order_key, order_value) = super::transcript_order::order_row_for_record(
+            &row.source_key,
+            &row.encoded,
+            &row.record,
+        )?;
+        let order_revision = db
+            .get_cf_revisioned(cf::CF_AGENT_TRANSCRIPT_ORDER, &order_key)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_ORDER_PRECONDITION_READ_FAILED: source_id={source_id} path={} line_no={} order_key_hex={}: {error}; remediation=repair the exact CF_AGENT_TRANSCRIPT_ORDER point-read before retrying",
+                    source_path.display(),
+                    row.record.line_no,
+                    synapse_storage::constellations::hex_encode(&order_key)
+                )
+            })?;
+        if let Some(existing) = &order_revision
+            && existing.value.as_deref() != Some(order_value.as_slice())
+        {
+            return Err(format!(
+                "{code_prefix}_ORDER_IDENTITY_CONFLICT: source_id={source_id} path={} line_no={} order_key_hex={} expected_sha256={} actual_sha256={}; remediation=preserve the source and order rows and identify the collision/corrupt writer before retrying",
+                source_path.display(),
+                row.record.line_no,
+                synapse_storage::constellations::hex_encode(&order_key),
+                sha256_hex(&order_value),
+                existing
+                    .value
+                    .as_deref()
+                    .map_or_else(|| "expired".to_owned(), sha256_hex)
+            ));
+        }
+        guards.push(CfRevisionGuard::new(
+            cf::CF_AGENT_TRANSCRIPT_ORDER,
+            order_key.clone(),
+            order_revision.map(|revisioned| revisioned.revision_sha256),
+        ));
+        order_rows.push((order_key, order_value));
     }
 
     let transcript_rows = rows
@@ -1015,7 +1059,10 @@ pub(super) fn commit_transcript_chunk(
     let outcome = db
         .put_cf_batches_if_revisions_pressure_bypass(
             guards,
-            vec![(cf::CF_AGENT_TRANSCRIPTS, transcript_rows)],
+            vec![
+                (cf::CF_AGENT_TRANSCRIPTS, transcript_rows),
+                (cf::CF_AGENT_TRANSCRIPT_ORDER, order_rows.clone()),
+            ],
         )
         .map_err(|error| {
             format!(
@@ -1073,6 +1120,34 @@ pub(super) fn commit_transcript_chunk(
                 synapse_storage::constellations::hex_encode(&row.source_key),
                 sha256_hex(&row.encoded),
                 actual
+                    .as_deref()
+                    .map_or_else(|| "absent".to_owned(), sha256_hex)
+            ));
+        }
+
+        let (order_key, expected_order_value) = super::transcript_order::order_row_for_record(
+            &row.source_key,
+            &row.encoded,
+            &row.record,
+        )?;
+        let actual_order_value = db
+            .get_cf(cf::CF_AGENT_TRANSCRIPT_ORDER, &order_key)
+            .map_err(|error| {
+                format!(
+                    "{code_prefix}_ORDER_READBACK_FAILED: source_id={source_id} path={} line_no={} order_key_hex={}: {error}; remediation=repair the Calyx ordered-index point-read before the source cursor advances",
+                    source_path.display(),
+                    row.record.line_no,
+                    synapse_storage::constellations::hex_encode(&order_key)
+                )
+            })?;
+        if actual_order_value.as_deref() != Some(expected_order_value.as_slice()) {
+            return Err(format!(
+                "{code_prefix}_ORDER_READBACK_MISMATCH: source_id={source_id} path={} line_no={} order_key_hex={} expected_sha256={} actual_sha256={}; remediation=hold the cursor and inspect the exact atomic source/index commit",
+                source_path.display(),
+                row.record.line_no,
+                synapse_storage::constellations::hex_encode(&order_key),
+                sha256_hex(&expected_order_value),
+                actual_order_value
                     .as_deref()
                     .map_or_else(|| "absent".to_owned(), sha256_hex)
             ));

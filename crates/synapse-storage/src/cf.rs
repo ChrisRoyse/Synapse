@@ -48,9 +48,24 @@ pub const CF_AGENT_EVENTS: &str = "CF_AGENT_EVENTS";
 /// reconcile line-for-line against the raw file. Idempotently
 /// re-ingestable: the same line always maps to the same key.
 pub const CF_AGENT_TRANSCRIPTS: &str = "CF_AGENT_TRANSCRIPTS";
+/// Timestamp-descending secondary index over `CF_AGENT_TRANSCRIPTS` (#2189).
+///
+/// Values are source pointers plus source-value digests. The collection has
+/// exactly the same retention horizon as its source and is written in the same
+/// physical Calyx transaction, so an index row can never legitimately outlive
+/// or lag its source row.
+pub const CF_AGENT_TRANSCRIPT_ORDER: &str = "CF_AGENT_TRANSCRIPT_ORDER";
+/// Timestamp-descending secondary index over `CF_REFLEX_AUDIT` (#2190).
+///
+/// This is a derived lookup surface, not a second source of truth. Readers
+/// point-read and hash the referenced `CF_REFLEX_AUDIT` row before returning it.
+pub const CF_REFLEX_AUDIT_ORDER: &str = "CF_REFLEX_AUDIT_ORDER";
 
 /// PRD §4 logical column family names persisted as Calyx vault collections.
-pub const ALL_COLUMN_FAMILIES: [&str; 17] = [
+///
+/// Append new families only: Calyx collection ids are position-derived and the
+/// existing 17 ids are durable vault identity.
+pub const ALL_COLUMN_FAMILIES: [&str; 19] = [
     CF_EVENTS,
     CF_OBSERVATIONS,
     CF_PROFILES,
@@ -68,4 +83,6 @@ pub const ALL_COLUMN_FAMILIES: [&str; 17] = [
     CF_ROUTINE_STATE,
     CF_AGENT_EVENTS,
     CF_AGENT_TRANSCRIPTS,
+    CF_AGENT_TRANSCRIPT_ORDER,
+    CF_REFLEX_AUDIT_ORDER,
 ];

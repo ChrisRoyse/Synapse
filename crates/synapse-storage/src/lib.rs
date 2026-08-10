@@ -10,6 +10,7 @@ pub mod episodes;
 pub mod error;
 mod gc;
 pub mod maintenance;
+pub mod ordered_index;
 pub mod panel_coverage;
 mod pressure;
 pub mod routines;
@@ -56,6 +57,43 @@ pub use synapse_calyx::timeseries::{SynapseCalyxRollupValue, SynapseCalyxRollupW
 /// One raw storage row: key bytes and value bytes.
 pub type RawRow = (Vec<u8>, Vec<u8>);
 
+/// One logical row whose retention expiry may be preserved from another row.
+///
+/// `expires_at_ms = None` applies the destination CF's normal retention policy
+/// at commit time. `Some` is reserved for derived-index backfill and is
+/// validated not to extend the destination policy; normal source+index writes
+/// use `None` for both and therefore receive the exact same commit clock.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawRowWithExpiry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub expires_at_ms: Option<u64>,
+}
+
+impl RawRowWithExpiry {
+    #[must_use]
+    pub fn retained(key: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            expires_at_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn preserving_expiry(
+        key: impl Into<Vec<u8>>,
+        value: impl Into<Vec<u8>>,
+        expires_at_ms: u64,
+    ) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            expires_at_ms: Some(expires_at_ms),
+        }
+    }
+}
+
 /// One physical Calyx envelope revision and its logical payload state.
 ///
 /// The outer `Option` returned by [`Db::get_cf_revisioned`] is `None` only
@@ -67,6 +105,10 @@ pub type RawRow = (Vec<u8>, Vec<u8>);
 pub struct RevisionedRawValue {
     pub value: Option<Vec<u8>>,
     pub revision_sha256: [u8; 32],
+    /// Physical Calyx retention-envelope expiry (`0` means no TTL).
+    pub expires_at_ms: u64,
+    /// Physical Calyx retention-envelope commit clock.
+    pub written_at_ms: u64,
 }
 
 /// One logical same-CF revision precondition.
@@ -156,6 +198,9 @@ pub struct RevisionGuardedWriteOutcome {
 /// One column-family batch: CF name plus raw rows.
 pub type CfWriteBatch<'a> = (&'a str, Vec<RawRow>);
 pub(crate) type OwnedCfWriteBatch = (String, Vec<RawRow>);
+/// One multi-CF batch whose rows may preserve a source retention expiry.
+pub type CfWriteBatchWithExpiry<'a> = (&'a str, Vec<RawRowWithExpiry>);
+pub(crate) type OwnedCfWriteBatchWithExpiry = (String, Vec<RawRowWithExpiry>);
 /// A bounded scan window plus whether more rows remain past it.
 pub type ScanWindow = (Vec<RawRow>, bool);
 /// Default bounded lifetime for one coherent multi-page enumeration.
@@ -527,6 +572,42 @@ impl Db {
                 .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
                 .collect(),
         )
+    }
+
+    /// Atomically writes revision-guarded rows across logical CFs while
+    /// allowing a derived-index backfill to preserve each source row's exact
+    /// retention expiry.
+    ///
+    /// Normal writes must use `expires_at_ms = None`. An explicit expiry is
+    /// rejected when it is already elapsed, the destination has no TTL, or it
+    /// would extend beyond a fresh destination write. This is intentionally a
+    /// narrow index-backfill primitive, not a retention override.
+    /// # Errors
+    ///
+    /// Returns a structured storage failure for invalid action-log rows,
+    /// guards, explicit expiries, oversized atomic commits, revision conflicts
+    /// at the substrate, or any Calyx durability failure.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn put_cf_batches_with_expiry_if_revisions_pressure_bypass(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<CfWriteBatchWithExpiry<'_>>,
+    ) -> StorageResult<RevisionGuardedMutationOutcome> {
+        for (cf_name, rows) in &batches {
+            let plain = rows
+                .iter()
+                .map(|row| (row.key.clone(), row.value.clone()))
+                .collect::<Vec<_>>();
+            validate_action_log_puts(cf_name, &plain)?;
+        }
+        self.backend
+            .put_cf_batches_with_expiry_if_revisions_pressure_bypass(
+                guards,
+                batches
+                    .into_iter()
+                    .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
+                    .collect(),
+            )
     }
 
     /// Reads one key from a column family.
