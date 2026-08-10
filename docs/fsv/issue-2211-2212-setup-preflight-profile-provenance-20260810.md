@@ -3,6 +3,11 @@
 Date: 2026-08-10 (America/Chicago)  
 Implementation: `81c3fa8b2599cb9213b37541350fa69a62c3e4d9` on `main`
 
+Acceptance comments:
+
+- #2211: <https://github.com/ChrisRoyse/Synapse/issues/2211#issuecomment-5245098376>
+- #2212: <https://github.com/ChrisRoyse/Synapse/issues/2212#issuecomment-5245098794>
+
 ## Defects and first-principles diagnosis
 
 Setup accepted all parameters, acquired setup state, built an optimized release,
