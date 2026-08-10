@@ -572,21 +572,20 @@ async fn wait_for_operator_panic_mcp_mutation_quiescence(
 async fn operator_panic_final_safety_sweep(
     service: &SynapseService,
 ) -> OperatorPanicFinalSafetySweepReadback {
+    let deadline = Instant::now() + crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT;
     let context = service.m2_release_all_context();
     // With request-owned mutation reservations at stable zero, no admitted MCP
     // request can register a new combo after this point. Disable first, then
     // drain the emitter so a final reflex tick cannot reassert held input after
     // the final ReleaseAll.
-    let reflex_disable = crate::safety::disable_reflexes(&service.m3_state_handle());
+    let reflex_disable =
+        crate::safety::disable_reflexes_until(&service.m3_state_handle(), deadline).await;
     let (release_all, snapshot_handle, context_error) = match context {
-        Ok((handle, snapshot_handle, _reflex_runtime)) => (
-            crate::safety::fire_release_all_with_handle_timeout(
-                &handle,
-                crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT,
-            ),
-            Some(snapshot_handle),
-            None,
-        ),
+        Ok((handle, snapshot_handle, _reflex_runtime)) => {
+            let release_all =
+                crate::safety::fire_release_all_with_handle_until(&handle, deadline).await;
+            (release_all, Some(snapshot_handle), None)
+        }
         Err(error) => {
             let detail = error.message.to_string();
             (
@@ -601,14 +600,18 @@ async fn operator_panic_final_safety_sweep(
         }
     };
     let (reflex_active_count_after, reflex_readback_error) =
-        match crate::safety::operator_panic_reflex_active_count_readback(&service.m3_state_handle())
+        match crate::safety::operator_panic_reflex_active_count_readback_until(
+            &service.m3_state_handle(),
+            deadline,
+        )
+        .await
         {
             Ok(count) => (count, None),
             Err(error) => (None, Some(error)),
         };
     let (emitter_after, emitter_readback_error) = match snapshot_handle {
         Some(snapshot_handle) => match tokio::time::timeout(
-            crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT,
+            deadline.saturating_duration_since(Instant::now()),
             snapshot_handle.snapshot(),
         )
         .await
@@ -621,8 +624,8 @@ async fn operator_panic_final_safety_sweep(
             Err(_elapsed) => (
                 None,
                 Some(format!(
-                    "action emitter readback timed out after {} ms",
-                    crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT.as_millis()
+                    "action emitter readback exhausted the shared {} ms K2 final-sweep deadline; remediation=inspect the action emitter task and snapshot channel liveness",
+                    crate::safety::OPERATOR_PANIC_K2_STOP_TIMEOUT.as_millis(),
                 )),
             ),
         },

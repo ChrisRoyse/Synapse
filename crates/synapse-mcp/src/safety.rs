@@ -8,7 +8,7 @@ use synapse_action::{
     ActionError, OperatorHotkeyGuard, OperatorHotkeyShutdownReport, OperatorHotkeyStatus,
     RELEASE_ALL_HANDLE, set_operator_hotkey_status,
 };
-use synapse_core::error_codes;
+use synapse_core::{Action, error_codes};
 use tokio::runtime::Handle;
 
 use crate::m3::SharedM3State;
@@ -1502,32 +1502,97 @@ pub(crate) fn disable_reflexes(m3_state: &SharedM3State) -> DisableReport {
 /// Separate post-disable readback used by K2 after every request-wide physical
 /// mutation reservation has drained. A missing runtime is terminal because no
 /// reflex scheduler exists; lock failures stay fail-closed.
-pub(crate) fn operator_panic_reflex_active_count_readback(
+enum OperatorPanicReflexReadbackAttempt {
+    Complete(Option<usize>),
+    Contended(&'static str),
+    Failed(&'static str),
+}
+
+fn operator_panic_reflex_active_count_readback_attempt(
     m3_state: &SharedM3State,
-) -> Result<Option<usize>, String> {
+) -> OperatorPanicReflexReadbackAttempt {
     let runtime = match m3_state.try_lock() {
         Ok(state) => state.reflex_runtime.clone(),
         Err(std::sync::TryLockError::Poisoned(_error)) => {
-            return Err("M3 service state lock poisoned during K2 reflex readback".to_owned());
+            return OperatorPanicReflexReadbackAttempt::Failed(
+                "M3 service state lock poisoned during K2 reflex readback",
+            );
         }
         Err(std::sync::TryLockError::WouldBlock) => {
-            return Err("M3 service state lock contended during K2 reflex readback".to_owned());
+            return OperatorPanicReflexReadbackAttempt::Contended(
+                "M3 service state lock contended during K2 reflex readback",
+            );
         }
     };
     let Some(runtime) = runtime else {
-        return Ok(None);
+        return OperatorPanicReflexReadbackAttempt::Complete(None);
     };
-    runtime
-        .try_lock()
-        .map(|runtime| Some(runtime.active_count()))
-        .map_err(|error| match error {
-            std::sync::TryLockError::Poisoned(_error) => {
-                "reflex runtime lock poisoned during K2 readback".to_owned()
+    match runtime.try_lock() {
+        Ok(runtime) => OperatorPanicReflexReadbackAttempt::Complete(Some(runtime.active_count())),
+        Err(std::sync::TryLockError::Poisoned(_error)) => {
+            OperatorPanicReflexReadbackAttempt::Failed(
+                "reflex runtime lock poisoned during K2 readback",
+            )
+        }
+        Err(std::sync::TryLockError::WouldBlock) => OperatorPanicReflexReadbackAttempt::Contended(
+            "reflex runtime lock contended during K2 readback",
+        ),
+    }
+}
+
+/// Repeats the K2 reflex readback only while an otherwise healthy lock is
+/// transiently contended. Poisoning and all non-contention failures remain
+/// immediate errors; the caller-provided deadline bounds the whole retry
+/// window.
+pub(crate) async fn operator_panic_reflex_active_count_readback_until(
+    m3_state: &SharedM3State,
+    deadline: Instant,
+) -> Result<Option<usize>, String> {
+    let started = Instant::now();
+    loop {
+        match operator_panic_reflex_active_count_readback_attempt(m3_state) {
+            OperatorPanicReflexReadbackAttempt::Complete(count) => return Ok(count),
+            OperatorPanicReflexReadbackAttempt::Contended(error) => {
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(format!(
+                        "{error}; timed out after {} ms waiting for a stable K2 source-of-truth readback; remediation=inspect the M3/reflex lock owner and its operation before retrying operator-panic recovery",
+                        started.elapsed().as_millis()
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(1).min(deadline - now)).await;
             }
-            std::sync::TryLockError::WouldBlock => {
-                "reflex runtime lock contended during K2 readback".to_owned()
-            }
-        })
+            OperatorPanicReflexReadbackAttempt::Failed(error) => return Err(error.to_owned()),
+        }
+    }
+}
+
+/// Repeats the K2 disable only when K1/K2 raced a short healthy lock holder.
+/// A durable disable error or poisoned lock is never retried or hidden.
+pub(crate) async fn disable_reflexes_until(
+    m3_state: &SharedM3State,
+    deadline: Instant,
+) -> DisableReport {
+    let started = Instant::now();
+    loop {
+        let report = disable_reflexes(m3_state);
+        if report.result != "contended" {
+            return report;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return DisableReport {
+                result: "error",
+                disabled_ids: Vec::new(),
+                error_code: Some(error_codes::TOOL_INTERNAL_ERROR),
+                detail: Some(format!(
+                    "reflex runtime lock remained contended for {} ms at the K2 final safety sweep; remediation=inspect the M3/reflex lock owner and its operation before retrying operator-panic recovery",
+                    started.elapsed().as_millis()
+                )),
+            };
+        }
+        tokio::time::sleep(Duration::from_millis(1).min(deadline - now)).await;
+    }
 }
 
 pub(crate) fn fire_release_all_with_handle(
@@ -1550,6 +1615,36 @@ pub(crate) fn fire_release_all_with_handle_timeout(
             result: "error",
             error_code: Some(error.code()),
             detail: Some(error.to_string()),
+        },
+    }
+}
+
+/// Awaits the action actor without blocking a Tokio worker. The actor and this
+/// caller share the same cooperative runtime in the daemon, so the synchronous
+/// panic-hook bridge above must never be used from an async K2 task.
+pub(crate) async fn fire_release_all_with_handle_until(
+    handle: &synapse_action::ActionHandle,
+    deadline: Instant,
+) -> ReleaseAllReport {
+    let now = Instant::now();
+    let timeout = deadline.saturating_duration_since(now);
+    match tokio::time::timeout(timeout, handle.execute(Action::ReleaseAll)).await {
+        Ok(Ok(())) => ReleaseAllReport {
+            result: "ok",
+            error_code: None,
+            detail: None,
+        },
+        Ok(Err(error)) => ReleaseAllReport {
+            result: "error",
+            error_code: Some(error.code()),
+            detail: Some(error.to_string()),
+        },
+        Err(_elapsed) => ReleaseAllReport {
+            result: "error",
+            error_code: Some(error_codes::ACTION_BACKEND_UNAVAILABLE),
+            detail: Some(format!(
+                "release_all async acknowledgement timed out after {timeout:?}; remediation=inspect the action safety channel and emitter task liveness"
+            )),
         },
     }
 }
