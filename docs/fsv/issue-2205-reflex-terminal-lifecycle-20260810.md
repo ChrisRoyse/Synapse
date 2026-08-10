@@ -210,3 +210,6 @@ production physical store:
   `f84667dd52e16592f2a0987cd0e53f92a5c7939e2bb138be9b6c1ed7ee6be432`;
 - vault generation `1`, reset count `0`, with the lineage-seeded origin and its
   historical coverage limitation reported truthfully.
+
+GitHub acceptance and closure evidence:
+<https://github.com/ChrisRoyse/Synapse/issues/2205#issuecomment-5243435113>.
