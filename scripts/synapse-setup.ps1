@@ -6656,11 +6656,13 @@ function Invoke-SynapseSetupMcpTool {
         [Parameter(Mandatory=$true)]$Arguments,
         [string]$Profile,
         [string]$ProfileReason,
+        [switch]$AcquireForegroundLease,
         [int]$TimeoutSec = $script:SynapseSetupMcpRequestTimeoutSec
     )
 
     $sessionId = $null
     $mcpReadSucceeded = $false
+    $leaseAcquired = $false
     try {
         $initParams = [ordered]@{
             protocolVersion = $script:SynapseMcpProtocolVersion
@@ -6688,6 +6690,43 @@ function Invoke-SynapseSetupMcpTool {
             Die "SYNAPSE_MCP_SETUP_TOOL_NOT_VISIBLE bind=$Bind session_id=$sessionId requested_tool=$Name visible_tools=$visible remediation=setup may only call public facade tools visible through tools/list; route hidden implementation tools through their public facade/profile path"
         }
         $requestId++
+        if ($AcquireForegroundLease) {
+            if ($Profile -notin @('break_glass', 'full_capability')) {
+                Die "SYNAPSE_MCP_SETUP_LEASE_PROFILE_INVALID bind=$Bind session_id=$sessionId tool=$Name requested_profile=$(if ([string]::IsNullOrWhiteSpace($Profile)) { '<none>' } else { $Profile }) remediation=AcquireForegroundLease is only valid for the two maintenance-authorized profiles break_glass/full_capability"
+            }
+            if ($toolNames -notcontains 'act') {
+                $visible = if ($toolNames.Count -eq 0) { '<none>' } else { $toolNames -join ',' }
+                Die "SYNAPSE_MCP_SETUP_ACT_TOOL_NOT_VISIBLE bind=$Bind session_id=$sessionId tool=$Name visible_tools=$visible remediation=an audited maintenance operation requires the public act facade so setup can acquire and independently read back the foreground input lease"
+            }
+            $leaseTtlMs = [Math]::Min(300000, [Math]::Max(100, ([int64]$TimeoutSec * 1000L)))
+            $leaseCallParams = @{
+                name = 'act'
+                arguments = [ordered]@{
+                    operation = 'lease_acquire'
+                    ttl_ms = $leaseTtlMs
+                }
+            }
+            $leaseResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $leaseCallParams -Id $requestId -TimeoutSec $TimeoutSec
+            $leaseMessage = Read-SynapseMcpSseJsonResponse -Content $leaseResponse.Content -Operation 'tools/call act lease_acquire' -ExpectedId $requestId
+            if ($leaseMessage.result.isError -eq $true) {
+                $leaseErrorText = @($leaseMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+                Die "SYNAPSE_MCP_SETUP_LEASE_ACQUIRE_ERROR bind=$Bind session_id=$sessionId tool=$Name error=$leaseErrorText remediation=repair the candidate's public act/foreground-lease authority path before accepting setup"
+            }
+            $leaseText = @($leaseMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+            try {
+                $leaseJson = $leaseText | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                Die "SYNAPSE_MCP_SETUP_LEASE_ACQUIRE_JSON_INVALID bind=$Bind session_id=$sessionId tool=$Name error=$($_.Exception.Message) remediation=act operation=lease_acquire must return its physical lease readback as JSON"
+            }
+            $lease = $leaseJson.lease
+            if ($null -eq $lease -or $lease.held -ne $true -or $lease.is_owner -ne $true -or [string]$lease.owner_session_id -ne $sessionId -or [string]$lease.this_session_id -ne $sessionId) {
+                $leaseReadback = if ($null -eq $lease) { '<missing>' } else { $lease | ConvertTo-Json -Depth 8 -Compress }
+                Die "SYNAPSE_MCP_SETUP_LEASE_ACQUIRE_READBACK_INVALID bind=$Bind session_id=$sessionId tool=$Name lease=$leaseReadback remediation=the public act facade did not independently read back this exact MCP session as the physical foreground-lease owner; refuse maintenance authority"
+            }
+            $leaseAcquired = $true
+            Info "Setup MCP session foreground lease acquired and read back session_id=$sessionId tool=$Name ttl_ms=$leaseTtlMs outcome=$($lease.outcome)"
+            $requestId++
+        }
         if (-not [string]::IsNullOrWhiteSpace($Profile)) {
             if ($toolNames -notcontains 'profile') {
                 $visible = if ($toolNames.Count -eq 0) { '<none>' } else { $toolNames -join ',' }
@@ -6733,6 +6772,45 @@ function Invoke-SynapseSetupMcpTool {
             Message = $callMessage
             Text = $text
             Json = $json
+        }
+        if ($leaseAcquired) {
+            $requestId++
+            $restoreProfileParams = @{
+                name = 'profile'
+                arguments = [ordered]@{
+                    operation = 'set'
+                    profile = 'normal_agent'
+                    confirm_break_glass = $false
+                    reason = "synapse-setup completed audited maintenance tool $Name; restore least authority before session teardown"
+                }
+            }
+            $restoreProfileResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $restoreProfileParams -Id $requestId -TimeoutSec $TimeoutSec
+            $restoreProfileMessage = Read-SynapseMcpSseJsonResponse -Content $restoreProfileResponse.Content -Operation 'tools/call profile restore normal_agent' -ExpectedId $requestId
+            if ($restoreProfileMessage.result.isError -eq $true) {
+                $restoreProfileError = @($restoreProfileMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+                Die "SYNAPSE_MCP_SETUP_PROFILE_RESTORE_ERROR bind=$Bind session_id=$sessionId tool=$Name error=$restoreProfileError remediation=the maintenance operation completed but session authority could not be restored; candidate validation must fail and destroy this isolated daemon"
+            }
+            $requestId++
+            $releaseCallParams = @{ name = 'act'; arguments = @{ operation = 'lease_release' } }
+            $releaseResponse = Invoke-SynapseMcpHttpPost -Bind $Bind -Token $Token -SessionId $sessionId -Method 'tools/call' -Params $releaseCallParams -Id $requestId -TimeoutSec $TimeoutSec
+            $releaseMessage = Read-SynapseMcpSseJsonResponse -Content $releaseResponse.Content -Operation 'tools/call act lease_release' -ExpectedId $requestId
+            if ($releaseMessage.result.isError -eq $true) {
+                $releaseError = @($releaseMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+                Die "SYNAPSE_MCP_SETUP_LEASE_RELEASE_ERROR bind=$Bind session_id=$sessionId tool=$Name error=$releaseError remediation=the maintenance operation completed but its foreground lease could not be released; candidate validation must fail and destroy this isolated daemon"
+            }
+            $releaseText = @($releaseMessage.result.content | Where-Object { [string]$_.type -eq 'text' } | Select-Object -First 1).text
+            try {
+                $releaseJson = $releaseText | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                Die "SYNAPSE_MCP_SETUP_LEASE_RELEASE_JSON_INVALID bind=$Bind session_id=$sessionId tool=$Name error=$($_.Exception.Message) remediation=act operation=lease_release must return its physical post-release readback as JSON"
+            }
+            $releasedLease = $releaseJson.lease
+            if ($null -eq $releasedLease -or $releasedLease.held -eq $true -or $releasedLease.is_owner -eq $true -or [string]$releasedLease.owner_session_id -eq $sessionId) {
+                $releaseReadback = if ($null -eq $releasedLease) { '<missing>' } else { $releasedLease | ConvertTo-Json -Depth 8 -Compress }
+                Die "SYNAPSE_MCP_SETUP_LEASE_RELEASE_READBACK_INVALID bind=$Bind session_id=$sessionId tool=$Name lease=$releaseReadback remediation=the public act facade did not independently prove the foreground lease absent after the maintenance operation; candidate validation must fail"
+            }
+            $leaseAcquired = $false
+            Info "Setup MCP session profile restored and foreground lease release read back session_id=$sessionId tool=$Name outcome=$($releasedLease.outcome) held=$($releasedLease.held)"
         }
         $mcpReadSucceeded = $true
         return $result
@@ -9196,6 +9274,55 @@ function Get-SynapseCandidateReplacementReservationId {
     return [string]$row.reservation_id
 }
 
+function Write-SynapseCandidateJsonEvidence {
+    param(
+        [Parameter(Mandatory=$true)][string]$CandidateRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^candidate-[a-z0-9-]+\.json$')][string]$LeafName,
+        [Parameter(Mandatory=$true)]$Value
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($CandidateRoot).TrimEnd('\')
+    $path = [System.IO.Path]::GetFullPath((Join-Path $CandidateRoot $LeafName))
+    $parent = [System.IO.Path]::GetFullPath((Split-Path -Parent $path)).TrimEnd('\')
+    if (-not $parent.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
+        Die "SYNAPSE_CANDIDATE_EVIDENCE_SCOPE_INVALID path=$path expected_parent=$rootFull actual_parent=$parent remediation=refuse to write candidate evidence outside the exact isolated candidate directory"
+    }
+    try {
+        $json = $Value | ConvertTo-Json -Depth 30
+        [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
+        $readback = Get-Content -Raw -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json -Depth 30 -ErrorAction Stop
+        $sha256 = Get-SynapseFileSha256 -Path $path
+        $length = (Get-Item -LiteralPath $path -ErrorAction Stop).Length
+    } catch {
+        Die "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$path error=$($_.Exception.Message) remediation=repair the exact candidate evidence directory before setup can accept or reject this binary"
+    }
+    return [pscustomobject]@{
+        Path = $path
+        Sha256 = $sha256
+        Length = $length
+        Readback = $readback
+    }
+}
+
+function Format-SynapseCandidateHealthFailures {
+    param([Parameter(Mandatory=$true)]$Health)
+
+    $failures = @()
+    if ($Health.subsystems) {
+        foreach ($prop in @($Health.subsystems.PSObject.Properties | Sort-Object Name)) {
+            $status = [string]$prop.Value.status
+            if ($status -eq 'error') {
+                $failures += [ordered]@{
+                    name = [string]$prop.Name
+                    status = $status
+                    detail = [string]$prop.Value.detail
+                }
+            }
+        }
+    }
+    return @($failures)
+}
+
 function Test-SynapseCandidateDaemon {
     param(
         [Parameter(Mandatory=$true)][string]$CandidateExePath,
@@ -9319,6 +9446,30 @@ function Test-SynapseCandidateDaemon {
         if ($healthPid -ne [int]$candidate.Id) {
             Die "SYNAPSE_CANDIDATE_PID_MISMATCH expected_pid=$($candidate.Id) health_pid=$healthPid bind=$candidateBind remediation=health came from an unexpected process; refusing handoff"
         }
+        $initialHealthEvidence = Write-SynapseCandidateJsonEvidence `
+            -CandidateRoot $candidateRoot `
+            -LeafName 'candidate-health-before.json' `
+            -Value $health
+        Info "Candidate initial health evidence written path=$($initialHealthEvidence.Path) sha256=$($initialHealthEvidence.Sha256) length=$($initialHealthEvidence.Length) ok=$($health.ok)"
+
+        # #2196: global health deliberately treats a known dirty build as
+        # degraded rather than operationally dead, but a production installer
+        # has a stronger contract: it must never replace the live binary with
+        # bytes that do not attest to one exact clean checkout. Keep that policy
+        # here at the deployment boundary instead of weakening health's useful
+        # diagnostic distinction.
+        $buildProvenance = $health.subsystems.build_provenance
+        $buildProvenanceAcceptable = (
+            $null -ne $buildProvenance -and
+            [string]$buildProvenance.status -eq 'ok' -and
+            [string]$buildProvenance.build_tree_state -eq 'clean' -and
+            $buildProvenance.build_matches_checkout -eq $true -and
+            [int64]$buildProvenance.build_changed_input_count -eq 0 -and
+            [int64]$buildProvenance.build_changed_input_omitted -eq 0)
+        if (-not $buildProvenanceAcceptable) {
+            $provenanceReadback = if ($null -eq $buildProvenance) { '<missing>' } else { $buildProvenance | ConvertTo-Json -Depth 12 -Compress }
+            Die "SYNAPSE_CANDIDATE_BUILD_PROVENANCE_UNACCEPTABLE exe=$CandidateExePath sha256=$candidateHash pid=$healthPid bind=$candidateBind health_evidence=$($initialHealthEvidence.Path) health_evidence_sha256=$($initialHealthEvidence.Sha256) build_provenance=$provenanceReadback remediation=build from one exact clean Git checkout, commit it locally before release validation, and rerun setup; the old installed executable and live daemon have not been touched"
+        }
         if ($EnableAudio) {
             $audioHealth = $health.subsystems.audio
             if ($null -eq $audioHealth -or [string]$audioHealth.status -eq 'disabled' -or $audioHealth.stt_model_available -ne $true) {
@@ -9326,7 +9477,75 @@ function Test-SynapseCandidateDaemon {
                 Die "SYNAPSE_CANDIDATE_AUDIO_CONTRACT_FAILED pid=$healthPid bind=$candidateBind audio=$audioReadback remediation=verify --enable-audio reached the candidate, READ_AUDIO is granted, and the pinned Whisper/ORT Extensions artifacts are packaged before replacing the live daemon"
             }
         }
+
+        # The isolated vault is intentionally new, so its active panel has no
+        # search generation yet. Do not reinterpret that real error as success.
+        # Bootstrap it through the same public, permission-gated, audited route
+        # an operator uses, then independently read health and the manifest from
+        # disk. Any other error is left untouched and refused below.
         if ($health.ok -ne $true) {
+            $initialFailures = @(Format-SynapseCandidateHealthFailures -Health $health)
+            $searchHealth = $health.subsystems.calyx_search_generation
+            $searchPanelVersion = try { [int64]$searchHealth.calyx_search_generation_panel_version } catch { 0 }
+            $isExactEmptySearchState = (
+                $initialFailures.Count -eq 1 -and
+                [string]$initialFailures[0].name -eq 'calyx_search_generation' -and
+                [string]$searchHealth.status -eq 'error' -and
+                [string]$searchHealth.calyx_search_generation_state -eq 'absent' -and
+                $searchHealth.calyx_search_generation_manifest_present -eq $false -and
+                $searchPanelVersion -gt 0 -and
+                [string]$health.subsystems.calyx_vault.status -eq 'ok' -and
+                [string]$health.subsystems.storage.status -eq 'ok')
+            if ($isExactEmptySearchState) {
+                $searchArgs = [ordered]@{
+                    operation = 'search_rebuild'
+                    search_rebuild = [ordered]@{
+                        expected_panel_version = $searchPanelVersion
+                    }
+                }
+                Info "Candidate isolated vault has no active-panel search generation; bootstrapping through public storage facade panel_version=$searchPanelVersion initial_health_sha256=$($initialHealthEvidence.Sha256)"
+                $searchBootstrap = Invoke-SynapseSetupMcpTool `
+                    -Bind $candidateBind `
+                    -Token $tokenRead.Token `
+                    -Name 'storage' `
+                    -Arguments $searchArgs `
+                    -Profile 'break_glass' `
+                    -ProfileReason 'synapse-setup candidate preflight must build and physically verify the isolated active-panel search generation before handoff' `
+                    -AcquireForegroundLease `
+                    -TimeoutSec 120
+                $searchBootstrapEvidence = Write-SynapseCandidateJsonEvidence `
+                    -CandidateRoot $candidateRoot `
+                    -LeafName 'candidate-search-bootstrap.json' `
+                    -Value $searchBootstrap.Json
+                $searchReadback = $searchBootstrap.Json.search_rebuild
+                $manifestPath = [string]$searchReadback.manifest_path
+                $manifestExpectedSha256 = [string]$searchReadback.manifest_sha256
+                if ($null -eq $searchReadback -or [int64]$searchReadback.panel_version -ne $searchPanelVersion -or [string]::IsNullOrWhiteSpace($manifestPath) -or [string]::IsNullOrWhiteSpace($manifestExpectedSha256) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+                    $bootstrapReadback = if ($null -eq $searchReadback) { '<missing>' } else { $searchReadback | ConvertTo-Json -Depth 16 -Compress }
+                    Die "SYNAPSE_CANDIDATE_SEARCH_BOOTSTRAP_READBACK_INVALID pid=$healthPid bind=$candidateBind panel_version=$searchPanelVersion evidence=$($searchBootstrapEvidence.Path) evidence_sha256=$($searchBootstrapEvidence.Sha256) readback=$bootstrapReadback remediation=the real storage search_rebuild call did not publish and report the exact active-panel manifest; inspect retained candidate evidence before retrying"
+                }
+                $manifestActualSha256 = Get-SynapseFileSha256 -Path $manifestPath
+                if ($manifestActualSha256 -ine $manifestExpectedSha256) {
+                    Die "SYNAPSE_CANDIDATE_SEARCH_BOOTSTRAP_MANIFEST_MISMATCH pid=$healthPid bind=$candidateBind panel_version=$searchPanelVersion manifest=$manifestPath expected_sha256=$manifestExpectedSha256 actual_sha256=$manifestActualSha256 evidence=$($searchBootstrapEvidence.Path) remediation=the independently read physical manifest bytes do not match the storage facade's committed readback; inspect the isolated vault and candidate logs"
+                }
+                $postBootstrapHealthRead = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token -TimeoutSec 30
+                if (-not $postBootstrapHealthRead.Ok) {
+                    Die "SYNAPSE_CANDIDATE_POST_BOOTSTRAP_HEALTH_UNREADABLE pid=$healthPid bind=$candidateBind panel_version=$searchPanelVersion manifest=$manifestPath manifest_sha256=$manifestActualSha256 error=$($postBootstrapHealthRead.Error) remediation=the search manifest exists on disk but authenticated health cannot independently report candidate state; inspect retained candidate evidence"
+                }
+                $health = $postBootstrapHealthRead.Health
+                if ([int]$health.pid -ne $healthPid) {
+                    Die "SYNAPSE_CANDIDATE_POST_BOOTSTRAP_PID_MISMATCH expected_pid=$healthPid health_pid=$($health.pid) bind=$candidateBind remediation=post-bootstrap health came from an unexpected process; refusing handoff"
+                }
+                $postBootstrapHealthEvidence = Write-SynapseCandidateJsonEvidence `
+                    -CandidateRoot $candidateRoot `
+                    -LeafName 'candidate-health-after-bootstrap.json' `
+                    -Value $health
+                Info "Candidate isolated search generation physically verified panel_version=$searchPanelVersion manifest=$manifestPath manifest_sha256=$manifestActualSha256 health_evidence=$($postBootstrapHealthEvidence.Path) health_evidence_sha256=$($postBootstrapHealthEvidence.Sha256) health_ok=$($health.ok)"
+            }
+        }
+        if ($health.ok -ne $true) {
+            $failures = @(Format-SynapseCandidateHealthFailures -Health $health)
+            $failuresJson = if ($failures.Count -eq 0) { '[]' } else { $failures | ConvertTo-Json -Depth 12 -Compress }
             $subsystemStatuses = @()
             if ($health.subsystems) {
                 foreach ($prop in @($health.subsystems.PSObject.Properties | Sort-Object Name)) {
@@ -9334,7 +9553,7 @@ function Test-SynapseCandidateDaemon {
                 }
             }
             $statusText = if ($subsystemStatuses.Count -gt 0) { $subsystemStatuses -join ',' } else { '<none>' }
-            Info "WARN: candidate daemon /health returned ok=false during isolated preflight; continuing with pid/tool-surface validation subsystem_statuses=$statusText"
+            Die "SYNAPSE_CANDIDATE_HEALTH_UNHEALTHY exe=$CandidateExePath sha256=$candidateHash pid=$healthPid bind=$candidateBind failures=$failuresJson subsystem_statuses=$statusText health_evidence=$($initialHealthEvidence.Path) health_evidence_sha256=$($initialHealthEvidence.Sha256) evidence_root=$candidateRoot stdout=$candidateStdout stderr=$candidateStderr remediation=repair every subsystem reporting error and rerun setup; setup refuses to replace the old installed executable or live daemon while candidate semantic health is false"
         }
         $surface = Read-SynapseDaemonToolSurface -Bind $candidateBind -Token $tokenRead.Token -Health $health
         if ($surface.tool_count -lt 1) {
