@@ -39,6 +39,10 @@ path = "src/bin/synapse-chrome-native-host.rs"
 default = []
 calyx-cuda = ["synapse-calyx/calyx-cuda"]
 
+[build-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
+
 [dependencies]
 calyx-anneal.workspace = true
 anyhow.workspace = true

@@ -149,6 +149,24 @@ pub struct CalyxSearchGenerationPanel {
     pub keys_to_bound: Option<u64>,
 }
 
+/// Bounded identity of one build input that differed from the checked-in tree.
+///
+/// Contents are never embedded; the digest and length are sufficient to prove
+/// which exact bytes entered the build without leaking source or secrets.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct BuildInputChange {
+    pub path: String,
+    /// Git porcelain-v1 `XY` status (`??` for a non-ignored untracked input).
+    pub status: String,
+    /// `tracked` | `untracked` | `missing_tracked`.
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SubsystemHealth {
@@ -171,6 +189,30 @@ pub struct SubsystemHealth {
     /// `clean` | `dirty` | `unknown` at the moment the binary was compiled.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_tree_state: Option<String>,
+    /// Canonical algorithm used for the input inventory and manifest digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_input_schema: Option<String>,
+    /// Exact number of tracked and non-ignored untracked build inputs hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_input_file_count: Option<u64>,
+    /// SHA-256 of canonical path/kind/length/content-digest records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_input_manifest_sha256: Option<String>,
+    /// SHA-256 of the complete raw Git porcelain-v1 `-z` status at build time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_git_status_sha256: Option<String>,
+    /// Build-relevant input rows whose Git state was not clean.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_changed_input_count: Option<u64>,
+    /// At most 16 changed identities; content is represented only by SHA-256.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_changed_input_examples: Option<Vec<BuildInputChange>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_changed_input_omitted: Option<u64>,
+    /// Exact build-time failure when provenance was deliberately allowed to be
+    /// unknown. Presence always makes `build_provenance.status=error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_input_attestation_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_unix_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -184,7 +226,9 @@ pub struct SubsystemHealth {
     /// Why the checkout's current commit could not be read, when it could not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_checkout_unavailable_reason: Option<String>,
-    /// True exactly when the running bytes and the checkout are the same commit.
+    /// True only when the build was clean and its commit is still the checkout
+    /// commit. Dirty input bytes are an established mismatch (`false`), while
+    /// unreadable/unknown provenance leaves this absent.
     ///
     /// This is the reading that was missing: a daemon many commits behind `main`
     /// was indistinguishable from a current one, so the whole accumulated delta
