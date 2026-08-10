@@ -4,6 +4,7 @@ mod audit_migration;
 pub mod audit_offload;
 mod audit_projection;
 mod audit_state;
+pub(crate) mod audit_timestamp;
 pub mod bus;
 pub mod conflict;
 mod dispatch;

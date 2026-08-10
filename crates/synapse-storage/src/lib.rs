@@ -25,10 +25,11 @@ pub use backend::{
     CalyxAnchorScanReport, CalyxAnchorValueReadback, CalyxAnchorWriteReport,
     CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
     GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
-    PanelLifecycleBackfillReport, STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind,
-    StorageCfDump, StorageDumpRow, SynapseAnchorSourceCarrier, SynapseSynergyPair,
-    SynapseSynergyReport, dump_cf_read_only, dump_cf_read_only_with_expired,
-    inspect_calyx_vault_read_only, scan_cf_read_only, scan_cf_read_only_with_expired,
+    PanelLifecycleBackfillReport, ReflexRegistrationPublicationReport,
+    STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
+    SynapseAnchorSourceCarrier, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
+    dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
+    scan_cf_read_only_with_expired,
 };
 pub use codecs::{decode_json, encode_json};
 pub use constellations::{
@@ -2288,6 +2289,37 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_reflex_audit_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Atomically commits a reflex registration's revision-guarded source,
+    /// ordered projection, aggregate/registry rows, native constellation,
+    /// grounding anchor, and provenance ledger entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage failure before visibility when a revision
+    /// guard differs or preparation fails, or when the single Calyx WAL/MVCC
+    /// commit cannot complete. Separate physical readback must exactly match
+    /// every committed source row, constellation, and anchor.
+    #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), guard_count = guards.len(), batch_count = batches.len(), backend = self.backend_name()))]
+    pub fn put_reflex_registration_grounded_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<CfWriteBatch<'_>>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &synapse_core::StoredReflexAudit,
+    ) -> StorageResult<ReflexRegistrationPublicationReport> {
+        self.backend.put_reflex_registration_grounded_publication(
+            guards,
+            batches
+                .into_iter()
+                .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
+                .collect(),
+            source_key,
+            raw_bytes,
+            record,
+        )
     }
 
     /// Measures and stores the native Calyx constellation for one persisted

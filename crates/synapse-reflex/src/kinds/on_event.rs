@@ -63,9 +63,16 @@ impl OnEventTickGuard {
         }
         self.limit_reported = true;
         metrics::counter!(REFLEX_RECURSION_CLAMPS_METRIC).increment(1);
-        publish_limit_event(event_bus, reflex_id, tick_index, trigger_event);
-        let audit = recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context);
-        enqueue_audit_if_configured(audit_sink, audit);
+        let occurred_at = Utc::now();
+        let audit_ts_ns = audit_sink.and_then(|_sink| {
+            crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_RECURSION_LIMIT_KIND)
+        });
+        publish_limit_event(event_bus, reflex_id, tick_index, trigger_event, occurred_at);
+        if let Some(ts_ns) = audit_ts_ns {
+            let audit =
+                recursion_limit_audit(reflex_id, tick_index, trigger_event, audit_context, ts_ns);
+            enqueue_audit_if_configured(audit_sink, audit);
+        }
     }
 }
 
@@ -78,9 +85,12 @@ pub(crate) fn publish_fired(
     actions: &[Action],
     audit_context: Option<&StoredAuditContext>,
 ) {
+    let occurred_at = Utc::now();
+    let audit_ts_ns = audit_sink
+        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_FIRED_KIND));
     let event = Event {
         seq: tick_index,
-        at: Utc::now(),
+        at: occurred_at,
         source: EventSource::Reflex,
         kind: REFLEX_FIRED_KIND.to_owned(),
         data: json!({
@@ -92,8 +102,17 @@ pub(crate) fn publish_fired(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
-    let audit = fired_audit(reflex_id, tick_index, trigger_event, actions, audit_context);
-    enqueue_audit_if_configured(audit_sink, audit);
+    if let Some(ts_ns) = audit_ts_ns {
+        let audit = fired_audit(
+            reflex_id,
+            tick_index,
+            trigger_event,
+            actions,
+            audit_context,
+            ts_ns,
+        );
+        enqueue_audit_if_configured(audit_sink, audit);
+    }
     tracing::info!(
         code = "REFLEX_FIRED",
         reflex_id = %reflex_id,
@@ -119,9 +138,12 @@ pub(crate) fn publish_debounced(
 ) {
     let debounce_ms = u64::try_from(debounce.as_millis()).unwrap_or(u64::MAX);
     let suppressed_count = u64::try_from(suppressed_count).unwrap_or(u64::MAX);
+    let occurred_at = Utc::now();
+    let audit_ts_ns = audit_sink
+        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_DEBOUNCED_KIND));
     let event = Event {
         seq: tick_index,
-        at: Utc::now(),
+        at: occurred_at,
         source: EventSource::Reflex,
         kind: REFLEX_DEBOUNCED_KIND.to_owned(),
         data: json!({
@@ -137,16 +159,18 @@ pub(crate) fn publish_debounced(
         correlations: trigger_correlation(trigger_event),
     };
     let _report = event_bus.publish(event);
-    let audit = debounced_audit(
-        reflex_id,
-        tick_index,
-        trigger_event,
-        debounce_ms,
-        suppressed_count,
-        reason,
-        audit_context,
-    );
-    enqueue_audit_if_configured(audit_sink, audit);
+    if let Some(ts_ns) = audit_ts_ns {
+        let audit = debounced_audit(
+            reflex_id,
+            tick_index,
+            trigger_event,
+            debounce_ms,
+            suppressed_count,
+            reason,
+            (audit_context, ts_ns),
+        );
+        enqueue_audit_if_configured(audit_sink, audit);
+    }
     tracing::info!(
         code = error_codes::REFLEX_DEBOUNCED,
         reflex_id = %reflex_id,
@@ -165,10 +189,11 @@ fn publish_limit_event(
     reflex_id: &ReflexId,
     tick_index: u64,
     trigger_event: &Event,
+    occurred_at: chrono::DateTime<Utc>,
 ) {
     let event = Event {
         seq: tick_index,
-        at: Utc::now(),
+        at: occurred_at,
         source: EventSource::Reflex,
         kind: REFLEX_RECURSION_LIMIT_KIND.to_owned(),
         data: json!({
@@ -191,13 +216,14 @@ fn debounced_audit(
     debounce_ms: u64,
     suppressed_count: u64,
     reason: &str,
-    audit_context: Option<&StoredAuditContext>,
+    audit_clock: (Option<&StoredAuditContext>, u64),
 ) -> StoredReflexAudit {
+    let (audit_context, ts_ns) = audit_clock;
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -222,12 +248,13 @@ fn fired_audit(
     trigger_event: &Event,
     actions: &[Action],
     audit_context: Option<&StoredAuditContext>,
+    ts_ns: u64,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -248,12 +275,13 @@ fn recursion_limit_audit(
     tick_index: u64,
     trigger_event: &Event,
     audit_context: Option<&StoredAuditContext>,
+    ts_ns: u64,
 ) -> StoredReflexAudit {
     StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: Some(trigger_event.seq.to_string()),
         audit_context: audit_context.cloned(),
@@ -297,11 +325,4 @@ fn trigger_correlation(trigger_event: &Event) -> Vec<EventRef> {
         seq: trigger_event.seq,
         relation: "trigger".to_owned(),
     }]
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }

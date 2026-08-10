@@ -1,6 +1,5 @@
 use std::{collections::HashSet, time::Duration};
 
-use chrono::Utc;
 use serde_json::{Value, json};
 use synapse_core::{
     Action, ButtonAction, Event, Point, ReflexAimAxis, ReflexButtonTarget, ReflexState,
@@ -644,6 +643,9 @@ fn write_path_follow_tick_audit(
     let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
+    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_PATH_FOLLOW_TICK_KIND) else {
+        return;
+    };
     let steps = records
         .iter()
         .enumerate()
@@ -662,7 +664,7 @@ fn write_path_follow_tick_audit(
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.to_owned(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -713,11 +715,15 @@ fn write_aim_track_correction_audit(
     let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
+    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_AIM_TRACK_CORRECTION_KIND)
+    else {
+        return;
+    };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: reflex_id.to_owned(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -827,11 +833,4 @@ const fn aim_axis_value(axis: ReflexAimAxis) -> &'static str {
         ReflexAimAxis::XOnly => "x_only",
         ReflexAimAxis::YOnly => "y_only",
     }
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }

@@ -2464,51 +2464,69 @@ impl SynapseService {
                         detail: Some("reflex runtime starts on first reflex tool call".to_owned()),
                         active_count: Some(0),
                         recursion_clamps_total: Some(0),
+                        audit_timestamp_invalid_total: Some(0),
                         ..SubsystemHealth::default()
                     };
                 };
                 match runtime.try_lock() {
-                    Ok(runtime) => match runtime.recursion_clamps_total() {
-                        Ok(recursion_clamps_total) => SubsystemHealth {
-                            status: if runtime.degraded_latency() {
-                                "degraded_latency".to_owned()
-                            } else {
-                                "ok".to_owned()
+                    Ok(runtime) => {
+                        let audit_timestamp_invalid_total = runtime.audit_timestamp_invalid_total();
+                        match runtime.recursion_clamps_total() {
+                            Ok(recursion_clamps_total) => SubsystemHealth {
+                                status: if audit_timestamp_invalid_total > 0 {
+                                    "error".to_owned()
+                                } else if runtime.degraded_latency() {
+                                    "degraded_latency".to_owned()
+                                } else {
+                                    "ok".to_owned()
+                                },
+                                detail: Some(if audit_timestamp_invalid_total > 0 {
+                                    format!(
+                                        "{audit_timestamp_invalid_total} reflex audit timestamp(s) were rejected; inspect REFLEX_AUDIT_TIMESTAMP_INVALID logs and repair the system clock/timestamp source before restarting"
+                                    )
+                                } else {
+                                    "reflex runtime initialized".to_owned()
+                                }),
+                                active_count: Some(runtime.active_count()),
+                                sample_count: Some(runtime.sample_count()),
+                                sample_limit: Some(runtime.sample_limit()),
+                                last_tick_jitter_us: runtime.last_tick_jitter_us(),
+                                p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
+                                late_tick_count: Some(runtime.late_tick_count()),
+                                deadline_miss_streak: runtime.deadline_miss_streak(),
+                                deadline_miss_audit_after: Some(
+                                    runtime.deadline_miss_audit_after(),
+                                ),
+                                severe_deadline_miss_after_us: Some(
+                                    runtime.severe_deadline_miss_after_us(),
+                                ),
+                                degraded_tick_count: Some(runtime.degraded_tick_count()),
+                                recursion_clamps_total: Some(recursion_clamps_total),
+                                audit_timestamp_invalid_total: Some(audit_timestamp_invalid_total),
+                                ..SubsystemHealth::default()
                             },
-                            detail: Some("reflex runtime initialized".to_owned()),
-                            active_count: Some(runtime.active_count()),
-                            sample_count: Some(runtime.sample_count()),
-                            sample_limit: Some(runtime.sample_limit()),
-                            last_tick_jitter_us: runtime.last_tick_jitter_us(),
-                            p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
-                            late_tick_count: Some(runtime.late_tick_count()),
-                            deadline_miss_streak: runtime.deadline_miss_streak(),
-                            deadline_miss_audit_after: Some(runtime.deadline_miss_audit_after()),
-                            severe_deadline_miss_after_us: Some(
-                                runtime.severe_deadline_miss_after_us(),
-                            ),
-                            degraded_tick_count: Some(runtime.degraded_tick_count()),
-                            recursion_clamps_total: Some(recursion_clamps_total),
-                            ..SubsystemHealth::default()
-                        },
-                        Err(error) => SubsystemHealth {
-                            status: "error".to_owned(),
-                            detail: Some(error.to_string()),
-                            active_count: Some(runtime.active_count()),
-                            sample_count: Some(runtime.sample_count()),
-                            sample_limit: Some(runtime.sample_limit()),
-                            last_tick_jitter_us: runtime.last_tick_jitter_us(),
-                            p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
-                            late_tick_count: Some(runtime.late_tick_count()),
-                            deadline_miss_streak: runtime.deadline_miss_streak(),
-                            deadline_miss_audit_after: Some(runtime.deadline_miss_audit_after()),
-                            severe_deadline_miss_after_us: Some(
-                                runtime.severe_deadline_miss_after_us(),
-                            ),
-                            degraded_tick_count: Some(runtime.degraded_tick_count()),
-                            ..SubsystemHealth::default()
-                        },
-                    },
+                            Err(error) => SubsystemHealth {
+                                status: "error".to_owned(),
+                                detail: Some(error.to_string()),
+                                active_count: Some(runtime.active_count()),
+                                sample_count: Some(runtime.sample_count()),
+                                sample_limit: Some(runtime.sample_limit()),
+                                last_tick_jitter_us: runtime.last_tick_jitter_us(),
+                                p99_tick_jitter_us: runtime.p99_tick_jitter_us(),
+                                late_tick_count: Some(runtime.late_tick_count()),
+                                deadline_miss_streak: runtime.deadline_miss_streak(),
+                                deadline_miss_audit_after: Some(
+                                    runtime.deadline_miss_audit_after(),
+                                ),
+                                severe_deadline_miss_after_us: Some(
+                                    runtime.severe_deadline_miss_after_us(),
+                                ),
+                                degraded_tick_count: Some(runtime.degraded_tick_count()),
+                                audit_timestamp_invalid_total: Some(audit_timestamp_invalid_total),
+                                ..SubsystemHealth::default()
+                            },
+                        }
+                    }
                     Err(error) => runtime_lock_unavailable_health("reflex", error),
                 }
             }

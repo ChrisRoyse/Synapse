@@ -42,6 +42,16 @@ impl fmt::Debug for ReflexRuntime {
 }
 
 impl ReflexRuntime {
+    /// Number of scheduler/offload audit timestamps rejected in this process.
+    ///
+    /// The counter is process-global because those paths can detect a failure
+    /// without holding the runtime mutex. Health exposes it so omission is
+    /// never visible only in a transient log stream.
+    #[must_use]
+    pub fn audit_timestamp_invalid_total(&self) -> u64 {
+        crate::audit_timestamp::invalid_total()
+    }
+
     /// Spawns the reflex runtime scaffold.
     ///
     /// # Errors

@@ -6,6 +6,12 @@ use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use super::{AsterVault, PutDisposition, encode, ledger_hook, prepared};
 use crate::cf::ColumnFamily;
 
+/// A revision changed between projection preparation and the atomic grounded
+/// publication. No source, constellation, anchor, ledger, WAL, or MVCC row was
+/// committed.
+pub const CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT: &str =
+    "CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT";
+
 /// Readback from one atomic source-row + grounded-observation publication.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GroundedObservationCommit {
@@ -26,6 +32,64 @@ where
     pub fn put_grounded_observation_with_source_rows(
         &self,
         source_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        content_addressed_source_identity: Vec<u8>,
+        constellation: Constellation,
+        anchor: Anchor,
+        ledger_payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<GroundedObservationCommit> {
+        self.put_grounded_observation_with_source_rows_inner(
+            source_rows,
+            None,
+            content_addressed_source_identity,
+            constellation,
+            anchor,
+            ledger_payload,
+            actor,
+        )
+    }
+
+    /// Atomically publishes revision-guarded source rows and their native
+    /// grounded observation.
+    ///
+    /// Every source row must have exactly one guard. Comparison, source rows,
+    /// Base/Slot/Scalar/Anchor rows, provenance ledger entry, and the WAL/MVCC
+    /// sequence share one durable commit lock. A conflict fails before any
+    /// mutation with
+    /// [`CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for malformed or mismatching guards, invalid
+    /// source/constellation/anchor data, or a ledger/WAL/MVCC durability
+    /// failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_guarded_grounded_observation_with_source_rows(
+        &self,
+        source_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        source_guards: Vec<super::CfRevisionGuard>,
+        content_addressed_source_identity: Vec<u8>,
+        constellation: Constellation,
+        anchor: Anchor,
+        ledger_payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<GroundedObservationCommit> {
+        self.put_grounded_observation_with_source_rows_inner(
+            source_rows,
+            Some(source_guards),
+            content_addressed_source_identity,
+            constellation,
+            anchor,
+            ledger_payload,
+            actor,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn put_grounded_observation_with_source_rows_inner(
+        &self,
+        source_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        source_guards: Option<Vec<super::CfRevisionGuard>>,
         content_addressed_source_identity: Vec<u8>,
         mut constellation: Constellation,
         anchor: Anchor,
@@ -88,16 +152,59 @@ where
             }
         }
 
+        if let Some(guards) = source_guards.as_ref() {
+            let mut guard_keys = BTreeSet::new();
+            for guard in guards {
+                if guard.cf != ColumnFamily::Kv || guard.key.is_empty() {
+                    return Err(CalyxError::aster_corrupt_shard(
+                        "guarded grounded observation guards must name non-empty KV keys",
+                    ));
+                }
+                if !guard_keys.insert(guard.key.clone()) {
+                    return Err(CalyxError::aster_corrupt_shard(
+                        "guarded grounded observation contains a duplicate guard key",
+                    ));
+                }
+            }
+            if guard_keys != source_keys {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "guarded grounded observation requires exactly one guard per source row: source_rows={} guards={} matching_keys={}",
+                    source_keys.len(),
+                    guard_keys.len(),
+                    source_keys.intersection(&guard_keys).count()
+                )));
+            }
+        }
+
         let publication_started = Instant::now();
         let commit = self.with_durable_commit_lock(move || {
             let latest = self.snapshot();
             let source_precondition_started = Instant::now();
-            for (_cf, key, _value) in &source_rows {
-                if self.read_cf_at(latest, ColumnFamily::Kv, key)?.is_some() {
-                    return Err(CalyxError::ledger_append_only_violation(format!(
-                        "grounded observation source row already exists: key_len={}",
-                        key.len()
-                    )));
+            if let Some(guards) = source_guards.as_ref() {
+                for (guard_index, guard) in guards.iter().enumerate() {
+                    let actual_revision = self
+                        .read_cf_at(latest, guard.cf, &guard.key)?
+                        .as_deref()
+                        .map(super::value_revision);
+                    if actual_revision != guard.expected_revision {
+                        return Err(CalyxError {
+                            code: CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT,
+                            message: format!(
+                                "grounded observation source revision changed before publication: guard_index={guard_index} key_len={} expected={:?} actual={actual_revision:?}",
+                                guard.key.len(), guard.expected_revision
+                            ),
+                            remediation: "reread every guarded source revision and rebuild the complete grounded publication; no row from this attempt was committed",
+                        });
+                    }
+                }
+            } else {
+                for (_cf, key, _value) in &source_rows {
+                    if self.read_cf_at(latest, ColumnFamily::Kv, key)?.is_some() {
+                        return Err(CalyxError::ledger_append_only_violation(format!(
+                            "grounded observation source row already exists: key_len={}",
+                            key.len()
+                        )));
+                    }
                 }
             }
             let source_precondition_us = elapsed_us(source_precondition_started);

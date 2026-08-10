@@ -332,6 +332,7 @@ impl ReflexScheduler {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -357,6 +358,7 @@ impl ReflexScheduler {
             Some(action_gate),
             None,
             None,
+            false,
         )
     }
 
@@ -382,6 +384,7 @@ impl ReflexScheduler {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -408,6 +411,7 @@ impl ReflexScheduler {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -435,6 +439,7 @@ impl ReflexScheduler {
             Some(action_gate),
             None,
             None,
+            false,
         )
     }
 
@@ -463,6 +468,7 @@ impl ReflexScheduler {
             None,
             Some(aim_track_target_source),
             None,
+            false,
         )
     }
 
@@ -493,6 +499,7 @@ impl ReflexScheduler {
             Some(action_gate),
             Some(aim_track_target_source),
             None,
+            false,
         )
     }
 
@@ -513,6 +520,7 @@ impl ReflexScheduler {
         action_gate: Option<ReflexActionGateHandle>,
         aim_track_target_source: Option<AimTrackTargetSourceHandle>,
         prior_statuses: &[ReflexStatus],
+        new_registration_at: chrono::DateTime<Utc>,
     ) -> ReflexResult<SchedulerHandle> {
         Self::spawn_inner(
             event_bus,
@@ -523,7 +531,8 @@ impl ReflexScheduler {
             audit_context,
             action_gate,
             aim_track_target_source,
-            Some(prior_statuses),
+            Some((prior_statuses, new_registration_at)),
+            true,
         )
     }
 
@@ -537,7 +546,8 @@ impl ReflexScheduler {
         audit_context: Option<StoredAuditContext>,
         action_gate: Option<ReflexActionGateHandle>,
         aim_track_target_source: Option<AimTrackTargetSourceHandle>,
-        prior_statuses: Option<&[ReflexStatus]>,
+        replacement_lifecycle: Option<(&[ReflexStatus], chrono::DateTime<Utc>)>,
+        start_prepared: bool,
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
@@ -564,8 +574,17 @@ impl ReflexScheduler {
                 detail: format!("scheduler event subscription failed: {error}"),
             })?;
         let stop = Arc::new(AtomicBool::new(false));
+        let start = Arc::new(AtomicBool::new(!start_prepared));
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(config.sample_limit)));
-        let statuses = Arc::new(Mutex::new(initial_statuses(&reflexes, prior_statuses)));
+        let (prior_statuses, new_registration_at) = replacement_lifecycle.map_or_else(
+            || (None, Utc::now()),
+            |(statuses, timestamp)| (Some(statuses), timestamp),
+        );
+        let statuses = Arc::new(Mutex::new(initial_statuses(
+            &reflexes,
+            prior_statuses,
+            new_registration_at,
+        )));
         let controls = Arc::new(Mutex::new(
             reflexes
                 .iter()
@@ -580,22 +599,7 @@ impl ReflexScheduler {
         let hold_button_states = hold_button_states(&reflexes)?;
         let combo_states = combo_states(&reflexes);
         let path_follow_states = path_follow_states(&reflexes)?;
-        let reflexes = reflexes
-            .into_iter()
-            .enumerate()
-            .map(|(registration_order, reflex)| RuntimeReflex {
-                registration_order,
-                reflex,
-            })
-            .collect::<Vec<_>>();
-        let on_event_states = reflexes
-            .iter()
-            .map(|_| OnEventState::default())
-            .collect::<Vec<_>>();
-        let starvation_states = reflexes
-            .iter()
-            .map(|_| crate::conflict::StarvationState::default())
-            .collect::<Vec<_>>();
+        let (reflexes, on_event_states, starvation_states) = runtime_reflex_state(reflexes);
 
         let runtime = RuntimeState {
             event_bus,
@@ -612,6 +616,7 @@ impl ReflexScheduler {
             aim_track_target_source,
             subscription,
             stop: Arc::clone(&stop),
+            start: Arc::clone(&start),
             samples: Arc::clone(&samples),
             controls: Arc::clone(&controls),
             statuses: Arc::clone(&statuses),
@@ -634,6 +639,7 @@ impl ReflexScheduler {
 
         Ok(SchedulerHandle {
             stop,
+            start,
             join: Some(join),
             samples,
             controls,
@@ -643,11 +649,36 @@ impl ReflexScheduler {
     }
 }
 
+fn runtime_reflex_state(
+    reflexes: Vec<ScheduledReflex>,
+) -> (
+    Vec<RuntimeReflex>,
+    Vec<OnEventState>,
+    Vec<crate::conflict::StarvationState>,
+) {
+    let count = reflexes.len();
+    let reflexes = reflexes
+        .into_iter()
+        .enumerate()
+        .map(|(registration_order, reflex)| RuntimeReflex {
+            registration_order,
+            reflex,
+        })
+        .collect();
+    (
+        reflexes,
+        (0..count).map(|_| OnEventState::default()).collect(),
+        (0..count)
+            .map(|_| crate::conflict::StarvationState::default())
+            .collect(),
+    )
+}
+
 fn initial_statuses(
     reflexes: &[ScheduledReflex],
     prior_statuses: Option<&[ReflexStatus]>,
+    registered_at: chrono::DateTime<Utc>,
 ) -> Vec<ReflexStatus> {
-    let registered_at = Utc::now();
     let prior_statuses = prior_statuses.unwrap_or_default();
     reflexes
         .iter()

@@ -19,6 +19,7 @@ use super::{
 
 pub struct SchedulerHandle {
     pub(super) stop: Arc<AtomicBool>,
+    pub(super) start: Arc<AtomicBool>,
     pub(super) join: Option<thread::JoinHandle<()>>,
     pub(super) samples: Arc<Mutex<VecDeque<TickSample>>>,
     pub(super) controls: Arc<Mutex<Vec<ReflexControl>>>,
@@ -29,6 +30,18 @@ pub struct SchedulerHandle {
 }
 
 impl SchedulerHandle {
+    /// Publishes a prepared replacement after its durable registration commit.
+    ///
+    /// This is deliberately infallible: the thread and every dependency were
+    /// created during preparation, so the post-commit transition is one atomic
+    /// store plus an unpark notification.
+    pub(crate) fn activate_prepared(&self) {
+        self.start.store(true, Ordering::Release);
+        if let Some(join) = self.join.as_ref() {
+            join.thread().unpark();
+        }
+    }
+
     /// The frozen guard-threshold feed the tick reads at tick start (#1686).
     #[must_use]
     pub const fn lowered_guard_thresholds(
@@ -150,6 +163,9 @@ impl SchedulerHandle {
     /// Returns an error if the scheduler thread panicked before joining.
     pub fn stop(&mut self) -> ReflexResult<()> {
         self.stop.store(true, Ordering::Release);
+        if let Some(join) = self.join.as_ref() {
+            join.thread().unpark();
+        }
         self.lowered_refresher.stop();
         if let Some(join) = self.join.take() {
             join.join().map_err(|error| ReflexError::ParamsInvalid {

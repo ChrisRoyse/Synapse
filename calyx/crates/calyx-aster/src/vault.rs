@@ -80,7 +80,9 @@ pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub(crate) use compaction_bridge::LIVE_COMPACTION_TRIGGER_FILES;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
-pub use grounded_observation::GroundedObservationCommit;
+pub use grounded_observation::{
+    CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT, GroundedObservationCommit,
+};
 pub use htap::HtapDualRead;
 pub use ingest_precondition::{
     CALYX_INGEST_PRECONDITION_FAILED, CALYX_INGEST_PRECONDITION_INVALID, IngestPrecondition,

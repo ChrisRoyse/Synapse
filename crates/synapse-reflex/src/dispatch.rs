@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use chrono::Utc;
 use serde_json::json;
 use synapse_action::ActionHandle;
 use synapse_core::{
@@ -114,11 +113,16 @@ impl ReflexActionDispatchContext {
         let Some(sink) = self.audit_sink.as_deref() else {
             return;
         };
+        let Some(ts_ns) =
+            crate::audit_timestamp::try_now_unix_ns(REFLEX_ACTION_PERMISSION_DENIED_KIND)
+        else {
+            return;
+        };
         let audit = StoredReflexAudit {
             schema_version: SCHEMA_VERSION,
             audit_id: Uuid::now_v7().to_string(),
             reflex_id: reflex_id.clone(),
-            ts_ns: now_ts_ns(),
+            ts_ns,
             status: ReflexState::ActionDenied,
             event_id: None,
             audit_context: self.audit_context.clone(),
@@ -171,11 +175,4 @@ const fn action_kind(action: &Action) -> &'static str {
         Action::Combo { .. } => "combo",
         Action::ReleaseAll => "release_all",
     }
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }

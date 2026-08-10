@@ -18,6 +18,14 @@ pub enum ReflexError {
     FilterInvalid { detail: String },
     #[error("reflex priority invalid: {detail}")]
     PriorityInvalid { detail: String },
+    #[error(
+        "reflex audit timestamp invalid: event_kind={event_kind} timestamp={timestamp}: {detail}"
+    )]
+    AuditTimestampInvalid {
+        event_kind: &'static str,
+        timestamp: String,
+        detail: String,
+    },
     #[error("reflex tick late by {late_by_us} us")]
     TickLate { late_by_us: u64 },
     #[error("reflex track lost: {reflex_id}")]
@@ -46,6 +54,7 @@ impl ReflexError {
             Self::TargetInvalid { .. } => error_codes::REFLEX_TARGET_INVALID,
             Self::FilterInvalid { .. } => error_codes::REFLEX_FILTER_INVALID,
             Self::PriorityInvalid { .. } => error_codes::REFLEX_PRIORITY_INVALID,
+            Self::AuditTimestampInvalid { .. } => error_codes::REFLEX_AUDIT_TIMESTAMP_INVALID,
             Self::TickLate { .. } => error_codes::REFLEX_TICK_LATE,
             Self::TrackLost { .. } => error_codes::REFLEX_TRACK_LOST,
             Self::Starved { .. } => error_codes::REFLEX_STARVED,

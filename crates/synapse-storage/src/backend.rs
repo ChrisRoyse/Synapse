@@ -273,6 +273,19 @@ pub struct McpUsageGroundedPublicationReport {
     pub anchor: CalyxAnchorWriteReport,
 }
 
+/// Physical readback from one atomic reflex-registration publication.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReflexRegistrationPublicationReport {
+    pub source_row_count: u64,
+    pub source_readback_exact_match_count: u64,
+    pub source_key_hex: String,
+    pub source_value_len_bytes: u64,
+    pub source_value_sha256: String,
+    pub committed_seq: u64,
+    pub constellation: ConstellationPutReport,
+    pub anchor: CalyxAnchorWriteReport,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CalyxRecurrenceSubjectReport {
     pub subject_kind: String,
@@ -891,6 +904,14 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &StoredReflexAudit,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_reflex_registration_grounded_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredReflexAudit,
+    ) -> StorageResult<ReflexRegistrationPublicationReport>;
     fn put_process_constellation(
         &self,
         source_key: &[u8],
@@ -6913,6 +6934,68 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_reflex_registration_grounded_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+        source_key: &[u8],
+        raw_bytes: &[u8],
+        record: &StoredReflexAudit,
+    ) -> StorageResult<ReflexRegistrationPublicationReport> {
+        const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+        let started = Instant::now();
+        validate_reflex_registration_publication(&guards, &batches, source_key, raw_bytes, record)?;
+
+        let result = self.with_vault(
+            OPERATION_CF,
+            "atomically publish revision-guarded reflex registration",
+            true,
+            |vault| {
+                let prepared = prepare_reflex_registration_publication(
+                    vault, guards, batches, source_key, raw_bytes, record,
+                )?;
+                commit_reflex_registration_publication(
+                    vault, prepared, source_key, raw_bytes, started,
+                )
+            },
+        );
+        match result {
+            Ok(report) => {
+                constellations::emit_success_metric(&report.constellation);
+                tracing::info!(
+                    code = "CALYX_REFLEX_REGISTRATION_ATOMIC_PUBLICATION_COMMITTED",
+                    reflex_id = %record.reflex_id,
+                    audit_id = %record.audit_id,
+                    committed_seq = report.committed_seq,
+                    source_row_count = report.source_row_count,
+                    source_readback_exact_match_count = report.source_readback_exact_match_count,
+                    cx_id = %report.constellation.cx_id,
+                    ledger_seq = report.anchor.ledger_seq,
+                    duration_us = report.constellation.duration_us,
+                    "reflex registration source, projections, constellation, anchor, and ledger entry committed atomically with physical readback"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                constellations::emit_error_metric(
+                    SYN_REFLEX_PANEL_NAME,
+                    cf::CF_REFLEX_AUDIT,
+                    error.code(),
+                    started.elapsed(),
+                );
+                tracing::error!(
+                    code = "REFLEX_REGISTRATION_ATOMIC_PUBLICATION_FAILED",
+                    reflex_id = %record.reflex_id,
+                    audit_id = %record.audit_id,
+                    error_code = error.code(),
+                    detail = %error,
+                    "reflex registration atomic durable publication failed before scheduler activation"
+                );
+                Err(error)
+            }
+        }
+    }
+
     fn put_process_constellation(
         &self,
         source_key: &[u8],
@@ -8419,6 +8502,226 @@ struct ConstellationReportInput<'a> {
     duration_us: u64,
 }
 
+struct PreparedReflexRegistrationPublication {
+    context: NativeConstellationContext,
+    physical_guards: Vec<SynapseCalyxRevisionGuard>,
+    physical_rows: Vec<SynapseCalyxCfWrite>,
+    constellation: Constellation,
+    slot_count: u64,
+    scalar_count: u64,
+    anchor: Anchor,
+    ledger_payload: Vec<u8>,
+}
+
+fn validate_reflex_registration_publication(
+    guards: &[CfRevisionGuard],
+    batches: &[OwnedCfWriteBatch],
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredReflexAudit,
+) -> StorageResult<()> {
+    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    validate_cross_cf_revision_guarded_put(guards, batches)?;
+    let requested_rows = batches
+        .iter()
+        .filter(|(cf_name, _rows)| cf_name == cf::CF_REFLEX_AUDIT)
+        .flat_map(|(_cf_name, rows)| rows.iter())
+        .filter(|(key, _value)| key.as_slice() == source_key)
+        .collect::<Vec<_>>();
+    if requested_rows.len() != 1 || requested_rows[0].1.as_slice() != raw_bytes {
+        return Err(calyx_write_failed_detail(
+            OPERATION_CF,
+            format!(
+                "REFLEX_REGISTRATION_SOURCE_ROW_INVALID: expected one exact CF_REFLEX_AUDIT source row; matching_rows={} expected_sha256={} actual_sha256={}; remediation=rebuild the complete registration publication from the encoded audit",
+                requested_rows.len(),
+                constellations::sha256_hex(raw_bytes),
+                requested_rows.first().map_or_else(
+                    || "absent".to_owned(),
+                    |row| constellations::sha256_hex(&row.1),
+                )
+            ),
+        ));
+    }
+    if record.status != synapse_core::ReflexState::Active
+        || record.details.get("kind").and_then(Value::as_str) != Some("reflex_registered")
+    {
+        return Err(calyx_write_failed_detail(
+            OPERATION_CF,
+            format!(
+                "REFLEX_REGISTRATION_AUDIT_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only an active reflex_registered audit through the registration transaction",
+                record.reflex_id,
+                record.status,
+                record.details.get("kind")
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn prepare_reflex_registration_publication(
+    vault: &SynapseCalyxVault,
+    guards: Vec<CfRevisionGuard>,
+    batches: Vec<OwnedCfWriteBatch>,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    record: &StoredReflexAudit,
+) -> StorageResult<PreparedReflexRegistrationPublication> {
+    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    let now_ms = calyx_clock_now_for_write(vault, OPERATION_CF)?;
+    let mut physical_guards = Vec::with_capacity(guards.len());
+    for guard in guards {
+        let collection_id = calyx_collection_id_for_cf_write(&guard.cf_name)?;
+        let physical_key = encode_calyx_key_for_write(&guard.cf_name, collection_id, &guard.key)?;
+        physical_guards.push(SynapseCalyxRevisionGuard::new(
+            ColumnFamily::Kv,
+            physical_key,
+            guard.expected_revision_sha256,
+        ));
+    }
+    let mut physical_rows = Vec::new();
+    for (cf_name, rows) in batches {
+        let collection_id = calyx_collection_id_for_cf_write(&cf_name)?;
+        for (key, value) in rows {
+            physical_rows.push(calyx_put_row(
+                &cf_name,
+                collection_id,
+                &key,
+                &value,
+                now_ms,
+            )?);
+        }
+    }
+    let context = NativeConstellationContext {
+        vault_id: vault.vault_id_value(),
+        cx_id: vault.cx_id_for_input(raw_bytes, SYN_REFLEX_PANEL_VERSION),
+        created_at_ms: now_ms,
+        next_ledger_seq: vault.latest_seq().saturating_add(1),
+    };
+    let constellation =
+        constellations::build_reflex_audit_constellation(context, source_key, raw_bytes, record)?;
+    let slot_count = u64::try_from(constellation.slots.len()).unwrap_or(u64::MAX);
+    let scalar_count = u64::try_from(constellation.scalars.len()).unwrap_or(u64::MAX);
+    let anchor = grounding_anchor_to_calyx(GroundingAnchor {
+        kind_label: "reflex_registration_state".to_owned(),
+        value: GroundingAnchorValue::Enum("active".to_owned()),
+        source: "synapse-reflex-registration".to_owned(),
+        observed_at_ms: record.ts_ns / 1_000_000,
+        confidence: 1.0,
+    })?;
+    let ledger_payload = serde_json::to_vec(&serde_json::json!({
+        "schema": "synapse.reflex.registration.v1",
+        "reflex_id": record.reflex_id,
+        "audit_id": record.audit_id,
+        "audit_ts_ns": record.ts_ns,
+        "source_cf": cf::CF_REFLEX_AUDIT,
+        "source_key_sha256": constellations::sha256_hex(source_key),
+        "source_value_sha256": constellations::sha256_hex(raw_bytes),
+        "publication_row_count": physical_rows.len(),
+    }))
+    .map_err(|source| StorageError::EncodeJson {
+        type_name: "reflex_registration_grounding_ledger_payload",
+        source,
+    })?;
+    Ok(PreparedReflexRegistrationPublication {
+        context,
+        physical_guards,
+        physical_rows,
+        constellation,
+        slot_count,
+        scalar_count,
+        anchor,
+        ledger_payload,
+    })
+}
+
+fn commit_reflex_registration_publication(
+    vault: &SynapseCalyxVault,
+    prepared: PreparedReflexRegistrationPublication,
+    source_key: &[u8],
+    raw_bytes: &[u8],
+    started: Instant,
+) -> StorageResult<ReflexRegistrationPublicationReport> {
+    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    let expected_rows = prepared.physical_rows.clone();
+    let write = vault
+        .put_guarded_grounded_observation_with_source_rows(
+            prepared.physical_rows,
+            prepared.physical_guards,
+            raw_bytes.to_vec(),
+            prepared.constellation,
+            prepared.anchor.clone(),
+            prepared.ledger_payload,
+            "synapse-reflex-registration",
+        )
+        .map_err(|source| {
+            calyx_write_failed(
+                OPERATION_CF,
+                "commit atomic reflex registration source/constellation/anchor rows",
+                &source,
+            )
+        })?;
+    if write.source_row_count != expected_rows.len() {
+        return Err(calyx_write_failed_detail(
+            OPERATION_CF,
+            format!(
+                "REFLEX_REGISTRATION_COMMITTED_ROW_COUNT_MISMATCH: committed={} expected={}; remediation=preserve the vault and inspect the atomic WAL sequence {}",
+                write.source_row_count,
+                expected_rows.len(),
+                write.committed_seq
+            ),
+        ));
+    }
+    let source_readback = verify_grounded_source_readback(
+        vault,
+        &expected_rows,
+        cf::CF_REFLEX_AUDIT,
+        source_key,
+        raw_bytes,
+        OPERATION_CF,
+        "reflex registration",
+    )?;
+    let anchor_count = verify_grounded_anchor_readback(
+        vault,
+        prepared.context.cx_id,
+        &prepared.anchor,
+        OPERATION_CF,
+        "reflex registration",
+    )?;
+    let constellation = constellation_report(ConstellationReportInput {
+        panel_name: SYN_REFLEX_PANEL_NAME,
+        panel_version: SYN_REFLEX_PANEL_VERSION,
+        source_cf: cf::CF_REFLEX_AUDIT,
+        source_key,
+        raw_bytes,
+        readback: grounded_observation_as_observation_readback(&write),
+        slot_count: prepared.slot_count,
+        scalar_count: prepared.scalar_count,
+        duration_us: constellations::duration_us(started.elapsed()),
+    });
+    let anchor = anchor_write_report(AnchorWriteReportInput {
+        source_cf: cf::CF_REFLEX_AUDIT,
+        source_key,
+        raw_bytes,
+        panel_name: SYN_REFLEX_PANEL_NAME,
+        panel_version: SYN_REFLEX_PANEL_VERSION,
+        cx_id: prepared.context.cx_id,
+        anchor: &prepared.anchor,
+        write: grounded_observation_as_anchor_readback(&write),
+        readback_anchor_count: anchor_count,
+    });
+    Ok(ReflexRegistrationPublicationReport {
+        source_row_count: u64::try_from(write.source_row_count).unwrap_or(u64::MAX),
+        source_readback_exact_match_count: u64::try_from(source_readback.exact_match_count)
+            .unwrap_or(u64::MAX),
+        source_key_hex: source_readback.logical_key_hex,
+        source_value_len_bytes: source_readback.logical_value_len_bytes,
+        source_value_sha256: source_readback.logical_value_sha256,
+        committed_seq: write.committed_seq,
+        constellation,
+        anchor,
+    })
+}
+
 struct PreparedMcpUsageGroundedPublication {
     context: NativeConstellationContext,
     content_addressed_source_identity: Vec<u8>,
@@ -8430,7 +8733,7 @@ struct PreparedMcpUsageGroundedPublication {
     physical_source_rows: Vec<SynapseCalyxCfWrite>,
 }
 
-struct VerifiedMcpUsageSourceReadback {
+struct VerifiedGroundedSourceReadback {
     exact_match_count: usize,
     logical_key_hex: String,
     logical_value_len_bytes: u64,
@@ -8572,11 +8875,24 @@ fn commit_mcp_usage_grounded_publication(
         ));
     }
     let source_readback_started = Instant::now();
-    let source_readback =
-        verify_mcp_usage_source_readback(vault, &expected_source_rows, source_key, raw_bytes)?;
+    let source_readback = verify_grounded_source_readback(
+        vault,
+        &expected_source_rows,
+        cf::CF_KV,
+        source_key,
+        raw_bytes,
+        "calyx_mcp_usage_publication",
+        "MCP usage",
+    )?;
     let source_readback_us = constellations::duration_us(source_readback_started.elapsed());
     let anchor_readback_started = Instant::now();
-    let readback_anchor_count = verify_mcp_usage_anchor_readback(vault, context.cx_id, &anchor)?;
+    let readback_anchor_count = verify_grounded_anchor_readback(
+        vault,
+        context.cx_id,
+        &anchor,
+        "calyx_mcp_usage_publication",
+        "MCP usage",
+    )?;
     let anchor_readback_us = constellations::duration_us(anchor_readback_started.elapsed());
     tracing::info!(
         code = "CALYX_MCP_USAGE_PUBLICATION_STAGE_TIMINGS",
@@ -8601,14 +8917,18 @@ fn commit_mcp_usage_grounded_publication(
     ))
 }
 
-fn verify_mcp_usage_source_readback(
+fn verify_grounded_source_readback(
     vault: &SynapseCalyxVault,
     expected_source_rows: &[SynapseCalyxCfWrite],
+    logical_source_cf: &'static str,
     source_key: &[u8],
     raw_bytes: &[u8],
-) -> StorageResult<VerifiedMcpUsageSourceReadback> {
-    let collection_id = calyx_collection_id_for_cf_write(cf::CF_KV)?;
-    let requested_physical_key = encode_calyx_key_for_write(cf::CF_KV, collection_id, source_key)?;
+    operation_cf: &'static str,
+    operation_label: &'static str,
+) -> StorageResult<VerifiedGroundedSourceReadback> {
+    let collection_id = calyx_collection_id_for_cf_write(logical_source_cf)?;
+    let requested_physical_key =
+        encode_calyx_key_for_write(logical_source_cf, collection_id, source_key)?;
     let mut requested_readback = None;
     let reads = expected_source_rows
         .iter()
@@ -8616,16 +8936,16 @@ fn verify_mcp_usage_source_readback(
         .collect::<Vec<_>>();
     let actual_rows = vault.read_cf_batch_latest(&reads).map_err(|source| {
         calyx_read_failed(
-            cf::CF_KV,
-            "read back atomic MCP usage source row batch from one latest view",
+            logical_source_cf,
+            "read back atomic grounded source row batch from one latest view",
             &source,
         )
     })?;
     if actual_rows.len() != expected_source_rows.len() {
         return Err(calyx_write_failed_detail(
-            "calyx_mcp_usage_publication",
+            operation_cf,
             format!(
-                "atomic MCP usage physical source readback returned {} rows for {} requested keys",
+                "atomic {operation_label} physical source readback returned {} rows for {} requested keys",
                 actual_rows.len(),
                 expected_source_rows.len()
             ),
@@ -8634,18 +8954,18 @@ fn verify_mcp_usage_source_readback(
     for (expected, actual) in expected_source_rows.iter().zip(actual_rows) {
         let Some(actual) = actual else {
             return Err(calyx_write_failed_detail(
-                "calyx_mcp_usage_publication",
+                operation_cf,
                 format!(
-                    "atomic MCP usage physical source readback missing: key_hex={}",
+                    "atomic {operation_label} physical source readback missing: key_hex={}",
                     constellations::hex_encode(&expected.key)
                 ),
             ));
         };
         if actual != expected.value {
             return Err(calyx_write_failed_detail(
-                "calyx_mcp_usage_publication",
+                operation_cf,
                 format!(
-                    "atomic MCP usage physical source readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
+                    "atomic {operation_label} physical source readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
                     constellations::hex_encode(&expected.key),
                     constellations::sha256_hex(&expected.value),
                     constellations::sha256_hex(&actual)
@@ -8655,25 +8975,25 @@ fn verify_mcp_usage_source_readback(
         if expected.key == requested_physical_key {
             let envelope = decode_calyx_value_raw(&actual).map_err(|detail| {
                 calyx_write_failed_detail(
-                    "calyx_mcp_usage_publication",
+                    operation_cf,
                     format!(
-                        "atomic MCP usage physical source readback has an invalid retention envelope: key_hex={} detail={detail}",
+                        "atomic {operation_label} physical source readback has an invalid retention envelope: key_hex={} detail={detail}",
                         constellations::hex_encode(source_key)
                     ),
                 )
             })?;
             if envelope.payload != raw_bytes {
                 return Err(calyx_write_failed_detail(
-                    "calyx_mcp_usage_publication",
+                    operation_cf,
                     format!(
-                        "atomic MCP usage logical payload readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
+                        "atomic {operation_label} logical payload readback mismatch: key_hex={} expected_sha256={} actual_sha256={}",
                         constellations::hex_encode(source_key),
                         constellations::sha256_hex(raw_bytes),
                         constellations::sha256_hex(envelope.payload)
                     ),
                 ));
             }
-            requested_readback = Some(VerifiedMcpUsageSourceReadback {
+            requested_readback = Some(VerifiedGroundedSourceReadback {
                 exact_match_count: expected_source_rows.len(),
                 logical_key_hex: constellations::hex_encode(source_key),
                 logical_value_len_bytes: u64::try_from(envelope.payload.len()).unwrap_or(u64::MAX),
@@ -8683,43 +9003,45 @@ fn verify_mcp_usage_source_readback(
     }
     requested_readback.ok_or_else(|| {
         calyx_write_failed_detail(
-            "calyx_mcp_usage_publication",
+            operation_cf,
             format!(
-                "atomic MCP usage physical source readback omitted requested key: key_hex={}",
+                "atomic {operation_label} physical source readback omitted requested key: key_hex={}",
                 constellations::hex_encode(source_key)
             ),
         )
     })
 }
 
-fn verify_mcp_usage_anchor_readback(
+fn verify_grounded_anchor_readback(
     vault: &SynapseCalyxVault,
     cx_id: CxId,
     expected_anchor: &Anchor,
+    operation_cf: &'static str,
+    operation_label: &'static str,
 ) -> StorageResult<usize> {
     let anchor_row = vault
         .read_anchor_exact(cx_id, &expected_anchor.kind)
         .map_err(|source| {
             calyx_read_failed(
                 "calyx_anchors",
-                "read back exact atomic MCP usage grounded anchor",
+                "read back exact atomic grounded anchor",
                 &source,
             )
         })?
         .ok_or_else(|| {
             calyx_write_failed_detail(
-                "calyx_mcp_usage_publication",
+                operation_cf,
                 format!(
-                    "atomic MCP usage exact physical anchor row is missing for cx_id={cx_id} kind={}",
+                    "atomic {operation_label} exact physical anchor row is missing for cx_id={cx_id} kind={}",
                     anchor_kind_label(&expected_anchor.kind)
                 ),
             )
         })?;
     if anchor_row.anchor != *expected_anchor {
         return Err(calyx_write_failed_detail(
-            "calyx_mcp_usage_publication",
+            operation_cf,
             format!(
-                "atomic MCP usage exact physical anchor readback mismatch for cx_id={cx_id} kind={}",
+                "atomic {operation_label} exact physical anchor readback mismatch for cx_id={cx_id} kind={}",
                 anchor_kind_label(&expected_anchor.kind)
             ),
         ));
@@ -8737,7 +9059,7 @@ fn finish_mcp_usage_grounded_publication(
     scalar_count: u64,
     expected_anchor: &Anchor,
     write: &SynapseCalyxGroundedObservationReadback,
-    source_readback: &VerifiedMcpUsageSourceReadback,
+    source_readback: &VerifiedGroundedSourceReadback,
     readback_anchor_count: usize,
     source_key: &[u8],
     raw_bytes: &[u8],

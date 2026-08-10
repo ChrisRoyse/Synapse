@@ -5730,6 +5730,60 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Atomically publishes revision-guarded physical source rows and the
+    /// grounded native observation derived from them under one Aster commit.
+    ///
+    /// Every source row must have exactly one guard. The guard comparison,
+    /// source rows, constellation, anchor, provenance ledger row, and WAL/MVCC
+    /// sequence are one visibility boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error before mutation when a guard
+    /// differs or when validation fails, and reports any ledger/WAL/MVCC
+    /// durability failure without publishing a partial source transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub fn put_guarded_grounded_observation_with_source_rows(
+        &self,
+        source_rows: Vec<SynapseCalyxCfWrite>,
+        source_guards: Vec<SynapseCalyxRevisionGuard>,
+        content_addressed_source_identity: Vec<u8>,
+        constellation: Constellation,
+        anchor: Anchor,
+        ledger_payload: Vec<u8>,
+        actor_service: impl Into<String>,
+    ) -> Result<SynapseCalyxGroundedObservationReadback, SynapseCalyxError> {
+        let outcome = self
+            .vault
+            .put_guarded_grounded_observation_with_source_rows(
+                source_rows
+                    .into_iter()
+                    .map(|row| (row.cf, row.key, row.value))
+                    .collect(),
+                source_guards.into_iter().map(Into::into).collect(),
+                content_addressed_source_identity,
+                constellation,
+                anchor,
+                ledger_payload,
+                ActorId::Service(actor_service.into()),
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "put atomic guarded grounded Calyx observation with source rows",
+                    &error,
+                )
+            })?;
+        Ok(SynapseCalyxGroundedObservationReadback {
+            cx_id: outcome.cx_id.to_string(),
+            disposition: outcome.disposition.into(),
+            ledger_seq: outcome.ledger_ref.seq,
+            ledger_hash: hex_bytes(&outcome.ledger_ref.hash),
+            source_row_count: outcome.source_row_count,
+            committed_seq: outcome.committed_seq,
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
     /// Runs one physical Aster compaction attempt for the Synapse KV storage CF.
     ///
     /// Synapse maps its storage column families onto namespaces inside Aster's

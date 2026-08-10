@@ -48,7 +48,6 @@ use std::{
     time::Duration,
 };
 
-use chrono::Utc;
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use serde_json::json;
 use synapse_core::{ReflexState, SCHEMA_VERSION, StoredAuditContext, StoredReflexAudit};
@@ -362,11 +361,15 @@ fn record_overflow_gap(
     if lost == 0 {
         return;
     }
+    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_AUDIT_QUEUE_OVERFLOW_KIND)
+    else {
+        return;
+    };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: SCHEDULER_REFLEX_ID.to_owned(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: None,
         audit_context: audit_context.cloned(),
@@ -407,11 +410,4 @@ fn record_overflow_gap(
             );
         }
     }
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }

@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use chrono::Utc;
 use synapse_core::{Action, ButtonAction, ReflexState, ReflexStatus};
 
 use crate::{
@@ -45,9 +46,12 @@ impl ReflexRuntime {
         }
         next.push(reflex.clone());
         scheduler::validate_reflexes(&next)?;
+        let registered_at = Utc::now();
+        let registered_at_ns =
+            crate::audit_timestamp::unix_ns(&registered_at, crate::REFLEX_REGISTERED_KIND)?;
 
         let prior_statuses = self.statuses();
-        let new_scheduler = scheduler::ReflexScheduler::spawn_replacement(
+        let mut new_scheduler = scheduler::ReflexScheduler::spawn_replacement(
             self.event_bus.clone(),
             self.action_handle.clone(),
             next.clone(),
@@ -57,29 +61,56 @@ impl ReflexRuntime {
             self.action_gate.clone(),
             self.aim_track_target_source.clone(),
             &prior_statuses,
+            registered_at,
         )?;
         if !self.disabled_reflex_ids.is_empty() {
             let disabled_reflex_ids = self.disabled_reflex_ids.iter().cloned().collect::<Vec<_>>();
             let _disabled_statuses = new_scheduler.disable_reflexes(&disabled_reflex_ids);
         }
-        let old_scheduler = self.scheduler.replace(new_scheduler);
-        self.reflexes = next;
-        if let Some(mut old_scheduler) = old_scheduler {
-            old_scheduler.stop()?;
-        }
-        let status = self
-            .scheduler
-            .as_ref()
-            .and_then(|scheduler| {
-                scheduler
-                    .statuses()
-                    .into_iter()
-                    .find(|status| status.id == reflex.reflex_id)
-            })
+        let status = new_scheduler
+            .statuses()
+            .into_iter()
+            .find(|status| status.id == reflex.reflex_id)
             .ok_or_else(|| ReflexError::ParamsInvalid {
                 detail: format!("registered reflex status missing: {}", reflex.reflex_id),
             })?;
-        self.write_registration_audit(&status)?;
+        if let Err(commit_error) = self.write_registration_audit(&status, registered_at_ns) {
+            let rollback = new_scheduler.stop();
+            return Err(ReflexError::ParamsInvalid {
+                detail: format!(
+                    "REFLEX_REGISTRATION_TRANSACTION_ROLLED_BACK: phase=durable_commit scheduler_prepared=true scheduler_activated=false audit_committed=false prepared_scheduler_stopped={} commit_error={commit_error} rollback_error={}; remediation=repair the commit error and retry; the prior scheduler and runtime definition remain authoritative",
+                    rollback.is_ok(),
+                    rollback
+                        .err()
+                        .map_or_else(|| "none".to_owned(), |error| error.to_string())
+                ),
+            });
+        }
+
+        // The Calyx transaction is now the crash-recovery authority. Stop the
+        // old generation before publishing the prepared candidate, preventing
+        // an overlap where both scheduler threads could dispatch. A join error
+        // means the old thread already terminated by panic; it is cleanup
+        // evidence, not a reason to report the committed registration as
+        // failed or leave the new durable state inactive.
+        if let Some(mut old_scheduler) = self.scheduler.take()
+            && let Err(error) = old_scheduler.stop()
+        {
+            tracing::error!(
+                code = "REFLEX_REGISTRATION_OLD_SCHEDULER_STOP_FAILED_AFTER_COMMIT",
+                reflex_id = %reflex.reflex_id,
+                phase = "old_scheduler_cleanup",
+                scheduler_prepared = true,
+                scheduler_activated = false,
+                audit_committed = true,
+                detail = %error,
+                remediation = "inspect the prior scheduler panic; the old thread is joined and terminated, and the committed replacement will now be activated",
+                "old reflex scheduler terminated with a panic while committing its replacement"
+            );
+        }
+        new_scheduler.activate_prepared();
+        self.scheduler = Some(new_scheduler);
+        self.reflexes = next;
         Ok(status)
     }
 

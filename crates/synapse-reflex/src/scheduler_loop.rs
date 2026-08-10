@@ -63,6 +63,9 @@ pub(super) struct RuntimeState {
     pub(super) aim_track_target_source: Option<AimTrackTargetSourceHandle>,
     pub(super) subscription: SubscriberHandle,
     pub(super) stop: Arc<AtomicBool>,
+    /// Registration candidates park here until their durable audit transaction
+    /// commits. A prepared scheduler cannot tick or dispatch an action.
+    pub(super) start: Arc<AtomicBool>,
     pub(super) samples: Arc<Mutex<VecDeque<TickSample>>>,
     pub(super) controls: Arc<Mutex<Vec<ReflexControl>>>,
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
@@ -198,6 +201,15 @@ pub(super) fn path_follow_states(
 /// the call makes that structurally impossible instead of a convention someone
 /// has to remember.
 pub(super) fn run_scheduler_thread(runtime: RuntimeState) {
+    while !runtime.start.load(Ordering::Acquire) {
+        if runtime.stop.load(Ordering::Acquire) {
+            return;
+        }
+        std::thread::park();
+    }
+    if runtime.stop.load(Ordering::Acquire) {
+        return;
+    }
     crate::hot_path::run_hot_tick_thread(move || run_tagged_scheduler_thread(runtime));
 }
 
@@ -550,6 +562,9 @@ fn write_lifetime_expired_audit_inner(
     let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
+    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_LIFETIME_EXPIRED_KIND) else {
+        return;
+    };
     let mut details = json!({
         "kind": REFLEX_LIFETIME_EXPIRED_KIND,
         "reason": reason,
@@ -563,7 +578,7 @@ fn write_lifetime_expired_audit_inner(
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: status.id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Expired,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -585,11 +600,14 @@ fn write_track_lost_audit(
     let Some(sink) = runtime.audit_sink.as_deref() else {
         return;
     };
+    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_TRACK_LOST_KIND) else {
+        return;
+    };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: status.id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Expired,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -606,13 +624,6 @@ fn write_track_lost_audit(
         redactions: Vec::new(),
     };
     sink.enqueue(audit);
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }
 
 const fn path_kind(path: &synapse_core::PathSpec) -> &'static str {

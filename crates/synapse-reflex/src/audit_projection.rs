@@ -8,7 +8,8 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use synapse_core::{ReflexStatus, StoredReflexAudit, error_codes};
+use serde_json::Value;
+use synapse_core::{ReflexState, ReflexStatus, StoredReflexAudit, error_codes};
 use synapse_storage::{
     CfRevisionGuard, Db, RawRow, RawRowWithExpiry, StorageError, StorageResult, cf, decode_json,
     encode_json,
@@ -286,6 +287,149 @@ pub fn write_projected_audit(
     require_exact_readback(db, cf::CF_REFLEX_AUDIT_ORDER, &order_key, &order_value)?;
     require_exact_readback(db, cf::CF_KV, &state_key, &state_value)?;
     Ok(())
+}
+
+/// Atomically publishes a registration audit, every durable projection row,
+/// and its grounded Calyx constellation/anchor/ledger evidence.
+///
+/// Unlike later lifecycle audits, a registration is the publication boundary
+/// for a new runtime identity. The source row, ordered pointer, aggregate, and
+/// registry mutation therefore share the same guarded WAL/MVCC commit as the
+/// native constellation. The scheduler remains prepared and unable to tick
+/// until this function returns success.
+pub fn write_projected_registration_audit(
+    db: &Db,
+    audit: &StoredReflexAudit,
+    source_key: &[u8],
+    source_value: &[u8],
+) -> StorageResult<()> {
+    if audit.status != ReflexState::Active
+        || audit.details.get("kind").and_then(Value::as_str) != Some("reflex_registered")
+    {
+        return Err(storage_write_error(&format!(
+            "REFLEX_REGISTRATION_PROJECTION_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only an active reflex_registered audit through the registration transaction",
+            audit.reflex_id,
+            audit.status,
+            audit.details.get("kind")
+        )));
+    }
+    let mut guard = PROJECTION_LOCK.lock().map_err(|_error| storage_write_error(
+        "REFLEX_AUDIT_PROJECTION_LOCK_POISONED: restart the daemon and inspect the prior panic before retrying",
+    ))?;
+    ensure_locked(db, &mut guard).map_err(|error| storage_write_error(&error.to_string()))?;
+
+    let order_key = reflex_audit_order_key(audit.ts_ns, &audit.audit_id, &audit.reflex_id);
+    let order_value = encode_pointer(&OrderedSourcePointer::new(source_key, source_value))?;
+    let existing_source = db.get_cf_revisioned(cf::CF_REFLEX_AUDIT, source_key)?;
+    if let Some(existing) = &existing_source {
+        if existing.value.as_deref() != Some(source_value) {
+            return Err(storage_write_error(&format!(
+                "REFLEX_REGISTRATION_SOURCE_IDENTITY_CONFLICT: source_key_hex={} expected_sha256={} actual_sha256={}; remediation=preserve both values and repair the duplicate audit identity before retrying",
+                hex_encode(source_key),
+                sha256_hex(source_value),
+                existing
+                    .value
+                    .as_deref()
+                    .map_or_else(|| "expired".to_owned(), sha256_hex)
+            )));
+        }
+        require_exact_readback(db, cf::CF_REFLEX_AUDIT_ORDER, &order_key, &order_value)?;
+        return Ok(());
+    }
+
+    let state_key = state_key(&audit.reflex_id);
+    let state_revision = db.get_cf_revisioned(cf::CF_KV, &state_key)?;
+    let prior_state = state_revision
+        .as_ref()
+        .and_then(|row| row.value.as_deref())
+        .map(decode_projection_state)
+        .transpose()?;
+    let next_state = next_projection_state(db, prior_state, audit, source_value)?;
+    let state_value = encode_json(&next_state)?;
+
+    let order_revision = db.get_cf_revisioned(cf::CF_REFLEX_AUDIT_ORDER, &order_key)?;
+    if let Some(existing) = &order_revision
+        && existing.value.as_deref() != Some(order_value.as_slice())
+    {
+        return Err(storage_write_error(&format!(
+            "REFLEX_REGISTRATION_ORDER_IDENTITY_CONFLICT: order_key_hex={}; remediation=preserve source/index rows and inspect the collision before repair",
+            hex_encode(&order_key)
+        )));
+    }
+
+    let mut guards = vec![
+        CfRevisionGuard::new(cf::CF_REFLEX_AUDIT, source_key.to_vec(), None),
+        CfRevisionGuard::new(
+            cf::CF_REFLEX_AUDIT_ORDER,
+            order_key.clone(),
+            order_revision.map(|row| row.revision_sha256),
+        ),
+        CfRevisionGuard::new(
+            cf::CF_KV,
+            state_key.clone(),
+            state_revision.map(|row| row.revision_sha256),
+        ),
+    ];
+    let mut kv_rows = vec![(state_key.clone(), state_value.clone())];
+
+    let registry_update = registration_registry_update(db, &audit.reflex_id)?;
+    if let Some((registry_guard, registry_row)) = registry_update.as_ref() {
+        guards.push(registry_guard.clone());
+        kv_rows.push(registry_row.clone());
+    }
+
+    db.put_reflex_registration_grounded_publication(
+        guards,
+        vec![
+            (
+                cf::CF_REFLEX_AUDIT,
+                vec![(source_key.to_vec(), source_value.to_vec())],
+            ),
+            (
+                cf::CF_REFLEX_AUDIT_ORDER,
+                vec![(order_key.clone(), order_value.clone())],
+            ),
+            (cf::CF_KV, kv_rows),
+        ],
+        source_key,
+        source_value,
+        audit,
+    )?;
+    require_exact_readback(db, cf::CF_REFLEX_AUDIT, source_key, source_value)?;
+    require_exact_readback(db, cf::CF_REFLEX_AUDIT_ORDER, &order_key, &order_value)?;
+    require_exact_readback(db, cf::CF_KV, &state_key, &state_value)?;
+    if let Some((_guard, (_key, registry_value))) = registry_update {
+        require_exact_readback(db, cf::CF_KV, REGISTRY_KEY, &registry_value)?;
+    }
+    Ok(())
+}
+
+fn registration_registry_update(
+    db: &Db,
+    reflex_id: &str,
+) -> StorageResult<Option<(CfRevisionGuard, RawRow)>> {
+    let mut registry =
+        read_registry(db).map_err(|error| storage_write_error(&error.to_string()))?;
+    if registry.reflex_ids.iter().any(|id| id == reflex_id) {
+        return Ok(None);
+    }
+    let registry_revision = db
+        .get_cf_revisioned(cf::CF_KV, REGISTRY_KEY)?
+        .ok_or_else(|| storage_write_error(
+            "REFLEX_AUDIT_REGISTRY_MISSING_AFTER_PUBLICATION: preserve projection state and inspect CF_KV protection",
+        ))?;
+    registry.reflex_ids.push(reflex_id.to_owned());
+    registry.reflex_ids.sort();
+    registry.reflex_ids.dedup();
+    let value = encode_json(&registry)?;
+    Ok(Some((
+        CfRevisionGuard::new(
+            cf::CF_KV,
+            REGISTRY_KEY,
+            Some(registry_revision.revision_sha256),
+        ),
+        (REGISTRY_KEY.to_vec(), value),
+    )))
 }
 
 pub fn global_history(db: &Db, limit: usize) -> ReflexResult<Vec<StoredReflexAudit>> {

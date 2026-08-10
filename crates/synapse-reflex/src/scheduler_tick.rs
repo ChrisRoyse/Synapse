@@ -377,9 +377,12 @@ fn publish_starved(
     audit_context: Option<&synapse_core::StoredAuditContext>,
 ) {
     let starved_for_ms = u64::try_from(starved_for.as_millis()).unwrap_or(u64::MAX);
+    let occurred_at = Utc::now();
+    let audit_ts_ns = audit_sink
+        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_STARVED_KIND));
     let event = Event {
         seq: tick_index,
-        at: Utc::now(),
+        at: occurred_at,
         source: EventSource::Reflex,
         kind: REFLEX_STARVED_KIND.to_owned(),
         data: json!({
@@ -396,11 +399,14 @@ fn publish_starved(
     let Some(sink) = audit_sink else {
         return;
     };
+    let Some(ts_ns) = audit_ts_ns else {
+        return;
+    };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: loser.loser_reflex_id.clone(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Starved,
         event_id: None,
         audit_context: audit_context.cloned(),
@@ -549,9 +555,14 @@ fn emit_tick_late(
     classification: &str,
     degraded: bool,
 ) {
+    let occurred_at = Utc::now();
+    let audit_ts_ns = runtime
+        .audit_sink
+        .as_deref()
+        .and_then(|_sink| crate::audit_timestamp::try_unix_ns(&occurred_at, REFLEX_TICK_LATE_KIND));
     let event = Event {
         seq: runtime.tick_index,
-        at: Utc::now(),
+        at: occurred_at,
         source: EventSource::Reflex,
         kind: REFLEX_TICK_LATE_KIND.to_owned(),
         data: json!({
@@ -576,6 +587,7 @@ fn emit_tick_late(
         reason,
         classification,
         degraded,
+        audit_ts_ns,
     );
 }
 
@@ -586,15 +598,19 @@ fn write_tick_late_audit(
     reason: &str,
     classification: &str,
     degraded: bool,
+    audit_ts_ns: Option<u64>,
 ) {
     let Some(sink) = runtime.audit_sink.as_deref() else {
+        return;
+    };
+    let Some(ts_ns) = audit_ts_ns else {
         return;
     };
     let audit = StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: "__scheduler__".to_owned(),
-        ts_ns: now_ts_ns(),
+        ts_ns,
         status: ReflexState::Active,
         event_id: None,
         audit_context: runtime.audit_context.clone(),
@@ -662,11 +678,4 @@ fn lock_samples(
 
 fn duration_us(duration: Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-fn now_ts_ns() -> u64 {
-    Utc::now()
-        .timestamp_nanos_opt()
-        .and_then(|value| u64::try_from(value).ok())
-        .unwrap_or_default()
 }

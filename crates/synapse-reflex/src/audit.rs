@@ -41,6 +41,19 @@ pub fn write_audit(db: &Db, audit: &StoredReflexAudit) -> StorageResult<()> {
     Ok(())
 }
 
+/// Atomically publishes a reflex registration and every durable derived row.
+///
+/// The runtime scheduler candidate is still start-gated while this executes.
+/// Source, ordered projection, aggregate/registry state, constellation,
+/// grounding anchor, provenance ledger row, and WAL/MVCC sequence share one
+/// Calyx commit; a failure cannot expose a durable active registration.
+pub(crate) fn write_registration_audit(db: &Db, audit: &StoredReflexAudit) -> StorageResult<()> {
+    crate::hot_path::guard_cold("reflex_write_registration_audit");
+    let key = audit_key(audit).into_bytes();
+    let value = encode_json(audit)?;
+    crate::audit_projection::write_projected_registration_audit(db, audit, &key, &value)
+}
+
 fn audit_key(audit: &StoredReflexAudit) -> String {
     format!("{}:{:020}:{}", audit.reflex_id, audit.ts_ns, audit.audit_id)
 }
