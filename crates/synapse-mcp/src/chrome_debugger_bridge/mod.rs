@@ -44,7 +44,7 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-10-exact-maintenance-foreground-v2";
+    "synapse-chrome-bridge-2026-08-10-trusted-pixel-redaction-v1";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "35908d1a0237fe49181794c18ba3e7e4df04d2322ce281cbd093f8e45e897aa6";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
@@ -3493,8 +3493,12 @@ pub struct ChromeDebuggerPageScreenshotResult {
     pub capture_attempt_count: usize,
     #[serde(default)]
     pub capture_attempts: Vec<ChromeDebuggerCaptureAttempt>,
+    pub document_id: String,
+    pub cleanup_verified: bool,
     #[serde(default)]
+    pub cleanup_document_id: Option<String>,
     pub mask_count: usize,
+    pub masks: Vec<ChromeDebuggerPageScreenshotMask>,
     #[serde(default)]
     pub readback_backend: String,
     #[serde(default)]
@@ -3684,6 +3688,13 @@ pub struct ChromeDebuggerPageScreenshotRect {
     pub w: f64,
     #[serde(default, alias = "height")]
     pub h: f64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChromeDebuggerPageScreenshotMask {
+    pub index: usize,
+    pub rect: ChromeDebuggerPageScreenshotRect,
+    pub color_rgba: [u8; 4],
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

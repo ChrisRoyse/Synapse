@@ -601,7 +601,8 @@ pub struct BrowserScreenshotParams {
     /// `browser_aria_snapshot`. Required with `scope=element`.
     #[serde(default)]
     pub element_id: Option<String>,
-    /// Elements to obscure before capture. Restored after capture.
+    /// Elements whose captured pixels are replaced after trusted tile stitching
+    /// and before resize/encode. No page-DOM overlay is created (#2214).
     #[serde(default)]
     pub masks: Vec<BrowserScreenshotMask>,
     /// Image format. Defaults to the file extension.
@@ -684,7 +685,20 @@ pub struct BrowserScreenshotResponse {
     pub scroll_width_css: f64,
     pub scroll_height_css: f64,
     pub tile_count: usize,
+    /// Caller-requested mask count. Equal to resolved/applied counts on success.
     pub mask_count: usize,
+    pub mask_requested_count: usize,
+    pub mask_resolved_count: usize,
+    pub mask_applied_count: usize,
+    pub mask_partial_intersection_count: usize,
+    /// Conservative overwrite operations in the native stitched bitmap. Pixels
+    /// covered by overlapping masks are counted once per overwrite.
+    pub mask_pixel_write_count: u64,
+    pub mask_backend: String,
+    /// SHA-256 over document generation plus ordered page-CSS rectangles and
+    /// exact RGBA bytes. It proves what was redacted without exposing selectors.
+    pub mask_commitment_sha256: String,
+    pub document_generation_sha256: String,
     pub omit_background: bool,
     pub required_foreground: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]

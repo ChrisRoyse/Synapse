@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-exact-maintenance-foreground-v2";
-const BRIDGE_DECLARED_BUILD_SHA256 = "35908d1a0237fe49181794c18ba3e7e4df04d2322ce281cbd093f8e45e897aa6";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-trusted-pixel-redaction-v1";
+const BRIDGE_DECLARED_BUILD_SHA256 = "0d5c06ee444c7e2ab8937b9a3403dacca73dd67271df0c1f6f6f83ecab6bbab9";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -5112,8 +5112,9 @@ async function handlePageScreenshot(params) {
   let activeForCapture = Boolean(before.active);
   let restoredPreviousActive = false;
   let setup = null;
+  let cleanupReadback = null;
+  let operationError = null;
   let captureBackend = "chrome_tabs_extension";
-  const token = `synapse-page-screenshot-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const tiles = [];
   const captureAttempts = [];
   try {
@@ -5130,10 +5131,7 @@ async function handlePageScreenshot(params) {
         remainingPageScreenshotBudgetMs(commandDeadlineMs, "restore_discarded_tab_document")
       );
     }
-    setup = await runPageScreenshotSetup(selected.tabId, {
-      ...request,
-      token
-    });
+    setup = await runPageScreenshotSetup(selected.tabId, request);
     if (!setup.ok) {
       throw bridgeError(
         String(setup.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
@@ -5186,7 +5184,11 @@ async function handlePageScreenshot(params) {
     const positions = pageScreenshotTilePositions(setup.clip_css, setup.metrics);
     for (const [index, position] of positions.entries()) {
       remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
-      const scrollReadback = await runPageScreenshotScroll(selected.tabId, position);
+      const scrollReadback = await runPageScreenshotScroll(
+        selected.tabId,
+        position,
+        setup.document_id
+      );
       remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
       await sleep(request.captureDelayMs);
       let imageDataUrl;
@@ -5251,17 +5253,20 @@ async function handlePageScreenshot(params) {
       });
     }
     }
+  } catch (error) {
+    operationError = error;
   } finally {
+    const cleanupErrors = [];
     if (setup?.ok) {
       try {
-        await runPageScreenshotCleanup(selected.tabId, {
-          token,
+        cleanupReadback = await runPageScreenshotCleanup(selected.tabId, {
+          expectedDocumentId: setup.document_id,
           scrollX: setup.before_scroll_x,
           scrollY: setup.before_scroll_y,
           backgroundRestore: setup.background_restore
         });
       } catch (error) {
-        console.warn(`Synapse pageScreenshot cleanup failed for tab ${selected.tabId}: ${errorMessage(error)}`);
+        cleanupErrors.push(`page_cleanup=${errorMessage(error)}`);
       }
     }
     if (
@@ -5274,11 +5279,25 @@ async function handlePageScreenshot(params) {
         await waitForTabActiveState(previousActiveTabId, true, 2000);
         restoredPreviousActive = true;
       } catch (error) {
-        console.warn(`Synapse pageScreenshot active-tab restore failed for tab ${previousActiveTabId}: ${errorMessage(error)}`);
+        cleanupErrors.push(
+          `active_tab_restore target_tab_id=${previousActiveTabId} error=${errorMessage(error)}`
+        );
       }
     } else if (before.active) {
       restoredPreviousActive = true;
     }
+    if (cleanupErrors.length > 0) {
+      const primary = operationError
+        ? ` primary_error=${errorMessage(operationError)}`
+        : "";
+      operationError = bridgeError(
+        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+        `pageScreenshot refused result because cleanup could not be proven:${primary} cleanup_errors=${cleanupErrors.join(" | ")}; inspect the exact tab/document generation and restore its scroll/background/active-tab state before retrying`
+      );
+    }
+  }
+  if (operationError) {
+    throw operationError;
   }
   const after = await tabPageState(selected.tabId, selected.target);
   return {
@@ -5315,11 +5334,14 @@ async function handlePageScreenshot(params) {
     tiles,
     capture_attempt_count: captureAttempts.length,
     capture_attempts: captureAttempts,
+    document_id: setup.document_id,
+    cleanup_verified: Boolean(cleanupReadback?.ok),
+    cleanup_document_id: cleanupReadback?.document_id || null,
     mask_count: setup.mask_count,
     masks: setup.masks,
     readback_backend: captureBackend === "chrome_debugger_page_surface"
-      ? "chrome.scripting.executeScript(page metrics/masks) + chrome.debugger Page.captureScreenshot"
-      : "chrome.scripting.executeScript(page metrics/masks/scroll) + chrome.tabs.captureVisibleTab",
+      ? "chrome.scripting.executeScript(document-pinned page metrics/mask geometry) + chrome.debugger Page.captureScreenshot"
+      : "chrome.scripting.executeScript(document-pinned page metrics/mask geometry/scroll) + chrome.tabs.captureVisibleTab",
     backend_tier_used: captureBackend,
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -5555,8 +5577,51 @@ function normalizePageScreenshotMasks(value, selectedTabId) {
     if (color.length > 128 || /[\u0000-\u001f]/.test(color)) {
       throw bridgeError(ERROR_CHROME_DOM_ACTION_UNSUPPORTED, `pageScreenshot mask[${index}] color is invalid`);
     }
-    return { selector, elementPath, color };
+    return { selector, elementPath, colorRgba: pageScreenshotMaskColorRgba(color, index) };
   });
+}
+
+function pageScreenshotMaskColorRgba(color, index) {
+  if (typeof OffscreenCanvas !== "function") {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot mask[${index}] color cannot be resolved because OffscreenCanvas is unavailable in the extension service worker`
+    );
+  }
+  const canvas = new OffscreenCanvas(1, 1);
+  const context = canvas.getContext("2d", { willReadFrequently: true });
+  if (!context) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot mask[${index}] color cannot be resolved because a 2D OffscreenCanvas context is unavailable`
+    );
+  }
+  // Canvas fillStyle parsing is extension-owned and deterministic. Setting the
+  // candidate from two different sentinels distinguishes a valid color from a
+  // rejected assignment without consulting mutable page CSS (#2214).
+  context.fillStyle = "#010203";
+  context.fillStyle = color;
+  const first = String(context.fillStyle);
+  context.fillStyle = "#040506";
+  context.fillStyle = color;
+  const second = String(context.fillStyle);
+  if (first !== second) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot mask[${index}] color ${JSON.stringify(color)} is not a valid extension-owned Canvas color`
+    );
+  }
+  context.clearRect(0, 0, 1, 1);
+  context.fillStyle = color;
+  context.fillRect(0, 0, 1, 1);
+  const rgba = Array.from(context.getImageData(0, 0, 1, 1).data);
+  if (rgba.length !== 4 || rgba.some((channel) => !Number.isSafeInteger(channel) || channel < 0 || channel > 255)) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot mask[${index}] color ${JSON.stringify(color)} did not resolve to exact RGBA bytes`
+    );
+  }
+  return rgba;
 }
 
 async function runPageScreenshotSetup(tabId, request) {
@@ -5596,10 +5661,17 @@ async function runPageScreenshotSetup(tabId, request) {
   if (!first || !first.result || typeof first.result !== "object") {
     throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "pageScreenshot setup returned no structured result");
   }
-  return first.result;
+  const documentId = stringOrNull(first.documentId);
+  if (!documentId) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `pageScreenshot setup for tab ${tabId} returned no document generation id; update Chrome and reload the Synapse bridge before retrying`
+    );
+  }
+  return { ...first.result, document_id: documentId };
 }
 
-async function runPageScreenshotScroll(tabId, position) {
+async function runPageScreenshotScroll(tabId, position, expectedDocumentId) {
   let injected;
   try {
     injected = await chrome.scripting.executeScript({
@@ -5624,12 +5696,22 @@ async function runPageScreenshotScroll(tabId, position) {
       `pageScreenshot scroll failed: ${String(first.result.error_detail || "")}`
     );
   }
-  return first.result;
+  const actualDocumentId = stringOrNull(first.documentId);
+  if (!actualDocumentId || actualDocumentId !== expectedDocumentId) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `pageScreenshot document changed before scroll/capture: expected_document_id=${JSON.stringify(expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; no artifact may be accepted from mixed document generations`
+    );
+  }
+  return { ...first.result, document_id: actualDocumentId };
 }
 
 async function runPageScreenshotCleanup(tabId, request) {
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    return null;
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "pageScreenshot cleanup cannot run because chrome.scripting.executeScript is unavailable"
+    );
   }
   const injected = await chrome.scripting.executeScript({
     target: { tabId },
@@ -5637,7 +5719,24 @@ async function runPageScreenshotCleanup(tabId, request) {
     func: pageScreenshotCleanupInPage,
     args: [request]
   });
-  return Array.isArray(injected) ? injected[0]?.result : null;
+  const first = Array.isArray(injected) ? injected[0] : null;
+  const actualDocumentId = stringOrNull(first?.documentId);
+  if (!first || !first.result || typeof first.result !== "object") {
+    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "pageScreenshot cleanup returned no structured result");
+  }
+  if (!actualDocumentId || actualDocumentId !== request.expectedDocumentId) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `pageScreenshot document changed before cleanup: expected_document_id=${JSON.stringify(request.expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; page mutation restoration cannot be proven`
+    );
+  }
+  if (!first.result.ok) {
+    throw bridgeError(
+      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+      `pageScreenshot cleanup failed: ${String(first.result.error_detail || "")}`
+    );
+  }
+  return { ...first.result, document_id: actualDocumentId };
 }
 
 async function waitForTabActiveState(tabId, expected, waitTimeoutMs) {
@@ -5806,7 +5905,6 @@ function pageScreenshotSetupInPage(request) {
     if (!clip || !finite(clip.x) || !finite(clip.y) || !finite(clip.w) || !finite(clip.h) || clip.w <= 0 || clip.h <= 0) {
       return fail("CAPTURE_TARGET_INVALID", `pageScreenshot resolved an empty/invalid clip ${JSON.stringify(clip)}`);
     }
-    const token = String(request.token || "");
     const masks = [];
     for (const [index, mask] of Array.from(request.masks || []).entries()) {
       const target = mask.elementPath ? elementByPath(mask.elementPath) : document.querySelector(String(mask.selector || ""));
@@ -5818,21 +5916,13 @@ function pageScreenshotSetupInPage(request) {
         return fail("CAPTURE_TARGET_INVALID", `mask[${index}] target has an empty box`);
       }
       const plain = rectToPlain(rect);
-      const overlay = document.createElement("div");
-      overlay.setAttribute("data-synapse-page-screenshot-mask", token);
-      overlay.style.position = "absolute";
-      overlay.style.left = `${plain.x}px`;
-      overlay.style.top = `${plain.y}px`;
-      overlay.style.width = `${plain.w}px`;
-      overlay.style.height = `${plain.h}px`;
-      overlay.style.background = String(mask.color || "#ff00ff");
-      overlay.style.zIndex = "2147483647";
-      overlay.style.pointerEvents = "none";
-      overlay.style.margin = "0";
-      overlay.style.padding = "0";
-      overlay.style.border = "0";
-      document.documentElement.appendChild(overlay);
-      masks.push({ index, selector: mask.selector || null, element_path: mask.elementPath || null, color: String(mask.color || "#ff00ff"), rect: plain });
+      const colorRgba = Array.from(mask.colorRgba || []);
+      if (colorRgba.length !== 4 || colorRgba.some((channel) => !Number.isSafeInteger(channel) || channel < 0 || channel > 255)) {
+        return fail("CAPTURE_TARGET_INVALID", `mask[${index}] did not carry exact extension-owned RGBA bytes`);
+      }
+      // Return geometry only. The page never receives a mask overlay: mutable
+      // author CSS/animations/script cannot participate in redaction (#2214).
+      masks.push({ index, color_rgba: colorRgba, rect: plain });
     }
     let backgroundRestore = null;
     if (request.omitBackground) {
@@ -5895,34 +5985,32 @@ function pageScreenshotScrollInPage(position) {
 }
 
 function pageScreenshotCleanupInPage(request) {
-  const token = String(request.token || "");
-  let removed = 0;
-  if (token) {
-    for (const node of Array.from(document.querySelectorAll("[data-synapse-page-screenshot-mask]"))) {
-      if (node.getAttribute("data-synapse-page-screenshot-mask") === token) {
-        node.remove();
-        removed += 1;
+  try {
+    const restore = request.backgroundRestore;
+    if (restore) {
+      if (document.documentElement) {
+        document.documentElement.style.background = restore.html_background || "";
+        document.documentElement.style.backgroundColor = restore.html_background_color || "";
+      }
+      if (document.body) {
+        document.body.style.background = restore.body_background || "";
+        document.body.style.backgroundColor = restore.body_background_color || "";
       }
     }
+    window.scrollTo(Number(request.scrollX || 0), Number(request.scrollY || 0));
+    return {
+      ok: true,
+      removed: 0,
+      scroll_x: Number(window.scrollX || 0),
+      scroll_y: Number(window.scrollY || 0)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: String(error && error.message || error)
+    };
   }
-  const restore = request.backgroundRestore;
-  if (restore) {
-    if (document.documentElement) {
-      document.documentElement.style.background = restore.html_background || "";
-      document.documentElement.style.backgroundColor = restore.html_background_color || "";
-    }
-    if (document.body) {
-      document.body.style.background = restore.body_background || "";
-      document.body.style.backgroundColor = restore.body_background_color || "";
-    }
-  }
-  window.scrollTo(Number(request.scrollX || 0), Number(request.scrollY || 0));
-  return {
-    ok: true,
-    removed,
-    scroll_x: Number(window.scrollX || 0),
-    scroll_y: Number(window.scrollY || 0)
-  };
 }
 
 function recordDownloadEvent(eventKind, item, delta) {

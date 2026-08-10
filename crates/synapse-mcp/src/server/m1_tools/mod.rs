@@ -1235,7 +1235,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without Page.captureScreenshot or debugger screenshot attach. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks restored after capture. Uses chrome.scripting for page metrics/masks/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without debugger screenshot attach on the normal path. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks. Masks never use page DOM overlays: the document-pinned bridge resolves page-CSS rectangles and extension-owned RGBA bytes, then trusted Rust overwrites every covered stitched pixel before resize/encode/write and returns count/commitment evidence. Uses chrome.scripting for page metrics/geometry/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
     )]
     pub async fn browser_screenshot(
         &self,
@@ -2375,8 +2375,34 @@ impl SynapseService {
             output_path = %validation.output_path.display(),
             "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
         );
-        let bitmap =
-            stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
+        if captured.mask_count != params.masks.len() || captured.masks.len() != params.masks.len() {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot refused unresolved mask manifest before writing: requested={} bridge_resolved={} bridge_records={}; every requested mask must resolve exactly once",
+                    params.masks.len(),
+                    captured.mask_count,
+                    captured.masks.len(),
+                ),
+            ));
+        }
+        if !captured.cleanup_verified
+            || captured.cleanup_document_id.as_deref() != Some(captured.document_id.as_str())
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot refused artifact because exact document cleanup was not independently verified: document_id_present={} cleanup_verified={} cleanup_document_matches={}; restore the exact tab document state and retry",
+                    !captured.document_id.is_empty(),
+                    captured.cleanup_verified,
+                    captured.cleanup_document_id.as_deref() == Some(captured.document_id.as_str()),
+                ),
+            ));
+        }
+        let BrowserScreenshotStitchResult {
+            bitmap,
+            mask_evidence,
+        } = stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
         let bitmap_sha256 = sha256_hex(&bitmap.bytes);
         let write_params = CaptureScreenshotParams {
             path: params.path.clone(),
@@ -2436,6 +2462,14 @@ impl SynapseService {
             scroll_height_css: captured.scroll_height_css,
             tile_count: captured.tile_count,
             mask_count: captured.mask_count,
+            mask_requested_count: params.masks.len(),
+            mask_resolved_count: captured.masks.len(),
+            mask_applied_count: mask_evidence.applied_count,
+            mask_partial_intersection_count: mask_evidence.partial_intersection_count,
+            mask_pixel_write_count: mask_evidence.pixel_write_count,
+            mask_backend: mask_evidence.backend.to_owned(),
+            mask_commitment_sha256: mask_evidence.commitment_sha256,
+            document_generation_sha256: sha256_hex(captured.document_id.as_bytes()),
             omit_background: captured.omit_background,
             required_foreground: foreground_readback.required || captured.required_foreground,
             human_os_foreground_before_hwnd: foreground_readback.prior_foreground.hwnd,
@@ -2445,10 +2479,10 @@ impl SynapseService {
             foreground_transaction: foreground_readback,
             backend_tier_used: captured.backend_tier_used,
             source_of_truth: if used_emulated_page_surface {
-                "normal Chrome bridge MAIN-world page metrics plus chrome.debugger Page.captureScreenshot page-surface pixels, independently geometry-checked before write"
+                "normal Chrome bridge document-pinned page metrics/mask geometry plus chrome.debugger Page.captureScreenshot page-surface pixels; synapse-mcp independently geometry-checks, overwrites every mask pixel after capture, then resizes/encodes/writes"
                     .to_owned()
             } else {
-                "human OS foreground readback plus normal Chrome bridge MAIN-world page metrics/masks/scroll and chrome.tabs.captureVisibleTab tiles stitched and independently geometry-checked by synapse-mcp"
+                "human OS foreground readback plus normal Chrome bridge document-pinned page metrics/mask geometry/scroll and chrome.tabs.captureVisibleTab tiles; synapse-mcp independently geometry-checks, overwrites every mask pixel after stitching, then resizes/encodes/writes"
                     .to_owned()
             },
         })
@@ -17526,6 +17560,7 @@ struct BrowserScreenshotValidation {
 fn validate_browser_screenshot_params(
     params: &BrowserScreenshotParams,
 ) -> Result<BrowserScreenshotValidation, ErrorData> {
+    const MAX_MASKS: usize = 32;
     let output_path = screenshot_output_path(&params.path)?;
     let path_format = screenshot_format_from_path(&output_path)?;
     let format = params.format.unwrap_or(path_format);
@@ -17556,6 +17591,15 @@ fn validate_browser_screenshot_params(
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             "browser_screenshot max_long_edge must be greater than zero",
+        ));
+    }
+    if params.masks.len() > MAX_MASKS {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "browser_screenshot supports at most {MAX_MASKS} masks; got {}",
+                params.masks.len()
+            ),
         ));
     }
     match params.scope {
@@ -17855,11 +17899,24 @@ fn f64_to_i32_rounded(value: f64, label: &str) -> Result<i32, ErrorData> {
     Ok(value.round() as i32)
 }
 
+struct BrowserScreenshotStitchResult {
+    bitmap: synapse_capture::CapturedBgraBitmap,
+    mask_evidence: BrowserScreenshotMaskEvidence,
+}
+
+struct BrowserScreenshotMaskEvidence {
+    applied_count: usize,
+    partial_intersection_count: usize,
+    pixel_write_count: u64,
+    backend: &'static str,
+    commitment_sha256: String,
+}
+
 fn stitch_browser_screenshot_tiles(
     captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
     format: CaptureScreenshotFormat,
     omit_background: bool,
-) -> Result<synapse_capture::CapturedBgraBitmap, ErrorData> {
+) -> Result<BrowserScreenshotStitchResult, ErrorData> {
     if captured.tiles.is_empty() {
         return Err(mcp_error(
             error_codes::A11Y_CDP_AXTREE_FAILED,
@@ -17904,30 +17961,160 @@ fn stitch_browser_screenshot_tiles(
     if omit_background && matches!(format, CaptureScreenshotFormat::Png) {
         browser_screenshot_omit_background_by_corner(&mut output);
     }
+    let mask_evidence = apply_browser_screenshot_masks(&mut output, captured, scale_x, scale_y)?;
     let mut bgra = output.into_raw();
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Ok(synapse_capture::CapturedBgraBitmap {
-        region: Rect {
-            x: 0,
-            y: 0,
-            w: i32::try_from(output_width).map_err(|_| {
-                mcp_error(
-                    error_codes::CAPTURE_TARGET_INVALID,
-                    format!("browser_screenshot output width {output_width} exceeds i32"),
-                )
-            })?,
-            h: i32::try_from(output_height).map_err(|_| {
-                mcp_error(
-                    error_codes::CAPTURE_TARGET_INVALID,
-                    format!("browser_screenshot output height {output_height} exceeds i32"),
-                )
-            })?,
+    Ok(BrowserScreenshotStitchResult {
+        bitmap: synapse_capture::CapturedBgraBitmap {
+            region: Rect {
+                x: 0,
+                y: 0,
+                w: i32::try_from(output_width).map_err(|_| {
+                    mcp_error(
+                        error_codes::CAPTURE_TARGET_INVALID,
+                        format!("browser_screenshot output width {output_width} exceeds i32"),
+                    )
+                })?,
+                h: i32::try_from(output_height).map_err(|_| {
+                    mcp_error(
+                        error_codes::CAPTURE_TARGET_INVALID,
+                        format!("browser_screenshot output height {output_height} exceeds i32"),
+                    )
+                })?,
+            },
+            width: output_width,
+            height: output_height,
+            bytes: bgra,
         },
-        width: output_width,
-        height: output_height,
-        bytes: bgra,
+        mask_evidence,
+    })
+}
+
+fn apply_browser_screenshot_masks(
+    output: &mut RgbaImage,
+    captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
+    scale_x: f64,
+    scale_y: f64,
+) -> Result<BrowserScreenshotMaskEvidence, ErrorData> {
+    const BACKEND: &str = "trusted_rust_post_stitch_exact_rgba_overwrite";
+    let mut commitment = Vec::with_capacity(64 + captured.masks.len() * 48);
+    commitment.extend_from_slice(b"synapse/browser-screenshot-mask/v1\0");
+    commitment.extend_from_slice(captured.document_id.as_bytes());
+    commitment.push(0);
+    let mut applied_count = 0_usize;
+    let mut partial_intersection_count = 0_usize;
+    let mut pixel_write_count = 0_u64;
+    let clip = captured.clip_css;
+    let clip_right = clip.x + clip.w;
+    let clip_bottom = clip.y + clip.h;
+
+    for (expected_index, mask) in captured.masks.iter().enumerate() {
+        if mask.index != expected_index {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot mask manifest order is invalid: expected_index={expected_index} actual_index={}",
+                    mask.index
+                ),
+            ));
+        }
+        let rect = mask.rect;
+        if !rect.x.is_finite()
+            || !rect.y.is_finite()
+            || !rect.w.is_finite()
+            || !rect.h.is_finite()
+            || rect.w <= 0.0
+            || rect.h <= 0.0
+        {
+            return Err(mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!(
+                    "browser_screenshot mask[{expected_index}] has invalid page-CSS rectangle x={} y={} w={} h={}",
+                    rect.x, rect.y, rect.w, rect.h
+                ),
+            ));
+        }
+        commitment.extend_from_slice(&(mask.index as u64).to_le_bytes());
+        for value in [rect.x, rect.y, rect.w, rect.h] {
+            commitment.extend_from_slice(&value.to_bits().to_le_bytes());
+        }
+        commitment.extend_from_slice(&mask.color_rgba);
+
+        let rect_right = rect.x + rect.w;
+        let rect_bottom = rect.y + rect.h;
+        if !rect_right.is_finite() || !rect_bottom.is_finite() {
+            return Err(mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("browser_screenshot mask[{expected_index}] rectangle overflows"),
+            ));
+        }
+        let left = rect.x.max(clip.x);
+        let top = rect.y.max(clip.y);
+        let right = rect_right.min(clip_right);
+        let bottom = rect_bottom.min(clip_bottom);
+        if right <= left || bottom <= top {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot mask[{expected_index}] is fully outside the captured page-CSS region and no pixels were redacted: mask=({}, {}, {}, {}) clip=({}, {}, {}, {}); capture a region containing the mask or remove it",
+                    rect.x, rect.y, rect.w, rect.h, clip.x, clip.y, clip.w, clip.h
+                ),
+            ));
+        }
+        if left > rect.x || top > rect.y || right < rect_right || bottom < rect_bottom {
+            partial_intersection_count += 1;
+        }
+        let x0 = ((left - clip.x) * scale_x).floor().max(0.0) as u32;
+        let y0 = ((top - clip.y) * scale_y).floor().max(0.0) as u32;
+        let x1 = ((right - clip.x) * scale_x)
+            .ceil()
+            .min(f64::from(output.width())) as u32;
+        let y1 = ((bottom - clip.y) * scale_y)
+            .ceil()
+            .min(f64::from(output.height())) as u32;
+        if x1 <= x0 || y1 <= y0 {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot mask[{expected_index}] intersected in CSS coordinates but resolved to no bitmap pixels: pixel_bounds=({x0},{y0})..({x1},{y1}) scale=({scale_x},{scale_y})"
+                ),
+            ));
+        }
+        let writes = u64::from(x1 - x0)
+            .checked_mul(u64::from(y1 - y0))
+            .and_then(|count| pixel_write_count.checked_add(count))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::CAPTURE_TARGET_INVALID,
+                    "browser_screenshot mask pixel write count overflowed u64",
+                )
+            })?;
+        pixel_write_count = writes;
+        for y in y0..y1 {
+            for x in x0..x1 {
+                output.put_pixel(x, y, image::Rgba(mask.color_rgba));
+            }
+        }
+        applied_count += 1;
+    }
+
+    if applied_count != captured.mask_count {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot refused incomplete trusted masking: bridge_resolved={} applied={applied_count}",
+                captured.mask_count
+            ),
+        ));
+    }
+    Ok(BrowserScreenshotMaskEvidence {
+        applied_count,
+        partial_intersection_count,
+        pixel_write_count,
+        backend: BACKEND,
+        commitment_sha256: sha256_hex(&commitment),
     })
 }
 
