@@ -14120,6 +14120,127 @@ if (-not $Remove -and -not $Stop -and -not $Start -and [string]::IsNullOrWhiteSp
     Die $sourceDirMessage
 }
 
+# Pure-input fence (#2211). Everything in this block depends only on bound
+# parameters, environment-backed parameter defaults, and read-only prerequisite
+# inspection. It MUST stay before parent waiting, maintenance-lock acquisition,
+# artifact cleanup, build output creation, or candidate launch. In particular,
+# parameter validation attributes do not validate default values, so ActiveIssue
+# must be normalized explicitly here to cover SYNAPSE_ACTIVE_ISSUE as well as an
+# explicitly supplied argument.
+if ($maintenanceReason -eq 'setup') {
+    $ActiveIssue = Get-SynapseNormalizedIssueRef -Issue $ActiveIssue
+
+    if ($ManualInstallHealthRollbackPauseMode -ne 'normal' -and -not $ManualInstallHealthRollbackProbe) {
+        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PAUSE_MODE_WITHOUT_PROBE mode=$ManualInstallHealthRollbackPauseMode remediation=-ManualInstallHealthRollbackPauseMode is only valid with -ManualInstallHealthRollbackProbe because it intentionally changes rollback maintenance-pause behavior"
+    }
+    if ($ManualInstallHealthRollbackProbe) {
+        if (-not $ForceRestart) {
+            Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_FORCE_RESTART remediation=the rollback drill intentionally drains and restarts the live daemon, so rerun with -ForceRestart during a maintenance window"
+        }
+        if ($SkipBuild) {
+            Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_BUILD remediation=the rollback drill needs a real candidate that differs from the installed daemon; -SkipBuild cannot produce a backup/candidate handoff"
+        }
+        if ($script:SynapsePostExitStartOnly) {
+            Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_POST_EXIT_UNSUPPORTED remediation=post-exit continuation only starts the already-installed daemon; run the rollback drill from the primary setup process"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
+        $CalyxConfigPath = $null
+    } else {
+        try {
+            $CalyxConfigPath = [System.IO.Path]::GetFullPath($CalyxConfigPath)
+        } catch {
+            Die "SYNAPSE_CALYX_CONFIG_PATH_INVALID path=$CalyxConfigPath error=$($_.Exception.Message) remediation=pass an absolute or resolvable local TOML file path to -CalyxConfigPath"
+        }
+        if (-not (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf)) {
+            Die "SYNAPSE_CALYX_CONFIG_FILE_MISSING path=$CalyxConfigPath remediation=create the exact [calyx] TOML file or omit -CalyxConfigPath to use validated defaults"
+        }
+        try {
+            $configStream = [System.IO.File]::Open($CalyxConfigPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+            $configStream.Dispose()
+        } catch {
+            Die "SYNAPSE_CALYX_CONFIG_FILE_UNREADABLE path=$CalyxConfigPath error=$($_.Exception.Message) remediation=repair the exact file permissions before setup builds or touches the live daemon"
+        }
+        Info "Explicit Calyx tuning source verified path=$CalyxConfigPath; candidate and installed daemon will both receive --calyx-config."
+    }
+
+    if (-not (Test-Path -LiteralPath (Join-Path $SourceDir 'Cargo.toml') -PathType Leaf)) {
+        Die "-SourceDir '$SourceDir' has no Cargo.toml. Point it at a synapse source checkout on a LOCAL drive."
+    }
+    if ($SourceDir -match '^\\\\' -or $SourceDir -match '^[Zz]:\\home\\') {
+        Die "-SourceDir '$SourceDir' looks like a UNC / WSL-mapped path. Build from a real local copy: building over \\wsl.localhost bakes transient drive paths into the binary."
+    }
+
+    # Source profiles are part of the candidate/install contract, not optional
+    # state that may be borrowed from a prior deployment (#2212). Validate once
+    # and carry this exact directory through candidate preflight and deployment.
+    $srcProfiles = Join-Path $SourceDir 'crates\synapse-profiles\profiles'
+    if (-not (Test-Path -LiteralPath $srcProfiles -PathType Container)) {
+        Die "SYNAPSE_SOURCE_PROFILES_MISSING source=$srcProfiles source_dir=$SourceDir remediation=restore the tracked crates\synapse-profiles\profiles directory in the named checkout; setup refuses to validate a new daemon against stale deployed profiles"
+    }
+    $candidateProfilesDir = $srcProfiles
+    $candidateProfileCount = @(Get-ChildItem -LiteralPath $candidateProfilesDir -Filter '*.toml' -File).Count
+    if ($candidateProfileCount -lt 1) {
+        Die "SYNAPSE_SOURCE_PROFILES_EMPTY source=$candidateProfilesDir source_dir=$SourceDir remediation=restore at least one tracked bundled .toml profile; setup refuses to validate a candidate against an empty or previously deployed profile set"
+    }
+
+    # An existing token is an input prerequisite. A missing token is created in
+    # the later token phase, but malformed existing bytes are knowable now and
+    # must not be discovered after a release build.
+    if (Test-Path -LiteralPath $TokenPath -PathType Leaf) {
+        try {
+            $preflightToken = (Get-Content -LiteralPath $TokenPath -Raw -ErrorAction Stop).Trim()
+        } catch {
+            Die "SYNAPSE_TOKEN_PREFLIGHT_READ_FAILED path=$TokenPath error=$($_.Exception.Message) remediation=repair the token file permissions or remove the unreadable file so setup can create a new token before rerunning"
+        }
+        if ($preflightToken.Length -lt 16) {
+            Die "SYNAPSE_TOKEN_PREFLIGHT_TOO_SHORT path=$TokenPath chars=$($preflightToken.Length) remediation=remove the malformed token and rerun setup so a cryptographically random replacement can be created before candidate launch"
+        }
+        Remove-Variable -Name preflightToken -ErrorAction SilentlyContinue
+    }
+
+    $cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
+    if (-not $SkipBuild) {
+        if (-not (Test-Path -LiteralPath $cargo -PathType Leaf)) {
+            Die "cargo not found at $cargo. Install the Rust toolchain (https://rustup.rs) on Windows, then re-run. Synapse builds with the current stable toolchain."
+        }
+
+        # #1819: Cargo resolves these path dependencies while parsing manifests,
+        # before a build script can emit a useful diagnostic.
+        $vendoredCalyxCrates = Join-Path $SourceDir 'calyx\crates'
+        $requiredCalyxCrates = @(
+            'calyx-assay', 'calyx-aster', 'calyx-core', 'calyx-forge', 'calyx-ledger',
+            'calyx-lodestar', 'calyx-loom', 'calyx-paths', 'calyx-registry',
+            'calyx-search', 'calyx-sextant'
+        )
+        $missingCalyxCrates = @(
+            $requiredCalyxCrates | Where-Object {
+                -not (Test-Path -LiteralPath (Join-Path $vendoredCalyxCrates (Join-Path $_ 'Cargo.toml')) -PathType Leaf)
+            }
+        )
+        if ($missingCalyxCrates.Count -gt 0) {
+            Die ("SYNAPSE_VENDORED_CALYX_TREE_MISSING source_dir=$SourceDir " +
+                 "vendored_path=$vendoredCalyxCrates missing_crate_count=$($missingCalyxCrates.Count) " +
+                 "missing_crates=$($missingCalyxCrates -join ',') " +
+                 "detail=crates\synapse-calyx depends on these through cargo path dependencies, which are " +
+                 "resolved before any build script runs, so the build cannot report this itself. " +
+                 "The tree is tracked in git and is NOT gitignored (.gitignore excludes only /calyx/target/). " +
+                 "remediation=run 'git checkout -- calyx' in $SourceDir to restore the vendored Calyx " +
+                 "workspace, confirm 'git status' reports no deletions under calyx/, then re-run setup")
+        }
+
+        # Resolve/authorize the output tree and select the physical math build
+        # capability before maintenance state or acquisition artifacts change.
+        $cargoTargetResolution = Resolve-SynapseCargoTargetDirectory `
+            -SourceDir $SourceDir `
+            -Requested $CargoTarget `
+            -AllowAlternate ([bool]$AllowAlternateBuildTarget)
+        $CargoTarget = $cargoTargetResolution.path
+        $cudaBuildCapability = Get-SynapseCudaBuildCapability
+    }
+}
+
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
 Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
@@ -14176,81 +14297,10 @@ if ($Remove) {
 # 1. Preflight
 # ---------------------------------------------------------------------------
 Step "Preflight"
-if ($ManualInstallHealthRollbackPauseMode -ne 'normal' -and -not $ManualInstallHealthRollbackProbe) {
-    Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PAUSE_MODE_WITHOUT_PROBE mode=$ManualInstallHealthRollbackPauseMode remediation=-ManualInstallHealthRollbackPauseMode is only valid with -ManualInstallHealthRollbackProbe because it intentionally changes rollback maintenance-pause behavior"
-}
 if ($ManualInstallHealthRollbackProbe) {
-    if (-not $ForceRestart) {
-        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_FORCE_RESTART remediation=the rollback drill intentionally drains and restarts the live daemon, so rerun with -ForceRestart during a maintenance window"
-    }
-    if ($SkipBuild) {
-        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_REQUIRES_BUILD remediation=the rollback drill needs a real candidate that differs from the installed daemon; -SkipBuild cannot produce a backup/candidate handoff"
-    }
-    if ($script:SynapsePostExitStartOnly) {
-        Die "SYNAPSE_MANUAL_INSTALL_HEALTH_ROLLBACK_PROBE_POST_EXIT_UNSUPPORTED remediation=post-exit continuation only starts the already-installed daemon; run the rollback drill from the primary setup process"
-    }
     Info "Manual install-health rollback probe armed pause_mode=$ManualInstallHealthRollbackPauseMode; setup will reject the first installed daemon health readback and exit fail-loud after rollback readback"
 }
-if ([string]::IsNullOrWhiteSpace($CalyxConfigPath)) {
-    $CalyxConfigPath = $null
-} else {
-    try {
-        $CalyxConfigPath = [System.IO.Path]::GetFullPath($CalyxConfigPath)
-    } catch {
-        Die "SYNAPSE_CALYX_CONFIG_PATH_INVALID path=$CalyxConfigPath error=$($_.Exception.Message) remediation=pass an absolute or resolvable local TOML file path to -CalyxConfigPath"
-    }
-    if (-not (Test-Path -LiteralPath $CalyxConfigPath -PathType Leaf)) {
-        Die "SYNAPSE_CALYX_CONFIG_FILE_MISSING path=$CalyxConfigPath remediation=create the exact [calyx] TOML file or omit -CalyxConfigPath to use validated defaults"
-    }
-    try {
-        $configStream = [System.IO.File]::Open($CalyxConfigPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
-        $configStream.Dispose()
-    } catch {
-        Die "SYNAPSE_CALYX_CONFIG_FILE_UNREADABLE path=$CalyxConfigPath error=$($_.Exception.Message) remediation=repair the exact file permissions before setup builds or touches the live daemon"
-    }
-    Info "Explicit Calyx tuning source verified path=$CalyxConfigPath; candidate and installed daemon will both receive --calyx-config."
-}
-$cargo = "$env:USERPROFILE\.cargo\bin\cargo.exe"
 if (-not $SkipBuild) {
-    if (-not (Test-Path $cargo)) {
-        Die "cargo not found at $cargo. Install the Rust toolchain (https://rustup.rs) on Windows, then re-run. Synapse builds with the current stable toolchain."
-    }
-    if (-not $SourceDir) { Die "-SourceDir is required unless -SkipBuild is set." }
-    if (-not (Test-Path (Join-Path $SourceDir 'Cargo.toml'))) {
-        Die "-SourceDir '$SourceDir' has no Cargo.toml. Point it at a synapse source checkout on a LOCAL drive."
-    }
-    if ($SourceDir -match '^\\\\' -or $SourceDir -match '^[Zz]:\\home\\') {
-        Die "-SourceDir '$SourceDir' looks like a UNC / WSL-mapped path. Build from a real local copy: building over \\wsl.localhost bakes transient drive paths into the binary."
-    }
-    # #1819: crates/synapse-calyx depends on the vendored Calyx workspace through
-    # path dependencies, which cargo resolves while PARSING manifests - before any
-    # build script or feature gate can run. If the vendored tree is missing (it was
-    # found deleted from the working tree on 2026-07-24 with 902 tracked files
-    # absent) the build dies with a raw path-dependency error that names a
-    # sub-crate manifest and gives no remediation - landing on top of whatever
-    # outage prompted the rebuild. Fail here instead, with the exact restore
-    # command, before spending a full release build to find out.
-    $vendoredCalyxCrates = Join-Path $SourceDir 'calyx\crates'
-    $requiredCalyxCrates = @(
-        'calyx-assay', 'calyx-aster', 'calyx-core', 'calyx-forge', 'calyx-ledger',
-        'calyx-lodestar', 'calyx-loom', 'calyx-paths', 'calyx-registry',
-        'calyx-search', 'calyx-sextant'
-    )
-    $missingCalyxCrates = @(
-        $requiredCalyxCrates | Where-Object {
-            -not (Test-Path -LiteralPath (Join-Path $vendoredCalyxCrates (Join-Path $_ 'Cargo.toml')))
-        }
-    )
-    if ($missingCalyxCrates.Count -gt 0) {
-        Die ("SYNAPSE_VENDORED_CALYX_TREE_MISSING source_dir=$SourceDir " +
-             "vendored_path=$vendoredCalyxCrates missing_crate_count=$($missingCalyxCrates.Count) " +
-             "missing_crates=$($missingCalyxCrates -join ',') " +
-             "detail=crates\synapse-calyx depends on these through cargo path dependencies, which are " +
-             "resolved before any build script runs, so the build cannot report this itself. " +
-             "The tree is tracked in git and is NOT gitignored (.gitignore excludes only /calyx/target/). " +
-             "remediation=run 'git checkout -- calyx' in $SourceDir to restore the vendored Calyx " +
-             "workspace, confirm 'git status' reports no deletions under calyx/, then re-run setup")
-    }
     Info "Vendored Calyx workspace verified: $($requiredCalyxCrates.Count) path-dependency crates present under $vendoredCalyxCrates"
     New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
     $cargoVersionLog = Join-Path $LogDir 'setup-cargo-version.log'
@@ -14365,11 +14415,6 @@ if (-not $SkipBuild) {
     # the deploy build). Cargo freshness is mtime-based against the dep-info
     # file list, and a checkout-owned tree is only ever written by that one
     # checkout's builds.
-    $cargoTargetResolution = Resolve-SynapseCargoTargetDirectory `
-        -SourceDir $SourceDir `
-        -Requested $CargoTarget `
-        -AllowAlternate ([bool]$AllowAlternateBuildTarget)
-    $CargoTarget = $cargoTargetResolution.path
     Info ("Cargo target directory: {0} (kind={1} authorized_by={2} source_dir={3})" -f `
         $cargoTargetResolution.path, $cargoTargetResolution.kind,
         $cargoTargetResolution.authorized_by, $cargoTargetResolution.source_dir)
@@ -14405,8 +14450,6 @@ if (-not $SkipBuild) {
     Info ("Build output holder preflight: cargo_target_dir={0} live_images_under_target=0 unreadable_path_processes={1}" -f `
         $buildOutputImageHolders.target_dir,
         @($buildOutputImageHolders.unreadable_path_processes).Count)
-
-    $cudaBuildCapability = Get-SynapseCudaBuildCapability
 
     New-Item -ItemType Directory -Force -Path $CargoTarget, $LogDir | Out-Null
     $env:CARGO_TARGET_DIR = $CargoTarget
@@ -14827,21 +14870,6 @@ try {
     Info "WARN: environment broadcast failed: $($_.Exception.Message). Future GUI clients may need restart before seeing SYNAPSE_BEARER_TOKEN."
 }
 
-$srcProfiles = if ($SourceDir) { Join-Path $SourceDir 'crates\synapse-profiles\profiles' } else { $null }
-$candidateProfilesDir = $null
-if ($srcProfiles -and (Test-Path $srcProfiles)) {
-    $candidateProfilesDir = $srcProfiles
-    Info "Candidate profile source: $candidateProfilesDir"
-} elseif (Test-Path $ProfilesDir) {
-    $candidateProfilesDir = $ProfilesDir
-    Info "Candidate profile source: existing deployed profiles at $candidateProfilesDir"
-} else {
-    Die "SYNAPSE_CANDIDATE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=provide bundled profiles from SourceDir or an existing deployed ProfilesDir before setup can touch the live daemon"
-}
-$candidateProfileCount = (Get-ChildItem $candidateProfilesDir -Filter *.toml -File).Count
-if ($candidateProfileCount -lt 1) {
-    Die "SYNAPSE_CANDIDATE_PROFILES_EMPTY path=$candidateProfilesDir remediation=profile-dependent tools need at least one .toml profile before setup can touch the live daemon"
-}
 Info "Candidate profiles verified path=$candidateProfilesDir count=$candidateProfileCount"
 
 # ---------------------------------------------------------------------------
@@ -15184,15 +15212,11 @@ if ($script:SynapsePostExitStartOnly) {
 #    keep an explicit --profile-dir for belt-and-suspenders.
 # ---------------------------------------------------------------------------
 Step "Deploying bundled profiles -> $ProfilesDir"
-if ($srcProfiles -and (Test-Path $srcProfiles)) {
-    $profileDeploy = Install-SynapseBundledProfiles -SourceProfilesDir $srcProfiles -ProfilesDir $ProfilesDir -LogDir $LogDir
-    if ($profileDeploy.BundledProfileCount -lt 1) {
-        Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=reconciled bundled profiles but found 0 top-level .toml files in the setup-owned manifest"
-    }
-    Info "Deployed $($profileDeploy.BundledProfileCount) bundled profiles from manifest $($profileDeploy.ManifestPath)."
-} elseif (-not (Test-Path $ProfilesDir)) {
-    Die "SYNAPSE_PROFILES_MISSING source=$srcProfiles deployed=$ProfilesDir remediation=profile-dependent tools need bundled or deployed profiles before daemon start"
-} else { Info "Reusing existing profiles at $ProfilesDir." }
+$profileDeploy = Install-SynapseBundledProfiles -SourceProfilesDir $srcProfiles -ProfilesDir $ProfilesDir -LogDir $LogDir
+if ($profileDeploy.BundledProfileCount -lt 1) {
+    Die "SYNAPSE_PROFILES_DEPLOYED_EMPTY path=$ProfilesDir source=$srcProfiles remediation=reconciled bundled profiles but found 0 top-level .toml files in the setup-owned manifest"
+}
+Info "Deployed $($profileDeploy.BundledProfileCount) bundled profiles from manifest $($profileDeploy.ManifestPath)."
 
 if ($script:SynapseBindPostExitContinuationRequired) {
     # #2092: this branch hands off to a separate process and then Dies, so the
