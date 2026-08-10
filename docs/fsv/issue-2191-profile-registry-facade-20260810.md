@@ -150,3 +150,5 @@ registry read views through the public facade; exact missing-row semantics,
 bounded real report reads, raw-route remediation, explicit profile elevation,
 cleanup, invalid inputs, physical CF counts, and full-vault integrity all agree.
 
+GitHub acceptance and closure evidence:
+<https://github.com/ChrisRoyse/Synapse/issues/2191#issuecomment-5244658198>.

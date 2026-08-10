@@ -183,3 +183,5 @@ physically persisted it, evicted both samples and events by elapsed time, kept
 valid Windows capture gaps observable without becoming unhealthy, rejected an
 invalid duration before any write, and left the full durable chain intact.
 
+GitHub acceptance and closure evidence:
+<https://github.com/ChrisRoyse/Synapse/issues/2187#issuecomment-5244577280>.
