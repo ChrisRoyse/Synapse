@@ -69,8 +69,16 @@ pub struct AudioTailResponse {
     pub channels: u16,
     pub format: String,
     pub requested_seconds: f64,
+    /// Duration represented by the returned real-time window, including
+    /// explicit zero-valued gaps where WASAPI supplied no packet.
     pub captured_seconds: f64,
     pub frames: usize,
+    /// Frames supplied by real WASAPI packets rather than timeline gaps.
+    pub device_frames: usize,
+    pub device_captured_seconds: f64,
+    /// Zero-valued frames required to preserve the real capture timeline.
+    pub timeline_gap_frames: usize,
+    pub timeline_gap_seconds: f64,
     pub rms_db: f32,
     pub vad_speech_pct: f32,
     pub recent_events: Vec<AudioEvent>,
@@ -133,6 +141,10 @@ pub fn tail_audio(
             requested_seconds: 0.0,
             captured_seconds: 0.0,
             frames: 0,
+            device_frames: 0,
+            device_captured_seconds: 0.0,
+            timeline_gap_frames: 0,
+            timeline_gap_seconds: 0.0,
             rms_db: synapse_audio::detectors::silence_db(),
             vad_speech_pct: 0.0,
             recent_events: Vec::new(),
@@ -263,6 +275,7 @@ fn response_from_window(
     recent_events: Vec<AudioEvent>,
 ) -> AudioTailResponse {
     let requested_samples = requested_samples(window, seconds);
+    let requested_frames = requested_frames(seconds, window.format.sample_rate_hz);
     let mut pcm = Vec::with_capacity(requested_samples.saturating_mul(BYTES_PER_SAMPLE));
     let missing_samples = requested_samples.saturating_sub(window.samples.len());
     pcm.resize(missing_samples.saturating_mul(BYTES_PER_SAMPLE), 0);
@@ -277,6 +290,13 @@ fn response_from_window(
         requested_seconds: seconds,
         captured_seconds: captured_seconds(window),
         frames: window.frames,
+        device_frames: window.device_frames,
+        device_captured_seconds: frame_seconds(window.device_frames, window),
+        timeline_gap_frames: requested_frames.saturating_sub(window.device_frames),
+        timeline_gap_seconds: frame_seconds(
+            requested_frames.saturating_sub(window.device_frames),
+            window,
+        ),
         rms_db: window.rms_db,
         vad_speech_pct: vad_speech_pct(window),
         recent_events,
@@ -328,7 +348,12 @@ fn requested_frames(seconds: f64, sample_rate_hz: u32) -> usize {
 
 #[allow(clippy::cast_precision_loss)]
 fn captured_seconds(window: &AudioWindow) -> f64 {
-    window.frames as f64 / f64::from(window.format.sample_rate_hz.max(1))
+    frame_seconds(window.frames, window)
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn frame_seconds(frames: usize, window: &AudioWindow) -> f64 {
+    frames as f64 / f64::from(window.format.sample_rate_hz.max(1))
 }
 
 #[allow(clippy::cast_possible_truncation)]

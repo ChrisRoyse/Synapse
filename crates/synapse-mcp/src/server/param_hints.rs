@@ -165,12 +165,15 @@ fn registry_hint(tool: &str, field: &str) -> Option<Hint> {
             })
         }
         // `profile` operation values passed as fields. `ProfileOperation` values
-        // are status/set/grant_reality_write/revoke_reality_write.
-        ("profile", "status" | "set" | "grant_reality_write" | "revoke_reality_write") => {
+        // are status/set/grant_reality_write/revoke_reality_write/registry_query.
+        (
+            "profile",
+            "status" | "set" | "grant_reality_write" | "revoke_reality_write" | "registry_query",
+        ) => {
             Some(Hint::OperationValue {
                 operation_field: "operation".to_owned(),
                 note: format!(
-                    "pass the `{field}` operation's own fields (e.g. profile, reason, confirm_break_glass) at the top level"
+                    "pass the `{field}` operation's own fields at the top level; operation=registry_query requires the nested registry_query payload"
                 ),
             })
         }

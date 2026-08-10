@@ -12,6 +12,8 @@ pub enum AudioError {
     DeviceLost { detail: String },
     #[error("audio loopback init failed: {detail}")]
     LoopbackInitFailed { detail: String },
+    #[error("audio capture timeline invalid: {detail}")]
+    TimelineInvalid { detail: String },
     #[error("audio STT model not loaded: {detail}")]
     SttModelNotLoaded { detail: String },
     #[error("audio STT model hash mismatch for {path}: expected {expected}, got {actual}")]
@@ -41,6 +43,7 @@ impl AudioError {
         match self {
             Self::DeviceLost { .. } => error_codes::AUDIO_DEVICE_LOST,
             Self::LoopbackInitFailed { .. } => error_codes::AUDIO_LOOPBACK_INIT_FAILED,
+            Self::TimelineInvalid { .. } => error_codes::AUDIO_TIMELINE_INVALID,
             Self::SttModelNotLoaded { .. } => error_codes::AUDIO_STT_MODEL_NOT_LOADED,
             Self::ModelHashMismatch { .. } => error_codes::MODEL_HASH_MISMATCH,
             Self::ModelLoadFailed { .. } => error_codes::MODEL_LOAD_FAILED,

@@ -188,6 +188,7 @@ All entries are `pub const … : &str` whose string value equals the constant na
 | `HUD_EXTRACTION_FAILED` | HUD extraction failed. |
 | `AUDIO_DEVICE_LOST` | Audio device lost. |
 | `AUDIO_LOOPBACK_INIT_FAILED` | Audio loopback init failed. |
+| `AUDIO_TIMELINE_INVALID` | WASAPI packet positions/timestamps cannot form one trustworthy capture timeline. |
 | `AUDIO_STT_MODEL_NOT_LOADED` | STT model not loaded. |
 
 #### Action (§8.2)

@@ -153,7 +153,7 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | Old public name(s) | Current route | Status |
 | --- | --- | --- |
 | `health` | `health` | Kept as public facade. |
-| `tool_profile_status`, `tool_profile_set` | `profile operation=status`, `profile operation=set` | Condensed. |
+| `tool_profile_status`, `tool_profile_set`, `profile_registry_query` | `profile operation=status`, `profile operation=set`, `profile operation=registry_query` | Registry search/inspect/report remains read-only and typed under the public facade. |
 | `session_list`, `session_status` | `session operation=list` | Condensed readback. |
 | `session_end` | Advanced maintenance/session lifecycle route | Removed from normal public surface. |
 | `profile_list`, `profile_authoring_generate`, `profile_authoring_inspect`, `profile_authoring_list` | Advanced profile-maintenance route | Removed from normal public surface. |

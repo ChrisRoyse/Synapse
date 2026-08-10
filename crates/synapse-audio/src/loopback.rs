@@ -11,7 +11,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 #[cfg(windows)]
-use crate::ring::{AudioFormat, DEFAULT_SAMPLE_RATE_HZ, STEREO_CHANNELS};
+use crate::ring::{AudioFormat, AudioPacketTimeline, DEFAULT_SAMPLE_RATE_HZ, STEREO_CHANNELS};
 use crate::{
     AudioError, AudioResult, MAX_RING_SECONDS, detectors::DetectorProcessor, ring::AudioRing,
 };
@@ -205,11 +205,11 @@ fn capture_loop(
             }
             return Err(AudioError::DeviceLost { detail: error });
         }
-        while let Some(samples) = capture.read_packet()? {
-            let frames = samples.len() / usize::from(capture.format.channels);
-            ring.push_interleaved(&samples);
+        while let Some(packet) = capture.read_packet()? {
+            let frames = packet.samples.len() / usize::from(capture.format.channels);
+            ring.push_packet(&packet.samples, packet.timeline)?;
             if let Some(processor) = detectors.as_mut() {
-                processor.process(&samples, capture.format);
+                processor.process(&packet.samples, capture.format);
             }
             let frames = u64::try_from(frames).unwrap_or(u64::MAX);
             stats.frames_captured.fetch_add(frames, Ordering::AcqRel);
@@ -226,6 +226,12 @@ struct WasapiLoopback {
     capture_client: wasapi::AudioCaptureClient,
     format: AudioFormat,
     block_align: usize,
+}
+
+#[cfg(windows)]
+struct CapturePacket {
+    samples: Vec<f32>,
+    timeline: AudioPacketTimeline,
 }
 
 #[cfg(windows)]
@@ -278,7 +284,7 @@ impl WasapiLoopback {
         }
     }
 
-    fn read_packet(&self) -> AudioResult<Option<Vec<f32>>> {
+    fn read_packet(&self) -> AudioResult<Option<CapturePacket>> {
         let frames = self
             .capture_client
             .get_next_packet_size()
@@ -303,7 +309,16 @@ impl WasapiLoopback {
             metrics::counter!(AUDIO_LOOPBACK_UNDERRUNS_TOTAL).increment(1);
             return Ok(None);
         }
-        Ok(Some(raw_f32_stereo(&raw, read_frames, &info)))
+        let samples = raw_f32_stereo(&raw, read_frames, &info);
+        Ok(Some(CapturePacket {
+            samples,
+            timeline: AudioPacketTimeline {
+                device_position: info.index,
+                qpc_position_100ns: info.timestamp,
+                data_discontinuity: info.flags.data_discontinuity,
+                timestamp_error: info.flags.timestamp_error,
+            },
+        }))
     }
 
     fn stop(&self) -> AudioResult<()> {

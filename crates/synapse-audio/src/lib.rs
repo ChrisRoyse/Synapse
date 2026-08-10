@@ -86,7 +86,7 @@ impl AudioRuntime {
     ) -> AudioResult<Self> {
         validate_config(&config)?;
         let ring = Arc::new(AudioRing::new(config.ring_seconds));
-        let detector_state = detectors::SharedDetectorState::default();
+        let detector_state = detectors::SharedDetectorState::new(config.ring_seconds);
         let loopback = if config.start_loopback {
             Some(loopback::start_loopback(
                 Arc::clone(&ring),

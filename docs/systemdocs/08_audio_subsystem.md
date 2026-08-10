@@ -110,6 +110,8 @@ Key `AudioRuntime` methods:
 |---|---|---|
 | `format` | `AudioFormat` | Format the samples were captured in |
 | `frames` | `usize` | Number of frames (per-channel samples) returned |
+| `device_frames` | `usize` | Frames supplied by real WASAPI packets |
+| `timeline_gap_frames` | `usize` | Explicit zero-valued frames used to preserve elapsed capture time |
 | `samples` | `Vec<f32>` | Interleaved samples, length `frames * channels` |
 | `rms_db` | `f32` | RMS of `samples` in dB (via `detectors::rms_db`) |
 
@@ -119,8 +121,9 @@ Method: `pcm_i16_le(&self) -> Vec<u8>` — clamps each sample to `[-1, 1]`, scal
 ### 2.4 `AudioRing`
 
 `#[derive(Debug)]`. Holds `inner: Mutex<RingState>` and `max_seconds: u32`. `RingState`
-contains `format: AudioFormat`, `samples: Vec<f32>`, and `total_frames: u64` (monotonic
-write counter).
+contains the sample ring, a per-frame device/gap provenance ring, monotonic logical-frame
+counter, the last/next WASAPI device positions, the last QPC packet timestamp, and the
+local monotonic time at which that packet was observed.
 
 **Sizing.** Backing buffer is allocated up front as
 `capacity_samples = sample_rate_hz * seconds * channels` floats. Frame capacity is
@@ -132,23 +135,28 @@ re-sized when `set_format` changes the format.
 | `new(max_seconds: u32) -> Self` | Allocates buffer for default format; zero-filled |
 | `max_seconds(&self) -> u32` | |
 | `format(&self) -> AudioFormat` | |
-| `frames_available(&self) -> usize` | `min(total_frames, capacity_frames)` |
+| `frames_available(&self) -> usize` | Real-time frame horizon, including elapsed silence since the last packet, bounded by capacity |
 | `total_frames(&self) -> u64` | Lifetime frame count |
-| `set_format(&self, format: AudioFormat)` | If format changed: reallocates buffer, resets `total_frames` to 0 |
-| `push_interleaved(&self, samples: &[f32])` | Writes frame-by-frame at `(total_frames % capacity_frames) * channels`; increments `total_frames` |
+| `set_format(&self, format: AudioFormat)` | If format changed: reallocates sample/provenance rings and resets all timeline anchors |
+| `push_packet(&self, samples, timeline) -> AudioResult<()>` | Validates and appends one WASAPI packet at its real device/QPC position; materializes intervening device-position gaps as silence |
 | `tail_seconds(&self, seconds: f32) -> AudioResult<AudioWindow>` | Returns last `seconds` of samples |
 
-**Write/overwrite behavior.** `push_interleaved` iterates `chunks_exact(channels)`,
-writing each frame to a slot computed modulo `capacity_frames`, so once full the ring
-overwrites the oldest frames. Partial trailing samples (not a full frame) are dropped by
-`chunks_exact`. If `channels == 0` or `capacity_frames == 0`, the push is a no-op.
+**Write/overwrite behavior.** `push_packet` refuses partial frames, timestamp-error
+packets, post-start discontinuity flags, regressing/overlapping device positions, and
+device/QPC clock disagreement beyond 10 ms. Its errors name both timing coordinates and
+the operator repair. Valid gaps are written as zero-valued, non-device frames. A gap at
+least as large as the ring capacity clears both backing arrays and advances the logical
+cursor in O(capacity), so long idle periods do not cause work proportional to idle time.
+Packet frames then overwrite the oldest slots modulo `capacity_frames`.
 
 **Read behavior.** `tail_seconds` validates `seconds` is finite, non-negative, and
 `<= max_seconds` (else `AudioError::LoopbackInitFailed`). It computes
-`requested = round(seconds * sample_rate_hz)`, clamps to `available`, then copies frames
-starting at `total_frames - frames`, each indexed modulo `capacity_frames`. The returned
-`AudioWindow` carries the current `format`, the realized `frames`, and `rms_db` over the
-copied samples.
+`requested = round(seconds * sample_rate_hz)`. Elapsed monotonic time since the last
+packet contributes a trailing zero-valued gap even when WASAPI has produced no new
+packet; this is deliberately read without mutating the device cursor. The method copies
+only the retained stored prefix and appends the trailing gap, reporting device and gap
+frame counts separately. Thus “last N seconds” is a wall-time window, never “last N
+seconds containing captured frames.”
 
 ---
 
@@ -332,7 +340,7 @@ Metrics: `AUDIO_EVENTS_TOTAL` (counter, tagged by `kind`), `AUDIO_RMS_DB` (gauge
 
 | Constant | Value | Use |
 |---|---|---|
-| `RECENT_EVENT_CAP` | `64` | Max retained recent events |
+| `RECENT_EVENT_CAP` | `64` | Secondary memory ceiling after time-horizon eviction |
 | `RMS_FLOOR` | `1e-6` | Linear RMS floor / dB floor reference |
 | `LOUD_RATIO` | `5.0` | Surge multiple over moving RMS |
 | `LOUD_ABSOLUTE_RMS` | `0.25` | Absolute loud onset threshold |
@@ -388,6 +396,13 @@ confidence is halved; result clamped to `[0, 1]`.
 `recent_events: Vec<AudioEvent>`, `direction_estimate: Option<DirectionEstimate>`.
 `AudioEvent`: `at: DateTime<Utc>`, `kind: String`, `azimuth_deg: Option<f32>`,
 `confidence: f32`.
+
+`SharedDetectorState` stores each recent event with an internal monotonic observation
+time and uses the configured audio-ring duration as its retention horizon. It prunes on
+both packet processing and snapshot reads, so a quiet endpoint cannot preserve an event
+past the advertised ring window. Snapshot reads also expire loud, speech/VAD, and music
+latches after their respective 0.25 s, 0.5 s, and 1 s silence horizons when WASAPI
+supplies no packet; after 1 s the reported RMS/moving RMS are reset to the silence floor.
 
 ---
 
@@ -460,6 +475,7 @@ strength        = max(energy_strength, lag_strength)
 |---|---|---|---|
 | `DeviceLost` | `detail: String` | `audio device lost: {detail}` | `AUDIO_DEVICE_LOST` |
 | `LoopbackInitFailed` | `detail: String` | `audio loopback init failed: {detail}` | `AUDIO_LOOPBACK_INIT_FAILED` |
+| `TimelineInvalid` | `detail: String` | `audio capture timeline invalid: {detail}` | `AUDIO_TIMELINE_INVALID` |
 | `SttModelNotLoaded` | `detail: String` | `audio STT model not loaded: {detail}` | `AUDIO_STT_MODEL_NOT_LOADED` |
 | `ModelHashMismatch` | `path: PathBuf, expected: String, actual: String` | `audio STT model hash mismatch for {path}: expected {expected}, got {actual}` | `MODEL_HASH_MISMATCH` |
 | `ModelLoadFailed` | `path: PathBuf, detail: String` | `audio STT model load failed for {path}: {detail}` | `MODEL_LOAD_FAILED` |

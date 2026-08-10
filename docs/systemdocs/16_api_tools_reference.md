@@ -132,7 +132,7 @@ See [10_reflex_subsystem.md](10_reflex_subsystem.md), [08_audio_subsystem.md](08
 | `reflex_cancel` | Cancel a reflex | `reflex_id` (req) | cancels reflex |
 | `reflex_list` | List reflexes | `include_expired?` | read-only |
 | `reflex_history` | Persisted reflex audit history | `reflex_id?`, `limit` | read-only |
-| `audio_tail` | Latest loopback audio tail (PCM s16le) | `seconds?` | read-only |
+| `audio_tail` | Latest real-time loopback audio tail (PCM s16le), including `device_frames`/`device_captured_seconds` and explicit `timeline_gap_frames`/`timeline_gap_seconds` provenance | `seconds?` | read-only |
 | `audio_transcribe` | Whisper-tiny transcription of tail | `seconds?`, `language?` | runs ASR |
 
 ## 16.6 Profiles, registry & authoring — `m3_tools.rs`
@@ -150,7 +150,7 @@ See [11_profiles_subsystem.md](11_profiles_subsystem.md).
 | `profile_authoring_decide` | Accept/reject a candidate | `candidate_id` (req), `decision` (req), `operator_note?`, `reason?` | mutates candidate state |
 | `profile_authoring_export` | Export candidate bundle | `candidate_id` (req), `output_path` (req) | writes file |
 | `profile_quality_refresh` | Refresh profile quality scoring | `profile_id` (req), `max_audit_rows?` | writes scoring rows |
-| `profile_registry_query` | Query registry rows (search/inspect/report) | `view` (req), filters (summarized) | read-only |
+| `profile_registry_query` | Hidden implementation for registry rows; scoped clients use `profile operation=registry_query` | `view` (req), filters (summarized) | read-only |
 | `profile_registry_install` | Install/update a registry package | `source_id` (req), `manifest_path` (req) | writes registry rows |
 | `profile_registry_disable` | Disable/remove an installed row | `profile_id` (req), `state` (req) | mutates registry |
 | `profile_registry_export` | Export registry rows to JSON | `output_path` (req), `row_kind?`, `limit?` | writes file |
@@ -374,6 +374,6 @@ Run-scoped durable key/value blackboard for multi-agent coordination.
 
 ## 16.18 Notes & caveats
 
-- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
+- **Param detail summarized** for: `browser_wait_for` (condition union), `browser_locate`, `profile operation=registry_query` / hidden `profile_registry_query`, `agent_stats`, `session_end`, `target_claim_adopt`, `task_dispatch_once`, `target_act` (full verb-param matrix), and `browser_cookies`/`browser_storage` (verb-shaped). Authoritative field sets live in the named `*Params` structs in each source file.
 - **Empty-schema tools** (`input_schema = empty_input_schema()`): `health`, `get_target`, `clear_target`, `control_lease_release`, `control_lease_status`, `tool_profile_status`, `escalation_config_get`.
 - Counts: enumerated by `#[tool(...)]` across `crates/synapse-mcp/src/server/`.

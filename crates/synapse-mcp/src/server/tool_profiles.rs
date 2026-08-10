@@ -20,6 +20,7 @@ use super::{
 
 const TOOL_PROFILE_PREFIX: &str = "mcp/tool-profile/v1/";
 const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<session_id>";
+const PROFILE_REGISTRY_QUERY_SOURCE_OF_TRUTH: &str = "CF_PROFILES profile_registry/v1/* + CF_KV profile_registry/v1/head/* and audit-export consent rows + bounded CF_ACTION_LOG/CF_OBSERVATIONS/CF_EVENTS report reads";
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
@@ -510,6 +511,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 Some("overlay status readback (cleared) + CF_ACTION_LOG intent/final audit rows"),
                 error_codes::TOOL_INTERNAL_ERROR,
                 "provide an MCP session id; revoke is always permitted (de-escalation) and audited",
+            ),
+            op(
+                "registry_query",
+                false,
+                false,
+                PROFILE_REGISTRY_QUERY_SOURCE_OF_TRUTH,
+                Some(
+                    "typed search/inspect/report response carrying exact CF names, row keys, key hex, and present/missing state",
+                ),
+                error_codes::TOOL_PARAMS_INVALID,
+                "pass exactly registry_query with its required view; inspect requires one exact registry identity and reports found=false for a known-absent row",
             ),
         ],
     ),
@@ -3790,6 +3802,10 @@ pub(crate) enum ProfileOperation {
     /// #1559: clear the runtime reality-write overlay, restoring the fail-closed
     /// default. De-escalation, so it needs only an MCP session id (audited).
     RevokeRealityWrite,
+    /// Read the local profile registry through the public 40-tool facade.
+    /// This preserves the hidden implementation's typed search/inspect/report
+    /// contract without requiring a policy escalation for read-only state.
+    RegistryQuery,
 }
 
 impl ProfileOperation {
@@ -3799,6 +3815,7 @@ impl ProfileOperation {
             Self::Set => "set",
             Self::GrantRealityWrite => "grant_reality_write",
             Self::RevokeRealityWrite => "revoke_reality_write",
+            Self::RegistryQuery => "registry_query",
         }
     }
 }
@@ -3820,6 +3837,8 @@ pub(crate) struct ProfileParams {
     #[serde(default)]
     #[schemars(default)]
     pub confirm_break_glass: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_query: Option<crate::m3::profile_registry::ProfileRegistryQueryParams>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -3834,6 +3853,9 @@ pub(crate) struct ProfileResponse {
     /// #1559: grant/revoke result for the runtime reality-write overlay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reality_write: Option<RealityWriteGrantResponse>,
+    /// Exact typed result for `operation=registry_query`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_query: Option<crate::m3::profile_registry::ProfileRegistryQueryResponse>,
 }
 
 /// #1559: result of a `profile operation=grant_reality_write` /
@@ -3891,7 +3913,7 @@ pub(crate) struct ToolProfileSetResponse {
 #[tool_router(router = tool_profile_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself."
+        description = "Public profile facade. operation=status reads this MCP session's effective profile, visible public facade tools, durable CF_SESSIONS policy row, facade contract, and effective M3 permission grants (with config source + any active reality-write overlay). operation=set persists a new profile through the same audited readback path as tool_profile_set; explicit advanced profiles require confirm_break_glass=true and a non-empty reason, and break_glass/full_capability also require the foreground input lease. operation=grant_reality_write installs a bounded-TTL, audited, revocable reality-write opt-in overlay (gated exactly like break_glass: confirm_break_glass=true + non-empty reason + this session owns the foreground input lease); operation=revoke_reality_write clears it. operation=registry_query exposes the read-only local registry search/inspect/report engine through the public facade; pass exactly the nested registry_query payload and no profile/escalation fields. The selected profile is INDEPENDENT of M3 permission grants and never yields WRITE_STORAGE by itself."
     )]
     pub async fn profile(
         &self,
@@ -3915,14 +3937,19 @@ impl SynapseService {
             None
         };
         match params.operation {
-            ProfileOperation::Status => Ok(Json(ProfileResponse {
-                operation: ProfileOperation::Status,
-                source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
-                status: Some(self.tool_profile_status_response(&request_context)?),
-                set: None,
-                reality_write: None,
-            })),
+            ProfileOperation::Status => {
+                reject_registry_query_for_other_profile_operation(&params)?;
+                Ok(Json(ProfileResponse {
+                    operation: ProfileOperation::Status,
+                    source_of_truth: TOOL_PROFILE_SOURCE_OF_TRUTH,
+                    status: Some(self.tool_profile_status_response(&request_context)?),
+                    set: None,
+                    reality_write: None,
+                    registry_query: None,
+                }))
+            }
             ProfileOperation::Set => {
+                reject_registry_query_for_other_profile_operation(&params)?;
                 let profile = params.profile.ok_or_else(|| {
                     profile_facade_error(
                         ProfileOperation::Set,
@@ -3949,9 +3976,11 @@ impl SynapseService {
                     status: None,
                     set: Some(set),
                     reality_write: None,
+                    registry_query: None,
                 }))
             }
             ProfileOperation::GrantRealityWrite => {
+                reject_registry_query_for_other_profile_operation(&params)?;
                 let session_id = super::context::mcp_session_id_from_request_context(
                     &request_context,
                 )?
@@ -3972,9 +4001,11 @@ impl SynapseService {
                     status: None,
                     set: None,
                     reality_write: Some(reality_write),
+                    registry_query: None,
                 }))
             }
             ProfileOperation::RevokeRealityWrite => {
+                reject_registry_query_for_other_profile_operation(&params)?;
                 let session_id = super::context::mcp_session_id_from_request_context(
                     &request_context,
                 )?
@@ -3991,6 +4022,38 @@ impl SynapseService {
                     status: None,
                     set: None,
                     reality_write: Some(reality_write),
+                    registry_query: None,
+                }))
+            }
+            ProfileOperation::RegistryQuery => {
+                if params.profile.is_some() || params.reason.is_some() || params.confirm_break_glass
+                {
+                    return Err(profile_facade_error(
+                        ProfileOperation::RegistryQuery,
+                        "profile operation=registry_query accepts no profile, reason, or confirm_break_glass fields",
+                        "remove escalation fields and pass exactly registry_query with its required view and matching query fields",
+                    ));
+                }
+                let query = params.registry_query.ok_or_else(|| {
+                    profile_facade_error(
+                        ProfileOperation::RegistryQuery,
+                        "profile operation=registry_query requires registry_query",
+                        "pass registry_query={view=search|inspect|report,...}; inspect reports found=false for a known-absent exact row",
+                    )
+                })?;
+                self.require_m3_permissions(
+                    "profile_registry_query",
+                    &crate::m3::profile_registry::required_permissions_query(&query),
+                )?;
+                let runtime = self.reflex_runtime()?;
+                let registry_query = crate::m3::profile_registry::query_registry(&runtime, &query)?;
+                Ok(Json(ProfileResponse {
+                    operation: ProfileOperation::RegistryQuery,
+                    source_of_truth: PROFILE_REGISTRY_QUERY_SOURCE_OF_TRUTH,
+                    status: None,
+                    set: None,
+                    reality_write: None,
+                    registry_query: Some(registry_query),
                 }))
             }
         }
@@ -5034,18 +5097,36 @@ fn normalize_reason(raw: Option<&str>) -> Result<Option<String>, ErrorData> {
     Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
 }
 
+fn reject_registry_query_for_other_profile_operation(
+    params: &ProfileParams,
+) -> Result<(), ErrorData> {
+    if params.registry_query.is_some() {
+        return Err(profile_facade_error(
+            params.operation,
+            "profile registry_query payload is valid only with operation=registry_query",
+            "remove registry_query or change operation to registry_query; profile registry reads never require profile escalation fields",
+        ));
+    }
+    Ok(())
+}
+
 fn profile_facade_error(
     operation: ProfileOperation,
     message: &'static str,
     remediation: &'static str,
 ) -> ErrorData {
+    let source_of_truth = if operation == ProfileOperation::RegistryQuery {
+        PROFILE_REGISTRY_QUERY_SOURCE_OF_TRUTH
+    } else {
+        TOOL_PROFILE_SOURCE_OF_TRUTH
+    };
     ErrorData::new(
         ErrorCode(-32099),
         message.to_owned(),
         Some(json!({
             "code": error_codes::TOOL_PARAMS_INVALID,
             "operation": operation.as_str(),
-            "source_of_truth": TOOL_PROFILE_SOURCE_OF_TRUTH,
+            "source_of_truth": source_of_truth,
             "remediation": remediation,
         })),
     )
@@ -5229,9 +5310,16 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
                 "session operation=list",
             ]
         }
-        "profile" => vec!["tool_profile_status", "tool_profile_set"],
+        "profile" => vec![
+            "profile operation=status",
+            "profile operation=set",
+            "profile operation=registry_query",
+        ],
         "tool_profile_set" | "tool_profile_status" => {
             vec!["profile operation=status", "profile operation=set"]
+        }
+        "profile_registry_query" => {
+            vec!["profile operation=registry_query registry_query={view=search|inspect|report,...}"]
         }
         "browser_console_messages"
         | "browser_network"

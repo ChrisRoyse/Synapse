@@ -4,6 +4,7 @@ use std::{
         Arc, Mutex, MutexGuard,
         atomic::{AtomicU64, Ordering},
     },
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -22,6 +23,7 @@ pub const MUSIC_STARTED: &str = "music_started";
 pub const MUSIC_ENDED: &str = "music_ended";
 
 const RECENT_EVENT_CAP: usize = 64;
+const DEFAULT_EVENT_RETENTION_SECONDS: u32 = 30;
 const RMS_FLOOR: f32 = 0.000_001;
 const LOUD_RATIO: f32 = 5.0;
 const LOUD_ABSOLUTE_RMS: f32 = 0.25;
@@ -30,9 +32,16 @@ const SPEECH_END_DB: f32 = -45.0;
 const MUSIC_START_DB: f32 = -38.0;
 const MUSIC_END_DB: f32 = -48.0;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SharedDetectorState {
     inner: Arc<Mutex<DetectorState>>,
+    retention: Duration,
+}
+
+#[derive(Clone, Debug)]
+struct TimedAudioEvent {
+    event: AudioEvent,
+    observed_at: Instant,
 }
 
 #[derive(Debug)]
@@ -50,7 +59,8 @@ struct DetectorState {
     quiet_loud_frames: u64,
     silent_speech_frames: u64,
     silent_music_frames: u64,
-    recent_events: VecDeque<AudioEvent>,
+    recent_events: VecDeque<TimedAudioEvent>,
+    last_processed_at: Option<Instant>,
 }
 
 impl Default for DetectorState {
@@ -66,6 +76,7 @@ impl Default for DetectorState {
             silent_speech_frames: 0,
             silent_music_frames: 0,
             recent_events: VecDeque::new(),
+            last_processed_at: None,
         }
     }
 }
@@ -81,13 +92,28 @@ pub struct DetectorSnapshot {
 
 impl SharedDetectorState {
     #[must_use]
+    pub fn new(retention_seconds: u32) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DetectorState::default())),
+            retention: Duration::from_secs(u64::from(retention_seconds)),
+        }
+    }
+
+    #[must_use]
     pub fn snapshot(&self) -> DetectorSnapshot {
-        let state = self.lock();
+        let now = Instant::now();
+        let mut state = self.lock();
+        prune_recent(&mut state.recent_events, self.retention, now);
+        expire_inactive_state(&mut state, now);
         DetectorSnapshot {
             context: AudioContext {
                 rms_db: state.rms_db,
                 vad_speech_recent: state.vad_speech_recent,
-                recent_events: state.recent_events.iter().cloned().collect(),
+                recent_events: state
+                    .recent_events
+                    .iter()
+                    .map(|timed| timed.event.clone())
+                    .collect(),
                 direction_estimate: None,
                 transcription: None,
             },
@@ -102,6 +128,12 @@ impl SharedDetectorState {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+}
+
+impl Default for SharedDetectorState {
+    fn default() -> Self {
+        Self::new(DEFAULT_EVENT_RETENTION_SECONDS)
     }
 }
 
@@ -139,10 +171,13 @@ impl DetectorProcessor {
 
         let mut events = Vec::new();
         {
+            let now = Instant::now();
             let mut state = self.state.lock();
+            prune_recent(&mut state.recent_events, self.state.retention, now);
             let prior_moving = state.moving_rms.max(RMS_FLOOR);
             state.rms_db = rms_db;
             state.moving_rms = state.moving_rms.mul_add(0.95, rms * 0.05);
+            state.last_processed_at = Some(now);
 
             let loud_surge = rms > prior_moving * LOUD_RATIO && rms_db > -24.0;
             let loud_absolute_onset =
@@ -156,7 +191,7 @@ impl DetectorProcessor {
             update_speech(&mut state, &mut events, rms_db, frames, format);
             update_music(&mut state, &mut events, rms_db, crest, frames, format);
             for event in &events {
-                push_recent(&mut state.recent_events, event.clone());
+                push_recent(&mut state.recent_events, event.clone(), now);
             }
             state.vad_speech_recent = state.speech_active;
         }
@@ -262,11 +297,44 @@ fn detector_event(kind: &str, rms_db: f32, confidence: f32) -> AudioEvent {
     }
 }
 
-fn push_recent(recent: &mut VecDeque<AudioEvent>, event: AudioEvent) {
+fn push_recent(recent: &mut VecDeque<TimedAudioEvent>, event: AudioEvent, observed_at: Instant) {
     if recent.len() >= RECENT_EVENT_CAP {
         let _oldest = recent.pop_front();
     }
-    recent.push_back(event);
+    recent.push_back(TimedAudioEvent { event, observed_at });
+}
+
+fn prune_recent(recent: &mut VecDeque<TimedAudioEvent>, retention: Duration, now: Instant) {
+    while recent
+        .front()
+        .is_some_and(|event| now.duration_since(event.observed_at) > retention)
+    {
+        let _expired = recent.pop_front();
+    }
+}
+
+fn expire_inactive_state(state: &mut DetectorState, now: Instant) {
+    let Some(elapsed) = state
+        .last_processed_at
+        .map(|last_processed| now.duration_since(last_processed))
+    else {
+        return;
+    };
+    if elapsed >= Duration::from_millis(250) {
+        state.loud_active = false;
+        state.quiet_loud_frames = 0;
+    }
+    if elapsed >= Duration::from_millis(500) {
+        state.speech_active = false;
+        state.vad_speech_recent = false;
+        state.silent_speech_frames = 0;
+    }
+    if elapsed >= Duration::from_secs(1) {
+        state.music_active = false;
+        state.silent_music_frames = 0;
+        state.rms_db = silence_db();
+        state.moving_rms = RMS_FLOOR;
+    }
 }
 
 fn confidence_for_rms(rms_db: f32, base: f32) -> f32 {
