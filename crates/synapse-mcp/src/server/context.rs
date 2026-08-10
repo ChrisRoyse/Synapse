@@ -412,6 +412,48 @@ impl SynapseService {
             .map_err(|error| m3_state_error(&error))?;
         drop(state);
         self.install_aim_track_target_source(&runtime)?;
+        self.install_reflex_action_gate(&runtime)?;
+        let activations = {
+            let mut runtime = runtime.lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    "reflex runtime lock poisoned during durable-state reconciliation",
+                )
+            })?;
+            runtime
+                .activate_recovered()
+                .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+            runtime.recovered_activations()
+        };
+        let m3_state = self.m3_state_handle();
+        let event_bus = self.sse_state()?.event_bus();
+        for (reflex_id, activation) in activations {
+            if crate::m3::reflex::file_jsonl_tail_watcher_installed(&m3_state, &reflex_id)? {
+                continue;
+            }
+            if let Err(error) = crate::m3::reflex::install_recovered_file_jsonl_tail_watcher(
+                &m3_state,
+                reflex_id.clone(),
+                activation,
+                event_bus.clone(),
+            ) {
+                let rollback = runtime
+                    .lock()
+                    .map_err(|_error| {
+                        mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "reflex runtime lock poisoned while stopping a partially reconciled scheduler",
+                        )
+                    })?
+                    .deactivate_after_recovery_failure();
+                return Err(mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "REFLEX_RECOVERY_HOST_ACTIVATION_FAILED: reflex_id={reflex_id} phase=file_jsonl_tail_install durable_state=unchanged scheduler_rollback={rollback:?} detail={error}; remediation=repair the named watcher dependency and retry reflex reconciliation"
+                    ),
+                ));
+            }
+        }
         Ok(runtime)
     }
 

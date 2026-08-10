@@ -97,6 +97,21 @@ struct ClampProjection {
     total: u64,
 }
 
+pub struct GroundedLifecycleDesiredMutation {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+    pub expected_revision: [u8; 32],
+}
+
+pub struct GroundedLifecycleProjectionEntry {
+    pub audit: StoredReflexAudit,
+    pub source_key: Vec<u8>,
+    pub source_value: Vec<u8>,
+    pub desired: Option<GroundedLifecycleDesiredMutation>,
+}
+
+type DesiredLifecycleMutation<'a> = (&'a [u8], &'a [u8], Option<[u8; 32]>);
+
 pub fn ensure(db: &Db) -> ReflexResult<()> {
     let mut guard = lock_projection()?;
     ensure_locked(db, &mut guard)
@@ -297,17 +312,28 @@ pub fn write_projected_audit(
 /// registry mutation therefore share the same guarded WAL/MVCC commit as the
 /// native constellation. The scheduler remains prepared and unable to tick
 /// until this function returns success.
-pub fn write_projected_registration_audit(
+#[expect(
+    clippy::too_many_lines,
+    reason = "the single source/order/aggregate/desired-state/grounding commit keeps every guarded identity and readback visible as one invariant"
+)]
+pub fn write_projected_grounded_lifecycle_audit(
     db: &Db,
     audit: &StoredReflexAudit,
     source_key: &[u8],
     source_value: &[u8],
+    desired: Option<DesiredLifecycleMutation<'_>>,
 ) -> StorageResult<()> {
-    if audit.status != ReflexState::Active
-        || audit.details.get("kind").and_then(Value::as_str) != Some("reflex_registered")
-    {
+    let kind = audit.details.get("kind").and_then(Value::as_str);
+    let valid_lifecycle = matches!(
+        (audit.status, kind),
+        (ReflexState::Active, Some("reflex_registered"))
+            | (ReflexState::Cancelled, Some("reflex_cancelled"))
+            | (ReflexState::Disabled, Some("reflex_disabled_by_operator"))
+            | (ReflexState::Expired | ReflexState::ActionDenied, Some(_))
+    );
+    if !valid_lifecycle {
         return Err(storage_write_error(&format!(
-            "REFLEX_REGISTRATION_PROJECTION_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only an active reflex_registered audit through the registration transaction",
+            "REFLEX_GROUNDED_LIFECYCLE_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/cancellation/disable audit through the grounded lifecycle transaction",
             audit.reflex_id,
             audit.status,
             audit.details.get("kind")
@@ -334,6 +360,9 @@ pub fn write_projected_registration_audit(
             )));
         }
         require_exact_readback(db, cf::CF_REFLEX_AUDIT_ORDER, &order_key, &order_value)?;
+        if let Some((desired_key, desired_value, _revision)) = desired {
+            require_exact_readback(db, cf::CF_KV, desired_key, desired_value)?;
+        }
         return Ok(());
     }
 
@@ -371,6 +400,25 @@ pub fn write_projected_registration_audit(
         ),
     ];
     let mut kv_rows = vec![(state_key.clone(), state_value.clone())];
+    if let Some((desired_key, desired_value, expected_revision)) = desired {
+        let existing = db.get_cf_revisioned(cf::CF_KV, desired_key)?;
+        let actual_revision = existing.as_ref().map(|row| row.revision_sha256);
+        if actual_revision != expected_revision {
+            return Err(storage_write_error(&format!(
+                "REFLEX_DURABLE_DEFINITION_REVISION_CONFLICT: reflex_id={} desired_key_hex={} expected_revision_sha256={:?} actual_revision_sha256={:?}; remediation=reload the exact desired state and retry the complete lifecycle transition",
+                audit.reflex_id,
+                hex_encode(desired_key),
+                expected_revision.map(|revision| hex_encode(&revision)),
+                actual_revision.map(|revision| hex_encode(&revision))
+            )));
+        }
+        guards.push(CfRevisionGuard::new(
+            cf::CF_KV,
+            desired_key.to_vec(),
+            expected_revision,
+        ));
+        kv_rows.push((desired_key.to_vec(), desired_value.to_vec()));
+    }
 
     let registry_update = registration_registry_update(db, &audit.reflex_id)?;
     if let Some((registry_guard, registry_row)) = registry_update.as_ref() {
@@ -378,7 +426,7 @@ pub fn write_projected_registration_audit(
         kv_rows.push(registry_row.clone());
     }
 
-    db.put_reflex_registration_grounded_publication(
+    db.put_reflex_lifecycle_grounded_publication(
         guards,
         vec![
             (
@@ -398,8 +446,181 @@ pub fn write_projected_registration_audit(
     require_exact_readback(db, cf::CF_REFLEX_AUDIT, source_key, source_value)?;
     require_exact_readback(db, cf::CF_REFLEX_AUDIT_ORDER, &order_key, &order_value)?;
     require_exact_readback(db, cf::CF_KV, &state_key, &state_value)?;
+    if let Some((desired_key, desired_value, _revision)) = desired {
+        require_exact_readback(db, cf::CF_KV, desired_key, desired_value)?;
+    }
     if let Some((_guard, (_key, registry_value))) = registry_update {
         require_exact_readback(db, cf::CF_KV, REGISTRY_KEY, &registry_value)?;
+    }
+    Ok(())
+}
+
+/// Atomically publishes several terminal lifecycle facts, their complete
+/// projections/desired-state revisions, and one grounded constellation per
+/// fact under a single Calyx WAL/MVCC sequence.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one multi-reflex command must prepare and verify every guarded projection member before crossing its single WAL boundary"
+)]
+pub fn write_projected_grounded_lifecycle_batch(
+    db: &Db,
+    entries: Vec<GroundedLifecycleProjectionEntry>,
+) -> StorageResult<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut guard = PROJECTION_LOCK.lock().map_err(|_error| storage_write_error(
+        "REFLEX_AUDIT_PROJECTION_LOCK_POISONED: restart the daemon and inspect the prior panic before retrying",
+    ))?;
+    ensure_locked(db, &mut guard).map_err(|error| storage_write_error(&error.to_string()))?;
+    let mut seen_reflex_ids = std::collections::BTreeSet::new();
+    let mut guards = Vec::new();
+    let mut source_rows = Vec::with_capacity(entries.len());
+    let mut order_rows = Vec::with_capacity(entries.len());
+    let mut kv_rows = Vec::with_capacity(entries.len() * 2);
+    let mut members = Vec::with_capacity(entries.len());
+    let mut readbacks = Vec::with_capacity(entries.len());
+
+    for entry in entries {
+        let audit = &entry.audit;
+        let kind = audit.details.get("kind").and_then(Value::as_str);
+        if !matches!(
+            (audit.status, kind),
+            (ReflexState::Cancelled, Some("reflex_cancelled"))
+                | (ReflexState::Disabled, Some("reflex_disabled_by_operator"))
+        ) {
+            return Err(storage_write_error(&format!(
+                "REFLEX_LIFECYCLE_BATCH_KIND_INVALID: reflex_id={} status={:?} kind={kind:?}; remediation=route only terminal cancellation/disable facts through the lifecycle batch",
+                audit.reflex_id, audit.status
+            )));
+        }
+        if !seen_reflex_ids.insert(audit.reflex_id.clone()) {
+            return Err(storage_write_error(&format!(
+                "REFLEX_LIFECYCLE_BATCH_DUPLICATE_REFLEX: reflex_id={}; remediation=collapse the command to one terminal transition per reflex",
+                audit.reflex_id
+            )));
+        }
+        if db
+            .get_cf_revisioned(cf::CF_REFLEX_AUDIT, &entry.source_key)?
+            .is_some()
+        {
+            return Err(storage_write_error(&format!(
+                "REFLEX_LIFECYCLE_BATCH_SOURCE_IDENTITY_CONFLICT: reflex_id={} source_key_hex={}; remediation=allocate a fresh audit identity and rebuild the entire command",
+                audit.reflex_id,
+                hex_encode(&entry.source_key)
+            )));
+        }
+        let order_key = reflex_audit_order_key(audit.ts_ns, &audit.audit_id, &audit.reflex_id);
+        let order_value = encode_pointer(&OrderedSourcePointer::new(
+            &entry.source_key,
+            &entry.source_value,
+        ))?;
+        let order_revision = db.get_cf_revisioned(cf::CF_REFLEX_AUDIT_ORDER, &order_key)?;
+        if let Some(existing) = &order_revision
+            && existing.value.as_deref() != Some(order_value.as_slice())
+        {
+            return Err(storage_write_error(&format!(
+                "REFLEX_LIFECYCLE_BATCH_ORDER_IDENTITY_CONFLICT: reflex_id={} order_key_hex={}; remediation=preserve the existing pointer and rebuild the complete command with a fresh audit identity",
+                audit.reflex_id,
+                hex_encode(&order_key)
+            )));
+        }
+        let state_key = state_key(&audit.reflex_id);
+        let state_revision = db.get_cf_revisioned(cf::CF_KV, &state_key)?;
+        let prior_state = state_revision
+            .as_ref()
+            .and_then(|row| row.value.as_deref())
+            .map(decode_projection_state)
+            .transpose()?;
+        let state_value = encode_json(&next_projection_state(
+            db,
+            prior_state,
+            audit,
+            &entry.source_value,
+        )?)?;
+        guards.push(CfRevisionGuard::new(
+            cf::CF_REFLEX_AUDIT,
+            entry.source_key.clone(),
+            None,
+        ));
+        guards.push(CfRevisionGuard::new(
+            cf::CF_REFLEX_AUDIT_ORDER,
+            order_key.clone(),
+            order_revision.map(|row| row.revision_sha256),
+        ));
+        guards.push(CfRevisionGuard::new(
+            cf::CF_KV,
+            state_key.clone(),
+            state_revision.map(|row| row.revision_sha256),
+        ));
+        source_rows.push((entry.source_key.clone(), entry.source_value.clone()));
+        order_rows.push((order_key.clone(), order_value.clone()));
+        kv_rows.push((state_key.clone(), state_value.clone()));
+        if let Some(desired) = entry.desired {
+            let actual = db.get_cf_revisioned(cf::CF_KV, &desired.key)?;
+            let actual_revision = actual.as_ref().map(|row| row.revision_sha256);
+            if actual_revision != Some(desired.expected_revision) {
+                return Err(storage_write_error(&format!(
+                    "REFLEX_LIFECYCLE_BATCH_DESIRED_REVISION_CONFLICT: reflex_id={} expected_revision={} actual_revision={:?}; remediation=reload every desired-state member and retry the complete command",
+                    audit.reflex_id,
+                    hex_encode(&desired.expected_revision),
+                    actual_revision.map(|revision| hex_encode(&revision))
+                )));
+            }
+            guards.push(CfRevisionGuard::new(
+                cf::CF_KV,
+                desired.key.clone(),
+                Some(desired.expected_revision),
+            ));
+            kv_rows.push((desired.key.clone(), desired.value.clone()));
+            readbacks.push((cf::CF_KV, desired.key, desired.value));
+        }
+        members.push(synapse_storage::ReflexGroundedLifecycleMember {
+            source_key: entry.source_key.clone(),
+            raw_bytes: entry.source_value.clone(),
+            record: entry.audit,
+        });
+        readbacks.push((cf::CF_REFLEX_AUDIT, entry.source_key, entry.source_value));
+        readbacks.push((cf::CF_REFLEX_AUDIT_ORDER, order_key, order_value));
+        readbacks.push((cf::CF_KV, state_key, state_value));
+    }
+
+    let mut registry =
+        read_registry(db).map_err(|error| storage_write_error(&error.to_string()))?;
+    let missing = seen_reflex_ids
+        .iter()
+        .filter(|id| !registry.reflex_ids.contains(id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        let registry_revision = db
+            .get_cf_revisioned(cf::CF_KV, REGISTRY_KEY)?
+            .ok_or_else(|| storage_write_error(
+                "REFLEX_AUDIT_REGISTRY_MISSING_DURING_LIFECYCLE_BATCH: preserve source/projection rows and rebuild the registry before retrying",
+            ))?;
+        registry.reflex_ids.extend(missing);
+        registry.reflex_ids.sort();
+        registry.reflex_ids.dedup();
+        let registry_value = encode_json(&registry)?;
+        guards.push(CfRevisionGuard::new(
+            cf::CF_KV,
+            REGISTRY_KEY,
+            Some(registry_revision.revision_sha256),
+        ));
+        kv_rows.push((REGISTRY_KEY.to_vec(), registry_value.clone()));
+        readbacks.push((cf::CF_KV, REGISTRY_KEY.to_vec(), registry_value));
+    }
+    db.put_reflex_lifecycle_grounded_batch_publication(
+        guards,
+        vec![
+            (cf::CF_REFLEX_AUDIT, source_rows),
+            (cf::CF_REFLEX_AUDIT_ORDER, order_rows),
+            (cf::CF_KV, kv_rows),
+        ],
+        members,
+    )?;
+    for (cf_name, key, value) in readbacks {
+        require_exact_readback(db, cf_name, &key, &value)?;
     }
     Ok(())
 }

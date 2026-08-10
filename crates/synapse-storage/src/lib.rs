@@ -25,7 +25,8 @@ pub use backend::{
     CalyxAnchorScanReport, CalyxAnchorValueReadback, CalyxAnchorWriteReport,
     CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
     GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
-    PanelLifecycleBackfillReport, ReflexRegistrationPublicationReport,
+    PanelLifecycleBackfillReport, ReflexGroundedLifecycleMember,
+    ReflexLifecycleBatchPublicationReport, ReflexRegistrationPublicationReport,
     STORAGE_METADATA_ONLY_REDACTION_POLICY, StorageBackendKind, StorageCfDump, StorageDumpRow,
     SynapseAnchorSourceCarrier, SynapseSynergyPair, SynapseSynergyReport, dump_cf_read_only,
     dump_cf_read_only_with_expired, inspect_calyx_vault_read_only, scan_cf_read_only,
@@ -2302,7 +2303,7 @@ impl Db {
     /// commit cannot complete. Separate physical readback must exactly match
     /// every committed source row, constellation, and anchor.
     #[tracing::instrument(skip_all, fields(source_key_len = source_key.len(), guard_count = guards.len(), batch_count = batches.len(), backend = self.backend_name()))]
-    pub fn put_reflex_registration_grounded_publication(
+    pub fn put_reflex_lifecycle_grounded_publication(
         &self,
         guards: Vec<CfRevisionGuard>,
         batches: Vec<CfWriteBatch<'_>>,
@@ -2310,7 +2311,7 @@ impl Db {
         raw_bytes: &[u8],
         record: &synapse_core::StoredReflexAudit,
     ) -> StorageResult<ReflexRegistrationPublicationReport> {
-        self.backend.put_reflex_registration_grounded_publication(
+        self.backend.put_reflex_lifecycle_grounded_publication(
             guards,
             batches
                 .into_iter()
@@ -2320,6 +2321,31 @@ impl Db {
             raw_bytes,
             record,
         )
+    }
+
+    /// Atomically commits a revision-guarded reflex lifecycle batch with one
+    /// grounded constellation per audit under one ledger/WAL boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured failure before visibility for malformed members,
+    /// revision conflicts, or any Calyx durability/readback error.
+    #[tracing::instrument(skip_all, fields(member_count = members.len(), guard_count = guards.len(), batch_count = batches.len(), backend = self.backend_name()))]
+    pub fn put_reflex_lifecycle_grounded_batch_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<CfWriteBatch<'_>>,
+        members: Vec<ReflexGroundedLifecycleMember>,
+    ) -> StorageResult<ReflexLifecycleBatchPublicationReport> {
+        self.backend
+            .put_reflex_lifecycle_grounded_batch_publication(
+                guards,
+                batches
+                    .into_iter()
+                    .map(|(cf_name, rows)| (cf_name.to_owned(), rows))
+                    .collect(),
+                members,
+            )
     }
 
     /// Measures and stores the native Calyx constellation for one persisted

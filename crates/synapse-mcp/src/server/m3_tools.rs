@@ -41,16 +41,16 @@ use super::{
     disable_registry_profile, export_audit_bundle, export_profile_authoring_candidate,
     export_registry, generate_profile_authoring_candidate, generate_routine_automation_candidate,
     get_episode, history_reflexes, import_registry, inspect_profile_authoring_candidate,
-    inspect_routine, inspect_storage, install_file_jsonl_tail_watcher, install_registry_package,
-    list_approvals, list_episodes, list_local_models, list_profile_authoring_candidates,
-    list_profiles, list_reflexes, list_routines, mine_and_store_routines, pause_timeline,
-    prepare_activation_links, probe_local_model, purge_timeline, put_probe_rows,
-    query_audit_intelligence, query_flags, query_registry, record_replay, refresh_profile_quality,
-    register_local_model, register_reflex, remove_local_model, request_approval, resume_timeline,
-    rollback_registry_profile, run_storage_gc_once, scan_storage, scan_text_tool, search_timeline,
-    segment_episodes, start_demo_recording, stop_demo_recording, subscribe_to_events, tail_audio,
-    tool, tool_router, transcribe_audio, update_approval_toast_state, update_local_model,
-    update_routine, update_timeline_exclusions,
+    inspect_routine, inspect_storage, install_registry_package, list_approvals, list_episodes,
+    list_local_models, list_profile_authoring_candidates, list_profiles, list_reflexes,
+    list_routines, mine_and_store_routines, pause_timeline, prepare_activation_links,
+    prepare_file_jsonl_tail_watcher_cancellation, probe_local_model, purge_timeline,
+    put_probe_rows, query_audit_intelligence, query_flags, query_registry, record_replay,
+    refresh_profile_quality, register_local_model, register_reflex, remove_local_model,
+    request_approval, resume_timeline, rollback_registry_profile, run_storage_gc_once,
+    scan_storage, scan_text_tool, search_timeline, segment_episodes, start_demo_recording,
+    stop_demo_recording, subscribe_to_events, tail_audio, tool, tool_router, transcribe_audio,
+    update_approval_toast_state, update_local_model, update_routine, update_timeline_exclusions,
 };
 use rmcp::{RoleServer, service::RequestContext};
 use serde_json::{Value, json};
@@ -207,46 +207,18 @@ impl SynapseService {
         let runtime = self.reflex_runtime()?;
         self.install_reflex_action_gate(&runtime)?;
         preflight.ensure_operator_panic_boundary("immediately_before_reflex_register")?;
-        let response = register_reflex(&runtime, params.clone())?;
+        let m3_state = self.m3_state_handle();
+        let event_bus = self.sse_state()?.event_bus();
+        let response = register_reflex(&runtime, params, &m3_state, event_bus)?;
         if let Err(error) =
             preflight.ensure_operator_panic_boundary("immediately_after_reflex_register")
         {
             let rollback = ReflexCancelParams {
-                reflex_id: response.reflex_id,
+                reflex_id: response.reflex_id.clone(),
             };
             let _rollback_result = cancel_reflex(&runtime, &rollback);
+            let _watcher_rollback = cancel_file_jsonl_tail_watcher(&m3_state, &response.reflex_id);
             return Err(error);
-        }
-        if let Some(request) = params.file_jsonl_tail_watcher_request(response.reflex_id.clone()) {
-            if let Err(error) =
-                preflight.ensure_operator_panic_boundary("before_reflex_file_watcher_install")
-            {
-                let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id,
-                };
-                let _rollback_result = cancel_reflex(&runtime, &rollback);
-                return Err(error);
-            }
-            let m3_state = self.m3_state_handle();
-            let event_bus = self.sse_state()?.event_bus();
-            if let Err(error) = install_file_jsonl_tail_watcher(&m3_state, request, event_bus) {
-                let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id,
-                };
-                let _rollback_result = cancel_reflex(&runtime, &rollback);
-                return Err(error);
-            }
-            if let Err(error) =
-                preflight.ensure_operator_panic_boundary("after_reflex_file_watcher_install")
-            {
-                let _cancelled_watcher =
-                    cancel_file_jsonl_tail_watcher(&m3_state, &response.reflex_id);
-                let rollback = ReflexCancelParams {
-                    reflex_id: response.reflex_id,
-                };
-                let _rollback_result = cancel_reflex(&runtime, &rollback);
-                return Err(error);
-            }
         }
         Ok(Json(response))
     }
@@ -267,10 +239,28 @@ impl SynapseService {
             &crate::m3::reflex::required_permissions_cancel(&params.0),
         )?;
         let runtime = self.reflex_runtime()?;
-        let response = cancel_reflex(&runtime, &params.0)?;
+        let m3_state = self.m3_state_handle();
+        let prepared_watcher =
+            prepare_file_jsonl_tail_watcher_cancellation(&m3_state, &params.0.reflex_id)?;
+        let response = match cancel_reflex(&runtime, &params.0) {
+            Ok(response) => response,
+            Err(error) => {
+                let rollback = prepared_watcher.rollback(&m3_state);
+                if let Err(rollback_error) = rollback {
+                    return Err(crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "REFLEX_CANCELLATION_HOST_ROLLBACK_FAILED: cancellation_error={error:?} rollback_error={rollback_error}; remediation=inspect the exact watcher generation; reflex runtime/durable cancellation was not committed"
+                        ),
+                    ));
+                }
+                return Err(error);
+            }
+        };
         if response.cancelled {
-            let _cancelled_watcher =
-                cancel_file_jsonl_tail_watcher(&self.m3_state_handle(), &params.0.reflex_id)?;
+            prepared_watcher.commit();
+        } else {
+            prepared_watcher.rollback(&m3_state)?;
         }
         Ok(Json(response))
     }

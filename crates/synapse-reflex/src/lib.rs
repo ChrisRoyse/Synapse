@@ -8,6 +8,7 @@ pub(crate) mod audit_timestamp;
 pub mod bus;
 pub mod conflict;
 mod dispatch;
+mod durable_state;
 pub mod error;
 pub mod hot_path;
 pub mod kinds;
@@ -34,6 +35,7 @@ pub use dispatch::{
     REFLEX_ACTION_DENIED_STEP_STATUS, REFLEX_ACTION_PERMISSION_DENIED_KIND, ReflexActionGate,
     ReflexActionGateHandle, ReflexActionPermissionDenied,
 };
+pub use durable_state::ReflexActivation;
 pub use error::{ReflexError, ReflexResult};
 pub use hot_path::{
     HOT_PATH_BOUNDARY_VIOLATION_CODE, HotPathViolation, HotTickThreadScope, enter_hot_tick_thread,

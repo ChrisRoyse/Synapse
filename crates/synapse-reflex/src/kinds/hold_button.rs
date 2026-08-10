@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use synapse_action::ActionHandle;
 use synapse_core::{Action, Backend, ButtonAction, ReflexButtonTarget, ReflexId, ReflexLifetime};
 
@@ -8,7 +9,8 @@ use super::hold_lifetime::{
     lifetime_expired,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoldButtonParams {
     pub button: ReflexButtonTarget,
     pub backend: Backend,

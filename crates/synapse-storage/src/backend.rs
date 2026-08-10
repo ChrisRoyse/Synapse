@@ -286,6 +286,24 @@ pub struct ReflexRegistrationPublicationReport {
     pub anchor: CalyxAnchorWriteReport,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReflexGroundedLifecycleMember {
+    pub source_key: Vec<u8>,
+    pub raw_bytes: Vec<u8>,
+    pub record: StoredReflexAudit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReflexLifecycleBatchPublicationReport {
+    pub member_count: u64,
+    pub source_row_count: u64,
+    pub source_readback_exact_match_count: u64,
+    pub committed_seq: u64,
+    pub cx_ids: Vec<String>,
+    pub ledger_seq: u64,
+    pub ledger_hash: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CalyxRecurrenceSubjectReport {
     pub subject_kind: String,
@@ -904,7 +922,7 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &StoredReflexAudit,
     ) -> StorageResult<ConstellationPutReport>;
-    fn put_reflex_registration_grounded_publication(
+    fn put_reflex_lifecycle_grounded_publication(
         &self,
         guards: Vec<CfRevisionGuard>,
         batches: Vec<OwnedCfWriteBatch>,
@@ -912,6 +930,12 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &StoredReflexAudit,
     ) -> StorageResult<ReflexRegistrationPublicationReport>;
+    fn put_reflex_lifecycle_grounded_batch_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+        members: Vec<ReflexGroundedLifecycleMember>,
+    ) -> StorageResult<ReflexLifecycleBatchPublicationReport>;
     fn put_process_constellation(
         &self,
         source_key: &[u8],
@@ -1180,6 +1204,222 @@ impl AnchorCarryLineageCounters {
             builds: self.builds.saturating_sub(before.builds),
             hits: self.hits.saturating_sub(before.hits),
             build_ms: self.build_ms.saturating_sub(before.build_ms),
+        }
+    }
+}
+
+impl CalyxBackend {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one atomic lifecycle batch keeps guard preparation, constellation construction, commit, and physical readback in one auditable invariant"
+    )]
+    fn put_reflex_lifecycle_grounded_batch_publication_inner(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+        members: &[ReflexGroundedLifecycleMember],
+    ) -> StorageResult<ReflexLifecycleBatchPublicationReport> {
+        const OPERATION_CF: &str = "calyx_reflex_lifecycle_batch_publication";
+        if members.is_empty() {
+            return Err(calyx_write_failed_detail(
+                OPERATION_CF,
+                "REFLEX_LIFECYCLE_BATCH_EMPTY: remediation=do not call the durable batch boundary for an empty lifecycle transition".to_owned(),
+            ));
+        }
+        validate_cross_cf_revision_guarded_put(&guards, &batches)?;
+        let audit_row_count = batches
+            .iter()
+            .filter(|(cf_name, _rows)| cf_name == cf::CF_REFLEX_AUDIT)
+            .map(|(_cf_name, rows)| rows.len())
+            .sum::<usize>();
+        if audit_row_count != members.len() {
+            return Err(calyx_write_failed_detail(
+                OPERATION_CF,
+                format!(
+                    "REFLEX_LIFECYCLE_BATCH_MEMBER_COUNT_MISMATCH: audit_rows={audit_row_count} members={}; remediation=rebuild the batch with exactly one grounded member per audit source row",
+                    members.len()
+                ),
+            ));
+        }
+        for member in members {
+            validate_reflex_registration_publication(
+                &guards,
+                &batches,
+                &member.source_key,
+                &member.raw_bytes,
+                &member.record,
+            )?;
+        }
+        let started = Instant::now();
+        let member_count = members.len();
+        let result = self.with_vault(
+            OPERATION_CF,
+            "atomically publish a revision-guarded reflex lifecycle batch",
+            true,
+            |vault| {
+                let now_ms = calyx_clock_now_for_write(vault, OPERATION_CF)?;
+                let mut physical_guards = Vec::with_capacity(guards.len());
+                for guard in guards {
+                    let collection_id = calyx_collection_id_for_cf_write(&guard.cf_name)?;
+                    let physical_key =
+                        encode_calyx_key_for_write(&guard.cf_name, collection_id, &guard.key)?;
+                    physical_guards.push(SynapseCalyxRevisionGuard::new(
+                        ColumnFamily::Kv,
+                        physical_key,
+                        guard.expected_revision_sha256,
+                    ));
+                }
+                let mut physical_rows = Vec::new();
+                for (cf_name, rows) in batches {
+                    let collection_id = calyx_collection_id_for_cf_write(&cf_name)?;
+                    for (key, value) in rows {
+                        physical_rows.push(calyx_put_row(
+                            &cf_name,
+                            collection_id,
+                            &key,
+                            &value,
+                            now_ms,
+                        )?);
+                    }
+                }
+                let expected_rows = physical_rows.clone();
+                let mut grounded_members = Vec::with_capacity(members.len());
+                let mut expected_anchors = Vec::with_capacity(members.len());
+                let mut identities = Vec::with_capacity(members.len());
+                for member in members {
+                    let context = NativeConstellationContext {
+                        vault_id: vault.vault_id_value(),
+                        cx_id: vault.cx_id_for_input(
+                            &member.raw_bytes,
+                            SYN_REFLEX_PANEL_VERSION,
+                        ),
+                        created_at_ms: now_ms,
+                        next_ledger_seq: vault.latest_seq().saturating_add(1),
+                    };
+                    let constellation = constellations::build_reflex_audit_constellation(
+                        context,
+                        &member.source_key,
+                        &member.raw_bytes,
+                        &member.record,
+                    )?;
+                    let lifecycle_state = reflex_lifecycle_state(&member.record)?;
+                    let anchor = grounding_anchor_to_calyx(GroundingAnchor {
+                        kind_label: "reflex_lifecycle_state".to_owned(),
+                        value: GroundingAnchorValue::Enum(lifecycle_state.to_owned()),
+                        source: "synapse-reflex-lifecycle".to_owned(),
+                        observed_at_ms: member.record.ts_ns / 1_000_000,
+                        confidence: 1.0,
+                    })?;
+                    expected_anchors.push((context.cx_id, anchor.clone()));
+                    identities.push(serde_json::json!({
+                        "reflex_id": member.record.reflex_id,
+                        "audit_id": member.record.audit_id,
+                        "state": lifecycle_state,
+                        "source_key_sha256": constellations::sha256_hex(&member.source_key),
+                        "source_value_sha256": constellations::sha256_hex(&member.raw_bytes),
+                    }));
+                    grounded_members.push((member.raw_bytes.clone(), constellation, anchor));
+                }
+                let ledger_payload = serde_json::to_vec(&serde_json::json!({
+                    "schema": "synapse.reflex.lifecycle.batch.v1",
+                    "members": identities,
+                    "publication_row_count": physical_rows.len(),
+                }))
+                .map_err(|source| StorageError::EncodeJson {
+                    type_name: "reflex_lifecycle_batch_grounding_ledger_payload",
+                    source,
+                })?;
+                let write = vault
+                    .put_guarded_grounded_observation_batch_with_source_rows(
+                        physical_rows,
+                        physical_guards,
+                        grounded_members,
+                        ledger_payload,
+                        "synapse-reflex-lifecycle",
+                    )
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            OPERATION_CF,
+                            "commit atomic reflex lifecycle batch source/constellation/anchor rows",
+                            &source,
+                        )
+                    })?;
+                if write.source_row_count != expected_rows.len() {
+                    return Err(calyx_write_failed_detail(
+                        OPERATION_CF,
+                        format!(
+                            "REFLEX_LIFECYCLE_BATCH_COMMITTED_ROW_COUNT_MISMATCH: committed={} expected={}; remediation=preserve the vault and inspect atomic WAL sequence {}",
+                            write.source_row_count,
+                            expected_rows.len(),
+                            write.committed_seq
+                        ),
+                    ));
+                }
+                let mut exact_match_count = 0_usize;
+                for member in members {
+                    let readback = verify_grounded_source_readback(
+                        vault,
+                        &expected_rows,
+                        cf::CF_REFLEX_AUDIT,
+                        &member.source_key,
+                        &member.raw_bytes,
+                        OPERATION_CF,
+                        "reflex lifecycle batch",
+                    )?;
+                    exact_match_count = exact_match_count
+                        .checked_add(readback.exact_match_count)
+                        .ok_or_else(|| {
+                            calyx_write_failed_detail(
+                                OPERATION_CF,
+                                "REFLEX_LIFECYCLE_BATCH_READBACK_COUNT_OVERFLOW: remediation=widen the exact-match counter".to_owned(),
+                            )
+                        })?;
+                }
+                for (cx_id, anchor) in expected_anchors {
+                    verify_grounded_anchor_readback(
+                        vault,
+                        cx_id,
+                        &anchor,
+                        OPERATION_CF,
+                        "reflex lifecycle batch",
+                    )?;
+                }
+                Ok(ReflexLifecycleBatchPublicationReport {
+                    member_count: u64::try_from(member_count).unwrap_or(u64::MAX),
+                    source_row_count: u64::try_from(write.source_row_count).unwrap_or(u64::MAX),
+                    source_readback_exact_match_count: u64::try_from(exact_match_count)
+                        .unwrap_or(u64::MAX),
+                    committed_seq: write.committed_seq,
+                    cx_ids: write.cx_ids,
+                    ledger_seq: write.ledger_seq,
+                    ledger_hash: write.ledger_hash,
+                })
+            },
+        );
+        match result {
+            Ok(report) => {
+                tracing::info!(
+                    code = "CALYX_REFLEX_LIFECYCLE_BATCH_ATOMIC_PUBLICATION_COMMITTED",
+                    member_count = report.member_count,
+                    source_row_count = report.source_row_count,
+                    source_readback_exact_match_count = report.source_readback_exact_match_count,
+                    committed_seq = report.committed_seq,
+                    ledger_seq = report.ledger_seq,
+                    duration_us = constellations::duration_us(started.elapsed()),
+                    "reflex lifecycle batch committed atomically with physical readback"
+                );
+                Ok(report)
+            }
+            Err(error) => {
+                tracing::error!(
+                    code = "REFLEX_LIFECYCLE_BATCH_ATOMIC_PUBLICATION_FAILED",
+                    member_count,
+                    error_code = error.code(),
+                    detail = %error,
+                    "reflex lifecycle batch failed before scheduler publication"
+                );
+                Err(error)
+            }
         }
     }
 }
@@ -6934,7 +7174,7 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
-    fn put_reflex_registration_grounded_publication(
+    fn put_reflex_lifecycle_grounded_publication(
         &self,
         guards: Vec<CfRevisionGuard>,
         batches: Vec<OwnedCfWriteBatch>,
@@ -6942,7 +7182,7 @@ impl StorageBackend for CalyxBackend {
         raw_bytes: &[u8],
         record: &StoredReflexAudit,
     ) -> StorageResult<ReflexRegistrationPublicationReport> {
-        const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+        const OPERATION_CF: &str = "calyx_reflex_lifecycle_publication";
         let started = Instant::now();
         validate_reflex_registration_publication(&guards, &batches, source_key, raw_bytes, record)?;
 
@@ -6963,7 +7203,7 @@ impl StorageBackend for CalyxBackend {
             Ok(report) => {
                 constellations::emit_success_metric(&report.constellation);
                 tracing::info!(
-                    code = "CALYX_REFLEX_REGISTRATION_ATOMIC_PUBLICATION_COMMITTED",
+                    code = "CALYX_REFLEX_LIFECYCLE_ATOMIC_PUBLICATION_COMMITTED",
                     reflex_id = %record.reflex_id,
                     audit_id = %record.audit_id,
                     committed_seq = report.committed_seq,
@@ -6972,7 +7212,7 @@ impl StorageBackend for CalyxBackend {
                     cx_id = %report.constellation.cx_id,
                     ledger_seq = report.anchor.ledger_seq,
                     duration_us = report.constellation.duration_us,
-                    "reflex registration source, projections, constellation, anchor, and ledger entry committed atomically with physical readback"
+                    "reflex lifecycle source, projections, desired state, constellation, anchor, and ledger entry committed atomically with physical readback"
                 );
                 Ok(report)
             }
@@ -6984,16 +7224,25 @@ impl StorageBackend for CalyxBackend {
                     started.elapsed(),
                 );
                 tracing::error!(
-                    code = "REFLEX_REGISTRATION_ATOMIC_PUBLICATION_FAILED",
+                    code = "REFLEX_LIFECYCLE_ATOMIC_PUBLICATION_FAILED",
                     reflex_id = %record.reflex_id,
                     audit_id = %record.audit_id,
                     error_code = error.code(),
                     detail = %error,
-                    "reflex registration atomic durable publication failed before scheduler activation"
+                    "reflex lifecycle atomic durable publication failed before scheduler publication"
                 );
                 Err(error)
             }
         }
+    }
+
+    fn put_reflex_lifecycle_grounded_batch_publication(
+        &self,
+        guards: Vec<CfRevisionGuard>,
+        batches: Vec<OwnedCfWriteBatch>,
+        members: Vec<ReflexGroundedLifecycleMember>,
+    ) -> StorageResult<ReflexLifecycleBatchPublicationReport> {
+        Self::put_reflex_lifecycle_grounded_batch_publication_inner(self, guards, batches, &members)
     }
 
     fn put_process_constellation(
@@ -8520,7 +8769,7 @@ fn validate_reflex_registration_publication(
     raw_bytes: &[u8],
     record: &StoredReflexAudit,
 ) -> StorageResult<()> {
-    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    const OPERATION_CF: &str = "calyx_reflex_lifecycle_publication";
     validate_cross_cf_revision_guarded_put(guards, batches)?;
     let requested_rows = batches
         .iter()
@@ -8532,7 +8781,7 @@ fn validate_reflex_registration_publication(
         return Err(calyx_write_failed_detail(
             OPERATION_CF,
             format!(
-                "REFLEX_REGISTRATION_SOURCE_ROW_INVALID: expected one exact CF_REFLEX_AUDIT source row; matching_rows={} expected_sha256={} actual_sha256={}; remediation=rebuild the complete registration publication from the encoded audit",
+                "REFLEX_LIFECYCLE_SOURCE_ROW_INVALID: expected one exact CF_REFLEX_AUDIT source row; matching_rows={} expected_sha256={} actual_sha256={}; remediation=rebuild the complete lifecycle publication from the encoded audit",
                 requested_rows.len(),
                 constellations::sha256_hex(raw_bytes),
                 requested_rows.first().map_or_else(
@@ -8542,13 +8791,27 @@ fn validate_reflex_registration_publication(
             ),
         ));
     }
-    if record.status != synapse_core::ReflexState::Active
-        || record.details.get("kind").and_then(Value::as_str) != Some("reflex_registered")
-    {
+    let kind = record.details.get("kind").and_then(Value::as_str);
+    if !matches!(
+        (record.status, kind),
+        (synapse_core::ReflexState::Active, Some("reflex_registered"))
+            | (
+                synapse_core::ReflexState::Cancelled,
+                Some("reflex_cancelled")
+            )
+            | (
+                synapse_core::ReflexState::Disabled,
+                Some("reflex_disabled_by_operator")
+            )
+            | (
+                synapse_core::ReflexState::Expired | synapse_core::ReflexState::ActionDenied,
+                Some(_)
+            )
+    ) {
         return Err(calyx_write_failed_detail(
             OPERATION_CF,
             format!(
-                "REFLEX_REGISTRATION_AUDIT_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only an active reflex_registered audit through the registration transaction",
+                "REFLEX_LIFECYCLE_AUDIT_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/cancellation/disable audit through the lifecycle transaction",
                 record.reflex_id,
                 record.status,
                 record.details.get("kind")
@@ -8556,6 +8819,23 @@ fn validate_reflex_registration_publication(
         ));
     }
     Ok(())
+}
+
+fn reflex_lifecycle_state(record: &StoredReflexAudit) -> StorageResult<&'static str> {
+    match record.status {
+        synapse_core::ReflexState::Active => Ok("active"),
+        synapse_core::ReflexState::Cancelled => Ok("cancelled"),
+        synapse_core::ReflexState::Disabled => Ok("disabled"),
+        synapse_core::ReflexState::Expired => Ok("expired"),
+        synapse_core::ReflexState::ActionDenied => Ok("action_denied"),
+        _ => Err(calyx_write_failed_detail(
+            "calyx_reflex_lifecycle_publication",
+            format!(
+                "REFLEX_LIFECYCLE_ANCHOR_STATE_INVALID: reflex_id={} status={:?}; remediation=validate the lifecycle audit before constellation preparation",
+                record.reflex_id, record.status
+            ),
+        )),
+    }
 }
 
 fn prepare_reflex_registration_publication(
@@ -8566,7 +8846,7 @@ fn prepare_reflex_registration_publication(
     raw_bytes: &[u8],
     record: &StoredReflexAudit,
 ) -> StorageResult<PreparedReflexRegistrationPublication> {
-    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    const OPERATION_CF: &str = "calyx_reflex_lifecycle_publication";
     let now_ms = calyx_clock_now_for_write(vault, OPERATION_CF)?;
     let mut physical_guards = Vec::with_capacity(guards.len());
     for guard in guards {
@@ -8601,15 +8881,17 @@ fn prepare_reflex_registration_publication(
         constellations::build_reflex_audit_constellation(context, source_key, raw_bytes, record)?;
     let slot_count = u64::try_from(constellation.slots.len()).unwrap_or(u64::MAX);
     let scalar_count = u64::try_from(constellation.scalars.len()).unwrap_or(u64::MAX);
+    let lifecycle_state = reflex_lifecycle_state(record)?;
     let anchor = grounding_anchor_to_calyx(GroundingAnchor {
-        kind_label: "reflex_registration_state".to_owned(),
-        value: GroundingAnchorValue::Enum("active".to_owned()),
-        source: "synapse-reflex-registration".to_owned(),
+        kind_label: "reflex_lifecycle_state".to_owned(),
+        value: GroundingAnchorValue::Enum(lifecycle_state.to_owned()),
+        source: "synapse-reflex-lifecycle".to_owned(),
         observed_at_ms: record.ts_ns / 1_000_000,
         confidence: 1.0,
     })?;
     let ledger_payload = serde_json::to_vec(&serde_json::json!({
-        "schema": "synapse.reflex.registration.v1",
+        "schema": "synapse.reflex.lifecycle.v1",
+        "state": lifecycle_state,
         "reflex_id": record.reflex_id,
         "audit_id": record.audit_id,
         "audit_ts_ns": record.ts_ns,
@@ -8641,7 +8923,7 @@ fn commit_reflex_registration_publication(
     raw_bytes: &[u8],
     started: Instant,
 ) -> StorageResult<ReflexRegistrationPublicationReport> {
-    const OPERATION_CF: &str = "calyx_reflex_registration_publication";
+    const OPERATION_CF: &str = "calyx_reflex_lifecycle_publication";
     let expected_rows = prepared.physical_rows.clone();
     let write = vault
         .put_guarded_grounded_observation_with_source_rows(
@@ -8651,12 +8933,12 @@ fn commit_reflex_registration_publication(
             prepared.constellation,
             prepared.anchor.clone(),
             prepared.ledger_payload,
-            "synapse-reflex-registration",
+            "synapse-reflex-lifecycle",
         )
         .map_err(|source| {
             calyx_write_failed(
                 OPERATION_CF,
-                "commit atomic reflex registration source/constellation/anchor rows",
+                "commit atomic reflex lifecycle source/constellation/anchor rows",
                 &source,
             )
         })?;
@@ -8664,7 +8946,7 @@ fn commit_reflex_registration_publication(
         return Err(calyx_write_failed_detail(
             OPERATION_CF,
             format!(
-                "REFLEX_REGISTRATION_COMMITTED_ROW_COUNT_MISMATCH: committed={} expected={}; remediation=preserve the vault and inspect the atomic WAL sequence {}",
+                "REFLEX_LIFECYCLE_COMMITTED_ROW_COUNT_MISMATCH: committed={} expected={}; remediation=preserve the vault and inspect the atomic WAL sequence {}",
                 write.source_row_count,
                 expected_rows.len(),
                 write.committed_seq
@@ -8678,14 +8960,14 @@ fn commit_reflex_registration_publication(
         source_key,
         raw_bytes,
         OPERATION_CF,
-        "reflex registration",
+        "reflex lifecycle",
     )?;
     let anchor_count = verify_grounded_anchor_readback(
         vault,
         prepared.context.cx_id,
         &prepared.anchor,
         OPERATION_CF,
-        "reflex registration",
+        "reflex lifecycle",
     )?;
     let constellation = constellation_report(ConstellationReportInput {
         panel_name: SYN_REFLEX_PANEL_NAME,

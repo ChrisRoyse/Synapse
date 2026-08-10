@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     time::{Duration, UNIX_EPOCH},
 };
 
@@ -116,6 +116,53 @@ impl ReflexRuntime {
     }
 }
 
+pub fn latest_active_statuses(db: &synapse_storage::Db) -> ReflexResult<Vec<ReflexStatus>> {
+    let rows = db
+        .scan_cf(cf::CF_REFLEX_AUDIT)
+        .map_err(|error| ReflexError::ParamsInvalid {
+            detail: format!(
+                "REFLEX_DURABLE_ORPHAN_SCAN_FAILED: detail={error}; remediation=repair the audit source scan before reflex startup"
+            ),
+        })?;
+    let mut by_id = BTreeMap::<ReflexId, Vec<StoredReflexAudit>>::new();
+    for (_key, value) in rows {
+        let audit = decode_json::<StoredReflexAudit>(&value).map_err(|error| {
+            ReflexError::ParamsInvalid {
+                detail: format!(
+                    "REFLEX_DURABLE_ORPHAN_AUDIT_DECODE_FAILED: detail={error}; remediation=preserve and repair the exact malformed CF_REFLEX_AUDIT row"
+                ),
+            }
+        })?;
+        by_id
+            .entry(audit.reflex_id.clone())
+            .or_default()
+            .push(audit);
+    }
+    let mut active = Vec::new();
+    for (reflex_id, mut audits) in by_id {
+        audits.sort_by(|left, right| {
+            left.ts_ns
+                .cmp(&right.ts_ns)
+                .then_with(|| left.audit_id.cmp(&right.audit_id))
+        });
+        let Some(latest) = audits.last() else {
+            continue;
+        };
+        if latest.status != ReflexState::Active {
+            continue;
+        }
+        let mut accumulator = AuditStatusAccumulator::new(reflex_id);
+        for audit in audits {
+            accumulator.record(audit);
+        }
+        if let Some(status) = accumulator.into_latest_status(ReflexState::Active, None) {
+            active.push(status);
+        }
+    }
+    active.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(active)
+}
+
 const fn is_non_terminal(state: ReflexState) -> bool {
     !matches!(
         state,
@@ -174,7 +221,10 @@ impl AuditStatusAccumulator {
 
         if matches!(
             audit.status,
-            ReflexState::ActionDenied | ReflexState::Cancelled | ReflexState::Expired
+            ReflexState::ActionDenied
+                | ReflexState::Cancelled
+                | ReflexState::Expired
+                | ReflexState::Disabled
         ) {
             self.update_common_fields(&audit);
             self.terminal = Some(audit);
@@ -225,6 +275,26 @@ impl AuditStatusAccumulator {
             lifetime: self.lifetime.unwrap_or_default(),
             exclusive: self.exclusive.unwrap_or(false),
             last_error_code: terminal.error_code,
+        })
+    }
+
+    fn into_latest_status(
+        self,
+        state: ReflexState,
+        last_error_code: Option<String>,
+    ) -> Option<ReflexStatus> {
+        let registered_at = self.registered_at?;
+        Some(ReflexStatus {
+            id: self.reflex_id,
+            kind_summary: self.kind_summary.unwrap_or_else(|| "unknown".to_owned()),
+            state,
+            registered_at,
+            last_fired_at: self.last_fired_at,
+            fire_count: self.fire_count,
+            priority: self.priority.unwrap_or(DEFAULT_REFLEX_PRIORITY),
+            lifetime: self.lifetime.unwrap_or_default(),
+            exclusive: self.exclusive.unwrap_or(false),
+            last_error_code,
         })
     }
 }

@@ -10,18 +10,19 @@ use std::{
 use chrono::Utc;
 use rmcp::ErrorData;
 use serde_json::{Value, json};
-use synapse_core::{Event, EventSource, ReflexLifetime, error_codes};
-use synapse_reflex::EventBus;
+use synapse_core::{Event, EventSource, error_codes};
+use synapse_reflex::{EventBus, ReflexActivation};
 use tokio_util::sync::CancellationToken;
 
 use crate::{m1::mcp_error, m3::SharedM3State};
 
-use super::common::{FILE_JSONL_TAIL_EVENT_KIND, FileJsonlTailWhen, ValidatedFileJsonlTailWhen};
+use super::common::{FILE_JSONL_TAIL_EVENT_KIND, ValidatedFileJsonlTailWhen};
 
 static NEXT_FILE_JSONL_TAIL_EVENT_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub(crate) struct FileJsonlTailWatcher {
     cancel: CancellationToken,
+    start: CancellationToken,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -30,8 +31,73 @@ impl fmt::Debug for FileJsonlTailWatcher {
         formatter
             .debug_struct("FileJsonlTailWatcher")
             .field("cancelled", &self.cancel.is_cancelled())
+            .field("started", &self.start.is_cancelled())
             .field("task_finished", &self.task.is_finished())
             .finish()
+    }
+}
+
+pub(crate) struct PreparedFileJsonlTailWatcher {
+    reflex_id: String,
+    cancel: CancellationToken,
+    start: CancellationToken,
+}
+
+pub(crate) struct PreparedFileJsonlTailWatcherCancellation {
+    reflex_id: String,
+    watcher: Option<FileJsonlTailWatcher>,
+}
+
+impl PreparedFileJsonlTailWatcherCancellation {
+    pub(crate) fn commit(mut self) {
+        if let Some(watcher) = self.watcher.take() {
+            watcher.cancel();
+        }
+    }
+
+    pub(crate) fn rollback(mut self, state: &SharedM3State) -> Result<(), ErrorData> {
+        let Some(watcher) = self.watcher.take() else {
+            return Ok(());
+        };
+        let mut state = state.lock().map_err(|_error| {
+            watcher.cancel();
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "m3 state lock poisoned while rolling back prepared file_jsonl_tail cancellation",
+            )
+        })?;
+        if state.file_jsonl_tail_watchers.contains_key(&self.reflex_id) {
+            watcher.cancel();
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "FILE_JSONL_TAIL_WATCHER_ROLLBACK_IDENTITY_CONFLICT: reflex_id={}; remediation=inspect the exact watcher generation before retrying cancellation",
+                    self.reflex_id
+                ),
+            ));
+        }
+        state
+            .file_jsonl_tail_watchers
+            .insert(self.reflex_id, watcher);
+        Ok(())
+    }
+}
+
+impl PreparedFileJsonlTailWatcher {
+    pub(crate) fn activate(self) {
+        self.start.cancel();
+    }
+
+    pub(crate) fn rollback(self, state: &SharedM3State) -> Result<(), ErrorData> {
+        self.cancel.cancel();
+        let mut state = state.lock().map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "m3 state lock poisoned while rolling back prepared file_jsonl_tail watcher",
+            )
+        })?;
+        state.file_jsonl_tail_watchers.remove(&self.reflex_id);
+        Ok(())
     }
 }
 
@@ -41,24 +107,117 @@ impl FileJsonlTailWatcher {
     }
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct FileJsonlTailWatcherRequest {
-    pub reflex_id: String,
-    pub when: FileJsonlTailWhen,
-    pub lifetime: ReflexLifetime,
-}
-
-pub(crate) fn install_file_jsonl_tail_watcher(
+pub(crate) fn install_recovered_file_jsonl_tail_watcher(
     state: &SharedM3State,
-    request: FileJsonlTailWatcherRequest,
+    reflex_id: String,
+    activation: ReflexActivation,
     event_bus: EventBus,
 ) -> Result<(), ErrorData> {
-    let spec = request
-        .when
-        .validate()
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let reflex_id = request.reflex_id.clone();
-    let stop_after_first_match = matches!(request.lifetime, ReflexLifetime::OneShot);
+    let ReflexActivation::FileJsonlTail {
+        host,
+        path,
+        json_path,
+        json_pointer,
+        event_data_pointer,
+        equals,
+        min_lines,
+        poll_interval_ms,
+        local_host,
+        stop_after_first_match,
+    } = activation;
+    let spec = ValidatedFileJsonlTailWhen {
+        host,
+        path,
+        json_path,
+        json_pointer,
+        event_data_pointer,
+        equals,
+        min_lines,
+        poll_interval_ms,
+        local_host,
+    };
+    install_validated_file_jsonl_tail_watcher(
+        state,
+        reflex_id,
+        spec,
+        stop_after_first_match,
+        event_bus,
+    )
+}
+
+fn install_validated_file_jsonl_tail_watcher(
+    state: &SharedM3State,
+    reflex_id: String,
+    spec: ValidatedFileJsonlTailWhen,
+    stop_after_first_match: bool,
+    event_bus: EventBus,
+) -> Result<(), ErrorData> {
+    let start = CancellationToken::new();
+    start.cancel();
+    install_file_jsonl_tail_watcher_with_gate(
+        state,
+        reflex_id,
+        spec,
+        stop_after_first_match,
+        event_bus,
+        start,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn prepare_file_jsonl_tail_watcher(
+    state: &SharedM3State,
+    reflex_id: String,
+    activation: ReflexActivation,
+    event_bus: EventBus,
+) -> Result<PreparedFileJsonlTailWatcher, ErrorData> {
+    let ReflexActivation::FileJsonlTail {
+        host,
+        path,
+        json_path,
+        json_pointer,
+        event_data_pointer,
+        equals,
+        min_lines,
+        poll_interval_ms,
+        local_host,
+        stop_after_first_match,
+    } = activation;
+    let spec = ValidatedFileJsonlTailWhen {
+        host,
+        path,
+        json_path,
+        json_pointer,
+        event_data_pointer,
+        equals,
+        min_lines,
+        poll_interval_ms,
+        local_host,
+    };
+    let start = CancellationToken::new();
+    let cancel = install_file_jsonl_tail_watcher_with_gate(
+        state,
+        reflex_id.clone(),
+        spec,
+        stop_after_first_match,
+        event_bus,
+        start.clone(),
+    )?;
+    Ok(PreparedFileJsonlTailWatcher {
+        reflex_id,
+        cancel,
+        start,
+    })
+}
+
+fn install_file_jsonl_tail_watcher_with_gate(
+    state: &SharedM3State,
+    reflex_id: String,
+    spec: ValidatedFileJsonlTailWhen,
+    stop_after_first_match: bool,
+    event_bus: EventBus,
+    start: CancellationToken,
+) -> Result<CancellationToken, ErrorData> {
     let cancel = CancellationToken::new();
     let task = tokio::spawn(run_file_jsonl_tail_watcher(
         state.clone(),
@@ -67,8 +226,13 @@ pub(crate) fn install_file_jsonl_tail_watcher(
         stop_after_first_match,
         event_bus,
         cancel.clone(),
+        start.clone(),
     ));
-    let watcher = FileJsonlTailWatcher { cancel, task };
+    let watcher = FileJsonlTailWatcher {
+        cancel: cancel.clone(),
+        start,
+        task,
+    };
     let mut state = state.lock().map_err(|_error| {
         watcher.cancel();
         mcp_error(
@@ -76,12 +240,18 @@ pub(crate) fn install_file_jsonl_tail_watcher(
             "m3 state lock poisoned while installing file_jsonl_tail watcher",
         )
     })?;
-    if let Some(previous) = state
-        .file_jsonl_tail_watchers
-        .insert(reflex_id.clone(), watcher)
-    {
-        previous.cancel();
+    if state.file_jsonl_tail_watchers.contains_key(&reflex_id) {
+        watcher.cancel();
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "FILE_JSONL_TAIL_WATCHER_IDENTITY_CONFLICT: reflex_id={reflex_id}; remediation=cancel the exact existing reflex before registering a replacement"
+            ),
+        ));
     }
+    state
+        .file_jsonl_tail_watchers
+        .insert(reflex_id.clone(), watcher);
     tracing::info!(
         code = "FILE_JSONL_TAIL_WATCHER_INSTALLED",
         reflex_id = %reflex_id,
@@ -93,7 +263,22 @@ pub(crate) fn install_file_jsonl_tail_watcher(
         stop_after_first_match,
         "installed file_jsonl_tail watcher"
     );
-    Ok(())
+    Ok(cancel)
+}
+
+pub(crate) fn file_jsonl_tail_watcher_installed(
+    state: &SharedM3State,
+    reflex_id: &str,
+) -> Result<bool, ErrorData> {
+    state
+        .lock()
+        .map(|state| state.file_jsonl_tail_watchers.contains_key(reflex_id))
+        .map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "m3 state lock poisoned while reading file_jsonl_tail watcher state",
+            )
+        })
 }
 
 pub(crate) fn cancel_file_jsonl_tail_watcher(
@@ -113,6 +298,26 @@ pub(crate) fn cancel_file_jsonl_tail_watcher(
     Ok(true)
 }
 
+pub(crate) fn prepare_file_jsonl_tail_watcher_cancellation(
+    state: &SharedM3State,
+    reflex_id: &str,
+) -> Result<PreparedFileJsonlTailWatcherCancellation, ErrorData> {
+    let watcher = state
+        .lock()
+        .map_err(|_error| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "m3 state lock poisoned while preparing file_jsonl_tail cancellation",
+            )
+        })?
+        .file_jsonl_tail_watchers
+        .remove(reflex_id);
+    Ok(PreparedFileJsonlTailWatcherCancellation {
+        reflex_id: reflex_id.to_owned(),
+        watcher,
+    })
+}
+
 async fn run_file_jsonl_tail_watcher(
     state: SharedM3State,
     reflex_id: String,
@@ -120,7 +325,12 @@ async fn run_file_jsonl_tail_watcher(
     stop_after_first_match: bool,
     event_bus: EventBus,
     cancel: CancellationToken,
+    start: CancellationToken,
 ) {
+    tokio::select! {
+        () = cancel.cancelled() => return,
+        () = start.cancelled() => {}
+    }
     let mut interval = tokio::time::interval(Duration::from_millis(spec.poll_interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_published = None::<MatchSignature>;

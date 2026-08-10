@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use synapse_action::ActionHandle;
 use synapse_core::{Action, Backend, ComboInput, ComboStep, Event, EventSource, Key, ReflexId};
@@ -10,7 +10,8 @@ use crate::{EventBus, ReflexError, ReflexResult};
 
 pub const REFLEX_COMBO_COMPLETED_KIND: &str = "reflex_combo_completed";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComboParams {
     pub steps: Vec<ComboStep>,
     pub backend: Backend,

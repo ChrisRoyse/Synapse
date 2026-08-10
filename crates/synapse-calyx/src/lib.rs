@@ -1483,6 +1483,16 @@ pub struct SynapseCalyxGroundedObservationReadback {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxGroundedObservationBatchReadback {
+    pub cx_ids: Vec<String>,
+    pub ledger_seq: Seq,
+    pub ledger_hash: String,
+    pub source_row_count: usize,
+    pub committed_seq: Seq,
+    pub latest_seq: Seq,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxNativeFanoutReadback {
     pub attempted_cfs: usize,
     pub compacted_cfs: usize,
@@ -5776,6 +5786,60 @@ impl SynapseCalyxVault {
         Ok(SynapseCalyxGroundedObservationReadback {
             cx_id: outcome.cx_id.to_string(),
             disposition: outcome.disposition.into(),
+            ledger_seq: outcome.ledger_ref.seq,
+            ledger_hash: hex_bytes(&outcome.ledger_ref.hash),
+            source_row_count: outcome.source_row_count,
+            committed_seq: outcome.committed_seq,
+            latest_seq: self.vault.latest_seq(),
+        })
+    }
+
+    /// Atomically publishes revision-guarded physical source rows and several
+    /// grounded native observations under one ledger and WAL/MVCC commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error before visibility for invalid members,
+    /// revision conflicts, or any ledger/WAL/MVCC durability failure.
+    pub fn put_guarded_grounded_observation_batch_with_source_rows(
+        &self,
+        source_rows: Vec<SynapseCalyxCfWrite>,
+        source_guards: Vec<SynapseCalyxRevisionGuard>,
+        members: Vec<(Vec<u8>, Constellation, Anchor)>,
+        ledger_payload: Vec<u8>,
+        actor_service: impl Into<String>,
+    ) -> Result<SynapseCalyxGroundedObservationBatchReadback, SynapseCalyxError> {
+        let outcome = self
+            .vault
+            .put_guarded_grounded_observation_batch_with_source_rows(
+                source_rows
+                    .into_iter()
+                    .map(|row| (row.cf, row.key, row.value))
+                    .collect(),
+                source_guards.into_iter().map(Into::into).collect(),
+                members
+                    .into_iter()
+                    .map(
+                        |(content_addressed_source_identity, constellation, anchor)| {
+                            calyx_aster::vault::GroundedObservationBatchMember {
+                                content_addressed_source_identity,
+                                constellation,
+                                anchor,
+                            }
+                        },
+                    )
+                    .collect(),
+                ledger_payload,
+                ActorId::Service(actor_service.into()),
+            )
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "put atomic guarded grounded Calyx observation batch with source rows",
+                    &error,
+                )
+            })?;
+        Ok(SynapseCalyxGroundedObservationBatchReadback {
+            cx_ids: outcome.cx_ids.iter().map(ToString::to_string).collect(),
             ledger_seq: outcome.ledger_ref.seq,
             ledger_hash: hex_bytes(&outcome.ledger_ref.hash),
             source_row_count: outcome.source_row_count,

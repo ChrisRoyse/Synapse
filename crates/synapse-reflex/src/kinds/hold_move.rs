@@ -1,5 +1,6 @@
 use std::{collections::HashSet, time::Duration};
 
+use serde::{Deserialize, Serialize};
 use synapse_action::{ActionHandle, HELD_KEY_MAX_DURATION_MS};
 use synapse_core::{Action, Backend, Key, ReflexId, ReflexLifetime};
 
@@ -13,7 +14,8 @@ use super::hold_lifetime::{
 const HELD_KEY_REFLEX_SAFETY_GRACE_MS: u64 = 1_000;
 const HOLD_MOVE_REASSERT_INTERVAL_MS: u64 = 50;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HoldMoveParams {
     pub keys: Vec<Key>,
     pub backend: Backend,

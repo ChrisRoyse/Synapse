@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, time::Instant};
 
 use calyx_core::{Anchor, CalyxError, Clock, Constellation, LedgerRef, Result, VaultStore};
-use calyx_ledger::{ActorId, EntryKind, SubjectId};
+use calyx_ledger::{ActorId, EntryKind, SubjectId, declare_batch_members};
 
 use super::{AsterVault, PutDisposition, encode, ledger_hook, prepared};
 use crate::cf::ColumnFamily;
@@ -22,10 +22,207 @@ pub struct GroundedObservationCommit {
     pub committed_seq: u64,
 }
 
+/// One member of an atomic multi-constellation grounded publication.
+#[derive(Clone, Debug)]
+pub struct GroundedObservationBatchMember {
+    pub content_addressed_source_identity: Vec<u8>,
+    pub constellation: Constellation,
+    pub anchor: Anchor,
+}
+
+/// Readback from one atomic source-row plus multi-constellation publication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroundedObservationBatchCommit {
+    pub cx_ids: Vec<calyx_core::CxId>,
+    pub ledger_ref: LedgerRef,
+    pub source_row_count: usize,
+    pub committed_seq: u64,
+}
+
 impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Atomically publishes revision-guarded source rows and multiple grounded
+    /// observations under one ledger entry and one WAL/MVCC sequence.
+    ///
+    /// # Errors
+    ///
+    /// Fails before visibility for an empty/duplicate member set, invalid
+    /// source guards, incompatible constellation identity, or any durability
+    /// error. Post-commit readback independently verifies every constellation.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn put_guarded_grounded_observation_batch_with_source_rows(
+        &self,
+        source_rows: Vec<(ColumnFamily, Vec<u8>, Vec<u8>)>,
+        source_guards: Vec<super::CfRevisionGuard>,
+        members: Vec<GroundedObservationBatchMember>,
+        ledger_payload: Vec<u8>,
+        actor: ActorId,
+    ) -> Result<GroundedObservationBatchCommit> {
+        if source_rows.is_empty() || members.is_empty() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "grounded observation batch requires non-empty source rows and members",
+            ));
+        }
+        let mut source_keys = BTreeSet::new();
+        for (cf, key, _value) in &source_rows {
+            if *cf != ColumnFamily::Kv || key.is_empty() || !source_keys.insert(key.clone()) {
+                return Err(CalyxError::aster_corrupt_shard(
+                    "grounded observation batch source rows must be unique non-empty KV keys",
+                ));
+            }
+        }
+        let mut guard_keys = BTreeSet::new();
+        for guard in &source_guards {
+            if guard.cf != ColumnFamily::Kv
+                || guard.key.is_empty()
+                || !guard_keys.insert(guard.key.clone())
+            {
+                return Err(CalyxError::aster_corrupt_shard(
+                    "grounded observation batch guards must be unique non-empty KV keys",
+                ));
+            }
+        }
+        if guard_keys != source_keys {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "grounded observation batch requires exactly one guard per source row: source_rows={} guards={} matching_keys={}",
+                source_keys.len(),
+                guard_keys.len(),
+                source_keys.intersection(&guard_keys).count()
+            )));
+        }
+
+        let mut cx_ids = BTreeSet::new();
+        let mut prepared_members = Vec::with_capacity(members.len());
+        for mut member in members {
+            if member.constellation.vault_id != self.vault_id()
+                || member.content_addressed_source_identity.is_empty()
+                || !member.constellation.anchors.is_empty()
+                || !member.constellation.flags.ungrounded
+            {
+                return Err(CalyxError::aster_corrupt_shard(
+                    "grounded observation batch member has invalid vault, identity, or pre-grounded state",
+                ));
+            }
+            let expected_cx_id = self.cx_id_for_input(
+                &member.content_addressed_source_identity,
+                member.constellation.panel_version,
+            );
+            if member.constellation.cx_id != expected_cx_id || !cx_ids.insert(expected_cx_id) {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "grounded observation batch member identity mismatch or duplicate: expected={} actual={}",
+                    expected_cx_id, member.constellation.cx_id
+                )));
+            }
+            member.anchor.validate_schema()?;
+            member.constellation.anchors.push(member.anchor);
+            member.constellation.flags.ungrounded = false;
+            member.constellation.validate_schema()?;
+            let encoding = prepared::PreparedConstellationEncoding::new(&member.constellation)?;
+            prepared_members.push((member.constellation, encoding));
+        }
+        let member_ids = cx_ids.iter().copied().collect::<Vec<_>>();
+        let ledger_payload = declare_batch_members(&ledger_payload, &member_ids)?;
+        let first_id = member_ids[0];
+
+        let commit = self.with_durable_commit_lock(move || {
+            let latest = self.snapshot();
+            for (guard_index, guard) in source_guards.iter().enumerate() {
+                let actual_revision = self
+                    .read_cf_at(latest, guard.cf, &guard.key)?
+                    .as_deref()
+                    .map(super::value_revision);
+                if actual_revision != guard.expected_revision {
+                    return Err(CalyxError {
+                        code: CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT,
+                        message: format!(
+                            "grounded observation batch source revision changed before publication: guard_index={guard_index} key_len={} expected={:?} actual={actual_revision:?}",
+                            guard.key.len(), guard.expected_revision
+                        ),
+                        remediation: "reread every guarded source revision and rebuild the complete grounded batch; no row from this attempt was committed",
+                    });
+                }
+            }
+            let mut rows = source_rows
+                .into_iter()
+                .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+                .collect::<Vec<_>>();
+            let mut hook_guard = match &self.ledger_hook {
+                Some(hook) => Some(ledger_hook::lock_hook(hook)?),
+                None => None,
+            };
+            let staged_ledger = if let Some(hook) = hook_guard.as_deref() {
+                Some(ledger_hook::stage_entry_payload(
+                    hook,
+                    &mut rows,
+                    EntryKind::Grounding,
+                    SubjectId::Cx(first_id),
+                    ledger_payload.clone(),
+                    actor.clone(),
+                )?)
+            } else {
+                None
+            };
+            let ledger_ref = if let Some(staged) = staged_ledger.as_ref() {
+                staged
+                    .first()
+                    .ok_or_else(|| {
+                        CalyxError::ledger_group_commit_failed(
+                            "no staged grounded-observation batch ledger rows",
+                        )
+                    })?
+                    .ledger_ref()
+            } else {
+                self.stage_raw_ledger_entry_locked(
+                    &mut rows,
+                    EntryKind::Grounding,
+                    SubjectId::Cx(first_id),
+                    ledger_payload,
+                    actor,
+                )?
+            };
+            let mut expected = Vec::with_capacity(prepared_members.len());
+            for (mut constellation, encoding) in prepared_members {
+                constellation.provenance = ledger_ref.clone();
+                expected.push(constellation.clone());
+                prepared::stage_validated_constellation_rows(
+                    &mut rows,
+                    &constellation,
+                    encoding,
+                )?;
+            }
+            let committed_seq = self.commit_rows_locked(&rows)?;
+            if let (Some(hook), Some(staged)) = (hook_guard.take(), staged_ledger.as_ref()) {
+                self.commit_persistent_ledger_staged_locked(
+                    hook,
+                    staged,
+                    "grounded_observation_batch",
+                )?;
+            }
+            Ok((
+                GroundedObservationBatchCommit {
+                    cx_ids: expected.iter().map(|item| item.cx_id).collect(),
+                    ledger_ref,
+                    source_row_count: source_keys.len(),
+                    committed_seq,
+                },
+                expected,
+            ))
+        })?;
+        let (commit, expected) = commit;
+        for constellation in expected {
+            let readback = self.get(constellation.cx_id, self.snapshot())?;
+            if readback != constellation {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "grounded observation batch post-commit readback mismatch for {} at committed seq {}",
+                    constellation.cx_id, commit.committed_seq
+                )));
+            }
+        }
+        Ok(commit)
+    }
+
     /// Atomically publishes append-only source rows and their native grounded
     /// observation. Source, Base/Slot/Scalar/Anchor, and grounding-ledger rows
     /// share one WAL/MVCC commit.

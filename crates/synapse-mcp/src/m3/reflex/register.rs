@@ -14,7 +14,7 @@ use synapse_core::{
 };
 use synapse_reflex::{
     AimTrackParams, AimTrackTarget, ComboParams, HoldButtonParams, HoldMoveParams,
-    PathFollowParams, ReflexError, ReflexRuntime, ScheduledReflex,
+    PathFollowParams, ReflexActivation, ReflexError, ReflexRuntime, ScheduledReflex,
 };
 
 use crate::m1::mcp_error;
@@ -84,19 +84,30 @@ pub struct ReflexRegisterParams {
 }
 
 impl ReflexRegisterParams {
-    pub(crate) fn file_jsonl_tail_watcher_request(
-        &self,
-        reflex_id: String,
-    ) -> Option<super::FileJsonlTailWatcherRequest> {
+    fn durable_activation(&self) -> Result<Option<ReflexActivation>, ReflexError> {
         if self.kind != "on_event" {
-            return None;
+            return Ok(None);
         }
-        let when = self.when.as_ref()?.file_jsonl_tail()?.clone();
-        Some(super::FileJsonlTailWatcherRequest {
-            reflex_id,
-            when,
-            lifetime: self.lifetime.clone(),
-        })
+        let Some(when) = self
+            .when
+            .as_ref()
+            .and_then(ReflexWhenParam::file_jsonl_tail)
+        else {
+            return Ok(None);
+        };
+        let spec = when.validate()?;
+        Ok(Some(ReflexActivation::FileJsonlTail {
+            host: spec.host,
+            path: spec.path,
+            json_path: spec.json_path,
+            json_pointer: spec.json_pointer,
+            event_data_pointer: spec.event_data_pointer,
+            equals: spec.equals,
+            min_lines: spec.min_lines,
+            poll_interval_ms: spec.poll_interval_ms,
+            local_host: spec.local_host,
+            stop_after_first_match: matches!(self.lifetime, ReflexLifetime::OneShot),
+        }))
     }
 }
 
@@ -156,19 +167,58 @@ pub fn requires_a11y_event_bridge(params: &ReflexRegisterParams) -> bool {
 pub fn register_reflex(
     runtime: &Arc<Mutex<ReflexRuntime>>,
     params: ReflexRegisterParams,
+    m3_state: &crate::m3::SharedM3State,
+    event_bus: synapse_reflex::EventBus,
 ) -> Result<ReflexRegisterResponse, ErrorData> {
+    let activation = params
+        .durable_activation()
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let reflex = scheduled_reflex_from_params(params)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let mut runtime = runtime.lock().map_err(|_err| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            "reflex runtime lock poisoned",
-        )
-    })?;
-    let state = runtime
-        .register(&reflex)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let prepared_watcher = activation
+        .clone()
+        .map(|activation| {
+            super::prepare_file_jsonl_tail_watcher(
+                m3_state,
+                reflex.reflex_id.clone(),
+                activation,
+                event_bus,
+            )
+        })
+        .transpose()?;
+    let mut runtime = match runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_error) => {
+            let rollback = prepared_watcher
+                .map(|prepared| prepared.rollback(m3_state))
+                .transpose();
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "REFLEX_REGISTRATION_RUNTIME_LOCK_POISONED: phase=prepare durable_registration_committed=false scheduler_activated=false host_activation_rollback={rollback:?}; remediation=restart the daemon and inspect the prior panic"
+                ),
+            ));
+        }
+    };
+    let state = match runtime.register_with_activation(&reflex, activation) {
+        Ok(state) => state,
+        Err(error) => {
+            drop(runtime);
+            let rollback = prepared_watcher
+                .map(|prepared| prepared.rollback(m3_state))
+                .transpose();
+            return Err(mcp_error(
+                error.code(),
+                format!(
+                    "{error}; host_activation_rollback={rollback:?}; durable_registration_committed=false scheduler_activated=false"
+                ),
+            ));
+        }
+    };
     drop(runtime);
+    if let Some(prepared) = prepared_watcher {
+        prepared.activate();
+    }
     Ok(ReflexRegisterResponse {
         reflex_id: state.id.clone(),
         state,

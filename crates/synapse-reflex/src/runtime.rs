@@ -1,12 +1,17 @@
-use std::{collections::HashSet, fmt, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+    time::Duration,
+};
 
 use synapse_action::ActionHandle;
 use synapse_core::{ReflexId, ReflexState, ReflexStatus, StoredAuditContext};
 use synapse_storage::Db;
 
 use crate::{
-    AimTrackTargetSourceHandle, EventBus, ReflexActionGateHandle, ReflexResult, ScheduledReflex,
-    SchedulerConfig, SchedulerHandle,
+    AimTrackTargetSourceHandle, EventBus, ReflexActionGateHandle, ReflexError, ReflexResult,
+    ScheduledReflex, SchedulerConfig, SchedulerHandle,
 };
 
 /// Runtime handle for the M3 reflex subsystem.
@@ -26,6 +31,8 @@ pub struct ReflexRuntime {
     pub(crate) aim_track_target_source: Option<AimTrackTargetSourceHandle>,
     pub(crate) reflexes: Vec<ScheduledReflex>,
     pub(crate) disabled_reflex_ids: HashSet<ReflexId>,
+    pub(crate) durable_records: HashMap<ReflexId, crate::durable_state::DurableReflexRecord>,
+    pub(crate) recovered_statuses: Vec<ReflexStatus>,
     pub(crate) scheduler: Option<SchedulerHandle>,
 }
 
@@ -82,6 +89,37 @@ impl ReflexRuntime {
     ) -> ReflexResult<Self> {
         crate::audit_migration::repair_reflex_audit_retention_corruption(&db)?;
         crate::audit_projection::ensure(&db)?;
+        crate::durable_state::reconcile_legacy_active_orphans(&db)?;
+        let durable_records = crate::durable_state::load_records(&db)?;
+        let mut reflexes = Vec::new();
+        let mut disabled_reflex_ids = HashSet::new();
+        let mut recovered_statuses = Vec::new();
+        let mut durable_records_by_id = HashMap::with_capacity(durable_records.len());
+        for record in durable_records {
+            match record.status.state {
+                ReflexState::Active => {
+                    reflexes.push(record.definition.clone());
+                    recovered_statuses.push(record.status.clone());
+                }
+                ReflexState::Disabled => {
+                    disabled_reflex_ids.insert(record.definition.reflex_id.clone());
+                    reflexes.push(record.definition.clone());
+                    recovered_statuses.push(record.status.clone());
+                }
+                ReflexState::Cancelled | ReflexState::ActionDenied | ReflexState::Expired => {}
+                ReflexState::Paused | ReflexState::Starved => {
+                    return Err(ReflexError::ParamsInvalid {
+                        detail: format!(
+                            "REFLEX_DURABLE_STATE_RECONCILIATION_INVALID: reflex_id={} state={:?}; remediation=preserve and repair the exact desired-state row before starting reflex",
+                            record.definition.reflex_id, record.status.state
+                        ),
+                    });
+                }
+            }
+            durable_records_by_id.insert(record.definition.reflex_id.clone(), record);
+        }
+        reflexes.sort_by(|left, right| left.reflex_id.cmp(&right.reflex_id));
+        recovered_statuses.sort_by(|left, right| left.id.cmp(&right.id));
         Ok(Self {
             db,
             action_handle,
@@ -90,10 +128,136 @@ impl ReflexRuntime {
             audit_context: None,
             action_gate: None,
             aim_track_target_source: None,
-            reflexes: Vec::new(),
-            disabled_reflex_ids: HashSet::new(),
+            reflexes,
+            disabled_reflex_ids,
+            durable_records: durable_records_by_id,
+            recovered_statuses,
             scheduler: None,
         })
+    }
+
+    /// Reconciles validated durable desired state into one prepared scheduler
+    /// generation, then publishes it. This is separate from storage recovery so
+    /// callers can install action and aim-target authorities first.
+    ///
+    /// # Errors
+    ///
+    /// Fails before activation when a required authority is missing or the
+    /// scheduler generation cannot be prepared.
+    pub fn activate_recovered(&mut self) -> ReflexResult<()> {
+        if self.scheduler.is_some() || self.reflexes.is_empty() {
+            return Ok(());
+        }
+        if self.action_gate.is_none() {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "REFLEX_RECOVERY_ACTION_GATE_MISSING: phase=prepare durable_state=validated scheduler=inactive; remediation=install the configured reflex action permission gate before activating recovered definitions".to_owned(),
+            });
+        }
+        if self
+            .reflexes
+            .iter()
+            .any(|reflex| matches!(&reflex.driver, crate::ScheduledReflexDriver::AimTrack(_)))
+            && self.aim_track_target_source.is_none()
+        {
+            return Err(ReflexError::ParamsInvalid {
+                detail: "REFLEX_RECOVERY_AIM_TARGET_SOURCE_MISSING: phase=prepare durable_state=validated scheduler=inactive; remediation=install the M1 aim-target source before activating recovered aim_track definitions".to_owned(),
+            });
+        }
+        let registered_at = self
+            .recovered_statuses
+            .iter()
+            .map(|status| status.registered_at)
+            .min()
+            .unwrap_or_else(chrono::Utc::now);
+        let mut scheduler = crate::scheduler::ReflexScheduler::spawn_replacement(
+            self.event_bus.clone(),
+            self.action_handle.clone(),
+            self.reflexes.clone(),
+            self.scheduler_config.clone(),
+            Arc::clone(&self.db),
+            self.audit_context.clone(),
+            self.action_gate.clone(),
+            self.aim_track_target_source.clone(),
+            &self.recovered_statuses,
+            registered_at,
+        )?;
+        if !self.disabled_reflex_ids.is_empty() {
+            let disabled = self.disabled_reflex_ids.iter().cloned().collect::<Vec<_>>();
+            let actual = scheduler.disable_reflexes(&disabled);
+            if actual.len() != disabled.len() {
+                let stopped = scheduler.stop();
+                return Err(ReflexError::ParamsInvalid {
+                    detail: format!(
+                        "REFLEX_RECOVERY_DISABLED_SET_MISMATCH: phase=prepare expected={} actual={} scheduler_stopped={} stop_error={}; remediation=preserve desired-state rows and inspect scheduler status construction",
+                        disabled.len(),
+                        actual.len(),
+                        stopped.is_ok(),
+                        stopped
+                            .err()
+                            .map_or_else(|| "none".to_owned(), |error| error.to_string())
+                    ),
+                });
+            }
+        }
+        scheduler.activate_prepared();
+        self.scheduler = Some(scheduler);
+        self.recovered_statuses.clear();
+        tracing::info!(
+            code = "REFLEX_DURABLE_STATE_RECONCILED",
+            definition_count = self.reflexes.len(),
+            disabled_count = self.disabled_reflex_ids.len(),
+            "reconciled durable reflex desired state into the executable scheduler"
+        );
+        Ok(())
+    }
+
+    /// Returns activation definitions that a host integration must reconcile
+    /// before it declares recovered reflex readiness.
+    #[must_use]
+    pub fn recovered_activations(&self) -> Vec<(ReflexId, crate::ReflexActivation)> {
+        let mut activations = self
+            .durable_records
+            .iter()
+            .filter(|(_id, record)| record.status.state == ReflexState::Active)
+            .filter_map(|(id, record)| {
+                record
+                    .activation
+                    .clone()
+                    .map(|activation| (id.clone(), activation))
+            })
+            .collect::<Vec<_>>();
+        activations.sort_by(|left, right| left.0.cmp(&right.0));
+        activations
+    }
+
+    /// Stops a scheduler generation whose host activation reconciliation
+    /// failed, leaving durable desired state intact for an exact retry.
+    ///
+    /// # Errors
+    ///
+    /// Reports a scheduler panic with durable/runtime phase evidence.
+    pub fn deactivate_after_recovery_failure(&mut self) -> ReflexResult<()> {
+        if let Some(mut scheduler) = self.scheduler.take() {
+            scheduler.stop().map_err(|error| ReflexError::ParamsInvalid {
+                detail: format!(
+                    "REFLEX_RECOVERY_SCHEDULER_STOP_FAILED: phase=host_activation_rollback durable_state=unchanged scheduler=terminated detail={error}; remediation=inspect the scheduler panic and retry reconciliation from durable desired state"
+                ),
+            })?;
+        }
+        self.recovered_statuses = self
+            .durable_records
+            .values()
+            .filter(|record| {
+                matches!(
+                    record.status.state,
+                    ReflexState::Active | ReflexState::Disabled
+                )
+            })
+            .map(|record| record.status.clone())
+            .collect();
+        self.recovered_statuses
+            .sort_by(|left, right| left.id.cmp(&right.id));
+        Ok(())
     }
 
     /// Returns the current scheduler status snapshot for active reflexes.

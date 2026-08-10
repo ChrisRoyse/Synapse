@@ -5,6 +5,8 @@ use std::{
     time::Duration,
 };
 
+use serde::{Deserialize, Serialize};
+
 use chrono::Utc;
 use synapse_action::ActionHandle;
 use synapse_core::{
@@ -110,7 +112,8 @@ impl SchedulerConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduledReflex {
     pub reflex_id: ReflexId,
     pub trigger: SchedulerTrigger,
@@ -263,7 +266,8 @@ impl ScheduledReflex {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "driver", content = "params", rename_all = "snake_case")]
 pub enum ScheduledReflexDriver {
     Actions,
     AimTrack(AimTrackParams),
@@ -273,7 +277,8 @@ pub enum ScheduledReflexDriver {
     PathFollow(PathFollowParams),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "trigger", content = "filter", rename_all = "snake_case")]
 pub enum SchedulerTrigger {
     EveryTick,
     OnEvent(EventFilter),

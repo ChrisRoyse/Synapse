@@ -1,6 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use synapse_action::ActionHandle;
 pub use synapse_core::DEFAULT_AIM_TRACK_EMA_ALPHA as DEFAULT_EMA_ALPHA;
@@ -24,7 +25,8 @@ pub trait AimTrackTargetSource: Send + Sync {
     fn snapshot(&self) -> AimTrackTargetSnapshot;
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AimTrackParams {
     pub target: AimTrackTarget,
     pub axis: ReflexAimAxis,
@@ -62,7 +64,8 @@ impl AimTrackParams {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "target", content = "value", rename_all = "snake_case")]
 pub enum AimTrackTarget {
     Point(Point),
     EntityId(EntityId),
