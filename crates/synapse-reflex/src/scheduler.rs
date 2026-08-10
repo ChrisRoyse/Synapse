@@ -590,6 +590,8 @@ impl ReflexScheduler {
             prior_statuses,
             new_registration_at,
         )));
+        let pending_terminals = Arc::new(Mutex::new(vec![None; reflexes.len()]));
+        let denied_terminal_audits = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let controls = Arc::new(Mutex::new(
             reflexes
                 .iter()
@@ -625,8 +627,10 @@ impl ReflexScheduler {
             samples: Arc::clone(&samples),
             controls: Arc::clone(&controls),
             statuses: Arc::clone(&statuses),
+            pending_terminals: Arc::clone(&pending_terminals),
+            denied_terminal_audits,
             config,
-            audit_sink,
+            audit_sink: audit_sink.clone(),
             audit_context,
             action_gate,
             lowered_guard_thresholds: Arc::clone(&lowered_feed),
@@ -649,6 +653,8 @@ impl ReflexScheduler {
             samples,
             controls,
             statuses,
+            pending_terminals,
+            audit_sink,
             lowered_refresher,
         })
     }

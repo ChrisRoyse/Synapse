@@ -41,8 +41,8 @@
 
 use std::{
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -50,7 +50,9 @@ use std::{
 
 use crossbeam::channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use serde_json::json;
-use synapse_core::{ReflexState, SCHEMA_VERSION, StoredAuditContext, StoredReflexAudit};
+use synapse_core::{
+    ReflexState, ReflexStatus, SCHEMA_VERSION, StoredAuditContext, StoredReflexAudit,
+};
 use synapse_storage::Db;
 use uuid::Uuid;
 
@@ -80,13 +82,49 @@ const WRITER_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const REFLEX_AUDIT_QUEUE_DEPTH_METRIC: &str = "reflex_audit_queue_depth";
 const REFLEX_AUDIT_QUEUE_OVERFLOW_METRIC: &str = "reflex_audit_queue_overflow_total";
 const REFLEX_AUDIT_WRITE_FAILED_METRIC: &str = "reflex_audit_write_failed_total";
+const REFLEX_TERMINAL_COMMIT_FAILED_METRIC: &str = "reflex_terminal_commit_failed_total";
+
+const TERMINAL_PREPARE_QUEUED: u8 = 1;
+const TERMINAL_PREPARED: u8 = 2;
+const TERMINAL_COMPLETION_QUEUED: u8 = 3;
+const TERMINAL_COMPLETED: u8 = 4;
+const TERMINAL_FAILED: u8 = 5;
 
 /// One queued audit row plus its durability requirement.
-struct AuditMessage {
-    audit: StoredReflexAudit,
-    /// Forces a vault flush after this row lands. Used for security-relevant
-    /// rows (action-denied) that previously flushed inline on the tick.
-    flush: bool,
+enum AuditMessage {
+    Telemetry {
+        audit: Box<StoredReflexAudit>,
+        /// Forces a vault flush after this row lands.
+        flush: bool,
+    },
+    TerminalPrepare(TerminalLifecycleToken),
+    TerminalComplete(TerminalLifecycleToken),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TerminalLifecycleToken {
+    inner: Arc<TerminalLifecycleTokenInner>,
+}
+
+#[derive(Debug)]
+struct TerminalLifecycleTokenInner {
+    intent_id: String,
+    final_status: ReflexStatus,
+    final_audit: StoredReflexAudit,
+    statuses: Arc<Mutex<Vec<ReflexStatus>>>,
+    state: AtomicU8,
+}
+
+impl TerminalLifecycleToken {
+    #[must_use]
+    pub(crate) fn reflex_id(&self) -> &str {
+        &self.inner.final_status.id
+    }
+
+    #[must_use]
+    pub(crate) fn is_completed(&self) -> bool {
+        self.inner.state.load(Ordering::Acquire) == TERMINAL_COMPLETED
+    }
 }
 
 /// Monotonic counters describing the hand-off queue.
@@ -99,10 +137,23 @@ struct ReflexAuditQueueCounters {
     write_failed: AtomicU64,
     flush_failed: AtomicU64,
     high_water_depth: AtomicU64,
+    terminal_pending: AtomicU64,
+    terminal_prepared: AtomicU64,
+    terminal_committed: AtomicU64,
+    terminal_failed: AtomicU64,
+    terminal_last_failure: Mutex<Option<TerminalLifecycleFailure>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TerminalLifecycleFailure {
+    reflex_id: String,
+    intent_id: String,
+    phase: String,
+    detail: String,
 }
 
 /// Point-in-time copy of the queue counters.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ReflexAuditQueueSnapshot {
     /// Rows handed to the sink by the scheduler thread.
     pub offered: u64,
@@ -120,6 +171,14 @@ pub struct ReflexAuditQueueSnapshot {
     pub high_water_depth: u64,
     /// Configured bound of the queue.
     pub capacity: u64,
+    pub terminal_pending: u64,
+    pub terminal_prepared: u64,
+    pub terminal_committed: u64,
+    pub terminal_failed: u64,
+    pub terminal_failure_reflex_id: Option<String>,
+    pub terminal_failure_intent_id: Option<String>,
+    pub terminal_failure_phase: Option<String>,
+    pub terminal_failure_detail: Option<String>,
 }
 
 /// Non-blocking audit hand-off owned by the reflex scheduler.
@@ -177,36 +236,174 @@ impl ReflexAuditSink {
     /// Hands one audit row to the writer thread. Never blocks, never performs
     /// I/O, never allocates a lock shared with the writer.
     pub fn enqueue(&self, audit: StoredReflexAudit) {
-        self.offer(audit, false);
+        self.offer_telemetry(audit, false);
     }
 
     /// Hands one audit row to the writer thread and requests a vault flush once
     /// it lands.
     pub fn enqueue_flushing(&self, audit: StoredReflexAudit) {
-        self.offer(audit, true);
+        self.offer_telemetry(audit, true);
     }
 
-    fn offer(&self, audit: StoredReflexAudit, flush: bool) {
+    fn offer_telemetry(&self, audit: StoredReflexAudit, flush: bool) {
         self.counters.offered.fetch_add(1, Ordering::Relaxed);
+        if matches!(
+            audit.status,
+            ReflexState::Expired | ReflexState::ActionDenied
+        ) {
+            self.counters.write_failed.fetch_add(1, Ordering::Relaxed);
+            metrics::counter!(REFLEX_AUDIT_WRITE_FAILED_METRIC).increment(1);
+            tracing::error!(
+                code = "REFLEX_TERMINAL_AUDIT_TELEMETRY_PATH_REFUSED",
+                component = "reflex_audit_offload",
+                reflex_id = %audit.reflex_id,
+                audit_id = %audit.audit_id,
+                terminal_state = ?audit.status,
+                remediation = "route this exact transition through prepare_terminal so desired state, readback acknowledgement, and public status share one lifecycle protocol",
+                "refused a terminal audit on the unacknowledged telemetry path"
+            );
+            return;
+        }
         let Some(tx) = self.tx.as_ref() else {
             self.record_overflow(&audit, "sink_closed");
             return;
         };
-        match tx.try_send(AuditMessage { audit, flush }) {
+        match tx.try_send(AuditMessage::Telemetry {
+            audit: Box::new(audit),
+            flush,
+        }) {
             Ok(()) => {
-                self.counters.enqueued.fetch_add(1, Ordering::Relaxed);
-                let depth = tx.len() as u64;
-                self.counters
-                    .high_water_depth
-                    .fetch_max(depth, Ordering::Relaxed);
+                self.record_enqueued(tx);
             }
-            Err(TrySendError::Full(message)) => {
-                self.record_overflow(&message.audit, "queue_full");
+            Err(TrySendError::Full(AuditMessage::Telemetry { audit, .. })) => {
+                self.record_overflow(&audit, "queue_full");
             }
-            Err(TrySendError::Disconnected(message)) => {
-                self.record_overflow(&message.audit, "writer_thread_gone");
+            Err(TrySendError::Disconnected(AuditMessage::Telemetry { audit, .. })) => {
+                self.record_overflow(&audit, "writer_thread_gone");
+            }
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => {
+                unreachable!("offer_telemetry submitted only the telemetry AuditMessage variant")
             }
         }
+    }
+
+    pub(crate) fn prepare_terminal(
+        &self,
+        mut final_audit: StoredReflexAudit,
+        final_status: ReflexStatus,
+        statuses: Arc<Mutex<Vec<ReflexStatus>>>,
+    ) -> TerminalLifecycleToken {
+        let intent_id = final_audit.audit_id.clone();
+        final_audit.details["lifecycle_intent_id"] = serde_json::Value::String(intent_id.clone());
+        final_audit.details["lifecycle_phase"] = serde_json::Value::String("completion".to_owned());
+        let token = TerminalLifecycleToken {
+            inner: Arc::new(TerminalLifecycleTokenInner {
+                intent_id,
+                final_status,
+                final_audit,
+                statuses,
+                state: AtomicU8::new(TERMINAL_PREPARE_QUEUED),
+            }),
+        };
+        self.counters
+            .terminal_pending
+            .fetch_add(1, Ordering::Relaxed);
+        self.offer_terminal(
+            AuditMessage::TerminalPrepare(token.clone()),
+            &token,
+            "prepare_queue",
+        );
+        token
+    }
+
+    pub(crate) fn advance_terminal(&self, token: &TerminalLifecycleToken) {
+        if token
+            .inner
+            .state
+            .compare_exchange(
+                TERMINAL_PREPARED,
+                TERMINAL_COMPLETION_QUEUED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        self.offer_terminal(
+            AuditMessage::TerminalComplete(token.clone()),
+            token,
+            "completion_queue",
+        );
+    }
+
+    fn offer_terminal(
+        &self,
+        message: AuditMessage,
+        token: &TerminalLifecycleToken,
+        phase: &'static str,
+    ) {
+        self.counters.offered.fetch_add(1, Ordering::Relaxed);
+        let Some(tx) = self.tx.as_ref() else {
+            self.record_terminal_failure(token, phase, "audit sink is closed");
+            return;
+        };
+        match tx.try_send(message) {
+            Ok(()) => self.record_enqueued(tx),
+            Err(TrySendError::Full(_)) => self.record_terminal_failure(
+                token,
+                phase,
+                "bounded reflex lifecycle queue is full; the terminal request was not accepted",
+            ),
+            Err(TrySendError::Disconnected(_)) => self.record_terminal_failure(
+                token,
+                phase,
+                "reflex lifecycle writer thread is disconnected; the terminal request was not accepted",
+            ),
+        }
+    }
+
+    fn record_enqueued(&self, tx: &Sender<AuditMessage>) {
+        self.counters.enqueued.fetch_add(1, Ordering::Relaxed);
+        let depth = tx.len() as u64;
+        self.counters
+            .high_water_depth
+            .fetch_max(depth, Ordering::Relaxed);
+    }
+
+    fn record_terminal_failure(
+        &self,
+        token: &TerminalLifecycleToken,
+        phase: &str,
+        detail: impl Into<String>,
+    ) {
+        let detail = detail.into();
+        if token.inner.state.swap(TERMINAL_FAILED, Ordering::AcqRel) != TERMINAL_FAILED {
+            self.counters
+                .terminal_failed
+                .fetch_add(1, Ordering::Relaxed);
+            metrics::counter!(REFLEX_TERMINAL_COMMIT_FAILED_METRIC).increment(1);
+        }
+        let failure = TerminalLifecycleFailure {
+            reflex_id: token.inner.final_status.id.clone(),
+            intent_id: token.inner.intent_id.clone(),
+            phase: phase.to_owned(),
+            detail: detail.clone(),
+        };
+        match self.counters.terminal_last_failure.lock() {
+            Ok(mut last) => *last = Some(failure),
+            Err(poisoned) => *poisoned.into_inner() = Some(failure),
+        }
+        tracing::error!(
+            code = "REFLEX_TERMINAL_LIFECYCLE_FAILED",
+            component = "reflex_audit_offload",
+            phase,
+            reflex_id = %token.inner.final_status.id,
+            intent_id = %token.inner.intent_id,
+            detail,
+            remediation = "keep this reflex non-dispatchable, preserve the vault and logs, repair the named queue/storage/readback failure, then restart so durable terminal-intent recovery can finish any prepared transition",
+            "reflex terminal lifecycle transition failed closed"
+        );
     }
 
     /// Records a row that will never reach the vault. Logs the complete record
@@ -238,6 +435,10 @@ impl ReflexAuditSink {
     /// Reads the accounting counters.
     #[must_use]
     pub fn snapshot(&self) -> ReflexAuditQueueSnapshot {
+        let last_failure = match self.counters.terminal_last_failure.lock() {
+            Ok(last) => last.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         ReflexAuditQueueSnapshot {
             offered: self.counters.offered.load(Ordering::Relaxed),
             enqueued: self.counters.enqueued.load(Ordering::Relaxed),
@@ -247,6 +448,18 @@ impl ReflexAuditSink {
             flush_failed: self.counters.flush_failed.load(Ordering::Relaxed),
             high_water_depth: self.counters.high_water_depth.load(Ordering::Relaxed),
             capacity: REFLEX_AUDIT_QUEUE_CAPACITY as u64,
+            terminal_pending: self.counters.terminal_pending.load(Ordering::Relaxed),
+            terminal_prepared: self.counters.terminal_prepared.load(Ordering::Relaxed),
+            terminal_committed: self.counters.terminal_committed.load(Ordering::Relaxed),
+            terminal_failed: self.counters.terminal_failed.load(Ordering::Relaxed),
+            terminal_failure_reflex_id: last_failure
+                .as_ref()
+                .map(|failure| failure.reflex_id.clone()),
+            terminal_failure_intent_id: last_failure
+                .as_ref()
+                .map(|failure| failure.intent_id.clone()),
+            terminal_failure_phase: last_failure.as_ref().map(|failure| failure.phase.clone()),
+            terminal_failure_detail: last_failure.map(|failure| failure.detail),
         }
     }
 }
@@ -274,6 +487,10 @@ impl Drop for ReflexAuditSink {
             written = snapshot.written,
             write_failed = snapshot.write_failed,
             flush_failed = snapshot.flush_failed,
+            terminal_pending = snapshot.terminal_pending,
+            terminal_prepared = snapshot.terminal_prepared,
+            terminal_committed = snapshot.terminal_committed,
+            terminal_failed = snapshot.terminal_failed,
             high_water_depth = snapshot.high_water_depth,
             capacity = snapshot.capacity,
             "reflex audit offload queue drained and shut down"
@@ -290,7 +507,7 @@ fn run_writer(
     let mut recorded_overflow = 0_u64;
     loop {
         match rx.recv_timeout(WRITER_POLL_INTERVAL) {
-            Ok(message) => write_one(db, &message, counters),
+            Ok(message) => write_one(db, message, counters),
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => {
                 // crossbeam reports `Disconnected` only once the queue is
@@ -304,8 +521,21 @@ fn run_writer(
     }
 }
 
-fn write_one(db: &Db, message: &AuditMessage, counters: &ReflexAuditQueueCounters) {
-    match write_audit(db, &message.audit) {
+fn write_one(db: &Db, message: AuditMessage, counters: &ReflexAuditQueueCounters) {
+    match message {
+        AuditMessage::Telemetry { audit, flush } => write_telemetry(db, &audit, flush, counters),
+        AuditMessage::TerminalPrepare(token) => prepare_terminal(db, &token, counters),
+        AuditMessage::TerminalComplete(token) => complete_terminal(db, &token, counters),
+    }
+}
+
+fn write_telemetry(
+    db: &Db,
+    audit: &StoredReflexAudit,
+    flush: bool,
+    counters: &ReflexAuditQueueCounters,
+) {
+    match write_audit(db, audit) {
         Ok(()) => {
             counters.written.fetch_add(1, Ordering::Relaxed);
         }
@@ -315,28 +545,242 @@ fn write_one(db: &Db, message: &AuditMessage, counters: &ReflexAuditQueueCounter
             tracing::error!(
                 code = "REFLEX_AUDIT_WRITE_FAILED",
                 component = "reflex_audit_offload",
-                reflex_id = %message.audit.reflex_id,
-                audit_id = %message.audit.audit_id,
-                ts_ns = message.audit.ts_ns,
+                reflex_id = %audit.reflex_id,
+                audit_id = %audit.audit_id,
+                ts_ns = audit.ts_ns,
                 detail = %format!("{error:#}"),
                 "off-thread reflex audit write failed; the row was not persisted"
             );
             return;
         }
     }
-    if message.flush
-        && let Err(error) = db.flush()
-    {
+    if flush && let Err(error) = db.flush() {
         counters.flush_failed.fetch_add(1, Ordering::Relaxed);
         tracing::error!(
             code = "REFLEX_AUDIT_FLUSH_FAILED",
             component = "reflex_audit_offload",
-            reflex_id = %message.audit.reflex_id,
-            audit_id = %message.audit.audit_id,
+            reflex_id = %audit.reflex_id,
+            audit_id = %audit.audit_id,
             detail = %format!("{error:#}"),
             "off-thread reflex audit flush failed after a durability-critical audit row"
         );
     }
+}
+
+fn prepare_terminal(db: &Db, token: &TerminalLifecycleToken, counters: &ReflexAuditQueueCounters) {
+    let result = (|| -> Result<(), String> {
+        let prior_record = crate::durable_state::load_record(db, &token.inner.final_status.id)
+            .map_err(|error| error.to_string())?;
+        if prior_record.terminal_intent.is_some() {
+            return Err(format!(
+                "REFLEX_TERMINAL_INTENT_ALREADY_PREPARED: reflex_id={} requested_intent_id={}; remediation=do not overwrite the existing intent; restart to run exact durable recovery",
+                token.inner.final_status.id, token.inner.intent_id
+            ));
+        }
+        let prepare_ts = token.inner.final_audit.ts_ns.checked_sub(1).ok_or_else(|| {
+            "REFLEX_TERMINAL_INTENT_TIMESTAMP_INVALID: terminal audit timestamp cannot reserve an immediately preceding prepare timestamp; remediation=repair the timestamp source before restarting terminal reconciliation".to_owned()
+        })?;
+        let terminal_intent = crate::durable_state::DurableTerminalIntent {
+            intent_id: token.inner.intent_id.clone(),
+            prepared_at_ns: prepare_ts,
+            terminal_status: token.inner.final_status.clone(),
+            terminal_audit: token.inner.final_audit.clone(),
+        };
+        let prepared_record = prior_record
+            .with_terminal_intent(terminal_intent)
+            .map_err(|error| error.to_string())?;
+        let prepare_audit = StoredReflexAudit {
+            schema_version: SCHEMA_VERSION,
+            audit_id: Uuid::now_v7().to_string(),
+            reflex_id: token.inner.final_status.id.clone(),
+            ts_ns: prepare_ts,
+            status: ReflexState::Active,
+            event_id: token.inner.final_audit.event_id.clone(),
+            audit_context: token.inner.final_audit.audit_context.clone(),
+            steps: Vec::new(),
+            error_code: None,
+            details: json!({
+                "kind": "reflex_terminal_lifecycle_intent_prepared",
+                "lifecycle_intent_id": token.inner.intent_id,
+                "lifecycle_phase": "prepared",
+                "terminal_state": token.inner.final_status.state,
+                "terminal_audit_id": token.inner.final_audit.audit_id,
+                "terminal_audit_sha256": synapse_storage::ordered_index::sha256_hex(
+                    &synapse_storage::encode_json(&token.inner.final_audit)
+                        .map_err(|error| error.to_string())?
+                ),
+            }),
+            redacted: false,
+            redactions: Vec::new(),
+        };
+        crate::audit::write_terminal_lifecycle_intent(
+            db,
+            &prepare_audit,
+            &prior_record,
+            &prepared_record,
+        )
+        .map_err(|error| error.to_string())?;
+        db.flush().map_err(|error| error.to_string())?;
+        crate::audit::verify_terminal_lifecycle_readback(
+            db,
+            &prepare_audit,
+            &prepared_record,
+            "prepare",
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            counters.written.fetch_add(1, Ordering::Relaxed);
+            counters.terminal_prepared.fetch_add(1, Ordering::Relaxed);
+            token
+                .inner
+                .state
+                .store(TERMINAL_PREPARED, Ordering::Release);
+            tracing::info!(
+                code = "REFLEX_TERMINAL_INTENT_PREPARED",
+                reflex_id = %token.inner.final_status.id,
+                intent_id = %token.inner.intent_id,
+                terminal_state = ?token.inner.final_status.state,
+                "durably prepared and independently read back a reflex terminal intent"
+            );
+        }
+        Err(error) => record_terminal_failure(counters, token, "prepare_commit_or_readback", error),
+    }
+}
+
+fn complete_terminal(db: &Db, token: &TerminalLifecycleToken, counters: &ReflexAuditQueueCounters) {
+    let result = (|| -> Result<(), String> {
+        let prior_record = crate::durable_state::load_record(db, &token.inner.final_status.id)
+            .map_err(|error| error.to_string())?;
+        let intent = prior_record.terminal_intent.as_ref().ok_or_else(|| {
+            format!(
+                "REFLEX_TERMINAL_INTENT_MISSING_AT_COMPLETION: reflex_id={} expected_intent_id={}; remediation=keep the reflex non-dispatchable and inspect the exact desired-state row",
+                token.inner.final_status.id, token.inner.intent_id
+            )
+        })?;
+        if intent.intent_id != token.inner.intent_id
+            || intent.terminal_status != token.inner.final_status
+            || intent.terminal_audit != token.inner.final_audit
+        {
+            return Err(format!(
+                "REFLEX_TERMINAL_INTENT_CHANGED_AT_COMPLETION: reflex_id={} expected_intent_id={} actual_intent_id={}; remediation=keep the reflex non-dispatchable and reconcile the competing lifecycle writer",
+                token.inner.final_status.id, token.inner.intent_id, intent.intent_id
+            ));
+        }
+        let next_record = prior_record
+            .with_status(token.inner.final_status.clone())
+            .map_err(|error| error.to_string())?;
+        crate::audit::write_terminal_lifecycle_audit(
+            db,
+            &token.inner.final_audit,
+            &prior_record,
+            &next_record,
+        )
+        .map_err(|error| error.to_string())?;
+        db.flush().map_err(|error| error.to_string())?;
+        crate::audit::verify_terminal_lifecycle_readback(
+            db,
+            &token.inner.final_audit,
+            &next_record,
+            "completion",
+        )
+        .map_err(|error| error.to_string())?;
+        match token.inner.statuses.lock() {
+            Ok(mut statuses) => publish_terminal_status(&mut statuses, token)?,
+            Err(_) => {
+                return Err(format!(
+                    "REFLEX_TERMINAL_STATUS_LOCK_POISONED_AFTER_COMMIT: reflex_id={} intent_id={}; remediation=restart the scheduler; durable state is terminal and will not replay",
+                    token.inner.final_status.id, token.inner.intent_id
+                ));
+            }
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            counters.written.fetch_add(1, Ordering::Relaxed);
+            counters.terminal_committed.fetch_add(1, Ordering::Relaxed);
+            counters.terminal_pending.fetch_sub(1, Ordering::Relaxed);
+            token
+                .inner
+                .state
+                .store(TERMINAL_COMPLETED, Ordering::Release);
+            tracing::info!(
+                code = "REFLEX_TERMINAL_LIFECYCLE_COMMITTED",
+                reflex_id = %token.inner.final_status.id,
+                intent_id = %token.inner.intent_id,
+                terminal_state = ?token.inner.final_status.state,
+                "durably committed and independently read back a reflex terminal transition before publishing runtime status"
+            );
+        }
+        Err(error) => record_terminal_failure(
+            counters,
+            token,
+            "completion_commit_readback_or_publish",
+            error,
+        ),
+    }
+}
+
+fn publish_terminal_status(
+    statuses: &mut [ReflexStatus],
+    token: &TerminalLifecycleToken,
+) -> Result<(), String> {
+    let status = statuses
+        .iter_mut()
+        .find(|status| status.id == token.inner.final_status.id)
+        .ok_or_else(|| {
+            format!(
+                "REFLEX_TERMINAL_STATUS_PUBLICATION_TARGET_MISSING: reflex_id={} intent_id={}; remediation=restart the scheduler generation from durable terminal state",
+                token.inner.final_status.id, token.inner.intent_id
+            )
+        })?;
+    if matches!(
+        status.state,
+        ReflexState::Expired | ReflexState::ActionDenied | ReflexState::Cancelled
+    ) {
+        return Err(format!(
+            "REFLEX_TERMINAL_STATUS_PUBLISHED_BEFORE_ACK: reflex_id={} intent_id={} current_state={:?}; remediation=inspect all runtime status writers and restart from durable terminal state",
+            token.inner.final_status.id, token.inner.intent_id, status.state
+        ));
+    }
+    *status = token.inner.final_status.clone();
+    Ok(())
+}
+
+fn record_terminal_failure(
+    counters: &ReflexAuditQueueCounters,
+    token: &TerminalLifecycleToken,
+    phase: &str,
+    detail: impl Into<String>,
+) {
+    let detail = detail.into();
+    if token.inner.state.swap(TERMINAL_FAILED, Ordering::AcqRel) != TERMINAL_FAILED {
+        counters.terminal_failed.fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(REFLEX_TERMINAL_COMMIT_FAILED_METRIC).increment(1);
+    }
+    let failure = TerminalLifecycleFailure {
+        reflex_id: token.inner.final_status.id.clone(),
+        intent_id: token.inner.intent_id.clone(),
+        phase: phase.to_owned(),
+        detail: detail.clone(),
+    };
+    match counters.terminal_last_failure.lock() {
+        Ok(mut last) => *last = Some(failure),
+        Err(poisoned) => *poisoned.into_inner() = Some(failure),
+    }
+    tracing::error!(
+        code = "REFLEX_TERMINAL_LIFECYCLE_FAILED",
+        component = "reflex_audit_offload",
+        phase,
+        reflex_id = %token.inner.final_status.id,
+        intent_id = %token.inner.intent_id,
+        detail,
+        remediation = "keep this reflex non-dispatchable, preserve the vault and logs, repair the named queue/storage/readback failure, then restart so durable terminal-intent recovery can finish any prepared transition",
+        "reflex terminal lifecycle transition failed closed"
+    );
 }
 
 fn publish_queue_metrics(rx: &Receiver<AuditMessage>, counters: &ReflexAuditQueueCounters) {

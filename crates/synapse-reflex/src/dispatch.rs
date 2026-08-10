@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use serde_json::json;
 use synapse_action::ActionHandle;
@@ -8,7 +11,7 @@ use synapse_core::{
 };
 use uuid::Uuid;
 
-use crate::{ReflexAuditSink, ReflexError, ReflexResult};
+use crate::{ReflexError, ReflexResult};
 
 pub const REFLEX_ACTION_PERMISSION_DENIED_KIND: &str = "reflex_action_permission_denied";
 pub const REFLEX_ACTION_DENIED_STEP_STATUS: &str = "action_denied";
@@ -55,10 +58,10 @@ impl ReflexActionPermissionDenied {
 pub struct ReflexActionDispatchContext {
     action_handle: ActionHandle,
     action_gate: Option<ReflexActionGateHandle>,
-    /// Off-thread audit hand-off; see [`crate::audit_offload`]. Action-denied
-    /// rows used to be written *and flushed* inline, which put a synchronous
-    /// vault write plus a flush on the scheduler tick thread (#1802).
-    audit_sink: Option<Arc<ReflexAuditSink>>,
+    /// Exact denial audit prepared on the tick and consumed by the terminal
+    /// lifecycle state machine after dispatch returns. It is never sent as
+    /// telemetry independently of that lifecycle transition.
+    denied_terminal_audits: Arc<Mutex<HashMap<ReflexId, StoredReflexAudit>>>,
     audit_context: Option<StoredAuditContext>,
     tick_index: u64,
 }
@@ -68,14 +71,14 @@ impl ReflexActionDispatchContext {
     pub fn new(
         action_handle: ActionHandle,
         action_gate: Option<ReflexActionGateHandle>,
-        audit_sink: Option<Arc<ReflexAuditSink>>,
+        denied_terminal_audits: Arc<Mutex<HashMap<ReflexId, StoredReflexAudit>>>,
         audit_context: Option<StoredAuditContext>,
         tick_index: u64,
     ) -> Self {
         Self {
             action_handle,
             action_gate,
-            audit_sink,
+            denied_terminal_audits,
             audit_context,
             tick_index,
         }
@@ -95,7 +98,7 @@ impl ReflexActionDispatchContext {
         if let Some(gate) = &self.action_gate
             && let Err(denial) = gate.ensure_action_allowed(reflex_id, action)
         {
-            self.write_action_denied_audit(reflex_id, action, &denial);
+            self.record_action_denied_audit(reflex_id, action, &denial)?;
             return Err(ReflexError::ActionPermissionDenied {
                 reflex_id: reflex_id.clone(),
                 detail: denial.detail,
@@ -104,20 +107,13 @@ impl ReflexActionDispatchContext {
         Ok(())
     }
 
-    fn write_action_denied_audit(
+    fn record_action_denied_audit(
         &self,
         reflex_id: &ReflexId,
         action: &Action,
         denial: &ReflexActionPermissionDenied,
-    ) {
-        let Some(sink) = self.audit_sink.as_deref() else {
-            return;
-        };
-        let Some(ts_ns) =
-            crate::audit_timestamp::try_now_unix_ns(REFLEX_ACTION_PERMISSION_DENIED_KIND)
-        else {
-            return;
-        };
+    ) -> ReflexResult<()> {
+        let ts_ns = crate::audit_timestamp::now_unix_ns(REFLEX_ACTION_PERMISSION_DENIED_KIND)?;
         let audit = StoredReflexAudit {
             schema_version: SCHEMA_VERSION,
             audit_id: Uuid::now_v7().to_string(),
@@ -148,9 +144,19 @@ impl ReflexActionDispatchContext {
             redactions: Vec::new(),
         };
 
-        // Durability-critical: the writer thread flushes the vault once this
-        // row lands, off the scheduler tick.
-        sink.enqueue_flushing(audit);
+        self.denied_terminal_audits.lock().map_or_else(
+            |_| {
+                Err(ReflexError::ParamsInvalid {
+                    detail: format!(
+                        "REFLEX_ACTION_DENIAL_INTENT_LOCK_POISONED: reflex_id={reflex_id}; remediation=stop the scheduler generation and restart from durable desired state"
+                    ),
+                })
+            },
+            |mut audits| {
+                audits.insert(reflex_id.clone(), audit);
+                Ok(())
+            },
+        )
     }
 }
 

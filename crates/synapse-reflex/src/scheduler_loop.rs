@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -20,6 +20,7 @@ use super::{
     ScheduledReflex, ScheduledReflexDriver, SchedulerConfig, SchedulerTrigger, TickSample,
     scheduler_tick::tick,
 };
+use crate::audit_offload::TerminalLifecycleToken;
 use crate::{
     EventBus, REFLEX_LIFETIME_EXPIRED_KIND, REFLEX_TRACK_LOST_KIND, ReflexActionGateHandle,
     ReflexAuditSink, SubscriberHandle,
@@ -69,6 +70,14 @@ pub(super) struct RuntimeState {
     pub(super) samples: Arc<Mutex<VecDeque<TickSample>>>,
     pub(super) controls: Arc<Mutex<Vec<ReflexControl>>>,
     pub(super) statuses: Arc<Mutex<Vec<ReflexStatus>>>,
+    /// Prepared terminal transitions indexed exactly like `reflexes`. A slot
+    /// makes its control non-dispatchable while public status remains
+    /// non-terminal until the writer publishes a verified commit ack.
+    pub(super) pending_terminals: Arc<Mutex<Vec<Option<TerminalLifecycleToken>>>>,
+    /// Exact action-denial records handed from dispatch to the lifecycle
+    /// transition builder without independently queueing terminal telemetry.
+    pub(super) denied_terminal_audits:
+        Arc<Mutex<HashMap<synapse_core::ReflexId, StoredReflexAudit>>>,
     pub(super) config: SchedulerConfig,
     /// Off-thread audit hand-off. The scheduler thread must never call
     /// [`crate::write_audit`] directly: that performs a synchronous Calyx
@@ -393,43 +402,36 @@ pub(super) fn mark_reflex_fired(runtime: &RuntimeState, index: usize) {
         .reflexes
         .get(index)
         .is_some_and(|reflex| matches!(reflex.reflex.lifetime, ReflexLifetime::OneShot));
-    if expired && let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let mut expired_status = None;
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = if expired {
-            ReflexState::Expired
-        } else {
-            ReflexState::Active
+    if expired {
+        let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
+            return;
         };
+        final_status.state = ReflexState::Expired;
+        final_status.last_fired_at = Some(Utc::now());
+        final_status.fire_count = final_status.fire_count.saturating_add(1);
+        final_status.last_error_code = None;
+        if let Some(audit) = build_lifetime_expired_audit(runtime, &final_status, "one_shot", None)
+        {
+            prepare_terminal_lifecycle(runtime, index, final_status, audit);
+        }
+    } else if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
+        status.state = ReflexState::Active;
         status.last_fired_at = Some(Utc::now());
         status.fire_count = status.fire_count.saturating_add(1);
         status.last_error_code = None;
-        if expired {
-            expired_status = Some(status.clone());
-        }
-    }
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit(runtime, &status, "one_shot");
     }
 }
 
 pub(super) fn mark_reflex_lifetime_expired(runtime: &RuntimeState, index: usize, reason: &str) {
-    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let expired_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Expired;
-        status.last_fired_at = Some(Utc::now());
-        status.fire_count = status.fire_count.saturating_add(1);
-        status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
-        Some(status.clone())
-    } else {
-        None
+    let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
+        return;
     };
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit(runtime, &status, reason);
+    final_status.state = ReflexState::Expired;
+    final_status.last_fired_at = Some(Utc::now());
+    final_status.fire_count = final_status.fire_count.saturating_add(1);
+    final_status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
+    if let Some(audit) = build_lifetime_expired_audit(runtime, &final_status, reason, None) {
+        prepare_terminal_lifecycle(runtime, index, final_status, audit);
     }
 }
 
@@ -438,20 +440,20 @@ pub(super) fn mark_reflex_combo_completed(
     index: usize,
     combo_completion: Value,
 ) {
-    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let expired_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Expired;
-        status.last_fired_at = Some(Utc::now());
-        status.fire_count = status.fire_count.saturating_add(1);
-        status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
-        Some(status.clone())
-    } else {
-        None
+    let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
+        return;
     };
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit_with_combo(runtime, &status, "completed", combo_completion);
+    final_status.state = ReflexState::Expired;
+    final_status.last_fired_at = Some(Utc::now());
+    final_status.fire_count = final_status.fire_count.saturating_add(1);
+    final_status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
+    if let Some(audit) = build_lifetime_expired_audit(
+        runtime,
+        &final_status,
+        "completed",
+        Some(("combo_completion", combo_completion)),
+    ) {
+        prepare_terminal_lifecycle(runtime, index, final_status, audit);
     }
 }
 
@@ -460,25 +462,20 @@ pub(super) fn mark_reflex_path_follow_completed(
     index: usize,
     path_follow_completion: Value,
 ) {
-    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let expired_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Expired;
-        status.last_fired_at = Some(Utc::now());
-        status.fire_count = status.fire_count.saturating_add(1);
-        status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
-        Some(status.clone())
-    } else {
-        None
+    let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
+        return;
     };
-    if let Some(status) = expired_status {
-        write_lifetime_expired_audit_with_path_follow(
-            runtime,
-            &status,
-            "completed",
-            path_follow_completion,
-        );
+    final_status.state = ReflexState::Expired;
+    final_status.last_fired_at = Some(Utc::now());
+    final_status.fire_count = final_status.fire_count.saturating_add(1);
+    final_status.last_error_code = Some(error_codes::REFLEX_LIFETIME_EXPIRED.to_owned());
+    if let Some(audit) = build_lifetime_expired_audit(
+        runtime,
+        &final_status,
+        "completed",
+        Some(("path_follow_completion", path_follow_completion)),
+    ) {
+        prepare_terminal_lifecycle(runtime, index, final_status, audit);
     }
 }
 
@@ -494,77 +491,123 @@ pub(super) fn mark_reflex_track_lost(
     lost_for: Duration,
     target_context: &serde_json::Value,
 ) {
-    if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
-        control.active = false;
-    }
-    let lost_status = if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::Expired;
-        status.last_error_code = Some(error_codes::REFLEX_TRACK_LOST.to_owned());
-        Some(status.clone())
-    } else {
-        None
-    };
-    let Some(status) = lost_status else {
+    let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
         return;
     };
-    write_track_lost_audit(runtime, &status, lost_for, target_context);
+    final_status.state = ReflexState::Expired;
+    final_status.last_error_code = Some(error_codes::REFLEX_TRACK_LOST.to_owned());
+    if let Some(audit) = build_track_lost_audit(runtime, &final_status, lost_for, target_context) {
+        prepare_terminal_lifecycle(runtime, index, final_status, audit);
+    }
 }
 
 pub(super) fn mark_reflex_action_denied(runtime: &RuntimeState, index: usize) {
+    let Some(mut final_status) = lock_statuses(&runtime.statuses).get(index).cloned() else {
+        return;
+    };
+    let audit = if let Ok(mut audits) = runtime.denied_terminal_audits.lock() {
+        audits.remove(&final_status.id)
+    } else {
+        tracing::error!(
+            code = "REFLEX_ACTION_DENIAL_INTENT_LOCK_POISONED",
+            reflex_id = %final_status.id,
+            remediation = "stop the scheduler generation and restart from durable desired state",
+            "could not obtain the prepared action-denial terminal audit"
+        );
+        None
+    };
+    let Some(audit) = audit else {
+        return;
+    };
+    final_status.state = ReflexState::ActionDenied;
+    final_status.last_error_code =
+        Some(synapse_core::error_codes::REFLEX_ACTION_PERMISSION_DENIED.to_owned());
+    prepare_terminal_lifecycle(runtime, index, final_status, audit);
+}
+
+fn prepare_terminal_lifecycle(
+    runtime: &RuntimeState,
+    index: usize,
+    final_status: ReflexStatus,
+    final_audit: StoredReflexAudit,
+) {
     if let Some(control) = lock_controls(&runtime.controls).get_mut(index) {
         control.active = false;
     }
-    if let Some(status) = lock_statuses(&runtime.statuses).get_mut(index) {
-        status.state = ReflexState::ActionDenied;
-        status.last_error_code =
-            Some(synapse_core::error_codes::REFLEX_ACTION_PERMISSION_DENIED.to_owned());
+    let Some(sink) = runtime.audit_sink.as_deref() else {
+        tracing::error!(
+            code = "REFLEX_TERMINAL_LIFECYCLE_SINK_MISSING",
+            reflex_id = %final_status.id,
+            terminal_state = ?final_status.state,
+            remediation = "stop this non-durable scheduler and construct it with a real audit database before registering executable reflexes",
+            "reflex was made non-dispatchable but its terminal transition cannot be prepared"
+        );
+        return;
+    };
+    let Ok(mut pending) = runtime.pending_terminals.lock() else {
+        tracing::error!(
+            code = "REFLEX_TERMINAL_PENDING_LOCK_POISONED",
+            reflex_id = %final_status.id,
+            terminal_state = ?final_status.state,
+            remediation = "stop the scheduler generation and restart from durable desired state",
+            "reflex was made non-dispatchable but its terminal state slot is unavailable"
+        );
+        return;
+    };
+    let Some(slot) = pending.get_mut(index) else {
+        tracing::error!(
+            code = "REFLEX_TERMINAL_PENDING_INDEX_MISSING",
+            reflex_id = %final_status.id,
+            reflex_index = index,
+            terminal_slots = pending.len(),
+            remediation = "stop the scheduler generation and repair the reflex/status/control index construction invariant",
+            "reflex was made non-dispatchable but has no terminal state slot"
+        );
+        return;
+    };
+    if slot.is_some() {
+        tracing::error!(
+            code = "REFLEX_TERMINAL_ALREADY_PENDING",
+            reflex_id = %final_status.id,
+            reflex_index = index,
+            remediation = "leave the reflex non-dispatchable and allow the exact existing terminal intent to finish",
+            "refused to replace an in-flight reflex terminal transition"
+        );
+        return;
+    }
+    *slot = Some(sink.prepare_terminal(final_audit, final_status, Arc::clone(&runtime.statuses)));
+}
+
+pub(super) fn advance_pending_terminal_lifecycles(runtime: &RuntimeState) {
+    let Some(sink) = runtime.audit_sink.as_deref() else {
+        return;
+    };
+    let Ok(mut pending) = runtime.pending_terminals.lock() else {
+        tracing::error!(
+            code = "REFLEX_TERMINAL_PENDING_LOCK_POISONED",
+            remediation = "stop the scheduler generation and restart from durable desired state",
+            "could not advance prepared reflex terminal transitions"
+        );
+        return;
+    };
+    for slot in pending.iter_mut() {
+        let Some(token) = slot.as_ref() else {
+            continue;
+        };
+        sink.advance_terminal(token);
+        if token.is_completed() {
+            *slot = None;
+        }
     }
 }
 
-fn write_lifetime_expired_audit(runtime: &RuntimeState, status: &ReflexStatus, reason: &str) {
-    write_lifetime_expired_audit_inner(runtime, status, reason, None);
-}
-
-fn write_lifetime_expired_audit_with_combo(
-    runtime: &RuntimeState,
-    status: &ReflexStatus,
-    reason: &str,
-    combo_completion: Value,
-) {
-    write_lifetime_expired_audit_inner(
-        runtime,
-        status,
-        reason,
-        Some(("combo_completion", combo_completion)),
-    );
-}
-
-fn write_lifetime_expired_audit_with_path_follow(
-    runtime: &RuntimeState,
-    status: &ReflexStatus,
-    reason: &str,
-    path_follow_completion: Value,
-) {
-    write_lifetime_expired_audit_inner(
-        runtime,
-        status,
-        reason,
-        Some(("path_follow_completion", path_follow_completion)),
-    );
-}
-
-fn write_lifetime_expired_audit_inner(
+fn build_lifetime_expired_audit(
     runtime: &RuntimeState,
     status: &ReflexStatus,
     reason: &str,
     completion: Option<(&'static str, Value)>,
-) {
-    let Some(sink) = runtime.audit_sink.as_deref() else {
-        return;
-    };
-    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_LIFETIME_EXPIRED_KIND) else {
-        return;
-    };
+) -> Option<StoredReflexAudit> {
+    let ts_ns = crate::audit_timestamp::try_now_unix_ns(REFLEX_LIFETIME_EXPIRED_KIND)?;
     let mut details = json!({
         "kind": REFLEX_LIFETIME_EXPIRED_KIND,
         "reason": reason,
@@ -574,7 +617,7 @@ fn write_lifetime_expired_audit_inner(
     if let Some((field, value)) = completion {
         details[field] = value;
     }
-    let audit = StoredReflexAudit {
+    Some(StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: status.id.clone(),
@@ -587,23 +630,17 @@ fn write_lifetime_expired_audit_inner(
         details,
         redacted: false,
         redactions: Vec::new(),
-    };
-    sink.enqueue(audit);
+    })
 }
 
-fn write_track_lost_audit(
+fn build_track_lost_audit(
     runtime: &RuntimeState,
     status: &ReflexStatus,
     lost_for: Duration,
     target_context: &serde_json::Value,
-) {
-    let Some(sink) = runtime.audit_sink.as_deref() else {
-        return;
-    };
-    let Some(ts_ns) = crate::audit_timestamp::try_now_unix_ns(REFLEX_TRACK_LOST_KIND) else {
-        return;
-    };
-    let audit = StoredReflexAudit {
+) -> Option<StoredReflexAudit> {
+    let ts_ns = crate::audit_timestamp::try_now_unix_ns(REFLEX_TRACK_LOST_KIND)?;
+    Some(StoredReflexAudit {
         schema_version: SCHEMA_VERSION,
         audit_id: Uuid::now_v7().to_string(),
         reflex_id: status.id.clone(),
@@ -622,8 +659,7 @@ fn write_track_lost_audit(
         }),
         redacted: false,
         redactions: Vec::new(),
-    };
-    sink.enqueue(audit);
+    })
 }
 
 const fn path_kind(path: &synapse_core::PathSpec) -> &'static str {

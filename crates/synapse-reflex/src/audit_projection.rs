@@ -326,14 +326,16 @@ pub fn write_projected_grounded_lifecycle_audit(
     let kind = audit.details.get("kind").and_then(Value::as_str);
     let valid_lifecycle = matches!(
         (audit.status, kind),
-        (ReflexState::Active, Some("reflex_registered"))
-            | (ReflexState::Cancelled, Some("reflex_cancelled"))
+        (
+            ReflexState::Active,
+            Some("reflex_registered" | "reflex_terminal_lifecycle_intent_prepared")
+        ) | (ReflexState::Cancelled, Some("reflex_cancelled"))
             | (ReflexState::Disabled, Some("reflex_disabled_by_operator"))
             | (ReflexState::Expired | ReflexState::ActionDenied, Some(_))
     );
     if !valid_lifecycle {
         return Err(storage_write_error(&format!(
-            "REFLEX_GROUNDED_LIFECYCLE_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/cancellation/disable audit through the grounded lifecycle transaction",
+            "REFLEX_GROUNDED_LIFECYCLE_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/terminal-intent/cancellation/disable audit through the grounded lifecycle transaction",
             audit.reflex_id,
             audit.status,
             audit.details.get("kind")

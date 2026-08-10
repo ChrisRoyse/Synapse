@@ -8794,24 +8794,24 @@ fn validate_reflex_registration_publication(
     let kind = record.details.get("kind").and_then(Value::as_str);
     if !matches!(
         (record.status, kind),
-        (synapse_core::ReflexState::Active, Some("reflex_registered"))
-            | (
-                synapse_core::ReflexState::Cancelled,
-                Some("reflex_cancelled")
-            )
-            | (
-                synapse_core::ReflexState::Disabled,
-                Some("reflex_disabled_by_operator")
-            )
-            | (
-                synapse_core::ReflexState::Expired | synapse_core::ReflexState::ActionDenied,
-                Some(_)
-            )
+        (
+            synapse_core::ReflexState::Active,
+            Some("reflex_registered" | "reflex_terminal_lifecycle_intent_prepared")
+        ) | (
+            synapse_core::ReflexState::Cancelled,
+            Some("reflex_cancelled")
+        ) | (
+            synapse_core::ReflexState::Disabled,
+            Some("reflex_disabled_by_operator")
+        ) | (
+            synapse_core::ReflexState::Expired | synapse_core::ReflexState::ActionDenied,
+            Some(_)
+        )
     ) {
         return Err(calyx_write_failed_detail(
             OPERATION_CF,
             format!(
-                "REFLEX_LIFECYCLE_AUDIT_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/cancellation/disable audit through the lifecycle transaction",
+                "REFLEX_LIFECYCLE_AUDIT_KIND_INVALID: reflex_id={} status={:?} kind={:?}; remediation=route only a supported registration/terminal-intent/cancellation/disable audit through the lifecycle transaction",
                 record.reflex_id,
                 record.status,
                 record.details.get("kind")

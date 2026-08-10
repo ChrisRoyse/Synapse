@@ -2471,10 +2471,15 @@ impl SynapseService {
                 match runtime.try_lock() {
                     Ok(runtime) => {
                         let audit_timestamp_invalid_total = runtime.audit_timestamp_invalid_total();
+                        let audit_queue = runtime.audit_queue_snapshot().unwrap_or_default();
                         match runtime.recursion_clamps_total() {
                             Ok(recursion_clamps_total) => SubsystemHealth {
-                                status: if audit_timestamp_invalid_total > 0 {
+                                status: if audit_timestamp_invalid_total > 0
+                                    || audit_queue.terminal_failed > 0
+                                {
                                     "error".to_owned()
+                                } else if audit_queue.terminal_pending > 0 {
+                                    "pending_terminal_commit".to_owned()
                                 } else if runtime.degraded_latency() {
                                     "degraded_latency".to_owned()
                                 } else {
@@ -2483,6 +2488,32 @@ impl SynapseService {
                                 detail: Some(if audit_timestamp_invalid_total > 0 {
                                     format!(
                                         "{audit_timestamp_invalid_total} reflex audit timestamp(s) were rejected; inspect REFLEX_AUDIT_TIMESTAMP_INVALID logs and repair the system clock/timestamp source before restarting"
+                                    )
+                                } else if audit_queue.terminal_failed > 0 {
+                                    format!(
+                                        "{} reflex terminal lifecycle transition(s) failed closed; last_reflex_id={} last_intent_id={} phase={} detail={}; remediation=keep the reflex non-dispatchable, repair the named queue/storage/readback failure, and restart so durable terminal-intent recovery can finish",
+                                        audit_queue.terminal_failed,
+                                        audit_queue
+                                            .terminal_failure_reflex_id
+                                            .as_deref()
+                                            .unwrap_or("unknown"),
+                                        audit_queue
+                                            .terminal_failure_intent_id
+                                            .as_deref()
+                                            .unwrap_or("unknown"),
+                                        audit_queue
+                                            .terminal_failure_phase
+                                            .as_deref()
+                                            .unwrap_or("unknown"),
+                                        audit_queue
+                                            .terminal_failure_detail
+                                            .as_deref()
+                                            .unwrap_or("unknown"),
+                                    )
+                                } else if audit_queue.terminal_pending > 0 {
+                                    format!(
+                                        "{} reflex terminal lifecycle transition(s) are non-dispatchable and awaiting durable prepare/completion acknowledgement",
+                                        audit_queue.terminal_pending
                                     )
                                 } else {
                                     "reflex runtime initialized".to_owned()
@@ -2503,6 +2534,22 @@ impl SynapseService {
                                 degraded_tick_count: Some(runtime.degraded_tick_count()),
                                 recursion_clamps_total: Some(recursion_clamps_total),
                                 audit_timestamp_invalid_total: Some(audit_timestamp_invalid_total),
+                                terminal_lifecycle_pending: Some(audit_queue.terminal_pending),
+                                terminal_lifecycle_prepared_total: Some(
+                                    audit_queue.terminal_prepared,
+                                ),
+                                terminal_lifecycle_committed_total: Some(
+                                    audit_queue.terminal_committed,
+                                ),
+                                terminal_lifecycle_failed_total: Some(audit_queue.terminal_failed),
+                                terminal_lifecycle_failure_reflex_id: audit_queue
+                                    .terminal_failure_reflex_id,
+                                terminal_lifecycle_failure_intent_id: audit_queue
+                                    .terminal_failure_intent_id,
+                                terminal_lifecycle_failure_phase: audit_queue
+                                    .terminal_failure_phase,
+                                terminal_lifecycle_failure_detail: audit_queue
+                                    .terminal_failure_detail,
                                 ..SubsystemHealth::default()
                             },
                             Err(error) => SubsystemHealth {
@@ -2523,6 +2570,22 @@ impl SynapseService {
                                 ),
                                 degraded_tick_count: Some(runtime.degraded_tick_count()),
                                 audit_timestamp_invalid_total: Some(audit_timestamp_invalid_total),
+                                terminal_lifecycle_pending: Some(audit_queue.terminal_pending),
+                                terminal_lifecycle_prepared_total: Some(
+                                    audit_queue.terminal_prepared,
+                                ),
+                                terminal_lifecycle_committed_total: Some(
+                                    audit_queue.terminal_committed,
+                                ),
+                                terminal_lifecycle_failed_total: Some(audit_queue.terminal_failed),
+                                terminal_lifecycle_failure_reflex_id: audit_queue
+                                    .terminal_failure_reflex_id,
+                                terminal_lifecycle_failure_intent_id: audit_queue
+                                    .terminal_failure_intent_id,
+                                terminal_lifecycle_failure_phase: audit_queue
+                                    .terminal_failure_phase,
+                                terminal_lifecycle_failure_detail: audit_queue
+                                    .terminal_failure_detail,
                                 ..SubsystemHealth::default()
                             },
                         }

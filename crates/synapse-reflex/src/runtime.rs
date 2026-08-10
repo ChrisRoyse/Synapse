@@ -59,6 +59,13 @@ impl ReflexRuntime {
         crate::audit_timestamp::invalid_total()
     }
 
+    #[must_use]
+    pub fn audit_queue_snapshot(&self) -> Option<crate::ReflexAuditQueueSnapshot> {
+        self.scheduler
+            .as_ref()
+            .and_then(SchedulerHandle::audit_queue_snapshot)
+    }
+
     /// Spawns the reflex runtime scaffold.
     ///
     /// # Errors
@@ -90,6 +97,8 @@ impl ReflexRuntime {
         crate::audit_migration::repair_reflex_audit_retention_corruption(&db)?;
         crate::audit_projection::ensure(&db)?;
         crate::durable_state::reconcile_legacy_active_orphans(&db)?;
+        let recovered_terminal_intents =
+            crate::durable_state::reconcile_prepared_terminal_intents(&db)?;
         let durable_records = crate::durable_state::load_records(&db)?;
         let mut reflexes = Vec::new();
         let mut disabled_reflex_ids = HashSet::new();
@@ -120,6 +129,13 @@ impl ReflexRuntime {
         }
         reflexes.sort_by(|left, right| left.reflex_id.cmp(&right.reflex_id));
         recovered_statuses.sort_by(|left, right| left.id.cmp(&right.id));
+        if recovered_terminal_intents > 0 {
+            tracing::warn!(
+                code = "REFLEX_TERMINAL_INTENTS_RECONCILED",
+                recovered_terminal_intents,
+                "completed every prepared reflex terminal intent before runtime construction"
+            );
+        }
         Ok(Self {
             db,
             action_handle,
@@ -397,8 +413,23 @@ impl ReflexRuntime {
         &self.event_bus
     }
 
-    pub(crate) fn terminal_runtime_reflex_ids(&self) -> HashSet<ReflexId> {
-        self.statuses()
+    pub(crate) fn terminal_runtime_reflex_ids(&self) -> ReflexResult<HashSet<ReflexId>> {
+        if let Some(scheduler) = &self.scheduler {
+            let mut pending_ids = scheduler
+                .pending_terminal_ids()?
+                .into_iter()
+                .collect::<Vec<_>>();
+            if !pending_ids.is_empty() {
+                pending_ids.sort();
+                return Err(ReflexError::ParamsInvalid {
+                    detail: format!(
+                        "REFLEX_TERMINAL_LIFECYCLE_PENDING: phase=scheduler_replacement_prepare pending_reflex_ids={pending_ids:?}; remediation=leave the current scheduler generation running until health terminal_lifecycle_pending returns zero, then retry the registration"
+                    ),
+                });
+            }
+        }
+        Ok(self
+            .statuses()
             .into_iter()
             .filter(|status| {
                 matches!(
@@ -407,7 +438,7 @@ impl ReflexRuntime {
                 )
             })
             .map(|status| status.id)
-            .collect()
+            .collect::<HashSet<_>>())
     }
 
     #[tracing::instrument(skip_all, fields(component = "reflex_runtime"))]

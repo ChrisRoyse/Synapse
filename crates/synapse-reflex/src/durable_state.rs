@@ -74,6 +74,24 @@ pub struct DurableReflexRecord {
     pub status: ReflexStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activation: Option<ReflexActivation>,
+    /// A scheduler-observed terminal transition which has been durably
+    /// prepared but not yet durably completed.
+    ///
+    /// This lives in the desired-state row itself so process recovery never
+    /// has to infer whether an in-memory non-dispatchable reflex may be
+    /// replayed. The exact terminal audit and status are frozen before the
+    /// prepare acknowledgement is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) terminal_intent: Option<DurableTerminalIntent>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DurableTerminalIntent {
+    pub intent_id: String,
+    pub prepared_at_ns: u64,
+    pub terminal_status: ReflexStatus,
+    pub terminal_audit: StoredReflexAudit,
 }
 
 impl DurableReflexRecord {
@@ -87,6 +105,7 @@ impl DurableReflexRecord {
             definition,
             status,
             activation,
+            terminal_intent: None,
         };
         record.validate()?;
         Ok(record)
@@ -98,6 +117,22 @@ impl DurableReflexRecord {
             definition: self.definition.clone(),
             status,
             activation: self.activation.clone(),
+            terminal_intent: None,
+        };
+        record.validate()?;
+        Ok(record)
+    }
+
+    pub(crate) fn with_terminal_intent(
+        &self,
+        terminal_intent: DurableTerminalIntent,
+    ) -> ReflexResult<Self> {
+        let record = Self {
+            schema_version: self.schema_version,
+            definition: self.definition.clone(),
+            status: self.status.clone(),
+            activation: self.activation.clone(),
+            terminal_intent: Some(terminal_intent),
         };
         record.validate()?;
         Ok(record)
@@ -133,6 +168,31 @@ impl DurableReflexRecord {
         scheduler::validate_reflexes(std::slice::from_ref(&self.definition))?;
         if let Some(activation) = &self.activation {
             activation.validate(reflex_id)?;
+        }
+        if let Some(intent) = &self.terminal_intent
+            && (self.status.state != ReflexState::Active
+                || intent.terminal_status.id != reflex_id
+                || intent.terminal_audit.reflex_id != reflex_id
+                || intent.terminal_audit.audit_id != intent.intent_id
+                || intent.terminal_audit.ts_ns < intent.prepared_at_ns
+                || intent.terminal_audit.status != intent.terminal_status.state
+                || !matches!(
+                    intent.terminal_status.state,
+                    ReflexState::Expired | ReflexState::ActionDenied
+                ))
+        {
+            return Err(durable_error(format!(
+                "REFLEX_DURABLE_TERMINAL_INTENT_INVALID: reflex_id={reflex_id} desired_state={:?} intent_id={} terminal_status_id={} terminal_audit_id={} terminal_audit_reflex_id={} terminal_state={:?} audit_state={:?} prepared_at_ns={} audit_ts_ns={}; remediation=preserve the row and repair the exact prepared terminal intent before restarting",
+                self.status.state,
+                intent.intent_id,
+                intent.terminal_status.id,
+                intent.terminal_audit.audit_id,
+                intent.terminal_audit.reflex_id,
+                intent.terminal_status.state,
+                intent.terminal_audit.status,
+                intent.prepared_at_ns,
+                intent.terminal_audit.ts_ns,
+            )));
         }
         Ok(())
     }
@@ -208,6 +268,64 @@ pub fn load_record(db: &Db, reflex_id: &str) -> ReflexResult<DurableReflexRecord
     )))?;
     record.validate()?;
     Ok(record)
+}
+
+/// Completes every durably prepared terminal transition before any recovered
+/// scheduler can be constructed.
+///
+/// A prepared intent is the crash-recovery authority: its exact terminal
+/// status and audit were committed while the prior public status was still
+/// active and the scheduler control was non-dispatchable. Recovery therefore
+/// completes that transition and never replays the definition.
+pub fn reconcile_prepared_terminal_intents(db: &Db) -> ReflexResult<usize> {
+    let records = load_records(db)?;
+    let pending = records
+        .into_iter()
+        .filter(|record| record.terminal_intent.is_some())
+        .collect::<Vec<_>>();
+    for prior_record in &pending {
+        let intent = prior_record.terminal_intent.as_ref().ok_or_else(|| {
+            durable_error(format!(
+                "REFLEX_TERMINAL_INTENT_RECOVERY_SELECTION_INVALID: reflex_id={}; remediation=stop startup and inspect the in-memory desired-state selection invariant",
+                prior_record.definition.reflex_id
+            ))
+        })?;
+        let next_record = prior_record.with_status(intent.terminal_status.clone())?;
+        crate::audit::write_terminal_lifecycle_audit(
+            db,
+            &intent.terminal_audit,
+            prior_record,
+            &next_record,
+        )
+        .map_err(|error| {
+            durable_error(format!(
+                "REFLEX_TERMINAL_INTENT_RECOVERY_COMMIT_FAILED: reflex_id={} intent_id={} detail={error}; remediation=preserve the vault, repair the named Calyx commit failure, and restart; the prepared definition must not be activated",
+                prior_record.definition.reflex_id, intent.intent_id
+            ))
+        })?;
+        db.flush().map_err(|error| {
+            durable_error(format!(
+                "REFLEX_TERMINAL_INTENT_RECOVERY_FLUSH_FAILED: reflex_id={} intent_id={} detail={error}; remediation=preserve the vault and repair the Calyx flush path before restart",
+                prior_record.definition.reflex_id, intent.intent_id
+            ))
+        })?;
+        crate::audit::verify_terminal_lifecycle_readback(
+            db,
+            &intent.terminal_audit,
+            &next_record,
+            "recovery_completion",
+        )
+        .map_err(|error| durable_error(error.to_string()))?;
+        tracing::warn!(
+            code = "REFLEX_TERMINAL_INTENT_RECOVERED",
+            reflex_id = %prior_record.definition.reflex_id,
+            intent_id = %intent.intent_id,
+            terminal_state = ?intent.terminal_status.state,
+            remediation = "none; the prepared terminal transition was completed from its exact durable intent before scheduler activation",
+            "completed a prepared reflex terminal transition during crash recovery without replaying the definition"
+        );
+    }
+    Ok(pending.len())
 }
 
 pub fn reconcile_legacy_active_orphans(db: &Db) -> ReflexResult<()> {

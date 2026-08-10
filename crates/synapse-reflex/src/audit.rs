@@ -149,6 +149,124 @@ pub(crate) fn write_terminal_lifecycle_audit(
     )
 }
 
+/// Atomically records a prepared terminal intent while keeping the durable
+/// executable status active. The scheduler remains non-dispatchable in memory;
+/// only the writer acknowledgement allows the completion phase to be queued.
+pub(crate) fn write_terminal_lifecycle_intent(
+    db: &Db,
+    audit: &StoredReflexAudit,
+    prior_record: &crate::durable_state::DurableReflexRecord,
+    prepared_record: &crate::durable_state::DurableReflexRecord,
+) -> StorageResult<()> {
+    crate::hot_path::guard_cold("reflex_write_terminal_lifecycle_intent");
+    write_guarded_lifecycle_mutation(db, audit, prior_record, prepared_record)
+}
+
+fn write_guarded_lifecycle_mutation(
+    db: &Db,
+    audit: &StoredReflexAudit,
+    prior_record: &crate::durable_state::DurableReflexRecord,
+    next_record: &crate::durable_state::DurableReflexRecord,
+) -> StorageResult<()> {
+    let key = audit_key(audit).into_bytes();
+    let value = encode_json(audit)?;
+    let desired_key = crate::durable_state::desired_state_key(&audit.reflex_id);
+    let prior_value = crate::durable_state::encode_record(prior_record).map_err(|error| {
+        synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_KV.to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+    let next_value = crate::durable_state::encode_record(next_record).map_err(|error| {
+        synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_KV.to_owned(),
+            detail: error.to_string(),
+        }
+    })?;
+    let revisioned = db
+        .get_cf_revisioned(synapse_storage::cf::CF_KV, &desired_key)?
+        .ok_or_else(|| synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_KV.to_owned(),
+            detail: format!(
+                "REFLEX_DURABLE_DEFINITION_MISSING: reflex_id={}; remediation=do not publish or execute the pending terminal transition; run explicit orphan reconciliation",
+                audit.reflex_id
+            ),
+        })?;
+    if revisioned.value.as_deref() != Some(prior_value.as_slice()) {
+        return Err(synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_KV.to_owned(),
+            detail: format!(
+                "REFLEX_TERMINAL_INTENT_DESIRED_READBACK_MISMATCH: reflex_id={} expected_sha256={} actual_sha256={}; remediation=keep the reflex non-dispatchable, inspect the exact desired-state revision, and reconcile the competing lifecycle writer",
+                audit.reflex_id,
+                synapse_storage::ordered_index::sha256_hex(&prior_value),
+                revisioned.value.as_deref().map_or_else(
+                    || "expired".to_owned(),
+                    synapse_storage::ordered_index::sha256_hex,
+                )
+            ),
+        });
+    }
+    crate::audit_projection::write_projected_grounded_lifecycle_audit(
+        db,
+        audit,
+        &key,
+        &value,
+        Some((&desired_key, &next_value, Some(revisioned.revision_sha256))),
+    )
+}
+
+/// Independently reopens the desired-state row and source audit after a flush.
+/// Equality of both exact byte strings is the terminal commit acknowledgement.
+pub(crate) fn verify_terminal_lifecycle_readback(
+    db: &Db,
+    audit: &StoredReflexAudit,
+    expected_record: &crate::durable_state::DurableReflexRecord,
+    phase: &str,
+) -> StorageResult<()> {
+    let desired_key = crate::durable_state::desired_state_key(&audit.reflex_id);
+    let expected_desired =
+        crate::durable_state::encode_record(expected_record).map_err(|error| {
+            synapse_storage::StorageError::WriteFailed {
+                cf_name: synapse_storage::cf::CF_KV.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+    let actual_desired = db.get_cf(synapse_storage::cf::CF_KV, &desired_key)?;
+    if actual_desired.as_deref() != Some(expected_desired.as_slice()) {
+        return Err(synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_KV.to_owned(),
+            detail: format!(
+                "REFLEX_TERMINAL_LIFECYCLE_READBACK_FAILED: phase={phase} reflex_id={} row=desired_state expected_sha256={} actual_sha256={}; remediation=keep the reflex non-dispatchable, preserve the vault, and repair the exact Calyx read/write disagreement",
+                audit.reflex_id,
+                synapse_storage::ordered_index::sha256_hex(&expected_desired),
+                actual_desired.as_deref().map_or_else(
+                    || "missing".to_owned(),
+                    synapse_storage::ordered_index::sha256_hex,
+                )
+            ),
+        });
+    }
+    let source_key = audit_key(audit).into_bytes();
+    let expected_audit = encode_json(audit)?;
+    let actual_audit = db.get_cf(synapse_storage::cf::CF_REFLEX_AUDIT, &source_key)?;
+    if actual_audit.as_deref() != Some(expected_audit.as_slice()) {
+        return Err(synapse_storage::StorageError::WriteFailed {
+            cf_name: synapse_storage::cf::CF_REFLEX_AUDIT.to_owned(),
+            detail: format!(
+                "REFLEX_TERMINAL_LIFECYCLE_READBACK_FAILED: phase={phase} reflex_id={} row=audit audit_id={} expected_sha256={} actual_sha256={}; remediation=keep the reflex non-dispatchable, preserve the vault, and repair the exact Calyx source-row disagreement",
+                audit.reflex_id,
+                audit.audit_id,
+                synapse_storage::ordered_index::sha256_hex(&expected_audit),
+                actual_audit.as_deref().map_or_else(
+                    || "missing".to_owned(),
+                    synapse_storage::ordered_index::sha256_hex,
+                )
+            ),
+        });
+    }
+    Ok(())
+}
+
 pub(crate) struct TerminalLifecycleTransition {
     pub(crate) audit: StoredReflexAudit,
     pub(crate) prior_record: crate::durable_state::DurableReflexRecord,
@@ -216,6 +334,6 @@ pub(crate) fn write_terminal_lifecycle_batch(
     crate::audit_projection::write_projected_grounded_lifecycle_batch(db, entries)
 }
 
-fn audit_key(audit: &StoredReflexAudit) -> String {
+pub(crate) fn audit_key(audit: &StoredReflexAudit) -> String {
     format!("{}:{:020}:{}", audit.reflex_id, audit.ts_ns, audit.audit_id)
 }

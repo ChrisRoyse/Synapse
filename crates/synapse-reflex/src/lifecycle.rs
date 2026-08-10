@@ -42,7 +42,7 @@ impl ReflexRuntime {
                 ),
             });
         }
-        let terminal_ids = self.terminal_runtime_reflex_ids();
+        let terminal_ids = self.terminal_runtime_reflex_ids()?;
         let mut next = self
             .reflexes
             .iter()

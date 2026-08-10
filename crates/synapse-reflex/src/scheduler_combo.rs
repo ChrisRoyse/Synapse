@@ -102,7 +102,7 @@ fn dispatch_context(runtime: &RuntimeState) -> ReflexActionDispatchContext {
     ReflexActionDispatchContext::new(
         runtime.action_handle.clone(),
         runtime.action_gate.clone(),
-        runtime.audit_sink.clone(),
+        runtime.denied_terminal_audits.clone(),
         runtime.audit_context.clone(),
         runtime.tick_index,
     )

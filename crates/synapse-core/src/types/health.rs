@@ -1070,6 +1070,22 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_timestamp_invalid_total: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_pending: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_prepared_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_committed_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_failed_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_failure_reflex_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_failure_intent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_failure_phase: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_lifecycle_failure_detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_count: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_reload_at: Option<String>,

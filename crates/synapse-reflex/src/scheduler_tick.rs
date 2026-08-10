@@ -15,7 +15,7 @@ use uuid::Uuid;
 use super::{
     REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, SchedulerTrigger, TickSample,
     scheduler_combo::{dispatch_reflex_action, step_active_combos},
-    scheduler_loop::TickLateSignal,
+    scheduler_loop::{TickLateSignal, advance_pending_terminal_lifecycles},
     scheduler_stateful::step_stateful_controllers,
 };
 use crate::{
@@ -42,6 +42,7 @@ pub(super) fn tick(runtime: &mut RuntimeState, elapsed: Duration, degraded: bool
         .lowered_guard_thresholds
         .load_for_tick(crate::hot_path::unix_time_ms_now());
     crate::hot_path::record_hot_tick();
+    advance_pending_terminal_lifecycles(runtime);
     let events = runtime.subscription.drain();
     expire_action_until_event_lifetimes(runtime, &events);
     let mut dispatched_actions = 0_usize;
