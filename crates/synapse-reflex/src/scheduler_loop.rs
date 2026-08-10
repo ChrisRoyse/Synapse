@@ -331,6 +331,27 @@ pub(super) fn status_for_reflex(
     }
 }
 
+pub(super) fn status_for_reflex_with_history(
+    reflex: &ScheduledReflex,
+    registered_at: chrono::DateTime<Utc>,
+    prior_statuses: &[ReflexStatus],
+) -> ReflexStatus {
+    let mut status = status_for_reflex(reflex, registered_at);
+    if let Some(prior) = prior_statuses
+        .iter()
+        .find(|prior| prior.id == reflex.reflex_id)
+    {
+        // The replacement scheduler owns current state/control fields, while
+        // these fields are the retained reflex's lifecycle history. Adding an
+        // unrelated reflex must not rewrite them (#2197).
+        status.registered_at = prior.registered_at;
+        status.last_fired_at = prior.last_fired_at;
+        status.fire_count = prior.fire_count;
+        status.last_error_code.clone_from(&prior.last_error_code);
+    }
+    status
+}
+
 fn kind_summary(reflex: &ScheduledReflex) -> String {
     match &reflex.driver {
         ScheduledReflexDriver::Actions => match &reflex.trigger {

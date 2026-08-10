@@ -46,48 +46,18 @@ impl ReflexRuntime {
         next.push(reflex.clone());
         scheduler::validate_reflexes(&next)?;
 
-        let new_scheduler = match (self.action_gate.clone(), self.aim_track_target_source.clone()) {
-            (Some(action_gate), Some(target_source)) => scheduler::ReflexScheduler::spawn_with_audit_db_context_action_gate_and_aim_track_source(
-                self.event_bus.clone(),
-                self.action_handle.clone(),
-                next.clone(),
-                self.scheduler_config.clone(),
-                Arc::clone(&self.db),
-                self.audit_context.clone(),
-                action_gate,
-                target_source,
-            )?,
-            (Some(action_gate), None) => {
-                scheduler::ReflexScheduler::spawn_with_audit_db_context_and_action_gate(
-                    self.event_bus.clone(),
-                    self.action_handle.clone(),
-                    next.clone(),
-                    self.scheduler_config.clone(),
-                    Arc::clone(&self.db),
-                    self.audit_context.clone(),
-                    action_gate,
-                )?
-            }
-            (None, Some(target_source)) => {
-                scheduler::ReflexScheduler::spawn_with_audit_db_context_and_aim_track_source(
-                    self.event_bus.clone(),
-                    self.action_handle.clone(),
-                    next.clone(),
-                    self.scheduler_config.clone(),
-                    Arc::clone(&self.db),
-                    self.audit_context.clone(),
-                    target_source,
-                )?
-            }
-            (None, None) => scheduler::ReflexScheduler::spawn_with_audit_db_and_context(
-                self.event_bus.clone(),
-                self.action_handle.clone(),
-                next.clone(),
-                self.scheduler_config.clone(),
-                Arc::clone(&self.db),
-                self.audit_context.clone(),
-            )?,
-        };
+        let prior_statuses = self.statuses();
+        let new_scheduler = scheduler::ReflexScheduler::spawn_replacement(
+            self.event_bus.clone(),
+            self.action_handle.clone(),
+            next.clone(),
+            self.scheduler_config.clone(),
+            Arc::clone(&self.db),
+            self.audit_context.clone(),
+            self.action_gate.clone(),
+            self.aim_track_target_source.clone(),
+            &prior_statuses,
+        )?;
         if !self.disabled_reflex_ids.is_empty() {
             let disabled_reflex_ids = self.disabled_reflex_ids.iter().cloned().collect::<Vec<_>>();
             let _disabled_statuses = new_scheduler.disable_reflexes(&disabled_reflex_ids);

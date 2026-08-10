@@ -7,7 +7,9 @@ use std::{
 
 use chrono::Utc;
 use synapse_action::ActionHandle;
-use synapse_core::{Action, EventFilter, ReflexId, ReflexLifetime, StoredAuditContext};
+use synapse_core::{
+    Action, EventFilter, ReflexId, ReflexLifetime, ReflexStatus, StoredAuditContext,
+};
 use synapse_storage::Db;
 
 use crate::{
@@ -29,7 +31,8 @@ use scheduler_loop::{
     hold_move_states, lock_controls, mark_reflex_action_denied, mark_reflex_active_if_starved,
     mark_reflex_combo_completed, mark_reflex_error, mark_reflex_fired,
     mark_reflex_lifetime_expired, mark_reflex_path_follow_completed, mark_reflex_starved,
-    mark_reflex_track_lost, path_follow_states, run_scheduler_thread, status_for_reflex,
+    mark_reflex_track_lost, path_follow_states, run_scheduler_thread,
+    status_for_reflex_with_history,
 };
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
@@ -328,6 +331,7 @@ impl ReflexScheduler {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -352,6 +356,7 @@ impl ReflexScheduler {
             None,
             Some(action_gate),
             None,
+            None,
         )
     }
 
@@ -373,6 +378,7 @@ impl ReflexScheduler {
             reflexes,
             config,
             Some(audit_db),
+            None,
             None,
             None,
             None,
@@ -401,6 +407,7 @@ impl ReflexScheduler {
             audit_context,
             None,
             None,
+            None,
         )
     }
 
@@ -426,6 +433,7 @@ impl ReflexScheduler {
             Some(audit_db),
             audit_context,
             Some(action_gate),
+            None,
             None,
         )
     }
@@ -454,6 +462,7 @@ impl ReflexScheduler {
             audit_context,
             None,
             Some(aim_track_target_source),
+            None,
         )
     }
 
@@ -483,6 +492,38 @@ impl ReflexScheduler {
             audit_context,
             Some(action_gate),
             Some(aim_track_target_source),
+            None,
+        )
+    }
+
+    /// Replaces a running scheduler without rewriting retained reflex
+    /// lifecycle history. History is installed before the tick thread is
+    /// spawned, so no observer can see a fresh timestamp/counter window.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "scheduler replacement carries the explicit runtime dependencies plus the lifecycle history being preserved"
+    )]
+    pub(crate) fn spawn_replacement(
+        event_bus: EventBus,
+        action_handle: ActionHandle,
+        reflexes: Vec<ScheduledReflex>,
+        config: SchedulerConfig,
+        audit_db: Arc<Db>,
+        audit_context: Option<StoredAuditContext>,
+        action_gate: Option<ReflexActionGateHandle>,
+        aim_track_target_source: Option<AimTrackTargetSourceHandle>,
+        prior_statuses: &[ReflexStatus],
+    ) -> ReflexResult<SchedulerHandle> {
+        Self::spawn_inner(
+            event_bus,
+            action_handle,
+            reflexes,
+            config,
+            Some(audit_db),
+            audit_context,
+            action_gate,
+            aim_track_target_source,
+            Some(prior_statuses),
         )
     }
 
@@ -496,6 +537,7 @@ impl ReflexScheduler {
         audit_context: Option<StoredAuditContext>,
         action_gate: Option<ReflexActionGateHandle>,
         aim_track_target_source: Option<AimTrackTargetSourceHandle>,
+        prior_statuses: Option<&[ReflexStatus]>,
     ) -> ReflexResult<SchedulerHandle> {
         config.validate()?;
         validate_reflexes(&reflexes)?;
@@ -523,13 +565,7 @@ impl ReflexScheduler {
             })?;
         let stop = Arc::new(AtomicBool::new(false));
         let samples = Arc::new(Mutex::new(VecDeque::with_capacity(config.sample_limit)));
-        let registered_at = Utc::now();
-        let statuses = Arc::new(Mutex::new(
-            reflexes
-                .iter()
-                .map(|reflex| status_for_reflex(reflex, registered_at))
-                .collect::<Vec<_>>(),
-        ));
+        let statuses = Arc::new(Mutex::new(initial_statuses(&reflexes, prior_statuses)));
         let controls = Arc::new(Mutex::new(
             reflexes
                 .iter()
@@ -605,6 +641,18 @@ impl ReflexScheduler {
             lowered_refresher,
         })
     }
+}
+
+fn initial_statuses(
+    reflexes: &[ScheduledReflex],
+    prior_statuses: Option<&[ReflexStatus]>,
+) -> Vec<ReflexStatus> {
+    let registered_at = Utc::now();
+    let prior_statuses = prior_statuses.unwrap_or_default();
+    reflexes
+        .iter()
+        .map(|reflex| status_for_reflex_with_history(reflex, registered_at, prior_statuses))
+        .collect()
 }
 
 /// Builds the tick's frozen guard-threshold feed and starts its off-tick
