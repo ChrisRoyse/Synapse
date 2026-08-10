@@ -1,7 +1,7 @@
 # FSV — #2208 / #2209 / #2210: truthful, durable setup phase ledgers
 
-Date: 2026-08-10  
-Host: configured Windows production host  
+Date: 2026-08-10
+Host: configured Windows production host
 Branch: `main` only
 
 ## Sources of Truth
