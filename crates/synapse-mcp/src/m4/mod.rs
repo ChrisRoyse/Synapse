@@ -11,6 +11,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use rmcp::{
     ErrorData,
     model::ErrorCode,
@@ -70,6 +71,9 @@ const RUN_SHELL_INLINE_AWAIT_LIMIT_ENV: &str = "SYNAPSE_RUN_SHELL_INLINE_AWAIT_L
 const ANY_PERMITTED_SENTINEL: &str = "__any_permitted__";
 const SHELL_OUTPUT_CAP_BYTES: usize = 1024 * 1024;
 const SHELL_CLEANUP_CAPTURE_CAP_BYTES: u64 = 1024 * 1024;
+const DEFAULT_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES: u64 = 1024 * 1024;
+pub(crate) const MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const LAUNCH_OUTPUT_PREVIEW_MAX_BYTES: usize = 4 * 1024;
 pub(crate) const SHELL_JOB_TAIL_DEFAULT_BYTES: u64 = 64 * 1024;
 const SHELL_JOB_TAIL_MAX_BYTES: u64 = 1024 * 1024;
 const SHELL_JOB_DASHBOARD_TAIL_BYTES: u64 = 2 * 1024;
@@ -1123,6 +1127,52 @@ pub struct ActLaunchParams {
     #[serde(default)]
     #[schemars(default)]
     pub desktop: Option<String>,
+    /// Terminal/output ownership contract for the freshly-created process.
+    /// Omission preserves the historical fire-and-forget behavior and reports
+    /// terminal observation as `not_requested`; it is never interpreted as a
+    /// successful exit. `capture` retains the exact process handle, drains
+    /// stdout/stderr concurrently, and durably publishes a terminal row.
+    #[serde(default)]
+    #[schemars(default)]
+    pub output: Option<ActLaunchOutput>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ActLaunchOutput {
+    FireAndForget,
+    Capture {
+        #[serde(default = "default_launch_output_capture_max_bytes")]
+        #[schemars(
+            default = "default_launch_output_capture_max_bytes",
+            range(min = 1, max = 16_777_216)
+        )]
+        max_bytes_per_stream: u64,
+    },
+}
+
+impl ActLaunchOutput {
+    #[must_use]
+    pub const fn mode(&self) -> &'static str {
+        match self {
+            Self::FireAndForget => "fire_and_forget",
+            Self::Capture { .. } => "capture",
+        }
+    }
+
+    #[must_use]
+    pub const fn capture_max_bytes_per_stream(&self) -> Option<u64> {
+        match self {
+            Self::FireAndForget => None,
+            Self::Capture {
+                max_bytes_per_stream,
+            } => Some(*max_bytes_per_stream),
+        }
+    }
+}
+
+const fn default_launch_output_capture_max_bytes() -> u64 {
+    DEFAULT_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -1688,8 +1738,15 @@ fn validate_local_model_ref(model_ref: &str) -> Result<(), ErrorData> {
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ActLaunchResponse {
+    /// Content-bound identity shared by the durable start and terminal rows.
+    pub launch_id: String,
     /// PID of the process act_launch freshly spawned.
     pub pid: u32,
+    /// Exact Windows process creation FILETIME read from the retained process
+    /// handle. Together with `pid`, this identifies the process generation and
+    /// prevents PID reuse from binding a terminal row to another process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_creation_time_100ns: Option<u64>,
     pub hwnd: Option<i64>,
     /// PID that actually OWNS `hwnd`. Equals `pid` for a normal launch where the
     /// spawned process showed its own window. Differs from `pid` when act_launch
@@ -1728,6 +1785,18 @@ pub struct ActLaunchResponse {
     /// Desktop routing readback when `desktop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<ActLaunchDesktopReadback>,
+    pub output: ActLaunchOutputLaunchReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActLaunchOutputLaunchReadback {
+    pub mode: String,
+    pub terminal_observation: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes_per_stream: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_history_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1754,6 +1823,7 @@ pub fn launch_request_details(params: &ActLaunchParams) -> serde_json::Value {
         "force_renderer_accessibility": params.force_renderer_accessibility,
         "windows_console_window_state": params.windows_console_window_state,
         "desktop": params.desktop,
+        "output": params.output,
         "windows_new_console": launch_target_needs_new_console(&params.target),
         "request_sha256": launch_request_sha256(params).ok(),
     })
@@ -1766,6 +1836,17 @@ pub fn launch_process_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
         response.pid
     )
     .into_bytes()
+}
+
+fn launch_process_terminal_history_row_key_parts(launched_at: &str, pid: u32) -> String {
+    format!(
+        "process_history/v1/act_launch/{}/{pid}/terminal",
+        launched_at.replace(':', "_")
+    )
+}
+
+pub fn launch_process_terminal_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
+    launch_process_terminal_history_row_key_parts(&response.launched_at, response.pid).into_bytes()
 }
 
 /// Build the `CF_PROCESS_HISTORY` row for one `act_launch`.
@@ -1786,10 +1867,24 @@ pub fn launch_process_history_row_key(response: &ActLaunchResponse) -> Vec<u8> {
 pub fn launch_process_history_row(
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
+    session_id: Option<&str>,
 ) -> Result<Vec<u8>, ErrorData> {
     let launched_at_unix_ms = launched_at_unix_ms(&response.launched_at)?;
     let parentage = synapse_action::capture_process_parentage(response.pid);
     let parent_pid = parentage.edge_parent_pid();
+    if let (Some(handle_creation), Some(snapshot_creation)) = (
+        response.process_creation_time_100ns,
+        parentage.child_start_time_100ns,
+    ) && handle_creation != snapshot_creation
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "act_launch exact handle/snapshot process creation identity mismatch for pid {}: handle={} snapshot={}",
+                response.pid, handle_creation, snapshot_creation
+            ),
+        ));
+    }
     if parent_pid.is_none() {
         tracing::warn!(
             code = "ACTION_LAUNCH_PARENTAGE_UNPROVEN",
@@ -1809,10 +1904,14 @@ pub fn launch_process_history_row(
     })?;
     let mut row = json!({
         "parentage": parentage,
-        "schema_version": 1,
+        "schema_version": 2,
         "row_kind": "process_start",
         "tool": "act_launch",
-        "status": "started",
+        "status": if response.output.terminal_observation == "running" { "running" } else { "started" },
+        "launch_id": response.launch_id,
+        "start_history_key": String::from_utf8_lossy(&launch_process_history_row_key(response)),
+        "terminal_history_key": response.output.terminal_history_key,
+        "session_id": session_id,
         "target": params.target,
         "args": params.args,
         "working_dir": params.working_dir,
@@ -1824,6 +1923,7 @@ pub fn launch_process_history_row(
         "request_sha256": launch_request_sha256(params).ok(),
         "command_line": launch_command_line(params).ok(),
         "pid": response.pid,
+        "process_creation_time_100ns": response.process_creation_time_100ns,
         "hwnd": response.hwnd,
         "matched_title": response.matched_title,
         "launched_at": response.launched_at,
@@ -1840,6 +1940,7 @@ pub fn launch_process_history_row(
         "cdp_verified_title": response.cdp_verified_title,
         "desktop": params.desktop,
         "desktop_readback": response.desktop,
+        "output": response.output,
     });
     // Written only when the observation is edge-bearing, and written as an
     // integer when it is. The key is absent rather than `null` for an unproven
@@ -1858,6 +1959,66 @@ pub fn launch_process_history_row(
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_launch process history row encode failed: {error}"),
+        )
+    })
+}
+
+pub fn launch_process_terminal_history_row(
+    params: &ActLaunchParams,
+    response: &ActLaunchResponse,
+    session_id: Option<&str>,
+    exit: &LaunchProcessExitObservation,
+    status: &str,
+    stdout: Option<&ActLaunchOutputArtifactReadback>,
+    stderr: Option<&ActLaunchOutputArtifactReadback>,
+    termination_cause: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<Vec<u8>, ErrorData> {
+    let observed_at = chrono::Utc::now();
+    let completed_at = exit.completed_at_unix_ms.and_then(|unix_ms| {
+        i64::try_from(unix_ms)
+            .ok()
+            .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+            .map(|value| value.to_rfc3339())
+    });
+    let ts_ns = exit
+        .completed_at_unix_ms
+        .unwrap_or_else(|| u64::try_from(observed_at.timestamp_millis()).unwrap_or(u64::MAX))
+        .saturating_mul(1_000_000);
+    let row = json!({
+        "schema_version": 2,
+        "row_kind": "process_terminal",
+        "tool": "act_launch",
+        "status": status,
+        "launch_id": response.launch_id,
+        "start_history_key": String::from_utf8_lossy(&launch_process_history_row_key(response)),
+        "terminal_history_key": String::from_utf8_lossy(&launch_process_terminal_history_row_key(response)),
+        "session_id": session_id,
+        "target": params.target,
+        "args": params.args,
+        "working_dir": params.working_dir,
+        "command_line": launch_command_line(params).ok(),
+        "request_sha256": launch_request_sha256(params).ok(),
+        "pid": response.pid,
+        "process_creation_time_100ns": exit.process_creation_time_100ns,
+        "process_exit_time_100ns": exit.process_exit_time_100ns,
+        "launched_at": response.launched_at,
+        "completed_at": completed_at,
+        "completed_at_unix_ms": exit.completed_at_unix_ms,
+        "observed_at": observed_at.to_rfc3339(),
+        "exit_code": exit.exit_code,
+        "exit_observation_status": exit.status,
+        "output_contract": response.output,
+        "stdout": stdout,
+        "stderr": stderr,
+        "termination_cause": termination_cause,
+        "error_message": error_message,
+        "ts_ns": ts_ns,
+    });
+    encode_json(&row).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_launch terminal process history row encode failed: {error}"),
         )
     })
 }
@@ -9024,6 +9185,29 @@ pub(crate) async fn launch_for_session_with_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActLaunchOutcome, ErrorData> {
     let matched_pattern = validate_launch_authorized(config, &params)?;
+    if matches!(params.output, Some(ActLaunchOutput::Capture { .. })) && session_id.is_none() {
+        return Err(launch_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_launch output capture requires an HTTP MCP session so the complete inherited process tree remains owned until every output writer closes",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "launch_output_capture_requires_session",
+                "remediation": "initialize Streamable HTTP MCP, then call act_launch/process launch with that Mcp-Session-Id; use fire_and_forget only when terminal/output observation is deliberately not required",
+            }),
+        ));
+    }
+    #[cfg(not(windows))]
+    if matches!(params.output, Some(ActLaunchOutput::Capture { .. })) {
+        return Err(launch_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_launch output capture is unavailable on this non-Windows build",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "launch_output_capture_windows_only",
+                "remediation": "run the Windows Synapse daemon whose retained process HANDLE and creation FILETIME provide the required exact-generation terminal authority",
+            }),
+        ));
+    }
     let command_line = launch_command_line(&params)?;
     let wait_regex = params
         .wait_for_window_title_regex
@@ -9055,7 +9239,7 @@ pub(crate) async fn launch_for_session_with_boundary(
         .as_ref()
         .map(PreparedLaunchDesktop::to_response);
     boundary("act_launch_immediately_before_create_process")?;
-    let spawned = spawn_launch_child(&spawn_params, launch_desktop)?;
+    let mut spawned = spawn_launch_child(&spawn_params, launch_desktop, session_id.is_some())?;
     let pid = spawned.pid;
     ensure_launched_process_mutation_boundary(
         boundary,
@@ -9139,6 +9323,29 @@ pub(crate) async fn launch_for_session_with_boundary(
         WindowWaitResult::not_requested()
     };
     let launched_at = chrono::Utc::now().to_rfc3339();
+    let request_sha256 = launch_request_sha256(&params)?;
+    let launch_id = sha256_hex(
+        format!(
+            "act_launch/v2\0{}\0{}\0{}\0{}",
+            pid,
+            spawned
+                .process_creation_time_100ns
+                .map_or_else(|| "unavailable".to_owned(), |value| value.to_string()),
+            launched_at,
+            request_sha256
+        )
+        .as_bytes(),
+    );
+    let output_mode = params
+        .output
+        .as_ref()
+        .map_or("fire_and_forget", ActLaunchOutput::mode);
+    let output_max_bytes = params
+        .output
+        .as_ref()
+        .and_then(ActLaunchOutput::capture_max_bytes_per_stream);
+    let terminal_history_key =
+        output_max_bytes.map(|_| launch_process_terminal_history_row_key_parts(&launched_at, pid));
     tracing::info!(
         code = "M4_ACT_LAUNCH_EXECUTED",
         command_line = %command_line,
@@ -9171,7 +9378,9 @@ pub(crate) async fn launch_for_session_with_boundary(
     ensure_launched_process_mutation_boundary(boundary, "act_launch_before_response", pid)?;
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
+            launch_id,
             pid,
+            process_creation_time_100ns: spawned.process_creation_time_100ns,
             window_owner_pid,
             reused_existing_window,
             hwnd: window.hwnd,
@@ -9184,15 +9393,29 @@ pub(crate) async fn launch_for_session_with_boundary(
             cdp_verified_url: cdp_target.as_ref().map(|target| target.url.clone()),
             cdp_verified_title: cdp_target.and_then(|target| target.title),
             desktop: desktop_readback,
+            output: ActLaunchOutputLaunchReadback {
+                mode: output_mode.to_owned(),
+                terminal_observation: if output_max_bytes.is_some() {
+                    "running".to_owned()
+                } else {
+                    "not_requested".to_owned()
+                },
+                max_bytes_per_stream: output_max_bytes,
+                terminal_history_key,
+            },
         },
-        desktop_lease: spawned.desktop_lease,
+        process_job: spawned.process_job.take(),
+        desktop_lease: spawned.desktop_lease.take(),
+        terminal_capture: spawned.terminal_capture.take(),
     })
 }
 
 #[derive(Debug)]
 pub(crate) struct ActLaunchOutcome {
     pub response: ActLaunchResponse,
+    pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<LaunchDesktopLease>,
+    pub terminal_capture: Option<LaunchTerminalCapture>,
 }
 
 /// Planned CDP-debug augmentation for a Chromium-family launch (#684).
@@ -10024,6 +10247,26 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
             )
         })?;
     }
+    if let Some(ActLaunchOutput::Capture {
+        max_bytes_per_stream,
+    }) = &params.output
+        && (*max_bytes_per_stream == 0
+            || *max_bytes_per_stream > MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES)
+    {
+        return Err(launch_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "act_launch output capture max_bytes_per_stream must be between 1 and {MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES}"
+            ),
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "launch_output_capture_limit_invalid",
+                "max_bytes_per_stream": max_bytes_per_stream,
+                "maximum": MAX_LAUNCH_OUTPUT_CAPTURE_MAX_BYTES,
+                "remediation": "set output.mode=capture with max_bytes_per_stream in the documented range, or use output.mode=fire_and_forget when terminal/output observation is not required",
+            }),
+        ));
+    }
     validate_console_launch_visibility(params)?;
     validate_launch_desktop_option(params)?;
     validate_shared_tabbed_desktop_launch_target(params)?;
@@ -10649,16 +10892,84 @@ fn validate_console_launch_visibility(params: &ActLaunchParams) -> Result<(), Er
 
 struct SpawnedLaunchChild {
     pid: u32,
+    process_creation_time_100ns: Option<u64>,
+    process_job: Option<OwnedProcessJob>,
     desktop_lease: Option<LaunchDesktopLease>,
+    terminal_capture: Option<LaunchTerminalCapture>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LaunchTerminalCapture {
+    pub control: LaunchTerminalCaptureControl,
+    pub process_wait: tokio::task::JoinHandle<LaunchProcessExitObservation>,
+    pub stdout: tokio::task::JoinHandle<ActLaunchOutputArtifactReadback>,
+    pub stderr: tokio::task::JoinHandle<ActLaunchOutputArtifactReadback>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct LaunchTerminalCaptureControl {
+    termination_cause: Arc<Mutex<Option<String>>>,
+}
+
+impl LaunchTerminalCaptureControl {
+    pub(crate) fn mark_termination_cause(&self, cause: &str) -> Result<(), String> {
+        let mut guard = self
+            .termination_cause
+            .lock()
+            .map_err(|_error| "launch terminal capture control lock poisoned".to_owned())?;
+        if guard.is_none() {
+            *guard = Some(cause.to_owned());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn termination_cause(&self) -> Result<Option<String>, String> {
+        self.termination_cause
+            .lock()
+            .map(|guard| guard.clone())
+            .map_err(|_error| "launch terminal capture control lock poisoned".to_owned())
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LaunchProcessExitObservation {
+    pub status: String,
+    pub exit_code: Option<u32>,
+    pub process_creation_time_100ns: u64,
+    pub process_exit_time_100ns: Option<u64>,
+    pub completed_at_unix_ms: Option<u64>,
+    pub error_message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ActLaunchOutputArtifactReadback {
+    pub state: String,
+    pub observed_bytes: u64,
+    pub observed_sha256: String,
+    pub captured_bytes: u64,
+    pub captured_sha256: String,
+    pub truncated: bool,
+    pub preview_bytes: u64,
+    pub preview_base64: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utf8_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    pub artifact_verified: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 fn spawn_launch_child(
     params: &ActLaunchParams,
     desktop: Option<PreparedLaunchDesktop>,
+    session_owned: bool,
 ) -> Result<SpawnedLaunchChild, ErrorData> {
     #[cfg(windows)]
     {
-        return spawn_windows_child(params, desktop);
+        return spawn_windows_child(params, desktop, session_owned);
     }
 
     #[cfg(not(windows))]
@@ -10704,9 +11015,17 @@ fn spawn_launch_child(
                 }),
             )
         })?;
+        let process_job = if session_owned {
+            Some(assign_owned_process_job(child.id(), "act_launch", None)?)
+        } else {
+            None
+        };
         Ok(SpawnedLaunchChild {
             pid: child.id(),
+            process_creation_time_100ns: None,
+            process_job,
             desktop_lease: None,
+            terminal_capture: None,
         })
     }
 }
@@ -10760,15 +11079,83 @@ fn launch_target_is_absolute_windows_path(target: &str) -> bool {
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
+struct OwnedLaunchWindowsHandle {
+    handle: Option<windows::Win32::Foundation::HANDLE>,
+    role: &'static str,
+}
+
+#[cfg(windows)]
+unsafe impl Send for OwnedLaunchWindowsHandle {}
+
+#[cfg(windows)]
+impl OwnedLaunchWindowsHandle {
+    const fn new(handle: windows::Win32::Foundation::HANDLE, role: &'static str) -> Self {
+        Self {
+            handle: Some(handle),
+            role,
+        }
+    }
+
+    fn raw(&self) -> windows::Win32::Foundation::HANDLE {
+        self.handle.unwrap_or_default()
+    }
+
+    fn take(&mut self) -> windows::Win32::Foundation::HANDLE {
+        self.handle.take().unwrap_or_default()
+    }
+
+    fn close_checked(&mut self) -> Result<(), String> {
+        let Some(handle) = self.handle else {
+            return Ok(());
+        };
+        unsafe { windows::Win32::Foundation::CloseHandle(handle) }
+            .map_err(|error| format!("CloseHandle({}) failed: {error}", self.role))?;
+        self.handle = None;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedLaunchWindowsHandle {
+    fn drop(&mut self) {
+        if let Err(error) = self.close_checked() {
+            synapse_action::record_operator_panic_safety_incident();
+            tracing::error!(
+                code = "M4_ACT_LAUNCH_HANDLE_CLOSE_FAILED",
+                role = self.role,
+                detail = %error,
+                "act_launch could not close an owned Windows handle"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
 fn spawn_windows_child(
     params: &ActLaunchParams,
     desktop: Option<PreparedLaunchDesktop>,
+    session_owned: bool,
 ) -> Result<SpawnedLaunchChild, ErrorData> {
     use windows::{
         Win32::{
-            Foundation::CloseHandle,
-            System::Threading::{
-                CreateProcessW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+            Foundation::{
+                GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
+            },
+            Security::SECURITY_ATTRIBUTES,
+            Storage::FileSystem::{
+                CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                OPEN_EXISTING,
+            },
+            System::{
+                Pipes::CreatePipe,
+                Threading::{
+                    CREATE_SUSPENDED, CreateProcessW, DeleteProcThreadAttributeList,
+                    EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+                    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    PROCESS_INFORMATION, ResumeThread, STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES,
+                    STARTUPINFOEXW, STARTUPINFOW, UpdateProcThreadAttribute,
+                },
             },
         },
         core::{PCWSTR, PWSTR},
@@ -10781,7 +11168,16 @@ fn spawn_windows_child(
         .as_ref()
         .map(|desktop| wide_null(desktop.startup_desktop()));
     let environment = launch_environment_block(params)?;
-    let startup_info_cb = u32::try_from(std::mem::size_of::<STARTUPINFOW>()).map_err(|error| {
+    let capture_limit = params
+        .output
+        .as_ref()
+        .and_then(ActLaunchOutput::capture_max_bytes_per_stream);
+    let startup_info_cb = u32::try_from(if capture_limit.is_some() {
+        std::mem::size_of::<STARTUPINFOEXW>()
+    } else {
+        std::mem::size_of::<STARTUPINFOW>()
+    })
+    .map_err(|error| {
         launch_tool_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("act_launch failed to prepare console startup info: {error}"),
@@ -10793,7 +11189,7 @@ fn spawn_windows_child(
         )
     })?;
 
-    let startup_info = STARTUPINFOW {
+    let mut startup_info = STARTUPINFOW {
         cb: startup_info_cb,
         lpDesktop: desktop_wide
             .as_ref()
@@ -10803,34 +11199,322 @@ fn spawn_windows_child(
         ..Default::default()
     };
 
+    let inheritable_security = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(std::mem::size_of::<SECURITY_ATTRIBUTES>()).map_err(|error| {
+            launch_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!("act_launch failed to size inherited-handle security attributes: {error}"),
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "reason": "launch_security_attributes_size_overflow",
+                }),
+            )
+        })?,
+        lpSecurityDescriptor: core::ptr::null_mut(),
+        bInheritHandle: true.into(),
+    };
+
+    let mut stdout_read = None;
+    let mut stdout_write = None;
+    let mut stderr_read = None;
+    let mut stderr_write = None;
+    let mut stdin_null = None;
+    let mut attribute_storage = Vec::<usize>::new();
+    let mut attribute_list = None;
+    let mut startup_info_ex = STARTUPINFOEXW::default();
+    let mut inherited_handles = None;
+
+    if capture_limit.is_some() {
+        let mut read = HANDLE::default();
+        let mut write = HANDLE::default();
+        unsafe {
+            CreatePipe(
+                &raw mut read,
+                &raw mut write,
+                Some(&raw const inheritable_security),
+                0,
+            )
+        }
+        .map_err(|error| {
+            launch_capture_prepare_error(params, "stdout_pipe_create_failed", error)
+        })?;
+        let read_handle = OwnedLaunchWindowsHandle::new(read, "stdout_read");
+        let write_handle = OwnedLaunchWindowsHandle::new(write, "stdout_write");
+        unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.map_err(
+            |error| {
+                launch_capture_prepare_error(params, "stdout_read_inheritance_clear_failed", error)
+            },
+        )?;
+        stdout_read = Some(read_handle);
+        stdout_write = Some(write_handle);
+
+        read = HANDLE::default();
+        write = HANDLE::default();
+        unsafe {
+            CreatePipe(
+                &raw mut read,
+                &raw mut write,
+                Some(&raw const inheritable_security),
+                0,
+            )
+        }
+        .map_err(|error| {
+            launch_capture_prepare_error(params, "stderr_pipe_create_failed", error)
+        })?;
+        let read_handle = OwnedLaunchWindowsHandle::new(read, "stderr_read");
+        let write_handle = OwnedLaunchWindowsHandle::new(write, "stderr_write");
+        unsafe { SetHandleInformation(read, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)) }.map_err(
+            |error| {
+                launch_capture_prepare_error(params, "stderr_read_inheritance_clear_failed", error)
+            },
+        )?;
+        stderr_read = Some(read_handle);
+        stderr_write = Some(write_handle);
+
+        let nul = unsafe {
+            CreateFileW(
+                windows::core::w!("NUL"),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                Some(&raw const inheritable_security),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        }
+        .map_err(|error| launch_capture_prepare_error(params, "stdin_null_open_failed", error))?;
+        stdin_null = Some(OwnedLaunchWindowsHandle::new(nul, "stdin_null"));
+
+        let inherited_handles = inherited_handles.insert([
+            stdin_null
+                .as_ref()
+                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
+            stdout_write
+                .as_ref()
+                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
+            stderr_write
+                .as_ref()
+                .map_or(HANDLE::default(), OwnedLaunchWindowsHandle::raw),
+        ]);
+        startup_info.dwFlags |= STARTF_USESTDHANDLES;
+        startup_info.hStdInput = inherited_handles[0];
+        startup_info.hStdOutput = inherited_handles[1];
+        startup_info.hStdError = inherited_handles[2];
+
+        let mut attribute_bytes = 0_usize;
+        let _ = unsafe {
+            InitializeProcThreadAttributeList(None, 1, Some(0), &raw mut attribute_bytes)
+        };
+        if attribute_bytes == 0 {
+            return Err(launch_tool_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                "act_launch could not size the strict inherited-handle allowlist",
+                json!({
+                    "code": error_codes::TOOL_INTERNAL_ERROR,
+                    "reason": "launch_handle_allowlist_size_unavailable",
+                    "target": params.target,
+                }),
+            ));
+        }
+        let word_size = std::mem::size_of::<usize>();
+        attribute_storage.resize(attribute_bytes.div_ceil(word_size), 0);
+        let list = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_storage.as_mut_ptr().cast());
+        unsafe {
+            InitializeProcThreadAttributeList(Some(list), 1, Some(0), &raw mut attribute_bytes)
+        }
+        .map_err(|error| {
+            launch_capture_prepare_error(params, "launch_handle_allowlist_initialize_failed", error)
+        })?;
+        attribute_list = Some(list);
+        unsafe {
+            UpdateProcThreadAttribute(
+                list,
+                0,
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                Some(inherited_handles.as_ptr().cast()),
+                std::mem::size_of_val(inherited_handles),
+                None,
+                None,
+            )
+        }
+        .map_err(|error| {
+            launch_capture_prepare_error(params, "launch_handle_allowlist_update_failed", error)
+        })?;
+        startup_info_ex.StartupInfo = startup_info;
+        startup_info_ex.lpAttributeList = list;
+    }
+
     let mut process_info = PROCESS_INFORMATION::default();
+    debug_assert_eq!(inherited_handles.is_some(), capture_limit.is_some());
     let current_dir = current_dir_wide
         .as_ref()
         .map_or(PCWSTR::null(), |dir| PCWSTR(dir.as_ptr()));
 
+    let mut creation_flags = windows_launch_creation_flags(params);
+    if session_owned {
+        creation_flags |= CREATE_SUSPENDED;
+    }
+    if capture_limit.is_some() {
+        creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+    let startup_info_pointer = if capture_limit.is_some() {
+        (&raw const startup_info_ex).cast::<STARTUPINFOW>()
+    } else {
+        &raw const startup_info
+    };
     let result = unsafe {
         CreateProcessW(
             PCWSTR::null(),
             Some(PWSTR(command_line_wide.as_mut_ptr())),
             None,
             None,
-            false,
-            windows_launch_creation_flags(params),
+            capture_limit.is_some(),
+            creation_flags,
             Some(environment.as_ptr().cast()),
             current_dir,
-            &raw const startup_info,
+            startup_info_pointer,
             &raw mut process_info,
         )
     };
 
+    if let Some(list) = attribute_list.take() {
+        unsafe { DeleteProcThreadAttributeList(list) };
+    }
+
     match result {
         Ok(()) => {
             let pid = process_info.dwProcessId;
-            let _ = unsafe { CloseHandle(process_info.hThread) };
-            let _ = unsafe { CloseHandle(process_info.hProcess) };
+            let mut process_handle =
+                OwnedLaunchWindowsHandle::new(process_info.hProcess, "process");
+            let mut thread_handle =
+                OwnedLaunchWindowsHandle::new(process_info.hThread, "primary_thread");
+            stdout_write.take();
+            stderr_write.take();
+            stdin_null.take();
+
+            let process_creation_time_100ns = match windows_process_times(process_handle.raw()) {
+                Ok(times) => times.0,
+                Err(error) => {
+                    let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
+                    return Err(launch_tool_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "act_launch could not read exact process creation identity for pid {pid}: {error}"
+                        ),
+                        json!({
+                            "code": error_codes::TOOL_INTERNAL_ERROR,
+                            "reason": "launch_process_identity_unavailable",
+                            "pid": pid,
+                            "detail": error,
+                            "cleanup": cleanup,
+                        }),
+                    ));
+                }
+            };
+            let process_job = if session_owned {
+                match assign_owned_process_job(pid, "act_launch", None) {
+                    Ok(job) => Some(job),
+                    Err(error) => {
+                        let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
+                        return Err(launch_tool_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            format!(
+                                "act_launch could not assign suspended pid {pid} to its session Job Object: {}",
+                                error.message
+                            ),
+                            json!({
+                                "code": error_codes::TOOL_INTERNAL_ERROR,
+                                "reason": "launch_suspended_job_assignment_failed",
+                                "pid": pid,
+                                "source_error": error.data,
+                                "cleanup": cleanup,
+                            }),
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            if session_owned && unsafe { ResumeThread(thread_handle.raw()) } == u32::MAX {
+                let error = windows::core::Error::from_thread();
+                let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
+                return Err(launch_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("act_launch could not resume contained pid {pid}: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "launch_contained_process_resume_failed",
+                        "pid": pid,
+                        "cleanup": cleanup,
+                    }),
+                ));
+            }
+            if let Err(error) = thread_handle.close_checked() {
+                let cleanup = terminate_wait_windows_launch_process(process_handle.raw());
+                return Err(launch_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "act_launch could not close the primary thread handle for pid {pid}: {error}"
+                    ),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "launch_primary_thread_handle_close_failed",
+                        "pid": pid,
+                        "cleanup": cleanup,
+                    }),
+                ));
+            }
+
+            let terminal_capture = capture_limit.map(|max_bytes| {
+                let process =
+                    OwnedLaunchWindowsHandle::new(process_handle.take(), "captured_process_wait");
+                let stdout = OwnedLaunchWindowsHandle::new(
+                    stdout_read
+                        .as_mut()
+                        .map(OwnedLaunchWindowsHandle::take)
+                        .unwrap_or_default(),
+                    "stdout_read",
+                );
+                let stderr = OwnedLaunchWindowsHandle::new(
+                    stderr_read
+                        .as_mut()
+                        .map(OwnedLaunchWindowsHandle::take)
+                        .unwrap_or_default(),
+                    "stderr_read",
+                );
+                let max_bytes = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+                LaunchTerminalCapture {
+                    control: LaunchTerminalCaptureControl::default(),
+                    process_wait: tokio::task::spawn_blocking(move || {
+                        wait_windows_launch_process(process, process_creation_time_100ns)
+                    }),
+                    stdout: tokio::task::spawn_blocking(move || {
+                        read_and_publish_launch_output(stdout, max_bytes, "stdout")
+                    }),
+                    stderr: tokio::task::spawn_blocking(move || {
+                        read_and_publish_launch_output(stderr, max_bytes, "stderr")
+                    }),
+                }
+            });
+            if terminal_capture.is_none() {
+                process_handle.close_checked().map_err(|error| {
+                    launch_tool_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("act_launch could not close fire-and-forget process handle for pid {pid}: {error}"),
+                        json!({
+                            "code": error_codes::TOOL_INTERNAL_ERROR,
+                            "reason": "launch_fire_and_forget_process_handle_close_failed",
+                            "pid": pid,
+                        }),
+                    )
+                })?;
+            }
             Ok(SpawnedLaunchChild {
                 pid,
+                process_creation_time_100ns: Some(process_creation_time_100ns),
+                process_job,
                 desktop_lease: desktop.map(|desktop| desktop.lease),
+                terminal_capture,
             })
         }
         Err(error) => Err(launch_tool_error(
@@ -10847,6 +11531,314 @@ fn spawn_windows_child(
             }),
         )),
     }
+}
+
+#[cfg(windows)]
+fn launch_capture_prepare_error(
+    params: &ActLaunchParams,
+    reason: &'static str,
+    error: windows::core::Error,
+) -> ErrorData {
+    launch_tool_error(
+        error_codes::TOOL_INTERNAL_ERROR,
+        format!("act_launch could not prepare exact terminal/output capture: {error}"),
+        json!({
+            "code": error_codes::TOOL_INTERNAL_ERROR,
+            "reason": reason,
+            "target": params.target,
+            "detail": error.to_string(),
+            "remediation": "inspect the named Win32 pipe/handle-list failure and daemon logs; the process was not launched",
+        }),
+    )
+}
+
+#[cfg(windows)]
+fn windows_filetime_100ns(filetime: windows::Win32::Foundation::FILETIME) -> u64 {
+    (u64::from(filetime.dwHighDateTime) << 32) | u64::from(filetime.dwLowDateTime)
+}
+
+#[cfg(windows)]
+fn windows_filetime_unix_ms(filetime_100ns: u64) -> Result<u64, String> {
+    const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
+    filetime_100ns
+        .checked_sub(WINDOWS_TO_UNIX_EPOCH_100NS)
+        .map(|ticks| ticks / 10_000)
+        .ok_or_else(|| {
+            format!(
+                "Windows FILETIME {filetime_100ns} precedes the Unix epoch {WINDOWS_TO_UNIX_EPOCH_100NS}"
+            )
+        })
+}
+
+#[cfg(windows)]
+fn windows_process_times(
+    process: windows::Win32::Foundation::HANDLE,
+) -> Result<(u64, u64), String> {
+    use windows::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+
+    let mut creation = FILETIME::default();
+    let mut exit = FILETIME::default();
+    let mut kernel = FILETIME::default();
+    let mut user = FILETIME::default();
+    unsafe {
+        GetProcessTimes(
+            process,
+            &raw mut creation,
+            &raw mut exit,
+            &raw mut kernel,
+            &raw mut user,
+        )
+    }
+    .map_err(|error| format!("GetProcessTimes failed: {error}"))?;
+    Ok((
+        windows_filetime_100ns(creation),
+        windows_filetime_100ns(exit),
+    ))
+}
+
+#[cfg(windows)]
+fn terminate_wait_windows_launch_process(process: windows::Win32::Foundation::HANDLE) -> Value {
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    let termination = unsafe { TerminateProcess(process, 1) }
+        .map(|()| "terminated".to_owned())
+        .unwrap_or_else(|error| format!("TerminateProcess failed: {error}"));
+    let wait = unsafe { WaitForSingleObject(process, 5_000) };
+    json!({
+        "termination": termination,
+        "wait_result": format!("0x{:08x}", wait.0),
+        "wait_object_0": wait == windows::Win32::Foundation::WAIT_OBJECT_0,
+    })
+}
+
+#[cfg(windows)]
+fn wait_windows_launch_process(
+    mut owned: OwnedLaunchWindowsHandle,
+    expected_creation_time_100ns: u64,
+) -> LaunchProcessExitObservation {
+    use windows::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0},
+        System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+    };
+
+    let process = owned.raw();
+    let wait = unsafe { WaitForSingleObject(process, u32::MAX) };
+    let mut errors = Vec::new();
+    let mut exit_code = None;
+    let mut exit_time_100ns = None;
+    let mut completed_at_unix_ms = None;
+    if wait == WAIT_OBJECT_0 {
+        let mut observed_exit_code = 0_u32;
+        match unsafe { GetExitCodeProcess(process, &raw mut observed_exit_code) } {
+            Ok(()) => exit_code = Some(observed_exit_code),
+            Err(error) => errors.push(format!(
+                "GetExitCodeProcess after signaled wait failed: {error}"
+            )),
+        }
+        match windows_process_times(process) {
+            Ok((actual_creation, actual_exit)) => {
+                if actual_creation != expected_creation_time_100ns {
+                    errors.push(format!(
+                        "retained process HANDLE creation identity changed: expected={expected_creation_time_100ns} actual={actual_creation}"
+                    ));
+                }
+                exit_time_100ns = Some(actual_exit);
+                match windows_filetime_unix_ms(actual_exit) {
+                    Ok(value) => completed_at_unix_ms = Some(value),
+                    Err(error) => errors.push(error),
+                }
+            }
+            Err(error) => errors.push(error),
+        }
+    } else if wait == WAIT_FAILED {
+        errors.push(format!(
+            "WaitForSingleObject(process) failed: {}",
+            windows::core::Error::from_thread()
+        ));
+    } else {
+        errors.push(format!(
+            "WaitForSingleObject(process) returned unexpected wait code 0x{:08x}",
+            wait.0
+        ));
+    }
+    if let Err(error) = owned.close_checked() {
+        errors.push(error);
+    }
+    LaunchProcessExitObservation {
+        status: if errors.is_empty() {
+            "observed".to_owned()
+        } else {
+            "unevaluable".to_owned()
+        },
+        exit_code,
+        process_creation_time_100ns: expected_creation_time_100ns,
+        process_exit_time_100ns: exit_time_100ns,
+        completed_at_unix_ms,
+        error_message: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+#[cfg(windows)]
+fn read_and_publish_launch_output(
+    mut owned: OwnedLaunchWindowsHandle,
+    max_bytes: usize,
+    stream: &'static str,
+) -> ActLaunchOutputArtifactReadback {
+    use std::os::windows::io::{FromRawHandle, IntoRawHandle, RawHandle};
+
+    let handle = owned.take();
+    let mut file = unsafe { fs::File::from_raw_handle(handle.0.cast() as RawHandle) };
+    let mut observed_hasher = Sha256::new();
+    let mut captured = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut observed_bytes = 0_u64;
+    let mut read_error = None;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                observed_hasher.update(&buffer[..read]);
+                observed_bytes =
+                    observed_bytes.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+                let remaining = max_bytes.saturating_sub(captured.len());
+                let keep = read.min(remaining);
+                captured.extend_from_slice(&buffer[..keep]);
+            }
+            Err(error) => {
+                read_error = Some(format!(
+                    "ReadFile({stream}) failed after {observed_bytes} bytes: {error}"
+                ));
+                break;
+            }
+        }
+    }
+    let raw_handle = file.into_raw_handle();
+    let close_error = unsafe {
+        windows::Win32::Foundation::CloseHandle(windows::Win32::Foundation::HANDLE(
+            raw_handle.cast(),
+        ))
+    }
+    .err()
+    .map(|error| format!("CloseHandle({stream}_read) failed: {error}"));
+    let observed_sha256 = hex_encode_lower(&observed_hasher.finalize());
+    let captured_sha256 = sha256_hex(&captured);
+    let captured_bytes = u64::try_from(captured.len()).unwrap_or(u64::MAX);
+    let preview = &captured[..captured.len().min(LAUNCH_OUTPUT_PREVIEW_MAX_BYTES)];
+    let publish = publish_launch_output_artifact(&captured, &captured_sha256);
+    let (artifact_path, artifact_verified, publish_error) = match publish {
+        Ok(path) => (Some(path.display().to_string()), true, None),
+        Err(error) => (None, false, Some(error)),
+    };
+    let mut errors = Vec::new();
+    if let Some(error) = read_error {
+        errors.push(error);
+    }
+    if let Some(error) = close_error {
+        errors.push(error);
+    }
+    if let Some(error) = publish_error {
+        errors.push(error);
+    }
+    let state = if errors.is_empty() {
+        "complete"
+    } else if !artifact_verified {
+        "artifact_publish_failed"
+    } else {
+        "read_failed"
+    };
+    ActLaunchOutputArtifactReadback {
+        state: state.to_owned(),
+        observed_bytes,
+        observed_sha256,
+        captured_bytes,
+        captured_sha256,
+        truncated: observed_bytes > captured_bytes || !errors.is_empty(),
+        preview_bytes: u64::try_from(preview.len()).unwrap_or(u64::MAX),
+        preview_base64: BASE64_STANDARD.encode(preview),
+        utf8_preview: std::str::from_utf8(preview).ok().map(ToOwned::to_owned),
+        artifact_path,
+        artifact_verified,
+        error_message: (!errors.is_empty()).then(|| errors.join("; ")),
+    }
+}
+
+#[cfg(windows)]
+fn launch_output_artifact_root_dir() -> Result<PathBuf, String> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "LOCALAPPDATA is missing/empty; cannot publish captured process output".to_owned()
+        })?;
+    let root = PathBuf::from(local_app_data)
+        .join("Synapse")
+        .join("process-output")
+        .join("sha256");
+    if !root.is_absolute() {
+        return Err(format!(
+            "captured process output root is not absolute: {}",
+            root.display()
+        ));
+    }
+    Ok(root)
+}
+
+#[cfg(windows)]
+fn publish_launch_output_artifact(bytes: &[u8], sha256: &str) -> Result<PathBuf, String> {
+    let directory = launch_output_artifact_root_dir()?.join(&sha256[..2]);
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "create captured process output artifact directory {} failed: {error}",
+            directory.display()
+        )
+    })?;
+    let path = directory.join(format!("{sha256}.bin"));
+    if !path.exists() {
+        let temporary = directory.join(format!(".{sha256}.{}.tmp", uuid::Uuid::new_v4().simple()));
+        let write_result = (|| -> Result<(), String> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+                .map_err(|error| format!("create {} failed: {error}", temporary.display()))?;
+            file.write_all(bytes)
+                .map_err(|error| format!("write {} failed: {error}", temporary.display()))?;
+            file.sync_all()
+                .map_err(|error| format!("fsync {} failed: {error}", temporary.display()))?;
+            drop(file);
+            fs::rename(&temporary, &path).map_err(|error| {
+                format!(
+                    "atomic publish {} -> {} failed: {error}",
+                    temporary.display(),
+                    path.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temporary);
+            if !path.exists() {
+                return Err(error);
+            }
+        }
+    }
+    let readback = fs::read(&path).map_err(|error| {
+        format!(
+            "independent artifact readback {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let readback_sha256 = sha256_hex(&readback);
+    if readback != bytes || readback_sha256 != sha256 {
+        return Err(format!(
+            "content-addressed process output readback mismatch path={} expected_bytes={} actual_bytes={} expected_sha256={} actual_sha256={}",
+            path.display(),
+            bytes.len(),
+            readback.len(),
+            sha256,
+            readback_sha256
+        ));
+    }
+    Ok(path)
 }
 
 #[derive(Debug)]
@@ -25328,8 +26320,12 @@ fn launch_tool_error(
 
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    hex_encode_lower(&digest)
+}
+
+fn hex_encode_lower(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
         use std::fmt::Write as _;
         let _ = write!(encoded, "{byte:02x}");
     }

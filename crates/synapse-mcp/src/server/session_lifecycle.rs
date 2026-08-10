@@ -17,14 +17,14 @@ use serde::Serialize;
 use serde_json::json;
 use synapse_action::ActionHandle;
 use synapse_core::error_codes;
-use synapse_storage::{Db, cf};
+use synapse_storage::{Db, cf, decode_json};
 
 use crate::{
     http::sse::SseState,
     m1::mcp_error,
     m2::SharedSessionClipboardBuffers,
     m3::SharedM3State,
-    m4::{self, OwnedProcessJob},
+    m4::{self, LaunchTerminalCaptureControl, OwnedProcessJob},
 };
 
 use super::{
@@ -99,6 +99,8 @@ pub(crate) struct SessionProcessResource {
     pub agent_cli: Option<String>,
     pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
+    pub terminal_capture_control: Option<LaunchTerminalCaptureControl>,
+    pub terminal_history_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -171,6 +173,8 @@ impl SessionProcessResource {
             agent_cli: None,
             process_job: Some(process_job),
             desktop_lease: None,
+            terminal_capture_control: None,
+            terminal_history_key: None,
         }
     }
 
@@ -184,6 +188,16 @@ impl SessionProcessResource {
         desktop_lease: Option<m4::LaunchDesktopLease>,
     ) -> Self {
         self.desktop_lease = desktop_lease;
+        self
+    }
+
+    pub(crate) fn with_terminal_capture(
+        mut self,
+        control: Option<LaunchTerminalCaptureControl>,
+        terminal_history_key: Option<String>,
+    ) -> Self {
+        self.terminal_capture_control = control;
+        self.terminal_history_key = terminal_history_key;
         self
     }
 }
@@ -1232,6 +1246,61 @@ impl SessionLifecycleState {
         for resource in resources.values_mut() {
             let mut status = "no_job_handle".to_owned();
             let mut error_message = None;
+            if let (Some(control), Some(terminal_history_key)) = (
+                resource.terminal_capture_control.as_ref(),
+                resource.terminal_history_key.as_deref(),
+            ) {
+                let initial_status =
+                    self.process_terminal_history_final_status(terminal_history_key);
+                if let Ok(Some(final_status)) = &initial_status {
+                    status = format!("terminal_already_verified:{final_status}");
+                } else {
+                    if let Err(error) = &initial_status {
+                        report.failed = report.failed.saturating_add(1);
+                        error_message = Some(format!(
+                            "initial captured terminal readback failed before forced completion: {error}"
+                        ));
+                    }
+                    if let Err(error) = control.mark_termination_cause("daemon_shutdown_forced") {
+                        report.failed = report.failed.saturating_add(1);
+                        error_message = Some(error);
+                    }
+                    if resource.process_job.is_some() {
+                        report.job_handles_before = report.job_handles_before.saturating_add(1);
+                    } else {
+                        report.failed = report.failed.saturating_add(1);
+                        error_message = Some(
+                            "captured launch had no armed Job Object during daemon shutdown"
+                                .to_owned(),
+                        );
+                    }
+                    drop(resource.process_job.take());
+                    match self.wait_for_process_terminal_history(
+                        terminal_history_key,
+                        PROCESS_JOB_CLOSE_WAIT,
+                    ) {
+                        Ok(final_status) => {
+                            status = format!("capture_terminal_verified:{final_status}");
+                        }
+                        Err(error) => {
+                            report.failed = report.failed.saturating_add(1);
+                            status = "capture_terminal_verification_failed".to_owned();
+                            error_message = Some(error);
+                        }
+                    }
+                    report.items.push(SessionProcessRestartHandoffItem {
+                        tool: resource.tool.to_owned(),
+                        pid: resource.pid,
+                        resource_id: resource.resource_id.clone(),
+                        launch_target: resource.launch_target.clone(),
+                        agent_cli: resource.agent_cli.clone(),
+                        registered_at_unix_ms: resource.registered_at_unix_ms,
+                        status,
+                        error_message,
+                    });
+                    continue;
+                }
+            }
             if let Some(process_job) = resource.process_job.as_mut() {
                 report.job_handles_before = report.job_handles_before.saturating_add(1);
                 match process_job.disarm_kill_on_close(
@@ -1270,6 +1339,66 @@ impl SessionLifecycleState {
             "readback=session_process_ledger edge=daemon_shutdown after=kill_on_close_disarmed"
         );
         report
+    }
+
+    fn process_terminal_history_final_status(
+        &self,
+        terminal_history_key: &str,
+    ) -> Result<Option<String>, String> {
+        let runtime = self
+            .authority_service
+            .reflex_runtime()
+            .map_err(|error| format!("read reflex runtime failed: {}", error.message))?;
+        let runtime = runtime.lock().map_err(|_error| {
+            "reflex runtime lock poisoned while reading captured process terminal history"
+                .to_owned()
+        })?;
+        let key = terminal_history_key.as_bytes();
+        let rows = runtime
+            .storage_cf_prefix_rows(cf::CF_PROCESS_HISTORY, key, 2)
+            .map_err(|error| format!("captured process terminal CF read failed: {error}"))?;
+        let Some((_row_key, row_bytes)) = rows.iter().find(|(row_key, _value)| row_key == key)
+        else {
+            return Ok(None);
+        };
+        let row = decode_json::<serde_json::Value>(row_bytes)
+            .map_err(|error| format!("captured process terminal row decode failed: {error}"))?;
+        if row.get("row_kind").and_then(serde_json::Value::as_str) != Some("process_terminal") {
+            return Err(format!(
+                "captured process terminal key holds non-terminal row_kind={:?}",
+                row.get("row_kind")
+            ));
+        }
+        let status = row
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "captured process terminal row has no string status".to_owned())?;
+        let outputs_final = row.get("stdout").is_some_and(serde_json::Value::is_object)
+            && row.get("stderr").is_some_and(serde_json::Value::is_object);
+        Ok(outputs_final.then(|| status.to_owned()))
+    }
+
+    fn wait_for_process_terminal_history(
+        &self,
+        terminal_history_key: &str,
+        timeout: Duration,
+    ) -> Result<String, String> {
+        let deadline = Instant::now() + timeout;
+        let mut last_error = None;
+        loop {
+            match self.process_terminal_history_final_status(terminal_history_key) {
+                Ok(Some(status)) => return Ok(status),
+                Ok(None) => {}
+                Err(error) => last_error = Some(error),
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "captured process terminal row did not reach independently verified final output state within {} ms; terminal_history_key={terminal_history_key}; last_error={last_error:?}",
+                    timeout.as_millis()
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 
     pub(crate) async fn cleanup_expired_lease_inputs_once(&self) {
@@ -1993,6 +2122,17 @@ impl SessionLifecycleState {
 
             if job_handle_dropped {
                 report.job_close_attempted = report.job_close_attempted.saturating_add(1);
+            }
+            let terminal_capture_pending =
+                resource.terminal_history_key.as_deref().is_some_and(|key| {
+                    !matches!(self.process_terminal_history_final_status(key), Ok(Some(_)))
+                });
+            if (!remaining_after_natural_wait.is_empty() || terminal_capture_pending)
+                && let Some(control) = resource.terminal_capture_control.as_ref()
+                && let Err(error) = control.mark_termination_cause("session_cleanup_forced")
+            {
+                completion_artifact_cleanup_error = Some(error);
+                synapse_action::record_operator_panic_safety_incident();
             }
             drop(resource.process_job.take());
             let (after_job_drop, _waited_ms) =

@@ -835,6 +835,7 @@ impl SynapseService {
             force_renderer_accessibility: None,
             windows_console_window_state: Some(LaunchWindowState::Hidden),
             desktop: session_id.map(|_| "agent:session".to_owned()),
+            output: None,
         };
         let result = self
             .act_launch_for_session_id(launch, session_id.map(ToOwned::to_owned), &preflight)

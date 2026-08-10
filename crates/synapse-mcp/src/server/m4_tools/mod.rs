@@ -40,7 +40,11 @@ use synapse_storage::{cf, decode_json};
 use crate::m3::local_models::{
     LocalModelApiShape, LocalModelProbeParams, LocalModelRegistryRow, ResolvedApiKey,
 };
-use crate::m4::ActRunShellExecutionMode;
+use crate::m4::{
+    ActLaunchOutput, ActLaunchOutputArtifactReadback, ActLaunchOutputLaunchReadback,
+    ActRunShellExecutionMode, LaunchProcessExitObservation, LaunchTerminalCapture,
+    launch_process_terminal_history_row, launch_process_terminal_history_row_key,
+};
 
 use super::{
     m1_tools::validate_target_window,
@@ -59,11 +63,13 @@ pub(crate) const AGENT_SPAWN_MANIFEST_FILENAME: &str = "spawn-manifest.json";
 pub(crate) const AGENT_SPAWN_MANIFEST_VERSION: u32 = 1;
 const CODEX_APP_SERVER_RUNNER_SCRIPT: &str = include_str!("../codex_app_server_runner.ps1");
 const SHELL_FACADE_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\Synapse\\shell-jobs + %LOCALAPPDATA%\\Synapse\\shell-sessions + daemon-tool-events.jsonl";
-const PROCESS_FACADE_SOURCE_OF_TRUTH: &str = "live OS process table + CF_PROCESS_HISTORY";
+const PROCESS_FACADE_SOURCE_OF_TRUTH: &str =
+    "live OS process table + CF_PROCESS_HISTORY + %LOCALAPPDATA%\\Synapse\\process-output\\sha256";
 const PROCESS_LIST_DEFAULT_LIMIT: usize = 100;
 const PROCESS_LIST_MAX_LIMIT: usize = 1000;
 const PROCESS_HISTORY_DEFAULT_LIMIT: usize = 20;
 const PROCESS_HISTORY_MAX_LIMIT: usize = 200;
+const PROCESS_HISTORY_MAX_SCAN_ROWS: usize = 10_000;
 
 mod agent_spawn;
 mod facade;
@@ -1426,17 +1432,16 @@ impl SynapseService {
                     ));
                 }
                 let process_job = if session_id.is_some() {
-                    match assign_owned_process_job(response.pid, "act_launch", None) {
-                        Ok(process_job) => Some(process_job),
-                        Err(error) => {
+                    match outcome.process_job.take() {
+                        Some(process_job) => Some(process_job),
+                        None => {
                             let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
                             return Err(launch_lifecycle_tool_error(
-                                "act_launch spawned the process but failed to assign a session process job; exact spawned PID cleanup was attempted",
+                                "act_launch spawned the process without the required pre-resume session Job Object; exact spawned PID cleanup was attempted",
                                 json!({
                                     "code": error_codes::TOOL_INTERNAL_ERROR,
-                                    "reason": "process_job_assign_failed",
+                                    "reason": "pre_resume_process_job_missing",
                                     "pid": response.pid,
-                                    "source_error": error.message,
                                     "cleanup": cleanup,
                                 }),
                             ));
@@ -1445,7 +1450,9 @@ impl SynapseService {
                 } else {
                     None
                 };
-                if let Err(error) = record_launch_process_history(self, &params, &response) {
+                if let Err(error) =
+                    record_launch_process_history(self, &params, &response, session_id.as_deref())
+                {
                     let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
                     return Err(launch_lifecycle_tool_error(
                         "act_launch spawned the process but failed to record process history; exact spawned PID cleanup was attempted",
@@ -1458,19 +1465,34 @@ impl SynapseService {
                         }),
                     ));
                 }
+                let terminal_capture_control = outcome
+                    .terminal_capture
+                    .as_ref()
+                    .map(|capture| capture.control.clone());
+                let terminal_history_key = response.output.terminal_history_key.clone();
                 if let (Some(session_id), Some(process_job)) = (session_id.clone(), process_job) {
                     if let Err(error) = self.register_session_process_resource(
                         super::session_lifecycle::SessionProcessResource::new(
-                            session_id,
+                            session_id.clone(),
                             "act_launch",
                             response.pid,
                             None,
                             params.target.clone(),
                             process_job,
                         )
-                        .with_desktop_lease(outcome.desktop_lease.take()),
+                        .with_desktop_lease(outcome.desktop_lease.take())
+                        .with_terminal_capture(terminal_capture_control, terminal_history_key),
                     ) {
                         let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
+                        if let Some(capture) = outcome.terminal_capture.take() {
+                            spawn_launch_terminal_monitor(
+                                self.clone(),
+                                params.clone(),
+                                response.clone(),
+                                Some(session_id),
+                                capture,
+                            );
+                        }
                         return Err(launch_lifecycle_tool_error(
                             "act_launch spawned the process but failed to register the session process resource; exact spawned PID cleanup was attempted",
                             json!({
@@ -1482,6 +1504,15 @@ impl SynapseService {
                             }),
                         ));
                     }
+                }
+                if let Some(capture) = outcome.terminal_capture.take() {
+                    spawn_launch_terminal_monitor(
+                        self.clone(),
+                        params.clone(),
+                        response.clone(),
+                        session_id.clone(),
+                        capture,
+                    );
                 }
                 Ok(response)
             }
@@ -1532,9 +1563,19 @@ fn record_launch_process_history(
     service: &SynapseService,
     params: &ActLaunchParams,
     response: &ActLaunchResponse,
+    session_id: Option<&str>,
 ) -> Result<(), ErrorData> {
-    let row = launch_process_history_row(params, response)?;
+    let row = launch_process_history_row(params, response, session_id)?;
     let row_key = launch_process_history_row_key(response);
+    record_and_verify_process_history_row(service, row_key, row, "process_start")
+}
+
+fn record_and_verify_process_history_row(
+    service: &SynapseService,
+    row_key: Vec<u8>,
+    row: Vec<u8>,
+    row_kind: &'static str,
+) -> Result<(), ErrorData> {
     let runtime = service.reflex_runtime()?;
     let runtime = runtime.lock().map_err(|_error| {
         mcp_error(
@@ -1543,8 +1584,211 @@ fn record_launch_process_history(
         )
     })?;
     runtime
-        .storage_put_process_history_rows(vec![(row_key, row)])
-        .map_err(|error| mcp_error(error.code(), error.to_string()))
+        .storage_put_process_history_rows(vec![(row_key.clone(), row.clone())])
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let readback = runtime
+        .storage_cf_prefix_rows(cf::CF_PROCESS_HISTORY, &row_key, 2)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    if readback
+        .iter()
+        .any(|(key, value)| key == &row_key && value == &row)
+    {
+        return Ok(());
+    }
+    Err(mcp_error(
+        error_codes::STORAGE_READ_FAILED,
+        format!(
+            "act_launch {row_kind} process history independent readback mismatch for key={} readback_rows={}",
+            String::from_utf8_lossy(&row_key),
+            readback.len()
+        ),
+    ))
+}
+
+fn record_launch_terminal_history(
+    service: &SynapseService,
+    params: &ActLaunchParams,
+    response: &ActLaunchResponse,
+    session_id: Option<&str>,
+    exit: &LaunchProcessExitObservation,
+    status: &str,
+    stdout: Option<&ActLaunchOutputArtifactReadback>,
+    stderr: Option<&ActLaunchOutputArtifactReadback>,
+    termination_cause: Option<&str>,
+    error_message: Option<&str>,
+) -> Result<(), ErrorData> {
+    let row = launch_process_terminal_history_row(
+        params,
+        response,
+        session_id,
+        exit,
+        status,
+        stdout,
+        stderr,
+        termination_cause,
+        error_message,
+    )?;
+    record_and_verify_process_history_row(
+        service,
+        launch_process_terminal_history_row_key(response),
+        row,
+        "process_terminal",
+    )
+}
+
+fn launch_output_task_failure(
+    stream: &'static str,
+    detail: String,
+) -> ActLaunchOutputArtifactReadback {
+    ActLaunchOutputArtifactReadback {
+        state: "task_failed".to_owned(),
+        observed_bytes: 0,
+        observed_sha256: String::new(),
+        captured_bytes: 0,
+        captured_sha256: String::new(),
+        truncated: true,
+        preview_bytes: 0,
+        preview_base64: String::new(),
+        utf8_preview: None,
+        artifact_path: None,
+        artifact_verified: false,
+        error_message: Some(format!("{stream} capture task failed: {detail}")),
+    }
+}
+
+fn record_launch_monitor_failure(
+    response: &ActLaunchResponse,
+    stage: &'static str,
+    error: &ErrorData,
+) {
+    synapse_action::record_operator_panic_safety_incident();
+    tracing::error!(
+        code = "M4_ACT_LAUNCH_TERMINAL_PERSIST_FAILED",
+        launch_id = %response.launch_id,
+        pid = response.pid,
+        process_creation_time_100ns = ?response.process_creation_time_100ns,
+        stage,
+        error_message = %error.message,
+        error_data = ?error.data,
+        terminal_history_key = ?response.output.terminal_history_key,
+        "act_launch exact terminal observation could not be durably persisted and independently read back"
+    );
+}
+
+fn spawn_launch_terminal_monitor(
+    service: SynapseService,
+    params: ActLaunchParams,
+    response: ActLaunchResponse,
+    session_id: Option<String>,
+    capture: LaunchTerminalCapture,
+) {
+    tokio::spawn(async move {
+        let LaunchTerminalCapture {
+            control,
+            process_wait,
+            stdout,
+            stderr,
+        } = capture;
+        let exit = match process_wait.await {
+            Ok(exit) => exit,
+            Err(error) => LaunchProcessExitObservation {
+                status: "unevaluable".to_owned(),
+                exit_code: None,
+                process_creation_time_100ns: response
+                    .process_creation_time_100ns
+                    .unwrap_or_default(),
+                process_exit_time_100ns: None,
+                completed_at_unix_ms: None,
+                error_message: Some(format!("exact process waiter task failed: {error}")),
+            },
+        };
+        let pending_status = if exit.status == "observed" {
+            "exited_output_pending"
+        } else {
+            "unevaluable"
+        };
+        let pending_termination_cause = control.termination_cause().ok().flatten();
+        if let Err(error) = record_launch_terminal_history(
+            &service,
+            &params,
+            &response,
+            session_id.as_deref(),
+            &exit,
+            pending_status,
+            None,
+            None,
+            pending_termination_cause.as_deref(),
+            exit.error_message.as_deref(),
+        ) {
+            record_launch_monitor_failure(&response, "pending_terminal_write", &error);
+        }
+
+        let (stdout_join, stderr_join) = tokio::join!(stdout, stderr);
+        let stdout = stdout_join
+            .unwrap_or_else(|error| launch_output_task_failure("stdout", error.to_string()));
+        let stderr = stderr_join
+            .unwrap_or_else(|error| launch_output_task_failure("stderr", error.to_string()));
+        let output_fault = stdout.state != "complete" || stderr.state != "complete";
+        let mut errors = Vec::new();
+        let termination_cause = control.termination_cause().unwrap_or_else(|error| {
+            errors.push(error);
+            None
+        });
+        let status = if exit.status != "observed" {
+            "unevaluable"
+        } else if output_fault {
+            "output_fault"
+        } else if let Some(cause) = termination_cause.as_deref() {
+            cause
+        } else if exit.exit_code == Some(0) {
+            "exit_zero"
+        } else {
+            "exit_nonzero"
+        };
+        if let Some(error) = exit.error_message.as_deref() {
+            errors.push(error.to_owned());
+        }
+        if let Some(error) = stdout.error_message.as_deref() {
+            errors.push(error.to_owned());
+        }
+        if let Some(error) = stderr.error_message.as_deref() {
+            errors.push(error.to_owned());
+        }
+        let error_message = (!errors.is_empty()).then(|| errors.join("; "));
+        if let Err(error) = record_launch_terminal_history(
+            &service,
+            &params,
+            &response,
+            session_id.as_deref(),
+            &exit,
+            status,
+            Some(&stdout),
+            Some(&stderr),
+            termination_cause.as_deref(),
+            error_message.as_deref(),
+        ) {
+            record_launch_monitor_failure(&response, "final_terminal_write", &error);
+            return;
+        }
+        tracing::info!(
+            code = "M4_ACT_LAUNCH_TERMINAL_RECORDED",
+            launch_id = %response.launch_id,
+            pid = response.pid,
+            process_creation_time_100ns = ?response.process_creation_time_100ns,
+            status,
+            exit_code = ?exit.exit_code,
+            stdout_observed_bytes = stdout.observed_bytes,
+            stdout_captured_bytes = stdout.captured_bytes,
+            stdout_truncated = stdout.truncated,
+            stdout_sha256 = %stdout.captured_sha256,
+            stderr_observed_bytes = stderr.observed_bytes,
+            stderr_captured_bytes = stderr.captured_bytes,
+            stderr_truncated = stderr.truncated,
+            stderr_sha256 = %stderr.captured_sha256,
+            terminal_history_key = ?response.output.terminal_history_key,
+            "readback=CF_PROCESS_HISTORY+content_addressed_process_output after=terminal_verified"
+        );
+    });
 }
 
 fn launch_agent_spawn_with_terminal_capture(
@@ -1594,8 +1838,12 @@ fn launch_agent_spawn_with_terminal_capture(
         status_path = %spawned.artifacts.status_path.display(),
         "act_spawn_agent launched wrapper in an owned PTY"
     );
+    let process_creation_time_100ns =
+        synapse_action::capture_process_parentage(spawned.process_id).child_start_time_100ns;
     Ok(ActLaunchResponse {
+        launch_id: format!("agent_spawn/{spawn_id}"),
         pid: spawned.process_id,
+        process_creation_time_100ns,
         hwnd: None,
         window_owner_pid: None,
         reused_existing_window: false,
@@ -1608,6 +1856,12 @@ fn launch_agent_spawn_with_terminal_capture(
         cdp_verified_url: None,
         cdp_verified_title: None,
         desktop: None,
+        output: ActLaunchOutputLaunchReadback {
+            mode: "owned_conpty_capture".to_owned(),
+            terminal_observation: "external_agent_capture".to_owned(),
+            max_bytes_per_stream: None,
+            terminal_history_key: None,
+        },
     })
 }
 
@@ -2328,6 +2582,7 @@ impl SynapseService {
             force_renderer_accessibility: None,
             windows_console_window_state: Some(LaunchWindowState::Hidden),
             desktop: None,
+            output: None,
         };
 
         timing.mark_prelaunch_done();
@@ -2418,7 +2673,12 @@ impl SynapseService {
                 ));
             }
         };
-        if let Err(error) = record_launch_process_history(self, &launch_params, &launch_response) {
+        if let Err(error) = record_launch_process_history(
+            self,
+            &launch_params,
+            &launch_response,
+            started_by_session_id.as_deref(),
+        ) {
             let cleanup = crate::m4::terminate_owned_process_tree(launch_response.pid);
             let completion_artifacts = write_agent_spawn_daemon_terminal_artifacts(
                 &files,

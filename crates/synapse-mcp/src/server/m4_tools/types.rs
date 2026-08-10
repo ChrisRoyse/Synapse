@@ -271,6 +271,8 @@ pub struct ProcessParams {
     #[serde(default)]
     pub desktop: Option<String>,
     #[serde(default)]
+    pub output: Option<ActLaunchOutput>,
+    #[serde(default)]
     pub pid: Option<u32>,
     #[serde(default)]
     pub process_name_contains: Option<String>,
@@ -342,6 +344,9 @@ pub struct ProcessHistoryResponse {
     pub cf_name: String,
     pub returned_count: usize,
     pub scanned_tail_rows: usize,
+    pub scan_limit: usize,
+    pub cf_exhausted: bool,
+    pub complete: bool,
     pub limit: usize,
     pub filters: ProcessFilters,
     pub rows: Vec<ProcessHistoryRow>,
@@ -366,4 +371,20 @@ pub struct ProcessHistoryRow {
     pub launched_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_creation_time_100ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination_cause: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<ActLaunchOutputArtifactReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<ActLaunchOutputArtifactReadback>,
 }
