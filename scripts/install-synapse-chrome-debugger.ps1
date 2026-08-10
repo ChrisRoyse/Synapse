@@ -2275,6 +2275,8 @@ function Invoke-SynapseChromeAddressBarNavigation {
     param(
         [Parameter(Mandatory = $true)]
         $Window,
+        [Parameter(Mandatory = $true)]
+        $ForegroundLease,
         [AllowNull()]
         [string]$ChromeUserDataRoot,
         [Parameter(Mandatory = $true)]
@@ -2289,28 +2291,37 @@ function Invoke-SynapseChromeAddressBarNavigation {
 
     $before = Read-SynapseChromeNavigationState -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
     $foregroundBefore = Read-SynapseForegroundWindow
-    $foregroundDeadline = (Get-Date).AddSeconds(5)
-    if ($foregroundDeadline -gt $Deadline) {
-        $foregroundDeadline = $Deadline
-    }
-    $foregroundReadback = Wait-SynapseChromeForegroundAcquisition -Window $Window -Deadline $foregroundDeadline
-    $foregroundAcquired = $foregroundReadback.foreground
-    if (-not $foregroundReadback.acquired) {
-        $foregroundAfter = Read-SynapseForegroundWindow
+    $leasedChrome = $ForegroundLease.acquired_chrome_foreground
+    if (-not $leasedChrome -or $leasedChrome.identity_valid -ne $true) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             purpose = $Purpose
-            target_url = $Url
-            chrome_window_hwnd = $Window.hwnd
-            chrome_window_pid = $Window.pid
-            show_window_async_result = [bool]$foregroundReadback.show_window_async_result
-            set_foreground_window_result = [bool]$foregroundReadback.initial_set_foreground_window_result
-            foreground_acquisition = $foregroundReadback
-            foreground_before = $foregroundBefore
-            foreground_after = $foregroundAfter
+            foreground_lease = $ForegroundLease
+            foreground_now = $foregroundBefore
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_LEASE_INVALID_BEFORE_NAVIGATION detail=$detail remediation=maintenance navigation requires the exact acquired Chrome HWND/PID/process-start/image identity; no new foreground acquisition is attempted inside an existing transaction"
+    }
+    if (-not (Test-SynapseForegroundIdentityExact -Expected $leasedChrome -Actual $foregroundBefore)) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            outcome = 'operator_superseded'
+            operator_superseded = $true
+            purpose = $Purpose
+            acquired_chrome_foreground = $leasedChrome
+            current_foreground = $foregroundBefore
             navigation_before = $before
         }) -Depth 8
-        throw "SYNAPSE_CHROME_NAVIGATION_FOREGROUND_NOT_ACQUIRED detail=$detail remediation=Windows did not make the exact Chrome HWND/PID/process-start/image identity the foreground keyboard target after the ordinary and sole paired-Alt-unlock retry; setup refuses to send browser navigation keys to an unverified or superseded window"
+        throw "SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_OPERATOR_SUPERSEDED_BEFORE_NAVIGATION detail=$detail remediation=the operator selected another exact foreground window after Chrome maintenance began; cleanup will preserve that window and the operation must be retried explicitly"
     }
+    $foregroundReadback = [pscustomobject]@{
+        acquired = $true
+        method = 'existing_maintenance_foreground_lease'
+        show_window_async_result = $false
+        initial_set_foreground_window_result = $false
+        alt_unlock_attempted = $false
+        alt_unlock_set_foreground_window_result = $null
+        attempts = @()
+        foreground = $foregroundBefore
+    }
+    $foregroundAcquired = $foregroundReadback.foreground
 
     $foregroundWindow = Get-SynapseChromeWindowByHwnd `
         -Hwnd $Window.hwnd `
@@ -3260,6 +3271,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
 
     $markerNavigation = Invoke-SynapseChromeAddressBarNavigation `
         -Window $createdWindow.window `
+        -ForegroundLease $foregroundLease `
         -ChromeUserDataRoot $ChromeUserDataRoot `
         -Url $MaintenanceMarkerUrl `
         -ExpectedTitlePattern ("^" + [regex]::Escape($MaintenanceMarkerTitle) + "( - Google Chrome)?$") `
@@ -3919,6 +3931,7 @@ function Invoke-SynapseChromeBridgeExistingUiReload {
 
     $navigation = Invoke-SynapseChromeAddressBarNavigation `
         -Window $chromeWindow `
+        -ForegroundLease $maintenance.lease.foreground_lease `
         -ChromeUserDataRoot $ChromeUserDataRoot `
         -Url $extensionDetailsUrl `
         -ExpectedTitlePattern '^Extensions( - Synapse Chrome Bridge)?( - Google Chrome)?$' `
@@ -4169,6 +4182,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
     # URL before Enter.
     $navigation = Invoke-SynapseChromeAddressBarNavigation `
         -Window $chromeWindow `
+        -ForegroundLease $maintenance.lease.foreground_lease `
         -ChromeUserDataRoot $ChromeUserDataRoot `
         -Url "chrome://extensions/?synapse_maintenance_token=$MaintenanceTabToken" `
         -ExpectedTitlePattern '^Extensions( - Google Chrome)?$' `
@@ -4419,6 +4433,18 @@ try {
         -TimeoutSeconds $AutoInstallTimeoutSeconds
 } catch {
     $operationError = $_.Exception.Message
+    if (
+        $operationError -like 'SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_OPERATOR_SUPERSEDED_BEFORE_NAVIGATION *' -and
+        $script:SynapseChromeMaintenanceTabLease -and
+        $script:SynapseChromeMaintenanceForegroundLease
+    ) {
+        $foregroundDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
+        $foreground = Restore-SynapseChromeMaintenanceForeground `
+            -ForegroundLease $script:SynapseChromeMaintenanceForegroundLease `
+            -Deadline $foregroundDeadline
+        $foregroundJson = ConvertTo-CompressedJson -Value $foreground -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED operation_error=$operationError cleanup=delegated_to_daemon_exact_bridge_ownership_cleanup foreground_transaction=$foregroundJson token=$($script:SynapseChromeMaintenanceTabLease.token) remediation=the operator superseded the maintenance foreground before navigation; the installer performed no further Chrome UI mutation, preserved the exact current foreground, and the daemon must close only the exact marker URL/title tab through the pre-operation bridge lease"
+    }
     if ($script:SynapseChromeMaintenanceTabLease) {
         $cleanupDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
         try {
@@ -4426,7 +4452,8 @@ try {
                 -Lease $script:SynapseChromeMaintenanceTabLease `
                 -ChromeUserDataRoot $chromeUserDataRoot `
                 -Deadline $cleanupDeadline
-            throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED operation_error=$operationError cleanup=verified_absent cleanup_method=$($cleanup.method) token=$($cleanup.token)"
+            $foregroundJson = ConvertTo-CompressedJson -Value $cleanup.foreground_transaction -Depth 10
+            throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED operation_error=$operationError cleanup=verified_absent cleanup_method=$($cleanup.method) foreground_transaction=$foregroundJson token=$($cleanup.token)"
         } catch {
             if ($_.Exception.Message -like 'SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED *') {
                 throw

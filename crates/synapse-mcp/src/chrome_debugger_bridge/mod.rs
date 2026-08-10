@@ -6740,7 +6740,9 @@ impl ChromeDebuggerBridge {
         let token_matches = before_cleanup
             .tabs
             .iter()
-            .filter(|tab| tab.url.contains(&token_fragment))
+            .filter(|tab| {
+                tab.url.contains(&token_fragment) || tab.title == maintenance.marker_title
+            })
             .collect::<Vec<_>>();
 
         if token_matches.is_empty()
@@ -6761,7 +6763,7 @@ impl ChromeDebuggerBridge {
         }
         if token_matches.len() != 1 {
             return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CREATED_TAB_NOT_UNIQUE token_sha256={} token_match_count={} tab_count={} remediation=the post-install bridge must find exactly one UI-created tab carrying the daemon-generated ownership token before closing anything",
+                "SYNAPSE_CHROME_MAINTENANCE_UI_CREATED_TAB_NOT_UNIQUE token_sha256={} token_match_count={} tab_count={} remediation=the post-install bridge must find exactly one UI-created tab carrying either the exact daemon-generated marker title or the token-bearing extension URL before closing anything",
                 sha256_hex_lower(maintenance.token.as_bytes()),
                 token_matches.len(),
                 before_cleanup.tabs.len(),
@@ -6869,7 +6871,7 @@ impl ChromeDebuggerBridge {
         let token_absent = !after_cleanup
             .tabs
             .iter()
-            .any(|tab| tab.url.contains(&token_fragment));
+            .any(|tab| tab.url.contains(&token_fragment) || tab.title == maintenance.marker_title);
         let preexisting_tabs_preserved_exact = maintenance.tabs_before.is_empty()
             || reload_preexisting_tabs_match(&maintenance.tabs_before, &after_cleanup.tabs);
         if !id_absent || !token_absent || !preexisting_tabs_preserved_exact {
