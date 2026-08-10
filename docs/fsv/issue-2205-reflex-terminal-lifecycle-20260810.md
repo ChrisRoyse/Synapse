@@ -173,5 +173,40 @@ production-only tree:
   formatting, dependency policy, and `clippy --all-targets -D warnings`.
 
 The exact clean implementation commit is installed through
-`scripts/synapse-setup.ps1`; its process, executable, health, vault, and chain
-readbacks are recorded in the final documentation-only commit.
+`scripts/synapse-setup.ps1` with the production audio and permission set. Setup
+used all 12 logical CPUs (`CARGO_BUILD_JOBS=12` and
+`CMAKE_BUILD_PARALLEL_LEVEL=12`), built the canonical checkout target, proved
+that this no-NVIDIA host must use the CPU build, exercised a candidate on an
+isolated real vault, gracefully drained the prior daemon, and completed all ten
+phases in 984.388 seconds.
+
+Independent reads after setup, rather than its return value, proved:
+
+- Windows PID `8472` runs
+  `C:\Users\hotra\.cargo\bin\synapse-mcp.exe`;
+- installed executable SHA-256 is
+  `41EAF21CB6ADC26AC1F294D5697D63FA9894553AFBB73FEEAA693A3CEFF68391`;
+- the served release build is exact clean commit
+  `a372763420e0d0c4accffd4e05b1b896bd11bda5` from `refs/heads/main`;
+- its 1,451-file build-input manifest SHA-256 is
+  `629287fd69d4a5b1320ea36908e8fcabd07c3de6ffa37cd06ac02e8c920434ae`;
+- a fresh MCP session initialized, listed all 40 real tools, and executed
+  `routine operation=reflex_list`, which initialized the production reflex
+  runtime through the public surface;
+- a separate full health call reported reflex status `ok`, active count `0`,
+  audit timestamp failures `0`, and terminal pending/prepared/committed/failed
+  `0/0/0/0`;
+- the same vault id `01KYJPGWATPD4XNMZY3ERGTKQW` was open at generation 1;
+- Calyx selected AVX2, its fixed dot/cosine/L2/top-k probes matched the portable
+  path bit-for-bit, and Windows execution-speed throttling was disabled.
+
+Finally, a real public `audit operation=verify_chain` re-read and re-hashed the
+production physical store:
+
+- verdict `intact`, entries/head `342986/342986`, verified `[0..342986)`;
+- raw commitments intact: `965212` total, `965209` sealed, three current
+  checkpoint-tail rows pending, and `39590` cohort seals;
+- tip hash
+  `f84667dd52e16592f2a0987cd0e53f92a5c7939e2bb138be9b6c1ed7ee6be432`;
+- vault generation `1`, reset count `0`, with the lineage-seeded origin and its
+  historical coverage limitation reported truthfully.
