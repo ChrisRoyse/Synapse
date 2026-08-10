@@ -1,10 +1,8 @@
 //! Exact retained timestamp-order projection for transcript health (#2189).
 
 use std::{
-    sync::{
-        LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
+    path::PathBuf,
+    sync::{LazyLock, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,8 +23,19 @@ const SCHEMA_VERSION: u32 = 1;
 const BACKFILL_ROWS: usize = 512;
 pub(super) const MAX_SNAPSHOT_ROWS: usize = 50;
 
-static PROJECTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static PROCESS_RECONCILED: AtomicBool = AtomicBool::new(false);
+static PROJECTION_LOCK: LazyLock<Mutex<ProjectionLockState>> =
+    LazyLock::new(|| Mutex::new(ProjectionLockState::default()));
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VaultIdentity {
+    vault_dir: PathBuf,
+    vault_id: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ProjectionLockState {
+    reconciled_vault: Option<VaultIdentity>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -47,14 +56,18 @@ struct ProjectionProgress {
     rows_indexed: u64,
 }
 
-pub(super) fn lock_projection() -> Result<MutexGuard<'static, ()>, String> {
+pub(super) fn lock_projection() -> Result<MutexGuard<'static, ProjectionLockState>, String> {
     PROJECTION_LOCK.lock().map_err(|_error| {
         "AGENT_TRANSCRIPT_ORDER_LOCK_POISONED: the projection serialization lock is poisoned; remediation=restart the daemon and inspect the prior panic before retrying".to_owned()
     })
 }
 
-pub(super) fn ensure_projection_locked(db: &Db) -> Result<(), String> {
-    if PROCESS_RECONCILED.load(Ordering::Acquire) {
+pub(super) fn ensure_projection_locked(
+    db: &Db,
+    lock_state: &mut ProjectionLockState,
+) -> Result<(), String> {
+    let vault_identity = read_vault_identity(db)?;
+    if lock_state.reconciled_vault.as_ref() == Some(&vault_identity) {
         return Ok(());
     }
     match read_meta(db)? {
@@ -64,8 +77,32 @@ pub(super) fn ensure_projection_locked(db: &Db) -> Result<(), String> {
         }
         None => build_projection(db)?,
     }
-    PROCESS_RECONCILED.store(true, Ordering::Release);
+    lock_state.reconciled_vault = Some(vault_identity);
     Ok(())
+}
+
+fn read_vault_identity(db: &Db) -> Result<VaultIdentity, String> {
+    let status = db.calyx_vault_status().map_err(|error| {
+        format!(
+            "AGENT_TRANSCRIPT_ORDER_VAULT_IDENTITY_READ_FAILED: {error}; remediation=repair the Calyx vault status path before reading or writing the ordered projection"
+        )
+    })?;
+    if !status.enabled || !status.open {
+        return Err(format!(
+            "AGENT_TRANSCRIPT_ORDER_VAULT_IDENTITY_UNAVAILABLE: enabled={} open={} phase={}; remediation=open the configured Calyx vault before reading or writing the ordered projection",
+            status.enabled, status.open, status.phase
+        ));
+    }
+    let vault_dir = status.vault_dir.ok_or_else(|| {
+        "AGENT_TRANSCRIPT_ORDER_VAULT_IDENTITY_UNAVAILABLE: open vault status has no vault_dir; remediation=repair the Calyx status contract before retrying".to_owned()
+    })?;
+    let vault_id = status.vault_id.ok_or_else(|| {
+        "AGENT_TRANSCRIPT_ORDER_VAULT_IDENTITY_UNAVAILABLE: open vault status has no vault_id; remediation=repair the Calyx identity read before retrying".to_owned()
+    })?;
+    Ok(VaultIdentity {
+        vault_dir,
+        vault_id,
+    })
 }
 
 pub(super) fn order_row_for_record(
@@ -91,8 +128,8 @@ pub(super) fn newest_rows(
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let _guard = lock_projection()?;
-    ensure_projection_locked(db)?;
+    let mut guard = lock_projection()?;
+    ensure_projection_locked(db, &mut guard)?;
     let candidate_limit = limit.saturating_mul(4);
     let (mut rows, more) = db
         .scan_cf_from(cf::CF_AGENT_TRANSCRIPT_ORDER, &[], candidate_limit)

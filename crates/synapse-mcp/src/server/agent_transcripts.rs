@@ -972,8 +972,8 @@ pub(super) fn commit_transcript_chunk(
     // writer and one serialization boundary. The first call in a process also
     // reconciles/backfills the complete retained corpus before any new source
     // mutation can commit.
-    let _order_projection_guard = super::transcript_order::lock_projection()?;
-    super::transcript_order::ensure_projection_locked(db)?;
+    let mut order_projection_guard = super::transcript_order::lock_projection()?;
+    super::transcript_order::ensure_projection_locked(db, &mut order_projection_guard)?;
 
     let mut guards = Vec::with_capacity(rows.len() * 2);
     let mut order_rows = Vec::with_capacity(rows.len());

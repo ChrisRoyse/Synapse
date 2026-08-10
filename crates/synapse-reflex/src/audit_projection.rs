@@ -2,10 +2,8 @@
 
 use std::{
     collections::BTreeMap,
-    sync::{
-        LazyLock, Mutex, MutexGuard,
-        atomic::{AtomicBool, Ordering},
-    },
+    path::PathBuf,
+    sync::{LazyLock, Mutex, MutexGuard},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -31,8 +29,19 @@ const SCHEMA_VERSION: u32 = 1;
 const BACKFILL_ROWS: usize = 512;
 const MAX_GLOBAL_HISTORY: usize = 1_000;
 
-static PROJECTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-static PROCESS_RECONCILED: AtomicBool = AtomicBool::new(false);
+static PROJECTION_LOCK: LazyLock<Mutex<ProjectionLockState>> =
+    LazyLock::new(|| Mutex::new(ProjectionLockState::default()));
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VaultIdentity {
+    vault_dir: PathBuf,
+    vault_id: String,
+}
+
+#[derive(Debug, Default)]
+struct ProjectionLockState {
+    reconciled_vault: Option<VaultIdentity>,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -88,18 +97,19 @@ struct ClampProjection {
 }
 
 pub fn ensure(db: &Db) -> ReflexResult<()> {
-    let _guard = lock_projection()?;
-    ensure_locked(db)
+    let mut guard = lock_projection()?;
+    ensure_locked(db, &mut guard)
 }
 
-fn lock_projection() -> ReflexResult<MutexGuard<'static, ()>> {
+fn lock_projection() -> ReflexResult<MutexGuard<'static, ProjectionLockState>> {
     PROJECTION_LOCK.lock().map_err(|_error| projection_error(
         "REFLEX_AUDIT_PROJECTION_LOCK_POISONED: restart the daemon and inspect the prior panic before retrying",
     ))
 }
 
-fn ensure_locked(db: &Db) -> ReflexResult<()> {
-    if PROCESS_RECONCILED.load(Ordering::Acquire) {
+fn ensure_locked(db: &Db, lock_state: &mut ProjectionLockState) -> ReflexResult<()> {
+    let vault_identity = read_vault_identity(db)?;
+    if lock_state.reconciled_vault.as_ref() == Some(&vault_identity) {
         return Ok(());
     }
     match read_meta(db)? {
@@ -110,8 +120,30 @@ fn ensure_locked(db: &Db) -> ReflexResult<()> {
         }
         None => build_projection(db)?,
     }
-    PROCESS_RECONCILED.store(true, Ordering::Release);
+    lock_state.reconciled_vault = Some(vault_identity);
     Ok(())
+}
+
+fn read_vault_identity(db: &Db) -> ReflexResult<VaultIdentity> {
+    let status = db.calyx_vault_status().map_err(|error| projection_error(&format!(
+        "REFLEX_AUDIT_PROJECTION_VAULT_IDENTITY_READ_FAILED: {error}; remediation=repair the Calyx vault status path before reading or writing the audit projection"
+    )))?;
+    if !status.enabled || !status.open {
+        return Err(projection_error(&format!(
+            "REFLEX_AUDIT_PROJECTION_VAULT_IDENTITY_UNAVAILABLE: enabled={} open={} phase={}; remediation=open the configured Calyx vault before reading or writing the audit projection",
+            status.enabled, status.open, status.phase
+        )));
+    }
+    let vault_dir = status.vault_dir.ok_or_else(|| projection_error(
+        "REFLEX_AUDIT_PROJECTION_VAULT_IDENTITY_UNAVAILABLE: open vault status has no vault_dir; remediation=repair the Calyx status contract before retrying",
+    ))?;
+    let vault_id = status.vault_id.ok_or_else(|| projection_error(
+        "REFLEX_AUDIT_PROJECTION_VAULT_IDENTITY_UNAVAILABLE: open vault status has no vault_id; remediation=repair the Calyx identity read before retrying",
+    ))?;
+    Ok(VaultIdentity {
+        vault_dir,
+        vault_id,
+    })
 }
 
 #[expect(
@@ -124,10 +156,10 @@ pub fn write_projected_audit(
     source_key: &[u8],
     source_value: &[u8],
 ) -> StorageResult<()> {
-    let _guard = PROJECTION_LOCK.lock().map_err(|_error| storage_write_error(
+    let mut guard = PROJECTION_LOCK.lock().map_err(|_error| storage_write_error(
         "REFLEX_AUDIT_PROJECTION_LOCK_POISONED: restart the daemon and inspect the prior panic before retrying",
     ))?;
-    ensure_locked(db).map_err(|error| storage_write_error(&error.to_string()))?;
+    ensure_locked(db, &mut guard).map_err(|error| storage_write_error(&error.to_string()))?;
 
     let order_key = reflex_audit_order_key(audit.ts_ns, &audit.audit_id, &audit.reflex_id);
     let order_value = encode_pointer(&OrderedSourcePointer::new(source_key, source_value))?;
@@ -265,8 +297,8 @@ pub fn global_history(db: &Db, limit: usize) -> ReflexResult<Vec<StoredReflexAud
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let _guard = lock_projection()?;
-    ensure_locked(db)?;
+    let mut guard = lock_projection()?;
+    ensure_locked(db, &mut guard)?;
     let candidate_limit = limit.saturating_mul(4);
     let (mut rows, more) = db
         .scan_cf_from(cf::CF_REFLEX_AUDIT_ORDER, &[], candidate_limit)
@@ -316,8 +348,8 @@ pub fn global_history(db: &Db, limit: usize) -> ReflexResult<Vec<StoredReflexAud
 }
 
 pub fn terminal_statuses(db: &Db) -> ReflexResult<Vec<ReflexStatus>> {
-    let _guard = lock_projection()?;
-    ensure_locked(db)?;
+    let mut guard = lock_projection()?;
+    ensure_locked(db, &mut guard)?;
     let registry = read_registry(db)?;
     let mut output = Vec::new();
     for reflex_id in registry.reflex_ids {
@@ -332,14 +364,14 @@ pub fn terminal_statuses(db: &Db) -> ReflexResult<Vec<ReflexStatus>> {
 }
 
 pub fn terminal_status(db: &Db, reflex_id: &str) -> ReflexResult<Option<ReflexStatus>> {
-    let _guard = lock_projection()?;
-    ensure_locked(db)?;
+    let mut guard = lock_projection()?;
+    ensure_locked(db, &mut guard)?;
     Ok(read_state(db, reflex_id)?.and_then(|state| state.accumulator.into_terminal_status()))
 }
 
 pub fn recursion_clamps_total(db: &Db) -> ReflexResult<u64> {
-    let _guard = lock_projection()?;
-    ensure_locked(db)?;
+    let mut guard = lock_projection()?;
+    ensure_locked(db, &mut guard)?;
     let bytes = db
         .get_cf(cf::CF_KV, CLAMP_KEY)
         .map_err(|error| projection_error(&format!("REFLEX_CLAMP_PROJECTION_READ_FAILED: {error}")))?
