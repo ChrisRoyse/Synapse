@@ -308,6 +308,11 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_drag_drop_after_bridge_input",
         )?;
+        super::input_provenance::reject_legacy_input_provenance_fragments(
+            &result,
+            "browser_drag_drop_legacy_input_provenance_fragment",
+            Some(provenance_context.target()),
+        )?;
         let (delivery_origin, expected_trust, default_actions, transport, method) = match dnd.mode {
             BrowserDndMode::Mouse => (
                 InputDeliveryOrigin::ChromeDebuggerProtocol,

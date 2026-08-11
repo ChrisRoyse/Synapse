@@ -1007,6 +1007,15 @@ impl SynapseService {
                 ) {
                     return fill_form_error_data(index, field, "operator_panic_boundary", error);
                 }
+                if let Err(error) =
+                    super::input_provenance::reject_legacy_input_provenance_fragments(
+                        &result,
+                        "browser_fill_form_legacy_input_provenance_fragment",
+                        Some(provenance_context.target()),
+                    )
+                {
+                    return fill_form_error_data(index, field, "input_provenance", error);
+                }
                 let (delivery_origin, default_actions, method) = match action {
                     "check" | "uncheck" => (
                         InputDeliveryOrigin::HtmlActivationMethod,

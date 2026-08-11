@@ -8499,9 +8499,10 @@ async function handleActivateTab(params) {
 // keydown/keypress/keyup handlers - which is exactly what a modal Escape
 // handler is - but by web-platform rule they never drive the browser's own
 // default behaviours (no form submit, no caret insertion, no browser
-// shortcuts). That limit is reported without conflating DOM trust with physical
-// origin; `native_default_actions=false` stays explicit, and the daemon
-// projects the complete typed provenance record.
+// shortcuts). The daemon projects that exact delivery into the canonical
+// `synapse.input_provenance.v1` record. Do not return a second, unversioned
+// trust/default-action summary here: parallel summaries can drift and
+// contradict that record.
 async function handleKeyDispatch(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
@@ -8558,12 +8559,6 @@ async function handleKeyDispatch(params) {
     frame_id: top.frame_id,
     frame_document_id: top.document_id,
     keys,
-    dom_event_is_trusted: false,
-    physical_device_origin: false,
-    browser_default_actions: "synthetic_dispatch_no_user_agent_input_defaults",
-    native_default_actions: false,
-    trust_note:
-      "KeyboardEvents dispatched through chrome.scripting have isTrusted=false: page keydown/keypress/keyup handlers run, but browser default behaviours do not. Raw-CDP Input.dispatchKeyEvent creates isTrusted=true events but remains software-originated.",
     readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
     required_foreground: false,
     wait_timeout_ms: waitTimeoutMs,
@@ -23318,9 +23313,6 @@ async function performDomActionInPage(request) {
     // predicate was overridden, and that the delivered events were synthetic
     // in-page dispatch rather than OS/CDP input.
     forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
-    dom_event_is_trusted: false,
-    physical_device_origin: false,
-    browser_default_actions: "synthetic_dispatch_no_user_agent_input_defaults",
     forced_dom_dispatch: Boolean(force),
     events_dispatched: eventsDispatched,
     action_readback: actionReadback,

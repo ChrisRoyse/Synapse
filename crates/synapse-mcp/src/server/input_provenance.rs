@@ -188,6 +188,46 @@ pub(crate) fn input_provenance_error(
     )
 }
 
+/// Reject the pre-#2167 provenance fragments at every public projection
+/// boundary. A scalar cannot faithfully summarize a multi-emission action, so
+/// carrying one beside `synapse.input_provenance.v1` creates two competing
+/// authorities. Producers must return delivery facts; the projection owns the
+/// sole typed provenance record.
+pub(crate) fn reject_legacy_input_provenance_fragments(
+    value: &serde_json::Value,
+    stage: &'static str,
+    target: Option<&InputTargetIdentity>,
+) -> Result<(), ErrorData> {
+    const LEGACY_FIELDS: [&str; 7] = [
+        "input_trust",
+        "native_default_actions",
+        "real_trusted_input",
+        "dom_event_is_trusted",
+        "physical_device_origin",
+        "browser_default_actions",
+        "trust_note",
+    ];
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    let present = LEGACY_FIELDS
+        .iter()
+        .copied()
+        .filter(|field| object.contains_key(*field))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        return Ok(());
+    }
+    Err(input_provenance_error(
+        stage,
+        format!(
+            "successful delegated input result contains deprecated parallel provenance fields {}; remove them at the producer and project only synapse.input_provenance.v1",
+            present.join(",")
+        ),
+        target,
+    ))
+}
+
 pub(crate) fn result_string<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     value.get(key).and_then(serde_json::Value::as_str)
 }

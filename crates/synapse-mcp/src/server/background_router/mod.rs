@@ -7226,8 +7226,6 @@ async fn target_act_raw_cdp_click_dispatch(
         "readback_backend": "raw_cdp",
         "method": "Input.dispatchMouseEvent(mouseMoved,mousePressed,mouseReleased)",
         "click_count": click_count,
-        "dom_event_is_trusted": true,
-        "physical_device_origin": false,
         "scrolled_into_view_before_click": true
     }))
 }
@@ -8490,6 +8488,12 @@ fn target_act_input_provenance(
             None,
         )
     })?;
+
+    super::input_provenance::reject_legacy_input_provenance_fragments(
+        result,
+        "target_act_legacy_input_provenance_fragment",
+        Some(context.target()),
+    )?;
 
     if delegated_tool == "browser_set_value" {
         return embedded_input_provenance(

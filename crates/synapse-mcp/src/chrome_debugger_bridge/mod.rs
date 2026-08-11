@@ -8958,8 +8958,9 @@ pub async fn list_tabs(
 /// expose, which left `act verb=key` with no route at all on the transport that
 /// can happily open a modal. This lane runs the key sequence through
 /// `chrome.scripting` in the page. The events are untrusted by web-platform
-/// rule, so the response reports `input_trust` and `native_default_actions`
-/// explicitly instead of implying trusted OS input.
+/// rule. The public action response reports that through the versioned
+/// `synapse.input_provenance.v1` record; this internal response deliberately
+/// carries no parallel trust/default-action fragments that could drift.
 pub async fn key_dispatch(
     hwnd: i64,
     target_id: &str,
