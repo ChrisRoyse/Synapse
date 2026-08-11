@@ -1235,7 +1235,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without debugger screenshot attach on the normal path. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks. Masks never use page DOM overlays: the document-pinned bridge resolves page-CSS rectangles and extension-owned RGBA bytes, then trusted Rust overwrites every covered stitched pixel before resize/encode/write and returns count/commitment evidence. Uses chrome.scripting for page metrics/geometry/scroll plus chrome.tabs.captureVisibleTab tile stitching, temporarily activates only the requested tab inside its existing Chrome window, and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge downscale the written image aspect-preserving to fit a vision-model pixel budget (see capture_screenshot); the response reports native_width/native_height and the applied scale."
+        description = "Capture a browser page screenshot from the calling session's owned normal Chrome tab through the popup-safe Chrome bridge, without debugger screenshot attach on the normal path. Supports scope=viewport, full_page, clip (page CSS x/y/w/h), and element (normal bridge element_id), PNG/JPEG format, JPEG quality, omit_background best-effort PNG transparency, and selector/element masks. Before page mutation or capture, the bridge computes native/output geometry plus hard peak-memory and native-message bounds; work outside those bounds fails with CAPTURE_PLAN_EXCEEDS_LIMIT. It allocates one bounded extension-owned OffscreenCanvas, captures/decodes/draws/releases one visible tile at a time, releases the canvas after encoding, and sends one bounded composite to the daemon. The daemon requires and independently verifies that plan and decoded dimensions; there is no legacy tile-retention fallback. Masks never use page DOM overlays: the document-pinned bridge resolves page-CSS rectangles and extension-owned RGBA bytes, then trusted Rust overwrites every covered bounded-composite pixel before encode/write and returns count/commitment evidence. The operation temporarily activates only the requested tab inside its existing Chrome window and may focus that Chrome window on Windows because captureVisibleTab can fail image readback otherwise; the response reports required_foreground and restore readback. Optional max_pixels and/or max_long_edge constrain the extension's allocation/capture pipeline itself, aspect-preserving; the response reports native_width/native_height, bounded written dimensions, the applied scale, and capture-plan budget/readback evidence."
     )]
     pub async fn browser_screenshot(
         &self,
@@ -2372,8 +2372,11 @@ impl SynapseService {
             capture_attempt_count = captured.capture_attempt_count,
             capture_attempts = ?captured.capture_attempts,
             tile_count = captured.tile_count,
+            composition_mode = %captured.composition_mode,
+            estimated_peak_bytes = captured.capture_plan.estimated_peak_bytes,
+            actual_native_message_bytes = captured.capture_plan.actual_native_message_bytes,
             output_path = %validation.output_path.display(),
-            "readback=chrome.tabs.captureVisibleTab outcome=bridge_tiles_returned"
+            "readback=bounded_extension_composite outcome=single_bounded_composite_returned"
         );
         if captured.mask_count != params.masks.len() || captured.masks.len() != params.masks.len() {
             return Err(mcp_error(
@@ -2399,18 +2402,29 @@ impl SynapseService {
                 ),
             ));
         }
-        let BrowserScreenshotStitchResult {
+        let BrowserScreenshotCompositeResult {
             bitmap,
             mask_evidence,
-        } = stitch_browser_screenshot_tiles(&captured, validation.format, params.omit_background)?;
+            native_width,
+            native_height,
+            applied_scale,
+        } = decode_browser_screenshot_bounded_composite(
+            &captured,
+            validation.format,
+            params.omit_background,
+            params.max_pixels,
+            params.max_long_edge,
+        )?;
         let bitmap_sha256 = sha256_hex(&bitmap.bytes);
         let write_params = CaptureScreenshotParams {
             path: params.path.clone(),
             region: Some(bitmap.region),
             window_hwnd: None,
             overwrite: params.overwrite,
-            max_pixels: params.max_pixels,
-            max_long_edge: params.max_long_edge,
+            // The extension already materialized the exact bounded dimensions.
+            // A second daemon resize would hide a broken bridge contract.
+            max_pixels: None,
+            max_long_edge: None,
         };
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_screenshot_before_output_write",
@@ -2445,9 +2459,9 @@ impl SynapseService {
             page_region,
             width: screenshot.width,
             height: screenshot.height,
-            native_width: screenshot.native_width,
-            native_height: screenshot.native_height,
-            scale: screenshot.scale,
+            native_width,
+            native_height,
+            scale: applied_scale,
             bytes_written: screenshot.bytes_written,
             bitmap_sha256: screenshot.bitmap_sha256,
             cdp_target_id: captured.target_id,
@@ -2461,6 +2475,26 @@ impl SynapseService {
             scroll_width_css: captured.scroll_width_css,
             scroll_height_css: captured.scroll_height_css,
             tile_count: captured.tile_count,
+            composition_mode: captured.composition_mode,
+            capture_plan_schema: captured.capture_plan.schema,
+            capture_plan_hard_peak_budget_bytes: captured.capture_plan.hard_peak_budget_bytes,
+            capture_plan_estimated_peak_bytes: captured.capture_plan.estimated_peak_bytes,
+            capture_plan_native_message_budget_bytes: captured
+                .capture_plan
+                .native_message_budget_bytes,
+            capture_plan_estimated_native_message_bytes: captured
+                .capture_plan
+                .estimated_native_message_bytes,
+            capture_plan_actual_native_message_bytes: captured
+                .capture_plan
+                .actual_native_message_bytes,
+            capture_plan_actual_max_tile_data_url_bytes: captured
+                .capture_plan
+                .actual_max_tile_data_url_bytes,
+            capture_plan_actual_composite_blob_bytes: captured
+                .capture_plan
+                .actual_composite_blob_bytes,
+            capture_plan_surface_released: captured.capture_plan.surface_released,
             mask_count: captured.mask_count,
             mask_requested_count: params.masks.len(),
             mask_resolved_count: captured.masks.len(),
@@ -2479,10 +2513,10 @@ impl SynapseService {
             foreground_transaction: foreground_readback,
             backend_tier_used: captured.backend_tier_used,
             source_of_truth: if used_emulated_page_surface {
-                "normal Chrome bridge document-pinned page metrics/mask geometry plus chrome.debugger Page.captureScreenshot page-surface pixels; synapse-mcp independently geometry-checks, overwrites every mask pixel after capture, then resizes/encodes/writes"
+                "normal Chrome bridge document-pinned page metrics plus a preflight-bounded chrome.debugger Page.captureScreenshot image drawn into an extension-owned bounded OffscreenCanvas; the bridge releases the decoded image and canvas before returning one size-proven composite, then synapse-mcp independently verifies the plan/decoded dimensions, overwrites every mask pixel, encodes, atomically writes, and reads the artifact from disk"
                     .to_owned()
             } else {
-                "human OS foreground readback plus normal Chrome bridge document-pinned page metrics/mask geometry/scroll and chrome.tabs.captureVisibleTab tiles; synapse-mcp independently geometry-checks, overwrites every mask pixel after stitching, then resizes/encodes/writes"
+                "human OS foreground readback plus normal Chrome bridge document-pinned page metrics/scroll and one-at-a-time chrome.tabs.captureVisibleTab images drawn into an extension-owned bounded OffscreenCanvas; each decoded tile is explicitly released, the canvas is released before one size-proven composite crosses native messaging, then synapse-mcp independently verifies the plan/decoded dimensions, overwrites every mask pixel, encodes, atomically writes, and reads the artifact from disk"
                     .to_owned()
             },
         })
@@ -17587,6 +17621,15 @@ fn validate_browser_screenshot_params(
             "browser_screenshot max_pixels must be greater than zero",
         ));
     }
+    if params
+        .max_pixels
+        .is_some_and(|value| value > 9_007_199_254_740_991)
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "browser_screenshot max_pixels must not exceed JavaScript's exact safe-integer maximum 9007199254740991",
+        ));
+    }
     if params.max_long_edge == Some(0) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -17865,6 +17908,8 @@ fn browser_screenshot_bridge_payload(
         },
         "quality": params.quality.unwrap_or(90),
         "omitBackground": params.omit_background,
+        "maxPixels": params.max_pixels,
+        "maxLongEdge": params.max_long_edge,
         "waitTimeoutMs": params.wait_timeout_ms,
     }))
 }
@@ -17899,9 +17944,12 @@ fn f64_to_i32_rounded(value: f64, label: &str) -> Result<i32, ErrorData> {
     Ok(value.round() as i32)
 }
 
-struct BrowserScreenshotStitchResult {
+struct BrowserScreenshotCompositeResult {
     bitmap: synapse_capture::CapturedBgraBitmap,
     mask_evidence: BrowserScreenshotMaskEvidence,
+    native_width: u32,
+    native_height: u32,
+    applied_scale: f64,
 }
 
 struct BrowserScreenshotMaskEvidence {
@@ -17912,83 +17960,254 @@ struct BrowserScreenshotMaskEvidence {
     commitment_sha256: String,
 }
 
-fn stitch_browser_screenshot_tiles(
+fn decode_browser_screenshot_bounded_composite(
     captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
     format: CaptureScreenshotFormat,
     omit_background: bool,
-) -> Result<BrowserScreenshotStitchResult, ErrorData> {
-    if captured.tiles.is_empty() {
-        return Err(mcp_error(
-            error_codes::A11Y_CDP_AXTREE_FAILED,
-            "browser_screenshot Chrome bridge returned no screenshot tiles",
-        ));
+    max_pixels: Option<u64>,
+    max_long_edge: Option<u32>,
+) -> Result<BrowserScreenshotCompositeResult, ErrorData> {
+    const PLAN_SCHEMA: &str = "synapse_page_screenshot_capture_plan/v1";
+    const COMPOSITION_MODE: &str = "bounded_offscreen_canvas_v1";
+    const HARD_PEAK_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
+    const NATIVE_MESSAGE_BUDGET_BYTES: u64 = 60 * 1024 * 1024;
+    let plan = &captured.capture_plan;
+    let fail = |detail: String| {
+        mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot refused an unproven bounded-compositor result before writing: {detail}; expected_schema={PLAN_SCHEMA} expected_mode={COMPOSITION_MODE} expected_hard_peak_budget_bytes={HARD_PEAK_BUDGET_BYTES} expected_native_message_budget_bytes={NATIVE_MESSAGE_BUDGET_BYTES}; reload the exact bundled Chrome bridge and retry"
+            ),
+        )
+    };
+    if plan.schema != PLAN_SCHEMA
+        || plan.composition_mode != COMPOSITION_MODE
+        || captured.composition_mode != COMPOSITION_MODE
+        || captured.composition_mode != plan.composition_mode
+    {
+        return Err(fail(format!(
+            "capture contract mismatch schema={:?} plan_mode={:?} result_mode={:?}",
+            plan.schema, plan.composition_mode, captured.composition_mode
+        )));
     }
-    let first = &captured.tiles[0];
-    let first_image = browser_screenshot_data_url_to_rgba(&first.image_data_url)?;
-    let scale_x = browser_screenshot_tile_scale(
-        first_image.width(),
-        first.viewport_width_css,
-        "viewport_width_css",
+    if plan.hard_peak_budget_bytes != HARD_PEAK_BUDGET_BYTES
+        || plan.native_message_budget_bytes != NATIVE_MESSAGE_BUDGET_BYTES
+        || plan.estimated_peak_bytes > plan.hard_peak_budget_bytes
+        || plan.estimated_native_message_bytes > plan.native_message_budget_bytes
+        || plan.actual_native_message_bytes == 0
+        || plan.actual_native_message_bytes > plan.native_message_budget_bytes
+        || !plan.surface_released
+    {
+        return Err(fail(format!(
+            "budget/release proof invalid hard_peak={} estimated_peak={} native_message_budget={} estimated_native_message={} actual_native_message={} surface_released={}",
+            plan.hard_peak_budget_bytes,
+            plan.estimated_peak_bytes,
+            plan.native_message_budget_bytes,
+            plan.estimated_native_message_bytes,
+            plan.actual_native_message_bytes,
+            plan.surface_released,
+        )));
+    }
+    if plan.tile_count == 0 || plan.tile_count > 400 {
+        return Err(fail(format!(
+            "planned tile count is outside 1..=400: plan_tiles={}",
+            plan.tile_count,
+        )));
+    }
+    if captured.tile_count != plan.tile_count {
+        return Err(fail(format!(
+            "result tile count differs from the plan: plan_tiles={} result_tiles={}",
+            plan.tile_count, captured.tile_count,
+        )));
+    }
+    if captured.capture_attempt_count != captured.tile_count
+        || captured.capture_attempts.len() != captured.capture_attempt_count
+    {
+        return Err(fail(format!(
+            "capture cardinality mismatch plan_tiles={} result_tiles={} attempt_count={} attempt_records={}",
+            plan.tile_count,
+            captured.tile_count,
+            captured.capture_attempt_count,
+            captured.capture_attempts.len(),
+        )));
+    }
+    for (index, attempt) in captured.capture_attempts.iter().enumerate() {
+        if usize::try_from(attempt.attempt).ok() != Some(index + 1)
+            || !attempt.ok
+            || !attempt.error_detail.is_empty()
+        {
+            return Err(fail(format!(
+                "capture attempt {} is not a completed success: declared_attempt={} ok={} retryable={} error_detail={:?}",
+                index + 1,
+                attempt.attempt,
+                attempt.ok,
+                attempt.retryable,
+                attempt.error_detail,
+            )));
+        }
+    }
+    if max_pixels != plan.max_pixels
+        || max_long_edge.map(u64::from) != plan.max_long_edge
+        || plan.native_width == 0
+        || plan.native_height == 0
+        || plan.output_width == 0
+        || plan.output_height == 0
+        || plan.output_width > plan.native_width
+        || plan.output_height > plan.native_height
+    {
+        return Err(fail(format!(
+            "dimension/request contract invalid requested_max_pixels={max_pixels:?} plan_max_pixels={:?} requested_max_long_edge={max_long_edge:?} plan_max_long_edge={:?} native={}x{} output={}x{}",
+            plan.max_pixels,
+            plan.max_long_edge,
+            plan.native_width,
+            plan.native_height,
+            plan.output_width,
+            plan.output_height,
+        )));
+    }
+    let expected_native_width = f64_to_u32_ceil(
+        captured.clip_css.w * captured.device_pixel_ratio,
+        "native width",
     )?;
-    let scale_y = browser_screenshot_tile_scale(
-        first_image.height(),
-        first.viewport_height_css,
-        "viewport_height_css",
+    let expected_native_height = f64_to_u32_ceil(
+        captured.clip_css.h * captured.device_pixel_ratio,
+        "native height",
     )?;
-    validate_browser_screenshot_geometry(captured, scale_x, scale_y)?;
-    let output_width = f64_to_u32_ceil(captured.clip_css.w * scale_x, "output width")?;
-    let output_height = f64_to_u32_ceil(captured.clip_css.h * scale_y, "output height")?;
-    let mut output = RgbaImage::new(output_width, output_height);
-    blit_browser_screenshot_tile(
-        &mut output,
-        &first_image,
-        first,
-        captured.clip_css,
-        scale_x,
-        scale_y,
-    )?;
-    for tile in captured.tiles.iter().skip(1) {
-        let image = browser_screenshot_data_url_to_rgba(&tile.image_data_url)?;
-        blit_browser_screenshot_tile(
-            &mut output,
-            &image,
-            tile,
-            captured.clip_css,
-            scale_x,
-            scale_y,
-        )?;
+    let expected_scale_x = f64::from(plan.output_width) / captured.clip_css.w;
+    let expected_scale_y = f64::from(plan.output_height) / captured.clip_css.h;
+    let expected_applied_scale = f64::from(plan.output_width.max(plan.output_height))
+        / f64::from(plan.native_width.max(plan.native_height));
+    let scale_tolerance = 1.0e-9_f64;
+    if plan.native_width != expected_native_width
+        || plan.native_height != expected_native_height
+        || !plan.output_scale_x.is_finite()
+        || !plan.output_scale_y.is_finite()
+        || !plan.applied_scale.is_finite()
+        || (plan.output_scale_x - expected_scale_x).abs() > scale_tolerance
+        || (plan.output_scale_y - expected_scale_y).abs() > scale_tolerance
+        || (plan.applied_scale - expected_applied_scale).abs() > scale_tolerance
+    {
+        return Err(fail(format!(
+            "geometry proof mismatch expected_native={}x{} plan_native={}x{} expected_output_scale={}x{} plan_output_scale={}x{} expected_applied_scale={} plan_applied_scale={}",
+            expected_native_width,
+            expected_native_height,
+            plan.native_width,
+            plan.native_height,
+            expected_scale_x,
+            expected_scale_y,
+            plan.output_scale_x,
+            plan.output_scale_y,
+            expected_applied_scale,
+            plan.applied_scale,
+        )));
+    }
+    let output_pixels = u64::from(plan.output_width)
+        .checked_mul(u64::from(plan.output_height))
+        .ok_or_else(|| fail("output pixel count overflowed u64".to_owned()))?;
+    let output_raw_bytes = output_pixels
+        .checked_mul(4)
+        .ok_or_else(|| fail("output raw byte count overflowed u64".to_owned()))?;
+    let tile_raw_bytes = u64::from(plan.tile_width)
+        .checked_mul(u64::from(plan.tile_height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| fail("tile raw byte count overflowed u64".to_owned()))?;
+    if output_raw_bytes != plan.output_raw_bytes
+        || tile_raw_bytes != plan.tile_raw_bytes
+        || plan.actual_max_tile_data_url_bytes == 0
+        || plan.actual_max_tile_data_url_bytes > plan.tile_data_url_upper_bound_bytes
+        || plan.actual_composite_blob_bytes == 0
+        || plan.actual_composite_blob_bytes > plan.output_encoded_upper_bound_bytes
+        || plan.actual_composite_data_url_bytes == 0
+        || plan.actual_composite_data_url_bytes > plan.output_data_url_upper_bound_bytes
+        || plan.actual_composite_data_url_bytes
+            != u64::try_from(captured.composite_image_data_url_len).unwrap_or(u64::MAX)
+        || captured.composite_image_data_url_len != captured.composite_image_data_url.len()
+    {
+        return Err(fail(format!(
+            "byte proof mismatch output_raw={} expected_output_raw={} tile_raw={} expected_tile_raw={} max_tile_data_url={} tile_data_url_bound={} composite_blob={} composite_blob_bound={} composite_data_url={} composite_data_url_bound={} declared_result_data_url_len={} actual_result_data_url_len={}",
+            plan.output_raw_bytes,
+            output_raw_bytes,
+            plan.tile_raw_bytes,
+            tile_raw_bytes,
+            plan.actual_max_tile_data_url_bytes,
+            plan.tile_data_url_upper_bound_bytes,
+            plan.actual_composite_blob_bytes,
+            plan.output_encoded_upper_bound_bytes,
+            plan.actual_composite_data_url_bytes,
+            plan.output_data_url_upper_bound_bytes,
+            captured.composite_image_data_url_len,
+            captured.composite_image_data_url.len(),
+        )));
+    }
+    if max_pixels.is_some_and(|limit| output_pixels > limit)
+        || max_long_edge.is_some_and(|limit| plan.output_width.max(plan.output_height) > limit)
+    {
+        return Err(fail(format!(
+            "bounded output exceeds the requested limit output={}x{} pixels={} max_pixels={max_pixels:?} max_long_edge={max_long_edge:?}",
+            plan.output_width, plan.output_height, output_pixels,
+        )));
+    }
+    let (mut output, encoded_bytes) =
+        browser_screenshot_data_url_to_rgba(&captured.composite_image_data_url, format)?;
+    if u64::try_from(encoded_bytes).unwrap_or(u64::MAX) != plan.actual_composite_blob_bytes
+        || output.width() != plan.output_width
+        || output.height() != plan.output_height
+    {
+        return Err(fail(format!(
+            "decoded composite mismatch encoded_bytes={} declared_blob_bytes={} decoded={}x{} planned={}x{}",
+            encoded_bytes,
+            plan.actual_composite_blob_bytes,
+            output.width(),
+            output.height(),
+            plan.output_width,
+            plan.output_height,
+        )));
     }
     if omit_background && matches!(format, CaptureScreenshotFormat::Png) {
         browser_screenshot_omit_background_by_corner(&mut output);
     }
-    let mask_evidence = apply_browser_screenshot_masks(&mut output, captured, scale_x, scale_y)?;
+    let mask_evidence = apply_browser_screenshot_masks(
+        &mut output,
+        captured,
+        plan.output_scale_x,
+        plan.output_scale_y,
+    )?;
     let mut bgra = output.into_raw();
     for pixel in bgra.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
-    Ok(BrowserScreenshotStitchResult {
+    Ok(BrowserScreenshotCompositeResult {
         bitmap: synapse_capture::CapturedBgraBitmap {
             region: Rect {
                 x: 0,
                 y: 0,
-                w: i32::try_from(output_width).map_err(|_| {
+                w: i32::try_from(plan.output_width).map_err(|_| {
                     mcp_error(
                         error_codes::CAPTURE_TARGET_INVALID,
-                        format!("browser_screenshot output width {output_width} exceeds i32"),
+                        format!(
+                            "browser_screenshot output width {} exceeds i32",
+                            plan.output_width
+                        ),
                     )
                 })?,
-                h: i32::try_from(output_height).map_err(|_| {
+                h: i32::try_from(plan.output_height).map_err(|_| {
                     mcp_error(
                         error_codes::CAPTURE_TARGET_INVALID,
-                        format!("browser_screenshot output height {output_height} exceeds i32"),
+                        format!(
+                            "browser_screenshot output height {} exceeds i32",
+                            plan.output_height
+                        ),
                     )
                 })?,
             },
-            width: output_width,
-            height: output_height,
+            width: plan.output_width,
+            height: plan.output_height,
             bytes: bgra,
         },
         mask_evidence,
+        native_width: plan.native_width,
+        native_height: plan.native_height,
+        applied_scale: plan.applied_scale,
     })
 }
 
@@ -17998,7 +18217,7 @@ fn apply_browser_screenshot_masks(
     scale_x: f64,
     scale_y: f64,
 ) -> Result<BrowserScreenshotMaskEvidence, ErrorData> {
-    const BACKEND: &str = "trusted_rust_post_stitch_exact_rgba_overwrite";
+    const BACKEND: &str = "trusted_rust_post_bounded_composite_exact_rgba_overwrite";
     let mut commitment = Vec::with_capacity(64 + captured.masks.len() * 48);
     commitment.extend_from_slice(b"synapse/browser-screenshot-mask/v1\0");
     commitment.extend_from_slice(captured.document_id.as_bytes());
@@ -18118,55 +18337,6 @@ fn apply_browser_screenshot_masks(
     })
 }
 
-fn browser_screenshot_tile_scale(
-    image_extent: u32,
-    viewport_extent_css: f64,
-    label: &str,
-) -> Result<f64, ErrorData> {
-    if image_extent == 0 || !viewport_extent_css.is_finite() || viewport_extent_css <= 0.0 {
-        return Err(mcp_error(
-            error_codes::A11Y_CDP_AXTREE_FAILED,
-            format!(
-                "browser_screenshot tile has invalid {label}: image_extent={image_extent} viewport_extent_css={viewport_extent_css}"
-            ),
-        ));
-    }
-    Ok(f64::from(image_extent) / viewport_extent_css)
-}
-
-fn validate_browser_screenshot_geometry(
-    captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
-    scale_x: f64,
-    scale_y: f64,
-) -> Result<(), ErrorData> {
-    let dpr = captured.device_pixel_ratio;
-    let tolerance = 0.02_f64.max(dpr.abs() * 0.01);
-    if !dpr.is_finite()
-        || dpr <= 0.0
-        || (scale_x - scale_y).abs() > tolerance
-        || (scale_x - dpr).abs() > tolerance
-        || (scale_y - dpr).abs() > tolerance
-    {
-        return Err(mcp_error(
-            error_codes::ACTION_POSTCONDITION_FAILED,
-            format!(
-                "browser_screenshot refused bitmap/CSS geometry mismatch before writing an artifact: backend={:?}, requested_clip_css={}x{}, declared_viewport_css={}x{}, declared_device_pixel_ratio={}, actual_first_tile_bitmap={}x{}, observed_scale_x={}, observed_scale_y={}. The capture backend returned pixels from a different surface than the page metrics; reset the active viewport/device emulation or use a build whose emulated-page capture uses CDP Page.captureScreenshot.",
-                captured.backend_tier_used,
-                captured.clip_css.w,
-                captured.clip_css.h,
-                captured.viewport_width_css,
-                captured.viewport_height_css,
-                dpr,
-                captured.tiles[0].viewport_width_css * scale_x,
-                captured.tiles[0].viewport_height_css * scale_y,
-                scale_x,
-                scale_y,
-            ),
-        ));
-    }
-    Ok(())
-}
-
 fn f64_to_u32_ceil(value: f64, label: &str) -> Result<u32, ErrorData> {
     if !value.is_finite() || value <= 0.0 || value > f64::from(u32::MAX) {
         return Err(mcp_error(
@@ -18177,7 +18347,10 @@ fn f64_to_u32_ceil(value: f64, label: &str) -> Result<u32, ErrorData> {
     Ok(value.ceil() as u32)
 }
 
-fn browser_screenshot_data_url_to_rgba(data_url: &str) -> Result<RgbaImage, ErrorData> {
+fn browser_screenshot_data_url_to_rgba(
+    data_url: &str,
+    format: CaptureScreenshotFormat,
+) -> Result<(RgbaImage, usize), ErrorData> {
     let (header, encoded) = data_url.split_once(',').ok_or_else(|| {
         mcp_error(
             error_codes::A11Y_CDP_AXTREE_FAILED,
@@ -18185,11 +18358,15 @@ fn browser_screenshot_data_url_to_rgba(data_url: &str) -> Result<RgbaImage, Erro
         )
     })?;
     let header_lower = header.to_ascii_lowercase();
-    if !header_lower.starts_with("data:image/") || !header_lower.contains(";base64") {
+    let expected_header = match format {
+        CaptureScreenshotFormat::Png => "data:image/png;base64",
+        CaptureScreenshotFormat::Jpeg => "data:image/jpeg;base64",
+    };
+    if header_lower != expected_header {
         return Err(mcp_error(
             error_codes::A11Y_CDP_AXTREE_FAILED,
             format!(
-                "browser_screenshot Chrome bridge returned unsupported image data URL header {header:?}"
+                "browser_screenshot Chrome bridge returned image data URL header {header:?}; expected exactly {expected_header:?}"
             ),
         ));
     }
@@ -18198,69 +18375,19 @@ fn browser_screenshot_data_url_to_rgba(data_url: &str) -> Result<RgbaImage, Erro
         .map_err(|error| {
             mcp_error(
                 error_codes::A11Y_CDP_AXTREE_FAILED,
-                format!("browser_screenshot could not decode tile base64: {error}"),
+                format!("browser_screenshot could not decode bounded composite base64: {error}"),
             )
         })?;
-    Ok(image::load_from_memory(&bytes)
+    let encoded_bytes = bytes.len();
+    let image = image::load_from_memory(&bytes)
         .map_err(|error| {
             mcp_error(
                 error_codes::A11Y_CDP_AXTREE_FAILED,
-                format!("browser_screenshot could not decode tile image: {error}"),
+                format!("browser_screenshot could not decode bounded composite image: {error}"),
             )
         })?
-        .to_rgba8())
-}
-
-fn blit_browser_screenshot_tile(
-    output: &mut RgbaImage,
-    tile_image: &RgbaImage,
-    tile: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotTile,
-    clip: crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotRect,
-    output_scale_x: f64,
-    output_scale_y: f64,
-) -> Result<(), ErrorData> {
-    let tile_scale_x = browser_screenshot_tile_scale(
-        tile_image.width(),
-        tile.viewport_width_css,
-        "tile viewport_width_css",
-    )?;
-    let tile_scale_y = browser_screenshot_tile_scale(
-        tile_image.height(),
-        tile.viewport_height_css,
-        "tile viewport_height_css",
-    )?;
-    let left = clip.x.max(tile.scroll_x_css);
-    let top = clip.y.max(tile.scroll_y_css);
-    let right = (clip.x + clip.w).min(tile.scroll_x_css + tile.viewport_width_css);
-    let bottom = (clip.y + clip.h).min(tile.scroll_y_css + tile.viewport_height_css);
-    if right <= left || bottom <= top {
-        return Ok(());
-    }
-    let dest_x0 = ((left - clip.x) * output_scale_x).floor().max(0.0) as u32;
-    let dest_y0 = ((top - clip.y) * output_scale_y).floor().max(0.0) as u32;
-    let dest_x1 = ((right - clip.x) * output_scale_x)
-        .ceil()
-        .min(f64::from(output.width())) as u32;
-    let dest_y1 = ((bottom - clip.y) * output_scale_y)
-        .ceil()
-        .min(f64::from(output.height())) as u32;
-    for dest_y in dest_y0..dest_y1 {
-        let css_y = clip.y + (f64::from(dest_y) + 0.5) / output_scale_y;
-        let source_y = ((css_y - tile.scroll_y_css) * tile_scale_y)
-            .floor()
-            .clamp(0.0, f64::from(tile_image.height().saturating_sub(1)))
-            as u32;
-        for dest_x in dest_x0..dest_x1 {
-            let css_x = clip.x + (f64::from(dest_x) + 0.5) / output_scale_x;
-            let source_x = ((css_x - tile.scroll_x_css) * tile_scale_x)
-                .floor()
-                .clamp(0.0, f64::from(tile_image.width().saturating_sub(1)))
-                as u32;
-            let pixel = *tile_image.get_pixel(source_x, source_y);
-            output.put_pixel(dest_x, dest_y, pixel);
-        }
-    }
-    Ok(())
+        .to_rgba8();
+    Ok((image, encoded_bytes))
 }
 
 fn browser_screenshot_omit_background_by_corner(image: &mut RgbaImage) {

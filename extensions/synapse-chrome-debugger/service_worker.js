@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-durable-capture-lease-v4";
-const BRIDGE_DECLARED_BUILD_SHA256 = "d10f938d10e56eafc36afc859a2c984cf4736f94130f401c00fb43b0abd7afbd";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-bounded-screenshot-compositor-v5";
+const BRIDGE_DECLARED_BUILD_SHA256 = "b0b4e4aed354a4bce254ca3028bc8c496ff62c4e267a6d70f60bfd2d5726cd8f";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -10,6 +10,15 @@ const EVALUATE_TIMEOUT_MIN_MS = 50;
 const EVALUATE_TIMEOUT_MAX_MS = 120000;
 const CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS = 600;
 const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
+// The screenshot pipeline is intentionally bounded before the first scroll,
+// background edit, tab activation, or Chrome capture. The 384 MiB peak budget
+// includes the extension-owned output surface, one raw tile, one encoded tile,
+// and the final Blob/ArrayBuffer/base64/JSON serialization cohort. Chrome caps
+// an extension-to-native-host message at 64 MiB; reserve 4 MiB for the command
+// envelope and evidence rather than treating the transport limit as headroom.
+const PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES = 384 * 1024 * 1024;
+const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES = 60 * 1024 * 1024;
+const PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES = 256 * 1024;
 let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
 const COMMAND_CAPABILITIES = Object.freeze([
@@ -78,6 +87,7 @@ const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
 const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
+const ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT = "CAPTURE_PLAN_EXCEEDS_LIMIT";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
@@ -5270,6 +5280,455 @@ async function handleCapturePageScreenshot(params) {
   return rejectAttachCommand("capturePageScreenshot", params);
 }
 
+function checkedPageScreenshotProduct(values, label) {
+  let product = 1;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        `pageScreenshot capture plan ${label} contains a non-safe extent ${JSON.stringify(value)}`
+      );
+    }
+    product *= value;
+    if (!Number.isSafeInteger(product)) {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        `pageScreenshot capture plan ${label} exceeds JavaScript's exact integer range`
+      );
+    }
+  }
+  return product;
+}
+
+function checkedPageScreenshotSum(values, label) {
+  let sum = 0;
+  for (const value of values) {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        `pageScreenshot capture plan ${label} contains a non-safe byte count ${JSON.stringify(value)}`
+      );
+    }
+    sum += value;
+    if (!Number.isSafeInteger(sum)) {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        `pageScreenshot capture plan ${label} exceeds JavaScript's exact integer range`
+      );
+    }
+  }
+  return sum;
+}
+
+function pageScreenshotEncodedUpperBound(rawBytes, height, format) {
+  if (format === "png") {
+    // One filter byte per scanline plus a conservative zlib stored-block
+    // overhead and PNG chunk/header allowance. A valid capture cannot need a
+    // larger lossless payload than this no-compression representation.
+    const filtered = checkedPageScreenshotSum([rawBytes, height], "png_filtered_bytes");
+    return checkedPageScreenshotSum(
+      [filtered, checkedPageScreenshotProduct([Math.ceil(filtered / 16383), 5], "png_stored_block_overhead"), 65536],
+      "png_encoded_upper_bound"
+    );
+  }
+  // JPEG encoders are implementation-owned. Bound them conservatively at two
+  // raw surfaces plus metadata rather than assuming compression is beneficial.
+  return checkedPageScreenshotSum(
+    [checkedPageScreenshotProduct([rawBytes, 2], "jpeg_raw_upper_bound"), 65536],
+    "jpeg_encoded_upper_bound"
+  );
+}
+
+function pageScreenshotDataUrlLengthUpperBound(encodedBytes, format) {
+  const headerBytes = `data:image/${format};base64,`.length;
+  return checkedPageScreenshotSum(
+    [headerBytes, checkedPageScreenshotProduct([Math.ceil(encodedBytes / 3), 4], "base64_upper_bound")],
+    "data_url_upper_bound"
+  );
+}
+
+function pageScreenshotOutputDimensions(nativeWidth, nativeHeight, request) {
+  let scale = 1;
+  if (request.maxLongEdge !== null) {
+    scale = Math.min(scale, request.maxLongEdge / Math.max(nativeWidth, nativeHeight));
+  }
+  if (request.maxPixels !== null) {
+    scale = Math.min(
+      scale,
+      Math.sqrt(request.maxPixels / checkedPageScreenshotProduct(
+        [nativeWidth, nativeHeight],
+        "native_pixels"
+      ))
+    );
+  }
+  let width = Math.max(1, Math.round(nativeWidth * Math.min(1, scale)));
+  let height = Math.max(1, Math.round(nativeHeight * Math.min(1, scale)));
+  while (
+    request.maxPixels !== null &&
+    checkedPageScreenshotProduct([width, height], "output_pixels") > request.maxPixels
+  ) {
+    if (width / nativeWidth >= height / nativeHeight && width > 1) {
+      width -= 1;
+    } else if (height > 1) {
+      height -= 1;
+    } else {
+      break;
+    }
+  }
+  while (request.maxLongEdge !== null && Math.max(width, height) > request.maxLongEdge) {
+    if (width >= height && width > 1) {
+      width -= 1;
+    } else if (height > 1) {
+      height -= 1;
+    } else {
+      break;
+    }
+  }
+  return { width, height };
+}
+
+function pageScreenshotPlanError(plan, reason) {
+  return bridgeError(
+    ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+    `pageScreenshot capture plan rejected before page mutation/capture: reason=${reason} ` +
+    `tile_count=${plan.tile_count} native=${plan.native_width}x${plan.native_height} ` +
+    `output=${plan.output_width}x${plan.output_height} ` +
+    `tile_raw_bytes=${plan.tile_raw_bytes} ` +
+    `tile_encoded_upper_bound_bytes=${plan.tile_encoded_upper_bound_bytes} ` +
+    `output_raw_bytes=${plan.output_raw_bytes} ` +
+    `output_encoded_upper_bound_bytes=${plan.output_encoded_upper_bound_bytes} ` +
+    `estimated_peak_bytes=${plan.estimated_peak_bytes} ` +
+    `hard_peak_budget_bytes=${plan.hard_peak_budget_bytes} ` +
+    `estimated_native_message_bytes=${plan.estimated_native_message_bytes} ` +
+    `native_message_budget_bytes=${plan.native_message_budget_bytes} ` +
+    `max_pixels=${String(plan.max_pixels)} max_long_edge=${String(plan.max_long_edge)}; ` +
+    `remediation=reduce the requested clip/page dimensions or provide a smaller maxPixels/maxLongEdge so the bounded extension-owned compositor and one Chrome tile fit the reported budgets`
+  );
+}
+
+function buildPageScreenshotCapturePlan(setup, request, positions, emulatedPageSurface) {
+  const clip = setup.clip_css;
+  const metrics = setup.metrics;
+  const dpr = Number(metrics.device_pixel_ratio);
+  for (const [label, value] of [
+    ["clip.w", clip.w],
+    ["clip.h", clip.h],
+    ["viewport_width", metrics.viewport_width],
+    ["viewport_height", metrics.viewport_height],
+    ["device_pixel_ratio", dpr]
+  ]) {
+    if (!Number.isFinite(Number(value)) || Number(value) <= 0) {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        `pageScreenshot capture plan cannot bind ${label}=${JSON.stringify(value)} to physical pixels`
+      );
+    }
+  }
+  const nativeWidth = Math.ceil(Number(clip.w) * dpr);
+  const nativeHeight = Math.ceil(Number(clip.h) * dpr);
+  const output = pageScreenshotOutputDimensions(nativeWidth, nativeHeight, request);
+  if (
+    !Number.isSafeInteger(nativeWidth) || !Number.isSafeInteger(nativeHeight) ||
+    nativeWidth <= 0 || nativeHeight <= 0 ||
+    nativeWidth > 0xffffffff || nativeHeight > 0xffffffff ||
+    output.width > 0xffffffff || output.height > 0xffffffff
+  ) {
+    throw bridgeError(
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      `pageScreenshot capture plan dimensions exceed the exact u32 artifact contract: native=${nativeWidth}x${nativeHeight} output=${output.width}x${output.height}`
+    );
+  }
+  const normalTileWidth = Math.ceil(Number(metrics.viewport_width) * dpr);
+  const normalTileHeight = Math.ceil(Number(metrics.viewport_height) * dpr);
+  // Page.captureScreenshot can apply the requested output scale before it
+  // materializes pixels. Its one page-surface image is therefore bounded by
+  // the output contract, not by the native emulated page dimensions.
+  const tileWidth = emulatedPageSurface ? output.width : normalTileWidth;
+  const tileHeight = emulatedPageSurface ? output.height : normalTileHeight;
+  const tileRawBytes = checkedPageScreenshotProduct(
+    [tileWidth, tileHeight, 4],
+    "tile_raw_bytes"
+  );
+  const outputRawBytes = checkedPageScreenshotProduct(
+    [output.width, output.height, 4],
+    "output_raw_bytes"
+  );
+  const tileEncodedUpperBoundBytes = pageScreenshotEncodedUpperBound(
+    tileRawBytes,
+    tileHeight,
+    request.format
+  );
+  const outputEncodedUpperBoundBytes = pageScreenshotEncodedUpperBound(
+    outputRawBytes,
+    output.height,
+    request.format
+  );
+  const tileDataUrlUpperBoundBytes = pageScreenshotDataUrlLengthUpperBound(
+    tileEncodedUpperBoundBytes,
+    request.format
+  );
+  const outputDataUrlUpperBoundBytes = pageScreenshotDataUrlLengthUpperBound(
+    outputEncodedUpperBoundBytes,
+    request.format
+  );
+  // V8 may represent these ASCII strings as one-byte or two-byte strings. Use
+  // the two-byte case, and include every final serialization cohort rather than
+  // relying on garbage collection to have run at a convenient moment.
+  const tilePhasePeakBytes = checkedPageScreenshotSum(
+    [
+      outputRawBytes,
+      tileRawBytes,
+      tileEncodedUpperBoundBytes,
+      checkedPageScreenshotProduct([tileDataUrlUpperBoundBytes, 2], "tile_data_url_heap_bytes")
+    ],
+    "tile_phase_peak_bytes"
+  );
+  const finalPhasePeakBytes = checkedPageScreenshotSum(
+    [
+      outputRawBytes,
+      checkedPageScreenshotProduct([outputEncodedUpperBoundBytes, 2], "output_blob_arraybuffer_bytes"),
+      checkedPageScreenshotProduct([outputDataUrlUpperBoundBytes, 4], "output_base64_json_heap_bytes")
+    ],
+    "final_phase_peak_bytes"
+  );
+  const estimatedPeakBytes = Math.max(tilePhasePeakBytes, finalPhasePeakBytes);
+  const estimatedNativeMessageBytes = checkedPageScreenshotSum(
+    [outputDataUrlUpperBoundBytes, PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES],
+    "estimated_native_message_bytes"
+  );
+  const plan = {
+    schema: "synapse_page_screenshot_capture_plan/v1",
+    composition_mode: "bounded_offscreen_canvas_v1",
+    hard_peak_budget_bytes: PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES,
+    native_message_budget_bytes: PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES,
+    estimated_peak_bytes: estimatedPeakBytes,
+    estimated_native_message_bytes: estimatedNativeMessageBytes,
+    native_width: nativeWidth,
+    native_height: nativeHeight,
+    output_width: output.width,
+    output_height: output.height,
+    output_scale_x: output.width / Number(clip.w),
+    output_scale_y: output.height / Number(clip.h),
+    applied_scale: Math.max(output.width, output.height) / Math.max(nativeWidth, nativeHeight),
+    tile_count: emulatedPageSurface ? 1 : positions.length,
+    tile_width: tileWidth,
+    tile_height: tileHeight,
+    tile_raw_bytes: tileRawBytes,
+    tile_encoded_upper_bound_bytes: tileEncodedUpperBoundBytes,
+    tile_data_url_upper_bound_bytes: tileDataUrlUpperBoundBytes,
+    output_raw_bytes: outputRawBytes,
+    output_encoded_upper_bound_bytes: outputEncodedUpperBoundBytes,
+    output_data_url_upper_bound_bytes: outputDataUrlUpperBoundBytes,
+    max_pixels: request.maxPixels,
+    max_long_edge: request.maxLongEdge,
+    actual_max_tile_data_url_bytes: 0,
+    actual_composite_blob_bytes: 0,
+    actual_composite_data_url_bytes: 0,
+    actual_native_message_bytes: 0,
+    surface_released: false
+  };
+  if (!Number.isSafeInteger(plan.tile_count) || plan.tile_count <= 0 || plan.tile_count > 400) {
+    throw pageScreenshotPlanError(plan, "tile_count_out_of_range");
+  }
+  if (estimatedPeakBytes > PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES) {
+    throw pageScreenshotPlanError(plan, "estimated_peak_exceeds_hard_budget");
+  }
+  if (estimatedNativeMessageBytes > PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES) {
+    throw pageScreenshotPlanError(plan, "estimated_native_message_exceeds_transport_budget");
+  }
+  return plan;
+}
+
+function createPageScreenshotCompositor(plan) {
+  if (typeof OffscreenCanvas !== "function") {
+    throw bridgeError(
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      "pageScreenshot bounded compositor requires OffscreenCanvas in the extension service worker; update Chrome to a version that supports worker OffscreenCanvas"
+    );
+  }
+  const canvas = new OffscreenCanvas(plan.output_width, plan.output_height);
+  const context = canvas.getContext("2d", { alpha: true });
+  if (!context) {
+    throw bridgeError(
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      `pageScreenshot could not allocate the bounded ${plan.output_width}x${plan.output_height} extension-owned 2D composition surface within estimated_peak_bytes=${plan.estimated_peak_bytes}`
+    );
+  }
+  context.imageSmoothingEnabled = true;
+  context.imageSmoothingQuality = "high";
+  context.clearRect(0, 0, plan.output_width, plan.output_height);
+  return { canvas, context, released: false };
+}
+
+function releasePageScreenshotCompositor(compositor, plan) {
+  if (!compositor || compositor.released) {
+    return;
+  }
+  compositor.canvas.width = 1;
+  compositor.canvas.height = 1;
+  compositor.released = true;
+  plan.surface_released = true;
+}
+
+async function compositePageScreenshotDataUrl(compositor, plan, dataUrl, tile, label) {
+  if (typeof dataUrl !== "string" || !dataUrl.startsWith("data:image/")) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `pageScreenshot ${label} returned an unsupported image payload`
+    );
+  }
+  const dataUrlBytes = dataUrl.length;
+  if (dataUrlBytes > plan.tile_data_url_upper_bound_bytes) {
+    throw pageScreenshotPlanError(
+      plan,
+      `actual_tile_data_url_exceeds_bound label=${label} actual=${dataUrlBytes}`
+    );
+  }
+  plan.actual_max_tile_data_url_bytes = Math.max(
+    plan.actual_max_tile_data_url_bytes,
+    dataUrlBytes
+  );
+  let bitmap = null;
+  try {
+    const response = await fetch(dataUrl);
+    const blob = await response.blob();
+    if (blob.size > plan.tile_encoded_upper_bound_bytes) {
+      throw pageScreenshotPlanError(
+        plan,
+        `actual_tile_blob_exceeds_bound label=${label} actual=${blob.size}`
+      );
+    }
+    if (typeof createImageBitmap !== "function") {
+      throw bridgeError(
+        ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+        "pageScreenshot bounded compositor requires createImageBitmap in the extension service worker; update Chrome and retry"
+      );
+    }
+    bitmap = await createImageBitmap(blob);
+    const tileScaleX = bitmap.width / Number(tile.viewport_width_css);
+    const tileScaleY = bitmap.height / Number(tile.viewport_height_css);
+    const dprTolerance = Math.max(0.02, Math.abs(plan.tile_width / Number(tile.viewport_width_css)) * 0.01);
+    if (
+      !Number.isFinite(tileScaleX) || !Number.isFinite(tileScaleY) ||
+      Math.abs(tileScaleX - tileScaleY) > dprTolerance
+    ) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `pageScreenshot ${label} bitmap/CSS scale mismatch bitmap=${bitmap.width}x${bitmap.height} viewport_css=${tile.viewport_width_css}x${tile.viewport_height_css} scale=${tileScaleX}x${tileScaleY}`
+      );
+    }
+    const clip = tile.clip_css;
+    const left = Math.max(clip.x, tile.scroll_x_css);
+    const top = Math.max(clip.y, tile.scroll_y_css);
+    const right = Math.min(clip.x + clip.w, tile.scroll_x_css + tile.viewport_width_css);
+    const bottom = Math.min(clip.y + clip.h, tile.scroll_y_css + tile.viewport_height_css);
+    if (right <= left || bottom <= top) {
+      return { data_url_bytes: dataUrlBytes, blob_bytes: blob.size, bitmap_width: bitmap.width, bitmap_height: bitmap.height };
+    }
+    const sourceX = (left - tile.scroll_x_css) * tileScaleX;
+    const sourceY = (top - tile.scroll_y_css) * tileScaleY;
+    const sourceW = (right - left) * tileScaleX;
+    const sourceH = (bottom - top) * tileScaleY;
+    const destX = (left - clip.x) * plan.output_scale_x;
+    const destY = (top - clip.y) * plan.output_scale_y;
+    const destW = (right - left) * plan.output_scale_x;
+    const destH = (bottom - top) * plan.output_scale_y;
+    compositor.context.drawImage(
+      bitmap,
+      sourceX,
+      sourceY,
+      sourceW,
+      sourceH,
+      destX,
+      destY,
+      destW,
+      destH
+    );
+    return { data_url_bytes: dataUrlBytes, blob_bytes: blob.size, bitmap_width: bitmap.width, bitmap_height: bitmap.height };
+  } finally {
+    if (bitmap) {
+      bitmap.close();
+    }
+  }
+}
+
+function pageScreenshotArrayBufferToBase64(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const parts = [];
+  const chunkBytes = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkBytes) {
+    parts.push(String.fromCharCode(...bytes.subarray(offset, offset + chunkBytes)));
+  }
+  return btoa(parts.join(""));
+}
+
+async function finalizePageScreenshotCompositor(compositor, plan, request) {
+  const expectedType = request.format === "jpeg" ? "image/jpeg" : "image/png";
+  const blob = await compositor.canvas.convertToBlob({
+    type: expectedType,
+    quality: request.format === "jpeg" ? request.quality / 100 : undefined
+  });
+  if (blob.type !== expectedType) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `pageScreenshot bounded compositor encoded ${JSON.stringify(blob.type)} instead of ${expectedType}; no format fallback is permitted`
+    );
+  }
+  if (blob.size <= 0 || blob.size > plan.output_encoded_upper_bound_bytes) {
+    throw pageScreenshotPlanError(
+      plan,
+      `composite_blob_out_of_range actual=${blob.size}`
+    );
+  }
+  const buffer = await blob.arrayBuffer();
+  const base64 = pageScreenshotArrayBufferToBase64(buffer);
+  const dataUrl = `data:${expectedType};base64,${base64}`;
+  if (dataUrl.length > plan.output_data_url_upper_bound_bytes) {
+    throw pageScreenshotPlanError(
+      plan,
+      `composite_data_url_exceeds_bound actual=${dataUrl.length}`
+    );
+  }
+  plan.actual_composite_blob_bytes = blob.size;
+  plan.actual_composite_data_url_bytes = dataUrl.length;
+  return dataUrl;
+}
+
+function finalizePageScreenshotNativeMessageReadback(result, plan) {
+  if (typeof TextEncoder !== "function") {
+    throw bridgeError(
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      "pageScreenshot cannot prove its native-message byte length because TextEncoder is unavailable in the extension service worker"
+    );
+  }
+  const encoder = new TextEncoder();
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    const actual = encoder.encode(JSON.stringify(result)).byteLength +
+      PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES;
+    if (!Number.isSafeInteger(actual)) {
+      throw pageScreenshotPlanError(plan, "actual_native_message_bytes_not_exact");
+    }
+    if (actual === plan.actual_native_message_bytes) {
+      break;
+    }
+    plan.actual_native_message_bytes = actual;
+  }
+  const verified = encoder.encode(JSON.stringify(result)).byteLength +
+    PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES;
+  if (verified !== plan.actual_native_message_bytes) {
+    throw pageScreenshotPlanError(
+      plan,
+      `actual_native_message_fixed_point_failed recorded=${plan.actual_native_message_bytes} verified=${verified}`
+    );
+  }
+  if (verified > plan.native_message_budget_bytes) {
+    throw pageScreenshotPlanError(
+      plan,
+      `actual_native_message_exceeds_transport_budget actual=${verified}`
+    );
+  }
+}
+
 async function handlePageScreenshot(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const request = normalizePageScreenshotRequest(params, selected.tabId);
@@ -5305,8 +5764,11 @@ async function handlePageScreenshot(params) {
   let cleanupReadback = null;
   let operationError = null;
   let captureBackend = "chrome_tabs_extension";
-  const tiles = [];
   const captureAttempts = [];
+  let capturePlan = null;
+  let compositor = null;
+  let compositeImageDataUrl = null;
+  let pageMutationStarted = false;
   try {
     if (before.discarded || before.ready_state === "unloaded") {
       await chrome.tabs.update(selected.tabId, { active: true });
@@ -5328,6 +5790,30 @@ async function handlePageScreenshot(params) {
         `pageScreenshot setup failed: ${String(setup.error_detail || "")}`
       );
     }
+    const emulatedPageSurface =
+      VIEWPORT_BASELINE_BY_TAB.has(selected.tabId) ||
+      DEVICE_BASELINE_BY_TAB.has(selected.tabId);
+    const positions = emulatedPageSurface
+      ? [{ x: setup.clip_css.x, y: setup.clip_css.y }]
+      : pageScreenshotTilePositions(setup.clip_css, setup.metrics);
+    capturePlan = buildPageScreenshotCapturePlan(
+      setup,
+      request,
+      positions,
+      emulatedPageSurface
+    );
+    compositor = createPageScreenshotCompositor(capturePlan);
+    pageMutationStarted = true;
+    const prepared = await runPageScreenshotPrepare(selected.tabId, {
+      expectedDocumentId: setup.document_id,
+      omitBackground: request.omitBackground
+    });
+    if (!prepared.ok) {
+      throw bridgeError(
+        String(prepared.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
+        `pageScreenshot prepare failed: ${String(prepared.error_detail || "")}`
+      );
+    }
     if (!activeForCapture) {
       await chrome.tabs.update(selected.tabId, { active: true });
       await waitForTabActiveState(
@@ -5337,58 +5823,15 @@ async function handlePageScreenshot(params) {
       );
       activeForCapture = true;
     }
-    const emulatedPageSurface =
-      VIEWPORT_BASELINE_BY_TAB.has(selected.tabId) ||
-      DEVICE_BASELINE_BY_TAB.has(selected.tabId);
     if (emulatedPageSurface) {
-      const imageDataUrl = await captureEmulatedPageSurface(
-        selected.tabId,
-        setup.clip_css,
-        request,
-        setup.metrics.device_pixel_ratio,
-        remainingPageScreenshotBudgetMs(commandDeadlineMs, "capture_emulated_page_surface")
-      );
-      tiles.push({
-        scroll_x_css: setup.clip_css.x,
-        scroll_y_css: setup.clip_css.y,
-        viewport_width_css: setup.clip_css.w,
-        viewport_height_css: setup.clip_css.h,
-        image_data_url: imageDataUrl,
-        image_data_url_len: imageDataUrl.length
-      });
-      captureAttempts.push({
+      const captureStartedAtMs = Date.now();
+      let imageDataUrl = null;
+      const attempt = {
         attempt: 1,
         scroll_x_css: setup.clip_css.x,
         scroll_y_css: setup.clip_css.y,
         requested_scroll_x_css: setup.clip_css.x,
         requested_scroll_y_css: setup.clip_css.y,
-        ok: true,
-        elapsed_ms: 0,
-        timeout_ms: remainingPageScreenshotBudgetMs(commandDeadlineMs, "capture_emulated_page_surface_readback"),
-        retryable: false,
-        image_data_url_len: imageDataUrl.length,
-        error_detail: ""
-      });
-      captureBackend = "chrome_debugger_page_surface";
-    } else {
-    const positions = pageScreenshotTilePositions(setup.clip_css, setup.metrics);
-    for (const [index, position] of positions.entries()) {
-      remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
-      const scrollReadback = await runPageScreenshotScroll(
-        selected.tabId,
-        position,
-        setup.document_id
-      );
-      remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
-      await sleep(request.captureDelayMs);
-      let imageDataUrl;
-      const captureStartedAtMs = Date.now();
-      const attempt = {
-        attempt: index + 1,
-        scroll_x_css: scrollReadback.scroll_x,
-        scroll_y_css: scrollReadback.scroll_y,
-        requested_scroll_x_css: position.x,
-        requested_scroll_y_css: position.y,
         ok: false,
         elapsed_ms: 0,
         timeout_ms: 0,
@@ -5399,60 +5842,135 @@ async function handlePageScreenshot(params) {
       try {
         const captureTimeoutMs = remainingPageScreenshotBudgetMs(
           commandDeadlineMs,
-          `capture_visible_tab_tile_${index + 1}`
+          "capture_emulated_page_surface"
         );
         attempt.timeout_ms = captureTimeoutMs;
-        imageDataUrl = await captureVisibleTabWithQuota(before.chrome_window_id, {
-          format: request.format,
-          quality: request.quality
-        }, captureTimeoutMs, {
-          tabId: selected.tabId,
-          windowId: before.chrome_window_id,
-          targetId: selected.target.id,
-          tileIndex: index + 1,
-          tileCount: positions.length,
-          requestedScrollX: position.x,
-          requestedScrollY: position.y
-        });
+        imageDataUrl = await captureEmulatedPageSurface(
+          selected.tabId,
+          setup.clip_css,
+          request,
+          setup.metrics.device_pixel_ratio,
+          capturePlan,
+          captureTimeoutMs
+        );
         attempt.ok = true;
-        attempt.image_data_url_len = String(imageDataUrl || "").length;
+        attempt.image_data_url_len = imageDataUrl.length;
+        await compositePageScreenshotDataUrl(
+          compositor,
+          capturePlan,
+          imageDataUrl,
+          {
+            scroll_x_css: setup.clip_css.x,
+            scroll_y_css: setup.clip_css.y,
+            viewport_width_css: setup.clip_css.w,
+            viewport_height_css: setup.clip_css.h,
+            clip_css: setup.clip_css
+          },
+          "emulated_page_surface"
+        );
+        imageDataUrl = null;
       } catch (error) {
         attempt.error_detail = errorMessage(error);
         attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
-        const captureErrorCode =
-          error?.code === ERROR_EXTENSION_TIMEOUT ||
-          error?.code === ERROR_CAPTURE_VISIBLE_TAB_PENDING
-            ? error.code
-            : ERROR_ATTACH_FAILED;
-        throw bridgeError(
-          captureErrorCode,
-          `pageScreenshot chrome.tabs.captureVisibleTab(window=${before.chrome_window_id}) failed: ${errorMessage(error)}`
-        );
+        throw error;
       } finally {
         attempt.elapsed_ms = Date.now() - captureStartedAtMs;
         captureAttempts.push(attempt);
       }
-      if (typeof imageDataUrl !== "string" || !imageDataUrl.startsWith("data:image/")) {
-        throw bridgeError(
-          ERROR_AXTREE_FAILED,
-          `pageScreenshot captureVisibleTab returned unsupported payload for tab ${selected.tabId}`
+      captureBackend = "chrome_debugger_page_surface";
+    } else {
+      for (const [index, position] of positions.entries()) {
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, `scroll_tile_${index + 1}`);
+        const scrollReadback = await runPageScreenshotScroll(
+          selected.tabId,
+          position,
+          setup.document_id
         );
+        remainingPageScreenshotBudgetMs(commandDeadlineMs, `delay_tile_${index + 1}`);
+        await sleep(request.captureDelayMs);
+        let imageDataUrl = null;
+        const captureStartedAtMs = Date.now();
+        const attempt = {
+          attempt: index + 1,
+          scroll_x_css: scrollReadback.scroll_x,
+          scroll_y_css: scrollReadback.scroll_y,
+          requested_scroll_x_css: position.x,
+          requested_scroll_y_css: position.y,
+          ok: false,
+          elapsed_ms: 0,
+          timeout_ms: 0,
+          retryable: false,
+          image_data_url_len: 0,
+          error_detail: ""
+        };
+        try {
+          const captureTimeoutMs = remainingPageScreenshotBudgetMs(
+            commandDeadlineMs,
+            `capture_visible_tab_tile_${index + 1}`
+          );
+          attempt.timeout_ms = captureTimeoutMs;
+          imageDataUrl = await captureVisibleTabWithQuota(before.chrome_window_id, {
+            format: request.format,
+            quality: request.quality
+          }, captureTimeoutMs, {
+            tabId: selected.tabId,
+            windowId: before.chrome_window_id,
+            targetId: selected.target.id,
+            tileIndex: index + 1,
+            tileCount: positions.length,
+            requestedScrollX: position.x,
+            requestedScrollY: position.y
+          });
+          attempt.ok = true;
+          attempt.image_data_url_len = String(imageDataUrl || "").length;
+          await compositePageScreenshotDataUrl(
+            compositor,
+            capturePlan,
+            imageDataUrl,
+            {
+              scroll_x_css: scrollReadback.scroll_x,
+              scroll_y_css: scrollReadback.scroll_y,
+              viewport_width_css: scrollReadback.viewport_width,
+              viewport_height_css: scrollReadback.viewport_height,
+              clip_css: setup.clip_css
+            },
+            `visible_tile_${index + 1}`
+          );
+          imageDataUrl = null;
+        } catch (error) {
+          attempt.error_detail = errorMessage(error);
+          attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
+          const captureErrorCode =
+            error?.code === ERROR_EXTENSION_TIMEOUT ||
+            error?.code === ERROR_CAPTURE_VISIBLE_TAB_PENDING ||
+            error?.code === ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT ||
+            error?.code === ERROR_AXTREE_FAILED
+              ? error.code
+              : ERROR_ATTACH_FAILED;
+          throw bridgeError(
+            captureErrorCode,
+            `pageScreenshot tile ${index + 1}/${positions.length} capture/composition failed: ${errorMessage(error)}`
+          );
+        } finally {
+          attempt.elapsed_ms = Date.now() - captureStartedAtMs;
+          captureAttempts.push(attempt);
+        }
       }
-      tiles.push({
-        scroll_x_css: scrollReadback.scroll_x,
-        scroll_y_css: scrollReadback.scroll_y,
-        viewport_width_css: scrollReadback.viewport_width,
-        viewport_height_css: scrollReadback.viewport_height,
-        image_data_url: imageDataUrl,
-        image_data_url_len: imageDataUrl.length
-      });
     }
-    }
+    compositeImageDataUrl = await finalizePageScreenshotCompositor(
+      compositor,
+      capturePlan,
+      request
+    );
+    releasePageScreenshotCompositor(compositor, capturePlan);
   } catch (error) {
     operationError = error;
   } finally {
+    if (compositor && capturePlan) {
+      releasePageScreenshotCompositor(compositor, capturePlan);
+    }
     const cleanupErrors = [];
-    if (setup?.ok) {
+    if (pageMutationStarted && setup?.ok) {
       try {
         cleanupReadback = await runPageScreenshotCleanup(selected.tabId, {
           expectedDocumentId: setup.document_id,
@@ -5494,8 +6012,14 @@ async function handlePageScreenshot(params) {
   if (operationError) {
     throw operationError;
   }
+  if (!capturePlan || !compositeImageDataUrl) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      "pageScreenshot reached response serialization without a verified capture plan and composite image"
+    );
+  }
   const after = await tabPageState(selected.tabId, selected.target);
-  return {
+  const result = {
     extension_id: chrome.runtime.id,
     target_id: after.target_id || selected.target.id,
     tab_id: selected.tabId,
@@ -5525,8 +6049,11 @@ async function handlePageScreenshot(params) {
     scroll_height_css: setup.metrics.scroll_height,
     viewport_width_css: setup.metrics.viewport_width,
     viewport_height_css: setup.metrics.viewport_height,
-    tile_count: tiles.length,
-    tiles,
+    composition_mode: capturePlan.composition_mode,
+    capture_plan: capturePlan,
+    composite_image_data_url: compositeImageDataUrl,
+    composite_image_data_url_len: compositeImageDataUrl.length,
+    tile_count: capturePlan.tile_count,
     capture_attempt_count: captureAttempts.length,
     capture_attempts: captureAttempts,
     document_id: setup.document_id,
@@ -5535,16 +6062,18 @@ async function handlePageScreenshot(params) {
     mask_count: setup.mask_count,
     masks: setup.masks,
     readback_backend: captureBackend === "chrome_debugger_page_surface"
-      ? "chrome.scripting.executeScript(document-pinned page metrics/mask geometry) + chrome.debugger Page.captureScreenshot"
-      : "chrome.scripting.executeScript(document-pinned page metrics/mask geometry/scroll) + chrome.tabs.captureVisibleTab",
+      ? "chrome.scripting.executeScript(document-pinned geometry) + bounded extension OffscreenCanvas + one Chrome debugger page-surface image"
+      : "chrome.scripting.executeScript(document-pinned geometry/scroll) + bounded extension OffscreenCanvas + one-at-a-time chrome.tabs.captureVisibleTab images",
     backend_tier_used: captureBackend,
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
+  finalizePageScreenshotNativeMessageReadback(result, capturePlan);
+  return result;
 }
 
-async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, timeoutMs) {
+async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, plan, timeoutMs) {
   const viewportBaseline = VIEWPORT_BASELINE_BY_TAB.get(tabId);
   const deviceBaseline = DEVICE_BASELINE_BY_TAB.get(tabId);
   const nativeDpr = Number(
@@ -5553,8 +6082,10 @@ async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, tim
     deviceBaseline?.device_pixel_ratio
   );
   const requestedDpr = Number(emulatedDpr);
+  const boundedCssScale = Math.min(plan.output_scale_x, plan.output_scale_y);
   if (!Number.isFinite(nativeDpr) || nativeDpr <= 0 ||
-      !Number.isFinite(requestedDpr) || requestedDpr <= 0) {
+      !Number.isFinite(requestedDpr) || requestedDpr <= 0 ||
+      !Number.isFinite(boundedCssScale) || boundedCssScale <= 0) {
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `pageScreenshot cannot bind emulated pixels to CSS geometry: tab=${tabId} native_dpr=${String(nativeDpr)} requested_dpr=${String(requestedDpr)}; reset and reapply the viewport/device override so its baseline is physically readable`
@@ -5575,7 +6106,7 @@ async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, tim
           y: Number(clip.y),
           width: Number(clip.w),
           height: Number(clip.h),
-          scale: requestedDpr / nativeDpr
+          scale: boundedCssScale / nativeDpr
         }
       },
       timeoutMs
@@ -5651,10 +6182,26 @@ function normalizePageScreenshotRequest(params, selectedTabId) {
     format: normalizePageScreenshotFormat(params.format),
     quality: normalizePageScreenshotQuality(params.quality),
     omitBackground: Boolean(params.omitBackground),
+    maxPixels: normalizePageScreenshotPositiveLimit(params.maxPixels, "maxPixels"),
+    maxLongEdge: normalizePageScreenshotPositiveLimit(params.maxLongEdge, "maxLongEdge"),
     masks: normalizePageScreenshotMasks(params.masks, selectedTabId),
     waitTimeoutMs: normalizeWaitTimeout(params.waitTimeoutMs),
     captureDelayMs: normalizePageScreenshotDelay(params.captureDelayMs)
   };
+}
+
+function normalizePageScreenshotPositiveLimit(value, label) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  const parsed = Number(value);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `pageScreenshot ${label} must be a positive safe integer; got ${JSON.stringify(value)}`
+    );
+  }
+  return parsed;
 }
 
 function normalizePageScreenshotScope(value) {
@@ -5866,6 +6413,38 @@ async function runPageScreenshotSetup(tabId, request) {
   return { ...first.result, document_id: documentId };
 }
 
+async function runPageScreenshotPrepare(tabId, request) {
+  let injected;
+  try {
+    injected = await chrome.scripting.executeScript({
+      target: { tabId },
+      world: "MAIN",
+      func: pageScreenshotPrepareInPage,
+      args: [request]
+    });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `chrome.scripting.executeScript pageScreenshot prepare(${tabId}) failed: ${errorMessage(error)}`
+    );
+  }
+  const first = Array.isArray(injected) ? injected[0] : null;
+  const actualDocumentId = stringOrNull(first?.documentId);
+  if (!first || !first.result || typeof first.result !== "object") {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      "pageScreenshot prepare returned no structured result"
+    );
+  }
+  if (!actualDocumentId || actualDocumentId !== request.expectedDocumentId) {
+    throw bridgeError(
+      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
+      `pageScreenshot document changed before preparation: expected_document_id=${JSON.stringify(request.expectedDocumentId)} actual_document_id=${JSON.stringify(actualDocumentId)}; no page mutation or artifact may be accepted from mixed document generations`
+    );
+  }
+  return { ...first.result, document_id: actualDocumentId };
+}
+
 async function runPageScreenshotScroll(tabId, position, expectedDocumentId) {
   let injected;
   try {
@@ -5957,6 +6536,18 @@ function pageScreenshotTilePositions(clip, metrics) {
   const top = Number(clip.y);
   const right = left + Number(clip.w);
   const bottom = top + Number(clip.h);
+  const xIterationBound = Math.max(1, Math.ceil(Number(clip.w) / viewportW));
+  const yIterationBound = Math.max(1, Math.ceil(Number(clip.h) / viewportH));
+  const iterationBound = checkedPageScreenshotProduct(
+    [xIterationBound, yIterationBound],
+    "tile_iteration_bound"
+  );
+  if (iterationBound > 400) {
+    throw bridgeError(
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      `pageScreenshot capture plan rejected before allocating tile positions: tile_iteration_bound=${iterationBound} limit=400 clip_css=${clip.w}x${clip.h} viewport_css=${viewportW}x${viewportH}; remediation=reduce the requested clip/page dimensions or capture a smaller bounded region`
+    );
+  }
   const maxScrollX = Math.max(0, Number(metrics.scroll_width || viewportW) - viewportW);
   const maxScrollY = Math.max(0, Number(metrics.scroll_height || viewportH) - viewportH);
   const xs = [];
@@ -5983,8 +6574,8 @@ function pageScreenshotTilePositions(clip, metrics) {
   }
   if (positions.length > 400) {
     throw bridgeError(
-      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-      `pageScreenshot would require ${positions.length} tiles; limit is 400`
+      ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT,
+      `pageScreenshot capture plan rejected before capture: exact_tile_count=${positions.length} limit=400; remediation=reduce the requested clip/page dimensions or capture a smaller bounded region`
     );
   }
   return positions;
@@ -6088,17 +6679,26 @@ function pageScreenshotSetupInPage(request) {
       if (!element) {
         return fail("CHROME_DOM_ELEMENT_NOT_FOUND", `element path ${JSON.stringify(request.elementPath)} was not found`);
       }
-      try {
-        element.scrollIntoView({ block: "center", inline: "center", behavior: "instant" });
-      } catch (_) {
-        element.scrollIntoView();
-      }
       const rect = element.getBoundingClientRect();
       element_rect = rectToPlain(rect);
       clip = { x: element_rect.x, y: element_rect.y, w: element_rect.w, h: element_rect.h };
     }
     if (!clip || !finite(clip.x) || !finite(clip.y) || !finite(clip.w) || !finite(clip.h) || clip.w <= 0 || clip.h <= 0) {
       return fail("CAPTURE_TARGET_INVALID", `pageScreenshot resolved an empty/invalid clip ${JSON.stringify(clip)}`);
+    }
+    const resolvedMetrics = metrics();
+    const clipRight = Number(clip.x) + Number(clip.w);
+    const clipBottom = Number(clip.y) + Number(clip.h);
+    if (
+      !finite(clipRight) || !finite(clipBottom) ||
+      Number(clip.x) < 0 || Number(clip.y) < 0 ||
+      clipRight > resolvedMetrics.scroll_width + 0.5 ||
+      clipBottom > resolvedMetrics.scroll_height + 0.5
+    ) {
+      return fail(
+        "CAPTURE_TARGET_INVALID",
+        `pageScreenshot clip lies outside the physical document surface: clip=${JSON.stringify(clip)} document_css=${resolvedMetrics.scroll_width}x${resolvedMetrics.scroll_height}; request a non-empty region wholly inside the document`
+      );
     }
     const masks = [];
     for (const [index, mask] of Array.from(request.masks || []).entries()) {
@@ -6129,14 +6729,6 @@ function pageScreenshotSetupInPage(request) {
         html_background_color: doc ? doc.style.backgroundColor : null,
         body_background_color: body ? body.style.backgroundColor : null
       };
-      if (doc) {
-        doc.style.background = "transparent";
-        doc.style.backgroundColor = "transparent";
-      }
-      if (body) {
-        body.style.background = "transparent";
-        body.style.backgroundColor = "transparent";
-      }
     }
     return {
       ok: true,
@@ -6147,7 +6739,7 @@ function pageScreenshotSetupInPage(request) {
         h: Number(clip.h)
       },
       element_rect,
-      metrics: metrics(),
+      metrics: resolvedMetrics,
       before_scroll_x: beforeScrollX,
       before_scroll_y: beforeScrollY,
       mask_count: masks.length,
@@ -6156,6 +6748,33 @@ function pageScreenshotSetupInPage(request) {
     };
   } catch (error) {
     return fail("CHROME_SCRIPTING_EXECUTE_FAILED", String(error && error.message || error));
+  }
+}
+
+function pageScreenshotPrepareInPage(request) {
+  try {
+    if (request.omitBackground) {
+      if (document.documentElement) {
+        document.documentElement.style.background = "transparent";
+        document.documentElement.style.backgroundColor = "transparent";
+      }
+      if (document.body) {
+        document.body.style.background = "transparent";
+        document.body.style.backgroundColor = "transparent";
+      }
+    }
+    return {
+      ok: true,
+      background_mutated: Boolean(request.omitBackground),
+      scroll_x: Number(window.scrollX || 0),
+      scroll_y: Number(window.scrollY || 0)
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
+      error_detail: String(error && error.message || error)
+    };
   }
 }
 

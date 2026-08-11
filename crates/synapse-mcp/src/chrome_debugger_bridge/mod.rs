@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-10-durable-capture-lease-v4";
+    "synapse-chrome-bridge-2026-08-11-bounded-screenshot-compositor-v5";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "d10f938d10e56eafc36afc859a2c984cf4736f94130f401c00fb43b0abd7afbd";
+    "b0b4e4aed354a4bce254ca3028bc8c496ff62c4e267a6d70f60bfd2d5726cd8f";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -3495,10 +3495,11 @@ pub struct ChromeDebuggerPageScreenshotResult {
     pub viewport_width_css: f64,
     #[serde(default)]
     pub viewport_height_css: f64,
-    #[serde(default)]
+    pub composition_mode: String,
+    pub capture_plan: ChromeDebuggerPageScreenshotCapturePlan,
+    pub composite_image_data_url: String,
+    pub composite_image_data_url_len: usize,
     pub tile_count: usize,
-    #[serde(default)]
-    pub tiles: Vec<ChromeDebuggerPageScreenshotTile>,
     #[serde(default)]
     pub capture_attempt_count: usize,
     #[serde(default)]
@@ -3707,19 +3708,37 @@ pub struct ChromeDebuggerPageScreenshotMask {
     pub color_rgba: [u8; 4],
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageScreenshotTile {
-    #[serde(default)]
-    pub scroll_x_css: f64,
-    #[serde(default)]
-    pub scroll_y_css: f64,
-    #[serde(default)]
-    pub viewport_width_css: f64,
-    #[serde(default)]
-    pub viewport_height_css: f64,
-    pub image_data_url: String,
-    #[serde(default)]
-    pub image_data_url_len: usize,
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct ChromeDebuggerPageScreenshotCapturePlan {
+    pub schema: String,
+    pub composition_mode: String,
+    pub hard_peak_budget_bytes: u64,
+    pub native_message_budget_bytes: u64,
+    pub estimated_peak_bytes: u64,
+    pub estimated_native_message_bytes: u64,
+    pub native_width: u32,
+    pub native_height: u32,
+    pub output_width: u32,
+    pub output_height: u32,
+    pub output_scale_x: f64,
+    pub output_scale_y: f64,
+    pub applied_scale: f64,
+    pub tile_count: usize,
+    pub tile_width: u32,
+    pub tile_height: u32,
+    pub tile_raw_bytes: u64,
+    pub tile_encoded_upper_bound_bytes: u64,
+    pub tile_data_url_upper_bound_bytes: u64,
+    pub output_raw_bytes: u64,
+    pub output_encoded_upper_bound_bytes: u64,
+    pub output_data_url_upper_bound_bytes: u64,
+    pub max_pixels: Option<u64>,
+    pub max_long_edge: Option<u64>,
+    pub actual_max_tile_data_url_bytes: u64,
+    pub actual_composite_blob_bytes: u64,
+    pub actual_composite_data_url_bytes: u64,
+    pub actual_native_message_bytes: u64,
+    pub surface_released: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

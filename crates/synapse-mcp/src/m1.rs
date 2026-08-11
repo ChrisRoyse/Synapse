@@ -601,8 +601,9 @@ pub struct BrowserScreenshotParams {
     /// `browser_aria_snapshot`. Required with `scope=element`.
     #[serde(default)]
     pub element_id: Option<String>,
-    /// Elements whose captured pixels are replaced after trusted tile stitching
-    /// and before resize/encode. No page-DOM overlay is created (#2214).
+    /// Elements whose captured pixels are replaced after the bounded extension
+    /// composite is independently decoded and before encode. No page-DOM
+    /// overlay is created (#2214).
     #[serde(default)]
     pub masks: Vec<BrowserScreenshotMask>,
     /// Image format. Defaults to the file extension.
@@ -685,13 +686,24 @@ pub struct BrowserScreenshotResponse {
     pub scroll_width_css: f64,
     pub scroll_height_css: f64,
     pub tile_count: usize,
+    /// Exact bridge compositor implementation required by the daemon.
+    pub composition_mode: String,
+    pub capture_plan_schema: String,
+    pub capture_plan_hard_peak_budget_bytes: u64,
+    pub capture_plan_estimated_peak_bytes: u64,
+    pub capture_plan_native_message_budget_bytes: u64,
+    pub capture_plan_estimated_native_message_bytes: u64,
+    pub capture_plan_actual_native_message_bytes: u64,
+    pub capture_plan_actual_max_tile_data_url_bytes: u64,
+    pub capture_plan_actual_composite_blob_bytes: u64,
+    pub capture_plan_surface_released: bool,
     /// Caller-requested mask count. Equal to resolved/applied counts on success.
     pub mask_count: usize,
     pub mask_requested_count: usize,
     pub mask_resolved_count: usize,
     pub mask_applied_count: usize,
     pub mask_partial_intersection_count: usize,
-    /// Conservative overwrite operations in the native stitched bitmap. Pixels
+    /// Conservative overwrite operations in the bounded composite. Pixels
     /// covered by overlapping masks are counted once per overwrite.
     pub mask_pixel_write_count: u64,
     pub mask_backend: String,

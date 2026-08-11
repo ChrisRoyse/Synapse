@@ -6,6 +6,10 @@ pub const CAPTURE_PRINTWINDOW_DISABLED: &str = "CAPTURE_PRINTWINDOW_DISABLED";
 pub const CAPTURE_PRINTWINDOW_BLACK: &str = "CAPTURE_PRINTWINDOW_BLACK";
 pub const CAPTURE_TARGET_LOST: &str = "CAPTURE_TARGET_LOST";
 pub const CAPTURE_NO_DIRTY_REGIONS: &str = "CAPTURE_NO_DIRTY_REGIONS";
+/// A screenshot request's independently calculated capture/composition/message
+/// plan cannot fit the hard pipeline budget. This is rejected before any page
+/// mutation or Chrome capture begins (#2170).
+pub const CAPTURE_PLAN_EXCEEDS_LIMIT: &str = "CAPTURE_PLAN_EXCEEDS_LIMIT";
 pub const A11Y_NOT_AVAILABLE: &str = "A11Y_NOT_AVAILABLE";
 pub const A11Y_ELEMENT_STALE: &str = "A11Y_ELEMENT_STALE";
 pub const A11Y_NO_FOREGROUND: &str = "A11Y_NO_FOREGROUND";
