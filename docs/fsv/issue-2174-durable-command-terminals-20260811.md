@@ -1,7 +1,8 @@
 # FSV — #2174 durable Chrome command terminals
 
 Date: 2026-08-11 (America/Chicago)  
-Implementation commit: `360e1a0a445e97afb7fba9ca49425b5bae7648f3` on `main`
+Implementation commit: `360e1a0a445e97afb7fba9ca49425b5bae7648f3` on `main`  
+Acceptance comment: https://github.com/ChrisRoyse/Synapse/issues/2174#issuecomment-5253740000
 
 ## Source of Truth
 
@@ -202,6 +203,16 @@ image, with one healthy Chrome host and no queue. The owned #2221 issue tab was
 closed with an independent absence read. The already-open Chrome window then
 contained only the two original tabs, #2174 and Gmail, with #2174 independently
 verified active. Gmail content was never read or mutated.
+
+The #2174 acceptance comment was entered through the real GitHub form. Its dual
+field readback matched 4,383 requested bytes with SHA-256
+`10457e36854a6047ec054ba24e0689e2f937d89572d3f85b98fa2036976f118f`;
+a separate browser evaluation independently recomputed the same SHA-256 from
+the live textarea before submission. A fresh DOM read found exactly one
+acceptance marker and the permalink above. After clicking the real `Close
+issue` control, a separate page read found zero close buttons, exactly one
+`Reopen issue` button, the same issue URL/title, and the acceptance marker still
+present.
 
 No automated test, mock data, fallback response lane, second browser, branch,
 worktree, alternate target directory, or temporary repository evidence tree
