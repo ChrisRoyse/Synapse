@@ -482,3 +482,17 @@ read showed process absent, port 18765 not listening, and HTTP unreachable.
 }
 ```
 
+## GitHub acceptance and closure
+
+Acceptance evidence was posted through the already-open authenticated Chrome
+tab and independently read back from the rendered issue DOM. The marker
+`SYNAPSE_ACCEPTANCE_2167_20260811` occurred exactly once and its durable comment
+permalink is:
+
+<https://github.com/ChrisRoyse/Synapse/issues/2167#issuecomment-5256280870>
+
+After the real `Close issue` action, a separate DOM/content read found the
+closed-state markup, found exactly one enabled `Reopen issue` button, found no
+`Close issue` button, and still found the acceptance marker exactly once. The
+GitHub issue page remained the active Chrome tab; Gmail remained inactive and
+Chrome remained outside the OS foreground.
