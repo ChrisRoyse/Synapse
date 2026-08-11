@@ -101,6 +101,7 @@ pub(crate) struct SessionProcessResource {
     pub desktop_lease: Option<m4::LaunchDesktopLease>,
     pub terminal_capture_control: Option<LaunchTerminalCaptureControl>,
     pub terminal_history_key: Option<String>,
+    pub cdp_resource: Option<m4::CdpLaunchResource>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -175,6 +176,7 @@ impl SessionProcessResource {
             desktop_lease: None,
             terminal_capture_control: None,
             terminal_history_key: None,
+            cdp_resource: None,
         }
     }
 
@@ -198,6 +200,11 @@ impl SessionProcessResource {
     ) -> Self {
         self.terminal_capture_control = control;
         self.terminal_history_key = terminal_history_key;
+        self
+    }
+
+    pub(crate) fn with_cdp_resource(mut self, resource: Option<m4::CdpLaunchResource>) -> Self {
+        self.cdp_resource = resource;
         self
     }
 }
@@ -437,6 +444,7 @@ pub struct SessionProcessCleanupItem {
     pub desktop_window_termination_status: Option<String>,
     pub desktop_window_process_ids_after: Vec<u32>,
     pub remaining_process_ids_after: Vec<u32>,
+    pub cdp_cleanup: Option<m4::CdpLaunchCleanupReadback>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, JsonSchema)]
@@ -798,25 +806,42 @@ impl SynapseService {
         &self,
         resource: SessionProcessResource,
     ) -> Result<(), ErrorData> {
+        self.register_session_process_resource_recoverable(resource)
+            .map_err(|(error, _resource)| error)
+    }
+
+    pub(crate) fn register_session_process_resource_recoverable(
+        &self,
+        resource: SessionProcessResource,
+    ) -> Result<(), (ErrorData, SessionProcessResource)> {
         let session_id = resource.session_id.clone();
         let pid = resource.pid;
-        let mut guard = self.session_processes.lock().map_err(|_error| {
-            mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "session process resource ledger lock poisoned",
-            )
-        })?;
+        let mut guard = match self.session_processes.lock() {
+            Ok(guard) => guard,
+            Err(_error) => {
+                return Err((
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        "session process resource ledger lock poisoned",
+                    ),
+                    resource,
+                ));
+            }
+        };
         let processes = guard.entry(session_id.clone()).or_default();
         if processes.contains_key(&pid) {
-            return Err(ErrorData::new(
-                ErrorCode(-32099),
-                format!("session process resource already registered for pid {pid}"),
-                Some(json!({
-                    "code": error_codes::TOOL_INTERNAL_ERROR,
-                    "session_id": session_id,
-                    "pid": pid,
-                    "reason": "duplicate_session_process_resource",
-                })),
+            return Err((
+                ErrorData::new(
+                    ErrorCode(-32099),
+                    format!("session process resource already registered for pid {pid}"),
+                    Some(json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "session_id": session_id,
+                        "pid": pid,
+                        "reason": "duplicate_session_process_resource",
+                    })),
+                ),
+                resource,
             ));
         }
         processes.insert(pid, resource);
@@ -2192,6 +2217,22 @@ impl SessionLifecycleState {
                     ),
                 }
             }
+            let cdp_owned_before = resource.cdp_resource.is_some();
+            let cdp_cleanup = if remaining.is_empty() {
+                resource
+                    .cdp_resource
+                    .take()
+                    .map(m4::cleanup_launched_cdp_resource)
+            } else {
+                None
+            };
+            let cdp_cleanup_succeeded = if cdp_owned_before {
+                cdp_cleanup
+                    .as_ref()
+                    .is_some_and(|readback| !readback.failed)
+            } else {
+                true
+            };
             let desktop_close = resource
                 .desktop_lease
                 .take()
@@ -2216,7 +2257,7 @@ impl SessionLifecycleState {
                 remaining.sort_unstable();
                 remaining.dedup();
             }
-            if remaining.is_empty() && desktop_cleanup_succeeded {
+            if remaining.is_empty() && desktop_cleanup_succeeded && cdp_cleanup_succeeded {
                 report.terminated = report.terminated.saturating_add(1);
             } else {
                 report.failed = report.failed.saturating_add(1);
@@ -2250,6 +2291,7 @@ impl SessionLifecycleState {
                 desktop_window_termination_status,
                 desktop_window_process_ids_after,
                 remaining_process_ids_after: remaining,
+                cdp_cleanup,
             });
         }
         report

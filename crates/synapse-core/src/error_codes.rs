@@ -156,6 +156,17 @@ pub const ACTION_POSTCONDITION_FAILED: &str = "ACTION_POSTCONDITION_FAILED";
 pub const ACTION_LAUNCH_WINDOW_NOT_FOUND: &str = "ACTION_LAUNCH_WINDOW_NOT_FOUND";
 pub const ACTION_LAUNCH_FOREGROUND_FAILED: &str = "ACTION_LAUNCH_FOREGROUND_FAILED";
 pub const ACTION_LAUNCH_URL_NOT_REACHED: &str = "ACTION_LAUNCH_URL_NOT_REACHED";
+/// Chromium debug flags do not describe one coherent port/profile endpoint.
+pub const ACTION_LAUNCH_CDP_CONFIG_INVALID: &str = "ACTION_LAUNCH_CDP_CONFIG_INVALID";
+/// The spawned Chromium process did not publish a complete, valid CDP endpoint
+/// within the launch budget.
+pub const ACTION_LAUNCH_CDP_ATTESTATION_FAILED: &str = "ACTION_LAUNCH_CDP_ATTESTATION_FAILED";
+/// The port file, HTTP endpoint, listener PID, process generation, or browser
+/// WebSocket identity contradicted the launch owner.
+pub const ACTION_LAUNCH_CDP_IDENTITY_MISMATCH: &str = "ACTION_LAUNCH_CDP_IDENTITY_MISMATCH";
+/// Identity-bound process, registry, or owned-profile cleanup did not reach its
+/// independently verified terminal state.
+pub const ACTION_LAUNCH_CDP_CLEANUP_FAILED: &str = "ACTION_LAUNCH_CDP_CLEANUP_FAILED";
 pub const ACTION_AGENT_SPAWN_FAILED: &str = "ACTION_AGENT_SPAWN_FAILED";
 pub const ACTION_AGENT_SPAWN_SESSION_TIMEOUT: &str = "ACTION_AGENT_SPAWN_SESSION_TIMEOUT";
 pub const ACTION_AGENT_SPAWN_TASK_NOT_STARTED: &str = "ACTION_AGENT_SPAWN_TASK_NOT_STARTED";

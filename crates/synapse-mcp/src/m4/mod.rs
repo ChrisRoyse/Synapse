@@ -1782,6 +1782,28 @@ pub struct ActLaunchResponse {
     /// Title observed for the verified CDP target URL, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cdp_verified_title: Option<String>,
+    /// Exact page target id independently read from `/json/list`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_verified_target_id: Option<String>,
+    /// Content-bound identity of the exact launched-endpoint registry row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_registration_id: Option<String>,
+    /// Browser UUID attested across DevToolsActivePort and /json/version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_browser_id: Option<String>,
+    /// Exact browser WebSocket URL independently read from /json/version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_browser_websocket_url: Option<String>,
+    /// Physical Windows PID that owns the loopback listening socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_listener_pid: Option<u32>,
+    /// Exact listener process generation read through GetProcessTimes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_listener_process_creation_time_100ns: Option<u64>,
+    /// `synapse_ephemeral` profiles are deleted on endpoint teardown;
+    /// `caller_managed_stable` profiles are never deleted by Synapse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_profile_ownership: Option<String>,
     /// Desktop routing readback when `desktop` was requested.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub desktop: Option<ActLaunchDesktopReadback>,
@@ -1942,17 +1964,42 @@ pub fn launch_process_history_row(
         "desktop_readback": response.desktop,
         "output": response.output,
     });
+    let Some(object) = row.as_object_mut() else {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "act_launch process history row was not a JSON object",
+        ));
+    };
+    object.insert(
+        "cdp_verified_target_id".to_owned(),
+        json!(response.cdp_verified_target_id),
+    );
+    object.insert(
+        "cdp_registration_id".to_owned(),
+        json!(response.cdp_registration_id),
+    );
+    object.insert("cdp_browser_id".to_owned(), json!(response.cdp_browser_id));
+    object.insert(
+        "cdp_browser_websocket_url".to_owned(),
+        json!(response.cdp_browser_websocket_url),
+    );
+    object.insert(
+        "cdp_listener_pid".to_owned(),
+        json!(response.cdp_listener_pid),
+    );
+    object.insert(
+        "cdp_listener_process_creation_time_100ns".to_owned(),
+        json!(response.cdp_listener_process_creation_time_100ns),
+    );
+    object.insert(
+        "cdp_profile_ownership".to_owned(),
+        json!(response.cdp_profile_ownership),
+    );
     // Written only when the observation is edge-bearing, and written as an
     // integer when it is. The key is absent rather than `null` for an unproven
     // parentage so the graph reader's "is this field present" question has one
     // unambiguous answer.
     if let Some(parent_pid) = parent_pid {
-        let Some(object) = row.as_object_mut() else {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                "act_launch process history row was not a JSON object",
-            ));
-        };
         object.insert("parent_pid".to_owned(), json!(parent_pid));
     }
     encode_json(&row).map_err(|error| {
@@ -9152,9 +9199,35 @@ pub(crate) async fn launch_for_session(
     launch_for_session_with_boundary(config, params, session_id, &allow_physical_mutation).await
 }
 
-fn cleanup_launched_process_after_boundary(error: ErrorData, pid: u32) -> ErrorData {
+fn cleanup_unspawned_cdp_after_error(
+    error: ErrorData,
+    launch: Option<&ChromiumCdpLaunch>,
+) -> ErrorData {
+    let cdp_cleanup = launch.map(cleanup_cdp_launch_plan);
+    let cleanup_verified = cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
+    if !cleanup_verified {
+        synapse_action::record_operator_panic_safety_incident();
+    }
+    physical_mutation_boundary_error(
+        error,
+        "act_launch_pre_spawn_cdp_cleanup",
+        json!({
+            "source_of_truth": "Synapse-owned CDP profile path + exact durable ownership marker + independent filesystem absence readback",
+            "cdp_cleanup": cdp_cleanup,
+            "cleanup_verified": cleanup_verified,
+        }),
+    )
+}
+
+fn cleanup_launched_process_after_boundary(
+    error: ErrorData,
+    pid: u32,
+    launch: Option<&ChromiumCdpLaunch>,
+) -> ErrorData {
     let cleanup = terminate_owned_process_tree(pid);
-    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
+    let cdp_cleanup = launch.map(cleanup_cdp_launch_plan);
+    let cleanup_verified = cleanup.remaining_process_ids.is_empty()
+        && cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
     if !cleanup_verified {
         synapse_action::record_operator_panic_safety_incident();
     }
@@ -9162,9 +9235,10 @@ fn cleanup_launched_process_after_boundary(error: ErrorData, pid: u32) -> ErrorD
         error,
         "act_launch_operator_panic_cleanup",
         json!({
-            "source_of_truth": "exact launched process tree + separate process-table readback",
+            "source_of_truth": "exact launched process tree + separate process-table readback + exact CDP registry/profile filesystem readback",
             "pid": pid,
             "termination": cleanup,
+            "cdp_cleanup": cdp_cleanup,
             "cleanup_verified": cleanup_verified,
         }),
     )
@@ -9174,8 +9248,9 @@ fn ensure_launched_process_mutation_boundary(
     boundary: &PhysicalMutationBoundary<'_>,
     stage: &'static str,
     pid: u32,
+    cdp_launch: Option<&ChromiumCdpLaunch>,
 ) -> Result<(), ErrorData> {
-    boundary(stage).map_err(|error| cleanup_launched_process_after_boundary(error, pid))
+    boundary(stage).map_err(|error| cleanup_launched_process_after_boundary(error, pid, cdp_launch))
 }
 
 pub(crate) async fn launch_for_session_with_boundary(
@@ -9224,7 +9299,18 @@ pub(crate) async fn launch_for_session_with_boundary(
     // #684: make a CDP debug port reachable for Synapse-launched Chromium so
     // observe/find can read the page DOM without manual flags. Augment the spawn
     // command only (policy already matched the original command above).
-    let cdp_launch = chromium_cdp_launch(&params);
+    let cdp_launch = chromium_cdp_launch(&params)?;
+    if cdp_launch.is_some() && session_id.is_none() {
+        return Err(launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            "act_launch CDP endpoint ownership requires an HTTP MCP session",
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "cdp_launch_requires_session_lifecycle",
+                "remediation": "initialize Streamable HTTP MCP and call act_launch with its Mcp-Session-Id so process, endpoint registry, and profile cleanup share one lifetime",
+            }),
+        ));
+    }
     let force_renderer_accessibility = chromium_renderer_accessibility_arg(&params);
     let spawn_params = params_with_chromium_launch_args(
         &params,
@@ -9238,24 +9324,44 @@ pub(crate) async fn launch_for_session_with_boundary(
     let desktop_readback = launch_desktop
         .as_ref()
         .map(PreparedLaunchDesktop::to_response);
-    boundary("act_launch_immediately_before_create_process")?;
-    let mut spawned = spawn_launch_child(&spawn_params, launch_desktop, session_id.is_some())?;
+    if let Some(launch) = cdp_launch.as_ref() {
+        prepare_cdp_profile_for_spawn(launch)?;
+    }
+    boundary("act_launch_immediately_before_create_process")
+        .map_err(|error| cleanup_unspawned_cdp_after_error(error, cdp_launch.as_ref()))?;
+    let mut spawned = spawn_launch_child(&spawn_params, launch_desktop, session_id.is_some())
+        .map_err(|error| cleanup_unspawned_cdp_after_error(error, cdp_launch.as_ref()))?;
     let pid = spawned.pid;
     ensure_launched_process_mutation_boundary(
         boundary,
         "act_launch_immediately_after_create_process",
         pid,
+        cdp_launch.as_ref(),
     )?;
-    let cdp = if let Some(launch) = &cdp_launch {
+    let mut cdp = if let Some(launch) = &cdp_launch {
         let cdp = await_physical_mutation_boundary(
             boundary,
             "act_launch_while_resolving_cdp",
-            resolve_launched_cdp_port(pid, launch),
+            resolve_launched_cdp_port(
+                pid,
+                spawned.process_creation_time_100ns,
+                launch,
+                params.timeout_ms,
+            ),
         )
         .await
-        .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
-        ensure_launched_process_mutation_boundary(boundary, "act_launch_after_resolving_cdp", pid)?;
-        cdp
+        .map_err(|error| {
+            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+        })?;
+        ensure_launched_process_mutation_boundary(
+            boundary,
+            "act_launch_after_resolving_cdp",
+            pid,
+            cdp_launch.as_ref(),
+        )?;
+        cdp.map_err(|error| {
+            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+        })?
     } else {
         LaunchedCdp::default()
     };
@@ -9265,14 +9371,16 @@ pub(crate) async fn launch_for_session_with_boundary(
         verify_launched_chromium_url(&params, cdp_launch.as_ref(), &cdp, params.timeout_ms),
     )
     .await
-    .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+    .map_err(|error| cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref()))?;
     ensure_launched_process_mutation_boundary(
         boundary,
         "act_launch_after_verifying_chromium_url",
         pid,
+        cdp_launch.as_ref(),
     )?;
-    let cdp_target =
-        cdp_target.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+    let cdp_target = cdp_target.map_err(|error| {
+        cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+    })?;
     let window = if let Some(regex) = wait_regex {
         if let Some(desktop_lease) = spawned.desktop_lease.as_ref() {
             let window = await_physical_mutation_boundary(
@@ -9290,13 +9398,18 @@ pub(crate) async fn launch_for_session_with_boundary(
                 ),
             )
             .await
-            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+            .map_err(|error| {
+                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+            })?;
             ensure_launched_process_mutation_boundary(
                 boundary,
                 "act_launch_after_waiting_for_desktop_window",
                 pid,
+                cdp_launch.as_ref(),
             )?;
-            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
+            window.map_err(|error| {
+                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+            })?
         } else {
             let window = await_physical_mutation_boundary(
                 boundary,
@@ -9311,13 +9424,18 @@ pub(crate) async fn launch_for_session_with_boundary(
                 ),
             )
             .await
-            .map_err(|error| cleanup_launched_process_after_boundary(error, pid))?;
+            .map_err(|error| {
+                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+            })?;
             ensure_launched_process_mutation_boundary(
                 boundary,
                 "act_launch_after_waiting_for_window",
                 pid,
+                cdp_launch.as_ref(),
             )?;
-            window.map_err(|error| cleanup_launched_process_after_boundary(error, pid))?
+            window.map_err(|error| {
+                cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+            })?
         }
     } else {
         WindowWaitResult::not_requested()
@@ -9375,7 +9493,18 @@ pub(crate) async fn launch_for_session_with_boundary(
             "act_launch matched a pre-existing/foreign window not owned by the spawned pid (#1358)"
         );
     }
-    ensure_launched_process_mutation_boundary(boundary, "act_launch_before_response", pid)?;
+    ensure_launched_process_mutation_boundary(
+        boundary,
+        "act_launch_before_response",
+        pid,
+        cdp_launch.as_ref(),
+    )?;
+    if let Some(launch) = cdp_launch.as_ref() {
+        publish_launched_cdp(launch, &mut cdp).map_err(|error| {
+            cleanup_launched_process_after_boundary(error, pid, cdp_launch.as_ref())
+        })?;
+    }
+    let cdp_registration = cdp.registration.as_ref();
     Ok(ActLaunchOutcome {
         response: ActLaunchResponse {
             launch_id,
@@ -9391,7 +9520,16 @@ pub(crate) async fn launch_for_session_with_boundary(
             cdp_endpoint: cdp.endpoint,
             cdp_user_data_dir: cdp.user_data_dir,
             cdp_verified_url: cdp_target.as_ref().map(|target| target.url.clone()),
-            cdp_verified_title: cdp_target.and_then(|target| target.title),
+            cdp_verified_title: cdp_target.as_ref().and_then(|target| target.title.clone()),
+            cdp_verified_target_id: cdp_target.map(|target| target.id),
+            cdp_registration_id: cdp_registration.map(|row| row.registration_id.clone()),
+            cdp_browser_id: cdp_registration.map(|row| row.browser_id.clone()),
+            cdp_browser_websocket_url: cdp_registration
+                .map(|row| row.browser_websocket_url.clone()),
+            cdp_listener_pid: cdp_registration.map(|row| row.listener_pid),
+            cdp_listener_process_creation_time_100ns: cdp_registration
+                .and_then(|row| row.listener_process_creation_time_100ns),
+            cdp_profile_ownership: cdp.profile_ownership.map(|value| value.as_str().to_owned()),
             desktop: desktop_readback,
             output: ActLaunchOutputLaunchReadback {
                 mode: output_mode.to_owned(),
@@ -9407,6 +9545,7 @@ pub(crate) async fn launch_for_session_with_boundary(
         process_job: spawned.process_job.take(),
         desktop_lease: spawned.desktop_lease.take(),
         terminal_capture: spawned.terminal_capture.take(),
+        cdp_resource: cdp.resource.take(),
     })
 }
 
@@ -9416,6 +9555,7 @@ pub(crate) struct ActLaunchOutcome {
     pub process_job: Option<OwnedProcessJob>,
     pub desktop_lease: Option<LaunchDesktopLease>,
     pub terminal_capture: Option<LaunchTerminalCapture>,
+    pub cdp_resource: Option<CdpLaunchResource>,
 }
 
 /// Planned CDP-debug augmentation for a Chromium-family launch (#684).
@@ -9425,6 +9565,38 @@ struct ChromiumCdpLaunch {
     user_data_dir: std::path::PathBuf,
     /// Args injected ahead of the caller's args.
     injected_args: Vec<String>,
+    requested_port: CdpRequestedPort,
+    profile_ownership: CdpProfileOwnership,
+    profile_ownership_token: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CdpRequestedPort {
+    Ephemeral,
+    Fixed(u16),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CdpProfileOwnership {
+    SynapseEphemeral,
+    CallerManagedStable,
+}
+
+impl CdpProfileOwnership {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SynapseEphemeral => "synapse_ephemeral",
+            Self::CallerManagedStable => "caller_managed_stable",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CdpLaunchResource {
+    registration: synapse_a11y::LaunchedCdpRegistration,
+    user_data_dir: PathBuf,
+    profile_ownership: CdpProfileOwnership,
+    profile_ownership_token: Option<String>,
 }
 
 /// Optional Chromium renderer accessibility launch flag (#689).
@@ -9489,46 +9661,207 @@ struct LaunchedCdp {
     port: Option<u16>,
     endpoint: Option<String>,
     user_data_dir: Option<String>,
+    registration: Option<synapse_a11y::LaunchedCdpRegistration>,
+    profile_ownership: Option<CdpProfileOwnership>,
+    resource: Option<CdpLaunchResource>,
 }
 
-/// Decides whether to inject CDP debug flags for this launch. Returns `None` for
-/// non-Chromium targets, when the caller opted out (`cdp_debug = Some(false)`),
-/// or when the caller already specified a debug port / user-data-dir (respect
-/// their intent). Otherwise plans an ephemeral port + dedicated profile.
-fn chromium_cdp_launch(params: &ActLaunchParams) -> Option<ChromiumCdpLaunch> {
-    if params.cdp_debug == Some(false) {
-        return None;
-    }
+/// Builds one complete CDP endpoint transaction. Caller-supplied port/profile
+/// switches are accepted only as a coherent, uniquely specified pair. Partial,
+/// duplicate, malformed, or pipe-based configuration fails before process
+/// creation instead of silently disabling endpoint ownership (#2166).
+fn chromium_cdp_launch(params: &ActLaunchParams) -> Result<Option<ChromiumCdpLaunch>, ErrorData> {
     let is_chromium =
         synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
-    if !is_chromium && params.cdp_debug != Some(true) {
-        return None;
-    }
-    let already_configured = params.args.iter().any(|arg| {
-        let lower = arg.to_ascii_lowercase();
-        lower.starts_with("--remote-debugging-port") || lower.starts_with("--user-data-dir")
+    let has_cdp_switch = params.args.iter().any(|arg| {
+        is_switch_arg(arg, "--remote-debugging-port")
+            || is_switch_arg(arg, "--remote-debugging-pipe")
+            || is_switch_arg(arg, "--user-data-dir")
     });
-    if already_configured {
-        tracing::info!(
-            code = "M4_ACT_LAUNCH_CDP_SKIPPED",
-            reason = "caller_supplied_debug_or_profile_flags",
-            "act_launch leaving caller-specified CDP/profile flags untouched"
-        );
-        return None;
+    if params.cdp_debug == Some(false) {
+        if has_cdp_switch {
+            return Err(cdp_config_error(
+                "cdp_disabled_with_debug_switches",
+                params,
+                "remove Chromium remote-debugging/profile switches or set cdp_debug=true",
+            ));
+        }
+        return Ok(None);
     }
-    let user_data_dir = cdp_automation_profile_dir();
-    let injected_args = vec![
-        "--remote-debugging-port=0".to_owned(),
-        format!("--user-data-dir={}", user_data_dir.display()),
-        "--silent-debugger-extension-api".to_owned(),
-        "--disable-extensions".to_owned(),
-        "--no-first-run".to_owned(),
-        "--no-default-browser-check".to_owned(),
-    ];
-    Some(ChromiumCdpLaunch {
-        user_data_dir,
-        injected_args,
-    })
+    if !is_chromium && params.cdp_debug != Some(true) && !has_cdp_switch {
+        return Ok(None);
+    }
+    if params
+        .args
+        .iter()
+        .any(|arg| is_switch_arg(arg, "--remote-debugging-pipe"))
+    {
+        return Err(cdp_config_error(
+            "remote_debugging_pipe_has_no_owned_loopback_endpoint",
+            params,
+            "use --remote-debugging-port with one dedicated --user-data-dir; pipe transport cannot satisfy the loopback listener ownership contract",
+        ));
+    }
+
+    let port_value = unique_switch_value(&params.args, "--remote-debugging-port")?;
+    let profile_value = unique_switch_value(&params.args, "--user-data-dir")?;
+    match (port_value, profile_value) {
+        (None, None) => {
+            let (user_data_dir, profile_ownership, profile_ownership_token) =
+                cdp_automation_profile_dir()?;
+            Ok(Some(ChromiumCdpLaunch {
+                injected_args: vec![
+                    "--remote-debugging-port=0".to_owned(),
+                    format!("--user-data-dir={}", user_data_dir.display()),
+                    "--silent-debugger-extension-api".to_owned(),
+                    "--disable-extensions".to_owned(),
+                    "--no-first-run".to_owned(),
+                    "--no-default-browser-check".to_owned(),
+                ],
+                user_data_dir,
+                requested_port: CdpRequestedPort::Ephemeral,
+                profile_ownership,
+                profile_ownership_token,
+            }))
+        }
+        (Some(port), Some(profile)) => {
+            let parsed_port = port.parse::<u16>().map_err(|error| {
+                cdp_config_error_with_detail(
+                    "remote_debugging_port_invalid",
+                    params,
+                    "set --remote-debugging-port to 0 for an ephemeral port or to an integer from 1 through 65535",
+                    format!("value={port:?} parse_error={error}"),
+                )
+            })?;
+            if profile.trim().is_empty() {
+                return Err(cdp_config_error(
+                    "user_data_dir_empty",
+                    params,
+                    "set --user-data-dir to one explicit non-default automation profile directory",
+                ));
+            }
+            Ok(Some(ChromiumCdpLaunch {
+                user_data_dir: PathBuf::from(profile),
+                injected_args: Vec::new(),
+                requested_port: if parsed_port == 0 {
+                    CdpRequestedPort::Ephemeral
+                } else {
+                    CdpRequestedPort::Fixed(parsed_port)
+                },
+                profile_ownership: CdpProfileOwnership::CallerManagedStable,
+                profile_ownership_token: None,
+            }))
+        }
+        (Some(_), None) => Err(cdp_config_error(
+            "remote_debugging_port_without_user_data_dir",
+            params,
+            "pair the single --remote-debugging-port switch with one non-default --user-data-dir",
+        )),
+        (None, Some(_)) => Err(cdp_config_error(
+            "user_data_dir_without_remote_debugging_port",
+            params,
+            "pair the single --user-data-dir switch with one --remote-debugging-port switch",
+        )),
+    }
+}
+
+fn unique_switch_value(args: &[String], switch: &str) -> Result<Option<String>, ErrorData> {
+    let mut value = None;
+    for (index, arg) in args.iter().enumerate() {
+        if !is_switch_arg(arg, switch) {
+            continue;
+        }
+        if value.is_some() {
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                format!("act_launch requires exactly one {switch} switch"),
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "duplicate_cdp_switch",
+                    "switch": switch,
+                    "args": args,
+                    "remediation": format!("remove duplicate {switch} switches and provide exactly one unambiguous value"),
+                }),
+            ));
+        }
+        let candidate = if let Some((_name, raw)) = arg.split_once('=') {
+            trim_arg_quotes(raw)
+        } else {
+            let Some(next) = args.get(index + 1) else {
+                return Err(launch_tool_error(
+                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    format!("act_launch {switch} switch has no value"),
+                    json!({
+                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                        "reason": "cdp_switch_value_missing",
+                        "switch": switch,
+                        "args": args,
+                        "remediation": format!("provide {switch}=<value> or {switch} <value>"),
+                    }),
+                ));
+            };
+            if next.starts_with("--") {
+                return Err(launch_tool_error(
+                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    format!(
+                        "act_launch {switch} switch is followed by another switch, not a value"
+                    ),
+                    json!({
+                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                        "reason": "cdp_switch_value_missing",
+                        "switch": switch,
+                        "next_arg": next,
+                        "args": args,
+                        "remediation": format!("provide {switch}=<value> or {switch} <value>"),
+                    }),
+                ));
+            }
+            trim_arg_quotes(next)
+        };
+        if candidate.is_empty() {
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                format!("act_launch {switch} value must not be empty"),
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "cdp_switch_value_empty",
+                    "switch": switch,
+                    "args": args,
+                    "remediation": format!("provide one non-empty value for {switch}"),
+                }),
+            ));
+        }
+        value = Some(candidate.to_owned());
+    }
+    Ok(value)
+}
+
+fn cdp_config_error(
+    reason: &'static str,
+    params: &ActLaunchParams,
+    remediation: &'static str,
+) -> ErrorData {
+    cdp_config_error_with_detail(reason, params, remediation, "none".to_owned())
+}
+
+fn cdp_config_error_with_detail(
+    reason: &'static str,
+    params: &ActLaunchParams,
+    remediation: &'static str,
+    detail: String,
+) -> ErrorData {
+    launch_tool_error(
+        error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+        format!("act_launch refused invalid Chromium CDP configuration ({reason})"),
+        json!({
+            "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            "reason": reason,
+            "target": params.target,
+            "args": params.args,
+            "detail": detail,
+            "remediation": remediation,
+        }),
+    )
 }
 
 /// A fresh ActLaunchParams whose injected browser args precede the caller's
@@ -9554,12 +9887,37 @@ fn params_with_chromium_launch_args(
 /// `SYNAPSE_CDP_USER_DATA_DIR` for a stable (login-persisting) profile; otherwise
 /// a unique per-launch dir under the OS temp so concurrent browsers never share
 /// a profile (Chrome refuses a second debug port on the same profile).
-fn cdp_automation_profile_dir() -> std::path::PathBuf {
+fn cdp_automation_profile_dir() -> Result<(PathBuf, CdpProfileOwnership, Option<String>), ErrorData>
+{
     if let Some(dir) = std::env::var_os("SYNAPSE_CDP_USER_DATA_DIR") {
         let dir = std::path::PathBuf::from(dir);
-        if !dir.as_os_str().is_empty() {
-            return dir;
+        if dir.as_os_str().is_empty() {
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "SYNAPSE_CDP_USER_DATA_DIR is present but empty",
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "stable_cdp_profile_env_empty",
+                    "remediation": "unset SYNAPSE_CDP_USER_DATA_DIR for a Synapse-owned ephemeral profile, or set it to one non-default stable automation profile directory",
+                }),
+            ));
         }
+        if !matches!(
+            chromium_user_data_dir_safety(dir.to_string_lossy().as_ref()),
+            ChromiumUserDataDirSafety::Dedicated
+        ) {
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "SYNAPSE_CDP_USER_DATA_DIR resolves to the default Chromium profile",
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "stable_cdp_profile_is_default_profile",
+                    "user_data_dir": dir,
+                    "remediation": "set SYNAPSE_CDP_USER_DATA_DIR to a dedicated automation profile that is not the user's normal browser profile",
+                }),
+            ));
+        }
+        return Ok((dir, CdpProfileOwnership::CallerManagedStable, None));
     }
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -9569,61 +9927,872 @@ fn cdp_automation_profile_dir() -> std::path::PathBuf {
         .map(|elapsed| elapsed.as_nanos())
         .unwrap_or(0);
     let token = format!("{}-{seq}-{nanos:x}", std::process::id());
-    std::env::temp_dir()
-        .join("synapse-cdp-profiles")
-        .join(token)
+    Ok((
+        std::env::temp_dir()
+            .join("synapse-cdp-profiles")
+            .join(&token),
+        CdpProfileOwnership::SynapseEphemeral,
+        Some(token),
+    ))
 }
 
-/// Polls the launched browser's `DevToolsActivePort` file (Chrome writes the
-/// chosen ephemeral port there) and registers it so observe/find can attach.
-/// Fail-loud: logs an error if the port never appears, but does not orphan the
-/// already-spawned browser.
-async fn resolve_launched_cdp_port(pid: u32, launch: &ChromiumCdpLaunch) -> LaunchedCdp {
+/// Polls the browser's physical port file/listener and builds an unpublished
+/// registration candidate. Publication happens only after `/json/list` also
+/// proves a page target, so no partial endpoint can escape this transaction.
+async fn resolve_launched_cdp_port(
+    pid: u32,
+    launch_process_creation_time_100ns: Option<u64>,
+    launch: &ChromiumCdpLaunch,
+    timeout_ms: u64,
+) -> Result<LaunchedCdp, ErrorData> {
     let port_file = launch.user_data_dir.join("DevToolsActivePort");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let user_data_dir = Some(launch.user_data_dir.display().to_string());
+    let mut last_error = None;
     loop {
-        if let Some(port) = read_devtools_active_port(&port_file) {
-            synapse_a11y::register_launched_port(pid, port);
-            tracing::info!(
-                code = "M4_ACT_LAUNCH_CDP_PORT_OPENED",
-                pid,
+        let port_evidence = match launch.requested_port {
+            CdpRequestedPort::Ephemeral => match read_devtools_active_port(&port_file) {
+                Ok(evidence) => Some(evidence),
+                Err(error) => {
+                    last_error = Some(error);
+                    None
+                }
+            },
+            CdpRequestedPort::Fixed(port) => Some(DevToolsActivePortEvidence {
                 port,
-                user_data_dir = ?launch.user_data_dir,
-                "act_launch opened a CDP debug port for the launched browser"
-            );
-            return LaunchedCdp {
-                port: Some(port),
-                endpoint: Some(format!("http://127.0.0.1:{port}")),
-                user_data_dir,
-            };
+                browser_path: None,
+                file_sha256: None,
+            }),
+        };
+        if let Some(port_evidence) = port_evidence {
+            match attest_cdp_listener(
+                pid,
+                launch_process_creation_time_100ns,
+                launch,
+                &port_evidence,
+            ) {
+                Ok(registration) => {
+                    tracing::info!(
+                        code = "M4_ACT_LAUNCH_CDP_ENDPOINT_ATTESTED",
+                        pid,
+                        port = port_evidence.port,
+                        listener_pid = registration.listener_pid,
+                        browser_id = %registration.browser_id,
+                        registration_id = %registration.registration_id,
+                        devtools_active_port_sha256 = ?port_evidence.file_sha256,
+                        user_data_dir = ?launch.user_data_dir,
+                        "act_launch attested an unpublished CDP endpoint candidate"
+                    );
+                    return Ok(LaunchedCdp {
+                        port: Some(port_evidence.port),
+                        endpoint: Some(format!("http://127.0.0.1:{}", port_evidence.port)),
+                        user_data_dir,
+                        registration: Some(registration),
+                        profile_ownership: Some(launch.profile_ownership),
+                        resource: None,
+                    });
+                }
+                Err(error) => last_error = Some(error),
+            }
         }
         if Instant::now() >= deadline {
-            tracing::error!(
-                code = error_codes::A11Y_CDP_ATTACH_FAILED,
-                pid,
-                user_data_dir = ?launch.user_data_dir,
-                "act_launch injected CDP flags but DevToolsActivePort never appeared; \
-                 the browser launched but its DOM will not be observable via CDP"
-            );
-            return LaunchedCdp {
-                port: None,
-                endpoint: None,
-                user_data_dir,
-            };
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+                "act_launch could not attest the launched Chromium CDP endpoint before the deadline",
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+                    "reason": "cdp_endpoint_attestation_timeout",
+                    "pid": pid,
+                    "process_creation_time_100ns": launch_process_creation_time_100ns,
+                    "requested_port": match launch.requested_port { CdpRequestedPort::Ephemeral => json!("ephemeral"), CdpRequestedPort::Fixed(port) => json!(port) },
+                    "user_data_dir": launch.user_data_dir,
+                    "devtools_active_port_path": port_file,
+                    "last_error": last_error,
+                    "timeout_ms": timeout_ms,
+                    "remediation": "inspect the exact launch arguments, DevToolsActivePort bytes, Windows listener owner table, process generations, and Chromium startup logs; the process tree and any Synapse-owned profile are terminated on this failure",
+                }),
+            ));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
-/// Reads the first line of a `DevToolsActivePort` file as a port number.
-fn read_devtools_active_port(path: &Path) -> Option<u16> {
-    let contents = std::fs::read_to_string(path).ok()?;
-    contents.lines().next()?.trim().parse::<u16>().ok()
+#[derive(Clone, Debug)]
+struct DevToolsActivePortEvidence {
+    port: u16,
+    browser_path: Option<String>,
+    file_sha256: Option<String>,
+}
+
+fn read_devtools_active_port(path: &Path) -> Result<DevToolsActivePortEvidence, String> {
+    let bytes = fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    if bytes.len() > 4096 {
+        return Err(format!(
+            "{} exceeds the 4096-byte DevToolsActivePort limit: {} bytes",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    let contents = std::str::from_utf8(&bytes)
+        .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
+    let lines = contents.lines().map(str::trim).collect::<Vec<_>>();
+    let [port_raw, browser_path] = lines.as_slice() else {
+        return Err(format!(
+            "{} must contain exactly two lines (port and browser WebSocket path); actual_line_count={}",
+            path.display(),
+            lines.len()
+        ));
+    };
+    let port = port_raw
+        .parse::<u16>()
+        .map_err(|error| format!("{} has invalid port {port_raw:?}: {error}", path.display()))?;
+    if port == 0 {
+        return Err(format!("{} contains invalid port 0", path.display()));
+    }
+    parse_browser_path(browser_path)?;
+    Ok(DevToolsActivePortEvidence {
+        port,
+        browser_path: Some((*browser_path).to_owned()),
+        file_sha256: Some(sha256_hex(&bytes)),
+    })
+}
+
+fn parse_browser_path(path: &str) -> Result<&str, String> {
+    let Some(browser_id) = path.strip_prefix("/devtools/browser/") else {
+        return Err(format!(
+            "browser WebSocket path must start with /devtools/browser/: {path:?}"
+        ));
+    };
+    if browser_id.is_empty()
+        || browser_id.contains('/')
+        || browser_id.chars().any(char::is_whitespace)
+    {
+        return Err(format!(
+            "browser WebSocket path has invalid browser id: {path:?}"
+        ));
+    }
+    Ok(browser_id)
+}
+
+fn browser_identity_from_websocket(
+    url: &str,
+    expected_port: u16,
+) -> Result<(String, String), String> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|error| format!("parse browser WebSocket URL {url:?}: {error}"))?;
+    if parsed.scheme() != "ws"
+        || parsed.host_str() != Some("127.0.0.1")
+        || parsed.port() != Some(expected_port)
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(format!(
+            "browser WebSocket URL must be ws://127.0.0.1:{expected_port}/devtools/browser/<id> with no query/fragment: {url:?}"
+        ));
+    }
+    let browser_path = parsed.path().to_owned();
+    let browser_id = parse_browser_path(&browser_path)?.to_owned();
+    Ok((browser_id, browser_path))
+}
+
+fn attest_cdp_listener(
+    launch_pid: u32,
+    launch_process_creation_time_100ns: Option<u64>,
+    launch: &ChromiumCdpLaunch,
+    port_evidence: &DevToolsActivePortEvidence,
+) -> Result<synapse_a11y::LaunchedCdpRegistration, String> {
+    #[cfg(windows)]
+    {
+        let actual_launch_creation = synapse_a11y::inspect_process_creation_time_100ns(launch_pid)?;
+        if actual_launch_creation != launch_process_creation_time_100ns
+            || actual_launch_creation.is_none()
+        {
+            return Err(format!(
+                "launch process generation mismatch pid={launch_pid} retained_handle={launch_process_creation_time_100ns:?} process_table={actual_launch_creation:?}"
+            ));
+        }
+    }
+    let listener =
+        synapse_a11y::inspect_local_cdp_listener(port_evidence.port, Duration::from_millis(750))?;
+    #[cfg(windows)]
+    {
+        let owned_process_ids = owned_process_tree_ids(launch_pid);
+        if !owned_process_ids.contains(&listener.listener_pid) {
+            return Err(format!(
+                "CDP listener pid {} is not in launched process tree root={} tree={owned_process_ids:?}",
+                listener.listener_pid, launch_pid
+            ));
+        }
+        if listener.listener_process_creation_time_100ns.is_none() {
+            return Err(format!(
+                "CDP listener pid {} has no process creation identity",
+                listener.listener_pid
+            ));
+        }
+    }
+    let (browser_id, browser_path) =
+        browser_identity_from_websocket(&listener.browser_websocket_url, port_evidence.port)?;
+    if let Some(expected_path) = port_evidence.browser_path.as_deref()
+        && expected_path != browser_path
+    {
+        return Err(format!(
+            "DevToolsActivePort browser path disagrees with /json/version: file={expected_path:?} http={browser_path:?}"
+        ));
+    }
+    let canonical_profile = fs::canonicalize(&launch.user_data_dir).map_err(|error| {
+        format!(
+            "canonicalize launched CDP profile {}: {error}",
+            launch.user_data_dir.display()
+        )
+    })?;
+    let user_data_dir_sha256 = sha256_hex(canonical_profile.to_string_lossy().as_bytes());
+    let registration_material = format!(
+        "synapse-launched-cdp/v1\0{launch_pid}\0{launch_process_creation_time_100ns:?}\0{}\0{:?}\0{}\0{}\0{}",
+        listener.listener_pid,
+        listener.listener_process_creation_time_100ns,
+        port_evidence.port,
+        browser_id,
+        user_data_dir_sha256
+    );
+    Ok(synapse_a11y::LaunchedCdpRegistration {
+        registration_id: sha256_hex(registration_material.as_bytes()),
+        launch_pid,
+        launch_process_creation_time_100ns,
+        listener_pid: listener.listener_pid,
+        listener_process_creation_time_100ns: listener.listener_process_creation_time_100ns,
+        port: port_evidence.port,
+        browser_id,
+        browser_websocket_url: listener.browser_websocket_url,
+        user_data_dir_sha256,
+    })
+}
+
+const CDP_PROFILE_OWNERSHIP_MARKER: &str = ".synapse-cdp-profile-owner.json";
+
+fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
+    let profile_root = std::env::temp_dir().join("synapse-cdp-profiles");
+    let entries = match fs::read_dir(&profile_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_enumeration_failed",
+                &profile_root,
+                error.to_string(),
+            ));
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            cdp_reconciliation_error(
+                "cdp_profile_reconciliation_entry_failed",
+                &profile_root,
+                error.to_string(),
+            )
+        })?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path).map_err(|error| {
+            cdp_reconciliation_error(
+                "cdp_profile_reconciliation_metadata_failed",
+                &path,
+                error.to_string(),
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_unsafe_entry",
+                &path,
+                "entry must be a real directory, not a file or symlink".to_owned(),
+            ));
+        }
+        let Some(token) = path.file_name().and_then(|value| value.to_str()) else {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_token_unreadable",
+                &path,
+                "directory name is not valid Unicode".to_owned(),
+            ));
+        };
+        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
+        let bytes = fs::read(&marker_path).map_err(|error| {
+            cdp_reconciliation_error(
+                "cdp_profile_reconciliation_marker_unreadable",
+                &path,
+                format!("read {}: {error}", marker_path.display()),
+            )
+        })?;
+        if bytes.len() > 4096 {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_marker_oversize",
+                &path,
+                format!("marker has {} bytes; maximum is 4096", bytes.len()),
+            ));
+        }
+        let marker: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            cdp_reconciliation_error(
+                "cdp_profile_reconciliation_marker_invalid",
+                &path,
+                error.to_string(),
+            )
+        })?;
+        let schema = marker.get("schema").and_then(Value::as_str);
+        let marker_token = marker.get("ownership_token").and_then(Value::as_str);
+        let launcher_pid = marker
+            .get("launcher_pid")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let launcher_creation = marker
+            .get("launcher_process_creation_time_100ns")
+            .and_then(Value::as_u64);
+        if schema != Some("synapse-cdp-profile-owner/v1")
+            || marker_token != Some(token)
+            || launcher_pid.is_none()
+            || launcher_creation.is_none()
+        {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_marker_identity_mismatch",
+                &path,
+                format!(
+                    "schema={schema:?} marker_token={marker_token:?} directory_token={token:?} launcher_pid={launcher_pid:?} launcher_creation={launcher_creation:?}"
+                ),
+            ));
+        }
+        let launcher_pid = launcher_pid.unwrap_or_default();
+        let launcher_creation = launcher_creation.unwrap_or_default();
+        let generation_live = match synapse_a11y::inspect_process_creation_time_100ns(launcher_pid)
+        {
+            Ok(Some(actual)) => actual == launcher_creation,
+            Ok(None) => {
+                return Err(cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_generation_missing",
+                    &path,
+                    format!("launcher pid={launcher_pid} returned no process generation"),
+                ));
+            }
+            Err(_error) if !process_exists(launcher_pid) => false,
+            Err(error) => {
+                return Err(cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_generation_unreadable",
+                    &path,
+                    format!(
+                        "launcher pid={launcher_pid} remains live but identity read failed: {error}"
+                    ),
+                ));
+            }
+        };
+        if generation_live {
+            continue;
+        }
+        let readback =
+            cleanup_cdp_profile(&path, CdpProfileOwnership::SynapseEphemeral, Some(token));
+        if readback.failed {
+            return Err(cdp_reconciliation_error(
+                "cdp_profile_reconciliation_delete_failed",
+                &path,
+                serde_json::to_string(&readback)
+                    .unwrap_or_else(|error| format!("readback serialization failed: {error}")),
+            ));
+        }
+        tracing::info!(
+            code = "M4_ACT_LAUNCH_CDP_STALE_PROFILE_RECLAIMED",
+            user_data_dir = %path.display(),
+            launcher_pid,
+            launcher_creation,
+            "readback=profile_filesystem after=stale_owned_profile_absent"
+        );
+    }
+    Ok(())
+}
+
+fn cdp_reconciliation_error(reason: &'static str, path: &Path, detail: String) -> ErrorData {
+    launch_tool_error(
+        error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+        format!("act_launch refused to continue with unproven stale CDP profile state ({reason})"),
+        json!({
+            "code": error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+            "reason": reason,
+            "path": path,
+            "detail": detail,
+            "remediation": "inspect the exact ownership marker and process generation; repair or explicitly remove only the proven stale entry, then retry",
+        }),
+    )
+}
+
+fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), ErrorData> {
+    if launch.profile_ownership == CdpProfileOwnership::CallerManagedStable {
+        return Ok(());
+    }
+    static PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _prepare_guard = PREPARE_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_error| {
+            launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "CDP profile preparation lock is poisoned",
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "cdp_profile_prepare_lock_poisoned",
+                    "remediation": "restart the Synapse daemon and inspect the preceding panic; profile reconciliation cannot run without exclusive ownership",
+                }),
+            )
+        })?;
+    reconcile_stale_cdp_profiles()?;
+    let Some(token) = launch.profile_ownership_token.as_deref() else {
+        return Err(launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            "Synapse-owned CDP profile plan has no ownership token",
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_token_missing",
+                "user_data_dir": launch.user_data_dir,
+                "remediation": "inspect CDP launch planning; a Synapse-owned profile must always carry a unique ownership token",
+            }),
+        ));
+    };
+    let launcher_process_creation_time_100ns =
+        synapse_a11y::inspect_process_creation_time_100ns(std::process::id())
+            .map_err(|error| {
+                launch_tool_error(
+                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    format!(
+                        "act_launch could not read its daemon process generation for the CDP ownership marker: {error}"
+                    ),
+                    json!({
+                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                        "reason": "ephemeral_profile_launcher_generation_unreadable",
+                        "launcher_pid": std::process::id(),
+                        "source_error": error,
+                        "remediation": "repair Windows process-query permissions; Synapse will not create an ownership marker without a PID-generation identity",
+                    }),
+                )
+            })?
+            .ok_or_else(|| {
+                launch_tool_error(
+                    error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "act_launch daemon process generation read returned no identity",
+                    json!({
+                        "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                        "reason": "ephemeral_profile_launcher_generation_missing",
+                        "launcher_pid": std::process::id(),
+                        "remediation": "run the Windows Synapse daemon with process-query access; no browser was spawned",
+                    }),
+                )
+            })?;
+    let expected_parent = std::env::temp_dir().join("synapse-cdp-profiles");
+    if launch.user_data_dir.parent() != Some(expected_parent.as_path())
+        || launch
+            .user_data_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            != Some(token)
+    {
+        return Err(launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            "Synapse-owned CDP profile path does not match its exact temp-root token",
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_path_identity_mismatch",
+                "user_data_dir": launch.user_data_dir,
+                "expected_parent": expected_parent,
+                "ownership_token": token,
+                "remediation": "inspect CDP launch planning; never weaken the exact owned-profile path invariant",
+            }),
+        ));
+    }
+    fs::create_dir_all(&expected_parent).map_err(|error| {
+        launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            format!("act_launch could not create CDP profile root: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_root_create_failed",
+                "profile_root": expected_parent,
+                "source_error": error.to_string(),
+                "remediation": "repair permissions or filesystem state for the OS temp synapse-cdp-profiles directory",
+            }),
+        )
+    })?;
+    fs::create_dir(&launch.user_data_dir).map_err(|error| {
+        launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            format!("act_launch could not exclusively create its CDP profile: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_create_new_failed",
+                "user_data_dir": launch.user_data_dir,
+                "source_error": error.to_string(),
+                "remediation": "inspect the exact path for a collision or filesystem failure; Synapse never reuses an ephemeral profile directory",
+            }),
+        )
+    })?;
+    let marker_path = launch.user_data_dir.join(CDP_PROFILE_OWNERSHIP_MARKER);
+    let marker_bytes = serde_json::to_vec_pretty(&json!({
+        "schema": "synapse-cdp-profile-owner/v1",
+        "ownership_token": token,
+        "launcher_pid": std::process::id(),
+        "launcher_process_creation_time_100ns": launcher_process_creation_time_100ns,
+        "created_at": chrono::Utc::now().to_rfc3339(),
+    }))
+    .map_err(|error| {
+        launch_tool_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("act_launch could not encode CDP ownership marker: {error}"),
+            json!({
+                "code": error_codes::TOOL_INTERNAL_ERROR,
+                "reason": "ephemeral_profile_marker_encode_failed",
+                "user_data_dir": launch.user_data_dir,
+            }),
+        )
+    })?;
+    let marker_result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .and_then(|mut file| {
+            file.write_all(&marker_bytes)?;
+            file.sync_all()
+        });
+    if let Err(error) = marker_result {
+        let cleanup = fs::remove_dir(&launch.user_data_dir);
+        return Err(launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            format!("act_launch could not durably create CDP ownership marker: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_marker_write_failed",
+                "marker_path": marker_path,
+                "source_error": error.to_string(),
+                "empty_directory_cleanup": cleanup.map(|()| "removed").map_err(|cleanup_error| cleanup_error.to_string()),
+                "remediation": "repair filesystem durability/permissions for the OS temp directory; no browser was spawned",
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn publish_launched_cdp(
+    launch: &ChromiumCdpLaunch,
+    cdp: &mut LaunchedCdp,
+) -> Result<(), ErrorData> {
+    let registration = cdp.registration.clone().ok_or_else(|| {
+        launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+            "act_launch reached CDP publication without an attested registration",
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+                "reason": "cdp_registration_candidate_missing",
+                "remediation": "inspect the endpoint attestation transaction; publication is forbidden until all physical identity fields exist",
+            }),
+        )
+    })?;
+    synapse_a11y::register_launched_endpoint(registration.clone()).map_err(|error| {
+        launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+            format!("act_launch could not publish its attested CDP endpoint: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED,
+                "reason": "cdp_registry_publish_failed",
+                "registration_id": registration.registration_id,
+                "pid": registration.launch_pid,
+                "source_error": error,
+                "remediation": "inspect the launched-endpoint registry for a poisoned lock or contradictory exact-PID generation row",
+            }),
+        )
+    })?;
+    cdp.resource = Some(CdpLaunchResource {
+        registration,
+        user_data_dir: launch.user_data_dir.clone(),
+        profile_ownership: launch.profile_ownership,
+        profile_ownership_token: launch.profile_ownership_token.clone(),
+    });
+    Ok(())
+}
+
+#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CdpLaunchCleanupReadback {
+    pub registration_id: Option<String>,
+    pub registration_present_before: bool,
+    pub registry_eviction_attempted: bool,
+    pub registry_evicted: bool,
+    pub registration_present_after: bool,
+    pub profile_ownership: String,
+    pub user_data_dir: String,
+    pub profile_existed_before: bool,
+    pub profile_deletion_attempted: bool,
+    pub profile_exists_after: bool,
+    pub failed: bool,
+    pub errors: Vec<String>,
+}
+
+pub(crate) fn cleanup_launched_cdp_resource(
+    resource: CdpLaunchResource,
+) -> CdpLaunchCleanupReadback {
+    let mut errors = Vec::new();
+    let registration_before =
+        match synapse_a11y::launched_endpoint_for_pid(resource.registration.launch_pid) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("read CDP registry before cleanup: {error}"));
+                None
+            }
+        };
+    let registration_present_before = registration_before
+        .as_ref()
+        .is_some_and(|row| row.registration_id == resource.registration.registration_id);
+    let registry_eviction_attempted = registration_present_before;
+    let registry_evicted = if registration_present_before {
+        match synapse_a11y::forget_launched_endpoint(
+            resource.registration.launch_pid,
+            &resource.registration.registration_id,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(format!("exact CDP registry eviction failed: {error}"));
+                false
+            }
+        }
+    } else if let Some(row) = registration_before {
+        errors.push(format!(
+            "refused CDP registry cleanup because pid {} now holds contradictory registration_id={} expected={}",
+            resource.registration.launch_pid,
+            row.registration_id,
+            resource.registration.registration_id
+        ));
+        false
+    } else {
+        false
+    };
+    let registration_present_after =
+        match synapse_a11y::launched_endpoint_for_pid(resource.registration.launch_pid) {
+            Ok(row) => {
+                row.is_some_and(|row| row.registration_id == resource.registration.registration_id)
+            }
+            Err(error) => {
+                errors.push(format!("read CDP registry after cleanup: {error}"));
+                false
+            }
+        };
+    if registration_present_after {
+        errors.push("exact CDP registry row still exists after cleanup".to_owned());
+    }
+    let mut readback = cleanup_cdp_profile(
+        &resource.user_data_dir,
+        resource.profile_ownership,
+        resource.profile_ownership_token.as_deref(),
+    );
+    readback.registration_id = Some(resource.registration.registration_id);
+    readback.registration_present_before = registration_present_before;
+    readback.registry_eviction_attempted = registry_eviction_attempted;
+    readback.registry_evicted = registry_evicted;
+    readback.registration_present_after = registration_present_after;
+    readback.errors.splice(0..0, errors);
+    readback.failed = !readback.errors.is_empty();
+    tracing::info!(
+        code = "M4_ACT_LAUNCH_CDP_RESOURCE_CLEANUP",
+        readback = %serde_json::to_string(&readback).unwrap_or_else(|error| format!("serialization_failed:{error}")),
+        "readback=launched_cdp_registry+profile after=exact_resource_cleanup"
+    );
+    readback
+}
+
+pub(crate) fn spawn_launched_cdp_exit_monitor(resource: CdpLaunchResource) {
+    tokio::spawn(async move {
+        let mut unreadable_polls = 0_u64;
+        loop {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let launch_live = exact_process_generation_is_live(
+                resource.registration.launch_pid,
+                resource.registration.launch_process_creation_time_100ns,
+            );
+            let listener_live = exact_process_generation_is_live(
+                resource.registration.listener_pid,
+                resource.registration.listener_process_creation_time_100ns,
+            );
+            match (launch_live, listener_live) {
+                (Ok(false), Ok(false)) => {
+                    let readback = cleanup_launched_cdp_resource(resource);
+                    if readback.failed {
+                        synapse_action::record_operator_panic_safety_incident();
+                        tracing::error!(
+                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+                            readback = %serde_json::to_string(&readback).unwrap_or_else(|error| format!("serialization_failed:{error}")),
+                            "natural CDP endpoint exit cleanup failed"
+                        );
+                    }
+                    return;
+                }
+                (Err(launch_error), Err(listener_error)) => {
+                    unreadable_polls = unreadable_polls.saturating_add(1);
+                    if unreadable_polls == 1 || unreadable_polls.is_multiple_of(120) {
+                        tracing::error!(
+                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+                            launch_pid = resource.registration.launch_pid,
+                            listener_pid = resource.registration.listener_pid,
+                            launch_error,
+                            listener_error,
+                            unreadable_polls,
+                            "CDP exit monitor cannot read either exact process generation; retaining registry/profile ownership and retrying"
+                        );
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    unreadable_polls = unreadable_polls.saturating_add(1);
+                    if unreadable_polls == 1 || unreadable_polls.is_multiple_of(120) {
+                        tracing::error!(
+                            code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+                            launch_pid = resource.registration.launch_pid,
+                            listener_pid = resource.registration.listener_pid,
+                            detail = %error,
+                            unreadable_polls,
+                            "CDP exit monitor cannot read one exact process generation; retaining registry/profile ownership and retrying"
+                        );
+                    }
+                }
+                _ => unreadable_polls = 0,
+            }
+        }
+    });
+}
+
+fn exact_process_generation_is_live(
+    pid: u32,
+    expected_creation_time_100ns: Option<u64>,
+) -> Result<bool, String> {
+    let Some(expected) = expected_creation_time_100ns else {
+        return Err(format!(
+            "process pid={pid} has no recorded creation identity"
+        ));
+    };
+    match synapse_a11y::inspect_process_creation_time_100ns(pid) {
+        Ok(Some(actual)) => Ok(actual == expected),
+        Ok(None) => Err(format!(
+            "process pid={pid} creation identity read returned no value"
+        )),
+        Err(_error) if !process_exists(pid) => Ok(false),
+        Err(error) => Err(format!(
+            "process pid={pid} remains live but its creation identity is unreadable: {error}"
+        )),
+    }
+}
+
+fn cleanup_cdp_launch_plan(launch: &ChromiumCdpLaunch) -> CdpLaunchCleanupReadback {
+    cleanup_cdp_profile(
+        &launch.user_data_dir,
+        launch.profile_ownership,
+        launch.profile_ownership_token.as_deref(),
+    )
+}
+
+fn cleanup_cdp_profile(
+    user_data_dir: &Path,
+    profile_ownership: CdpProfileOwnership,
+    ownership_token: Option<&str>,
+) -> CdpLaunchCleanupReadback {
+    let profile_existed_before = user_data_dir.exists();
+    let mut readback = CdpLaunchCleanupReadback {
+        profile_ownership: profile_ownership.as_str().to_owned(),
+        user_data_dir: user_data_dir.display().to_string(),
+        profile_existed_before,
+        profile_exists_after: profile_existed_before,
+        ..CdpLaunchCleanupReadback::default()
+    };
+    if profile_ownership == CdpProfileOwnership::CallerManagedStable || !profile_existed_before {
+        return readback;
+    }
+    readback.profile_deletion_attempted = true;
+    let Some(token) = ownership_token else {
+        readback
+            .errors
+            .push("Synapse-owned CDP profile cleanup has no ownership token".to_owned());
+        readback.failed = true;
+        return readback;
+    };
+    let expected_parent = std::env::temp_dir().join("synapse-cdp-profiles");
+    if user_data_dir.parent() != Some(expected_parent.as_path())
+        || user_data_dir.file_name().and_then(|value| value.to_str()) != Some(token)
+    {
+        readback.errors.push(format!(
+            "refused recursive profile deletion: path {} is not exact token {token:?} beneath {}",
+            user_data_dir.display(),
+            expected_parent.display()
+        ));
+        readback.failed = true;
+        return readback;
+    }
+    match fs::symlink_metadata(user_data_dir) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            readback.errors.push(format!(
+                "refused recursive profile deletion: {} is a symlink",
+                user_data_dir.display()
+            ));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            readback.errors.push(format!(
+                "refused recursive profile deletion: {} is not a directory",
+                user_data_dir.display()
+            ));
+        }
+        Ok(_) => {
+            let marker_path = user_data_dir.join(CDP_PROFILE_OWNERSHIP_MARKER);
+            let marker_result = fs::read(&marker_path)
+                .map_err(|error| format!("read ownership marker {}: {error}", marker_path.display()))
+                .and_then(|bytes| {
+                    if bytes.len() > 4096 {
+                        return Err(format!(
+                            "ownership marker {} exceeds 4096 bytes",
+                            marker_path.display()
+                        ));
+                    }
+                    let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+                        format!("decode ownership marker {}: {error}", marker_path.display())
+                    })?;
+                    let actual_schema = value.get("schema").and_then(Value::as_str);
+                    let actual_token = value.get("ownership_token").and_then(Value::as_str);
+                    if actual_schema != Some("synapse-cdp-profile-owner/v1")
+                        || actual_token != Some(token)
+                    {
+                        return Err(format!(
+                            "ownership marker mismatch path={} schema={actual_schema:?} token={actual_token:?} expected_token={token:?}",
+                            marker_path.display()
+                        ));
+                    }
+                    Ok(())
+                });
+            match marker_result {
+                Ok(()) => {
+                    if let Err(error) = fs::remove_dir_all(user_data_dir)
+                        && error.kind() != io::ErrorKind::NotFound
+                    {
+                        readback.errors.push(format!(
+                            "remove exact owned CDP profile {}: {error}",
+                            user_data_dir.display()
+                        ));
+                    }
+                }
+                Err(_error) if !user_data_dir.exists() => {}
+                Err(error) => readback.errors.push(error),
+            }
+        }
+        Err(error) => readback.errors.push(format!(
+            "read profile metadata {}: {error}",
+            user_data_dir.display()
+        )),
+    }
+    readback.profile_exists_after = user_data_dir.exists();
+    if readback.profile_exists_after {
+        readback.errors.push(format!(
+            "CDP profile still exists after cleanup: {}",
+            user_data_dir.display()
+        ));
+    }
+    readback.failed = !readback.errors.is_empty();
+    readback
 }
 
 #[derive(Clone, Debug)]
 struct VerifiedCdpTarget {
+    id: String,
     url: String,
     title: Option<String>,
 }
@@ -9631,11 +10800,15 @@ struct VerifiedCdpTarget {
 #[derive(Clone, Debug, Deserialize)]
 struct CdpTargetListEntry {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     url: String,
     #[serde(default)]
     title: Option<String>,
     #[serde(default, rename = "type")]
     target_type: Option<String>,
+    #[serde(default, rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: String,
 }
 
 async fn verify_launched_chromium_url(
@@ -9644,16 +10817,15 @@ async fn verify_launched_chromium_url(
     cdp: &LaunchedCdp,
     timeout_ms: u64,
 ) -> Result<Option<VerifiedCdpTarget>, ErrorData> {
-    let Some(expected_url) = launch_requested_url(&params.args) else {
-        return Ok(None);
-    };
     if cdp_launch.is_none() {
         return Ok(None);
     }
+    let expected_url = launch_requested_url(&params.args);
+    let expected_description = expected_url.as_deref().unwrap_or("<any page target>");
     let Some(endpoint) = cdp.endpoint.as_deref() else {
         return Err(launch_url_verification_error(
             "cdp_endpoint_missing",
-            &expected_url,
+            expected_description,
             None,
             timeout_ms,
             None,
@@ -9685,21 +10857,24 @@ async fn verify_launched_chromium_url(
             Ok(targets) => {
                 last_targets = target_summaries(&targets);
                 if let Some(target) = targets.iter().find(|target| {
-                    target
-                        .target_type
-                        .as_deref()
-                        .is_none_or(|kind| kind == "page")
-                        && url_matches(&expected_url, &target.url)
+                    target.target_type.as_deref() == Some("page")
+                        && !target.id.is_empty()
+                        && cdp_page_websocket_matches(target, cdp.port)
+                        && expected_url
+                            .as_deref()
+                            .is_none_or(|expected| url_matches(expected, &target.url))
                 }) {
                     tracing::info!(
                         code = "M4_ACT_LAUNCH_CDP_URL_VERIFIED",
                         endpoint,
-                        expected_url,
+                        expected_url = ?expected_url,
                         actual_url = %target.url,
+                        target_id = %target.id,
                         title = ?target.title,
                         "act_launch verified requested browser URL in CDP target list"
                     );
                     return Ok(Some(VerifiedCdpTarget {
+                        id: target.id.clone(),
                         url: target.url.clone(),
                         title: target.title.clone().filter(|title| !title.is_empty()),
                     }));
@@ -9714,7 +10889,7 @@ async fn verify_launched_chromium_url(
         if started.elapsed() >= timeout {
             return Err(launch_url_verification_error(
                 "url_not_observed_within_timeout",
-                &expected_url,
+                expected_description,
                 Some(endpoint),
                 timeout_ms,
                 last_error,
@@ -9739,10 +10914,33 @@ async fn fetch_cdp_target_list(
     if !status.is_success() {
         return Err(format!("GET {url}: HTTP {status}"));
     }
-    response
-        .json::<Vec<CdpTargetListEntry>>()
+    let bytes = response
+        .bytes()
         .await
+        .map_err(|error| format!("read {url}: {error}"))?;
+    if bytes.len() > 1024 * 1024 {
+        return Err(format!(
+            "GET {url}: response exceeds 1048576-byte limit ({} bytes)",
+            bytes.len()
+        ));
+    }
+    serde_json::from_slice::<Vec<CdpTargetListEntry>>(&bytes)
         .map_err(|error| format!("decode {url}: {error}"))
+}
+
+fn cdp_page_websocket_matches(target: &CdpTargetListEntry, port: Option<u16>) -> bool {
+    let Some(port) = port else {
+        return false;
+    };
+    let Ok(url) = reqwest::Url::parse(&target.web_socket_debugger_url) else {
+        return false;
+    };
+    url.scheme() == "ws"
+        && url.host_str() == Some("127.0.0.1")
+        && url.port() == Some(port)
+        && url.path() == format!("/devtools/page/{}", target.id)
+        && url.query().is_none()
+        && url.fragment().is_none()
 }
 
 fn launch_requested_url(args: &[String]) -> Option<String> {

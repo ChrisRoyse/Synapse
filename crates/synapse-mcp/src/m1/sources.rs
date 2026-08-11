@@ -1346,9 +1346,8 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
     }
     let started = Instant::now();
     let pid = input.foreground.pid;
-    let ports = synapse_a11y::candidate_ports_for_pid(pid);
     let diagnostics =
-        synapse_a11y::probe_chromium_cdp_blocking(&process_name, &ports, CDP_PROBE_TIMEOUT);
+        synapse_a11y::probe_chromium_cdp_for_pid_blocking(&process_name, pid, CDP_PROBE_TIMEOUT);
     input
         .sensor_latency_ms
         .insert("cdp".to_owned(), started.elapsed().as_secs_f32() * 1000.0);
@@ -1360,10 +1359,14 @@ fn populate_cdp_diagnostics(input: &mut ObservationInput) {
 
     if diagnostics.status == CdpStatus::Unreachable {
         tracing::warn!(
-            code = "A11Y_CDP_UNREACHABLE",
+            code = diagnostics
+                .reason_code
+                .as_deref()
+                .unwrap_or("A11Y_CDP_UNREACHABLE"),
             process_name = %process_name,
             pid,
-            probed_ports = ?ports,
+            probed_ports = ?diagnostics.checked_ports,
+            detail = ?diagnostics.detail,
             "Chromium foreground has no reachable CDP HTTP endpoint; web DOM is not \
              exposed. Launch the browser via act_launch for a dedicated debug profile, \
              set SYNAPSE_CDP_PORTS to an already-running browser that was started with \

@@ -11,6 +11,7 @@ publish.workspace = true
 
 [dependencies]
 serde.workspace = true
+serde_json.workspace = true
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 thiserror.workspace = true
 tokio.workspace = true
@@ -22,7 +23,6 @@ chromiumoxide.workspace = true
 futures-util.workspace = true
 png = "0.18"
 regex.workspace = true
-serde_json.workspace = true
 tokio-tungstenite.workspace = true
 uiautomation.workspace = true
 windows.workspace = true

@@ -1409,7 +1409,12 @@ impl SynapseService {
                 let response = outcome.response.clone();
                 if let Err(error) = boundary("act_launch_after_low_level_launch") {
                     let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
-                    let cleanup_verified = cleanup.remaining_process_ids.is_empty();
+                    let cdp_cleanup = outcome
+                        .cdp_resource
+                        .take()
+                        .map(crate::m4::cleanup_launched_cdp_resource);
+                    let cleanup_verified = cleanup.remaining_process_ids.is_empty()
+                        && cdp_cleanup.as_ref().is_none_or(|readback| !readback.failed);
                     let drain = if cleanup_verified {
                         None
                     } else {
@@ -1426,6 +1431,7 @@ impl SynapseService {
                             "source_of_truth": "exact launched process tree + separate process-table readback",
                             "pid": response.pid,
                             "termination": cleanup,
+                            "cdp_cleanup": cdp_cleanup,
                             "cleanup_verified": cleanup_verified,
                             "drain": drain,
                         }),
@@ -1436,6 +1442,10 @@ impl SynapseService {
                         Some(process_job) => Some(process_job),
                         None => {
                             let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
+                            let cdp_cleanup = outcome
+                                .cdp_resource
+                                .take()
+                                .map(crate::m4::cleanup_launched_cdp_resource);
                             return Err(launch_lifecycle_tool_error(
                                 "act_launch spawned the process without the required pre-resume session Job Object; exact spawned PID cleanup was attempted",
                                 json!({
@@ -1443,6 +1453,7 @@ impl SynapseService {
                                     "reason": "pre_resume_process_job_missing",
                                     "pid": response.pid,
                                     "cleanup": cleanup,
+                                    "cdp_cleanup": cdp_cleanup,
                                 }),
                             ));
                         }
@@ -1454,6 +1465,10 @@ impl SynapseService {
                     record_launch_process_history(self, &params, &response, session_id.as_deref())
                 {
                     let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
+                    let cdp_cleanup = outcome
+                        .cdp_resource
+                        .take()
+                        .map(crate::m4::cleanup_launched_cdp_resource);
                     return Err(launch_lifecycle_tool_error(
                         "act_launch spawned the process but failed to record process history; exact spawned PID cleanup was attempted",
                         json!({
@@ -1462,6 +1477,7 @@ impl SynapseService {
                             "pid": response.pid,
                             "source_error": error.message,
                             "cleanup": cleanup,
+                            "cdp_cleanup": cdp_cleanup,
                         }),
                     ));
                 }
@@ -1470,20 +1486,29 @@ impl SynapseService {
                     .as_ref()
                     .map(|capture| capture.control.clone());
                 let terminal_history_key = response.output.terminal_history_key.clone();
+                let cdp_exit_monitor_resource = outcome.cdp_resource.clone();
                 if let (Some(session_id), Some(process_job)) = (session_id.clone(), process_job) {
-                    if let Err(error) = self.register_session_process_resource(
-                        super::session_lifecycle::SessionProcessResource::new(
-                            session_id.clone(),
-                            "act_launch",
-                            response.pid,
-                            None,
-                            params.target.clone(),
-                            process_job,
+                    if let Err((error, mut rejected_resource)) = self
+                        .register_session_process_resource_recoverable(
+                            super::session_lifecycle::SessionProcessResource::new(
+                                session_id.clone(),
+                                "act_launch",
+                                response.pid,
+                                None,
+                                params.target.clone(),
+                                process_job,
+                            )
+                            .with_desktop_lease(outcome.desktop_lease.take())
+                            .with_terminal_capture(terminal_capture_control, terminal_history_key)
+                            .with_cdp_resource(outcome.cdp_resource.take()),
                         )
-                        .with_desktop_lease(outcome.desktop_lease.take())
-                        .with_terminal_capture(terminal_capture_control, terminal_history_key),
-                    ) {
+                    {
                         let cleanup = crate::m4::terminate_owned_process_tree(response.pid);
+                        let cdp_cleanup = rejected_resource
+                            .cdp_resource
+                            .take()
+                            .map(crate::m4::cleanup_launched_cdp_resource);
+                        drop(rejected_resource.process_job.take());
                         if let Some(capture) = outcome.terminal_capture.take() {
                             spawn_launch_terminal_monitor(
                                 self.clone(),
@@ -1501,9 +1526,13 @@ impl SynapseService {
                                 "pid": response.pid,
                                 "source_error": error.message,
                                 "cleanup": cleanup,
+                                "cdp_cleanup": cdp_cleanup,
                             }),
                         ));
                     }
+                }
+                if let Some(resource) = cdp_exit_monitor_resource {
+                    crate::m4::spawn_launched_cdp_exit_monitor(resource);
                 }
                 if let Some(capture) = outcome.terminal_capture.take() {
                     spawn_launch_terminal_monitor(
@@ -1855,6 +1884,13 @@ fn launch_agent_spawn_with_terminal_capture(
         cdp_user_data_dir: None,
         cdp_verified_url: None,
         cdp_verified_title: None,
+        cdp_verified_target_id: None,
+        cdp_registration_id: None,
+        cdp_browser_id: None,
+        cdp_browser_websocket_url: None,
+        cdp_listener_pid: None,
+        cdp_listener_process_creation_time_100ns: None,
+        cdp_profile_ownership: None,
         desktop: None,
         output: ActLaunchOutputLaunchReadback {
             mode: "owned_conpty_capture".to_owned(),
