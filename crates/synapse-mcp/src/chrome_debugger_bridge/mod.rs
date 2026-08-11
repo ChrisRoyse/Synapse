@@ -15,6 +15,7 @@ use axum::{
     Json,
     extract::{
         Query,
+        rejection::JsonRejection,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
@@ -42,19 +43,22 @@ const BRIDGE_TOKEN_HEADER: &str = "x-synapse-bridge-token";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
-const BRIDGE_PROTOCOL_VERSION: u32 = 1;
+const BRIDGE_PROTOCOL_VERSION: u32 = 2;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-truthful-navigation-events-v9";
+    "synapse-chrome-bridge-2026-08-11-websocket-terminal-evaluate-exception-v13";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "fd72131dc2ca91f5bcfb825aa91207f109e7e398e9b2258dc429238b0c7ea272";
+    "5878a1f4e4f4142104c2953aedc4f70eef960e3e625ab32ec32dad4269967b7d";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
 // <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES: usize =
     NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
+pub const NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES: u64 =
     PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
+const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES: usize = 60 * 1024 * 1024;
+const COMMAND_TERMINAL_RECEIPT_LIMIT: usize = 64;
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -130,7 +134,9 @@ const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
     "A11Y_CDP_EXTENSION_DETACHED",
     "A11Y_CDP_EXTENSION_TIMEOUT",
     "A11Y_CDP_EXTENSION_UNAVAILABLE",
+    "A11Y_CDP_RESPONSE_TOO_LARGE",
     "ACTION_TARGET_INVALID",
+    "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION",
     "BROWSER_EVALUATE_TIMEOUT",
     "BROWSER_NAVIGATION_FAILED",
     "BROWSER_WAIT_TIMEOUT",
@@ -143,6 +149,7 @@ const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
     "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
     "CHROME_BRIDGE_EXTENSION_STALE",
     "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT",
+    "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR",
     "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
     "CHROME_CLOCK_FAILED",
     "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
@@ -4570,7 +4577,7 @@ struct ChromeCommand {
     params: Value,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ChromeResponse {
     id: String,
     ok: bool,
@@ -4578,10 +4585,48 @@ struct ChromeResponse {
     error: Option<ChromeResponseError>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct ChromeResponseError {
     code: Option<String>,
     detail: Option<String>,
+    diagnostics: Option<ChromeResponseErrorDiagnostics>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChromeResponseErrorDiagnostics {
+    exception_type: String,
+    exception_message: String,
+    line_number: Option<u64>,
+    column_number: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommandTerminalEnvelope {
+    #[serde(rename = "type")]
+    message_type: String,
+    protocol_version: u32,
+    original_host_id: String,
+    browser_session_id: String,
+    command_id: String,
+    command_kind: String,
+    terminal_sequence: u64,
+    payload_json: String,
+    payload_sha256: String,
+    payload_bytes: usize,
+    created_at_unix_ms: u64,
+    worker_boot_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct CommandTerminalReceipt {
+    command_id: String,
+    command_kind: String,
+    original_host_id: String,
+    browser_session_id: String,
+    terminal_sequence: u64,
+    payload_sha256: String,
+    payload_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -4735,6 +4780,8 @@ pub struct ChromeDebuggerExtensionOwnerCounts {
     pub media_override_count: usize,
     pub network_override_count: usize,
     #[serde(default)]
+    pub command_terminal_pending_count: usize,
+    #[serde(default)]
     pub capture_visible_tab_pending_count: usize,
     #[serde(default)]
     pub capture_visible_tab_quarantined_count: usize,
@@ -4760,6 +4807,7 @@ impl ChromeDebuggerExtensionOwnerCounts {
             && self.locale_override_count == 0
             && self.media_override_count == 0
             && self.network_override_count == 0
+            && self.command_terminal_pending_count == 0
             && self.capture_visible_tab_pending_count == 0
             && self.capture_visible_tab_quarantined_count == 0
             && self.mutation_handler_in_flight_count == 0
@@ -4784,6 +4832,10 @@ pub struct ChromeDebuggerExtensionOwnerReadback {
     pub storage_state_load_error: Option<String>,
     pub persisted_state_revision: u64,
     pub persisted_in_flight_mutation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub command_terminal_outbox: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub last_command_terminal_ack: Option<serde_json::Value>,
     #[serde(default)]
     pub capture_visible_tab_lease: Option<serde_json::Value>,
     #[serde(default)]
@@ -5005,13 +5057,15 @@ struct BridgeInner {
     hosts: HashMap<String, HostRecord>,
     commands: VecDeque<QueuedCommand>,
     pending: HashMap<String, PendingResponse>,
+    command_terminal_receipts: VecDeque<CommandTerminalReceipt>,
+    command_terminal_high_water: HashMap<String, u64>,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
 struct TransportLossPendingStats {
     queued_removed: usize,
     pending_failed_before_delivery: usize,
-    delivered_mutations_preserved: usize,
+    delivered_commands_preserved: usize,
 }
 
 fn preserve_delivered_mutations_on_transport_loss(
@@ -5029,34 +5083,23 @@ fn preserve_delivered_mutations_on_transport_loss(
         .map(|(id, _pending)| id.clone())
         .collect::<Vec<_>>();
     let mut pending_failed_before_delivery = 0usize;
-    let mut delivered_mutations_preserved = 0usize;
+    let mut delivered_commands_preserved = 0usize;
     for id in pending_ids {
         let preserve = inner
             .pending
             .get(&id)
-            .is_some_and(|pending| pending.delivered && pending.mutation_capable);
+            .is_some_and(|pending| pending.delivered);
         if preserve {
             if let Some(pending) = inner.pending.get_mut(&id) {
                 pending.transport_lost = true;
-                if let Some(sender) = pending.sender.take() {
-                    let _ = sender.send(ChromeResponse {
-                        id: id.clone(),
-                        ok: false,
-                        result: None,
-                        error: Some(ChromeResponseError {
-                            code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
-                            detail: Some(detail.to_owned()),
-                        }),
-                    });
-                }
-                delivered_mutations_preserved = delivered_mutations_preserved.saturating_add(1);
-                tracing::error!(
-                    code = "CHROME_DEBUGGER_DELIVERED_MUTATION_TRANSPORT_LOST",
+                delivered_commands_preserved = delivered_commands_preserved.saturating_add(1);
+                tracing::warn!(
+                    code = "CHROME_DEBUGGER_DELIVERED_COMMAND_TRANSPORT_LOST",
                     host_id = %host_id,
                     command_id = %id,
                     command_kind = %pending.kind,
                     detail = %detail,
-                    "delivered Chrome mutation remains owned until daemon owner-registry teardown; extension cleanup/readback cannot reconcile a lost transport lineage"
+                    "delivered Chrome command remains owned while its durable terminal is reconciled on a replacement authenticated WebSocket"
                 );
             }
         } else if let Some(pending) = inner.pending.remove(&id) {
@@ -5068,6 +5111,7 @@ fn preserve_delivered_mutations_on_transport_loss(
                     error: Some(ChromeResponseError {
                         code: Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE.to_owned()),
                         detail: Some(detail.to_owned()),
+                        diagnostics: None,
                     }),
                 });
             }
@@ -5077,7 +5121,7 @@ fn preserve_delivered_mutations_on_transport_loss(
     TransportLossPendingStats {
         queued_removed,
         pending_failed_before_delivery,
-        delivered_mutations_preserved,
+        delivered_commands_preserved,
     }
 }
 
@@ -6921,57 +6965,11 @@ impl ChromeDebuggerBridge {
                 );
             }
             "response" => {
-                let response = serde_json::from_value::<ChromeResponse>(request.message)
-                    .map_err(|error| format!("decode chrome debugger response: {error}"))?;
-                let id = response.id.clone();
-                if inner
-                    .pending
-                    .get(&id)
-                    .is_some_and(|pending| pending.host_id != request.host_id)
-                {
-                    tracing::warn!(
-                        code = "CHROME_DEBUGGER_RESPONSE_HOST_MISMATCH",
-                        host_id = %request.host_id,
-                        command_id = %id,
-                        "Chrome debugger response came from a different host than the pending command owner"
-                    );
-                    return Ok(());
-                }
-                let Some(pending) = inner.pending.remove(&id) else {
-                    tracing::warn!(
-                        code = "CHROME_DEBUGGER_RESPONSE_WITHOUT_PENDING_COMMAND",
-                        host_id = %request.host_id,
-                        command_id = %id,
-                        "Chrome debugger response had no pending daemon command"
-                    );
-                    return Ok(());
-                };
-                let readback_summary =
-                    chrome_response_readback_summary(&pending.kind, response.result.as_ref());
-                let response_error_code = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.code.as_deref())
-                    .unwrap_or_default();
-                let response_error_detail = response
-                    .error
-                    .as_ref()
-                    .and_then(|error| error.detail.as_deref())
-                    .unwrap_or_default();
-                tracing::info!(
-                    code = "CHROME_DEBUGGER_RESPONSE_ACCEPTED",
-                    host_id = %request.host_id,
-                    command_id = %id,
-                    command_kind = %pending.kind,
-                    response_ok = response.ok,
-                    response_error_code,
-                    response_error_detail,
-                    readback = %readback_summary.as_deref().unwrap_or(""),
-                    "Chrome debugger response accepted"
-                );
-                if let Some(sender) = pending.sender {
-                    let _ = sender.send(response);
-                }
+                return Err(format!(
+                    "{}: HTTP command responses are retired in bridge protocol v{}; send a durable command_terminal envelope on the authenticated command WebSocket and wait for its matching acknowledgement",
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    BRIDGE_PROTOCOL_VERSION,
+                ));
             }
             "event" => {
                 let event = request
@@ -7019,7 +7017,7 @@ impl ChromeDebuggerBridge {
                         detail = %detail_for_log,
                         queued_removed = stats.queued_removed,
                         pending_failed_before_delivery = stats.pending_failed_before_delivery,
-                        delivered_mutations_preserved = stats.delivered_mutations_preserved,
+                        delivered_commands_preserved = stats.delivered_commands_preserved,
                         "Chrome debugger native port disconnected"
                     );
                 } else if event == "tabNavigation" || event == "navigationClaim" {
@@ -7145,11 +7143,10 @@ impl ChromeDebuggerBridge {
         let marker_url =
             format!("data:text/html,<title>Synapse%20Bridge%20Maintenance%20{token}</title>");
         // Repair must not depend on the mutation lane that it is repairing.
-        // A live bridge may be stale or fail-closed by durable-owner recovery;
-        // use it only for a read-only pre-operation snapshot. The installer
-        // creates and proves its own exact UIA marker tab, and the replacement
-        // bridge resolves that session-unique marker to a Chrome tab identity
-        // before closing it.
+        // Only a current, healthy bridge may contribute the optional read-only
+        // pre-operation snapshot. The installer creates and proves its own
+        // exact UIA marker tab, and the replacement bridge resolves that
+        // session-unique marker to a Chrome tab identity before closing it.
         let tabs_before = if has_active_host {
             self.list_tabs_for_reload_maintenance().await?.tabs
         } else {
@@ -7418,8 +7415,25 @@ impl ChromeDebuggerBridge {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
         invalidate_chrome_profile_scan_cache("host_ui_reload_before_snapshot");
         let before = self.active_host_snapshot().ok();
+        let pre_reload_bridge_readback_usable = before.as_ref().is_some_and(|snapshot| {
+            !snapshot.extension_stale && snapshot.last_disconnect_detail.is_none()
+        });
+        if let Some(snapshot) = before
+            .as_ref()
+            .filter(|_| !pre_reload_bridge_readback_usable)
+        {
+            tracing::warn!(
+                code = "CHROME_DEBUGGER_HOST_RELOAD_PRE_SNAPSHOT_SKIPPED",
+                host_id = %snapshot.host_id,
+                extension_stale = snapshot.extension_stale,
+                stale_reasons = %snapshot.extension_stale_reasons.join("|"),
+                last_disconnect_detail = snapshot.last_disconnect_detail.as_deref().unwrap_or("none"),
+                source_of_truth = "installer-owned UIA tab-strip lease",
+                "Chrome bridge repair refused to depend on an unhealthy worker for its pre-operation snapshot"
+            );
+        }
         let maintenance = self
-            .prepare_reload_maintenance_tab(before.is_some())
+            .prepare_reload_maintenance_tab(pre_reload_bridge_readback_usable)
             .await?;
         let attempt = match run_chrome_bridge_host_ui_reload(&maintenance).await {
             Ok(attempt) => attempt,
@@ -7893,20 +7907,20 @@ impl ChromeDebuggerBridge {
             synapse_action::record_operator_panic_safety_incident();
             return;
         };
-        let keep_delivered_mutation = inner
+        let keep_delivered_command = inner
             .pending
             .get(id)
-            .is_some_and(|pending| pending.delivered && pending.mutation_capable);
-        if keep_delivered_mutation {
+            .is_some_and(|pending| pending.delivered);
+        if keep_delivered_command {
             if let Some(pending) = inner.pending.get_mut(id) {
                 pending.sender = None;
                 pending.caller_timed_out = true;
                 tracing::error!(
-                    code = "CHROME_DEBUGGER_DELIVERED_MUTATION_UNRESOLVED",
+                    code = "CHROME_DEBUGGER_DELIVERED_COMMAND_CALLER_TIMED_OUT",
                     command_id = %id,
                     command_kind = %pending.kind,
                     reason,
-                    "delivered Chrome mutation remains owned until terminal extension acknowledgement"
+                    "delivered Chrome command remains owned until its durable terminal is acknowledged"
                 );
             }
             return;
@@ -7972,6 +7986,279 @@ impl ChromeDebuggerBridge {
         })
     }
 
+    fn accept_command_terminal(&self, socket_host_id: &str, raw: &str) -> Value {
+        let nack = |command_id: &str, code: &str, detail: String| {
+            tracing::error!(
+                code,
+                host_id = %socket_host_id,
+                command_id,
+                detail = %detail,
+                "Chrome command terminal rejected"
+            );
+            json!({
+                "type": "command_terminal_nack",
+                "ok": false,
+                "code": code,
+                "command_id": command_id,
+                "detail": detail,
+            })
+        };
+        let envelope = match serde_json::from_str::<CommandTerminalEnvelope>(raw) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return nack(
+                    "",
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    format!("decode command terminal envelope: {error}"),
+                );
+            }
+        };
+        let command_id = envelope.command_id.clone();
+        if envelope.message_type != "command_terminal"
+            || envelope.protocol_version != BRIDGE_PROTOCOL_VERSION
+            || envelope.original_host_id.is_empty()
+            || envelope.browser_session_id.is_empty()
+            || envelope.command_id.is_empty()
+            || envelope.command_kind.is_empty()
+            || envelope.terminal_sequence == 0
+            || envelope.payload_bytes == 0
+            || envelope.payload_bytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES
+            || envelope.created_at_unix_ms == 0
+            || envelope.worker_boot_id.is_empty()
+        {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                format!(
+                    "invalid command terminal fields protocol_version={} original_host_id={:?} browser_session_id_present={} command_kind={:?} terminal_sequence={} payload_bytes={} payload_limit_bytes={} created_at_unix_ms={} worker_boot_id_present={}",
+                    envelope.protocol_version,
+                    envelope.original_host_id,
+                    !envelope.browser_session_id.is_empty(),
+                    envelope.command_kind,
+                    envelope.terminal_sequence,
+                    envelope.payload_bytes,
+                    COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES,
+                    envelope.created_at_unix_ms,
+                    !envelope.worker_boot_id.is_empty(),
+                ),
+            );
+        }
+        let actual_payload_bytes = envelope.payload_json.len();
+        let actual_payload_sha256 = sha256_hex_lower(envelope.payload_json.as_bytes());
+        if actual_payload_bytes != envelope.payload_bytes
+            || actual_payload_sha256 != envelope.payload_sha256
+        {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                format!(
+                    "command terminal payload evidence mismatch recorded_bytes={} actual_bytes={} recorded_sha256={} actual_sha256={}",
+                    envelope.payload_bytes,
+                    actual_payload_bytes,
+                    envelope.payload_sha256,
+                    actual_payload_sha256,
+                ),
+            );
+        }
+        let response = match serde_json::from_str::<ChromeResponse>(&envelope.payload_json) {
+            Ok(response) => response,
+            Err(error) => {
+                return nack(
+                    &command_id,
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    format!("decode command terminal response payload: {error}"),
+                );
+            }
+        };
+        if response.id != command_id {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                format!(
+                    "command terminal response id mismatch envelope_id={command_id:?} response_id={:?}",
+                    response.id
+                ),
+            );
+        }
+
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return nack(
+                    &command_id,
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    "chrome debugger bridge lock poisoned during terminal acceptance".to_owned(),
+                );
+            }
+        };
+        if inner.active_host_id.as_deref() != Some(socket_host_id)
+            || inner
+                .hosts
+                .get(socket_host_id)
+                .and_then(|host| host.transport.as_deref())
+                != Some("direct_http")
+        {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                "command terminal arrived on a non-active or non-direct authenticated host"
+                    .to_owned(),
+            );
+        }
+        if let Some(receipt) = inner
+            .command_terminal_receipts
+            .iter()
+            .find(|receipt| receipt.command_id == command_id)
+        {
+            let exact = receipt.command_kind == envelope.command_kind
+                && receipt.original_host_id == envelope.original_host_id
+                && receipt.browser_session_id == envelope.browser_session_id
+                && receipt.terminal_sequence == envelope.terminal_sequence
+                && receipt.payload_sha256 == envelope.payload_sha256
+                && receipt.payload_bytes == envelope.payload_bytes;
+            if !exact {
+                return nack(
+                    &command_id,
+                    error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                    "replayed command terminal contradicts the daemon receipt ledger".to_owned(),
+                );
+            }
+            tracing::info!(
+                code = "CHROME_DEBUGGER_COMMAND_TERMINAL_DEDUPLICATED",
+                host_id = %socket_host_id,
+                command_id = %command_id,
+                terminal_sequence = envelope.terminal_sequence,
+                payload_sha256 = %envelope.payload_sha256,
+                payload_bytes = envelope.payload_bytes,
+                "matching durable Chrome command terminal replay acknowledged without re-execution"
+            );
+            return json!({
+                "type": "command_terminal_ack",
+                "ok": true,
+                "host_id": socket_host_id,
+                "command_id": command_id,
+                "terminal_sequence": envelope.terminal_sequence,
+                "payload_sha256": envelope.payload_sha256,
+                "payload_bytes": envelope.payload_bytes,
+                "deduplicated": true,
+            });
+        }
+        let Some(pending) = inner.pending.get(&command_id) else {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                "command terminal has neither a pending delivered command nor a matching receipt"
+                    .to_owned(),
+            );
+        };
+        if !pending.delivered
+            || pending.host_id != envelope.original_host_id
+            || pending.kind != envelope.command_kind
+        {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                format!(
+                    "command terminal ownership mismatch delivered={} expected_host_id={:?} actual_host_id={:?} expected_kind={:?} actual_kind={:?}",
+                    pending.delivered,
+                    pending.host_id,
+                    envelope.original_host_id,
+                    pending.kind,
+                    envelope.command_kind,
+                ),
+            );
+        }
+        let high_water = inner
+            .command_terminal_high_water
+            .get(&envelope.browser_session_id)
+            .copied()
+            .unwrap_or(0);
+        if envelope.terminal_sequence <= high_water {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                format!(
+                    "new command terminal sequence is not above the browser-session high-water mark; sequence={} high_water={high_water}",
+                    envelope.terminal_sequence
+                ),
+            );
+        }
+        let Some(pending) = inner.pending.remove(&command_id) else {
+            return nack(
+                &command_id,
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                "pending command disappeared while accepting its terminal".to_owned(),
+            );
+        };
+        inner.command_terminal_high_water.insert(
+            envelope.browser_session_id.clone(),
+            envelope.terminal_sequence,
+        );
+        inner
+            .command_terminal_receipts
+            .push_back(CommandTerminalReceipt {
+                command_id: command_id.clone(),
+                command_kind: envelope.command_kind.clone(),
+                original_host_id: envelope.original_host_id.clone(),
+                browser_session_id: envelope.browser_session_id.clone(),
+                terminal_sequence: envelope.terminal_sequence,
+                payload_sha256: envelope.payload_sha256.clone(),
+                payload_bytes: envelope.payload_bytes,
+            });
+        while inner.command_terminal_receipts.len() > COMMAND_TERMINAL_RECEIPT_LIMIT {
+            inner.command_terminal_receipts.pop_front();
+        }
+        let readback_summary =
+            chrome_response_readback_summary(&pending.kind, response.result.as_ref());
+        let response_error = response.error.as_ref();
+        let response_error_diagnostics =
+            response_error.and_then(|error| error.diagnostics.as_ref());
+        tracing::info!(
+            code = "CHROME_DEBUGGER_COMMAND_TERMINAL_ACCEPTED",
+            host_id = %socket_host_id,
+            original_host_id = %envelope.original_host_id,
+            command_id = %command_id,
+            command_kind = %pending.kind,
+            terminal_sequence = envelope.terminal_sequence,
+            payload_sha256 = %envelope.payload_sha256,
+            payload_bytes = envelope.payload_bytes,
+            response_ok = response.ok,
+            response_error_code = response_error
+                .and_then(|error| error.code.as_deref())
+                .unwrap_or(""),
+            response_error_detail = response_error
+                .and_then(|error| error.detail.as_deref())
+                .unwrap_or(""),
+            exception_type = response_error_diagnostics
+                .map(|diagnostics| diagnostics.exception_type.as_str())
+                .unwrap_or(""),
+            exception_message = response_error_diagnostics
+                .map(|diagnostics| diagnostics.exception_message.as_str())
+                .unwrap_or(""),
+            exception_line_number = response_error_diagnostics
+                .and_then(|diagnostics| diagnostics.line_number)
+                .unwrap_or(0),
+            exception_column_number = response_error_diagnostics
+                .and_then(|diagnostics| diagnostics.column_number)
+                .unwrap_or(0),
+            readback = %readback_summary.as_deref().unwrap_or(""),
+            "durable Chrome command terminal accepted on the authoritative WebSocket"
+        );
+        if let Some(sender) = pending.sender {
+            let _ = sender.send(response);
+        }
+        json!({
+            "type": "command_terminal_ack",
+            "ok": true,
+            "host_id": socket_host_id,
+            "command_id": command_id,
+            "terminal_sequence": envelope.terminal_sequence,
+            "payload_sha256": envelope.payload_sha256,
+            "payload_bytes": envelope.payload_bytes,
+            "deduplicated": false,
+        })
+    }
+
     fn disconnect_direct_http_host(&self, host_id: &str, detail: &str) {
         let Ok(mut inner) = self.inner.lock() else {
             tracing::error!(
@@ -8009,7 +8296,7 @@ impl ChromeDebuggerBridge {
             detail = %detail,
             queued_removed = stats.queued_removed,
             pending_failed_before_delivery = stats.pending_failed_before_delivery,
-            delivered_mutations_preserved = stats.delivered_mutations_preserved,
+            delivered_commands_preserved = stats.delivered_commands_preserved,
             "Chrome debugger direct HTTP WebSocket disconnected"
         );
         self.notify.notify_waiters();
@@ -8209,6 +8496,7 @@ pub async fn drain_mutation_command_owners(
                             "operator panic canceled Chrome command before extension delivery"
                                 .to_owned(),
                         ),
+                        diagnostics: None,
                     }),
                 });
             }
@@ -10640,8 +10928,39 @@ pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Respon
 
 pub async fn http_message(
     headers: HeaderMap,
-    Json(request): Json<NativeMessageRequest>,
+    request: Result<Json<NativeMessageRequest>, JsonRejection>,
 ) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            let status = rejection.status();
+            let detail = format!(
+                "Chrome bridge HTTP event ingress rejected before dispatch; status={} limit_bytes={} extractor_detail={}; remediation=send only bounded non-command events over this route; command terminals must use the authenticated WebSocket",
+                status.as_u16(),
+                NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES,
+                rejection.body_text(),
+            );
+            tracing::error!(
+                code = error_codes::CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT,
+                http_status = status.as_u16(),
+                limit_bytes = NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES,
+                detail = %detail,
+                "Chrome bridge HTTP event ingress rejected"
+            );
+            return with_direct_http_bridge_cors_headers(
+                (
+                    status,
+                    Json(json!({
+                        "ok": false,
+                        "code": error_codes::CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT,
+                        "detail": detail,
+                        "limit_bytes": NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES,
+                    })),
+                )
+                    .into_response(),
+            );
+        }
+    };
     if bridge_token_from_headers(&headers).is_some()
         && !direct_http_bridge_token_header_matches_host(&headers, &request.host_id)
     {
@@ -10651,15 +10970,22 @@ pub async fn http_message(
     }
     with_direct_http_bridge_cors_headers(match bridge().post_message(request) {
         Ok(()) => Json(json!({"ok": true})).into_response(),
-        Err(detail) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "code": error_codes::A11Y_CDP_ATTACH_FAILED,
-                "detail": detail,
-            })),
-        )
-            .into_response(),
+        Err(detail) => {
+            let code = if detail.starts_with(error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR) {
+                error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR
+            } else {
+                error_codes::A11Y_CDP_ATTACH_FAILED
+            };
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "code": code,
+                    "detail": detail,
+                })),
+            )
+                .into_response()
+        }
     })
 }
 
@@ -10770,7 +11096,9 @@ pub async fn http_ws(Query(query): Query<NativeWsQuery>, ws: WebSocketUpgrade) -
             .into_response();
     }
     let host_id = query.host_id;
-    ws.on_upgrade(move |socket| direct_http_ws_loop(socket, host_id))
+    ws.max_message_size(NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES)
+        .max_frame_size(NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES)
+        .on_upgrade(move |socket| direct_http_ws_loop(socket, host_id))
 }
 
 async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
@@ -10785,9 +11113,46 @@ async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
         tokio::select! {
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(_) | Message::Binary(_) | Message::Pong(_))) => {
+                    Some(Ok(Message::Text(raw))) => {
                         if !bridge().touch_host(&host_id) {
-                            disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket keepalive".to_owned();
+                            disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket text".to_owned();
+                            break;
+                        }
+                        let message_type = serde_json::from_str::<Value>(raw.as_str())
+                            .ok()
+                            .and_then(|value| value.get("type").and_then(Value::as_str).map(ToOwned::to_owned));
+                        if message_type.as_deref() == Some("keepalive") {
+                            continue;
+                        }
+                        let acknowledgement = bridge().accept_command_terminal(&host_id, raw.as_str());
+                        let terminal_rejected = acknowledgement.get("ok").and_then(Value::as_bool) == Some(false);
+                        if let Err(error) = sender.send(Message::Text(acknowledgement.to_string().into())).await {
+                            disconnect_detail = format!("failed to send command-terminal acknowledgement: {error}");
+                            break;
+                        }
+                        if terminal_rejected {
+                            disconnect_detail = "daemon rejected contradictory command terminal; extension must remain fail-closed".to_owned();
+                            break;
+                        }
+                    }
+                    Some(Ok(Message::Binary(payload))) => {
+                        disconnect_detail = format!(
+                            "direct HTTP WebSocket binary client payload is forbidden; bytes={}",
+                            payload.len()
+                        );
+                        let rejection = json!({
+                            "type": "command_terminal_nack",
+                            "ok": false,
+                            "code": error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                            "command_id": "",
+                            "detail": disconnect_detail,
+                        });
+                        let _ = sender.send(Message::Text(rejection.to_string().into())).await;
+                        break;
+                    }
+                    Some(Ok(Message::Pong(_))) => {
+                        if !bridge().touch_host(&host_id) {
+                            disconnect_detail = "registered direct HTTP host disappeared while processing WebSocket pong".to_owned();
                             break;
                         }
                     }
@@ -12155,7 +12520,7 @@ fn replace_active_direct_http_host(inner: &mut BridgeInner, new_host_id: &str) {
         new_host_id = %new_host_id,
         queued_removed = stats.queued_removed,
         pending_failed_before_delivery = stats.pending_failed_before_delivery,
-        delivered_mutations_preserved = stats.delivered_mutations_preserved,
+        delivered_commands_preserved = stats.delivered_commands_preserved,
         "Chrome debugger direct HTTP bridge host replaced"
     );
 }

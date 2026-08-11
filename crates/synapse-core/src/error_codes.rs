@@ -32,6 +32,14 @@ pub const CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION: &str =
 /// exact serialized HTTP envelope exceeded the shared bounded transport limit.
 pub const CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT: &str =
     "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
+/// The extension executed a Chrome command, but the exact serialized result
+/// could not fit the bounded, authenticated terminal channel.
+///
+/// The command is never replayed; callers must request a smaller result.
+pub const A11Y_CDP_RESPONSE_TOO_LARGE: &str = "A11Y_CDP_RESPONSE_TOO_LARGE";
+/// A command-terminal envelope, acknowledgement, replay, digest, sequence, or
+/// ownership claim contradicted the daemon's ledger. The bridge fails closed.
+pub const CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR: &str = "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR";
 pub const CHROME_CAPTURE_VISIBLE_TAB_PENDING: &str = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 /// The host-side exact Chrome extension management control could not reload or
 /// install the normal-profile bridge, or its independent profile/host readback
@@ -50,10 +58,16 @@ pub const CHROME_DOM_ACTION_POSTCONDITION_FAILED: &str = "CHROME_DOM_ACTION_POST
 pub const BROWSER_WAIT_TIMEOUT: &str = "BROWSER_WAIT_TIMEOUT";
 /// Emitted when an evaluate expression outlives its `timeout_ms` budget.
 ///
-/// Distinct from `A11Y_CDP_AXTREE_FAILED`, which signals a thrown JS exception.
-/// The message carries the elapsed and budget milliseconds so an agent can retry
-/// with a larger `timeout_ms` rather than guessing.
+/// Distinct from `BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION`, which means CDP
+/// completed the transport operation and the evaluated page program threw.
+/// The message carries the elapsed and budget milliseconds so an agent can
+/// retry with a larger `timeout_ms` rather than guessing.
 pub const BROWSER_EVALUATE_TIMEOUT: &str = "BROWSER_EVALUATE_TIMEOUT";
+/// Chrome DevTools Protocol completed `Runtime.evaluate`, but returned
+/// `exceptionDetails` for the caller's JavaScript.
+///
+/// This is a page-program failure, not a debugger attach/transport failure.
+pub const BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION: &str = "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION";
 pub const BROWSER_NAVIGATION_FAILED: &str = "BROWSER_NAVIGATION_FAILED";
 pub const CHROME_ACTIVE_ELEMENT_MISSING: &str = "CHROME_ACTIVE_ELEMENT_MISSING";
 pub const CHROME_ACTIVE_ELEMENT_NOT_EDITABLE: &str = "CHROME_ACTIVE_ELEMENT_NOT_EDITABLE";

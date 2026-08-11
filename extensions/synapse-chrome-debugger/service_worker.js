@@ -1,6 +1,6 @@
-const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-truthful-navigation-events-v9";
-const BRIDGE_DECLARED_BUILD_SHA256 = "fd72131dc2ca91f5bcfb825aa91207f109e7e398e9b2258dc429238b0c7ea272";
+const PROTOCOL_VERSION = 2;
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-websocket-terminal-evaluate-exception-v13";
+const BRIDGE_DECLARED_BUILD_SHA256 = "5878a1f4e4f4142104c2953aedc4f70eef960e3e625ab32ec32dad4269967b7d";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -23,8 +23,12 @@ const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB = 60;
 // <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
 const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES =
   NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
+const NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES = 1024 * 1024;
 const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES =
   PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
+const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES = PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES;
+const COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES = 8;
+const COMMAND_TERMINAL_ACK_TIMEOUT_MS = 30000;
 const PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES = 256 * 1024;
 let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
@@ -96,9 +100,12 @@ const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
 const ERROR_EXTENSION_DETACHED = "A11Y_CDP_EXTENSION_DETACHED";
 const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 const ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT = "CAPTURE_PLAN_EXCEEDS_LIMIT";
+const ERROR_EVALUATE_JAVASCRIPT_EXCEPTION = "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_MESSAGE_BODY_EXCEEDS_LIMIT = "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
+const ERROR_RESPONSE_TOO_LARGE = "A11Y_CDP_RESPONSE_TOO_LARGE";
+const ERROR_TERMINAL_PROTOCOL = "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
 const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
@@ -127,7 +134,9 @@ const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
   "A11Y_CDP_EXTENSION_DETACHED",
   "A11Y_CDP_EXTENSION_TIMEOUT",
   "A11Y_CDP_EXTENSION_UNAVAILABLE",
+  "A11Y_CDP_RESPONSE_TOO_LARGE",
   "ACTION_TARGET_INVALID",
+  "BROWSER_EVALUATE_JAVASCRIPT_EXCEPTION",
   "BROWSER_EVALUATE_TIMEOUT",
   "BROWSER_NAVIGATION_FAILED",
   "BROWSER_WAIT_TIMEOUT",
@@ -140,6 +149,7 @@ const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
   "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
   "CHROME_BRIDGE_EXTENSION_STALE",
   "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT",
+  "CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR",
   "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
   "CHROME_CLOCK_FAILED",
   "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
@@ -233,7 +243,8 @@ let ACTIVE_COMMAND_MUTATION_CONTEXT = null;
 let IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = 0;
 let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
 let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
-const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
+const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV4";
+const LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
 const LEGACY_DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV1";
 const DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY =
   "synapseOperatorPanicBrowserSessionTokenV1";
@@ -258,6 +269,7 @@ let RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = null;
 let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
 let RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = null;
 let REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = null;
+let RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 
 function recordDurableOwnerLifecycleEvent(kind, reason = null) {
@@ -324,6 +336,7 @@ let hostId = null;
 let bridgeToken = null;
 let connectInFlight = null;
 let webSocket = null;
+const COMMAND_TERMINAL_ACK_WAITERS = new Map();
 let keepAliveTimer = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
@@ -1210,6 +1223,12 @@ function connectWebSocket() {
     resetReconnectState();
     console.info(`Synapse daemon bridge connected: host_id=${hostId}`);
     startWebSocketKeepAlive(socket);
+    flushCommandTerminalOutbox(socket).catch((error) => {
+      scheduleReconnect(
+        `durable command-terminal replay failed: ${errorMessage(error)}`,
+        ERROR_DAEMON_UNAVAILABLE
+      );
+    });
   };
   socket.onmessage = (event) => {
     handleWebSocketMessage(event.data).catch((error) => {
@@ -1248,7 +1267,19 @@ async function handleWebSocketMessage(raw) {
   if (message?.ok === false) {
     throw new Error(`daemon websocket refused command delivery: ${JSON.stringify(message)}`);
   }
+  if (message?.type === "command_terminal_ack") {
+    await acknowledgeCommandTerminal(message);
+    return;
+  }
+  if (message?.type === "command_terminal_nack") {
+    disableBridgePermanently(
+      `daemon rejected a durable command terminal: ${JSON.stringify(message)}`,
+      ERROR_TERMINAL_PROTOCOL
+    );
+    return;
+  }
   if (message?.command) {
+    message.command.__synapseOriginalHostId = hostId;
     await enqueueCommand(message.command);
   }
 }
@@ -1301,12 +1332,15 @@ function enqueueImmediateOperatorPanicDisable(command) {
 
 function emptyDurableOwnerLedger() {
   return {
-    version: 2,
+    version: 4,
     revision: 0,
     browserSessionId: "",
     enabled: true,
     disableSequence: 0,
     inFlightMutation: null,
+    commandTerminalSequence: 0,
+    commandTerminalOutbox: [],
+    lastCommandTerminalAck: null,
     captureVisibleTabLease: null,
     lastCaptureVisibleTabSettlement: null,
     openedTabs: [],
@@ -1437,6 +1471,65 @@ function normalizeStoredCaptureVisibleTabSettlement(value) {
   };
 }
 
+function normalizeStoredCommandTerminal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable command terminal is not an object");
+  }
+  const normalized = {
+    protocolVersion: Number(value.protocolVersion),
+    originalHostId: String(value.originalHostId || "").trim(),
+    browserSessionId: String(value.browserSessionId || "").trim(),
+    commandId: String(value.commandId || "").trim(),
+    commandKind: String(value.commandKind || "").trim(),
+    terminalSequence: Number(value.terminalSequence),
+    payloadJson: typeof value.payloadJson === "string" ? value.payloadJson : "",
+    payloadSha256: String(value.payloadSha256 || "").toLowerCase(),
+    payloadBytes: Number(value.payloadBytes),
+    createdAtUnixMs: Number(value.createdAtUnixMs),
+    workerBootId: String(value.workerBootId || "").trim()
+  };
+  const actualPayloadBytes = new TextEncoder().encode(normalized.payloadJson).byteLength;
+  if (
+    normalized.protocolVersion !== PROTOCOL_VERSION ||
+    !normalized.originalHostId || !normalized.browserSessionId ||
+    !normalized.commandId || !normalized.commandKind || !normalized.workerBootId ||
+    !Number.isSafeInteger(normalized.terminalSequence) || normalized.terminalSequence <= 0 ||
+    !Number.isSafeInteger(normalized.payloadBytes) || normalized.payloadBytes <= 0 ||
+    normalized.payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES ||
+    actualPayloadBytes !== normalized.payloadBytes ||
+    !/^[0-9a-f]{64}$/.test(normalized.payloadSha256) ||
+    !Number.isSafeInteger(normalized.createdAtUnixMs) || normalized.createdAtUnixMs <= 0
+  ) {
+    throw new Error(
+      `durable command terminal fields are malformed: command_id=${normalized.commandId || "missing"} ` +
+        `recorded_bytes=${normalized.payloadBytes} actual_bytes=${actualPayloadBytes}`
+    );
+  }
+  return normalized;
+}
+
+function normalizeStoredCommandTerminalAck(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable command terminal acknowledgement is not an object");
+  }
+  const ack = {
+    commandId: String(value.commandId || "").trim(),
+    terminalSequence: Number(value.terminalSequence),
+    payloadSha256: String(value.payloadSha256 || "").toLowerCase(),
+    payloadBytes: Number(value.payloadBytes),
+    daemonHostId: String(value.daemonHostId || "").trim(),
+    acknowledgedAtUnixMs: Number(value.acknowledgedAtUnixMs)
+  };
+  if (!ack.commandId || !Number.isSafeInteger(ack.terminalSequence) ||
+      ack.terminalSequence <= 0 || !/^[0-9a-f]{64}$/.test(ack.payloadSha256) ||
+      !Number.isSafeInteger(ack.payloadBytes) || ack.payloadBytes <= 0 ||
+      !ack.daemonHostId || !Number.isSafeInteger(ack.acknowledgedAtUnixMs) ||
+      ack.acknowledgedAtUnixMs <= 0) {
+    throw new Error("durable command terminal acknowledgement fields are malformed");
+  }
+  return ack;
+}
+
 function normalizeDurableOwnerLedger(value) {
   if (value === undefined) {
     return emptyDurableOwnerLedger();
@@ -1445,8 +1538,14 @@ function normalizeDurableOwnerLedger(value) {
     throw new Error("durable owner ledger is not an object");
   }
   const source = value;
-  if (source.version !== 2) {
+  if (![2, 4].includes(source.version)) {
     throw new Error(`durable owner ledger version is unsupported: ${String(source.version)}`);
+  }
+  if (source.version === 2 && source.inFlightMutation) {
+    throw new Error(
+      "durable owner ledger v2 contains an in-flight mutation without a terminal outbox; " +
+        "execution outcome cannot be reconstructed, so migration is refused"
+    );
   }
   if (typeof source.enabled !== "boolean") {
     throw new Error("durable owner ledger enabled flag is not boolean");
@@ -1505,6 +1604,37 @@ function normalizeDurableOwnerLedger(value) {
       throw new Error("durable owner ledger in-flight mutation fields are malformed");
     }
     ledger.inFlightMutation = { id, kind, activitySequence, workerBootId };
+  }
+  if (source.version === 4) {
+    if (!Number.isSafeInteger(source.commandTerminalSequence) ||
+        source.commandTerminalSequence < 0) {
+      throw new Error("durable owner ledger command terminal sequence is malformed");
+    }
+    if (!Array.isArray(source.commandTerminalOutbox) ||
+        source.commandTerminalOutbox.length > COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES) {
+      throw new Error("durable owner ledger command terminal outbox is malformed or over capacity");
+    }
+    ledger.commandTerminalSequence = source.commandTerminalSequence;
+    let outboxPayloadBytes = 0;
+    const commandIds = new Set();
+    for (const entry of source.commandTerminalOutbox) {
+      const normalized = normalizeStoredCommandTerminal(entry);
+      if (commandIds.has(normalized.commandId)) {
+        throw new Error(`durable command terminal outbox repeats command id ${normalized.commandId}`);
+      }
+      commandIds.add(normalized.commandId);
+      outboxPayloadBytes += normalized.payloadBytes;
+      ledger.commandTerminalOutbox.push(normalized);
+    }
+    if (outboxPayloadBytes >
+        COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES * COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
+      throw new Error(
+        `durable command terminal outbox byte bound exceeded: actual=${outboxPayloadBytes}`
+      );
+    }
+    ledger.lastCommandTerminalAck = source.lastCommandTerminalAck === null
+      ? null
+      : normalizeStoredCommandTerminalAck(source.lastCommandTerminalAck);
   }
   const initKeys = new Set();
   for (const entry of source.initScripts) {
@@ -1730,6 +1860,96 @@ function assertDurableOwnerPersistenceAuthority(context, duringRestore) {
   }
 }
 
+async function writeAndVerifyDurableOwnerSnapshot(snapshot) {
+  await chrome.storage.local.set({ [DURABLE_OWNER_STORAGE_KEY]: snapshot });
+  const readback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
+  const stored = readback?.[DURABLE_OWNER_STORAGE_KEY];
+  const expectedJson = canonicalDurableOwnerJson(snapshot);
+  const actualJson = canonicalDurableOwnerJson(stored);
+  if (actualJson !== expectedJson) {
+    throw new Error(
+      "chrome.storage.local durable owner write postcondition failed; " +
+        `expected_sha256=${await sha256HexText(expectedJson)} ` +
+        `actual_sha256=${await sha256HexText(actualJson || "missing")} ` +
+        `expected_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
+        `actual_bytes=${new TextEncoder().encode(actualJson || "").byteLength}`
+    );
+  }
+}
+
+function canonicalDurableOwnerJson(value) {
+  const canonicalize = (entry) => {
+    if (Array.isArray(entry)) {
+      return entry.map(canonicalize);
+    }
+    if (entry && typeof entry === "object") {
+      return Object.fromEntries(
+        Object.keys(entry)
+          .sort()
+          .map((key) => [key, canonicalize(entry[key])])
+      );
+    }
+    return entry;
+  };
+  return JSON.stringify(canonicalize(value));
+}
+
+async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
+  if (v4Stored?.version !== 4 || v2Stored?.version !== 2) {
+    throw new Error(
+      "both durable owner ledger keys exist but do not carry exact v4/v2 versions; " +
+        `v4_version=${String(v4Stored?.version)} v2_version=${String(v2Stored?.version)}; ` +
+        "refusing ambiguous authority"
+    );
+  }
+  const actualV4 = normalizeDurableOwnerLedger(v4Stored);
+  const expectedV4 = normalizeDurableOwnerLedger(v2Stored);
+  const sourceRevision = expectedV4.revision;
+  expectedV4.revision += 1;
+  const actualJson = canonicalDurableOwnerJson(actualV4);
+  const expectedJson = canonicalDurableOwnerJson(expectedV4);
+  const actualSha256 = await sha256HexText(actualJson);
+  const expectedSha256 = await sha256HexText(expectedJson);
+  if (actualJson !== expectedJson) {
+    throw new Error(
+      "both v4 and legacy v2 durable owner ledgers are present and the v4 row is not " +
+        "the exact one-revision migration product; refusing ambiguous authority; " +
+        `v2_revision=${sourceRevision} v4_revision=${actualV4.revision} ` +
+        `expected_v4_sha256=${expectedSha256} actual_v4_sha256=${actualSha256} ` +
+        `expected_v4_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
+        `actual_v4_bytes=${new TextEncoder().encode(actualJson).byteLength}`
+    );
+  }
+
+  await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
+  const readback = await chrome.storage.local.get([
+    DURABLE_OWNER_STORAGE_KEY,
+    LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
+  ]);
+  const v2Absent = readback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
+  const persistedV4Json = canonicalDurableOwnerJson(
+    normalizeDurableOwnerLedger(readback?.[DURABLE_OWNER_STORAGE_KEY])
+  );
+  const persistedV4Sha256 = await sha256HexText(persistedV4Json);
+  if (!v2Absent || persistedV4Json !== actualJson) {
+    throw new Error(
+      "interrupted durable owner migration cleanup postcondition failed; " +
+        `legacy_v2_absent=${v2Absent} expected_v4_sha256=${actualSha256} ` +
+        `actual_v4_sha256=${persistedV4Sha256}; v4 must remain exact and v2 must be absent`
+    );
+  }
+  return {
+    reconciled: true,
+    reason: "exact_one_revision_v2_to_v4_migration_product",
+    source_v2_revision: sourceRevision,
+    accepted_v4_revision: actualV4.revision,
+    accepted_v4_sha256: actualSha256,
+    accepted_v4_bytes: new TextEncoder().encode(actualJson).byteLength,
+    legacy_v2_absent_after: true,
+    reconciled_at_unix_ms: Date.now()
+  };
+}
+
 async function persistDurableOwnerLedgerRepairSnapshot({ duringRestore = false } = {}) {
   assertDurableOwnerPersistenceAuthority(
     "persist durable owner repair snapshot",
@@ -1739,9 +1959,7 @@ async function persistDurableOwnerLedgerRepairSnapshot({ duringRestore = false }
   const snapshot = typeof globalThis.structuredClone === "function"
     ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
     : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
-  const write = () => chrome.storage.local.set({
-    [DURABLE_OWNER_STORAGE_KEY]: snapshot
-  });
+  const write = () => writeAndVerifyDurableOwnerSnapshot(snapshot);
   const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
   DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
   await persisted;
@@ -1865,21 +2083,44 @@ async function waitForDurableOwnerLifecycleEvent() {
 }
 
 async function restoreDurableOwnerLedger() {
+  let schemaMigrated = false;
   try {
     if (!chrome.storage?.local || !chrome.storage?.session) {
       throw new Error("chrome.storage.local/session are required for durable owner continuity");
     }
     const [localStored, sessionStored] = await Promise.all([
-      chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY),
+      chrome.storage.local.get([
+        DURABLE_OWNER_STORAGE_KEY,
+        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
+      ]),
       chrome.storage.session.get([
         DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY,
         LEGACY_DURABLE_OWNER_STORAGE_KEY
       ])
     ]);
-    const hasLocalLedger = Object.prototype.hasOwnProperty.call(
+    const hasV4LocalLedger = Object.prototype.hasOwnProperty.call(
       localStored || {},
       DURABLE_OWNER_STORAGE_KEY
     );
+    let hasV2LocalLedger = Object.prototype.hasOwnProperty.call(
+      localStored || {},
+      LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
+    );
+    if (hasV4LocalLedger && hasV2LocalLedger) {
+      RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION =
+        await reconcileInterruptedDurableOwnerMigration(
+          localStored[DURABLE_OWNER_STORAGE_KEY],
+          localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]
+        );
+      delete localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
+      hasV2LocalLedger = false;
+      console.warn(
+        "synapse durable owner ledger: reconciled an interrupted v2-to-v4 migration " +
+          "only after proving the v4 row was the exact one-revision migration product",
+        RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION
+      );
+    }
+    const hasLocalLedger = hasV4LocalLedger || hasV2LocalLedger;
     const storedBrowserSessionId = typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]
       === "string"
       ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
@@ -1915,10 +2156,13 @@ async function restoreDurableOwnerLedger() {
       }
       await persistDurableOwnerLedger({ duringRestore: true });
     } else {
-      const storedLedger = localStored[DURABLE_OWNER_STORAGE_KEY];
+      const storedLedger = hasV4LocalLedger
+        ? localStored[DURABLE_OWNER_STORAGE_KEY]
+        : localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
       let repairedEmptyMissingSession = false;
       try {
         DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(storedLedger);
+        schemaMigrated = hasV2LocalLedger && storedLedger?.version === 2;
       } catch (error) {
         if (errorMessage(error) !== "durable owner ledger browser session id is missing") {
           throw error;
@@ -2216,11 +2460,29 @@ async function restoreDurableOwnerLedger() {
       hydrateDurableOverrideMaps();
     }
     if (DURABLE_OWNER_LEDGER.inFlightMutation) {
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+      const matchingTerminal = DURABLE_OWNER_LEDGER.commandTerminalOutbox.find(
+        (entry) => entry.commandId === DURABLE_OWNER_LEDGER.inFlightMutation.id
+      );
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = matchingTerminal ? 0 : 1;
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       DURABLE_OWNER_LEDGER.enabled = false;
       if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
         await persistDurableOwnerLedger({ mergeLiveOwners: true, duringRestore: true });
+      }
+    }
+    if (schemaMigrated) {
+      await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
+      await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
+      const migrationReadback = await chrome.storage.local.get([
+        DURABLE_OWNER_STORAGE_KEY,
+        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
+      ]);
+      if (migrationReadback?.[DURABLE_OWNER_STORAGE_KEY]?.version !== 4 ||
+          migrationReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] !== undefined) {
+        throw new Error(
+          "durable owner ledger v2-to-v4 migration postcondition failed; " +
+            "v4 must exist and v2 must be absent after the verified v4 write"
+        );
       }
     }
     DURABLE_OWNER_STATE_LOADED = true;
@@ -2351,9 +2613,7 @@ async function persistDurableOwnerLedger({
   const snapshot = typeof globalThis.structuredClone === "function"
     ? globalThis.structuredClone(DURABLE_OWNER_LEDGER)
     : JSON.parse(JSON.stringify(DURABLE_OWNER_LEDGER));
-  const write = () => chrome.storage.local.set({
-    [DURABLE_OWNER_STORAGE_KEY]: snapshot
-  });
+  const write = () => writeAndVerifyDurableOwnerSnapshot(snapshot);
   const persisted = DURABLE_OWNER_PERSIST_TAIL.then(write, write);
   DURABLE_OWNER_PERSIST_TAIL = persisted.catch(() => undefined);
   await persisted;
@@ -2620,7 +2880,6 @@ async function handleTrackedCommand(command) {
   const mutationCapable = isMutationCapableCommand(kind);
   const activitySequence = ++COMMAND_ACTIVITY_SEQUENCE;
   const admittedDisableSequence = DURABLE_MUTATION_DISABLE_SEQUENCE;
-  let persistedMutationMarker = false;
   COMMAND_IN_FLIGHT_COUNT += 1;
   if (mutationCapable) {
     MUTATION_HANDLER_IN_FLIGHT_COUNT += 1;
@@ -2628,7 +2887,6 @@ async function handleTrackedCommand(command) {
     if (DURABLE_MUTATION_OWNERS_ENABLED && DURABLE_OWNER_STATE_LOADED) {
       try {
         await beginPersistedMutationCommand(command, activitySequence);
-        persistedMutationMarker = true;
       } catch (error) {
         DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation admission failed: ${errorMessage(error)}`;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
@@ -2649,15 +2907,6 @@ async function handleTrackedCommand(command) {
       ACTIVE_COMMAND_MUTATION_CONTEXT = previousContext;
     }
   } finally {
-    if (persistedMutationMarker) {
-      try {
-        await finishPersistedMutationCommand();
-      } catch (error) {
-        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation completion failed: ${errorMessage(error)}`;
-        DURABLE_MUTATION_OWNERS_ENABLED = false;
-        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
-      }
-    }
     if (mutationCapable) {
       MUTATION_HANDLER_IN_FLIGHT_COUNT = Math.max(0, MUTATION_HANDLER_IN_FLIGHT_COUNT - 1);
       MUTATION_HANDLER_COMPLETED_COUNT += 1;
@@ -3106,9 +3355,12 @@ async function handleCommand(command) {
   if (!id || typeof id !== "string") {
     throw bridgeError(ERROR_ATTACH_FAILED, "native command id is required");
   }
+  let terminalOk = false;
+  let terminalResult = null;
+  let terminalError = null;
+  let closeWebSocketAfterResponse = null;
   try {
     let result;
-    let closeWebSocketAfterResponse = null;
     if (isMutationCapableCommand(kind) && !DURABLE_MUTATION_OWNERS_ENABLED) {
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
@@ -3246,21 +3498,23 @@ async function handleCommand(command) {
           `loaded_capabilities=${COMMAND_CAPABILITIES.join(",")}`
       );
     }
-    await postResponse(id, true, result, null);
-    if (closeWebSocketAfterResponse) {
-      setTimeout(() => {
-        try {
-          closeWebSocket({
-            failOnError: false,
-            reason: closeWebSocketAfterResponse
-          });
-        } catch (error) {
-          console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
-        }
-      }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
-    }
+    terminalOk = true;
+    terminalResult = result;
   } catch (error) {
-    await postResponse(id, false, null, errorPayload(error));
+    terminalError = errorPayload(error);
+  }
+  await postResponse(command, terminalOk, terminalResult, terminalError);
+  if (closeWebSocketAfterResponse) {
+    setTimeout(() => {
+      try {
+        closeWebSocket({
+          failOnError: false,
+          reason: closeWebSocketAfterResponse
+        });
+      } catch (error) {
+        console.error(`Synapse post-response websocket close failed: ${errorMessage(error)}`);
+      }
+    }, WEBSOCKET_CLOSE_AFTER_RESPONSE_DELAY_MS);
   }
 }
 
@@ -3372,6 +3626,7 @@ function bridgeIdentity() {
     DURABLE_OWNER_LEDGER.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
     STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
     !DURABLE_OWNER_LEDGER.inFlightMutation &&
+    DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
     DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length === 0 &&
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
     captureLeaseContinuityHealthy;
@@ -3427,6 +3682,10 @@ function bridgeIdentity() {
         persisted_in_flight_mutation_present: Boolean(
           DURABLE_OWNER_LEDGER.inFlightMutation
         ),
+        command_terminal_outbox_count:
+          DURABLE_OWNER_LEDGER.commandTerminalOutbox.length,
+        command_terminal_sequence: DURABLE_OWNER_LEDGER.commandTerminalSequence,
+        last_command_terminal_ack: DURABLE_OWNER_LEDGER.lastCommandTerminalAck,
         unresolved_debugger_command_timeout_count:
           DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
         capture_visible_tab_lease: captureLease,
@@ -3436,6 +3695,8 @@ function bridgeIdentity() {
         unresolved_worker_restart_mutation_count:
           UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
         owner_continuity_healthy: durableOwnerContinuityHealthy,
+        interrupted_migration_reconciliation:
+          RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
         empty_missing_session_repair:
           REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION
       },
@@ -3706,9 +3967,11 @@ async function handleEvaluateScript(params) {
     }
   }
   if (evaluation?.exceptionDetails) {
+    const diagnostics = debuggerExceptionDiagnostics(evaluation.exceptionDetails);
     throw bridgeError(
-      ERROR_ATTACH_FAILED,
-      `Runtime.evaluate exception: ${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}`
+      ERROR_EVALUATE_JAVASCRIPT_EXCEPTION,
+      `Runtime.evaluate JavaScript exception: ${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}`,
+      diagnostics
     );
   }
   const remote = evaluation?.result || {};
@@ -14773,6 +15036,8 @@ function operatorPanicActiveOwners() {
     locale_override_count: DURABLE_OWNER_LEDGER.localeOverrides.length,
     media_override_count: DURABLE_OWNER_LEDGER.mediaOverrides.length,
     network_override_count: DURABLE_OWNER_LEDGER.networkOverrides.length,
+    command_terminal_pending_count:
+      DURABLE_OWNER_LEDGER.commandTerminalOutbox.length,
     capture_visible_tab_pending_count:
       ["admitted", "active"].includes(
         DURABLE_OWNER_LEDGER.captureVisibleTabLease?.status
@@ -14811,8 +15076,23 @@ function operatorPanicOwnerReadback() {
     stale_browser_session_repair: DURABLE_OWNER_STALE_SESSION_REPAIR,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
+    interrupted_migration_reconciliation:
+      RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    command_terminal_outbox: DURABLE_OWNER_LEDGER.commandTerminalOutbox.map((entry) => ({
+      protocol_version: entry.protocolVersion,
+      original_host_id: entry.originalHostId,
+      browser_session_id: entry.browserSessionId,
+      command_id: entry.commandId,
+      command_kind: entry.commandKind,
+      terminal_sequence: entry.terminalSequence,
+      payload_sha256: entry.payloadSha256,
+      payload_bytes: entry.payloadBytes,
+      created_at_unix_ms: entry.createdAtUnixMs,
+      worker_boot_id: entry.workerBootId
+    })),
+    last_command_terminal_ack: DURABLE_OWNER_LEDGER.lastCommandTerminalAck,
     capture_visible_tab_lease: captureLease,
     last_capture_visible_tab_settlement:
       DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement,
@@ -14837,6 +15117,8 @@ function operatorPanicOwnerReadback() {
       !DURABLE_OWNER_STATE_LOAD_ERROR &&
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
       STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
+      !DURABLE_OWNER_LEDGER.inFlightMutation &&
+      DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
       captureLeaseContinuityHealthy,
     active_after: activeAfter,
@@ -27451,6 +27733,28 @@ function formatDebuggerExceptionDetails(details) {
   return `${String(exceptionText)}${url}${line}${column}`;
 }
 
+function debuggerExceptionDiagnostics(details) {
+  const description = String(
+    details?.exception?.description || details?.exception?.value || details?.text ||
+      "unknown exception"
+  );
+  const firstLine = description.split(/\r?\n/, 1)[0];
+  const className = typeof details?.exception?.className === "string"
+    ? details.exception.className.trim()
+    : "";
+  const separator = firstLine.indexOf(":");
+  const inferredType = separator > 0 ? firstLine.slice(0, separator).trim() : "";
+  const inferredMessage = separator > 0
+    ? firstLine.slice(separator + 1).trim()
+    : firstLine.trim();
+  return {
+    exception_type: (className || inferredType || "JavaScriptException").slice(0, 256),
+    exception_message: inferredMessage.slice(0, 4096),
+    line_number: Number.isInteger(details?.lineNumber) ? details.lineNumber + 1 : null,
+    column_number: Number.isInteger(details?.columnNumber) ? details.columnNumber + 1 : null
+  };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -27766,20 +28070,253 @@ function formatPageScreenshotCaptureContext(context) {
   ].join(" ");
 }
 
-async function postResponse(id, ok, result, error) {
-  await postDaemonMessage({
-    type: "response",
-    id,
-    ok,
-    result,
-    error
+async function commandTerminalPayload(command, ok, result, error) {
+  const id = String(command?.id || "").trim();
+  const kind = String(command?.kind || "").trim();
+  const response = { id, ok, result: result === undefined ? null : result, error };
+  let payloadJson = JSON.stringify(response);
+  let payloadBytes = new TextEncoder().encode(payloadJson).byteLength;
+  if (payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
+    response.ok = false;
+    response.result = null;
+    response.error = {
+      code: ERROR_RESPONSE_TOO_LARGE,
+      detail:
+        `Chrome executed command ${kind} but its serialized terminal response exceeded the ` +
+        `bounded WebSocket payload budget; actual_bytes=${payloadBytes} ` +
+        `limit_bytes=${COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES}; result_discarded=true; ` +
+        "reduce the requested result at the page boundary"
+    };
+    payloadJson = JSON.stringify(response);
+    payloadBytes = new TextEncoder().encode(payloadJson).byteLength;
+  }
+  if (payloadBytes <= 0 || payloadBytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES) {
+    throw bridgeError(
+      ERROR_RESPONSE_TOO_LARGE,
+      `command terminal could not fit its typed oversize diagnostic; command_id=${id} ` +
+        `payload_bytes=${payloadBytes} limit_bytes=${COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES}`
+    );
+  }
+  return { payloadJson, payloadBytes, payloadSha256: await sha256HexText(payloadJson) };
+}
+
+function commandTerminalWireEntry(entry) {
+  return {
+    type: "command_terminal",
+    protocol_version: entry.protocolVersion,
+    original_host_id: entry.originalHostId,
+    browser_session_id: entry.browserSessionId,
+    command_id: entry.commandId,
+    command_kind: entry.commandKind,
+    terminal_sequence: entry.terminalSequence,
+    payload_json: entry.payloadJson,
+    payload_sha256: entry.payloadSha256,
+    payload_bytes: entry.payloadBytes,
+    created_at_unix_ms: entry.createdAtUnixMs,
+    worker_boot_id: entry.workerBootId
+  };
+}
+
+function sendCommandTerminal(socket, entry) {
+  if (webSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+    throw bridgeError(
+      ERROR_DAEMON_UNAVAILABLE,
+      `command terminal cannot send on a non-open authoritative WebSocket; ` +
+        `command_id=${entry.commandId} ready_state=${String(socket?.readyState ?? "missing")}`
+    );
+  }
+  const serialized = JSON.stringify(commandTerminalWireEntry(entry));
+  const wireBytes = new TextEncoder().encode(serialized).byteLength;
+  if (wireBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
+    throw bridgeError(
+      ERROR_RESPONSE_TOO_LARGE,
+      `command terminal envelope exceeds the server WebSocket bound; command_id=${entry.commandId} ` +
+        `wire_bytes=${wireBytes} limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}`
+    );
+  }
+  socket.send(serialized);
+}
+
+async function flushCommandTerminalOutbox(socket) {
+  await DURABLE_OWNER_STATE_READY;
+  for (const entry of DURABLE_OWNER_LEDGER.commandTerminalOutbox) {
+    sendCommandTerminal(socket, entry);
+  }
+}
+
+function waitForCommandTerminalAck(entry) {
+  const existing = COMMAND_TERMINAL_ACK_WAITERS.get(entry.commandId);
+  if (existing) {
+    return existing.promise;
+  }
+  let resolvePromise;
+  let rejectPromise;
+  const promise = new Promise((resolve, reject) => {
+    resolvePromise = resolve;
+    rejectPromise = reject;
   });
+  const timeoutId = setTimeout(() => {
+    const current = COMMAND_TERMINAL_ACK_WAITERS.get(entry.commandId);
+    if (current?.entry.payloadSha256 === entry.payloadSha256) {
+      COMMAND_TERMINAL_ACK_WAITERS.delete(entry.commandId);
+      rejectPromise(bridgeError(
+        ERROR_DAEMON_UNAVAILABLE,
+        `daemon did not acknowledge the durable command terminal before timeout; ` +
+          `command_id=${entry.commandId} terminal_sequence=${entry.terminalSequence} ` +
+          `payload_sha256=${entry.payloadSha256} timeout_ms=${COMMAND_TERMINAL_ACK_TIMEOUT_MS}; ` +
+          "the terminal remains in chrome.storage.local and only that terminal may be replayed"
+      ));
+    }
+  }, COMMAND_TERMINAL_ACK_TIMEOUT_MS);
+  COMMAND_TERMINAL_ACK_WAITERS.set(entry.commandId, {
+    entry,
+    promise,
+    resolve: resolvePromise,
+    reject: rejectPromise,
+    timeoutId
+  });
+  return promise;
+}
+
+async function acknowledgeCommandTerminal(message) {
+  await DURABLE_OWNER_STATE_READY;
+  const commandId = String(message?.command_id || "").trim();
+  const terminalSequence = Number(message?.terminal_sequence);
+  const payloadSha256 = String(message?.payload_sha256 || "").toLowerCase();
+  const payloadBytes = Number(message?.payload_bytes);
+  const daemonHostId = String(message?.host_id || "").trim();
+  const index = DURABLE_OWNER_LEDGER.commandTerminalOutbox.findIndex(
+    (entry) => entry.commandId === commandId
+  );
+  if (index < 0) {
+    const last = DURABLE_OWNER_LEDGER.lastCommandTerminalAck;
+    if (last && last.commandId === commandId && last.terminalSequence === terminalSequence &&
+        last.payloadSha256 === payloadSha256 && last.payloadBytes === payloadBytes) {
+      return;
+    }
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon acknowledged an unknown command terminal; command_id=${commandId || "missing"}`
+    );
+  }
+  const entry = DURABLE_OWNER_LEDGER.commandTerminalOutbox[index];
+  if (entry.terminalSequence !== terminalSequence || entry.payloadSha256 !== payloadSha256 ||
+      entry.payloadBytes !== payloadBytes || !daemonHostId) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon command-terminal acknowledgement contradicted durable storage; ` +
+        `command_id=${commandId} expected_sequence=${entry.terminalSequence} ` +
+        `actual_sequence=${String(terminalSequence)} expected_sha256=${entry.payloadSha256} ` +
+        `actual_sha256=${payloadSha256 || "missing"} expected_bytes=${entry.payloadBytes} ` +
+        `actual_bytes=${String(payloadBytes)}`
+    );
+  }
+  const priorRevision = DURABLE_OWNER_LEDGER.revision;
+  const priorLastAck = DURABLE_OWNER_LEDGER.lastCommandTerminalAck;
+  const priorInFlightMutation = DURABLE_OWNER_LEDGER.inFlightMutation;
+  const priorRuntimeEnabled = DURABLE_MUTATION_OWNERS_ENABLED;
+  const priorLedgerEnabled = DURABLE_OWNER_LEDGER.enabled;
+  const priorUnresolvedCount = UNRESOLVED_WORKER_RESTART_MUTATION_COUNT;
+  DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 1);
+  DURABLE_OWNER_LEDGER.lastCommandTerminalAck = {
+    commandId,
+    terminalSequence,
+    payloadSha256,
+    payloadBytes,
+    daemonHostId,
+    acknowledgedAtUnixMs: Date.now()
+  };
+  if (DURABLE_OWNER_LEDGER.inFlightMutation?.id === commandId) {
+    DURABLE_OWNER_LEDGER.inFlightMutation = null;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
+  }
+  if (DURABLE_OWNER_LEDGER.commandTerminalOutbox.length === 0 &&
+      DURABLE_OWNER_LEDGER.disableSequence === 0 &&
+      IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0) {
+    DURABLE_MUTATION_OWNERS_ENABLED = true;
+  }
+  try {
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    DURABLE_OWNER_LEDGER.commandTerminalOutbox.splice(index, 0, entry);
+    DURABLE_OWNER_LEDGER.lastCommandTerminalAck = priorLastAck;
+    DURABLE_OWNER_LEDGER.inFlightMutation = priorInFlightMutation;
+    DURABLE_OWNER_LEDGER.revision = priorRevision;
+    DURABLE_OWNER_LEDGER.enabled = priorLedgerEnabled;
+    DURABLE_MUTATION_OWNERS_ENABLED = priorRuntimeEnabled;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = priorUnresolvedCount;
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `daemon acknowledged command ${commandId}, but chrome.storage.local could not persist ` +
+        `the matching acknowledgement; payload_sha256=${payloadSha256} ` +
+        `storage_error=${errorMessage(error)}; the durable terminal remains pending for exact replay`
+    );
+  }
+  const waiter = COMMAND_TERMINAL_ACK_WAITERS.get(commandId);
+  if (waiter && waiter.entry.terminalSequence === terminalSequence &&
+      waiter.entry.payloadSha256 === payloadSha256) {
+    clearTimeout(waiter.timeoutId);
+    COMMAND_TERMINAL_ACK_WAITERS.delete(commandId);
+    waiter.resolve(DURABLE_OWNER_LEDGER.lastCommandTerminalAck);
+  }
+}
+
+async function postResponse(command, ok, result, error) {
+  await DURABLE_OWNER_STATE_READY;
+  if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `command terminal persistence is unavailable; command_id=${String(command?.id || "missing")} ` +
+        `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}`
+    );
+  }
+  if (DURABLE_OWNER_LEDGER.commandTerminalOutbox.length >=
+      COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `durable command terminal outbox is full; entries=${DURABLE_OWNER_LEDGER.commandTerminalOutbox.length} ` +
+        `limit=${COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES}`
+    );
+  }
+  const id = String(command?.id || "").trim();
+  const kind = String(command?.kind || "").trim();
+  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
+  if (!id || !kind || !originalHostId || !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `command terminal ownership is incomplete; command_id=${id || "missing"} ` +
+        `command_kind=${kind || "missing"} original_host_id=${originalHostId || "missing"} ` +
+        `browser_session_id=${DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID || "missing"}`
+    );
+  }
+  const payload = await commandTerminalPayload(command, ok, result, error);
+  const entry = {
+    protocolVersion: PROTOCOL_VERSION,
+    originalHostId,
+    browserSessionId: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+    commandId: id,
+    commandKind: kind,
+    terminalSequence: ++DURABLE_OWNER_LEDGER.commandTerminalSequence,
+    payloadJson: payload.payloadJson,
+    payloadSha256: payload.payloadSha256,
+    payloadBytes: payload.payloadBytes,
+    createdAtUnixMs: Date.now(),
+    workerBootId: DURABLE_OWNER_WORKER_BOOT_ID
+  };
+  DURABLE_OWNER_LEDGER.commandTerminalOutbox.push(entry);
+  await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  const ack = waitForCommandTerminalAck(entry);
+  sendCommandTerminal(webSocket, entry);
+  await ack;
 }
 
 async function postDaemonMessage(message) {
   if (!hostId) {
-    console.warn("Synapse daemon bridge unavailable; message dropped");
-    return;
+    throw bridgeError(
+      ERROR_DAEMON_UNAVAILABLE,
+      `Synapse daemon bridge has no registered host for message_type=${String(message?.type || "missing")}; ` +
+        "the event was not accepted or reported as delivered"
+    );
   }
   try {
     await daemonFetchJson("/chrome-debugger/native/message", {
@@ -27843,13 +28380,12 @@ async function daemonFetchJson(path, options = {}) {
         );
       }
       const bodyBytes = new TextEncoder().encode(serializedBody).byteLength;
-      if (bodyBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
+      if (bodyBytes > NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES) {
         throw bridgeError(
           ERROR_MESSAGE_BODY_EXCEEDS_LIMIT,
-          "direct Chrome bridge refused a native-message HTTP body before fetch: " +
-            `body_bytes=${bodyBytes} limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}; ` +
-            "remediation=reduce the command response below the declared transport budget; " +
-            "pageScreenshot callers must reduce the clip dimensions or set maxPixels/maxLongEdge"
+          "direct Chrome bridge refused an event HTTP body before fetch: " +
+            `body_bytes=${bodyBytes} limit_bytes=${NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES}; ` +
+            "remediation=bound the non-command event; command terminals use the authenticated WebSocket"
         );
       }
     }
@@ -27889,9 +28425,12 @@ async function daemonFetchJson(path, options = {}) {
   return value;
 }
 
-function bridgeError(code, detail) {
+function bridgeError(code, detail, diagnostics = null) {
   const error = new Error(detail);
   error.code = code;
+  if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
+    error.diagnostics = diagnostics;
+  }
   return error;
 }
 
@@ -27925,10 +28464,26 @@ function errorPayload(error) {
         "then bump/redeploy the bridge build identity"
     };
   }
-  return {
+  const diagnostics = error?.diagnostics;
+  const payload = {
     code: receivedCode,
     detail: originalDetail
   };
+  if (diagnostics && typeof diagnostics === "object" && !Array.isArray(diagnostics)) {
+    payload.diagnostics = {
+      exception_type: String(diagnostics.exception_type || "JavaScriptException").slice(0, 256),
+      exception_message: redactPublicErrorDetail(
+        String(diagnostics.exception_message || "unknown exception")
+      ).slice(0, 4096),
+      line_number: Number.isInteger(diagnostics.line_number)
+        ? diagnostics.line_number
+        : null,
+      column_number: Number.isInteger(diagnostics.column_number)
+        ? diagnostics.column_number
+        : null
+    };
+  }
+  return payload;
 }
 
 function errorMessage(error) {
