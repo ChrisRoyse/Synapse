@@ -5671,7 +5671,7 @@ function Compare-SynapseDaemonStartupProgressSample {
 
 function New-SynapseDaemonStartupWatchdog {
     param(
-        [Parameter(Mandatory=$true)][ValidateSet('install','rollback')][string]$Phase,
+        [Parameter(Mandatory=$true)][ValidateSet('candidate','install','rollback')][string]$Phase,
         [Parameter(Mandatory=$true)][string]$LogDir,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$DbPath,
@@ -9766,16 +9766,37 @@ function Test-SynapseCandidateDaemon {
                 Remove-Item "Env:$replacementEnvName" -ErrorAction SilentlyContinue
             }
         }
-        $deadline = (Get-Date).AddSeconds(25)
-        do {
+        $candidateWatchdog = New-SynapseDaemonStartupWatchdog `
+            -Phase 'candidate' `
+            -LogDir $candidateRoot `
+            -Bind $candidateBind `
+            -DbPath $candidateDb `
+            -VaultPath $candidateCalyxVault `
+            -BaseTimeoutSeconds 25 `
+            -MaxSeconds 180 `
+            -StallSeconds 45 `
+            -SampleIntervalSeconds 5
+        $candidateGateVerdict = 'continue'
+        Info ("SYNAPSE_STARTUP_WATCHDOG_ARMED phase=candidate base_timeout_s={0} absolute_cap_s={1} stall_window_s={2} sample_interval_s={3} vault={4} remediation=candidate validation keeps waiting only while the exact isolated process proves CPU, I/O, or vault progress and always retains a hard ceiling" -f `
+            $candidateWatchdog.BaseTimeoutSeconds,
+            $candidateWatchdog.MaxSeconds,
+            $candidateWatchdog.StallSeconds,
+            $candidateWatchdog.SampleIntervalSeconds,
+            $candidateWatchdog.VaultPath)
+        while ($true) {
             Start-Sleep -Milliseconds 500
-            $read = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token
+            $read = Read-SynapseHealthForRestartGuard -Bind $candidateBind -Token $tokenRead.Token -TimeoutSec 2
             if ($read.Ok) {
                 $health = $read.Health
                 break
             }
             $lastHealthError = $read.Error
-        } while ((Get-Date) -lt $deadline)
+            $candidateTick = Update-SynapseDaemonStartupWatchdog -Watchdog $candidateWatchdog
+            if (-not $candidateTick.Continue) {
+                $candidateGateVerdict = $candidateTick.Verdict
+                break
+            }
+        }
 
         if ($null -eq $health) {
             $alive = [bool](Get-Process -Id $candidate.Id -ErrorAction SilentlyContinue)
@@ -9784,7 +9805,7 @@ function Test-SynapseCandidateDaemon {
             $candidatePhysicalState = Format-SynapseDaemonStartupPhysicalState -DbPath $candidateDb -CalyxVaultPath $candidateCalyxVault
             $stdoutHash = if (Test-Path -LiteralPath $candidateStdout -PathType Leaf) { Get-SynapseFileSha256 -Path $candidateStdout } else { '<missing>' }
             $stderrHash = if (Test-Path -LiteralPath $candidateStderr -PathType Leaf) { Get-SynapseFileSha256 -Path $candidateStderr } else { '<missing>' }
-            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} exit_code_signed={4} exit_code_hex={5} bind={6} listeners={7} last_error={8} evidence_root={9} stdout={10} stdout_sha256={11} stderr={12} stderr_sha256={13}`nphysical_storage_state:`n{14}`nremediation=the newly built daemon did not answer /health on an isolated DB/port; old live daemon was not touched. Inspect retained candidate-diagnostic.json, stdout, stderr, and isolated lifecycle ledgers." -f `
+            Die ("SYNAPSE_CANDIDATE_HEALTH_FAILED exe={0} sha256={1} pid={2} alive={3} exit_code_signed={4} exit_code_hex={5} bind={6} listeners={7} gate_verdict={8} last_error={9} evidence_root={10} stdout={11} stdout_sha256={12} stderr={13} stderr_sha256={14}`nstartup_watchdog:`n{15}`nphysical_storage_state:`n{16}`nremediation={17} Old live daemon was not touched. Inspect retained candidate-diagnostic.json, stdout, stderr, and isolated lifecycle ledgers." -f `
                 $CandidateExePath,
                 $candidateHash,
                 $candidate.Id,
@@ -9793,13 +9814,16 @@ function Test-SynapseCandidateDaemon {
                 $(if ($null -eq $exit.ExitCodeHex) { '<running-or-unavailable>' } else { $exit.ExitCodeHex }),
                 $candidateBind,
                 (Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners),
+                $candidateGateVerdict,
                 $lastHealthError,
                 $candidateRoot,
                 $candidateStdout,
                 $stdoutHash,
                 $candidateStderr,
                 $stderrHash,
-                $candidatePhysicalState)
+                (Format-SynapseDaemonStartupWatchdogState -Watchdog $candidateWatchdog),
+                $candidatePhysicalState,
+                (Get-SynapseDaemonStartupWatchdogRemediation -Verdict $candidateGateVerdict -Phase 'candidate'))
         }
 
         $healthPid = [int]$health.pid
