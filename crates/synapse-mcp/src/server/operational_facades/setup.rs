@@ -23,7 +23,7 @@ use crate::{
 use super::{
     SETUP_SOT, SETUP_TOOL,
     errors::{facade_delegate_error, missing_spec},
-    host_transition,
+    host_transition, launchd_service,
     policy::require_maintenance_profile,
     response::setup_response,
     types::{FileReadback, SetupOperation, SetupParams, SetupResponse, SetupStatusResponse},
@@ -111,6 +111,30 @@ pub(super) async fn handle(
                 launched.readback_source_of_truth(),
                 |out| {
                     out.status = Some(status);
+                },
+            )))
+        }
+        SetupOperation::LaunchdService => {
+            let spec = params
+                .0
+                .launchd_service
+                .ok_or_else(|| missing_spec(SETUP_TOOL, "launchd_service"))?;
+            if spec.action == super::types::SetupLaunchdServiceAction::Restart {
+                require_maintenance_profile(
+                    service,
+                    &request_context,
+                    SETUP_TOOL,
+                    operation.as_str(),
+                    "synapse_launchd_service_restart",
+                    SETUP_SOT,
+                )?;
+            }
+            let result = launchd_service::handle(spec).await?;
+            Ok(Json(setup_response(
+                operation,
+                result.source_of_truth.clone(),
+                |out| {
+                    out.launchd_service = Some(result);
                 },
             )))
         }

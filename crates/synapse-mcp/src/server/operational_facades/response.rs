@@ -100,6 +100,7 @@ pub(super) fn setup_response(
         readback_source_of_truth: readback,
         status: None,
         doctor: None,
+        launchd_service: None,
         host_transition: None,
     };
     fill(&mut response);

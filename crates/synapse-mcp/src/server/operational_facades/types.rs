@@ -556,6 +556,7 @@ pub enum SetupOperation {
     Status,
     Doctor,
     Repair,
+    LaunchdService,
     HostTransition,
 }
 
@@ -565,6 +566,7 @@ impl SetupOperation {
             Self::Status => "status",
             Self::Doctor => "doctor",
             Self::Repair => "repair",
+            Self::LaunchdService => "launchd_service",
             Self::HostTransition => "host_transition",
         }
     }
@@ -578,6 +580,102 @@ pub struct SetupStatusParams {}
 #[serde(deny_unknown_fields)]
 pub struct SetupRepairParams {
     pub reason: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupLaunchdServiceAction {
+    Status,
+    Restart,
+}
+
+impl SetupLaunchdServiceAction {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Status => "status",
+            Self::Restart => "restart",
+        }
+    }
+}
+
+/// Lifecycle request for Synapse's one installed macOS LaunchAgent.
+///
+/// The label and executable are intentionally not parameters: accepting either
+/// from the caller would turn this typed capability back into generic shell.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupLaunchdServiceParams {
+    pub action: SetupLaunchdServiceAction,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub confirmation: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SetupLaunchdRestartState {
+    Requested,
+    Completed,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupLaunchdCommandReadback {
+    pub executable: String,
+    pub args: Vec<String>,
+    pub exit_code: i32,
+    pub stdout_len_bytes: usize,
+    pub stdout_sha256: String,
+    pub stderr_len_bytes: usize,
+    pub stderr_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupLaunchdServiceProbe {
+    pub label: String,
+    pub service_target: String,
+    pub effective_uid: u32,
+    pub registered: bool,
+    pub state: Option<String>,
+    pub pid: Option<u32>,
+    pub query: SetupLaunchdCommandReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupLaunchdRestartReadback {
+    pub schema: String,
+    pub request_id: String,
+    pub state: SetupLaunchdRestartState,
+    pub service_target: String,
+    pub requesting_pid: u32,
+    pub completed_pid: Option<u32>,
+    pub requested_at_unix_ms: u128,
+    pub completed_at_unix_ms: Option<u128>,
+    pub reason_len_bytes: usize,
+    pub reason_sha256: String,
+    pub command_executable: String,
+    pub command_args: Vec<String>,
+    pub command_exit_code: Option<i32>,
+    pub before_query_sha256: String,
+    pub after_query_sha256: Option<String>,
+    pub failure_code: Option<String>,
+    pub manifest_path: String,
+    pub manifest_len_bytes: u64,
+    pub manifest_sha256: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SetupLaunchdServiceResponse {
+    pub action: SetupLaunchdServiceAction,
+    pub source_of_truth: String,
+    pub service: SetupLaunchdServiceProbe,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart: Option<SetupLaunchdRestartReadback>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -676,6 +774,8 @@ pub struct SetupParams {
     pub doctor: Option<SetupStatusParams>,
     #[serde(default)]
     pub repair: Option<SetupRepairParams>,
+    #[serde(default)]
+    pub launchd_service: Option<SetupLaunchdServiceParams>,
     #[serde(default)]
     pub host_transition: Option<SetupHostTransitionParams>,
 }
@@ -811,6 +911,8 @@ pub struct SetupResponse {
     pub status: Option<SetupStatusResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doctor: Option<SetupStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_service: Option<SetupLaunchdServiceResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_transition: Option<SetupHostTransitionResponse>,
 }

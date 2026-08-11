@@ -94,6 +94,7 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
         SetupOperation::Status
             if params.doctor.is_none()
                 && params.repair.is_none()
+                && params.launchd_service.is_none()
                 && params.host_transition.is_none() =>
         {
             return Ok(());
@@ -101,6 +102,7 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
         SetupOperation::Doctor
             if params.status.is_none()
                 && params.repair.is_none()
+                && params.launchd_service.is_none()
                 && params.host_transition.is_none() =>
         {
             return Ok(());
@@ -114,6 +116,7 @@ pub(super) fn validate_setup_params(params: &SetupParams) -> Result<(), ErrorDat
             ("status", params.status.is_some()),
             ("doctor", params.doctor.is_some()),
             ("repair", params.repair.is_some()),
+            ("launchd_service", params.launchd_service.is_some()),
             ("host_transition", params.host_transition.is_some()),
         ],
     )

@@ -2839,6 +2839,17 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "switch to an explicit maintenance profile and run repair from an external process",
             ),
             op(
+                "launchd_service",
+                true,
+                false,
+                "exact /bin/launchctl print gui/<euid>/com.synapse.mcp output + durable launchd restart manifest",
+                Some(
+                    "separate launchctl print PID/state readback + durable restart-manifest byte/hash readback",
+                ),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "run status on the installed macOS LaunchAgent host; restart additionally requires the exact maintenance profile, reason, and confirmation",
+            ),
+            op(
                 "host_transition",
                 true,
                 false,
