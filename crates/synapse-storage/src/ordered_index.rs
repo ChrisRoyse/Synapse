@@ -184,7 +184,9 @@ fn index_read_failed(index_cf: &str, detail: String) -> StorageError {
     StorageError::ReadFailed {
         cf_name: if matches!(
             index_cf,
-            cf::CF_AGENT_TRANSCRIPT_ORDER | cf::CF_REFLEX_AUDIT_ORDER
+            cf::CF_AGENT_TRANSCRIPT_ORDER
+                | cf::CF_REFLEX_AUDIT_ORDER
+                | cf::CF_AGENT_EVENT_SPAWN_INDEX
         ) {
             index_cf.to_owned()
         } else {

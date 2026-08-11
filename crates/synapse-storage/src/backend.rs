@@ -13394,7 +13394,7 @@ fn apply_calyx_gc_cap_eviction(
             soft_cap = budget.soft_cap,
             hard_cap = budget.hard_cap,
             reason = CALYX_GC_PROTECTED_CF_POLICY_SKIPPED,
-            "Calyx storage GC skipped cap eviction for protected operator-owned column family"
+            "Calyx storage GC skipped cap eviction for a policy-protected column family"
         );
         outcome.eviction_skipped_reason = Some(CALYX_GC_PROTECTED_CF_POLICY_SKIPPED);
         return Ok(outcome);
@@ -13940,7 +13940,14 @@ fn calyx_cf_protected_from_auto_delete(cf_name: &str) -> bool {
     // secondary-index rows all live here today. A generic LRU cap cannot know
     // which keys are rebuildable, so automatic Calyx GC must preserve the whole
     // family until each high-volume prefix has an explicit typed store.
-    matches!(cf_name, cf::CF_KV | cf::CF_ROUTINE_STATE)
+    // The agent-event journal and its spawn index are one logical append. A
+    // generic per-CF LRU decision cannot delete both atomically, so cap
+    // eviction is forbidden for both. Their identical row TTLs remain the
+    // logical expiry authority, and complete compaction reclaims expired bytes.
+    matches!(
+        cf_name,
+        cf::CF_KV | cf::CF_ROUTINE_STATE | cf::CF_AGENT_EVENTS | cf::CF_AGENT_EVENT_SPAWN_INDEX
+    )
 }
 
 fn calyx_put_row(

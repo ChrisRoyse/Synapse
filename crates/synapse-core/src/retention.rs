@@ -17,7 +17,7 @@ pub enum RetentionTtl {
 }
 
 /// PRD §4/§6 storage retention defaults.
-pub const DEFAULTS: [RetentionDefault; 19] = [
+pub const DEFAULTS: [RetentionDefault; 20] = [
     RetentionDefault {
         cf: "CF_EVENTS",
         ttl: RetentionTtl::Hours(24),
@@ -158,5 +158,14 @@ pub const DEFAULTS: [RetentionDefault; 19] = [
         ttl: RetentionTtl::Days(7),
         soft_cap_mb: 32,
         hard_cap_mb: 64,
+    },
+    // Exact spawn-scoped pointer index for the agent-event journal (#2140).
+    // It must expire at the same logical boundary as its source; placing this
+    // in non-expiring CF_KV would manufacture dangling index rows after day 30.
+    RetentionDefault {
+        cf: "CF_AGENT_EVENT_SPAWN_INDEX",
+        ttl: RetentionTtl::Days(30),
+        soft_cap_mb: 64,
+        hard_cap_mb: 128,
     },
 ];

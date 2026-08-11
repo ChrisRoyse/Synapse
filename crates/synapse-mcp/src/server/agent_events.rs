@@ -366,6 +366,13 @@ pub(crate) fn commit_agent_event_records_with_intents(
         }
     }
 
+    // #2140: the complete retained projection is reconciled before the next
+    // source mutation, and this guard remains held through atomic commit plus
+    // exact readback. No agent-event writer can race the backfill or publish a
+    // source row without its spawn-index row.
+    let mut spawn_index_guard = super::agent_event_spawn_index::lock_projection()?;
+    super::agent_event_spawn_index::ensure_projection_locked(db, &mut spawn_index_guard)?;
+
     for commit_attempt in 1..=MAX_COMMIT_ATTEMPTS {
         let mut journal_rows = Vec::with_capacity(records.len());
         let mut unique_keys = BTreeSet::new();
@@ -388,6 +395,19 @@ pub(crate) fn commit_agent_event_records_with_intents(
         if journal_rows.len() != records.len() {
             continue;
         }
+
+        let spawn_index_rows = journal_rows
+            .iter()
+            .zip(records)
+            .map(|((source_key, source_value), record)| {
+                super::agent_event_spawn_index::index_row_for_record(
+                    source_key,
+                    source_value,
+                    record,
+                )
+            })
+            .filter_map(Result::transpose)
+            .collect::<StorageResult<Vec<_>>>()?;
 
         let mut projection_rows = Vec::with_capacity(intents.len().saturating_mul(2));
         for intent in intents {
@@ -424,9 +444,17 @@ pub(crate) fn commit_agent_event_records_with_intents(
             ));
         }
 
-        let mut guards = Vec::with_capacity(journal_rows.len() + projection_rows.len());
+        let mut guards =
+            Vec::with_capacity(journal_rows.len() + spawn_index_rows.len() + projection_rows.len());
         for (key, _value) in &journal_rows {
             guards.push(CfRevisionGuard::new(cf::CF_AGENT_EVENTS, key.clone(), None));
+        }
+        for (key, _value) in &spawn_index_rows {
+            guards.push(CfRevisionGuard::new(
+                cf::CF_AGENT_EVENT_SPAWN_INDEX,
+                key.clone(),
+                None,
+            ));
         }
         for (key, _value, expected_revision) in &projection_rows {
             guards.push(CfRevisionGuard::new(
@@ -439,14 +467,14 @@ pub(crate) fn commit_agent_event_records_with_intents(
             .iter()
             .map(|(key, value, _expected)| (key.clone(), value.clone()))
             .collect::<Vec<_>>();
-        let batches = if kv_rows.is_empty() {
-            vec![(cf::CF_AGENT_EVENTS, journal_rows.clone())]
-        } else {
-            vec![
-                (cf::CF_AGENT_EVENTS, journal_rows.clone()),
-                (cf::CF_KV, kv_rows.clone()),
-            ]
-        };
+        let mut batches = Vec::with_capacity(3);
+        batches.push((cf::CF_AGENT_EVENTS, journal_rows.clone()));
+        if !spawn_index_rows.is_empty() {
+            batches.push((cf::CF_AGENT_EVENT_SPAWN_INDEX, spawn_index_rows.clone()));
+        }
+        if !kv_rows.is_empty() {
+            batches.push((cf::CF_KV, kv_rows.clone()));
+        }
         let outcome = match db.put_cf_batches_if_revisions_pressure_bypass(guards.clone(), batches)
         {
             Ok(outcome) => outcome,
@@ -455,6 +483,7 @@ pub(crate) fn commit_agent_event_records_with_intents(
                     db,
                     &guards,
                     &journal_rows,
+                    &spawn_index_rows,
                     &kv_rows,
                     &error,
                 )? {
@@ -465,7 +494,8 @@ pub(crate) fn commit_agent_event_records_with_intents(
                             committed_seq,
                             record_count = records.len(),
                             transition_cursor_count = intents.len(),
-                            projection_row_count = projection_rows.len(),
+                            spawn_index_row_count = spawn_index_rows.len(),
+                            transition_projection_row_count = projection_rows.len(),
                             original_error = %error,
                             "all atomic journal/projection rows physically matched after the backend returned an error; accepting the committed reality"
                         );
@@ -473,6 +503,7 @@ pub(crate) fn commit_agent_event_records_with_intents(
                             db,
                             records,
                             &journal_rows,
+                            &spawn_index_rows,
                             &kv_rows,
                             committed_seq,
                             &committed_revisions,
@@ -509,6 +540,7 @@ pub(crate) fn commit_agent_event_records_with_intents(
             db,
             records,
             &journal_rows,
+            &spawn_index_rows,
             &kv_rows,
             outcome.committed_seq,
             &outcome.committed_revisions_sha256,
@@ -535,11 +567,15 @@ fn exact_committed_event_batch(
     db: &Db,
     records: &[AgentEventRecord],
     journal_rows: &[(Vec<u8>, Vec<u8>)],
+    spawn_index_rows: &[(Vec<u8>, Vec<u8>)],
     cursor_rows: &[(Vec<u8>, Vec<u8>)],
     committed_seq: u64,
     committed_revisions: &[Option<[u8; 32]>],
 ) -> StorageResult<CommittedAgentEventBatch> {
-    let expected_guard_count = journal_rows.len().saturating_add(cursor_rows.len());
+    let expected_guard_count = journal_rows
+        .len()
+        .saturating_add(spawn_index_rows.len())
+        .saturating_add(cursor_rows.len());
     if committed_revisions.len() != expected_guard_count {
         return Err(StorageError::WriteFailed {
             cf_name: cf::CF_AGENT_EVENTS.to_owned(),
@@ -577,8 +613,25 @@ fn exact_committed_event_batch(
             value_len_bytes: expected_value.len(),
         });
     }
-    for (offset, (key, expected_value)) in cursor_rows.iter().enumerate() {
+    for (offset, (key, expected_value)) in spawn_index_rows.iter().enumerate() {
         let index = journal_rows.len() + offset;
+        let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENT_SPAWN_INDEX.to_owned(),
+            detail: format!(
+                "AGENT_EVENT_COMMIT_READBACK_INVALID: committed spawn-index put has no revision: index={index} committed_seq={committed_seq}"
+            ),
+        })?;
+        let _physical = exact_revisioned_row(
+            db,
+            cf::CF_AGENT_EVENT_SPAWN_INDEX,
+            key,
+            expected_value,
+            revision,
+            "agent-event spawn-index row",
+        )?;
+    }
+    for (offset, (key, expected_value)) in cursor_rows.iter().enumerate() {
+        let index = journal_rows.len() + spawn_index_rows.len() + offset;
         let revision = committed_revisions[index].ok_or_else(|| StorageError::WriteFailed {
             cf_name: cf::CF_KV.to_owned(),
             detail: format!(
@@ -646,6 +699,7 @@ fn reconcile_failed_atomic_event_commit(
     db: &Db,
     guards: &[CfRevisionGuard],
     journal_rows: &[(Vec<u8>, Vec<u8>)],
+    spawn_index_rows: &[(Vec<u8>, Vec<u8>)],
     cursor_rows: &[(Vec<u8>, Vec<u8>)],
     original_error: &StorageError,
 ) -> StorageResult<Option<ReconciledAtomicCommit>> {
@@ -654,6 +708,11 @@ fn reconcile_failed_atomic_event_commit(
     let planned = journal_rows
         .iter()
         .map(|(key, value)| (cf::CF_AGENT_EVENTS, key, value))
+        .chain(
+            spawn_index_rows
+                .iter()
+                .map(|(key, value)| (cf::CF_AGENT_EVENT_SPAWN_INDEX, key, value)),
+        )
         .chain(
             cursor_rows
                 .iter()
@@ -822,17 +881,10 @@ fn anchor_agent_event_outcomes(
     records: &[AgentEventRecord],
     source_rows: &[(Vec<u8>, Vec<u8>)],
 ) -> StorageResult<()> {
-    // #2117: the terminal rows of every spawn this batch touches, materialized
-    // by ONE pass over `CF_AGENT_EVENTS` instead of the two full passes per
-    // terminal record this loop used to run (`canonical_spawn_terminal_event`
-    // and `anchor_spawn_terminal_event_rows` walked the same family with the
-    // same predicate, 2·N times for N terminal records — 93,078 JSON decodes
-    // per record on the deployed 46,539-row family).
-    //
-    // Nothing inside this loop writes `CF_AGENT_EVENTS`: the constellation and
-    // anchor writes address other families, and the transcript finalizer never
-    // touches this family. The family is therefore immutable for the duration
-    // of the loop and one materialization is exactly as current as N of them.
+    // #2117 made one materialization feed the whole batch; #2140 makes that
+    // materialization seek each exact spawn prefix and verify only its pointed
+    // journal rows. The earlier full pass decoded 46,539 rows per batch on the
+    // deployed family even when the requested spawn owned one terminal row.
     //
     // A batch with no terminal record names no spawns and scans nothing at all.
     let terminal_spawns = records
@@ -897,8 +949,8 @@ pub(crate) fn anchor_spawn_end_state_from_storage(
     db: &Db,
     spawn_id: &str,
 ) -> StorageResult<Option<&'static str>> {
-    // #2117: one materialization feeds both the canonical decision and the
-    // anchor write, where this used to run two identical full scans.
+    // One verified spawn-prefix materialization feeds both the canonical
+    // decision and the anchor write.
     let terminal_rows =
         SpawnTerminalEventRows::materialize(db, &BTreeSet::from([spawn_id.to_owned()]))?;
     let Some(canonical) = canonical_spawn_terminal_event(&terminal_rows, spawn_id)? else {
@@ -929,13 +981,13 @@ struct SpawnTerminalEventRow {
     outcome: &'static str,
 }
 
-/// The terminal `CF_AGENT_EVENTS` rows of a named set of spawns, in scan order,
-/// materialized by a single pass over the family (#2117).
+/// The terminal `CF_AGENT_EVENTS` rows of a named set of spawns, in source-key
+/// order, materialized through the exact spawn index (#2117, #2140).
 ///
-/// Replaces "read every row, then keep the ones matching this spawn" — run
-/// twice per terminal record — with "read every row once, keep the ones
-/// matching any spawn in this batch". The retained row set for any one spawn is
-/// identical by construction: same source, same predicate, same order.
+/// Every index pointer is independently point-read and digest-verified against
+/// the journal before it reaches this type. An incomplete or divergent index
+/// fails closed; there is no whole-family fallback that could hide projection
+/// drift or restore the original `O(all retained events)` cost.
 struct SpawnTerminalEventRows {
     rows_scanned: usize,
     by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>>,
@@ -944,50 +996,42 @@ struct SpawnTerminalEventRows {
 impl SpawnTerminalEventRows {
     fn materialize(db: &Db, spawns: &BTreeSet<String>) -> StorageResult<Self> {
         let mut by_spawn: BTreeMap<String, Vec<SpawnTerminalEventRow>> = BTreeMap::new();
-        let mut rows_scanned = 0_usize;
         if spawns.is_empty() {
-            // Nothing to look for. The family is not read at all — the common
+            // Nothing to look for. The index is not read at all — the common
             // case on the write path, where most batches carry no terminal
-            // record and the old code also scanned nothing.
+            // record.
             return Ok(Self {
-                rows_scanned,
+                rows_scanned: 0,
                 by_spawn,
             });
         }
-        for (key, value) in db.scan_cf(cf::CF_AGENT_EVENTS)? {
-            rows_scanned = rows_scanned.saturating_add(1);
-            // Decoding every row is retained deliberately: the two scans this
-            // replaces both decoded every row and both failed the whole
-            // projection on any undecodable row anywhere in the family. Keeping
-            // that means a corrupt row still fails exactly as loudly as before.
-            let record: AgentEventRecord = decode_json(&value)?;
-            let Some(spawn_id) = nonblank_option(record.spawn_id.as_deref()) else {
-                continue;
-            };
-            if !spawns.contains(spawn_id) {
-                continue;
+        let indexed = super::agent_event_spawn_index::read_for_spawns(db, spawns)?;
+        let rows_scanned = indexed.rows_scanned;
+        for (spawn_id, rows) in indexed.by_spawn {
+            for row in rows {
+                let Some(outcome) = terminal_agent_outcome(&row.record) else {
+                    continue;
+                };
+                by_spawn
+                    .entry(spawn_id.clone())
+                    .or_default()
+                    .push(SpawnTerminalEventRow {
+                        key: row.source_key,
+                        value: row.source_value,
+                        record: row.record,
+                        outcome,
+                    });
             }
-            let Some(outcome) = terminal_agent_outcome(&record) else {
-                continue;
-            };
-            by_spawn
-                .entry(spawn_id.to_owned())
-                .or_default()
-                .push(SpawnTerminalEventRow {
-                    key,
-                    value,
-                    record,
-                    outcome,
-                });
         }
         tracing::debug!(
             code = "AGENT_END_STATE_TERMINAL_ROWS_MATERIALIZED",
             spawns_requested = spawns.len(),
             spawns_matched = by_spawn.len(),
-            rows_scanned,
+            index_rows_scanned = rows_scanned,
             terminal_rows = by_spawn.values().map(Vec::len).sum::<usize>(),
-            cf_name = cf::CF_AGENT_EVENTS,
-            "readback=one physical CF_AGENT_EVENTS pass shared by the canonical end-state decision and the terminal-row anchor write"
+            index_cf = cf::CF_AGENT_EVENT_SPAWN_INDEX,
+            source_cf = cf::CF_AGENT_EVENTS,
+            "readback=spawn-prefix index scan plus exact digest-verified CF_AGENT_EVENTS point reads shared by canonical end-state and anchor publication"
         );
         Ok(Self {
             rows_scanned,
@@ -1105,7 +1149,7 @@ fn anchor_spawn_terminal_event_rows(
         code = "AGENT_END_STATE_EVENT_ROWS_ANCHORED",
         spawn_id,
         event_rows = anchored,
-        rows_scanned = terminal_rows.rows_scanned,
+        index_rows_scanned = terminal_rows.rows_scanned,
         "terminal agent outcomes grounded on terminal spawn event constellations"
     );
     Ok(())

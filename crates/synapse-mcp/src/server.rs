@@ -210,6 +210,7 @@ mod action_preflight;
 pub(crate) mod agent_control;
 pub(crate) mod agent_cost;
 pub(crate) mod agent_event_ingress;
+pub(crate) mod agent_event_spawn_index;
 pub(crate) mod agent_events;
 mod agent_facades;
 mod agent_mailbox;

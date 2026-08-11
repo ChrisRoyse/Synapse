@@ -54,7 +54,25 @@ const MAX_PROBE_VALUE_BYTES: u32 = 65_536;
 const MAX_KEY_PREFIX_BYTES: usize = 128;
 const MAX_ROW_CAP: u64 = 1_000_000;
 const MAX_INSPECT_SAMPLE_ROWS_PER_CF: usize = 3;
-const PROBE_WRITABLE_CFS: [&str; cf::ALL_COLUMN_FAMILIES.len()] = cf::ALL_COLUMN_FAMILIES;
+// Raw diagnostic writes must never bypass a source/projection transaction.
+// Those families have typed writers and exact repair paths; admitting arbitrary
+// probe bytes would make their "one writer" invariant false by construction.
+const PROBE_WRITABLE_CFS: [&str; 14] = [
+    cf::CF_EVENTS,
+    cf::CF_OBSERVATIONS,
+    cf::CF_PROFILES,
+    cf::CF_MODEL_CACHE,
+    cf::CF_SESSIONS,
+    cf::CF_OCR_CACHE,
+    cf::CF_TELEMETRY,
+    cf::CF_ACTION_LOG,
+    cf::CF_PROCESS_HISTORY,
+    cf::CF_KV,
+    cf::CF_TIMELINE,
+    cf::CF_EPISODES,
+    cf::CF_ROUTINES,
+    cf::CF_ROUTINE_STATE,
+];
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectParams {}
@@ -5450,7 +5468,7 @@ pub fn run_storage_gc_once(
         });
     }
     reject_audit_retention_fields(params)?;
-    let cf_name = probe_writable_cf(&params.cf_name)?;
+    let cf_name = known_gc_cf(&params.cf_name)?;
     let report = db
         .run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -6073,6 +6091,22 @@ fn probe_writable_cf(raw: &str) -> Result<&'static str, ErrorData> {
                 format!(
                     "storage diagnostic writes support only {}; got {trimmed:?}",
                     PROBE_WRITABLE_CFS.join(", ")
+                ),
+            )
+        })
+}
+
+fn known_gc_cf(raw: &str) -> Result<&'static str, ErrorData> {
+    let trimmed = raw.trim();
+    cf::ALL_COLUMN_FAMILIES
+        .into_iter()
+        .find(|name| *name == trimmed)
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "storage GC requires one exact declared column family ({}); got {trimmed:?}",
+                    cf::ALL_COLUMN_FAMILIES.join(", ")
                 ),
             )
         })
