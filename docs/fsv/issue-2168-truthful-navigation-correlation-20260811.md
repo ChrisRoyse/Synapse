@@ -2,7 +2,7 @@
 
 Date: 2026-08-11 (America/Chicago)  
 Implementation commit: `a83c566faedaf39ad3005594f203a2728039c290` on `main`  
-Acceptance comment: pending
+Acceptance comment: https://github.com/ChrisRoyse/Synapse/issues/2168#issuecomment-5251143665
 
 ## Source of Truth
 
