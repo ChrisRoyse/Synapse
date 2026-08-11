@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
@@ -8495,7 +8496,10 @@ fn inspect_calyx_vault_with_schema(
         "<calyx-vault>",
         "calyx_vault_inspect",
         &prefix_range(&[CALYX_KV_DISC]),
-        |full_key, stored_value| census.add_row(full_key, stored_value, inspected_at_unix_ms),
+        |full_key, stored_value| {
+            census.add_row(full_key, stored_value, inspected_at_unix_ms)?;
+            Ok(ControlFlow::Continue(()))
+        },
     )?;
     let CalyxVaultCensus {
         collections,
@@ -10437,6 +10441,7 @@ struct CalyxKvSweep {
     rows_visited: usize,
     snapshot_seq_first: u64,
     snapshot_seq_last: u64,
+    stopped_early: bool,
 }
 
 impl CalyxKvSweep {
@@ -10455,6 +10460,7 @@ impl CalyxKvSweep {
         self.pages = self.pages.saturating_add(other.pages);
         self.rows_examined = self.rows_examined.saturating_add(other.rows_examined);
         self.rows_visited = self.rows_visited.saturating_add(other.rows_visited);
+        self.stopped_early |= other.stopped_early;
     }
 }
 
@@ -10478,9 +10484,11 @@ impl CalyxKvSweep {
 ///
 /// # Errors
 ///
-/// Fails closed when a page reports more candidates without a resume cursor, or
-/// returns a cursor that does not advance — both would re-read the same page
-/// forever — and propagates the visitor's own error verbatim.
+/// Fails closed when a page that must be continued reports more candidates
+/// without a resume cursor, or returns a cursor that does not advance — both
+/// would re-read the same page forever. The visitor may return
+/// [`ControlFlow::Break`] after consuming a row to stop without reading another
+/// page; its own errors are propagated verbatim.
 fn sweep_kv_range_pages<V>(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
@@ -10489,12 +10497,12 @@ fn sweep_kv_range_pages<V>(
     mut visit: V,
 ) -> StorageResult<CalyxKvSweep>
 where
-    V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
+    V: FnMut(&[u8], &[u8]) -> StorageResult<ControlFlow<()>>,
 {
     let started = Instant::now();
     let mut cursor: Option<Vec<u8>> = None;
     let mut sweep = CalyxKvSweep::default();
-    loop {
+    'pages: loop {
         let page = vault
             .scan_kv_range_page_latest(range, cursor.as_deref(), CALYX_INSPECT_SWEEP_PAGE_ROWS)
             .map_err(|source| {
@@ -10512,7 +10520,10 @@ where
         sweep.rows_examined = sweep.rows_examined.saturating_add(page.examined_rows);
         for (key, value) in &page.rows {
             sweep.rows_visited = sweep.rows_visited.saturating_add(1);
-            visit(key, value)?;
+            if visit(key, value)?.is_break() {
+                sweep.stopped_early = true;
+                break 'pages;
+            }
         }
         if !page.more {
             break;
@@ -10552,6 +10563,7 @@ where
         snapshot_seq_first = sweep.snapshot_seq_first,
         snapshot_seq_last = sweep.snapshot_seq_last,
         atomic = sweep.atomic(),
+        stopped_early = sweep.stopped_early,
         "folded an ordered Calyx KV range page by page, releasing the row-table read guard between pages"
     );
     Ok(sweep)
@@ -10595,14 +10607,17 @@ fn sweep_calyx_namespace_rows<V>(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
     site: &'static str,
-    visit: V,
+    mut visit: V,
 ) -> StorageResult<CalyxKvSweep>
 where
     V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
 {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
-    sweep_calyx_range_rows(vault, cf_name, site, &range, visit)
+    sweep_calyx_range_rows(vault, cf_name, site, &range, |key, payload, expired| {
+        visit(key, payload, expired)?;
+        Ok(ControlFlow::Continue(()))
+    })
 }
 
 /// [`sweep_calyx_namespace_rows`] over an arbitrary ordered sub-range of one
@@ -10620,7 +10635,7 @@ fn sweep_calyx_range_rows<V>(
     mut visit: V,
 ) -> StorageResult<CalyxKvSweep>
 where
-    V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
+    V: FnMut(&[u8], &[u8], bool) -> StorageResult<ControlFlow<()>>,
 {
     let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
     let now_ms = vault
@@ -10656,9 +10671,9 @@ where
                     .to_owned(),
             });
         }
-        visit(&user_key, envelope.payload, expired)?;
+        let control = visit(&user_key, envelope.payload, expired)?;
         previous = Some(user_key);
-        Ok(())
+        Ok(control)
     })
 }
 
@@ -10794,7 +10809,7 @@ fn read_rows_from_vault_range_filtered(
             if include_expired || !expired {
                 decoded.push((user_key.to_vec(), payload.to_vec()));
             }
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         },
     )?;
     if !sweep.atomic() {
@@ -10961,36 +10976,39 @@ fn read_fixed_width_rows_from_vault_range(
         start: encode_calyx_key_for_read(cf_name, collection_id, start_key)?,
         end: Some(encode_calyx_key_for_read(cf_name, collection_id, end_key)?),
     };
-    let rows = vault
-        .scan_kv_range_latest(&range)
-        .map_err(|source| calyx_read_failed(cf_name, "scan Calyx KV fixed-key range", &source))?;
-    let now_ms = vault
-        .clock_now_ms()
-        .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
-    let mut decoded = Vec::with_capacity(rows.len().min(max_rows));
+    let mut decoded = Vec::with_capacity(max_rows.min(CALYX_INSPECT_SWEEP_PAGE_ROWS));
     let mut more = false;
-    for (key, value) in rows {
-        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &key)?;
-        let envelope = decode_calyx_value_raw(&value).map_err(|detail| {
-            tracing::error!(
-                code = error_codes::STORAGE_READ_FAILED,
-                cf = cf_name,
-                detail,
-                "Calyx storage backend rejected malformed KV retention envelope during bounded range scan"
-            );
-            StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail,
+    let sweep = sweep_calyx_range_rows(
+        vault,
+        cf_name,
+        "calyx_fixed_width_range_read",
+        &range,
+        |user_key, payload, expired| {
+            if expired {
+                return Ok(ControlFlow::Continue(()));
             }
-        })?;
-        if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-            continue;
-        }
-        if decoded.len() == max_rows {
-            more = true;
-            break;
-        }
-        decoded.push((user_key, envelope.payload.to_vec()));
+            if decoded.len() == max_rows {
+                more = true;
+                return Ok(ControlFlow::Break(()));
+            }
+            decoded.push((user_key.to_vec(), payload.to_vec()));
+            Ok(ControlFlow::Continue(()))
+        },
+    )?;
+    if !sweep.atomic() {
+        tracing::debug!(
+            code = "STORAGE_CALYX_FIXED_WIDTH_RANGE_READ_INTERVAL",
+            cf = cf_name,
+            site = "calyx_fixed_width_range_read",
+            pages = sweep.pages,
+            rows_visited = sweep.rows_visited,
+            snapshot_seq_first = sweep.snapshot_seq_first,
+            snapshot_seq_last = sweep.snapshot_seq_last,
+            stopped_early = sweep.stopped_early,
+            max_rows,
+            more,
+            "fixed-width Calyx range read spanned more than one committed sequence; rows are individually current and the set is a bounded interval"
+        );
     }
     Ok((decoded, more))
 }
@@ -13613,7 +13631,7 @@ fn collect_calyx_retention_state(
             let referenced_by_derived = referenced.is_some_and(|keys| keys.contains(&user_key));
             if referenced_by_derived {
                 state.retained_referenced_rows = state.retained_referenced_rows.saturating_add(1);
-                return Ok(());
+                return Ok(ControlFlow::Continue(()));
             }
             if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
                 if !protected {
@@ -13622,7 +13640,7 @@ fn collect_calyx_retention_state(
                         value_digest: calyx_gc_row_digest(value),
                     });
                 }
-                return Ok(());
+                return Ok(ControlFlow::Continue(()));
             }
             let live_bytes = calyx_live_row_bytes(cf_name, &user_key, envelope.payload)?;
             state.before_live_bytes =
@@ -13642,7 +13660,7 @@ fn collect_calyx_retention_state(
                 written_at_ms: envelope.written_at_ms,
                 value_digest: calyx_gc_row_digest(value),
             });
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         },
     )?;
     state.sweep = sweep;
