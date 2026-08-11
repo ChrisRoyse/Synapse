@@ -24,8 +24,8 @@ pub use blind_spot::{
 };
 pub use cross_term::{
     AgreementOutcome, CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag,
-    ZeroNormSide, agreement_batch_cpu, agreement_batch_gpu, agreement_scalar,
-    agreement_scalar_classified, agreement_weight, concat_vec, delta_vec, interaction_vec,
+    ZeroNormSide, agreement_scalar, agreement_scalar_classified, agreement_weight, concat_vec,
+    delta_vec, interaction_vec,
 };
 pub use error::{
     CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_FORGE_UNAVAILABLE, CALYX_LOOM_NON_FINITE_VECTOR,

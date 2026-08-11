@@ -53,7 +53,9 @@ pub fn loom_error(code: &'static str, message: impl Into<String>) -> CalyxError 
         CALYX_LOOM_UNCALIBRATED_BLINDSPOT => {
             "collect enough per-lens-pair blind-spot calibration samples"
         }
-        CALYX_LOOM_FORGE_UNAVAILABLE => "enable Loom's cuda feature and verify Forge CUDA first",
+        CALYX_LOOM_FORGE_UNAVAILABLE => {
+            "repair the selected Forge backend, its device runtime, or its explicit dispatch budget; Loom never retries on another backend"
+        }
         CALYX_LOOM_SERIES_READ_ERROR => "repair the recurrence series before temporal xterm reads",
         CALYX_LOOM_TEMPORAL_XTERM_CORRUPT => {
             "rewrite the temporal_xterm row from recurrence series"

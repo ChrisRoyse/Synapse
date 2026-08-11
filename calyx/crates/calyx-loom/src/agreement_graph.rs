@@ -1,22 +1,23 @@
 //! In-memory xterm CF and agreement graph readbacks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
 use calyx_core::{CalyxError, CxId, PanelSlotId, Result, SlotId};
+use calyx_forge::Backend;
 use serde::{Deserialize, Serialize};
 
 use crate::cross_term::{
     AgreementOutcome, CrossTermKey, CrossTermKind, CrossTermValue, SignalProvenanceTag,
-    ZeroNormSide, agreement_scalar, agreement_scalar_classified, agreement_weight, canonical_pair,
-    concat_vec, delta_vec, interaction_vec,
+    ZeroNormSide, agreement_batch_prevalidated, agreement_scalar, agreement_scalar_classified,
+    agreement_weight, canonical_pair, concat_vec, delta_vec, ensure_same_dim, interaction_vec,
 };
 use crate::error::{
-    CALYX_LOOM_PANEL_SCOPE_REQUIRED, CALYX_LOOM_SLOT_MISSING, CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
-    loom_error,
+    CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_PANEL_SCOPE_REQUIRED, CALYX_LOOM_SLOT_MISSING,
+    CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED, loom_error,
 };
 use crate::lru_cache::LruCache;
-use crate::materialization::{MaterializationAction, MaterializationPlan};
+use crate::materialization::{MaterializationAction, MaterializationEntry, MaterializationPlan};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct XtermRow {
@@ -62,6 +63,12 @@ pub struct LoomStore {
     cache: LruCache<CrossTermKey, CrossTermValue>,
     zero_norm_skips: Vec<ZeroNormAgreementSkip>,
     zero_norm_skip_total: usize,
+}
+
+struct PendingAgreement<'a> {
+    key: CrossTermKey,
+    left: &'a [f32],
+    right: &'a [f32],
 }
 
 impl LoomStore {
@@ -112,59 +119,56 @@ impl LoomStore {
 
     pub fn weave(
         &mut self,
+        backend: &dyn Backend,
         panel_version: u32,
         cx: CxId,
         slots: &BTreeMap<SlotId, Vec<f32>>,
     ) -> Result<usize> {
-        let mut inserted = 0;
-        for slot in slots.keys() {
-            self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
-        }
         let ids: Vec<_> = slots.keys().copied().collect();
+        let slot_count = ids.len();
+        let pair_count = if slot_count.is_multiple_of(2) {
+            (slot_count / 2).checked_mul(slot_count.saturating_sub(1))
+        } else {
+            slot_count.checked_mul(slot_count.saturating_sub(1) / 2)
+        }
+        .ok_or_else(|| {
+            loom_error(
+                CALYX_LOOM_DIM_MISMATCH,
+                "Loom agreement pair count overflows usize",
+            )
+        })?;
+        let mut entries = Vec::with_capacity(pair_count);
         for i in 0..ids.len() {
             for j in i + 1..ids.len() {
-                let a = ids[i];
-                let b = ids[j];
-                let key = CrossTermKey {
-                    cx_id: cx,
-                    a: PanelSlotId::new(panel_version, a),
-                    b: PanelSlotId::new(panel_version, b),
+                entries.push(MaterializationEntry {
+                    a: ids[i],
+                    b: ids[j],
                     kind: CrossTermKind::Agreement,
-                };
-                let value = match agreement_scalar_classified(&slots[&a], &slots[&b])? {
-                    AgreementOutcome::Scored(value) => value,
-                    AgreementOutcome::ZeroNorm(zero_side) => {
-                        self.record_zero_norm_skip(ZeroNormAgreementSkip {
-                            cx_id: cx,
-                            a: key.a,
-                            b: key.b,
-                            zero_side,
-                        });
-                        continue;
-                    }
-                };
-                self.xterm_cf.insert(
-                    key,
-                    XtermRow {
-                        key,
-                        value: CrossTermValue::Scalar(value),
-                        tag: SignalProvenanceTag::Derived,
-                    },
-                );
-                inserted += 1;
+                    action: MaterializationAction::EagerStore,
+                });
             }
         }
-        Ok(inserted)
+        self.materialize_plan(
+            backend,
+            panel_version,
+            cx,
+            slots,
+            &MaterializationPlan { entries },
+        )
     }
 
     pub fn materialize_plan(
         &mut self,
+        backend: &dyn Backend,
         panel_version: u32,
         cx: CxId,
         slots: &BTreeMap<SlotId, Vec<f32>>,
         plan: &MaterializationPlan,
     ) -> Result<usize> {
         let mut inserted = 0;
+        let mut zero_norm_by_slot = BTreeMap::<SlotId, bool>::new();
+        let mut queued_agreement_keys = BTreeSet::<CrossTermKey>::new();
+        let mut agreement_by_dim = BTreeMap::<usize, Vec<PendingAgreement<'_>>>::new();
         for slot in slots.keys() {
             self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
         }
@@ -183,13 +187,19 @@ impl LoomStore {
             if self.xterm_cf.contains_key(&key) {
                 continue;
             }
-            // #2076: a zero-norm operand is a valid measurement with no
-            // direction, not a write failure. Skip the one pair it makes
-            // undefined, name it, and let the rest of the record — and the rest
-            // of the corpus — weave.
-            let value = match compute_cross_term_classified(a, b, entry.kind, slots)? {
-                CrossTermOutcome::Value(value) => value,
-                CrossTermOutcome::ZeroNormAgreement(zero_side) => {
+            if entry.kind == CrossTermKind::Agreement {
+                let (left, right) = slot_pair(a, b, slots)?;
+                ensure_same_dim(left, right)?;
+                let left_zero = agreement_operand_zero_norm(a, slots, &mut zero_norm_by_slot)?;
+                let right_zero = agreement_operand_zero_norm(b, slots, &mut zero_norm_by_slot)?;
+                let zero_side = if left_zero {
+                    Some(ZeroNormSide::A)
+                } else if right_zero {
+                    Some(ZeroNormSide::B)
+                } else {
+                    None
+                };
+                if let Some(zero_side) = zero_side {
                     self.record_zero_norm_skip(ZeroNormAgreementSkip {
                         cx_id: cx,
                         a: key.a,
@@ -198,7 +208,16 @@ impl LoomStore {
                     });
                     continue;
                 }
-            };
+                if !queued_agreement_keys.insert(key) {
+                    continue;
+                }
+                agreement_by_dim
+                    .entry(left.len())
+                    .or_default()
+                    .push(PendingAgreement { key, left, right });
+                continue;
+            }
+            let value = compute_cross_term(a, b, entry.kind, slots)?;
             self.xterm_cf.insert(
                 key,
                 XtermRow {
@@ -208,6 +227,37 @@ impl LoomStore {
                 },
             );
             inserted += 1;
+        }
+
+        for (dim, pending) in agreement_by_dim {
+            let pair_count = pending.len();
+            let row_values = pair_count.checked_mul(dim).ok_or_else(|| {
+                loom_error(
+                    CALYX_LOOM_DIM_MISMATCH,
+                    format!(
+                        "Loom agreement batch shape overflows usize: pairs={pair_count} dim={dim}"
+                    ),
+                )
+            })?;
+            let mut left_rows = Vec::with_capacity(row_values);
+            let mut right_rows = Vec::with_capacity(row_values);
+            for pair in &pending {
+                left_rows.extend_from_slice(pair.left);
+                right_rows.extend_from_slice(pair.right);
+            }
+            let scores =
+                agreement_batch_prevalidated(backend, &left_rows, &right_rows, pair_count, dim)?;
+            for (pair, value) in pending.into_iter().zip(scores) {
+                self.xterm_cf.insert(
+                    pair.key,
+                    XtermRow {
+                        key: pair.key,
+                        value: CrossTermValue::Scalar(value),
+                        tag: SignalProvenanceTag::Derived,
+                    },
+                );
+                inserted += 1;
+            }
         }
         Ok(inserted)
     }
@@ -360,39 +410,32 @@ fn compute_cross_term(
     }
 }
 
-/// A materialized cross-term, or the reason there is none to materialize.
-enum CrossTermOutcome {
-    Value(CrossTermValue),
-    /// Agreement only: one operand is a directionless exact measurement.
-    /// `Delta`, `Interaction` and `Concat` are all defined at zero and are
-    /// never reported here.
-    ZeroNormAgreement(ZeroNormSide),
-}
-
-fn compute_cross_term_classified(
-    a: SlotId,
-    b: SlotId,
-    kind: CrossTermKind,
+fn agreement_operand_zero_norm(
+    slot: SlotId,
     slots: &BTreeMap<SlotId, Vec<f32>>,
-) -> Result<CrossTermOutcome> {
-    let (left, right) = slot_pair(a, b, slots)?;
-    match kind {
-        CrossTermKind::Agreement => match agreement_scalar_classified(left, right)? {
-            AgreementOutcome::Scored(value) => {
-                Ok(CrossTermOutcome::Value(CrossTermValue::Scalar(value)))
-            }
-            AgreementOutcome::ZeroNorm(side) => Ok(CrossTermOutcome::ZeroNormAgreement(side)),
-        },
-        CrossTermKind::Delta => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(delta_vec(
-            left, right,
-        )?))),
-        CrossTermKind::Interaction => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(
-            interaction_vec(left, right)?,
-        ))),
-        CrossTermKind::Concat => Ok(CrossTermOutcome::Value(CrossTermValue::Vector(concat_vec(
-            left, right,
-        )?))),
+    classified: &mut BTreeMap<SlotId, bool>,
+) -> Result<bool> {
+    if let Some(zero_norm) = classified.get(&slot) {
+        return Ok(*zero_norm);
     }
+    let values = slots.get(&slot).ok_or_else(|| {
+        loom_error(
+            CALYX_LOOM_SLOT_MISSING,
+            format!("slot {} missing", slot.get()),
+        )
+    })?;
+    let outcome = agreement_scalar_classified(values, values).map_err(|error| CalyxError {
+        code: error.code,
+        message: format!(
+            "agreement operand slot {} failed one-time preclassification: {}",
+            slot.get(),
+            error.message
+        ),
+        remediation: error.remediation,
+    })?;
+    let zero_norm = matches!(outcome, AgreementOutcome::ZeroNorm(_));
+    classified.insert(slot, zero_norm);
+    Ok(zero_norm)
 }
 
 fn slot_pair(a: SlotId, b: SlotId, slots: &BTreeMap<SlotId, Vec<f32>>) -> Result<(&[f32], &[f32])> {

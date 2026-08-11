@@ -389,6 +389,7 @@ impl SynapseCalyxVault {
         let mut agreement_zero_norm_records = 0usize;
         let mut lens_ids: BTreeSet<SlotId> = BTreeSet::new();
         let mut measured_slot_instances = 0usize;
+        let backend = self.math_runtime.backend();
         for record in &corpus.records {
             for slot in record.slots.keys() {
                 lens_ids.insert(*slot);
@@ -416,7 +417,13 @@ impl SynapseCalyxVault {
             }
             let skips_before = store.zero_norm_agreement_skip_total();
             store
-                .materialize_plan(params.panel_version, record.cx_id, &record.slots, &plan)
+                .materialize_plan(
+                    backend,
+                    params.panel_version,
+                    record.cx_id,
+                    &record.slots,
+                    &plan,
+                )
                 .map_err(|error| {
                     loom_math_error("materialize within-record cross-terms", &error)
                 })?;

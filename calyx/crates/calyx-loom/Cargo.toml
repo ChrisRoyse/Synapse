@@ -9,6 +9,8 @@ publish.workspace = true
 
 [features]
 default = []
+# Workspace CUDA compile gate. Runtime backend ownership remains with the
+# caller; enabling this never makes Loom construct a private CUDA context.
 cuda = ["calyx-forge/cuda"]
 
 [dependencies]
@@ -16,7 +18,8 @@ calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
 # Not optional: `agreement_scalar` routes its reduction at the shared
 # runtime-dispatched CPU kernel rather than hand-rolling a fifth scalar cosine
-# loop (#1917). The CUDA backend stays feature-gated behind `cuda`.
+# loop (#1917). GPU policy and the initialized backend are injected by the
+# owning runtime; Loom never constructs a parallel CUDA context.
 calyx-forge = { workspace = true }
 calyx-ledger = { workspace = true }
 calyx-ward = { workspace = true }

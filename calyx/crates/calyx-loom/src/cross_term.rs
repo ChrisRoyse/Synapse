@@ -1,12 +1,12 @@
 //! Cross-term value types and CPU/GPU-parity math kernels.
 
-use calyx_core::{CxId, PanelSlotId, Result, SlotId};
+use calyx_core::{CalyxError, CxId, PanelSlotId, Result, SlotId};
+use calyx_forge::Backend;
 use calyx_forge::cpu::distance::{CosineFailure, CosineSide, cosine};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{
-    CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_FORGE_UNAVAILABLE, CALYX_LOOM_NON_FINITE_VECTOR,
-    CALYX_LOOM_ZERO_NORM_VECTOR, loom_error,
+    CALYX_LOOM_DIM_MISMATCH, CALYX_LOOM_NON_FINITE_VECTOR, CALYX_LOOM_ZERO_NORM_VECTOR, loom_error,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -220,25 +220,54 @@ pub fn agreement_weight(raw_cosine: f32) -> Result<f32> {
     Ok(raw_cosine.clamp(0.0, 1.0))
 }
 
-pub fn agreement_batch_cpu(pairs: &[(&[f32], &[f32])]) -> Result<Vec<f32>> {
-    pairs.iter().map(|(a, b)| agreement_scalar(a, b)).collect()
-}
-
-pub fn agreement_batch_gpu(pairs: &[(&[f32], &[f32])]) -> Result<Vec<f32>> {
-    if pairs.is_empty() {
-        return Ok(Vec::new());
+/// Dispatches already-validated, row-major agreement slabs and enforces Loom's
+/// scalar cosine range contract on the backend output.
+pub(crate) fn agreement_batch_prevalidated(
+    backend: &dyn Backend,
+    left_rows: &[f32],
+    right_rows: &[f32],
+    pair_count: usize,
+    dim: usize,
+) -> Result<Vec<f32>> {
+    let expected = pair_count.checked_mul(dim).ok_or_else(|| {
+        loom_error(
+            CALYX_LOOM_DIM_MISMATCH,
+            format!("agreement batch shape overflows usize: pairs={pair_count} dim={dim}"),
+        )
+    })?;
+    if left_rows.len() != expected || right_rows.len() != expected {
+        return Err(loom_error(
+            CALYX_LOOM_DIM_MISMATCH,
+            format!(
+                "agreement batch slabs do not match pairs*dim={expected}: left={} right={}",
+                left_rows.len(),
+                right_rows.len()
+            ),
+        ));
     }
-    #[cfg(feature = "cuda")]
-    {
-        agreement_batch_cuda(pairs)
+    let mut out = vec![0.0_f32; pair_count];
+    let backend_kind = backend.device_info().kind;
+    backend
+        .paired_cosine(left_rows, right_rows, pair_count, dim, &mut out)
+        .map_err(|error| CalyxError {
+            code: error.code(),
+            message: format!(
+                "selected {backend_kind} Forge backend failed Loom paired cosine: {error}"
+            ),
+            remediation: "repair the selected Forge backend, its device runtime, input contract, or explicit dispatch budget; Loom never retries on another backend",
+        })?;
+    for (pair_idx, score) in out.iter_mut().enumerate() {
+        *score = calyx_core::clamp_cosine_quotient(*score).ok_or_else(|| {
+            loom_error(
+                CALYX_LOOM_NON_FINITE_VECTOR,
+                format!(
+                    "agreement batch pair {pair_idx} produced cosine {}, further outside [-1,1] than f32 rounding explains; this is a defect in the inputs or selected backend reduction",
+                    *score
+                ),
+            )
+        })?;
     }
-    #[cfg(not(feature = "cuda"))]
-    {
-        Err(loom_error(
-            CALYX_LOOM_FORGE_UNAVAILABLE,
-            "agreement_batch_gpu requires calyx-loom feature cuda",
-        ))
-    }
+    Ok(out)
 }
 
 pub fn delta_vec(a: &[f32], b: &[f32]) -> Result<Vec<f32>> {
@@ -266,7 +295,7 @@ fn ensure_same_dim_finite(a: &[f32], b: &[f32]) -> Result<()> {
 /// The half of [`ensure_same_dim_finite`] that cannot be fused into a
 /// reduction, split out so `agreement_scalar` can keep it without paying for
 /// the finiteness pass the reduction already detects (#1917).
-fn ensure_same_dim(a: &[f32], b: &[f32]) -> Result<()> {
+pub(crate) fn ensure_same_dim(a: &[f32], b: &[f32]) -> Result<()> {
     if a.len() != b.len() || a.is_empty() {
         return Err(loom_error(
             CALYX_LOOM_DIM_MISMATCH,
@@ -284,53 +313,4 @@ fn ensure_finite(values: &[f32]) -> Result<()> {
         CALYX_LOOM_NON_FINITE_VECTOR,
         "xterm vector contains NaN or infinity",
     ))
-}
-
-#[cfg(feature = "cuda")]
-fn agreement_batch_cuda(pairs: &[(&[f32], &[f32])]) -> Result<Vec<f32>> {
-    use calyx_forge::{Backend, CudaBackend};
-
-    let backend = CudaBackend::new().map_err(|err| {
-        loom_error(
-            CALYX_LOOM_FORGE_UNAVAILABLE,
-            format!("Forge CUDA backend unavailable for Loom agreement: {err}"),
-        )
-    })?;
-    let dim = pairs[0].0.len();
-    let row_values = pairs.len().checked_mul(dim).ok_or_else(|| {
-        loom_error(
-            CALYX_LOOM_DIM_MISMATCH,
-            format!(
-                "agreement_batch_gpu shape overflows usize: pairs={} dim={dim}",
-                pairs.len()
-            ),
-        )
-    })?;
-    let mut left_rows = Vec::with_capacity(row_values);
-    let mut right_rows = Vec::with_capacity(row_values);
-    for (pair_idx, (left, right)) in pairs.iter().enumerate() {
-        ensure_same_dim_finite(left, right)?;
-        if left.len() != dim {
-            return Err(loom_error(
-                CALYX_LOOM_DIM_MISMATCH,
-                format!(
-                    "agreement_batch_gpu requires one dim per batch; pair {pair_idx} has dim {}, first pair dim {dim}",
-                    left.len()
-                ),
-            ));
-        }
-        left_rows.extend_from_slice(left);
-        right_rows.extend_from_slice(right);
-    }
-
-    let mut out = vec![0.0_f32; pairs.len()];
-    backend
-        .paired_cosine(&left_rows, &right_rows, pairs.len(), dim, &mut out)
-        .map_err(|err| {
-            loom_error(
-                CALYX_LOOM_FORGE_UNAVAILABLE,
-                format!("Forge CUDA paired cosine failed for Loom agreement: {err}"),
-            )
-        })?;
-    Ok(out)
 }

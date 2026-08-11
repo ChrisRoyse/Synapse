@@ -7,7 +7,7 @@ Date: 2026-07-16
 Issue #1695 examined the PRD-listed Forge ops that Synapse will rely on during the Calyx integration. The root problem was not a blanket lack of CUDA. Forge already had working CUDA distance/top-k/KSG primitives, but two production-facing capabilities were not first-class backend operations:
 
 - exact KNN was assembled ad hoc from lower-level distance/top-k calls, so callers could not audit backend support directly;
-- Loom `agreement_batch_gpu` launched one CUDA cosine call per pair, making the GPU path much slower than CPU at real batch sizes.
+- Loom's original `agreement_batch_gpu` constructed a private CUDA backend and was never called by the live weave. The live materialization path now receives the owning vault's selected backend, groups scoreable agreement pairs by dimension, and issues one admitted `Backend::paired_cosine` dispatch per group.
 
 ## Source Sizing
 
