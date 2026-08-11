@@ -36,7 +36,9 @@ pub use budget::{
     VRAM_BUDGET_REMEDIATION, VramBudgeter, VramGuard,
 };
 #[cfg(feature = "cuda")]
-pub use budgeted_backend::VramBudgetedCudaBackend;
+pub use budgeted_backend::{
+    CudaDispatchOperationSnapshot, CudaDispatchTelemetrySnapshot, VramBudgetedCudaBackend,
+};
 pub use host_reservation::{
     DEFAULT_HOST_CAP_MIB, DEFAULT_HOST_HEADROOM_MIB, DEFAULT_REQUIRED_FREE_MIB, HOST_CAP_MIB_ENV,
     HOST_RESERVATION_ROOT_ENV, HostCudaDeviceVerdict, HostGpuReservation,

@@ -3,9 +3,10 @@
 //! mutate a device output.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::vram::{
     CudaVramProbe, HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore,
@@ -17,6 +18,89 @@ const F32_BYTES: usize = size_of::<f32>();
 const I32_BYTES: usize = size_of::<i32>();
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const DISPATCH_REMEDIATION: &str = "reduce the exact input/batch dimensions or raise the explicit Forge VRAM budget only after measuring the operation; never bypass admission or move the dispatch to CPU implicitly";
+const DISPATCH_OPERATIONS: [&str; 8] = [
+    "gemm",
+    "cosine",
+    "dot",
+    "l2",
+    "normalize",
+    "topk",
+    "knn",
+    "paired_cosine",
+];
+
+/// Process-local CUDA dispatch telemetry since the serving epoch began.
+///
+/// The startup probes are deliberately removed from this epoch by Synapse after
+/// they pass. Unlike the host reservation ledger, these counters describe this
+/// backend instance, preserve the exact Forge operation, and classify the final
+/// result only after the host reservation release has been read back.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CudaDispatchTelemetrySnapshot {
+    pub epoch_started_unix_ms: u64,
+    pub sampled_at_unix_ms: u64,
+    pub operations: Vec<CudaDispatchOperationSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
+pub struct CudaDispatchOperationSnapshot {
+    pub operation: String,
+    pub attempted_total: u64,
+    pub in_flight: u64,
+    pub succeeded_total: u64,
+    pub refused_total: u64,
+    pub failed_total: u64,
+    pub attempted_measured_bytes_total: u64,
+    pub in_flight_measured_bytes: u64,
+    pub succeeded_measured_bytes_total: u64,
+    pub refused_measured_bytes_total: u64,
+    pub failed_measured_bytes_total: u64,
+    pub last_attempt_unix_ms: Option<u64>,
+    pub last_success_unix_ms: Option<u64>,
+    pub last_error_unix_ms: Option<u64>,
+    pub last_error_code: Option<String>,
+}
+
+#[derive(Debug)]
+struct DispatchTelemetry {
+    epoch_started_unix_ms: u64,
+    serving_epoch_started: bool,
+    operations: [DispatchOperationState; DISPATCH_OPERATIONS.len()],
+}
+
+#[derive(Clone, Debug, Default)]
+struct DispatchOperationState {
+    attempted_total: u64,
+    in_flight: u64,
+    succeeded_total: u64,
+    refused_total: u64,
+    failed_total: u64,
+    attempted_measured_bytes_total: u64,
+    in_flight_measured_bytes: u64,
+    succeeded_measured_bytes_total: u64,
+    refused_measured_bytes_total: u64,
+    failed_measured_bytes_total: u64,
+    last_attempt_unix_ms: Option<u64>,
+    last_success_unix_ms: Option<u64>,
+    last_error_unix_ms: Option<u64>,
+    last_error_code: Option<String>,
+}
+
+impl DispatchTelemetry {
+    fn new(epoch_started_unix_ms: u64) -> Self {
+        Self {
+            epoch_started_unix_ms,
+            serving_epoch_started: false,
+            operations: std::array::from_fn(|_| DispatchOperationState::default()),
+        }
+    }
+}
+
+enum DispatchOutcome<'a> {
+    Succeeded,
+    Refused(&'a ForgeError),
+    Failed(&'a ForgeError),
+}
 
 /// CUDA backend whose every public [`Backend`] operation has a measured
 /// buffer-shape reservation held until the inner CUDA call returns.
@@ -28,6 +112,7 @@ pub struct VramBudgetedCudaBackend {
     inner: CudaBackend,
     budgeter: VramBudgeter<CudaVramProbe>,
     host_dispatch: Option<HostDispatchReservations>,
+    dispatch_telemetry: Mutex<DispatchTelemetry>,
 }
 
 struct HostDispatchReservations {
@@ -56,10 +141,12 @@ impl VramBudgetedCudaBackend {
             ));
         }
         let probe = CudaVramProbe::new(Arc::new(inner.context().clone()));
+        let telemetry_epoch = unix_ms()?;
         Ok(Self {
             inner,
             budgeter: VramBudgeter::with_soft_cap(soft_cap_bytes, probe),
             host_dispatch: None,
+            dispatch_telemetry: Mutex::new(DispatchTelemetry::new(telemetry_epoch)),
         })
     }
 
@@ -112,6 +199,184 @@ impl VramBudgetedCudaBackend {
     /// free-memory read.
     pub fn stats_strict(&self) -> Result<VramStats> {
         self.budgeter.stats_strict()
+    }
+
+    /// Resets process-local dispatch telemetry after startup validation so the
+    /// published epoch contains serving work only.
+    pub fn reset_dispatch_telemetry(&self) -> Result<()> {
+        let mut telemetry = self.dispatch_telemetry.lock().map_err(|_| {
+            telemetry_error("dispatch telemetry mutex is poisoned during serving-epoch reset")
+        })?;
+        if telemetry.serving_epoch_started {
+            return Err(telemetry_error(
+                "serving dispatch telemetry epoch was already started; refusing to erase live counters",
+            ));
+        }
+        let epoch_started_unix_ms = unix_ms()?;
+        *telemetry = DispatchTelemetry::new(epoch_started_unix_ms);
+        telemetry.serving_epoch_started = true;
+        Ok(())
+    }
+
+    /// Reads and validates the complete process-local dispatch Source of Truth.
+    pub fn dispatch_telemetry(&self) -> Result<CudaDispatchTelemetrySnapshot> {
+        let telemetry = self.dispatch_telemetry.lock().map_err(|_| {
+            telemetry_error("dispatch telemetry mutex is poisoned during health readback")
+        })?;
+        let sampled_at_unix_ms = unix_ms()?;
+        let mut operations = Vec::with_capacity(DISPATCH_OPERATIONS.len());
+        for (operation, state) in DISPATCH_OPERATIONS.iter().zip(&telemetry.operations) {
+            validate_operation_telemetry(operation, state)?;
+            operations.push(CudaDispatchOperationSnapshot {
+                operation: (*operation).to_owned(),
+                attempted_total: state.attempted_total,
+                in_flight: state.in_flight,
+                succeeded_total: state.succeeded_total,
+                refused_total: state.refused_total,
+                failed_total: state.failed_total,
+                attempted_measured_bytes_total: state.attempted_measured_bytes_total,
+                in_flight_measured_bytes: state.in_flight_measured_bytes,
+                succeeded_measured_bytes_total: state.succeeded_measured_bytes_total,
+                refused_measured_bytes_total: state.refused_measured_bytes_total,
+                failed_measured_bytes_total: state.failed_measured_bytes_total,
+                last_attempt_unix_ms: state.last_attempt_unix_ms,
+                last_success_unix_ms: state.last_success_unix_ms,
+                last_error_unix_ms: state.last_error_unix_ms,
+                last_error_code: state.last_error_code.clone(),
+            });
+        }
+        Ok(CudaDispatchTelemetrySnapshot {
+            epoch_started_unix_ms: telemetry.epoch_started_unix_ms,
+            sampled_at_unix_ms,
+            operations,
+        })
+    }
+
+    fn record_dispatch_attempt(
+        &self,
+        operation: &'static str,
+        measured_bytes: u64,
+        at_unix_ms: u64,
+    ) -> Result<()> {
+        let mut telemetry = self.dispatch_telemetry.lock().map_err(|_| {
+            telemetry_error("dispatch telemetry mutex is poisoned while recording an attempt")
+        })?;
+        let state = operation_state_mut(&mut telemetry, operation)?;
+        let attempted_total =
+            checked_counter_add(operation, "attempted_total", state.attempted_total, 1)?;
+        let attempted_measured_bytes_total = checked_counter_add(
+            operation,
+            "attempted_measured_bytes_total",
+            state.attempted_measured_bytes_total,
+            measured_bytes,
+        )?;
+        let in_flight = checked_counter_add(operation, "in_flight", state.in_flight, 1)?;
+        let in_flight_measured_bytes = checked_counter_add(
+            operation,
+            "in_flight_measured_bytes",
+            state.in_flight_measured_bytes,
+            measured_bytes,
+        )?;
+        state.attempted_total = attempted_total;
+        state.attempted_measured_bytes_total = attempted_measured_bytes_total;
+        state.in_flight = in_flight;
+        state.in_flight_measured_bytes = in_flight_measured_bytes;
+        state.last_attempt_unix_ms = Some(
+            state
+                .last_attempt_unix_ms
+                .map_or(at_unix_ms, |current| current.max(at_unix_ms)),
+        );
+        Ok(())
+    }
+
+    fn record_dispatch_outcome(
+        &self,
+        operation: &'static str,
+        measured_bytes: u64,
+        at_unix_ms: u64,
+        outcome: DispatchOutcome<'_>,
+    ) -> Result<()> {
+        let mut telemetry = self.dispatch_telemetry.lock().map_err(|_| {
+            telemetry_error("dispatch telemetry mutex is poisoned while recording an outcome")
+        })?;
+        let state = operation_state_mut(&mut telemetry, operation)?;
+        let in_flight = state.in_flight.checked_sub(1).ok_or_else(|| {
+            telemetry_error(format!(
+                "{operation} dispatch outcome has no matching in-flight attempt"
+            ))
+        })?;
+        let in_flight_measured_bytes = state
+            .in_flight_measured_bytes
+            .checked_sub(measured_bytes)
+            .ok_or_else(|| {
+            telemetry_error(format!(
+                "{operation} dispatch outcome bytes {measured_bytes} exceed in-flight bytes {}",
+                state.in_flight_measured_bytes
+            ))
+        })?;
+        match outcome {
+            DispatchOutcome::Succeeded => {
+                let total =
+                    checked_counter_add(operation, "succeeded_total", state.succeeded_total, 1)?;
+                let bytes = checked_counter_add(
+                    operation,
+                    "succeeded_measured_bytes_total",
+                    state.succeeded_measured_bytes_total,
+                    measured_bytes,
+                )?;
+                state.succeeded_total = total;
+                state.succeeded_measured_bytes_total = bytes;
+                state.in_flight = in_flight;
+                state.in_flight_measured_bytes = in_flight_measured_bytes;
+                state.last_success_unix_ms = Some(
+                    state
+                        .last_success_unix_ms
+                        .map_or(at_unix_ms, |current| current.max(at_unix_ms)),
+                );
+            }
+            DispatchOutcome::Refused(error) => {
+                let total =
+                    checked_counter_add(operation, "refused_total", state.refused_total, 1)?;
+                let bytes = checked_counter_add(
+                    operation,
+                    "refused_measured_bytes_total",
+                    state.refused_measured_bytes_total,
+                    measured_bytes,
+                )?;
+                state.refused_total = total;
+                state.refused_measured_bytes_total = bytes;
+                state.in_flight = in_flight;
+                state.in_flight_measured_bytes = in_flight_measured_bytes;
+                if state
+                    .last_error_unix_ms
+                    .is_none_or(|current| at_unix_ms >= current)
+                {
+                    state.last_error_unix_ms = Some(at_unix_ms);
+                    state.last_error_code = Some(error.code().to_owned());
+                }
+            }
+            DispatchOutcome::Failed(error) => {
+                let total = checked_counter_add(operation, "failed_total", state.failed_total, 1)?;
+                let bytes = checked_counter_add(
+                    operation,
+                    "failed_measured_bytes_total",
+                    state.failed_measured_bytes_total,
+                    measured_bytes,
+                )?;
+                state.failed_total = total;
+                state.failed_measured_bytes_total = bytes;
+                state.in_flight = in_flight;
+                state.in_flight_measured_bytes = in_flight_measured_bytes;
+                if state
+                    .last_error_unix_ms
+                    .is_none_or(|current| at_unix_ms >= current)
+                {
+                    state.last_error_unix_ms = Some(at_unix_ms);
+                    state.last_error_code = Some(error.code().to_owned());
+                }
+            }
+        }
+        Ok(())
     }
 
     fn measured_f32_bytes(
@@ -252,13 +517,70 @@ impl VramBudgetedCudaBackend {
         measured_bytes: usize,
         dispatch: impl FnOnce(&CudaBackend) -> Result<T>,
     ) -> Result<T> {
-        let _process_reservation = self.budgeter.reserve(measured_bytes)?;
-        let host_reservation = self.acquire_host_dispatch(operation, measured_bytes)?;
+        let observed = measured_bytes > 0;
+        let measured_bytes_u64 = u64::try_from(measured_bytes).map_err(|_| {
+            telemetry_error(format!(
+                "{operation} measured dispatch bytes {measured_bytes} do not fit u64"
+            ))
+        })?;
+        let attempted_at = if observed {
+            let at = unix_ms()?;
+            self.record_dispatch_attempt(operation, measured_bytes_u64, at)?;
+            Some(at)
+        } else {
+            None
+        };
+        let _process_reservation = match self.budgeter.reserve(measured_bytes) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if let Some(at) = attempted_at {
+                    self.record_dispatch_outcome(
+                        operation,
+                        measured_bytes_u64,
+                        at,
+                        DispatchOutcome::Refused(&error),
+                    )?;
+                }
+                tracing::warn!(
+                    target: "calyx_forge::vram::budgeted_backend",
+                    code = "CALYX_FORGE_DISPATCH_REFUSED",
+                    operation,
+                    measured_bytes,
+                    source_code = error.code(),
+                    source_error = %error,
+                    "process-local CUDA dispatch admission refused"
+                );
+                return Err(error);
+            }
+        };
+        let host_reservation = match self.acquire_host_dispatch(operation, measured_bytes) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                if let Some(at) = attempted_at {
+                    self.record_dispatch_outcome(
+                        operation,
+                        measured_bytes_u64,
+                        at,
+                        DispatchOutcome::Refused(&error),
+                    )?;
+                }
+                tracing::warn!(
+                    target: "calyx_forge::vram::budgeted_backend",
+                    code = "CALYX_FORGE_DISPATCH_REFUSED",
+                    operation,
+                    measured_bytes,
+                    source_code = error.code(),
+                    source_error = %error,
+                    "host-wide CUDA dispatch admission refused"
+                );
+                return Err(error);
+            }
+        };
         let operation_result = dispatch(&self.inner);
         let release_result = host_reservation
             .map(HostGpuReservation::release)
             .transpose();
-        match (operation_result, release_result) {
+        let final_result = match (operation_result, release_result) {
             (Ok(value), Ok(_readback)) => Ok(value),
             (Err(operation_error), Ok(_readback)) => Err(operation_error),
             (Ok(_value), Err(release_error)) => Err(release_error),
@@ -274,7 +596,47 @@ impl VramBudgetedCudaBackend {
                 );
                 Err(release_error)
             }
+        };
+        if observed {
+            let completed_at = match unix_ms() {
+                Ok(at) => at,
+                Err(clock_error) => {
+                    self.record_dispatch_outcome(
+                        operation,
+                        measured_bytes_u64,
+                        attempted_at.expect("observed dispatch has an attempt timestamp"),
+                        DispatchOutcome::Failed(&clock_error),
+                    )?;
+                    return Err(clock_error);
+                }
+            };
+            match &final_result {
+                Ok(_) => self.record_dispatch_outcome(
+                    operation,
+                    measured_bytes_u64,
+                    completed_at,
+                    DispatchOutcome::Succeeded,
+                )?,
+                Err(error) => {
+                    self.record_dispatch_outcome(
+                        operation,
+                        measured_bytes_u64,
+                        completed_at,
+                        DispatchOutcome::Failed(error),
+                    )?;
+                    tracing::error!(
+                        target: "calyx_forge::vram::budgeted_backend",
+                        code = "CALYX_FORGE_DISPATCH_FAILED",
+                        operation,
+                        measured_bytes,
+                        source_code = error.code(),
+                        source_error = %error,
+                        "CUDA operation or mandatory host-reservation release failed"
+                    );
+                }
+            }
         }
+        final_result
     }
 }
 
@@ -366,6 +728,77 @@ fn checked_sum(operation: &'static str, values: &[usize]) -> Result<usize> {
             ))
         })
     })
+}
+
+fn operation_state_mut<'a>(
+    telemetry: &'a mut DispatchTelemetry,
+    operation: &'static str,
+) -> Result<&'a mut DispatchOperationState> {
+    let index = DISPATCH_OPERATIONS
+        .iter()
+        .position(|candidate| *candidate == operation)
+        .ok_or_else(|| telemetry_error(format!("unknown Forge dispatch operation {operation}")))?;
+    Ok(&mut telemetry.operations[index])
+}
+
+fn checked_counter_add(operation: &str, field: &str, current: u64, delta: u64) -> Result<u64> {
+    current.checked_add(delta).ok_or_else(|| {
+        telemetry_error(format!(
+            "{operation} dispatch telemetry {field} overflow: current={current} delta={delta}"
+        ))
+    })
+}
+
+fn validate_operation_telemetry(operation: &str, state: &DispatchOperationState) -> Result<()> {
+    let outcomes = state
+        .succeeded_total
+        .checked_add(state.refused_total)
+        .and_then(|total| total.checked_add(state.failed_total))
+        .ok_or_else(|| telemetry_error(format!("{operation} outcome counter sum overflow")))?;
+    let terminal_or_in_flight = outcomes
+        .checked_add(state.in_flight)
+        .ok_or_else(|| telemetry_error(format!("{operation} in-flight counter sum overflow")))?;
+    let outcome_bytes = state
+        .succeeded_measured_bytes_total
+        .checked_add(state.refused_measured_bytes_total)
+        .and_then(|total| total.checked_add(state.failed_measured_bytes_total))
+        .ok_or_else(|| telemetry_error(format!("{operation} outcome byte sum overflow")))?;
+    let terminal_or_in_flight_bytes = outcome_bytes
+        .checked_add(state.in_flight_measured_bytes)
+        .ok_or_else(|| telemetry_error(format!("{operation} in-flight byte sum overflow")))?;
+    if terminal_or_in_flight != state.attempted_total
+        || terminal_or_in_flight_bytes != state.attempted_measured_bytes_total
+    {
+        return Err(telemetry_error(format!(
+            "{operation} dispatch telemetry invariant failed: attempts={} outcomes={outcomes} in_flight={} attempted_bytes={} outcome_bytes={outcome_bytes} in_flight_bytes={}",
+            state.attempted_total,
+            state.in_flight,
+            state.attempted_measured_bytes_total,
+            state.in_flight_measured_bytes
+        )));
+    }
+    Ok(())
+}
+
+fn unix_ms() -> Result<u64> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| {
+            telemetry_error(format!(
+                "system clock is before Unix epoch while recording dispatch telemetry: {error}"
+            ))
+        })?;
+    u64::try_from(elapsed.as_millis()).map_err(|_| {
+        telemetry_error("dispatch telemetry Unix timestamp does not fit u64 milliseconds")
+    })
+}
+
+fn telemetry_error(detail: impl Into<String>) -> ForgeError {
+    ForgeError::NumericalInvariant {
+        op: "dispatch_telemetry".to_owned(),
+        detail: detail.into(),
+        remediation: "repair the process clock or Forge dispatch telemetry invariant; health and subsequent dispatches never substitute guessed counters".to_owned(),
+    }
 }
 
 fn budget_error(detail: String) -> ForgeError {

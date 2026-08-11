@@ -54,6 +54,7 @@ pub struct SynapseCalyxMathBackendStatus {
     pub cpu_simd_path: String,
     pub vram_budget_bytes: u64,
     pub vram_dispatch: Option<SynapseCalyxVramDispatchStatus>,
+    pub dispatch_telemetry: Option<SynapseCalyxMathDispatchTelemetry>,
     pub host_reservation_basis: Option<String>,
     pub host_reservation_id: Option<String>,
     pub host_reservation: Option<HostGpuReservationSnapshot>,
@@ -75,8 +76,32 @@ impl SynapseCalyxMathBackendStatus {
                 .iter()
                 .find(|row| row.reservation_id == reservation_id)
         });
+        let dispatch_summary = self.dispatch_telemetry.as_ref().map_or_else(
+            || "none".to_owned(),
+            |telemetry| {
+                telemetry
+                    .operations
+                    .iter()
+                    .map(|operation| {
+                        format!(
+                            "{}:attempted={},in_flight={},succeeded={},refused={},failed={},bytes={},last_success={:?},last_error_code={}",
+                            operation.operation,
+                            operation.attempted_total,
+                            operation.in_flight,
+                            operation.succeeded_total,
+                            operation.refused_total,
+                            operation.failed_total,
+                            operation.attempted_measured_bytes_total,
+                            operation.last_success_unix_ms,
+                            operation.last_error_code.as_deref().unwrap_or("none")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            },
+        );
         format!(
-            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} cpu_simd_path={} vram_budget_bytes={} vram_budget_enforced={} dispatch_soft_cap_bytes={:?} dispatch_allocated_bytes={:?} dispatch_device_free_bytes={:?} host_reservation_basis={} host_reservation_state_path={} host_reservation_sha256={} host_reservation_id={} host_reservation_pid={:?} host_reservation_requested_mib={:?} runtime_readback_code={} runtime_readback_error={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
+            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} cpu_simd_path={} vram_budget_bytes={} vram_budget_enforced={} dispatch_soft_cap_bytes={:?} dispatch_allocated_bytes={:?} dispatch_device_free_bytes={:?} dispatch_epoch_started_unix_ms={:?} dispatch_sampled_at_unix_ms={:?} dispatch_ops={} host_reservation_basis={} host_reservation_state_path={} host_reservation_sha256={} host_reservation_id={} host_reservation_pid={:?} host_reservation_requested_mib={:?} runtime_readback_code={} runtime_readback_error={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
             self.requested_backend.as_str(),
             self.selected_backend,
             self.cuda_compiled,
@@ -94,6 +119,13 @@ impl SynapseCalyxMathBackendStatus {
             self.vram_dispatch
                 .as_ref()
                 .map(|status| status.device_free_bytes),
+            self.dispatch_telemetry
+                .as_ref()
+                .map(|telemetry| telemetry.epoch_started_unix_ms),
+            self.dispatch_telemetry
+                .as_ref()
+                .map(|telemetry| telemetry.sampled_at_unix_ms),
+            dispatch_summary,
             self.host_reservation_basis.as_deref().unwrap_or("none"),
             self.host_reservation
                 .as_ref()
@@ -121,6 +153,32 @@ pub struct SynapseCalyxVramDispatchStatus {
     pub serving_allocated_bytes: u64,
     pub anneal_allocated_bytes: u64,
     pub device_free_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxMathDispatchTelemetry {
+    pub epoch_started_unix_ms: u64,
+    pub sampled_at_unix_ms: u64,
+    pub operations: Vec<SynapseCalyxMathDispatchOperation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxMathDispatchOperation {
+    pub operation: String,
+    pub attempted_total: u64,
+    pub in_flight: u64,
+    pub succeeded_total: u64,
+    pub refused_total: u64,
+    pub failed_total: u64,
+    pub attempted_measured_bytes_total: u64,
+    pub in_flight_measured_bytes: u64,
+    pub succeeded_measured_bytes_total: u64,
+    pub refused_measured_bytes_total: u64,
+    pub failed_measured_bytes_total: u64,
+    pub last_attempt_unix_ms: Option<u64>,
+    pub last_success_unix_ms: Option<u64>,
+    pub last_error_unix_ms: Option<u64>,
+    pub last_error_code: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -175,6 +233,15 @@ impl SynapseCalyxMathRuntime {
                 status.runtime_readback_code = Some(error.code().to_owned());
                 status.runtime_readback_error =
                     Some(format!("process-local CUDA VRAM readback failed: {error}"));
+            }
+        }
+        match self.backend.strict_dispatch_telemetry() {
+            Ok(dispatch_telemetry) => status.dispatch_telemetry = dispatch_telemetry,
+            Err(error) => {
+                status.runtime_readback_code = Some(error.code().to_owned());
+                status.runtime_readback_error = Some(format!(
+                    "process-local CUDA dispatch telemetry readback failed: {error}"
+                ));
             }
         }
         if let Some(reservation) = self.host_reservation.as_ref() {
@@ -314,11 +381,25 @@ impl CpuReadback {
 
 trait SynapseMathBackend: Backend {
     fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError>;
+    fn strict_dispatch_telemetry(
+        &self,
+    ) -> Result<Option<SynapseCalyxMathDispatchTelemetry>, ForgeError>;
+    fn reset_serving_dispatch_telemetry(&self) -> Result<(), ForgeError>;
 }
 
 impl SynapseMathBackend for CpuBackend {
     fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError> {
         Ok(None)
+    }
+
+    fn strict_dispatch_telemetry(
+        &self,
+    ) -> Result<Option<SynapseCalyxMathDispatchTelemetry>, ForgeError> {
+        Ok(None)
+    }
+
+    fn reset_serving_dispatch_telemetry(&self) -> Result<(), ForgeError> {
+        Ok(())
     }
 }
 
@@ -328,6 +409,49 @@ impl SynapseMathBackend for VramBudgetedCudaBackend {
         self.stats_strict()
             .map(SynapseCalyxVramDispatchStatus::from)
             .map(Some)
+    }
+
+    fn strict_dispatch_telemetry(
+        &self,
+    ) -> Result<Option<SynapseCalyxMathDispatchTelemetry>, ForgeError> {
+        self.dispatch_telemetry()
+            .map(SynapseCalyxMathDispatchTelemetry::from)
+            .map(Some)
+    }
+
+    fn reset_serving_dispatch_telemetry(&self) -> Result<(), ForgeError> {
+        self.reset_dispatch_telemetry()
+    }
+}
+
+#[cfg(feature = "calyx-cuda")]
+impl From<calyx_forge::CudaDispatchTelemetrySnapshot> for SynapseCalyxMathDispatchTelemetry {
+    fn from(snapshot: calyx_forge::CudaDispatchTelemetrySnapshot) -> Self {
+        Self {
+            epoch_started_unix_ms: snapshot.epoch_started_unix_ms,
+            sampled_at_unix_ms: snapshot.sampled_at_unix_ms,
+            operations: snapshot
+                .operations
+                .into_iter()
+                .map(|operation| SynapseCalyxMathDispatchOperation {
+                    operation: operation.operation,
+                    attempted_total: operation.attempted_total,
+                    in_flight: operation.in_flight,
+                    succeeded_total: operation.succeeded_total,
+                    refused_total: operation.refused_total,
+                    failed_total: operation.failed_total,
+                    attempted_measured_bytes_total: operation.attempted_measured_bytes_total,
+                    in_flight_measured_bytes: operation.in_flight_measured_bytes,
+                    succeeded_measured_bytes_total: operation.succeeded_measured_bytes_total,
+                    refused_measured_bytes_total: operation.refused_measured_bytes_total,
+                    failed_measured_bytes_total: operation.failed_measured_bytes_total,
+                    last_attempt_unix_ms: operation.last_attempt_unix_ms,
+                    last_success_unix_ms: operation.last_success_unix_ms,
+                    last_error_unix_ms: operation.last_error_unix_ms,
+                    last_error_code: operation.last_error_code,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -598,6 +722,15 @@ where
             ));
         }
     };
+    let dispatch_telemetry = match reset_and_read_dispatch_telemetry(&backend) {
+        Ok(status) => status,
+        Err(error) => {
+            return Err(cleanup_optional_host_reservation_after_startup_failure(
+                host_reservation,
+                error,
+            ));
+        }
+    };
     let vram_dispatch = match backend.strict_vram_status() {
         Ok(status) => status,
         Err(error) => {
@@ -634,6 +767,7 @@ where
         MathStatusInputs {
             cpu_readback,
             vram_dispatch,
+            dispatch_telemetry,
             host_reservation: host_reservation.as_ref(),
             host_reservation_snapshot,
             host_reservation_basis,
@@ -651,6 +785,7 @@ where
         vram_budget_bytes = status.vram_budget_bytes,
         vram_budget_enforced = status.vram_dispatch.is_some(),
         vram_dispatch = ?status.vram_dispatch,
+        dispatch_telemetry = ?status.dispatch_telemetry,
         host_reservation_basis = status.host_reservation_basis.as_deref().unwrap_or("none"),
         host_reservation = ?status.host_reservation,
         fallback_code = status.fallback_code.as_deref().unwrap_or("none"),
@@ -669,9 +804,31 @@ where
     })
 }
 
+fn reset_and_read_dispatch_telemetry(
+    backend: &impl SynapseMathBackend,
+) -> Result<Option<SynapseCalyxMathDispatchTelemetry>, SynapseCalyxError> {
+    backend
+        .reset_serving_dispatch_telemetry()
+        .map_err(|error| {
+            forge_error(
+                "SYNAPSE_CALYX_MATH_DISPATCH_TELEMETRY_RESET_FAILED",
+                "reset process-local Forge dispatch telemetry after every startup probe passed",
+                &error,
+            )
+        })?;
+    backend.strict_dispatch_telemetry().map_err(|error| {
+        forge_error(
+            "SYNAPSE_CALYX_MATH_DISPATCH_TELEMETRY_READBACK_FAILED",
+            "read back the zeroed serving dispatch epoch after startup probes",
+            &error,
+        )
+    })
+}
+
 struct MathStatusInputs<'a> {
     cpu_readback: CpuReadback,
     vram_dispatch: Option<SynapseCalyxVramDispatchStatus>,
+    dispatch_telemetry: Option<SynapseCalyxMathDispatchTelemetry>,
     host_reservation: Option<&'a HostGpuReservation>,
     host_reservation_snapshot: Option<HostGpuReservationSnapshot>,
     host_reservation_basis: Option<String>,
@@ -686,6 +843,7 @@ fn status_from_device_info(
     let MathStatusInputs {
         cpu_readback,
         vram_dispatch,
+        dispatch_telemetry,
         host_reservation,
         host_reservation_snapshot,
         host_reservation_basis,
@@ -700,6 +858,7 @@ fn status_from_device_info(
         cpu_simd_path: cpu_readback.simd_path,
         vram_budget_bytes: config.vram_budget_bytes,
         vram_dispatch,
+        dispatch_telemetry,
         host_reservation_basis,
         host_reservation_id: host_reservation
             .map(|reservation| reservation.reservation_id().to_owned()),
@@ -744,7 +903,7 @@ fn run_startup_probe(
     Ok(SynapseCalyxMathProbeReport {
         status: "ok".to_owned(),
         detail: format!(
-            "fixed vectors matched expected dot={EXPECTED_DOT:?} cosine={EXPECTED_COSINE:?} l2_squared={EXPECTED_L2_SQUARED:?} topk={EXPECTED_TOPK:?}; cpu reduction backend={reduction_backend} agrees bit-for-bit with the portable path over {REDUCTION_PROBE_LEN} elements"
+            "fixed vectors matched expected dot={EXPECTED_DOT:?} cosine={EXPECTED_COSINE:?} l2_squared={EXPECTED_L2_SQUARED:?} topk={EXPECTED_TOPK:?}; cpu_reduction_probe_kernel={reduction_backend} agrees bit-for-bit with the portable path over {REDUCTION_PROBE_LEN} elements"
         ),
         tolerance: PROBE_TOLERANCE,
         dot,

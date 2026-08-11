@@ -1015,6 +1015,15 @@ pub struct SubsystemHealth {
     pub calyx_math_device_vram_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_cpu_simd_path: Option<String>,
+    /// Process-local CUDA serving epoch, reset only after startup probes pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_dispatch_epoch_started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_dispatch_sampled_at_unix_ms: Option<u64>,
+    /// Fixed-cardinality records for every Forge backend operation. Zero rows
+    /// are present from epoch start so absence is never confused with zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_dispatch_operations: Option<Vec<CalyxMathDispatchOperation>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_fallback_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1326,6 +1335,30 @@ pub struct ProcessQosHealth {
 pub struct CalyxMathProbeTopKEntry {
     pub index: usize,
     pub score: f32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxMathDispatchOperation {
+    pub operation: String,
+    pub attempted_total: u64,
+    pub in_flight: u64,
+    pub succeeded_total: u64,
+    pub refused_total: u64,
+    pub failed_total: u64,
+    pub attempted_measured_bytes_total: u64,
+    pub in_flight_measured_bytes: u64,
+    pub succeeded_measured_bytes_total: u64,
+    pub refused_measured_bytes_total: u64,
+    pub failed_measured_bytes_total: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_attempt_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_success_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
 }
 
 /// Externally readable state of the Calyx hot-path boundary (#1686).

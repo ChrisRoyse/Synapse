@@ -7,8 +7,9 @@ use sha2::{Digest as _, Sha256};
 use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{
-    Backend, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement,
-    CalyxTuningKnobStatus, ChromeBridgeDetail, PerceptionDetectionHealth, PerceptionMode,
+    Backend, CalyxMathDispatchOperation, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus,
+    CalyxTuningKnobEnforcement, CalyxTuningKnobStatus, ChromeBridgeDetail,
+    PerceptionDetectionHealth, PerceptionMode,
 };
 
 /// Verbosity control for the `health` tool response.
@@ -1707,6 +1708,42 @@ impl SynapseService {
             calyx_math_device_name: math_backend.as_ref().map(|math| math.device_name.clone()),
             calyx_math_device_vram_mib: math_backend.as_ref().and_then(|math| math.device_vram_mib),
             calyx_math_cpu_simd_path: math_backend.as_ref().map(|math| math.cpu_simd_path.clone()),
+            calyx_math_dispatch_epoch_started_unix_ms: math_backend
+                .as_ref()
+                .and_then(|math| math.dispatch_telemetry.as_ref())
+                .map(|telemetry| telemetry.epoch_started_unix_ms),
+            calyx_math_dispatch_sampled_at_unix_ms: math_backend
+                .as_ref()
+                .and_then(|math| math.dispatch_telemetry.as_ref())
+                .map(|telemetry| telemetry.sampled_at_unix_ms),
+            calyx_math_dispatch_operations: math_backend
+                .as_ref()
+                .and_then(|math| math.dispatch_telemetry.as_ref())
+                .map(|telemetry| {
+                    telemetry
+                        .operations
+                        .iter()
+                        .map(|operation| CalyxMathDispatchOperation {
+                            operation: operation.operation.clone(),
+                            attempted_total: operation.attempted_total,
+                            in_flight: operation.in_flight,
+                            succeeded_total: operation.succeeded_total,
+                            refused_total: operation.refused_total,
+                            failed_total: operation.failed_total,
+                            attempted_measured_bytes_total: operation
+                                .attempted_measured_bytes_total,
+                            in_flight_measured_bytes: operation.in_flight_measured_bytes,
+                            succeeded_measured_bytes_total: operation
+                                .succeeded_measured_bytes_total,
+                            refused_measured_bytes_total: operation.refused_measured_bytes_total,
+                            failed_measured_bytes_total: operation.failed_measured_bytes_total,
+                            last_attempt_unix_ms: operation.last_attempt_unix_ms,
+                            last_success_unix_ms: operation.last_success_unix_ms,
+                            last_error_unix_ms: operation.last_error_unix_ms,
+                            last_error_code: operation.last_error_code.clone(),
+                        })
+                        .collect()
+                }),
             calyx_math_fallback_code: math_backend
                 .as_ref()
                 .and_then(|math| math.fallback_code.clone()),

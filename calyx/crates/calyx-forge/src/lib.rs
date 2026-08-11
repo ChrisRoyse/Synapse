@@ -99,3 +99,5 @@ pub use vram::{
     VramBudgeter, VramGuard, VramProbe, VramStats, YieldPolicy, YieldStats, admit_lens,
     probe_host_cuda_device,
 };
+#[cfg(feature = "cuda")]
+pub use vram::{CudaDispatchOperationSnapshot, CudaDispatchTelemetrySnapshot};
