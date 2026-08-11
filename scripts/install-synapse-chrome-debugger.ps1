@@ -3812,13 +3812,126 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
     $ownedRows = @($tabsBefore.tabs | Where-Object {
         [string]$_.runtime_id -ceq $ownedRuntimeId
     })
+    if ($ownedRows.Count -eq 0) {
+        # The tab may have reached its terminal absent state before cleanup is
+        # entered (for example, Chrome can discard the internal maintenance
+        # surface while activating an updated unpacked worker). Absence is not
+        # inferred from the zero match alone. Re-read the strip independently,
+        # require the owned id absent in both snapshots, require every exact
+        # pre-operation runtime id present, and preserve the current selection.
+        # This is the same postcondition required after our own close below.
+        $baselineRuntimeIds = @(
+            $Lease.tab_strip_before_create.tabs | ForEach-Object { [string]$_.runtime_id }
+        )
+        $baselineDuplicateRuntimeIds = @(
+            $baselineRuntimeIds | Group-Object | Where-Object { $_.Count -ne 1 } |
+                ForEach-Object { [string]$_.Name }
+        )
+        if (
+            $baselineRuntimeIds -contains $ownedRuntimeId -or
+            $baselineDuplicateRuntimeIds.Count -gt 0
+        ) {
+            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                lease = $Lease
+                owned_runtime_id_in_baseline = ($baselineRuntimeIds -contains $ownedRuntimeId)
+                baseline_duplicate_runtime_ids = $baselineDuplicateRuntimeIds
+            }) -Depth 12
+            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_BASELINE_IDENTITY_INVALID detail=$detail remediation=the operation-owned runtime id must be absent from a unique pre-create tab snapshot"
+        }
+        $windowReadback = Get-SynapseChromeWindowByHwnd `
+            -Hwnd $Lease.chrome_window_hwnd `
+            -ChromeUserDataRoot $ChromeUserDataRoot
+        if (-not $windowReadback) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_ABSENCE_READBACK_WINDOW_MISSING hwnd=$($Lease.chrome_window_hwnd) pid=$($Lease.chrome_window_pid) token=$($Lease.token) remediation=the exact Chrome window must survive the independent already-absent readback"
+        }
+        $tabsReadback = Read-SynapseChromeTabStripState -Window $windowReadback
+        $currentRuntimeIds = @(
+            $tabsReadback.tabs | ForEach-Object { [string]$_.runtime_id }
+        )
+        $currentDuplicateRuntimeIds = @(
+            $currentRuntimeIds | Group-Object | Where-Object { $_.Count -ne 1 } |
+                ForEach-Object { [string]$_.Name }
+        )
+        $ownedReadbackCount = @(
+            $tabsReadback.tabs | Where-Object {
+                [string]$_.runtime_id -ceq $ownedRuntimeId
+            }
+        ).Count
+        $missingBaselineRuntimeIds = @(
+            $baselineRuntimeIds | Where-Object { $_ -notin $currentRuntimeIds }
+        )
+        $selectedReadback = @($tabsReadback.tabs | Where-Object { $_.selected -eq $true })
+        if (
+            $ownedReadbackCount -ne 0 -or
+            $missingBaselineRuntimeIds.Count -ne 0 -or
+            $currentDuplicateRuntimeIds.Count -ne 0 -or
+            $selectedReadback.Count -ne 1
+        ) {
+            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                lease = $Lease
+                tabs_first_absence_read = $tabsBefore
+                tabs_second_absence_read = $tabsReadback
+                owned_runtime_id_second_match_count = $ownedReadbackCount
+                missing_baseline_runtime_ids = $missingBaselineRuntimeIds
+                current_duplicate_runtime_ids = $currentDuplicateRuntimeIds
+                selected_runtime_id_count = $selectedReadback.Count
+            }) -Depth 12
+            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_ALREADY_ABSENT_NOT_PROVEN detail=$detail remediation=acceptance requires the owned id absent on both reads, every unique baseline id present, unique current ids, and one exact preserved selection"
+        }
+        $expectedSelected = @(
+            $Lease.tab_strip_before_create.tabs | Where-Object { $_.selected -eq $true }
+        )
+        if ($expectedSelected.Count -ne 1) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_SNAPSHOT_INVALID hwnd=$($window.hwnd) selected_count=$($expectedSelected.Count) token=$($Lease.token) remediation=the UI-created maintenance path requires exactly one previously-selected Chrome tab identity"
+        }
+        $expectedRuntimeId = [string]$expectedSelected[0].runtime_id
+        $currentSelectedRuntimeId = [string]$selectedReadback[0].runtime_id
+        $selectionAlreadyRestored = $currentSelectedRuntimeId -ceq $expectedRuntimeId
+        $selectionRestore = [pscustomobject]@{
+            attempted = $false
+            restored = $selectionAlreadyRestored
+            operator_superseded = (-not $selectionAlreadyRestored)
+            reason = if ($selectionAlreadyRestored) {
+                'already_restored_when_owned_tab_was_absent'
+            } else {
+                'preserved_newer_selection_when_owned_tab_was_absent'
+            }
+            expected_runtime_id = $expectedRuntimeId
+            before_runtime_id = $currentSelectedRuntimeId
+            after_runtime_id = $currentSelectedRuntimeId
+        }
+        return [pscustomobject]@{
+            attempted = $true
+            close_attempted = $false
+            closed = $false
+            already_absent_before_cleanup = $true
+            absent_verified = $true
+            method = 'exact_uia_runtime_id_already_absent_two_readback'
+            token = $Lease.token
+            owned_tab_runtime_id = $Lease.owned_tab_runtime_id
+            chrome_tab_id = $Lease.chrome_tab_id
+            chrome_window_id = $Lease.chrome_window_id
+            chrome_window_hwnd = $Lease.chrome_window_hwnd
+            tabs_before = $tabsBefore
+            tabs_after = $tabsReadback
+            navigation_before = $null
+            navigation_after = $null
+            concurrent_runtime_ids = @(
+                $currentRuntimeIds | Where-Object {
+                    $_ -notin $baselineRuntimeIds -and $_ -cne $ownedRuntimeId
+                }
+            )
+            missing_baseline_runtime_ids = @()
+            prior_selection_restore = $selectionRestore
+        }
+    }
     if ($ownedRows.Count -ne 1) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             lease = $Lease
             tabs_before_cleanup = $tabsBefore
             owned_runtime_id_match_count = $ownedRows.Count
         }) -Depth 12
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_ID_NOT_UNIQUE detail=$detail remediation=cleanup requires the one exact UIA tab identity created by this operation"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_ID_DUPLICATED detail=$detail remediation=cleanup requires at most one exact UIA tab identity and refuses every duplicate identity"
     }
     $navigationBefore = Read-SynapseChromeNavigationState -Hwnd $window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
     $addressBefore = ([string]$navigationBefore.address_bar_value).Trim().TrimEnd('/')
@@ -4114,7 +4227,9 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
     }
     [pscustomobject]@{
         attempted = $true
+        close_attempted = $true
         closed = $true
+        already_absent_before_cleanup = $false
         absent_verified = $true
         method = 'exact_uia_runtime_id_tab_close_button_invoke'
         token = $Lease.token
