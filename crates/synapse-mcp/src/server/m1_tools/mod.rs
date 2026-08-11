@@ -80,6 +80,7 @@ use chrono::{DateTime, Utc};
 use image::{DynamicImage, ImageFormat, RgbaImage, codecs::jpeg::JpegEncoder};
 #[cfg(windows)]
 use image::{GrayImage, Luma};
+use num_traits::ToPrimitive as _;
 #[cfg(windows)]
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2411,6 +2412,8 @@ impl SynapseService {
         } = decode_browser_screenshot_bounded_composite(
             &captured,
             validation.format,
+            params.scope,
+            params.quality.unwrap_or(90),
             params.omit_background,
             params.max_pixels,
             params.max_long_edge,
@@ -17960,9 +17963,166 @@ struct BrowserScreenshotMaskEvidence {
     commitment_sha256: String,
 }
 
+fn browser_screenshot_expected_output_dimensions(
+    native_width: u32,
+    native_height: u32,
+    max_pixels: Option<u64>,
+    max_long_edge: Option<u32>,
+) -> Result<(u32, u32), ErrorData> {
+    let mut scale = 1.0_f64;
+    if let Some(limit) = max_long_edge {
+        scale = scale.min(f64::from(limit) / f64::from(native_width.max(native_height)));
+    }
+    if let Some(limit) = max_pixels {
+        let native_pixels = u64::from(native_width)
+            .checked_mul(u64::from(native_height))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    "browser_screenshot native pixel count overflowed u64 while independently recomputing the capture plan",
+                )
+            })?;
+        let limit_f64 = limit.to_f64().ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!("browser_screenshot max_pixels={limit} cannot be represented as f64"),
+            )
+        })?;
+        let native_pixels_f64 = native_pixels.to_f64().ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot native_pixels={native_pixels} cannot be represented as f64"
+                ),
+            )
+        })?;
+        scale = scale.min((limit_f64 / native_pixels_f64).sqrt());
+    }
+    scale = scale.min(1.0);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot independently calculated an invalid output scale {scale}: native={native_width}x{native_height} max_pixels={max_pixels:?} max_long_edge={max_long_edge:?}"
+            ),
+        ));
+    }
+    let mut width = (f64::from(native_width) * scale).round().max(1.0) as u32;
+    let mut height = (f64::from(native_height) * scale).round().max(1.0) as u32;
+    let mut correction_count = 0_u8;
+    while max_pixels.is_some_and(|limit| u64::from(width) * u64::from(height) > limit) {
+        if f64::from(width) / f64::from(native_width)
+            >= f64::from(height) / f64::from(native_height)
+            && width > 1
+        {
+            width -= 1;
+        } else if height > 1 {
+            height -= 1;
+        } else {
+            break;
+        }
+        correction_count = correction_count.saturating_add(1);
+        if correction_count > 4 {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                "browser_screenshot output rounding required more than four corrections; extension and daemon dimension algorithms have diverged",
+            ));
+        }
+    }
+    while max_long_edge.is_some_and(|limit| width.max(height) > limit) {
+        if width >= height && width > 1 {
+            width -= 1;
+        } else if height > 1 {
+            height -= 1;
+        } else {
+            break;
+        }
+        correction_count = correction_count.saturating_add(1);
+        if correction_count > 4 {
+            return Err(mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                "browser_screenshot long-edge rounding required more than four corrections; extension and daemon dimension algorithms have diverged",
+            ));
+        }
+    }
+    Ok((width, height))
+}
+
+fn browser_screenshot_plan_add(values: &[u64], label: &str) -> Result<u64, ErrorData> {
+    values.iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(*value).ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!(
+                    "browser_screenshot {label} overflowed u64 while independently recomputing the capture plan"
+                ),
+            )
+        })
+    })
+}
+
+fn browser_screenshot_plan_mul(left: u64, right: u64, label: &str) -> Result<u64, ErrorData> {
+    left.checked_mul(right).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "browser_screenshot {label} overflowed u64 while independently recomputing the capture plan"
+            ),
+        )
+    })
+}
+
+fn browser_screenshot_encoded_upper_bound(
+    raw_bytes: u64,
+    height: u32,
+    format: CaptureScreenshotFormat,
+) -> Result<u64, ErrorData> {
+    match format {
+        CaptureScreenshotFormat::Png => {
+            let filtered =
+                browser_screenshot_plan_add(&[raw_bytes, u64::from(height)], "PNG filtered bytes")?;
+            let stored_blocks = filtered.div_ceil(16_383);
+            browser_screenshot_plan_add(
+                &[
+                    filtered,
+                    browser_screenshot_plan_mul(stored_blocks, 5, "PNG stored-block overhead")?,
+                    65_536,
+                ],
+                "PNG encoded upper bound",
+            )
+        }
+        CaptureScreenshotFormat::Jpeg => browser_screenshot_plan_add(
+            &[
+                browser_screenshot_plan_mul(raw_bytes, 2, "JPEG raw upper bound")?,
+                65_536,
+            ],
+            "JPEG encoded upper bound",
+        ),
+    }
+}
+
+fn browser_screenshot_data_url_upper_bound(
+    encoded_bytes: u64,
+    format: CaptureScreenshotFormat,
+) -> Result<u64, ErrorData> {
+    let header_bytes = match format {
+        CaptureScreenshotFormat::Png => 22,
+        CaptureScreenshotFormat::Jpeg => 23,
+    };
+    browser_screenshot_plan_add(
+        &[
+            header_bytes,
+            browser_screenshot_plan_mul(encoded_bytes.div_ceil(3), 4, "base64 upper bound")?,
+        ],
+        "data URL upper bound",
+    )
+}
+
 fn decode_browser_screenshot_bounded_composite(
     captured: &crate::chrome_debugger_bridge::ChromeDebuggerPageScreenshotResult,
     format: CaptureScreenshotFormat,
+    scope: BrowserScreenshotScope,
+    quality: u8,
     omit_background: bool,
     max_pixels: Option<u64>,
     max_long_edge: Option<u32>,
@@ -18048,6 +18208,14 @@ fn decode_browser_screenshot_bounded_composite(
     }
     if max_pixels != plan.max_pixels
         || max_long_edge.map(u64::from) != plan.max_long_edge
+        || captured.image_format
+            != match format {
+                CaptureScreenshotFormat::Png => "png",
+                CaptureScreenshotFormat::Jpeg => "jpeg",
+            }
+        || captured.scope != browser_screenshot_scope_str(scope)
+        || captured.quality != Some(quality)
+        || captured.omit_background != omit_background
         || plan.native_width == 0
         || plan.native_height == 0
         || plan.output_width == 0
@@ -18056,7 +18224,11 @@ fn decode_browser_screenshot_bounded_composite(
         || plan.output_height > plan.native_height
     {
         return Err(fail(format!(
-            "dimension/request contract invalid requested_max_pixels={max_pixels:?} plan_max_pixels={:?} requested_max_long_edge={max_long_edge:?} plan_max_long_edge={:?} native={}x{} output={}x{}",
+            "dimension/request contract invalid requested_format={format:?} result_format={:?} requested_scope={scope:?} result_scope={:?} requested_quality={quality} result_quality={:?} requested_omit_background={omit_background} result_omit_background={} requested_max_pixels={max_pixels:?} plan_max_pixels={:?} requested_max_long_edge={max_long_edge:?} plan_max_long_edge={:?} native={}x{} output={}x{}",
+            captured.image_format,
+            captured.scope,
+            captured.quality,
+            captured.omit_background,
             plan.max_pixels,
             plan.max_long_edge,
             plan.native_width,
@@ -18073,6 +18245,21 @@ fn decode_browser_screenshot_bounded_composite(
         captured.clip_css.h * captured.device_pixel_ratio,
         "native height",
     )?;
+    let expected_native_pixels = u64::from(expected_native_width)
+        .checked_mul(u64::from(expected_native_height))
+        .ok_or_else(|| fail("expected native pixel count overflowed u64".to_owned()))?;
+    if expected_native_pixels > 9_007_199_254_740_991 {
+        return Err(fail(format!(
+            "native pixel count exceeds JavaScript's exact safe-integer contract: native={expected_native_width}x{expected_native_height} pixels={expected_native_pixels}",
+        )));
+    }
+    let (expected_output_width, expected_output_height) =
+        browser_screenshot_expected_output_dimensions(
+            expected_native_width,
+            expected_native_height,
+            max_pixels,
+            max_long_edge,
+        )?;
     let expected_scale_x = f64::from(plan.output_width) / captured.clip_css.w;
     let expected_scale_y = f64::from(plan.output_height) / captured.clip_css.h;
     let expected_applied_scale = f64::from(plan.output_width.max(plan.output_height))
@@ -18080,6 +18267,10 @@ fn decode_browser_screenshot_bounded_composite(
     let scale_tolerance = 1.0e-9_f64;
     if plan.native_width != expected_native_width
         || plan.native_height != expected_native_height
+        || plan.output_width != expected_output_width
+        || plan.output_height != expected_output_height
+        || (captured.output_css_width - captured.clip_css.w).abs() > scale_tolerance
+        || (captured.output_css_height - captured.clip_css.h).abs() > scale_tolerance
         || !plan.output_scale_x.is_finite()
         || !plan.output_scale_y.is_finite()
         || !plan.applied_scale.is_finite()
@@ -18088,17 +18279,53 @@ fn decode_browser_screenshot_bounded_composite(
         || (plan.applied_scale - expected_applied_scale).abs() > scale_tolerance
     {
         return Err(fail(format!(
-            "geometry proof mismatch expected_native={}x{} plan_native={}x{} expected_output_scale={}x{} plan_output_scale={}x{} expected_applied_scale={} plan_applied_scale={}",
+            "geometry proof mismatch expected_native={}x{} plan_native={}x{} expected_output={}x{} plan_output={}x{} clip_css={}x{} result_output_css={}x{} expected_output_scale={}x{} plan_output_scale={}x{} expected_applied_scale={} plan_applied_scale={}",
             expected_native_width,
             expected_native_height,
             plan.native_width,
             plan.native_height,
+            expected_output_width,
+            expected_output_height,
+            plan.output_width,
+            plan.output_height,
+            captured.clip_css.w,
+            captured.clip_css.h,
+            captured.output_css_width,
+            captured.output_css_height,
             expected_scale_x,
             expected_scale_y,
             plan.output_scale_x,
             plan.output_scale_y,
             expected_applied_scale,
             plan.applied_scale,
+        )));
+    }
+    let (expected_tile_width, expected_tile_height) = match captured.backend_tier_used.as_str() {
+        "chrome_debugger_page_surface" => (expected_output_width, expected_output_height),
+        "chrome_tabs_extension" => (
+            f64_to_u32_ceil(
+                captured.viewport_width_css * captured.device_pixel_ratio,
+                "tile width",
+            )?,
+            f64_to_u32_ceil(
+                captured.viewport_height_css * captured.device_pixel_ratio,
+                "tile height",
+            )?,
+        ),
+        other => {
+            return Err(fail(format!(
+                "unsupported capture backend tier {other:?}; no fallback compositor is permitted"
+            )));
+        }
+    };
+    if plan.tile_width != expected_tile_width || plan.tile_height != expected_tile_height {
+        return Err(fail(format!(
+            "tile geometry mismatch backend={:?} expected_tile={}x{} plan_tile={}x{}",
+            captured.backend_tier_used,
+            expected_tile_width,
+            expected_tile_height,
+            plan.tile_width,
+            plan.tile_height,
         )));
     }
     let output_pixels = u64::from(plan.output_width)
@@ -18111,8 +18338,64 @@ fn decode_browser_screenshot_bounded_composite(
         .checked_mul(u64::from(plan.tile_height))
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| fail("tile raw byte count overflowed u64".to_owned()))?;
+    let expected_tile_encoded_upper_bound =
+        browser_screenshot_encoded_upper_bound(tile_raw_bytes, plan.tile_height, format)?;
+    let expected_output_encoded_upper_bound =
+        browser_screenshot_encoded_upper_bound(output_raw_bytes, plan.output_height, format)?;
+    let expected_tile_data_url_upper_bound =
+        browser_screenshot_data_url_upper_bound(expected_tile_encoded_upper_bound, format)?;
+    let expected_output_data_url_upper_bound =
+        browser_screenshot_data_url_upper_bound(expected_output_encoded_upper_bound, format)?;
+    let expected_tile_phase_peak = browser_screenshot_plan_add(
+        &[
+            output_raw_bytes,
+            tile_raw_bytes,
+            expected_tile_encoded_upper_bound,
+            browser_screenshot_plan_mul(
+                expected_tile_data_url_upper_bound,
+                2,
+                "tile data URL heap bytes",
+            )?,
+        ],
+        "tile phase peak bytes",
+    )?;
+    let expected_final_phase_peak = browser_screenshot_plan_add(
+        &[
+            output_raw_bytes,
+            browser_screenshot_plan_mul(
+                expected_output_encoded_upper_bound,
+                2,
+                "output blob/array-buffer bytes",
+            )?,
+            browser_screenshot_plan_mul(
+                expected_output_data_url_upper_bound,
+                4,
+                "output base64/JSON heap bytes",
+            )?,
+        ],
+        "final phase peak bytes",
+    )?;
+    let expected_peak_bytes = expected_tile_phase_peak.max(expected_final_phase_peak);
+    let expected_native_message_bytes = browser_screenshot_plan_add(
+        &[expected_output_data_url_upper_bound, 256 * 1024],
+        "estimated native message bytes",
+    )?;
+    let actual_native_message_lower_bound = browser_screenshot_plan_add(
+        &[
+            u64::try_from(captured.composite_image_data_url.len()).unwrap_or(u64::MAX),
+            256 * 1024,
+        ],
+        "actual native message lower bound",
+    )?;
     if output_raw_bytes != plan.output_raw_bytes
         || tile_raw_bytes != plan.tile_raw_bytes
+        || plan.tile_encoded_upper_bound_bytes != expected_tile_encoded_upper_bound
+        || plan.output_encoded_upper_bound_bytes != expected_output_encoded_upper_bound
+        || plan.tile_data_url_upper_bound_bytes != expected_tile_data_url_upper_bound
+        || plan.output_data_url_upper_bound_bytes != expected_output_data_url_upper_bound
+        || plan.estimated_peak_bytes != expected_peak_bytes
+        || plan.estimated_native_message_bytes != expected_native_message_bytes
+        || plan.actual_native_message_bytes < actual_native_message_lower_bound
         || plan.actual_max_tile_data_url_bytes == 0
         || plan.actual_max_tile_data_url_bytes > plan.tile_data_url_upper_bound_bytes
         || plan.actual_composite_blob_bytes == 0
@@ -18124,17 +18407,28 @@ fn decode_browser_screenshot_bounded_composite(
         || captured.composite_image_data_url_len != captured.composite_image_data_url.len()
     {
         return Err(fail(format!(
-            "byte proof mismatch output_raw={} expected_output_raw={} tile_raw={} expected_tile_raw={} max_tile_data_url={} tile_data_url_bound={} composite_blob={} composite_blob_bound={} composite_data_url={} composite_data_url_bound={} declared_result_data_url_len={} actual_result_data_url_len={}",
+            "byte proof mismatch output_raw={} expected_output_raw={} tile_raw={} expected_tile_raw={} tile_encoded_bound={} expected_tile_encoded_bound={} output_encoded_bound={} expected_output_encoded_bound={} tile_data_url_bound={} expected_tile_data_url_bound={} output_data_url_bound={} expected_output_data_url_bound={} estimated_peak={} expected_peak={} estimated_native_message={} expected_estimated_native_message={} actual_native_message={} actual_native_message_lower_bound={} max_tile_data_url={} composite_blob={} composite_data_url={} declared_result_data_url_len={} actual_result_data_url_len={}",
             plan.output_raw_bytes,
             output_raw_bytes,
             plan.tile_raw_bytes,
             tile_raw_bytes,
-            plan.actual_max_tile_data_url_bytes,
-            plan.tile_data_url_upper_bound_bytes,
-            plan.actual_composite_blob_bytes,
+            plan.tile_encoded_upper_bound_bytes,
+            expected_tile_encoded_upper_bound,
             plan.output_encoded_upper_bound_bytes,
-            plan.actual_composite_data_url_bytes,
+            expected_output_encoded_upper_bound,
+            plan.tile_data_url_upper_bound_bytes,
+            expected_tile_data_url_upper_bound,
             plan.output_data_url_upper_bound_bytes,
+            expected_output_data_url_upper_bound,
+            plan.estimated_peak_bytes,
+            expected_peak_bytes,
+            plan.estimated_native_message_bytes,
+            expected_native_message_bytes,
+            plan.actual_native_message_bytes,
+            actual_native_message_lower_bound,
+            plan.actual_max_tile_data_url_bytes,
+            plan.actual_composite_blob_bytes,
+            plan.actual_composite_data_url_bytes,
             captured.composite_image_data_url_len,
             captured.composite_image_data_url.len(),
         )));
