@@ -720,8 +720,21 @@ pub struct DerivedStateReadback {
     pub last_weave_actions: BTreeMap<u32, String>,
     pub last_weave_until_ns: BTreeMap<u32, i64>,
     pub last_weave_records: BTreeMap<u32, u64>,
-    pub last_weave_xterm_rows: BTreeMap<u32, usize>,
-    pub last_weave_graph_rows: BTreeMap<u32, usize>,
+    /// Per-panel rows submitted and durably flushed by the completed interval
+    /// parts in this pass. These are write counts, not claims that every upsert
+    /// grew the physical CF cardinality.
+    pub last_weave_xterm_rows_written: BTreeMap<u32, usize>,
+    pub last_weave_graph_rows_written: BTreeMap<u32, usize>,
+    /// Physical vault-global CF gauges observed after this panel's last
+    /// completed interval part. Completion order can make these differ across
+    /// otherwise equivalent parallel runs, so the names deliberately do not
+    /// imply panel-local or additive state (#2151).
+    pub last_weave_global_xterm_cf_rows_after: BTreeMap<u32, usize>,
+    pub last_weave_global_graph_cf_rows_after: BTreeMap<u32, usize>,
+    /// How each adjacent global gauge was obtained: a physical walk, a drift
+    /// check, or proof that the CF commit sequence was unchanged (#2114).
+    pub last_weave_global_xterm_cf_rows_readback: BTreeMap<u32, String>,
+    pub last_weave_global_graph_cf_rows_readback: BTreeMap<u32, String>,
     /// Ingest time this panel's weave has not reached yet, the parts still owed,
     /// and how many consecutive ticks the backlog has grown (#2085).
     ///
@@ -2924,9 +2937,12 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
     let mut intervals = VecDeque::from([(since_ns, until_ns)]);
     let mut completed_parts = 0usize;
     let mut records_woven = 0u64;
-    let mut last_xterm_rows = 0usize;
-    let mut last_graph_rows = 0usize;
-    // #2114: how the two counts above were obtained on the last completed part.
+    let mut xterm_rows_written = 0usize;
+    let mut graph_rows_written = 0usize;
+    let mut last_global_xterm_cf_rows_after = 0usize;
+    let mut last_global_graph_cf_rows_after = 0usize;
+    // #2114: how the two vault-global counts were obtained on the last
+    // completed part.
     // The weave no longer re-walks `XTerm` + `Graph` (2.75 M rows on the
     // deployed vault) after a pass that the commit sequence proves changed
     // nothing, so this log line must say which of the two it is reporting
@@ -3055,8 +3071,37 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         completed_parts += 1;
         frontier_ns = part_until;
         records_woven = records_woven.saturating_add(report.records_woven as u64);
-        last_xterm_rows = report.xterm_cf_rows_after;
-        last_graph_rows = report.graph_cf_rows_after;
+        xterm_rows_written = xterm_rows_written
+            .checked_add(report.cross_terms_materialized)
+            .ok_or_else(|| {
+                format!(
+                    "panel {panel_version} XTerm write-count overflow after interval \
+                     [{part_since},{part_until}): prior={xterm_rows_written} \
+                     part={}",
+                    report.cross_terms_materialized
+                )
+            })?;
+        let part_graph_rows_written = report
+            .agreement_edges_persisted
+            .checked_add(report.between_record_edges_persisted)
+            .ok_or_else(|| {
+                format!(
+                    "panel {panel_version} Graph interval write-count overflow for \
+                     [{part_since},{part_until}): agreement={} between_record={}",
+                    report.agreement_edges_persisted, report.between_record_edges_persisted
+                )
+            })?;
+        graph_rows_written = graph_rows_written
+            .checked_add(part_graph_rows_written)
+            .ok_or_else(|| {
+                format!(
+                    "panel {panel_version} Graph pass write-count overflow after interval \
+                     [{part_since},{part_until}): prior={graph_rows_written} \
+                     part={part_graph_rows_written}"
+                )
+            })?;
+        last_global_xterm_cf_rows_after = report.xterm_cf_rows_after;
+        last_global_graph_cf_rows_after = report.graph_cf_rows_after;
         for provenance in [
             report.xterm_cf_rows_readback.as_str(),
             report.graph_cf_rows_readback.as_str(),
@@ -3100,11 +3145,23 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             .last_weave_records
             .insert(panel_version, records_woven);
         readback
-            .last_weave_xterm_rows
-            .insert(panel_version, last_xterm_rows);
+            .last_weave_xterm_rows_written
+            .insert(panel_version, xterm_rows_written);
         readback
-            .last_weave_graph_rows
-            .insert(panel_version, last_graph_rows);
+            .last_weave_graph_rows_written
+            .insert(panel_version, graph_rows_written);
+        readback
+            .last_weave_global_xterm_cf_rows_after
+            .insert(panel_version, last_global_xterm_cf_rows_after);
+        readback
+            .last_weave_global_graph_cf_rows_after
+            .insert(panel_version, last_global_graph_cf_rows_after);
+        readback
+            .last_weave_global_xterm_cf_rows_readback
+            .insert(panel_version, last_xterm_readback.clone());
+        readback
+            .last_weave_global_graph_cf_rows_readback
+            .insert(panel_version, last_graph_readback.clone());
         readback
             .last_weave_backlog_ns
             .insert(panel_version, backlog_ns);
@@ -3127,15 +3184,17 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         backlog_ns,
         backlog_growth_ticks = trend.consecutive_growth,
         records_woven,
-        xterm_cf_rows = last_xterm_rows,
-        graph_cf_rows = last_graph_rows,
-        xterm_cf_rows_readback = %last_xterm_readback,
-        graph_cf_rows_readback = %last_graph_readback,
+        xterm_rows_written,
+        graph_rows_written,
+        global_xterm_cf_rows_after = last_global_xterm_cf_rows_after,
+        global_graph_cf_rows_after = last_global_graph_cf_rows_after,
+        global_xterm_cf_rows_readback = %last_xterm_readback,
+        global_graph_cf_rows_readback = %last_graph_readback,
         cf_readback_walks = walked_readbacks,
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "readback=physical XTerm/Graph CF counts, each either walked on this pass or proved \
-         unchanged by an unmoved commit sequence (see *_readback); the watermark now stands at \
-         frontier_ns"
+        "readback=per-panel rows durably written plus explicit vault-global XTerm/Graph CF \
+         gauges, each either walked on this pass or proved unchanged by an unmoved commit \
+         sequence (see *_readback); the watermark now stands at frontier_ns"
     );
 
     // --- Classifying the stop: progress, or a wall (#2085) ---
