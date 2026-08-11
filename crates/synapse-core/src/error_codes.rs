@@ -63,7 +63,7 @@ pub const BROWSER_WAIT_TIMEOUT: &str = "BROWSER_WAIT_TIMEOUT";
 /// The message carries the elapsed and budget milliseconds so an agent can
 /// retry with a larger `timeout_ms` rather than guessing.
 pub const BROWSER_EVALUATE_TIMEOUT: &str = "BROWSER_EVALUATE_TIMEOUT";
-/// Chrome DevTools Protocol completed `Runtime.evaluate`, but returned
+/// `Runtime.evaluate` completed in Chrome, but returned
 /// `exceptionDetails` for the caller's JavaScript.
 ///
 /// This is a page-program failure, not a debugger attach/transport failure.
