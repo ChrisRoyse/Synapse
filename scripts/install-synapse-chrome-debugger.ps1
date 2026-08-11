@@ -2920,6 +2920,478 @@ function Read-SynapseChromeProfilePickerState {
     }
 }
 
+function Get-SynapseAutomationElementRuntimeIdString {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Automation.AutomationElement]$Element
+    )
+
+    try {
+        $parts = @($Element.GetRuntimeId())
+        if ($parts.Count -eq 0) {
+            throw 'runtime_id_empty'
+        }
+        return ($parts -join '.')
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_CONTROL_RUNTIME_ID_UNREADABLE error=$($_.Exception.Message) remediation=the exact fullscreen UIA control must expose a bounded runtime identity before Synapse may invoke it"
+    }
+}
+
+function Get-SynapseChromeTabContainerCount {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window
+    )
+
+    $condition = [System.Windows.Automation.AndCondition]::new(
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Tab
+        ),
+        [System.Windows.Automation.PropertyCondition]::new(
+            [System.Windows.Automation.AutomationElement]::ClassNameProperty,
+            'TabContainerImpl'
+        )
+    )
+    try {
+        return [int]$Window.element.FindAll(
+            [System.Windows.Automation.TreeScope]::Descendants,
+            $condition
+        ).Count
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_TAB_CONTAINER_READ_FAILED hwnd=$($Window.hwnd) pid=$($Window.pid) error=$($_.Exception.Message) remediation=reacquire the exact Chrome HWND UIA root; fullscreen classification refuses an unreadable provider tree"
+    }
+}
+
+function Get-SynapseChromeFullscreenControlFingerprint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Windows.Automation.AutomationElement]$Element
+    )
+
+    $current = $Element.Current
+    $invokeSupported = $false
+    try {
+        $null = $Element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $invokeSupported = $true
+    } catch {
+        $invokeSupported = $false
+    }
+    $owner = $null
+    try {
+        $candidate = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($Element)
+        for ($depth = 0; $candidate -and $depth -lt 12; $depth += 1) {
+            $candidateCurrent = $candidate.Current
+            if (
+                -not [string]::IsNullOrWhiteSpace([string]$candidateCurrent.AutomationId) -or
+                -not [string]::IsNullOrWhiteSpace([string]$candidateCurrent.ClassName)
+            ) {
+                $owner = $candidate
+                break
+            }
+            $candidate = [System.Windows.Automation.TreeWalker]::ControlViewWalker.GetParent($candidate)
+        }
+    } catch {
+        $owner = $null
+    }
+    $ownerRuntimeId = $null
+    $ownerAutomationId = $null
+    $ownerClassName = $null
+    $ownerName = $null
+    if ($owner) {
+        try { $ownerRuntimeId = (@($owner.GetRuntimeId()) -join '.') } catch { $ownerRuntimeId = $null }
+        $ownerAutomationId = [string]$owner.Current.AutomationId
+        $ownerClassName = [string]$owner.Current.ClassName
+        $ownerName = [string]$owner.Current.Name
+    }
+    $bounds = $current.BoundingRectangle
+    [pscustomobject]@{
+        runtime_id = Get-SynapseAutomationElementRuntimeIdString -Element $Element
+        automation_id = [string]$current.AutomationId
+        class_name = [string]$current.ClassName
+        name = [string]$current.Name
+        is_enabled = [bool]$current.IsEnabled
+        is_offscreen = [bool]$current.IsOffscreen
+        invoke_pattern_supported = [bool]$invokeSupported
+        bounds = [pscustomobject]@{
+            x = [double]$bounds.X
+            y = [double]$bounds.Y
+            width = [double]$bounds.Width
+            height = [double]$bounds.Height
+        }
+        owner_runtime_id = $ownerRuntimeId
+        owner_automation_id = $ownerAutomationId
+        owner_class_name = $ownerClassName
+        owner_name = $ownerName
+    }
+}
+
+function Find-SynapseChromeFullscreenControls {
+    param(
+        [Parameter(Mandatory = $true)]
+        $Window,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('exit', 'enter')]
+        [string]$Direction,
+        [AllowNull()]
+        $ExpectedFingerprint
+    )
+
+    $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+        [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+        [System.Windows.Automation.ControlType]::Button
+    )
+    $namePattern = if ($Direction -eq 'exit') {
+        '(?i)^Exit full screen(?:\s*\([^)]+\))?$'
+    } else {
+        '(?i)^(?:Enter )?Full screen(?:\s*\([^)]+\))?$'
+    }
+    # Never name this collection `$matches`: PowerShell variable names are
+    # case-insensitive and every successful -match/-notmatch expression writes
+    # the automatic `$Matches` hashtable in this same scope.
+    $controls = @()
+    foreach ($button in $Window.element.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonCondition)) {
+        $name = [string]$button.Current.Name
+        if ($name -notmatch $namePattern) {
+            continue
+        }
+        $fingerprint = Get-SynapseChromeFullscreenControlFingerprint -Element $button
+        if (
+            $fingerprint.invoke_pattern_supported -ne $true -or
+            $fingerprint.is_enabled -ne $true -or
+            $fingerprint.is_offscreen -eq $true -or
+            [double]$fingerprint.bounds.width -le 0 -or
+            [double]$fingerprint.bounds.height -le 0
+        ) {
+            continue
+        }
+        if ($ExpectedFingerprint) {
+            $sameControl = (
+                [string]$fingerprint.runtime_id -ceq [string]$ExpectedFingerprint.runtime_id -and
+                [string]$fingerprint.automation_id -ceq [string]$ExpectedFingerprint.automation_id -and
+                [string]$fingerprint.class_name -ceq [string]$ExpectedFingerprint.class_name -and
+                [string]$fingerprint.owner_runtime_id -ceq [string]$ExpectedFingerprint.owner_runtime_id -and
+                [string]$fingerprint.owner_automation_id -ceq [string]$ExpectedFingerprint.owner_automation_id -and
+                [string]$fingerprint.owner_class_name -ceq [string]$ExpectedFingerprint.owner_class_name
+            )
+            if (-not $sameControl) {
+                continue
+            }
+        }
+        $controls += [pscustomobject]@{
+            element = $button
+            fingerprint = $fingerprint
+        }
+    }
+    return @($controls)
+}
+
+function Test-SynapseChromeWindowIdentityExact {
+    param(
+        [Parameter(Mandatory = $true)]$Expected,
+        [Parameter(Mandatory = $true)]$Actual
+    )
+
+    return (
+        $Actual.identity_valid -eq $true -and
+        [int64]$Actual.hwnd -eq [int64]$Expected.hwnd -and
+        [int]$Actual.pid -eq [int]$Expected.pid -and
+        [uint64]$Actual.process_started_at_100ns -eq [uint64]$Expected.process_started_at_100ns -and
+        [string]$Actual.executable_path -ieq [string]$Expected.executable_path
+    )
+}
+
+function Enter-SynapseChromeMaintenanceFullscreenTransaction {
+    param(
+        [Parameter(Mandatory = $true)]$Window,
+        [Parameter(Mandatory = $true)][string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+
+    $initialContainerCount = Get-SynapseChromeTabContainerCount -Window $Window
+    if ($initialContainerCount -eq 1) {
+        $tabStrip = Read-SynapseChromeTabStripState -Window $Window
+        $selected = @($tabStrip.tabs | Where-Object { $_.selected -eq $true })
+        if ($selected.Count -ne 1) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_BASELINE_SELECTION_INVALID hwnd=$($Window.hwnd) selected_count=$($selected.Count) remediation=maintenance requires one exact selected tab before any mutation"
+        }
+        return [pscustomobject]@{
+            window = $Window
+            tab_strip = $tabStrip
+            transaction = [pscustomobject]@{
+                mode = 'none'
+                detected = $false
+                exit_attempted = $false
+                exit_verified = $true
+                restore_required = $false
+                restore_attempted = $false
+                restored = $true
+                operator_superseded = $false
+                outcome = 'not_required'
+                chrome_window_hwnd = [int64]$Window.hwnd
+                chrome_window_pid = [int]$Window.pid
+                chrome_process_started_at_100ns = [uint64]$Window.process_started_at_100ns
+                chrome_executable_path = [string]$Window.executable_path
+                selected_runtime_id = [string]$selected[0].runtime_id
+                initial_tab_container_count = 1
+                post_exit_tab_container_count = 1
+                post_restore_tab_container_count = 1
+                exit_control = $null
+                inverse_control = $null
+            }
+        }
+    }
+    if ($initialContainerCount -ne 0) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_TAB_CONTAINER_COUNT_INVALID hwnd=$($Window.hwnd) pid=$($Window.pid) count=$initialContainerCount remediation=the exact Chrome HWND must expose either one normal tab strip or zero containers plus one proven content-fullscreen exit control"
+    }
+    $picker = Read-SynapseChromeProfilePickerState -Window $Window
+    if ($picker.present) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            hwnd = $Window.hwnd
+            pid = $Window.pid
+            profile_picker = $picker
+        }) -Depth 8
+        throw "SYNAPSE_CHROME_MAINTENANCE_PROFILE_PICKER_ONLY detail=$detail remediation=this Chrome window is the profile picker, not a browser window; pick the installed profile and retry"
+    }
+    $exitControls = @(Find-SynapseChromeFullscreenControls -Window $Window -Direction exit -ExpectedFingerprint $null)
+    if ($exitControls.Count -ne 1) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            hwnd = $Window.hwnd
+            pid = $Window.pid
+            process_started_at_100ns = $Window.process_started_at_100ns
+            executable_path = $Window.executable_path
+            tab_container_count = $initialContainerCount
+            exit_control_match_count = $exitControls.Count
+            exit_control_fingerprints = @($exitControls | ForEach-Object { $_.fingerprint })
+            profile_picker = $picker
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_MODE_UNPROVEN detail=$detail remediation=zero tab containers are accepted only when the same Chrome HWND exposes one enabled visible InvokePattern content control named Exit full screen; browser/F11 fullscreen, ambiguous controls, and unreadable modes fail before tab mutation"
+    }
+    $exitFingerprint = $exitControls[0].fingerprint
+    # Publish the compensating transaction before Invoke. UIA Invoke is
+    # asynchronous and may throw after Chrome has already accepted the action;
+    # the outer failure path must therefore know the exact window/control that
+    # may need restoration even when the post-exit readback never converges.
+    $transaction = [pscustomobject]@{
+        mode = 'content_fullscreen_exact_uia_control'
+        detected = $true
+        exit_attempted = $true
+        exit_verified = $false
+        restore_required = $true
+        restore_attempted = $false
+        restored = $false
+        operator_superseded = $false
+        outcome = 'exit_invoked_pending_verification'
+        chrome_window_hwnd = [int64]$Window.hwnd
+        chrome_window_pid = [int]$Window.pid
+        chrome_process_started_at_100ns = [uint64]$Window.process_started_at_100ns
+        chrome_executable_path = [string]$Window.executable_path
+        selected_runtime_id = $null
+        initial_tab_container_count = 0
+        post_exit_tab_container_count = $null
+        post_restore_tab_container_count = $null
+        exit_control = $exitFingerprint
+        inverse_control = $null
+    }
+    $script:SynapseChromeMaintenanceFullscreenTransaction = $transaction
+    try {
+        $invoke = $exitControls[0].element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $invoke.Invoke()
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_EXIT_INVOKE_FAILED hwnd=$($Window.hwnd) pid=$($Window.pid) runtime_id=$($exitFingerprint.runtime_id) error=$($_.Exception.Message) remediation=repair the exact content fullscreen control InvokePattern; Synapse does not send Escape/F11 or click coordinates"
+    }
+    $postExit = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
+        $current = Get-SynapseChromeWindowByHwnd -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
+        if (-not $current -or -not (Test-SynapseChromeWindowIdentityExact -Expected $Window -Actual $current)) {
+            return $null
+        }
+        if ((Get-SynapseChromeTabContainerCount -Window $current) -ne 1) {
+            return $null
+        }
+        $tabs = Read-SynapseChromeTabStripState -Window $current
+        $selected = @($tabs.tabs | Where-Object { $_.selected -eq $true })
+        $inverse = @(Find-SynapseChromeFullscreenControls -Window $current -Direction enter -ExpectedFingerprint $exitFingerprint)
+        if ($selected.Count -eq 1 -and $inverse.Count -eq 1) {
+            return [pscustomobject]@{
+                window = $current
+                tab_strip = $tabs
+                selected_runtime_id = [string]$selected[0].runtime_id
+                inverse_control = $inverse[0].fingerprint
+            }
+        }
+        return $null
+    }
+    if (-not $postExit) {
+        $latest = Get-SynapseChromeWindowByHwnd -Hwnd $Window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
+        $latestContainerCount = if ($latest) { Get-SynapseChromeTabContainerCount -Window $latest } else { -1 }
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            expected_window = $Window
+            latest_window = $latest
+            latest_tab_container_count = $latestContainerCount
+            exit_control = $exitFingerprint
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_EXIT_NOT_CONFIRMED detail=$detail remediation=Invoke is asynchronous; the exact window must be freshly reacquired with one tab strip, one selected tab, and the same control fingerprint in its enter-fullscreen state before any maintenance tab is created"
+    }
+    $transaction.exit_verified = $true
+    $transaction.outcome = 'exited_pending_restore'
+    $transaction.selected_runtime_id = [string]$postExit.selected_runtime_id
+    $transaction.post_exit_tab_container_count = 1
+    $transaction.inverse_control = $postExit.inverse_control
+    return [pscustomobject]@{
+        window = $postExit.window
+        tab_strip = $postExit.tab_strip
+        transaction = $transaction
+    }
+}
+
+function Restore-SynapseChromeMaintenanceFullscreenTransaction {
+    param(
+        [Parameter(Mandatory = $true)]$Transaction,
+        [Parameter(Mandatory = $true)]$SelectionRestore,
+        [Parameter(Mandatory = $true)][string]$ChromeUserDataRoot,
+        [Parameter(Mandatory = $true)][datetime]$Deadline
+    )
+
+    if ([string]$Transaction.mode -eq 'none') {
+        $Transaction.restore_attempted = $false
+        $Transaction.restored = $true
+        $Transaction.operator_superseded = $false
+        $Transaction.outcome = 'not_required'
+        return $Transaction
+    }
+    if ([string]$Transaction.mode -cne 'content_fullscreen_exact_uia_control') {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_LEASE_MODE_INVALID mode=$($Transaction.mode) remediation=cleanup accepts only none or content_fullscreen_exact_uia_control from the immediately preceding installer transaction"
+    }
+    if ($SelectionRestore.operator_superseded -eq $true) {
+        $Transaction.restore_attempted = $false
+        $Transaction.restored = $false
+        $Transaction.operator_superseded = $true
+        $Transaction.outcome = 'operator_superseded'
+        return $Transaction
+    }
+    $current = Get-SynapseChromeWindowByHwnd `
+        -Hwnd ([int64]$Transaction.chrome_window_hwnd) `
+        -ChromeUserDataRoot $ChromeUserDataRoot
+    if (-not $current -or -not (Test-SynapseChromeWindowIdentityExact -Expected ([pscustomobject]@{
+        hwnd = [int64]$Transaction.chrome_window_hwnd
+        pid = [int]$Transaction.chrome_window_pid
+        process_started_at_100ns = [uint64]$Transaction.chrome_process_started_at_100ns
+        executable_path = [string]$Transaction.chrome_executable_path
+    }) -Actual $current)) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            transaction = $Transaction
+            current_window = $current
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_IDENTITY_DRIFT detail=$detail remediation=the original Chrome HWND/PID/process-start/image must still exist before fullscreen can be restored"
+    }
+    $currentContainerCount = Get-SynapseChromeTabContainerCount -Window $current
+    if ($currentContainerCount -eq 0) {
+        $alreadyRestoredControls = @(Find-SynapseChromeFullscreenControls `
+            -Window $current `
+            -Direction exit `
+            -ExpectedFingerprint $Transaction.exit_control)
+        if ($alreadyRestoredControls.Count -ne 1) {
+            $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+                transaction = $Transaction
+                tab_container_count = $currentContainerCount
+                exact_exit_control_match_count = $alreadyRestoredControls.Count
+                exit_controls = @($alreadyRestoredControls | ForEach-Object { $_.fingerprint })
+            }) -Depth 10
+            throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_ALREADY_RESTORED_UNPROVEN detail=$detail remediation=zero tab containers count as restored only when the exact original fullscreen exit control is independently present"
+        }
+        $Transaction.restore_attempted = $false
+        $Transaction.restored = $true
+        $Transaction.operator_superseded = $false
+        $Transaction.outcome = 'already_restored_content_fullscreen'
+        $Transaction.post_restore_tab_container_count = 0
+        return $Transaction
+    }
+    if ($currentContainerCount -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_TAB_CONTAINER_COUNT_INVALID hwnd=$($current.hwnd) count=$currentContainerCount remediation=restoration accepts only one normal tab strip or zero containers with the exact original fullscreen exit control"
+    }
+    $tabs = Read-SynapseChromeTabStripState -Window $current
+    $selected = @($tabs.tabs | Where-Object { $_.selected -eq $true })
+    if ($selected.Count -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_SELECTION_AMBIGUOUS hwnd=$($current.hwnd) selected_count=$($selected.Count) remediation=fullscreen restoration requires one exact selected tab"
+    }
+    if (
+        -not [string]::IsNullOrWhiteSpace([string]$Transaction.selected_runtime_id) -and
+        [string]$selected[0].runtime_id -cne [string]$Transaction.selected_runtime_id
+    ) {
+        $Transaction.restore_attempted = $false
+        $Transaction.restored = $false
+        $Transaction.operator_superseded = $true
+        $Transaction.outcome = 'operator_superseded'
+        return $Transaction
+    }
+    $inverseControls = @(Find-SynapseChromeFullscreenControls `
+        -Window $current `
+        -Direction enter `
+        -ExpectedFingerprint $Transaction.exit_control)
+    if ($inverseControls.Count -ne 1) {
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            expected_control = $Transaction.exit_control
+            inverse_match_count = $inverseControls.Count
+            inverse_controls = @($inverseControls | ForEach-Object { $_.fingerprint })
+            selected_runtime_id = [string]$selected[0].runtime_id
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_CONTROL_NOT_UNIQUE detail=$detail remediation=the original selected document must expose one inverse InvokePattern control with the exact bounded runtime/owner/class/automation fingerprint"
+    }
+    $Transaction.restore_attempted = $true
+    try {
+        $invoke = $inverseControls[0].element.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+        $invoke.Invoke()
+    } catch {
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_INVOKE_FAILED hwnd=$($current.hwnd) runtime_id=$($Transaction.exit_control.runtime_id) error=$($_.Exception.Message) remediation=repair the exact inverse fullscreen control; Synapse does not synthesize Escape/F11 or coordinates"
+    }
+    $restored = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
+        $afterWindow = Get-SynapseChromeWindowByHwnd `
+            -Hwnd ([int64]$Transaction.chrome_window_hwnd) `
+            -ChromeUserDataRoot $ChromeUserDataRoot
+        if (-not $afterWindow) {
+            return $null
+        }
+        $expected = [pscustomobject]@{
+            hwnd = [int64]$Transaction.chrome_window_hwnd
+            pid = [int]$Transaction.chrome_window_pid
+            process_started_at_100ns = [uint64]$Transaction.chrome_process_started_at_100ns
+            executable_path = [string]$Transaction.chrome_executable_path
+        }
+        if (-not (Test-SynapseChromeWindowIdentityExact -Expected $expected -Actual $afterWindow)) {
+            return $null
+        }
+        $containerCount = Get-SynapseChromeTabContainerCount -Window $afterWindow
+        $exitControls = @(Find-SynapseChromeFullscreenControls `
+            -Window $afterWindow `
+            -Direction exit `
+            -ExpectedFingerprint $Transaction.exit_control)
+        if ($containerCount -eq 0 -and $exitControls.Count -eq 1) {
+            return [pscustomobject]@{
+                window = $afterWindow
+                container_count = $containerCount
+                exit_control = $exitControls[0].fingerprint
+            }
+        }
+        return $null
+    }
+    if (-not $restored) {
+        $latest = Get-SynapseChromeWindowByHwnd `
+            -Hwnd ([int64]$Transaction.chrome_window_hwnd) `
+            -ChromeUserDataRoot $ChromeUserDataRoot
+        $detail = ConvertTo-CompressedJson -Value ([ordered]@{
+            transaction = $Transaction
+            latest_window = $latest
+            latest_container_count = if ($latest) { Get-SynapseChromeTabContainerCount -Window $latest } else { -1 }
+        }) -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_NOT_CONFIRMED detail=$detail remediation=the exact original fullscreen exit control and zero-tab-container state were not independently observed before the deadline"
+    }
+    $Transaction.restored = $true
+    $Transaction.operator_superseded = $false
+    $Transaction.outcome = 'restored_content_fullscreen'
+    $Transaction.post_restore_tab_container_count = 0
+    return $Transaction
+}
+
 function Read-SynapseChromeTabStripState {
     param(
         [Parameter(Mandatory = $true)]
@@ -3124,7 +3596,13 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         throw "SYNAPSE_CHROME_MAINTENANCE_WINDOW_IDENTITY_CHANGED_AFTER_FOREGROUND detail=$detail remediation=the foreground HWND no longer belongs to the exact eligible Chrome profile selected before acquisition; setup refuses cross-profile tab creation"
     }
     $chromeWindow = $foregroundWindow
-    $tabStripBefore = Read-SynapseChromeTabStripState -Window $chromeWindow
+    $fullscreenState = Enter-SynapseChromeMaintenanceFullscreenTransaction `
+        -Window $chromeWindow `
+        -ChromeUserDataRoot $ChromeUserDataRoot `
+        -Deadline $Deadline
+    $chromeWindow = $fullscreenState.window
+    $tabStripBefore = $fullscreenState.tab_strip
+    $script:SynapseChromeMaintenanceFullscreenTransaction = $fullscreenState.transaction
 
     $newTabCondition = [System.Windows.Automation.AndCondition]::new(
         [System.Windows.Automation.PropertyCondition]::new(
@@ -3264,6 +3742,7 @@ function Enter-SynapseOwnedChromeMaintenanceTab {
         expected_tab_count_after_cleanup = $tabStripBefore.count
         created_via_ui = $true
         foreground_lease = $foregroundLease
+        fullscreen_transaction = $fullscreenState.transaction
     }
     # Publish ownership before navigation so every later failure, including
     # concurrent address-bar input, is cleaned by exact UIA runtime identity.
@@ -3341,57 +3820,6 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
         }) -Depth 12
         throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_ID_NOT_UNIQUE detail=$detail remediation=cleanup requires the one exact UIA tab identity created by this operation"
     }
-    if ($ownedRows[0].selected -ne $true) {
-        $tabItemCondition = [System.Windows.Automation.PropertyCondition]::new(
-            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-            [System.Windows.Automation.ControlType]::TabItem
-        )
-        $items = $window.element.FindAll(
-            [System.Windows.Automation.TreeScope]::Descendants,
-            $tabItemCondition
-        )
-        $ownedElements = @()
-        foreach ($item in $items) {
-            $runtimeId = '<unavailable>'
-            try {
-                $runtimeId = (@($item.GetRuntimeId()) -join '.')
-            } catch {
-                $runtimeId = "<error:$($_.Exception.Message)>"
-            }
-            if ($runtimeId -ceq $ownedRuntimeId) {
-                $ownedElements += $item
-            }
-        }
-        if ($ownedElements.Count -ne 1) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_ELEMENT_NOT_UNIQUE hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId match_count=$($ownedElements.Count) token=$($Lease.token) remediation=repair Chrome UI Automation identity exposure before cleanup"
-        }
-        try {
-            $selection = $ownedElements[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-            $selection.Select()
-        } catch {
-            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_SELECT_FAILED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId token=$($Lease.token) error=$($_.Exception.Message) remediation=repair Chrome UI Automation tab selection before cleanup"
-        }
-        $selectedOwned = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-            $current = Get-SynapseChromeWindowByHwnd `
-                -Hwnd $window.hwnd `
-                -ChromeUserDataRoot $ChromeUserDataRoot
-            if (-not $current) {
-                return $null
-            }
-            $tabs = Read-SynapseChromeTabStripState -Window $current
-            $selected = @($tabs.tabs | Where-Object { $_.selected -eq $true })
-            if ($selected.Count -eq 1 -and [string]$selected[0].runtime_id -ceq $ownedRuntimeId) {
-                return $tabs
-            }
-            return $null
-        }
-        if (-not $selectedOwned) {
-            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_RUNTIME_SELECT_NOT_CONFIRMED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId token=$($Lease.token) remediation=the exact operation-created tab was not independently observed selected"
-        }
-        $window = Get-SynapseChromeWindowByHwnd `
-            -Hwnd $Lease.chrome_window_hwnd `
-            -ChromeUserDataRoot $ChromeUserDataRoot
-    }
     $navigationBefore = Read-SynapseChromeNavigationState -Hwnd $window.hwnd -ChromeUserDataRoot $ChromeUserDataRoot
     $addressBefore = ([string]$navigationBefore.address_bar_value).Trim().TrimEnd('/')
     $markerAddress = ([string]$Lease.marker_url).Trim().TrimEnd('/')
@@ -3401,27 +3829,48 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
     # query string from chrome:// URLs, so the token this lease was built around is
     # erased from the omnibox by the very navigation the operation performs. The
     # durable identity is the UIA runtime id of the exact tab this operation
-    # created, which is already what selection is verified against above. Refusing
-    # Refusing any close against a tab we cannot prove we own stays correct;
-    # this only stops a correctly-owned tab being disowned by URL normalisation.
-    # Read the strip again here rather than reusing the pre-selection snapshot, so
-    # the selected identity is the one that exists at the moment of the check.
+    # created. It does not need to be selected: selecting it here would overwrite
+    # a newer operator selection before cleanup had a chance to classify it.
+    # Read the strip again here rather than reusing the first snapshot so the
+    # unique runtime identity is proven at the destructive boundary.
     $tabsAtOwnershipCheck = Read-SynapseChromeTabStripState -Window $window
     $selectedTabs = @($tabsAtOwnershipCheck.tabs | Where-Object { $_.selected -eq $true })
-    $ownedRuntime = (
-        $selectedTabs.Count -eq 1 -and
-        [string]$selectedTabs[0].runtime_id -ceq [string]$Lease.owned_tab_runtime_id
-    )
+    if ($selectedTabs.Count -ne 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_SELECTION_AMBIGUOUS hwnd=$($window.hwnd) selected_count=$($selectedTabs.Count) token=$($Lease.token) remediation=cleanup refuses to mutate Chrome unless one exact selected runtime identity can be preserved"
+    }
+    $selectionAtOwnedClose = [string]$selectedTabs[0].runtime_id
+    $orderedRuntimeIdsAtClose = @($tabsAtOwnershipCheck.tabs | ForEach-Object { [string]$_.runtime_id })
+    $ownedIndexesAtClose = @()
+    for ($tabIndex = 0; $tabIndex -lt $orderedRuntimeIdsAtClose.Count; $tabIndex += 1) {
+        if ($orderedRuntimeIdsAtClose[$tabIndex] -ceq [string]$Lease.owned_tab_runtime_id) {
+            $ownedIndexesAtClose += $tabIndex
+        }
+    }
+    $ownedRuntimeMatches = $ownedIndexesAtClose.Count
+    $ownedRuntime = ($ownedRuntimeMatches -eq 1)
     if (-not ($ownedAddress -or $ownedRuntime)) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             lease = $Lease
             navigation_before = $navigationBefore
             owned_by_address = $ownedAddress
             owned_by_runtime_id = $ownedRuntime
+            owned_runtime_id_match_count = $ownedRuntimeMatches
             expected_runtime_id = [string]$Lease.owned_tab_runtime_id
             selected_runtime_ids = @($selectedTabs | ForEach-Object { [string]$_.runtime_id })
         }) -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is neither the active exact marker/token tab nor the exact UIA runtime identity this operation created; setup refuses any close against an operator tab"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_OWNERSHIP_LOST detail=$detail remediation=the operation-created tab is neither the active exact marker/token tab nor one unique exact UIA runtime identity; setup refuses any close against an operator tab"
+    }
+    $expectedChromeSelectionAfterOwnedClose = $null
+    if ($selectionAtOwnedClose -ceq $ownedRuntimeId) {
+        $ownedIndexAtClose = [int]$ownedIndexesAtClose[0]
+        if ($ownedIndexAtClose + 1 -lt $orderedRuntimeIdsAtClose.Count) {
+            $expectedChromeSelectionAfterOwnedClose = [string]$orderedRuntimeIdsAtClose[$ownedIndexAtClose + 1]
+        } elseif ($ownedIndexAtClose -gt 0) {
+            $expectedChromeSelectionAfterOwnedClose = [string]$orderedRuntimeIdsAtClose[$ownedIndexAtClose - 1]
+        }
+        if ([string]::IsNullOrWhiteSpace($expectedChromeSelectionAfterOwnedClose)) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_POST_CLOSE_SELECTION_UNDEFINED hwnd=$($window.hwnd) owned_runtime_id=$ownedRuntimeId tab_count=$($orderedRuntimeIdsAtClose.Count) remediation=cleanup refuses to close the only tab because Chrome would replace it with an unleased document"
+        }
     }
     # Close the exact owned UIA tab element directly. Ctrl+W depends on the
     # global foreground at the instant the key arrives, so concurrent operator
@@ -3521,6 +3970,7 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
     $selectionRestore = [pscustomobject]@{
         attempted = $false
         restored = $false
+        operator_superseded = $false
         reason = 'no_precreate_tab_strip_snapshot'
         expected_runtime_id = $null
         before_runtime_id = $null
@@ -3533,64 +3983,133 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUiCore {
         }
         $expectedRuntimeId = [string]$expectedSelected[0].runtime_id
         $selectedBeforeRestore = @($after.tab_strip.tabs | Where-Object { $_.selected -eq $true })
-        $beforeRuntimeId = if ($selectedBeforeRestore.Count -eq 1) { [string]$selectedBeforeRestore[0].runtime_id } else { '<ambiguous>' }
-        if ($beforeRuntimeId -cne $expectedRuntimeId) {
-            $currentWindow = Get-SynapseChromeWindowByHwnd -Hwnd $window.hwnd
-            $tabItemCondition = [System.Windows.Automation.PropertyCondition]::new(
-                [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
-                [System.Windows.Automation.ControlType]::TabItem
-            )
-            $items = $currentWindow.element.FindAll(
-                [System.Windows.Automation.TreeScope]::Descendants,
-                $tabItemCondition
-            )
-            $matches = @()
-            foreach ($item in $items) {
-                $runtimeId = '<unavailable>'
+        if ($selectedBeforeRestore.Count -ne 1) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_AFTER_CLOSE_AMBIGUOUS hwnd=$($window.hwnd) selected_count=$($selectedBeforeRestore.Count) token=$($Lease.token) remediation=cleanup must observe one exact selected runtime identity after closing its owned tab"
+        }
+        $beforeRuntimeId = [string]$selectedBeforeRestore[0].runtime_id
+        if ($selectionAtOwnedClose -cne $ownedRuntimeId) {
+            # The maintenance tab was not selected at the destructive boundary.
+            # Closing its exact close glyph cannot own a selection change, so the
+            # existing selection is newer operator state and must be preserved.
+            $selectionRestore = [pscustomobject]@{
+                attempted = $false
+                restored = $false
+                operator_superseded = $true
+                reason = 'preserved_newer_operator_selection'
+                expected_runtime_id = $expectedRuntimeId
+                before_runtime_id = $beforeRuntimeId
+                after_runtime_id = $beforeRuntimeId
+            }
+        } elseif ($beforeRuntimeId -ceq $expectedRuntimeId) {
+            $selectionRestore = [pscustomobject]@{
+                attempted = $false
+                restored = $true
+                operator_superseded = $false
+                reason = 'already_restored_by_chrome_after_owned_close'
+                expected_runtime_id = $expectedRuntimeId
+                before_runtime_id = $beforeRuntimeId
+                after_runtime_id = $beforeRuntimeId
+            }
+        } elseif ($beforeRuntimeId -cne $expectedChromeSelectionAfterOwnedClose) {
+            # When the selected owned tab closes, Chrome deterministically
+            # selects its right neighbour, or its left neighbour at the right
+            # edge. Any other observed identity is newer operator state.
+            $selectionRestore = [pscustomobject]@{
+                attempted = $false
+                restored = $false
+                operator_superseded = $true
+                reason = 'preserved_non_deterministic_post_close_selection'
+                expected_runtime_id = $expectedRuntimeId
+                before_runtime_id = $beforeRuntimeId
+                after_runtime_id = $beforeRuntimeId
+            }
+        } else {
+            # A selected right-edge maintenance tab makes Chrome select its
+            # immediate left neighbour when its own close glyph is invoked. That
+            # deterministic transition belongs to this operation, not the
+            # operator. Compare again immediately before restoring the baseline;
+            # any second change is genuine supersession and is preserved.
+            $currentWindow = Get-SynapseChromeWindowByHwnd `
+                -Hwnd $window.hwnd `
+                -ChromeUserDataRoot $ChromeUserDataRoot
+            if (-not $currentWindow) {
+                throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_WINDOW_MISSING hwnd=$($window.hwnd) token=$($Lease.token) remediation=the exact Chrome window disappeared after owned-tab close"
+            }
+            $freshTabs = Read-SynapseChromeTabStripState -Window $currentWindow
+            $freshSelected = @($freshTabs.tabs | Where-Object { $_.selected -eq $true })
+            if ($freshSelected.Count -ne 1) {
+                throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_CURRENT_AMBIGUOUS hwnd=$($window.hwnd) selected_count=$($freshSelected.Count) token=$($Lease.token) remediation=one exact current selection is required at the compare-and-act boundary"
+            }
+            $freshRuntimeId = [string]$freshSelected[0].runtime_id
+            if ($freshRuntimeId -cne $beforeRuntimeId) {
+                $after.tab_strip = $freshTabs
+                $selectionRestore = [pscustomobject]@{
+                    attempted = $false
+                    restored = $false
+                    operator_superseded = $true
+                    reason = 'preserved_newer_operator_selection_during_restore'
+                    expected_runtime_id = $expectedRuntimeId
+                    before_runtime_id = $beforeRuntimeId
+                    after_runtime_id = $freshRuntimeId
+                }
+            } else {
+                $tabItemCondition = [System.Windows.Automation.PropertyCondition]::new(
+                    [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+                    [System.Windows.Automation.ControlType]::TabItem
+                )
+                $items = $currentWindow.element.FindAll(
+                    [System.Windows.Automation.TreeScope]::Descendants,
+                    $tabItemCondition
+                )
+                $matches = @()
+                foreach ($item in $items) {
+                    $runtimeId = '<unavailable>'
+                    try {
+                        $runtimeId = (@($item.GetRuntimeId()) -join '.')
+                    } catch {
+                        $runtimeId = "<error:$($_.Exception.Message)>"
+                    }
+                    if ($runtimeId -ceq $expectedRuntimeId) {
+                        $matches += $item
+                    }
+                }
+                if ($matches.Count -ne 1) {
+                    throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_TARGET_NOT_UNIQUE hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId match_count=$($matches.Count) token=$($Lease.token) remediation=setup closed its maintenance tab but refuses to guess which operator tab was previously selected"
+                }
                 try {
-                    $runtimeId = (@($item.GetRuntimeId()) -join '.')
+                    $selection = $matches[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
+                    $selection.Select()
                 } catch {
-                    $runtimeId = "<error:$($_.Exception.Message)>"
+                    throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_FAILED hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId error=$($_.Exception.Message) remediation=repair Chrome UI Automation tab selection before accepting maintenance cleanup"
                 }
-                if ($runtimeId -ceq $expectedRuntimeId) {
-                    $matches += $item
-                }
-            }
-            if ($matches.Count -ne 1) {
-                throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_TARGET_NOT_UNIQUE hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId match_count=$($matches.Count) token=$($Lease.token) remediation=setup closed its maintenance tab but refuses to guess which operator tab was previously selected"
-            }
-            try {
-                $selection = $matches[0].GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern)
-                $selection.Select()
-            } catch {
-                throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_FAILED hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId error=$($_.Exception.Message) remediation=repair Chrome UI Automation tab selection before accepting maintenance cleanup"
-            }
-            $restored = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
-                $current = Get-SynapseChromeWindowByHwnd -Hwnd $window.hwnd
-                if (-not $current) {
+                $restored = Wait-SynapseUntil -Deadline $Deadline -SleepMilliseconds 100 -Probe {
+                    $current = Get-SynapseChromeWindowByHwnd `
+                        -Hwnd $window.hwnd `
+                        -ChromeUserDataRoot $ChromeUserDataRoot
+                    if (-not $current) {
+                        return $null
+                    }
+                    $tabs = Read-SynapseChromeTabStripState -Window $current
+                    $selected = @($tabs.tabs | Where-Object { $_.selected -eq $true })
+                    if ($selected.Count -eq 1 -and [string]$selected[0].runtime_id -ceq $expectedRuntimeId) {
+                        return $tabs
+                    }
                     return $null
                 }
-                $tabs = Read-SynapseChromeTabStripState -Window $current
-                $selected = @($tabs.tabs | Where-Object { $_.selected -eq $true })
-                if ($selected.Count -eq 1 -and [string]$selected[0].runtime_id -ceq $expectedRuntimeId) {
-                    return $tabs
+                if (-not $restored) {
+                    throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_NOT_CONFIRMED hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId token=$($Lease.token) remediation=the previously-selected operator tab was not independently observed selected after cleanup"
                 }
-                return $null
+                $after.tab_strip = $restored
+                $selectionRestore = [pscustomobject]@{
+                    attempted = $true
+                    restored = $true
+                    operator_superseded = $false
+                    reason = 'restored_exact_precreate_runtime_id_after_owned_close'
+                    expected_runtime_id = $expectedRuntimeId
+                    before_runtime_id = $beforeRuntimeId
+                    after_runtime_id = $expectedRuntimeId
+                }
             }
-            if (-not $restored) {
-                throw "SYNAPSE_CHROME_MAINTENANCE_SELECTION_RESTORE_NOT_CONFIRMED hwnd=$($window.hwnd) expected_runtime_id=$expectedRuntimeId token=$($Lease.token) remediation=the previously-selected operator tab was not independently observed selected after cleanup"
-            }
-            $after.tab_strip = $restored
-        }
-        $selectedAfterRestore = @($after.tab_strip.tabs | Where-Object { $_.selected -eq $true })
-        $afterRuntimeId = if ($selectedAfterRestore.Count -eq 1) { [string]$selectedAfterRestore[0].runtime_id } else { '<ambiguous>' }
-        $selectionRestore = [pscustomobject]@{
-            attempted = ($beforeRuntimeId -cne $expectedRuntimeId)
-            restored = ($afterRuntimeId -ceq $expectedRuntimeId)
-            reason = if ($beforeRuntimeId -ceq $expectedRuntimeId) { 'already_restored_by_chrome' } else { 'uia_selection_item_exact_runtime_id' }
-            expected_runtime_id = $expectedRuntimeId
-            before_runtime_id = $beforeRuntimeId
-            after_runtime_id = $afterRuntimeId
         }
     }
     [pscustomobject]@{
@@ -3631,6 +4150,26 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         $cleanupError = $_.Exception.Message
     }
 
+    $fullscreenTransaction = $Lease.fullscreen_transaction
+    if (-not $fullscreenTransaction) {
+        $fullscreenTransaction = $script:SynapseChromeMaintenanceFullscreenTransaction
+    }
+    $fullscreen = $null
+    $fullscreenError = $null
+    if ($fullscreenTransaction -and $cleanup) {
+        try {
+            $fullscreen = Restore-SynapseChromeMaintenanceFullscreenTransaction `
+                -Transaction $fullscreenTransaction `
+                -SelectionRestore $cleanup.prior_selection_restore `
+                -ChromeUserDataRoot $ChromeUserDataRoot `
+                -Deadline $Deadline
+        } catch {
+            $fullscreenError = $_.Exception.Message
+        }
+    } elseif (-not $fullscreenTransaction) {
+        $fullscreenError = 'SYNAPSE_CHROME_MAINTENANCE_FULLSCREEN_RESTORE_LEASE_MISSING remediation=cleanup cannot classify or restore the original Chrome display mode without the exact pre-operation fullscreen transaction'
+    }
+
     $foregroundLease = $Lease.foreground_lease
     if (-not $foregroundLease) {
         $foregroundLease = $script:SynapseChromeMaintenanceForegroundLease
@@ -3649,16 +4188,24 @@ function Close-SynapseOwnedChromeMaintenanceTabViaUi {
         $foregroundError = 'SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_LEASE_MISSING remediation=cleanup cannot prove whether it still owns the foreground without the pre-operation and acquired-Chrome identities'
     }
 
-    if ($cleanupError -and $foregroundError) {
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_AND_FOREGROUND_RESTORE_FAILED cleanup_error=$cleanupError foreground_error=$foregroundError remediation=repair both exact tab cleanup and foreground transaction conditions; neither failure is hidden"
+    $transactionErrors = @()
+    if ($cleanupError) { $transactionErrors += "cleanup_error=$cleanupError" }
+    if ($fullscreenError) { $transactionErrors += "fullscreen_error=$fullscreenError" }
+    if ($foregroundError) { $transactionErrors += "foreground_error=$foregroundError" }
+    if ($transactionErrors.Count -gt 1) {
+        throw "SYNAPSE_CHROME_MAINTENANCE_TRANSACTION_FAILED failures=$($transactionErrors -join ' | ') remediation=repair every named exact cleanup/fullscreen/foreground transaction condition; no failure is hidden"
     }
     if ($cleanupError) {
         $foregroundJson = ConvertTo-CompressedJson -Value $foreground -Depth 10
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_FAILED cleanup_error=$cleanupError foreground_transaction=$foregroundJson remediation=the exact foreground transaction completed, but tab cleanup did not prove its postconditions"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_FAILED cleanup_error=$cleanupError foreground_transaction=$foregroundJson remediation=the exact foreground transaction completed, but tab cleanup did not prove its postconditions; fullscreen was not mutated again without a proven cleanup selection"
+    }
+    if ($fullscreenError) {
+        throw $fullscreenError
     }
     if ($foregroundError) {
         throw $foregroundError
     }
+    $cleanup | Add-Member -NotePropertyName fullscreen_transaction -NotePropertyValue $fullscreen -Force
     $cleanup | Add-Member -NotePropertyName foreground_transaction -NotePropertyValue $foreground -Force
     return $cleanup
 }
@@ -4392,7 +4939,32 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
         [int64]$cleanupLease.foreground_lease.acquired_chrome_foreground.hwnd -ne [int64]$cleanupLease.chrome_window_hwnd -or
         [int]$cleanupLease.foreground_lease.acquired_chrome_foreground.pid -ne [int]$cleanupLease.chrome_window_pid -or
         [uint64]$cleanupLease.foreground_lease.acquired_chrome_foreground.process_started_at_100ns -eq 0 -or
-        [string]::IsNullOrWhiteSpace([string]$cleanupLease.foreground_lease.acquired_chrome_foreground.executable_path)
+        [string]::IsNullOrWhiteSpace([string]$cleanupLease.foreground_lease.acquired_chrome_foreground.executable_path) -or
+        $null -eq $cleanupLease.fullscreen_transaction -or
+        [string]$cleanupLease.fullscreen_transaction.mode -notin @('none', 'content_fullscreen_exact_uia_control') -or
+        [int64]$cleanupLease.fullscreen_transaction.chrome_window_hwnd -ne [int64]$cleanupLease.chrome_window_hwnd -or
+        [int]$cleanupLease.fullscreen_transaction.chrome_window_pid -ne [int]$cleanupLease.chrome_window_pid -or
+        [uint64]$cleanupLease.fullscreen_transaction.chrome_process_started_at_100ns -eq 0 -or
+        [string]::IsNullOrWhiteSpace([string]$cleanupLease.fullscreen_transaction.chrome_executable_path) -or
+        (
+            [string]$cleanupLease.fullscreen_transaction.mode -ceq 'content_fullscreen_exact_uia_control' -and
+            (
+                $cleanupLease.fullscreen_transaction.detected -ne $true -or
+                $cleanupLease.fullscreen_transaction.exit_attempted -ne $true -or
+                $cleanupLease.fullscreen_transaction.exit_verified -ne $true -or
+                $cleanupLease.fullscreen_transaction.restore_required -ne $true -or
+                [string]::IsNullOrWhiteSpace([string]$cleanupLease.fullscreen_transaction.selected_runtime_id) -or
+                $null -eq $cleanupLease.fullscreen_transaction.exit_control -or
+                [string]::IsNullOrWhiteSpace([string]$cleanupLease.fullscreen_transaction.exit_control.runtime_id) -or
+                [string]::IsNullOrWhiteSpace([string]$cleanupLease.fullscreen_transaction.exit_control.name) -or
+                $cleanupLease.fullscreen_transaction.exit_control.invoke_pattern_supported -ne $true -or
+                $cleanupLease.fullscreen_transaction.exit_control.is_enabled -ne $true -or
+                $cleanupLease.fullscreen_transaction.exit_control.is_offscreen -eq $true -or
+                [double]$cleanupLease.fullscreen_transaction.exit_control.bounds.width -le 0 -or
+                [double]$cleanupLease.fullscreen_transaction.exit_control.bounds.height -le 0 -or
+                $null -eq $cleanupLease.fullscreen_transaction.inverse_control
+            )
+        )
     ) {
         $detail = ConvertTo-CompressedJson -Value ([ordered]@{
             supplied_token = $MaintenanceTabToken
@@ -4400,7 +4972,7 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
             supplied_marker_title = $MaintenanceMarkerTitle
             lease = $cleanupLease
         }) -Depth 12
-        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_LEASE_MISMATCH detail=$detail remediation=cleanup-only refuses any lease whose token, marker, UI ownership source, tab count, or exact prior/acquired HWND/PID/process-start/image identity differs"
+        throw "SYNAPSE_CHROME_MAINTENANCE_CLEANUP_LEASE_MISMATCH detail=$detail remediation=cleanup-only refuses any lease whose token, marker, UI ownership source, tab count, exact window/foreground identity, or bounded fullscreen transaction differs"
     }
     $cleanupDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
     $cleanup = Close-SynapseOwnedChromeMaintenanceTabViaUi `
@@ -4425,6 +4997,7 @@ if ($CleanupOwnedMaintenanceTabViaUi) {
 
 $script:SynapseChromeMaintenanceTabLease = $null
 $script:SynapseChromeMaintenanceForegroundLease = $null
+$script:SynapseChromeMaintenanceFullscreenTransaction = $null
 try {
     $chromeBridgeAutoInstall = Invoke-SynapseChromeBridgeAutoInstall `
         -ChromeUserDataRoot $chromeUserDataRoot `
@@ -4461,6 +5034,45 @@ try {
             $cleanupError = $_.Exception.Message
             throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_CLEANUP_FAILED operation_error=$operationError cleanup_error=$cleanupError token=$($script:SynapseChromeMaintenanceTabLease.token) hwnd=$($script:SynapseChromeMaintenanceTabLease.chrome_window_hwnd) chrome_tab_id=$($script:SynapseChromeMaintenanceTabLease.chrome_tab_id) remediation=inspect the exact ownership identity and remove only that tab after proving its marker/token URL"
         }
+    }
+    if (
+        $script:SynapseChromeMaintenanceFullscreenTransaction -and
+        -not $script:SynapseChromeMaintenanceTabLease
+    ) {
+        # Fullscreen exit is published before its asynchronous Invoke. If a
+        # later pre-tab proof fails, compensate that exact display-mode
+        # transaction before restoring the original foreground.
+        $recoveryDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))
+        $fullscreenRecovery = $null
+        $fullscreenRecoveryError = $null
+        $foregroundRecovery = $null
+        $foregroundRecoveryError = $null
+        try {
+            $fullscreenRecovery = Restore-SynapseChromeMaintenanceFullscreenTransaction `
+                -Transaction $script:SynapseChromeMaintenanceFullscreenTransaction `
+                -SelectionRestore ([pscustomobject]@{ operator_superseded = $false }) `
+                -ChromeUserDataRoot $chromeUserDataRoot `
+                -Deadline $recoveryDeadline
+        } catch {
+            $fullscreenRecoveryError = $_.Exception.Message
+        }
+        if ($script:SynapseChromeMaintenanceForegroundLease) {
+            try {
+                $foregroundRecovery = Restore-SynapseChromeMaintenanceForeground `
+                    -ForegroundLease $script:SynapseChromeMaintenanceForegroundLease `
+                    -Deadline $recoveryDeadline
+            } catch {
+                $foregroundRecoveryError = $_.Exception.Message
+            }
+        } else {
+            $foregroundRecoveryError = 'SYNAPSE_CHROME_MAINTENANCE_FOREGROUND_RESTORE_LEASE_MISSING'
+        }
+        if ($fullscreenRecoveryError -or $foregroundRecoveryError) {
+            throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_PRETAB_RECOVERY_FAILED operation_error=$operationError fullscreen_error=$fullscreenRecoveryError foreground_error=$foregroundRecoveryError remediation=repair every named exact fullscreen/foreground recovery condition; no maintenance tab was created and no substitute input was sent"
+        }
+        $fullscreenJson = ConvertTo-CompressedJson -Value $fullscreenRecovery -Depth 12
+        $foregroundJson = ConvertTo-CompressedJson -Value $foregroundRecovery -Depth 10
+        throw "SYNAPSE_CHROME_MAINTENANCE_OPERATION_FAILED operation_error=$operationError fullscreen_transaction=$fullscreenJson foreground_transaction=$foregroundJson remediation=the pre-tab operation failed, and the exact original display mode and foreground were independently restored"
     }
     if ($script:SynapseChromeMaintenanceForegroundLease) {
         $foregroundDeadline = (Get-Date).AddSeconds([Math]::Max(5, [Math]::Min(30, $AutoInstallTimeoutSeconds)))

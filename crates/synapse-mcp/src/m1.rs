@@ -1896,7 +1896,10 @@ pub struct CdpBridgeForegroundTransactionReadback {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeMaintenanceTabReadback {
     pub ownership_source: String,
+    /// Exact target-window tab count from the installer UIA HWND Source of Truth.
     pub preexisting_tab_count: usize,
+    /// Browser-wide pre-operation count from the independent chrome.tabs lane.
+    pub bridge_preexisting_tab_count: usize,
     pub owned_tab_runtime_id: String,
     pub chrome_window_hwnd: i64,
     pub chrome_window_pid: u32,
@@ -1912,10 +1915,61 @@ pub struct CdpBridgeMaintenanceTabReadback {
 pub struct CdpBridgePriorSelectionReadback {
     pub attempted: bool,
     pub restored: bool,
+    pub operator_superseded: bool,
     pub reason: String,
     pub expected_runtime_id: String,
     pub before_runtime_id: String,
     pub after_runtime_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeFullscreenControlReadback {
+    pub runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_name: Option<String>,
+    pub name: String,
+    pub owner_runtime_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_automation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_class_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
+    pub bounds_x: f64,
+    pub bounds_y: f64,
+    pub bounds_width: f64,
+    pub bounds_height: f64,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CdpBridgeFullscreenTransactionReadback {
+    pub mode: String,
+    pub detected: bool,
+    pub exit_attempted: bool,
+    pub exit_verified: bool,
+    pub restore_required: bool,
+    pub restore_attempted: bool,
+    pub restored: bool,
+    pub operator_superseded: bool,
+    pub outcome: String,
+    pub chrome_window_hwnd: i64,
+    pub chrome_window_pid: u32,
+    pub chrome_process_started_at_100ns: u64,
+    pub chrome_executable_path_sha256: String,
+    pub selected_runtime_id: String,
+    pub initial_tab_container_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_exit_tab_container_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub post_restore_tab_container_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_control: Option<CdpBridgeFullscreenControlReadback>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inverse_control: Option<CdpBridgeFullscreenControlReadback>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -1941,6 +1995,7 @@ pub struct CdpBridgeMaintenanceCleanupReadback {
     pub missing_baseline_count: usize,
     pub concurrent_tab_count: usize,
     pub prior_selection_restore: CdpBridgePriorSelectionReadback,
+    pub fullscreen_transaction: CdpBridgeFullscreenTransactionReadback,
     pub foreground_transaction: CdpBridgeForegroundTransactionReadback,
     pub bridge_post_cleanup: CdpBridgePostCleanupReadback,
 }

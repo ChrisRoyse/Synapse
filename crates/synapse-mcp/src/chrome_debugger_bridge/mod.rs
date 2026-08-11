@@ -5721,6 +5721,163 @@ fn process_diagnostic(bytes: &[u8]) -> String {
     bounded.replace(['\r', '\n'], " | ")
 }
 
+fn bounded_json_string<'a>(value: &'a Value, key: &str, max_chars: usize) -> Option<&'a str> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|text| text.chars().count() <= max_chars)
+}
+
+fn sanitize_chrome_fullscreen_control(value: &Value) -> Option<Value> {
+    let runtime_id = bounded_json_string(value, "runtime_id", 512)?.trim();
+    let automation_id = bounded_json_string(value, "automation_id", 512)?;
+    let class_name = bounded_json_string(value, "class_name", 512)?;
+    let name = bounded_json_string(value, "name", 512)?.trim();
+    let owner_runtime_id = bounded_json_string(value, "owner_runtime_id", 512)?.trim();
+    let owner_automation_id = bounded_json_string(value, "owner_automation_id", 512)?;
+    let owner_class_name = bounded_json_string(value, "owner_class_name", 512)?;
+    let owner_name = bounded_json_string(value, "owner_name", 512)?;
+    let is_enabled = value.get("is_enabled").and_then(Value::as_bool)?;
+    let is_offscreen = value.get("is_offscreen").and_then(Value::as_bool)?;
+    let invoke_pattern_supported = value
+        .get("invoke_pattern_supported")
+        .and_then(Value::as_bool)?;
+    let bounds = value.get("bounds")?;
+    let x = bounds.get("x").and_then(Value::as_f64)?;
+    let y = bounds.get("y").and_then(Value::as_f64)?;
+    let width = bounds.get("width").and_then(Value::as_f64)?;
+    let height = bounds.get("height").and_then(Value::as_f64)?;
+    if runtime_id.is_empty()
+        || name.is_empty()
+        || owner_runtime_id.is_empty()
+        || !is_enabled
+        || is_offscreen
+        || !invoke_pattern_supported
+        || !x.is_finite()
+        || !y.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+    Some(json!({
+        "runtime_id": runtime_id,
+        "automation_id": automation_id,
+        "class_name": class_name,
+        "name": name,
+        "is_enabled": is_enabled,
+        "is_offscreen": is_offscreen,
+        "invoke_pattern_supported": invoke_pattern_supported,
+        "bounds": { "x": x, "y": y, "width": width, "height": height },
+        "owner_runtime_id": owner_runtime_id,
+        "owner_automation_id": owner_automation_id,
+        "owner_class_name": owner_class_name,
+        "owner_name": owner_name,
+    }))
+}
+
+fn sanitize_chrome_fullscreen_transaction(
+    value: &Value,
+    expected_hwnd: i64,
+    expected_pid: u64,
+) -> Option<Value> {
+    let mode = bounded_json_string(value, "mode", 64)?;
+    let detected = value.get("detected").and_then(Value::as_bool)?;
+    let exit_attempted = value.get("exit_attempted").and_then(Value::as_bool)?;
+    let exit_verified = value.get("exit_verified").and_then(Value::as_bool)?;
+    let restore_required = value.get("restore_required").and_then(Value::as_bool)?;
+    let restore_attempted = value.get("restore_attempted").and_then(Value::as_bool)?;
+    let restored = value.get("restored").and_then(Value::as_bool)?;
+    let operator_superseded = value.get("operator_superseded").and_then(Value::as_bool)?;
+    let outcome = bounded_json_string(value, "outcome", 96)?;
+    let chrome_window_hwnd = value.get("chrome_window_hwnd").and_then(Value::as_i64)?;
+    let chrome_window_pid = value.get("chrome_window_pid").and_then(Value::as_u64)?;
+    let chrome_process_started_at_100ns = value
+        .get("chrome_process_started_at_100ns")
+        .and_then(Value::as_u64)?;
+    let chrome_executable_path =
+        bounded_json_string(value, "chrome_executable_path", 32_768)?.trim();
+    let selected_runtime_id = bounded_json_string(value, "selected_runtime_id", 512)?.trim();
+    let initial_tab_container_count = value
+        .get("initial_tab_container_count")
+        .and_then(Value::as_u64)?;
+    let post_exit_tab_container_count = value
+        .get("post_exit_tab_container_count")
+        .and_then(Value::as_u64)?;
+    let post_restore_tab_container_count = value
+        .get("post_restore_tab_container_count")
+        .and_then(Value::as_u64);
+    if chrome_window_hwnd != expected_hwnd
+        || chrome_window_pid != expected_pid
+        || chrome_process_started_at_100ns == 0
+        || chrome_executable_path.is_empty()
+        || selected_runtime_id.is_empty()
+    {
+        return None;
+    }
+    let (exit_control, inverse_control) = match mode {
+        "none"
+            if !detected
+                && !exit_attempted
+                && exit_verified
+                && !restore_required
+                && !restore_attempted
+                && restored
+                && !operator_superseded
+                && outcome == "not_required"
+                && initial_tab_container_count == 1
+                && post_exit_tab_container_count == 1
+                && post_restore_tab_container_count == Some(1)
+                && value.get("exit_control").is_some_and(Value::is_null)
+                && value.get("inverse_control").is_some_and(Value::is_null) =>
+        {
+            (Value::Null, Value::Null)
+        }
+        "content_fullscreen_exact_uia_control"
+            if detected
+                && exit_attempted
+                && exit_verified
+                && restore_required
+                && !restore_attempted
+                && !restored
+                && !operator_superseded
+                && outcome == "exited_pending_restore"
+                && initial_tab_container_count == 0
+                && post_exit_tab_container_count == 1
+                && post_restore_tab_container_count.is_none() =>
+        {
+            (
+                sanitize_chrome_fullscreen_control(value.get("exit_control")?)?,
+                sanitize_chrome_fullscreen_control(value.get("inverse_control")?)?,
+            )
+        }
+        _ => return None,
+    };
+    Some(json!({
+        "mode": mode,
+        "detected": detected,
+        "exit_attempted": exit_attempted,
+        "exit_verified": exit_verified,
+        "restore_required": restore_required,
+        "restore_attempted": restore_attempted,
+        "restored": restored,
+        "operator_superseded": operator_superseded,
+        "outcome": outcome,
+        "chrome_window_hwnd": chrome_window_hwnd,
+        "chrome_window_pid": chrome_window_pid,
+        "chrome_process_started_at_100ns": chrome_process_started_at_100ns,
+        "chrome_executable_path": chrome_executable_path,
+        "selected_runtime_id": selected_runtime_id,
+        "initial_tab_container_count": initial_tab_container_count,
+        "post_exit_tab_container_count": post_exit_tab_container_count,
+        "post_restore_tab_container_count": post_restore_tab_container_count,
+        "exit_control": exit_control,
+        "inverse_control": inverse_control,
+    }))
+}
+
 #[cfg(windows)]
 async fn run_chrome_bridge_host_ui_reload(
     maintenance: &ChromeBridgeMaintenanceTabLease,
@@ -5942,6 +6099,10 @@ async fn run_chrome_bridge_host_ui_reload(
             | "migrated_existing_extension_to_credentialed_stable_path"
             | "installed_unpacked_extension_in_active_profile"
     );
+    let ui_preexisting_target_tab_count = json_pointer_required_u32(
+        &readback,
+        "/synapse_chrome_auto_install/maintenance_tab/tab_strip_before_create/count",
+    )?;
     let postcondition_error = if !ok
         || extension_id != EXTENSION_ID
         || extension_service_worker_sha256.len() != 64
@@ -6040,7 +6201,12 @@ async fn run_chrome_bridge_host_ui_reload(
             "marker_url": maintenance.marker_url,
             "marker_title": maintenance.marker_title,
             "ownership_source": "verified_uia_new_tab_marker_then_exact_chrome_tabs_token_resolution",
-            "preexisting_tab_count": maintenance.tabs_before.len(),
+            // UI Automation scopes this count to the exact HWND selected by the
+            // installer. The read-only bridge snapshot is browser-wide and is
+            // deliberately carried separately; equating them breaks whenever a
+            // second Chrome window exists.
+            "preexisting_tab_count": ui_preexisting_target_tab_count,
+            "bridge_preexisting_tab_count": maintenance.tabs_before.len(),
             "script_lease": readback.pointer("/synapse_chrome_auto_install/maintenance_tab"),
             "operation_navigation": readback.pointer("/synapse_chrome_auto_install/navigation"),
         }),
@@ -6209,6 +6375,9 @@ async fn run_chrome_bridge_host_ui_cleanup(
         .and_then(|value| value.pointer("/acquired_chrome_foreground/executable_path"))
         .and_then(Value::as_str)
         .unwrap_or("");
+    let fullscreen_transaction = lease.get("fullscreen_transaction").and_then(|value| {
+        sanitize_chrome_fullscreen_transaction(value, chrome_window_hwnd, chrome_window_pid)
+    });
     if ownership_source != "verified_uia_new_tab_marker"
         || !created_via_ui
         || chrome_window_hwnd <= 0
@@ -6232,9 +6401,10 @@ async fn run_chrome_bridge_host_ui_cleanup(
         || acquired_foreground_pid != chrome_window_pid
         || acquired_foreground_started == 0
         || acquired_foreground_path.is_empty()
+        || fullscreen_transaction.is_none()
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} expected_count_matches_baseline={} owned_runtime_id_present={} baseline_count={} baseline_invalid_count={} selected_before_count={} owned_absent_from_baseline={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} remediation=the first installer must return the complete bounded unique pre-operation UIA runtime-id set with one selected tab, plus exact prior/acquired HWND/PID/process-start/image foreground identities",
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} expected_count_matches_baseline={} owned_runtime_id_present={} baseline_count={} baseline_invalid_count={} selected_before_count={} owned_absent_from_baseline={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} fullscreen_transaction_valid={} remediation=the first installer must return the complete bounded unique pre-operation UIA runtime-id set with one selected tab, exact prior/acquired HWND/PID/process-start/image foreground identities, and the exact sanitized fullscreen transaction",
             ownership_source,
             created_via_ui,
             chrome_window_hwnd,
@@ -6257,6 +6427,7 @@ async fn run_chrome_bridge_host_ui_cleanup(
             acquired_foreground_pid,
             acquired_foreground_started,
             !acquired_foreground_path.is_empty(),
+            fullscreen_transaction.is_some(),
         )));
     }
     let cleanup_lease = json!({
@@ -6276,6 +6447,7 @@ async fn run_chrome_bridge_host_ui_cleanup(
             "tabs": sanitized_baseline_tabs,
         },
         "foreground_lease": foreground_lease.cloned().unwrap_or(Value::Null),
+        "fullscreen_transaction": fullscreen_transaction.unwrap_or(Value::Null),
     });
     let lease_json = serde_json::to_vec(&cleanup_lease).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
@@ -6410,6 +6582,47 @@ async fn run_chrome_bridge_host_ui_cleanup(
         .pointer("/maintenance_cleanup/foreground_transaction/restore_method")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let fullscreen_mode = readback
+        .pointer("/maintenance_cleanup/fullscreen_transaction/mode")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let fullscreen_restored = readback
+        .pointer("/maintenance_cleanup/fullscreen_transaction/restored")
+        .and_then(Value::as_bool);
+    let fullscreen_operator_superseded = readback
+        .pointer("/maintenance_cleanup/fullscreen_transaction/operator_superseded")
+        .and_then(Value::as_bool);
+    let fullscreen_outcome = readback
+        .pointer("/maintenance_cleanup/fullscreen_transaction/outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let fullscreen_post_restore_tab_container_count = readback
+        .pointer("/maintenance_cleanup/fullscreen_transaction/post_restore_tab_container_count")
+        .and_then(Value::as_u64);
+    let fullscreen_postcondition_valid = match fullscreen_mode {
+        "none" => {
+            fullscreen_restored == Some(true)
+                && fullscreen_operator_superseded == Some(false)
+                && fullscreen_outcome == "not_required"
+                && fullscreen_post_restore_tab_container_count == Some(1)
+        }
+        "content_fullscreen_exact_uia_control" => {
+            match (fullscreen_restored, fullscreen_operator_superseded) {
+                (Some(true), Some(false)) => {
+                    matches!(
+                        fullscreen_outcome,
+                        "restored_content_fullscreen" | "already_restored_content_fullscreen"
+                    ) && fullscreen_post_restore_tab_container_count == Some(0)
+                }
+                (Some(false), Some(true)) => {
+                    fullscreen_outcome == "operator_superseded"
+                        && fullscreen_post_restore_tab_container_count.is_none()
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    };
     let missing_baseline_count = readback
         .pointer("/maintenance_cleanup/missing_baseline_runtime_ids")
         .and_then(Value::as_array)
@@ -6432,15 +6645,21 @@ async fn run_chrome_bridge_host_ui_cleanup(
             (foreground_restored, operator_superseded),
             (Some(true), Some(false)) | (Some(false), Some(true))
         )
+        || !fullscreen_postcondition_valid
     {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} missing_baseline_count={:?} foreground_restored={:?} operator_superseded={:?} foreground_outcome={} foreground_method={} remediation=cleanup-only must prove exact token/runtime-id absence, every baseline tab present, and either exact prior foreground restoration or explicit operator supersession",
+            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} missing_baseline_count={:?} foreground_restored={:?} operator_superseded={:?} foreground_outcome={} foreground_method={} fullscreen_mode={} fullscreen_restored={:?} fullscreen_operator_superseded={:?} fullscreen_outcome={} fullscreen_post_restore_tab_container_count={:?} remediation=cleanup-only must prove exact token/runtime-id absence, every baseline tab present, and independently classified fullscreen plus foreground restoration or operator supersession",
             sha256_hex_lower(&payload),
             missing_baseline_count,
             foreground_restored,
             operator_superseded,
             foreground_outcome,
             foreground_method,
+            fullscreen_mode,
+            fullscreen_restored,
+            fullscreen_operator_superseded,
+            fullscreen_outcome,
+            fullscreen_post_restore_tab_container_count,
         )));
     }
     Ok(readback

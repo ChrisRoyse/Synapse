@@ -42,7 +42,8 @@ use crate::m1::{
     BrowserScreenshotForegroundIdentityReadback, BrowserScreenshotForegroundTransactionReadback,
     BrowserTabsActivationVisualReadback, BrowserTabsMutation, BrowserTabsOperation,
     CaptureRetryEvidence, CdpBridgeDurableProfileReadback, CdpBridgeForegroundIdentityReadback,
-    CdpBridgeForegroundTransactionReadback, CdpBridgeMaintenanceCleanupReadback,
+    CdpBridgeForegroundTransactionReadback, CdpBridgeFullscreenControlReadback,
+    CdpBridgeFullscreenTransactionReadback, CdpBridgeMaintenanceCleanupReadback,
     CdpBridgeMaintenanceTabReadback, CdpBridgePostCleanupReadback, CdpBridgePriorSelectionReadback,
     ClipboardTimelineSample, FsTimelineEvent, M1ObservationSnapshot,
     build_find_input_from_snapshot, effective_ocr_backend, global_only_input_from_snapshot,
@@ -21146,10 +21147,11 @@ fn chrome_bridge_reload_ack_readback(
     let expected_during_maintenance = maintenance_tab
         .preexisting_tab_count
         .checked_add(1)
+        .and_then(|count| count.checked_add(maintenance_cleanup.concurrent_tab_count))
         .ok_or_else(|| {
             chrome_bridge_reload_evidence_error(
                 "/maintenance_tab/preexisting_tab_count",
-                "a bounded count that admits one owned maintenance tab",
+                "a bounded target-window count that admits one owned maintenance tab and concurrent operator tabs",
             )
         })?;
     let expected_post_cleanup = maintenance_tab
@@ -21161,23 +21163,42 @@ fn chrome_bridge_reload_ack_readback(
                 "a bounded post-cleanup tab count",
             )
         })?;
+    let expected_bridge_post_cleanup = maintenance_tab
+        .bridge_preexisting_tab_count
+        .checked_add(maintenance_cleanup.bridge_post_cleanup.concurrent_tab_count)
+        .ok_or_else(|| {
+            chrome_bridge_reload_evidence_error(
+                "/maintenance_cleanup/bridge_post_cleanup/concurrent_tab_count",
+                "a bounded browser-wide post-cleanup tab count",
+            )
+        })?;
     if maintenance_tab.tab_count_after_marker != expected_during_maintenance
         || maintenance_cleanup.tab_count_before_cleanup != expected_during_maintenance
         || maintenance_cleanup.tab_count_after_cleanup != expected_post_cleanup
         || maintenance_cleanup
             .bridge_post_cleanup
             .preexisting_tab_count
-            != maintenance_tab.preexisting_tab_count
-        || maintenance_cleanup.bridge_post_cleanup.concurrent_tab_count
-            != maintenance_cleanup.concurrent_tab_count
+            != maintenance_tab.bridge_preexisting_tab_count
         || maintenance_cleanup
             .bridge_post_cleanup
             .post_cleanup_tab_count
-            != maintenance_cleanup.tab_count_after_cleanup
+            != expected_bridge_post_cleanup
+        || maintenance_cleanup
+            .fullscreen_transaction
+            .chrome_window_hwnd
+            != maintenance_tab.chrome_window_hwnd
+        || maintenance_cleanup.fullscreen_transaction.chrome_window_pid
+            != maintenance_tab.chrome_window_pid
+        || (maintenance_cleanup
+            .fullscreen_transaction
+            .operator_superseded
+            && !maintenance_cleanup
+                .prior_selection_restore
+                .operator_superseded)
     {
         return Err(chrome_bridge_reload_evidence_error(
             "/maintenance_cleanup",
-            "mutually consistent UIA and independent chrome.tabs baseline/concurrent/pre/post counts",
+            "separately consistent target-window UIA and browser-wide chrome.tabs baseline/concurrent/pre/post counts",
         ));
     }
     let durable_profile_readback =
@@ -21273,6 +21294,23 @@ fn reload_evidence_usize(value: &Value, pointer: &str) -> Result<usize, ErrorDat
         .map_err(|_| chrome_bridge_reload_evidence_error(pointer, "platform-sized count"))
 }
 
+fn reload_evidence_optional_usize(
+    value: &Value,
+    pointer: &str,
+) -> Result<Option<usize>, ErrorData> {
+    let raw = reload_evidence_value(value, pointer, "nonnegative integer or null")?;
+    if raw.is_null() {
+        Ok(None)
+    } else {
+        raw.as_u64()
+            .and_then(|count| usize::try_from(count).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                chrome_bridge_reload_evidence_error(pointer, "nonnegative integer or null")
+            })
+    }
+}
+
 fn reload_evidence_i64(value: &Value, pointer: &str) -> Result<i64, ErrorData> {
     reload_evidence_value(value, pointer, "signed integer")?
         .as_i64()
@@ -21296,6 +21334,32 @@ fn reload_evidence_string(
         ));
     }
     Ok(text.to_owned())
+}
+
+fn reload_evidence_optional_bounded_string(
+    value: &Value,
+    pointer: &str,
+    max_chars: usize,
+) -> Result<Option<String>, ErrorData> {
+    let text = reload_evidence_value(value, pointer, "bounded string")?
+        .as_str()
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "bounded string"))?
+        .trim();
+    if text.chars().count() > max_chars {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "bounded string",
+        ));
+    }
+    Ok((!text.is_empty()).then(|| text.to_owned()))
+}
+
+fn reload_evidence_f64(value: &Value, pointer: &str) -> Result<f64, ErrorData> {
+    let number = reload_evidence_value(value, pointer, "finite number")?
+        .as_f64()
+        .filter(|number| number.is_finite())
+        .ok_or_else(|| chrome_bridge_reload_evidence_error(pointer, "finite number"))?;
+    Ok(number)
 }
 
 fn reload_evidence_array_len(value: &Value, pointer: &str) -> Result<usize, ErrorData> {
@@ -21369,6 +21433,10 @@ fn chrome_bridge_maintenance_tab_readback(
     Ok(CdpBridgeMaintenanceTabReadback {
         ownership_source,
         preexisting_tab_count: reload_evidence_usize(value, "/preexisting_tab_count")?,
+        bridge_preexisting_tab_count: reload_evidence_usize(
+            value,
+            "/bridge_preexisting_tab_count",
+        )?,
         owned_tab_runtime_id: reload_evidence_string(
             value,
             "/script_lease/owned_tab_runtime_id",
@@ -21448,6 +21516,196 @@ fn chrome_bridge_foreground_transaction_readback(
     })
 }
 
+fn chrome_bridge_fullscreen_control_readback(
+    value: &Value,
+    pointer: &str,
+) -> Result<CdpBridgeFullscreenControlReadback, ErrorData> {
+    let enabled = reload_evidence_bool(value, &format!("{pointer}/is_enabled"))?;
+    let offscreen = reload_evidence_bool(value, &format!("{pointer}/is_offscreen"))?;
+    let invoke_supported =
+        reload_evidence_bool(value, &format!("{pointer}/invoke_pattern_supported"))?;
+    let bounds_width = reload_evidence_f64(value, &format!("{pointer}/bounds/width"))?;
+    let bounds_height = reload_evidence_f64(value, &format!("{pointer}/bounds/height"))?;
+    if !enabled || offscreen || !invoke_supported || bounds_width <= 0.0 || bounds_height <= 0.0 {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "enabled visible InvokePattern control with positive finite bounds",
+        ));
+    }
+    Ok(CdpBridgeFullscreenControlReadback {
+        runtime_id: reload_evidence_string(value, &format!("{pointer}/runtime_id"), 512)?,
+        automation_id: reload_evidence_optional_bounded_string(
+            value,
+            &format!("{pointer}/automation_id"),
+            512,
+        )?,
+        class_name: reload_evidence_optional_bounded_string(
+            value,
+            &format!("{pointer}/class_name"),
+            512,
+        )?,
+        name: reload_evidence_string(value, &format!("{pointer}/name"), 512)?,
+        owner_runtime_id: reload_evidence_string(
+            value,
+            &format!("{pointer}/owner_runtime_id"),
+            512,
+        )?,
+        owner_automation_id: reload_evidence_optional_bounded_string(
+            value,
+            &format!("{pointer}/owner_automation_id"),
+            512,
+        )?,
+        owner_class_name: reload_evidence_optional_bounded_string(
+            value,
+            &format!("{pointer}/owner_class_name"),
+            512,
+        )?,
+        owner_name: reload_evidence_optional_bounded_string(
+            value,
+            &format!("{pointer}/owner_name"),
+            512,
+        )?,
+        bounds_x: reload_evidence_f64(value, &format!("{pointer}/bounds/x"))?,
+        bounds_y: reload_evidence_f64(value, &format!("{pointer}/bounds/y"))?,
+        bounds_width,
+        bounds_height,
+    })
+}
+
+fn chrome_bridge_fullscreen_transaction_readback(
+    value: &Value,
+    pointer: &str,
+) -> Result<CdpBridgeFullscreenTransactionReadback, ErrorData> {
+    let mode = reload_evidence_string(value, &format!("{pointer}/mode"), 64)?;
+    let detected = reload_evidence_bool(value, &format!("{pointer}/detected"))?;
+    let exit_attempted = reload_evidence_bool(value, &format!("{pointer}/exit_attempted"))?;
+    let exit_verified = reload_evidence_bool(value, &format!("{pointer}/exit_verified"))?;
+    let restore_required = reload_evidence_bool(value, &format!("{pointer}/restore_required"))?;
+    let restore_attempted = reload_evidence_bool(value, &format!("{pointer}/restore_attempted"))?;
+    let restored = reload_evidence_bool(value, &format!("{pointer}/restored"))?;
+    let operator_superseded =
+        reload_evidence_bool(value, &format!("{pointer}/operator_superseded"))?;
+    let outcome = reload_evidence_string(value, &format!("{pointer}/outcome"), 96)?;
+    let initial_tab_container_count =
+        reload_evidence_usize(value, &format!("{pointer}/initial_tab_container_count"))?;
+    let post_exit_tab_container_count =
+        reload_evidence_optional_usize(value, &format!("{pointer}/post_exit_tab_container_count"))?;
+    let post_restore_tab_container_count = reload_evidence_optional_usize(
+        value,
+        &format!("{pointer}/post_restore_tab_container_count"),
+    )?;
+    let (exit_control, inverse_control) = match mode.as_str() {
+        "none"
+            if !detected
+                && !exit_attempted
+                && exit_verified
+                && !restore_required
+                && !restore_attempted
+                && restored
+                && !operator_superseded
+                && outcome == "not_required"
+                && initial_tab_container_count == 1
+                && post_exit_tab_container_count == Some(1)
+                && post_restore_tab_container_count == Some(1)
+                && reload_evidence_value(value, &format!("{pointer}/exit_control"), "null")?
+                    .is_null()
+                && reload_evidence_value(value, &format!("{pointer}/inverse_control"), "null")?
+                    .is_null() =>
+        {
+            (None, None)
+        }
+        "content_fullscreen_exact_uia_control"
+            if detected
+                && exit_attempted
+                && exit_verified
+                && restore_required
+                && ((restored && !operator_superseded) || (!restored && operator_superseded))
+                && ((restored
+                    && matches!(
+                        outcome.as_str(),
+                        "restored_content_fullscreen" | "already_restored_content_fullscreen"
+                    )
+                    && post_restore_tab_container_count == Some(0))
+                    || (operator_superseded
+                        && !restore_attempted
+                        && outcome == "operator_superseded"
+                        && post_restore_tab_container_count.is_none()))
+                && initial_tab_container_count == 0
+                && post_exit_tab_container_count == Some(1) =>
+        {
+            let exit = chrome_bridge_fullscreen_control_readback(
+                value,
+                &format!("{pointer}/exit_control"),
+            )?;
+            let inverse = chrome_bridge_fullscreen_control_readback(
+                value,
+                &format!("{pointer}/inverse_control"),
+            )?;
+            if exit.runtime_id != inverse.runtime_id
+                || exit.automation_id != inverse.automation_id
+                || exit.class_name != inverse.class_name
+                || exit.owner_runtime_id != inverse.owner_runtime_id
+                || exit.owner_automation_id != inverse.owner_automation_id
+                || exit.owner_class_name != inverse.owner_class_name
+                || !exit
+                    .name
+                    .to_ascii_lowercase()
+                    .starts_with("exit full screen")
+                || !inverse.name.to_ascii_lowercase().contains("full screen")
+            {
+                return Err(chrome_bridge_reload_evidence_error(
+                    pointer,
+                    "the same exact bounded fullscreen control and owner fingerprint across exit/restore",
+                ));
+            }
+            (Some(exit), Some(inverse))
+        }
+        _ => {
+            return Err(chrome_bridge_reload_evidence_error(
+                pointer,
+                "a complete none or exact content-fullscreen transaction",
+            ));
+        }
+    };
+    let chrome_window_hwnd = reload_evidence_i64(value, &format!("{pointer}/chrome_window_hwnd"))?;
+    let chrome_window_pid = reload_evidence_u32(value, &format!("{pointer}/chrome_window_pid"))?;
+    let chrome_process_started_at_100ns =
+        reload_evidence_u64(value, &format!("{pointer}/chrome_process_started_at_100ns"))?;
+    if chrome_window_hwnd <= 0 || chrome_window_pid == 0 || chrome_process_started_at_100ns == 0 {
+        return Err(chrome_bridge_reload_evidence_error(
+            pointer,
+            "positive exact Chrome HWND/PID/process-start identity",
+        ));
+    }
+    let executable_path =
+        reload_evidence_string(value, &format!("{pointer}/chrome_executable_path"), 32_768)?;
+    Ok(CdpBridgeFullscreenTransactionReadback {
+        mode,
+        detected,
+        exit_attempted,
+        exit_verified,
+        restore_required,
+        restore_attempted,
+        restored,
+        operator_superseded,
+        outcome,
+        chrome_window_hwnd,
+        chrome_window_pid,
+        chrome_process_started_at_100ns,
+        chrome_executable_path_sha256: sha256_hex(executable_path.as_bytes()),
+        selected_runtime_id: reload_evidence_string(
+            value,
+            &format!("{pointer}/selected_runtime_id"),
+            512,
+        )?,
+        initial_tab_container_count,
+        post_exit_tab_container_count,
+        post_restore_tab_container_count,
+        exit_control,
+        inverse_control,
+    })
+}
+
 fn chrome_bridge_maintenance_cleanup_readback(
     value: &Value,
 ) -> Result<CdpBridgeMaintenanceCleanupReadback, ErrorData> {
@@ -21465,6 +21723,10 @@ fn chrome_bridge_maintenance_cleanup_readback(
     let prior_selection_restore = CdpBridgePriorSelectionReadback {
         attempted: reload_evidence_bool(value, &format!("{selection_pointer}/attempted"))?,
         restored: reload_evidence_bool(value, &format!("{selection_pointer}/restored"))?,
+        operator_superseded: reload_evidence_bool(
+            value,
+            &format!("{selection_pointer}/operator_superseded"),
+        )?,
         reason: reload_evidence_string(value, &format!("{selection_pointer}/reason"), 128)?,
         expected_runtime_id: reload_evidence_string(
             value,
@@ -21482,10 +21744,10 @@ fn chrome_bridge_maintenance_cleanup_readback(
             512,
         )?,
     };
-    if !prior_selection_restore.restored {
+    if prior_selection_restore.restored == prior_selection_restore.operator_superseded {
         return Err(chrome_bridge_reload_evidence_error(
-            "/prior_selection_restore/restored",
-            "true exact prior-tab selection readback",
+            "/prior_selection_restore",
+            "exactly one of prior selection restored or newer operator selection preserved",
         ));
     }
     let bridge = "/bridge_post_cleanup";
@@ -21525,6 +21787,10 @@ fn chrome_bridge_maintenance_cleanup_readback(
         missing_baseline_count,
         concurrent_tab_count: reload_evidence_array_len(value, "/concurrent_runtime_ids")?,
         prior_selection_restore,
+        fullscreen_transaction: chrome_bridge_fullscreen_transaction_readback(
+            value,
+            "/fullscreen_transaction",
+        )?,
         foreground_transaction: chrome_bridge_foreground_transaction_readback(
             value,
             "/foreground_transaction",
