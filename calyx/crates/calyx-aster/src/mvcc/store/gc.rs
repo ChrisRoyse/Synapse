@@ -37,12 +37,15 @@ pub const DEFAULT_SNAPSHOT_VERSION_GC_MAX_PASS_US: u64 = 2_000_000;
 /// the budget the read guards are judged against would be trading a memory leak
 /// for the commit stall #1950 and #2060 spent two issues removing.
 ///
-/// It is a budget checked at [`CLOCK_CHECK_CHAINS`] granularity, not a hard
-/// ceiling, and the difference is measured rather than hand-waved: an isolated
-/// daemon under a 32 MB/min write load reported a maximum hold of **16.1 ms**
-/// against this 15 ms budget (mean 650 us over 108 holds, **0** over-budget
-/// holds against the 25 ms census budget). The ~1 ms overshoot is the work of
-/// up to `CLOCK_CHECK_CHAINS` chains, which is what that constant buys.
+/// It is a cooperative budget, not a hard ceiling: a version chain is the
+/// smallest resumable unit because the durable cursor names a row key, not a
+/// position inside its version vector. The clock is checked at the next key
+/// boundary after every chain that actually reclaims work or scans multiple
+/// versions, and after at most [`CLOCK_CHECK_CLEAN_CHAINS`] single-version
+/// no-op chains. Production measured **28.7 ms** with the former 32-chain
+/// cadence against this 15 ms budget; the work-aware cadence bounds ordinary
+/// overshoot to one dirty/multi-version chain (or eight single-version no-ops)
+/// instead of assuming every corpus gives a chain the same cost.
 pub const DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US: u64 = 15_000;
 
 const MAX_VERSIONS_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_VERSIONS";
@@ -50,23 +53,20 @@ const MAX_CHAINS_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_CHAINS";
 const MAX_PASS_US_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_PASS_US";
 const MAX_SHARD_HOLD_US_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US";
 
-/// How often the shard walk consults the clock, in chains.
+/// Maximum no-op chains between shard-hold clock reads.
 ///
-/// `Instant::now()` is a syscall-ish read on Windows (`QueryPerformanceCounter`);
-/// doing it per chain would make the instrument a measurable fraction of the
-/// work it measures. So the hold budget is enforced at this granularity, and
-/// the overshoot it admits is bounded by this many chain visits rather than by
-/// a time.
+/// A dirty or multi-version chain always schedules a clock read at the next key
+/// boundary, because version traversal and value-buffer destruction are the
+/// work whose corpus-driven variance broke the old chain-count model. Only
+/// single-version no-op chains batch clock reads, keeping `Instant::elapsed()`
+/// from becoming a measurable part of an already-drained sweep.
 ///
-/// **Measured, not guessed.** At 256 this was too coarse to bind at all on the
-/// shapes that matter: an isolated daemon under a 32 MB/min write load held
-/// shards for up to **20.7 ms** against a 15 ms budget, because each shard held
-/// only ~165 chains — fewer than one check interval — so the clock was never
-/// consulted inside a shard and the hold ran to the shard's natural length. 32
-/// makes the budget bind on those shards while still costing one clock read per
-/// 32 chains, which is noise against the per-chain reclaim work (mean hold in
-/// that same run was 599 us across 267 holds).
-const CLOCK_CHECK_CHAINS: usize = 32;
+/// Eight is the conservative production-derived clean-path floor: the observed
+/// 32-chain overshoot was 13.7 ms, or ~0.43 ms/chain at that corpus shape. Even
+/// if a supposedly clean visit reaches that observed per-chain cost, eight add
+/// ~3.4 ms rather than consuming the 10 ms margin between the 15 ms write-hold
+/// target and the 25 ms row-guard warning threshold.
+const CLOCK_CHECK_CLEAN_CHAINS: usize = 8;
 
 /// Bounds on one snapshot-version GC pass.
 ///
@@ -498,20 +498,16 @@ impl PassWalk {
     /// key))` when it stopped early — naming the key it was about to process,
     /// which the next acquisition resumes *at*, not after.
     ///
-    /// The inclusive cursor is load-bearing. Every early return here happens
-    /// *before* the current chain is touched, so an exclusive cursor would skip
-    /// it: manual FSV caught precisely that as 196 paged passes reclaiming
-    /// 18,872 of 18,944 reclaimable versions. Re-walking the boundary
-    /// key costs one chain visit and is idempotent, because reclaiming an
-    /// already-clean chain frees nothing.
+    /// The inclusive cursor is load-bearing. Every early return happens before
+    /// the current chain is touched, so an exclusive cursor would skip it:
+    /// manual FSV caught precisely that as 196 paged passes reclaiming 18,872
+    /// of 18,944 reclaimable versions.
     ///
-    /// Forward progress is guaranteed for the hold-budget return: the clock is
-    /// consulted only every [`CLOCK_CHECK_CHAINS`] chains, so that return cannot
-    /// fire until `CLOCK_CHECK_CHAINS - 1` chains of this acquisition have been
-    /// processed. Without that floor a tight hold budget would re-acquire the
-    /// same shard forever at the same key. The work-budget returns can fire
-    /// immediately and do not need the floor — they end the pass rather than
-    /// re-acquiring.
+    /// Forward progress is guaranteed for the hold-budget return because a
+    /// clock read becomes due only after at least one prior chain in this
+    /// acquisition was processed. If that was the shard's final chain, the walk
+    /// ends and releases the guard directly. Work-budget returns can still fire
+    /// immediately because they end the pass rather than re-acquiring.
     fn reclaim_shard(
         &mut self,
         table: &mut RowTable,
@@ -520,7 +516,8 @@ impl PassWalk {
         acquired: &Instant,
     ) -> Option<(ColumnFamily, Vec<u8>)> {
         let resume_cf = resume.map(|(cf, _)| *cf);
-        let mut since_clock_check = 0usize;
+        let mut clean_chains_since_clock_check = 0usize;
+        let mut clock_due = false;
         for (cf, rows) in table.iter_mut() {
             // The outer map holds one entry per live column family — tens, not
             // millions — so skipping to the resume family linearly costs
@@ -545,25 +542,35 @@ impl PassWalk {
                     self.stopped_on = SnapshotVersionGcStop::VersionBudget;
                     return Some((*cf, key.clone()));
                 }
-                since_clock_check += 1;
-                if since_clock_check >= CLOCK_CHECK_CHAINS {
-                    since_clock_check = 0;
+                if clock_due {
+                    clock_due = false;
                     if super::elapsed_us(acquired) >= self.budget.max_shard_hold_us {
                         // Not a budget *stop*: the pass is healthy, this shard's
-                        // guard has simply been held long enough. Leave
-                        // `stopped_on` alone so the caller releases, re-acquires,
-                        // and continues this shard from this key.
+                        // guard has simply been held long enough. The current
+                        // chain is untouched and is the inclusive resume key.
                         return Some((*cf, key.clone()));
                     }
                 }
                 self.chains_remaining -= 1;
                 self.chains_scanned += 1;
+                let versions_examined = versions.len();
                 let (reclaimed, bytes) =
                     reclaim_chain(versions, floor, &mut self.versions_remaining);
                 if reclaimed > 0 {
                     self.chains_compacted += 1;
                     self.versions_reclaimed += reclaimed as u64;
                     self.bytes_reclaimed += bytes as u64;
+                }
+                let clock_after_chain = reclaimed > 0 || versions_examined > 1;
+                if clock_after_chain {
+                    clean_chains_since_clock_check = 0;
+                    clock_due = true;
+                } else {
+                    clean_chains_since_clock_check += 1;
+                    if clean_chains_since_clock_check >= CLOCK_CHECK_CLEAN_CHAINS {
+                        clean_chains_since_clock_check = 0;
+                        clock_due = true;
+                    }
                 }
             }
         }
