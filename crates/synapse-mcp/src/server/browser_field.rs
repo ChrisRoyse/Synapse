@@ -22,7 +22,11 @@ use rmcp::schemars::JsonSchema;
 use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::error_codes;
+use synapse_core::{
+    BrowserDefaultActionSemantics, InputDeliveryOrigin, InputProvenance, error_codes,
+};
+
+use super::input_provenance::{InputProvenanceContext, InputProvenanceSpec};
 
 const TOOL: &str = "browser_set_value";
 const FORM_TOOL: &str = "browser_form";
@@ -145,6 +149,7 @@ pub struct BrowserSetValueResponse {
     pub independent_readback_sha256: String,
     pub status: String,
     pub elapsed_ms: u32,
+    pub input_provenance: InputProvenance,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -242,6 +247,7 @@ pub struct BrowserFillFormResponse {
     pub failed_fields: u32,
     pub skipped_fields: u32,
     pub fields: Vec<BrowserFillFormFieldOutcome>,
+    pub input_provenance: Vec<InputProvenance>,
     pub elapsed_ms: u32,
 }
 
@@ -263,6 +269,8 @@ pub struct BrowserFillFormFieldOutcome {
     pub error_message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_provenance: Option<InputProvenance>,
 }
 
 #[tool_router(router = browser_field_tool_router, vis = "pub(super)")]
@@ -529,6 +537,8 @@ impl SynapseService {
             ));
         }
         let expected_chrome_window_id = owner.as_ref().and_then(|owner| owner.chrome_window_id);
+        let provenance_context =
+            InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id)?;
 
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_set_value_before_bridge_field_replace",
@@ -637,11 +647,36 @@ impl SynapseService {
         let before_len = char_len(&before_value);
         let after_len = char_len(&after_value);
         let changed = before_value != after_value;
-        let trusted_text_backend = result.readback_backend.contains("chrome.debugger.Input");
-        let source_of_truth = if trusted_text_backend {
+        let chrome_generated_text_backend =
+            result.readback_backend.contains("chrome.debugger.Input");
+        let source_of_truth = if chrome_generated_text_backend {
             "chrome.debugger.Input text dispatch + chrome.scripting editable readback + separate chrome.tabs active-element readback"
         } else {
             SOURCE_OF_TRUTH
+        };
+        let input_provenance = if chrome_generated_text_backend {
+            provenance_context.finish(InputProvenanceSpec {
+                delivery_origin: InputDeliveryOrigin::ChromeDebuggerProtocol,
+                expected_dom_event_is_trusted: Some(true),
+                browser_default_actions: BrowserDefaultActionSemantics::UserAgentInput,
+                backend: &result.readback_backend,
+                transport: "chrome_tabs_extension+chrome.debugger",
+                protocol_method: result.method.as_deref().or(Some("Input.insertText")),
+                required_foreground: false,
+                per_emission_fence_verified: false,
+            })?
+        } else {
+            provenance_context.finish(InputProvenanceSpec {
+                delivery_origin: InputDeliveryOrigin::DomDispatch,
+                expected_dom_event_is_trusted: Some(false),
+                browser_default_actions:
+                    BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+                backend: &result.readback_backend,
+                transport: "chrome_tabs_extension+chrome.scripting",
+                protocol_method: Some("native_value_setter+dispatchEvent(input,change)"),
+                required_foreground: false,
+                per_emission_fence_verified: false,
+            })?
         };
 
         tracing::info!(
@@ -653,7 +688,7 @@ impl SynapseService {
             match_count = result.match_count,
             tag_name = %result.tag_name,
             readback_backend = %result.readback_backend,
-            trusted_text_backend,
+            chrome_generated_text_backend,
             before_len,
             after_len,
             requested_len,
@@ -682,6 +717,7 @@ impl SynapseService {
             independent_readback_sha256: text_signature(&independent),
             status: "verified_state".to_owned(),
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            input_provenance,
         })
     }
 
@@ -719,6 +755,20 @@ impl SynapseService {
         let failed_fields = attempted_fields.saturating_sub(succeeded_fields);
         let skipped_fields = total_fields.saturating_sub(attempted_fields);
         let ok = failed_fields == 0 && skipped_fields == 0;
+        let input_provenance = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.input_provenance.clone())
+            .collect::<Vec<_>>();
+        if outcomes
+            .iter()
+            .any(|outcome| outcome.ok && outcome.input_provenance.is_none())
+        {
+            return Err(super::input_provenance::input_provenance_error(
+                "browser_fill_form_success",
+                "a successful field outcome omitted input_provenance",
+                None,
+            ));
+        }
         let status = if ok {
             "verified_state"
         } else if params.continue_on_error {
@@ -758,6 +808,7 @@ impl SynapseService {
             failed_fields,
             skipped_fields,
             fields: outcomes,
+            input_provenance,
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
         })
     }
@@ -797,7 +848,14 @@ impl SynapseService {
                     .await
                 {
                     Ok(result) => {
-                        fill_form_success(index_u32, field, "browser_set_value", json!(result))
+                        let provenance = result.input_provenance.clone();
+                        fill_form_success(
+                            index_u32,
+                            field,
+                            "browser_set_value",
+                            json!(result),
+                            provenance,
+                        )
                     }
                     Err(error) => {
                         fill_form_error_data(index_u32, field, "browser_set_value", error)
@@ -814,6 +872,7 @@ impl SynapseService {
                 };
                 let action = if checked { "check" } else { "uncheck" };
                 self.browser_fill_form_dom_action(
+                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -833,6 +892,7 @@ impl SynapseService {
                     );
                 }
                 self.browser_fill_form_dom_action(
+                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -871,6 +931,7 @@ impl SynapseService {
                     );
                 }
                 self.browser_fill_form_dom_action(
+                    session_id,
                     index_u32,
                     field,
                     window_hwnd,
@@ -886,6 +947,7 @@ impl SynapseService {
 
     async fn browser_fill_form_dom_action(
         &self,
+        session_id: &str,
         index: u32,
         field: &BrowserFillFormField,
         window_hwnd: i64,
@@ -894,6 +956,13 @@ impl SynapseService {
         options: Option<&Value>,
         wait_timeout_ms: u64,
     ) -> BrowserFillFormFieldOutcome {
+        let provenance_context =
+            match InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id) {
+                Ok(context) => context,
+                Err(error) => {
+                    return fill_form_error_data(index, field, "input_provenance", error);
+                }
+            };
         let option = field.option.as_deref().or(field.value.as_deref());
         if let Err(error) = super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_fill_form_before_bridge_dom_action",
@@ -938,7 +1007,48 @@ impl SynapseService {
                 ) {
                     return fill_form_error_data(index, field, "operator_panic_boundary", error);
                 }
-                fill_form_success(index, field, "chrome_debugger_bridge.domAction", result)
+                let (delivery_origin, default_actions, method) = match action {
+                    "check" | "uncheck" => (
+                        InputDeliveryOrigin::HtmlActivationMethod,
+                        BrowserDefaultActionSemantics::HtmlActivationBehavior,
+                        "HTMLElement.click",
+                    ),
+                    "select" => (
+                        InputDeliveryOrigin::DomDispatch,
+                        BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+                        "selectedOptions mutation+dispatchEvent(input,change)",
+                    ),
+                    _ => {
+                        let error = super::input_provenance::input_provenance_error(
+                            "browser_fill_form_dom_action",
+                            format!("unclassified successful DOM action {action:?}"),
+                            None,
+                        );
+                        return fill_form_error_data(index, field, "input_provenance", error);
+                    }
+                };
+                let provenance = match provenance_context.finish(InputProvenanceSpec {
+                    delivery_origin,
+                    expected_dom_event_is_trusted: Some(false),
+                    browser_default_actions: default_actions,
+                    backend: "chrome.scripting.executeScript",
+                    transport: "chrome_tabs_extension+chrome.scripting",
+                    protocol_method: Some(method),
+                    required_foreground: false,
+                    per_emission_fence_verified: false,
+                }) {
+                    Ok(provenance) => provenance,
+                    Err(error) => {
+                        return fill_form_error_data(index, field, "input_provenance", error);
+                    }
+                };
+                fill_form_success(
+                    index,
+                    field,
+                    "chrome_debugger_bridge.domAction",
+                    result,
+                    provenance,
+                )
             }
             Err(error) => {
                 fill_form_bridge_error(index, field, "chrome_debugger_bridge.domAction", error)
@@ -1168,6 +1278,7 @@ fn fill_form_success(
     field: &BrowserFillFormField,
     delegated_tool: &str,
     result: Value,
+    input_provenance: InputProvenance,
 ) -> BrowserFillFormFieldOutcome {
     BrowserFillFormFieldOutcome {
         index,
@@ -1180,6 +1291,7 @@ fn fill_form_success(
         error_code: None,
         error_message: None,
         result: Some(result),
+        input_provenance: Some(input_provenance),
     }
 }
 
@@ -1199,6 +1311,7 @@ fn invalid_fill_form_field(
         error_code: Some(error_codes::TOOL_PARAMS_INVALID.to_owned()),
         error_message: Some(message.to_owned()),
         result: None,
+        input_provenance: None,
     }
 }
 
@@ -1226,6 +1339,7 @@ fn fill_form_error_data(
         error_code: Some(error_code),
         error_message: Some(error.message.to_string()),
         result: None,
+        input_provenance: None,
     }
 }
 
@@ -1246,6 +1360,7 @@ fn fill_form_bridge_error(
         error_code: Some(error.code().to_owned()),
         error_message: Some(error.detail().to_owned()),
         result: None,
+        input_provenance: None,
     }
 }
 

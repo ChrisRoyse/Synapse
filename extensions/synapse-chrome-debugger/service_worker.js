@@ -8499,8 +8499,9 @@ async function handleActivateTab(params) {
 // keydown/keypress/keyup handlers - which is exactly what a modal Escape
 // handler is - but by web-platform rule they never drive the browser's own
 // default behaviours (no form submit, no caret insertion, no browser
-// shortcuts). That limit is reported in every response as `input_trust` and
-// `native_default_actions`, never papered over.
+// shortcuts). That limit is reported without conflating DOM trust with physical
+// origin; `native_default_actions=false` stays explicit, and the daemon
+// projects the complete typed provenance record.
 async function handleKeyDispatch(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
@@ -8557,10 +8558,12 @@ async function handleKeyDispatch(params) {
     frame_id: top.frame_id,
     frame_document_id: top.document_id,
     keys,
-    input_trust: "synthetic_dom_dispatch",
+    dom_event_is_trusted: false,
+    physical_device_origin: false,
+    browser_default_actions: "synthetic_dispatch_no_user_agent_input_defaults",
     native_default_actions: false,
     trust_note:
-      "KeyboardEvents dispatched through chrome.scripting have isTrusted=false: page keydown/keypress/keyup handlers run (this is what dismisses a modal), but the browser default behaviours - form submission, caret text insertion, browser shortcuts - do not fire. Use a raw-CDP Input.dispatchKeyEvent target for trusted key input.",
+      "KeyboardEvents dispatched through chrome.scripting have isTrusted=false: page keydown/keypress/keyup handlers run, but browser default behaviours do not. Raw-CDP Input.dispatchKeyEvent creates isTrusted=true events but remains software-originated.",
     readback_backend: "chrome.scripting.executeScript+chrome.tabs.get",
     required_foreground: false,
     wait_timeout_ms: waitTimeoutMs,
@@ -8721,7 +8724,7 @@ async function handleDomAction(params) {
   const autoWait = Boolean(params.autoWait);
   const autoWaitTimeoutMs = normalizeDomActionAutoWaitTimeout(params.autoWaitTimeoutMs, autoWait);
   // #1821 Playwright `force` parity, honoured only on this debugger-free
-  // synthetic-dispatch lane (a real mouse event cannot bypass occlusion).
+  // synthetic-dispatch lane (coordinate-resolved UA/CDP input cannot bypass occlusion).
   const force = Boolean(params.force);
   const suppressPageText = Boolean(params.suppressPageText);
   if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
@@ -9019,9 +9022,9 @@ async function handleCdpInput(params) {
     };
   }
 
-  // tap/click/dblclick deliver real trusted Input.* events through
+  // tap/click/dblclick deliver Chrome-generated `isTrusted=true` Input.* events through
   // chrome.debugger, which the renderer only processes for the ACTIVE tab
-  // (an inactive tab silently drops mousePressed/mouseReleased; the real mouse
+  // (an inactive tab silently drops mousePressed/mouseReleased; the protocol mouse
   // drag lane shares this constraint and activates the same way). Activate the
   // owned tab in its already-focused Chrome window first; hover does not need
   // it. This is in-Chrome tab activation, not OS foreground theft
@@ -13552,12 +13555,12 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
   };
   let dispatch;
   if (action === "drag") {
-    // Real trusted mouse drag: chrome.debugger Input.* only dispatches to the
+    // Chrome-generated mouse drag: chrome.debugger Input.* only dispatches to the
     // ACTIVE tab, so activate the owned tab in its already-focused Chrome
     // window first (in-Chrome activation, required_foreground=false), then
-    // dispatch the real Input.dispatchMouseEvent press/move/release. NO
+    // dispatch Input.dispatchMouseEvent press/move/release. NO
     // synthetic fallback (#1355): a guarded pointer-DnD target must see
-    // isTrusted=true, or the verb fails loud — never a synthetic no-op that
+    // isTrusted=true (physical_device_origin=false), or the verb fails loud — never a synthetic no-op that
     // looks like success.
     dragActivation = await activateTabForCdpTouch(selected.tabId, before, "drag");
     const realDrag = await dispatchCdpInputMouseDrag(
@@ -13569,7 +13572,7 @@ async function handleCdpInputDrag(selected, action, params, before, beforePageTe
     );
     dispatch = { ...realDrag, backend: "chrome.debugger.Input" };
   } else if (action === "html5_real_drag") {
-    // Real, TRUSTED HTML5 drop via CDP Input.dispatchDragEvent (#1356). Chrome
+    // Chrome-generated HTML5 drop via CDP Input.dispatchDragEvent (#1356). Chrome
     // only delivers Input.* to the active tab, so activate first (in-Chrome,
     // required_foreground=false), then dispatch dragEnter/dragOver/drop on the
     // target point with a DragData built from data_mime_type/data_text. Unlike
@@ -13775,12 +13778,13 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
       };
     }
     if (action === "click" || action === "dblclick") {
-      // Real, trusted mouse click via chrome.debugger: isTrusted=true so
+      // Chrome-generated mouse click via chrome.debugger: isTrusted=true while
+      // physical_device_origin remains false, so
       // activation-guarded handlers fire (synthetic dispatchEvent does not).
       const button = String(options.button || "left");
       const modifiers = cdpModifierBitmask(options.modifiers);
       const dispatched = [];
-      // Move first so :hover/pointer state matches a real click.
+      // Move first so :hover/pointer state matches Chrome's input sequence.
       await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
         type: "mouseMoved", x: point.x, y: point.y, button: "none", modifiers, pointerType: "mouse"
       });
@@ -13930,7 +13934,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   }
 }
 
-// #1356: real, TRUSTED HTML5 drop. Dispatches CDP Input.dispatchDragEvent
+// #1356: Chrome-generated HTML5 drop. Dispatches CDP Input.dispatchDragEvent
 // dragEnter/dragOver/drop at the resolved target point with a DragData built
 // from the caller's data_mime_type/data_text. These events are isTrusted=true
 // and carry a real DataTransfer, so native drop zones that gate on trust (which
@@ -23148,7 +23152,7 @@ async function performDomActionInPage(request) {
     let autoWaitReadback = null;
     if (resolveActionability && !bypassActionability) {
       // #1821: `autoWait` controls WAITING, not gating. Probing once when the
-      // caller asked not to wait keeps the safety check (a real mouse event
+      // caller asked not to wait keeps the safety check (coordinate-resolved UA/CDP input
       // dispatched at an occluded point would activate the overlay instead of
       // the target) while returning the refusal immediately, with the typed
       // not-actionable code rather than a wait-timeout the caller never asked
@@ -23312,9 +23316,12 @@ async function performDomActionInPage(request) {
     auto_wait_readback: autoWaitReadback,
     // #1821: an explicit, auditable record that an unmet actionability
     // predicate was overridden, and that the delivered events were synthetic
-    // in-page dispatch rather than trusted OS/CDP input.
+    // in-page dispatch rather than OS/CDP input.
     forced_actionability_bypass: Boolean(force && autoWaitReadback && !autoWaitReadback.ok),
-    input_trust: force ? "synthetic_dom_dispatch_forced" : "synthetic_dom_dispatch",
+    dom_event_is_trusted: false,
+    physical_device_origin: false,
+    browser_default_actions: "synthetic_dispatch_no_user_agent_input_defaults",
+    forced_dom_dispatch: Boolean(force),
     events_dispatched: eventsDispatched,
     action_readback: actionReadback,
     in_page_before_url: beforeUrl,
@@ -23990,13 +23997,13 @@ async function performDomActionInPage(request) {
     let readback;
     try {
       if (!needsSyntheticEvents && typeof element.click === "function") {
-        // A real left click always emits the pointer/mouse press-release sequence
+        // A user-agent click normally emits the pointer/mouse press-release sequence
         // before activation. Many components (e.g. react-select's control, which
         // opens on `mousedown`, not `click`) never respond to a bare
-        // element.click() that fires only a `click` event. Emit the real
+        // element.click() that fires only a `click` event. Emit the synthetic
         // pointerdown/mousedown/pointerup/mouseup sequence first, then use the
-        // native click() for trusted activation defaults (checkbox/link/form
-        // submit). This is a strict superset of the prior behavior. (#1311)
+        // native click() for HTML activation behavior (its click event remains
+        // isTrusted=false). This is a strict superset of the prior behavior. (#1311)
         const point = elementClickPoint(element, null);
         dispatchPointerLikeEvent(element, "pointerdown", point, button, modifiers, 1, true);
         events.push("pointerdown");

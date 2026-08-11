@@ -253,6 +253,7 @@ mod handler;
 mod health;
 pub(crate) use health::HealthParams;
 mod hygiene_report;
+mod input_provenance;
 mod intent_tools;
 mod lease_tools;
 mod m1_tools;

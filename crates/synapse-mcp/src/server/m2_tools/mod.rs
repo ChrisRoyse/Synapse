@@ -4675,6 +4675,8 @@ impl SynapseService {
             ok: true,
             chars_typed,
             elapsed_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
+            backend_used: readback.readback_backend.clone(),
+            method: readback.method,
             backend_tier_used: ACT_TYPE_CHROME_BRIDGE_ACTIVE_ELEMENT_TIER.to_owned(),
             required_foreground: false,
             target_text_integrity: ACT_TYPE_CHROME_BRIDGE_ACTIVE_ELEMENT_TEXT_INTEGRITY.to_owned(),

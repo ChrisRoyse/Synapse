@@ -1946,6 +1946,7 @@ pub struct ChromeDebuggerTypeActiveElementResult {
     pub tab_id: u32,
     pub chars_typed: u32,
     pub readback_backend: String,
+    pub method: String,
     pub before_active_element: ChromeDebuggerActiveElement,
     pub after_active_element: ChromeDebuggerActiveElement,
     pub expected_value: Option<String>,
@@ -1970,6 +1971,12 @@ pub struct ChromeDebuggerSetFieldValueResult {
     #[serde(default)]
     pub chars_requested: u32,
     pub readback_backend: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub frame_id: Option<i64>,
+    #[serde(default)]
+    pub frame_document_id: Option<String>,
     /// `selector` or `active_element`.
     #[serde(default)]
     pub resolved_by: String,

@@ -13,6 +13,11 @@
 //! target but cannot seize the human foreground.
 
 use super::browser_field::BrowserSetValueParams;
+use super::input_provenance::{
+    InputProvenanceContext, InputProvenanceSpec, embedded_input_provenance, input_provenance_error,
+    required_any_result_string, required_result_bool, required_result_string, result_bool,
+    result_string,
+};
 use super::m1_tools::{
     chrome_debugger_default_endpoint, chrome_debugger_endpoint, validate_cdp_target_id,
 };
@@ -42,7 +47,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use synapse_core::{AccessibleNode, ElementId, Point, Rect, UiaPattern, error_codes};
+use synapse_core::{
+    AccessibleNode, BrowserDefaultActionSemantics, ElementId, InputDeliveryOrigin, InputProvenance,
+    InputTargetKind, Point, Rect, UiaPattern, error_codes,
+};
 use tokio_util::sync::CancellationToken;
 
 const DEFAULT_TARGET_ACT_SHELL_TIMEOUT_MS: u64 = 30_000;
@@ -630,6 +638,10 @@ pub struct TargetActResponse {
     pub routing: String,
     /// The delegated tool's full response.
     pub result: Value,
+    /// Present for every input delivery. Successful input without this exact
+    /// typed record is an internal error, never a degraded response.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_provenance: Vec<InputProvenance>,
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
@@ -2466,6 +2478,8 @@ impl SynapseService {
     ) -> Result<Json<TargetActResponse>, ErrorData> {
         let params = params.0;
         let verb = params.verb.as_str().to_owned();
+        let input_provenance_context =
+            target_act_input_provenance_context(self, &request_context, &params)?;
         tracing::info!(
             code = "MCP_TOOL_INVOCATION",
             kind = "target_act",
@@ -2829,6 +2843,14 @@ impl SynapseService {
                             delivery_state: target_act_delivery_state(ok, status).to_owned(),
                             delegated_tool: delegated_tool.to_owned(),
                             routing: target_act_routing_description(),
+                            input_provenance: target_act_input_provenance(
+                                &verb,
+                                delegated_tool,
+                                ok,
+                                status,
+                                &result,
+                                input_provenance_context.as_ref(),
+                            )?,
                             result,
                         }));
                     }
@@ -2869,8 +2891,9 @@ impl SynapseService {
                 if target_act_has_key_chord(&params) {
                     target_act_key_press(self, &params, &request_context).await?
                 } else {
-                    // press a named button/link = a real trusted click on the
-                    // bridge target; keep the synthetic "press" DOM-action only as
+                    // A named button/link press uses Chrome-generated CDP input
+                    // (`isTrusted=true`, physical_device_origin=false). Keep the
+                    // synthetic "press" DOM-action only as
                     // the raw-CDP/native fallback (#1348 headline #2).
                     target_act_dom_locator_pointer(
                         self,
@@ -2926,6 +2949,7 @@ impl SynapseService {
                             .to_owned(),
                             delegated_tool: "act_focus_window".to_owned(),
                             routing: target_act_routing_description(),
+                            input_provenance: Vec::new(),
                             result: target_act_error_result("act_focus_window", error),
                         }));
                     }
@@ -2948,6 +2972,7 @@ impl SynapseService {
                         .to_owned(),
                         delegated_tool: "act_focus_window".to_owned(),
                         routing: target_act_routing_description(),
+                        input_provenance: Vec::new(),
                         result: target_act_error_result("act_focus_window", error),
                     }));
                 }
@@ -2971,6 +2996,7 @@ impl SynapseService {
                             .to_owned(),
                             delegated_tool: "act_focus_window".to_owned(),
                             routing: target_act_routing_description(),
+                            input_provenance: Vec::new(),
                             result: target_act_error_result("act_focus_window", error),
                         }));
                     }
@@ -2986,6 +3012,14 @@ impl SynapseService {
             other => return Err(target_act_unknown_verb_error(other)),
         };
 
+        let input_provenance = target_act_input_provenance(
+            &verb,
+            delegated_tool,
+            ok,
+            status,
+            &result,
+            input_provenance_context.as_ref(),
+        )?;
         Ok(Json(TargetActResponse {
             verb: verb.as_str().to_owned(),
             ok,
@@ -2994,6 +3028,7 @@ impl SynapseService {
             delegated_tool: delegated_tool.to_owned(),
             routing: target_act_routing_description(),
             result,
+            input_provenance,
         }))
     }
 
@@ -6762,12 +6797,11 @@ async fn target_act_hover(
     ))
 }
 
-/// Route a DOM-locator click/dblclick/press to the REAL trusted-input lane
+/// Route a DOM-locator click/dblclick/press to the Chrome-generated CDP lane
 /// (#1348 headline #1/#2). For the normal Chrome bridge target this dispatches
 /// chrome.debugger `Input.dispatchMouseEvent` (isTrusted=true) instead of the
 /// synthetic `performClick` that guarded handlers ignore. Raw-CDP and
-/// native/window targets keep the existing path (raw-CDP real mouse click is a
-/// tracked follow-up). `bridge_action` is the cdpInput action ("click"/
+/// native/window targets keep their exact transport. `bridge_action` is the cdpInput action ("click"/
 /// "dblclick"); `fallback_action` is the DOM-action verb used when the real lane
 /// does not apply (so verb=press keeps its named-button fallback semantics).
 #[cfg(windows)]
@@ -6780,7 +6814,7 @@ async fn target_act_dom_locator_pointer(
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     let session_id = target_act_session_id(request_context, bridge_action)?;
     // #1821: `force` means "dispatch even though a predicate is unmet". A real
-    // trusted mouse event physically cannot do that — it lands on whatever is
+    // Chrome-generated mouse event cannot do that — it lands on whatever is
     // painted at the action point — so the only honest implementation is the
     // synthetic in-page DOM dispatch lane, which delivers the event sequence to
     // the resolved node itself. Route there before the raw-CDP / bridge
@@ -6802,12 +6836,13 @@ async fn target_act_dom_locator_pointer(
         return target_act_browser_dom_action(service, fallback_action, params, request_context)
             .await;
     };
-    // Raw-CDP endpoint present → real trusted mouse click via
+    // Raw-CDP endpoint present → Chrome-generated mouse click via
     // synapse_a11y::cdp_click_node (Input.dispatchMouseEvent mouseMoved →
     // mousePressed → mouseReleased), NOT the bridge synthetic path (which rejects
     // a non-bridge raw-CDP target outright). #1348: closes the last
-    // synthetic/broken input lane — raw-CDP locator clicks are now real and
-    // trusted, mirroring the verb=tap raw-CDP path. Bridge-only targets fall
+    // synthetic/broken input lane — raw-CDP locator clicks now have
+    // `isTrusted=true` while remaining software-originated, mirroring the
+    // verb=tap raw-CDP path. Bridge-only targets fall
     // through to the cdpInput lane below.
     #[cfg(windows)]
     if let Some(endpoint) = synapse_a11y::endpoint_for_window(*window_hwnd) {
@@ -6815,7 +6850,8 @@ async fn target_act_dom_locator_pointer(
             "session_id": &session_id,
             "verb": bridge_action,
             "lane": "synapse_a11y.cdp_click_node",
-            "real_trusted_input": true,
+            "dom_event_is_trusted": true,
+            "physical_device_origin": false,
             "required_foreground": false,
             "window_hwnd": *window_hwnd,
             "cdp_target_id": cdp_target_id,
@@ -6871,7 +6907,8 @@ async fn target_act_dom_locator_pointer(
         "verb": bridge_action,
         "fallback_verb": fallback_action,
         "lane": "chrome_debugger_bridge.cdpInput",
-        "real_trusted_input": true,
+        "dom_event_is_trusted": true,
+        "physical_device_origin": false,
         "required_foreground": false,
     });
     if let Err(error) =
@@ -7132,11 +7169,12 @@ fn target_act_click_modifiers_cdp_mask(modifiers: &[TargetActClickModifier]) -> 
     mask
 }
 
-/// Real, TRUSTED raw-CDP mouse click/dblclick on a DOM-locator/element_id target
+/// Chrome-generated raw-CDP mouse click/dblclick on a DOM-locator/element_id target
 /// via `synapse_a11y::cdp_click_node` (Input.dispatchMouseEvent
 /// mouseMoved→mousePressed→mouseReleased), mirroring `target_act_touch_tap_dispatch`
-/// but with mouse instead of touch. isTrusted=true, so activation-guarded handlers
-/// fire — the raw-CDP analogue of the bridge cdpInput real-click lane (#1348).
+/// but with mouse instead of touch. `isTrusted=true` while
+/// `physical_device_origin=false`, so activation-guarded handlers fire without
+/// claiming hardware input (#1348).
 #[cfg(windows)]
 async fn target_act_raw_cdp_click_dispatch(
     endpoint: &str,
@@ -7188,7 +7226,8 @@ async fn target_act_raw_cdp_click_dispatch(
         "readback_backend": "raw_cdp",
         "method": "Input.dispatchMouseEvent(mouseMoved,mousePressed,mouseReleased)",
         "click_count": click_count,
-        "real_trusted_input": true,
+        "dom_event_is_trusted": true,
+        "physical_device_origin": false,
         "scrolled_into_view_before_click": true
     }))
 }
@@ -8366,6 +8405,664 @@ fn require_param(value: Option<String>, verb: &str, field: &str) -> Result<Strin
     })
 }
 
+fn target_act_is_input_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "set_field"
+            | "insert_text"
+            | "append_text"
+            | "set_selection"
+            | "click"
+            | "dblclick"
+            | "tap"
+            | "hover"
+            | "dispatch_event"
+            | "dispatchevent"
+            | "clear"
+            | "focus"
+            | "blur"
+            | "select_text"
+            | "selecttext"
+            | "check"
+            | "uncheck"
+            | "type"
+            | "key"
+            | "key_chord"
+            | "press"
+            | "select"
+            | "submit"
+            | "scroll"
+    )
+}
+
+fn target_act_input_provenance_context(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    params: &TargetActParams,
+) -> Result<Option<InputProvenanceContext>, ErrorData> {
+    if !target_act_is_input_verb(params.verb.as_str()) {
+        return Ok(None);
+    }
+    let session_id = target_act_session_id(request_context, params.verb.as_str())?;
+    match service.session_target(Some(&session_id))? {
+        Some(SessionTarget::Cdp {
+            window_hwnd,
+            cdp_target_id,
+        }) => {
+            InputProvenanceContext::browser_tab(&session_id, window_hwnd, &cdp_target_id).map(Some)
+        }
+        Some(SessionTarget::Window { hwnd }) => {
+            InputProvenanceContext::native_window(&session_id, hwnd).map(Some)
+        }
+        None => Ok(None),
+    }
+}
+
+fn target_act_input_provenance(
+    verb: &str,
+    delegated_tool: &str,
+    ok: bool,
+    status: &str,
+    result: &Value,
+    context: Option<&InputProvenanceContext>,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    if !target_act_is_input_verb(verb) {
+        return Ok(Vec::new());
+    }
+    if !ok {
+        if status == TARGET_ACT_STATUS_REFUSED {
+            return Ok(Vec::new());
+        }
+        return Err(input_provenance_error(
+            "target_act_failed_input_delivery",
+            format!(
+                "verb={verb:?} delegated_tool={delegated_tool:?} ended with status={status:?}; delivery was not proven absent and the error result carries no validated provenance"
+            ),
+            context.map(InputProvenanceContext::target),
+        ));
+    }
+    let context = context.ok_or_else(|| {
+        input_provenance_error(
+            "target_act_success_missing_target",
+            format!(
+                "successful input verb={verb:?} delegated_tool={delegated_tool:?} had no session target captured before dispatch"
+            ),
+            None,
+        )
+    })?;
+
+    if delegated_tool == "browser_set_value" {
+        return embedded_input_provenance(
+            result,
+            "input_provenance",
+            "target_act_browser_set_value",
+            context,
+        )
+        .map(|provenance| vec![provenance]);
+    }
+    if delegated_tool == "chrome_debugger_bridge.coordinateClick+act_type" {
+        let coordinate = result.get("coordinate_click").ok_or_else(|| {
+            input_provenance_error(
+                "target_act_coordinate_type",
+                "combined coordinate+type result omitted coordinate_click",
+                Some(context.target()),
+            )
+        })?;
+        let typed = result.get("type").ok_or_else(|| {
+            input_provenance_error(
+                "target_act_coordinate_type",
+                "combined coordinate+type result omitted type",
+                Some(context.target()),
+            )
+        })?;
+        let mut records = target_act_input_provenance(
+            "click",
+            "chrome_debugger_bridge.coordinateClick",
+            true,
+            TARGET_ACT_STATUS_OK,
+            coordinate,
+            Some(context),
+        )?;
+        records.extend(target_act_input_provenance(
+            "type",
+            "act_type",
+            true,
+            status,
+            typed,
+            Some(context),
+        )?);
+        return Ok(records);
+    }
+    if delegated_tool.starts_with("target_act.text_focus+") {
+        let steps = result
+            .get("steps")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                input_provenance_error(
+                    "target_act_text_composite",
+                    "successful text composite omitted steps[]",
+                    Some(context.target()),
+                )
+            })?;
+        let mut records = Vec::new();
+        for step in steps {
+            let step_ok = required_result_bool(step, "ok", "target_act_text_composite_step")?;
+            let step_status =
+                required_result_string(step, "status", "target_act_text_composite_step")?;
+            let step_tool =
+                required_result_string(step, "delegated_tool", "target_act_text_composite_step")?;
+            let step_result = step.get("result").ok_or_else(|| {
+                input_provenance_error(
+                    "target_act_text_composite_step",
+                    "step omitted result",
+                    Some(context.target()),
+                )
+            })?;
+            let step_verb = match result_string(step, "step") {
+                Some("move_caret_to_end") => "press",
+                Some("type") => "type",
+                Some("focus") => "click",
+                Some(other) => {
+                    return Err(input_provenance_error(
+                        "target_act_text_composite_step",
+                        format!("unclassified successful step {other:?}"),
+                        Some(context.target()),
+                    ));
+                }
+                None => {
+                    return Err(input_provenance_error(
+                        "target_act_text_composite_step",
+                        "step omitted non-empty step name",
+                        Some(context.target()),
+                    ));
+                }
+            };
+            records.extend(target_act_input_provenance(
+                step_verb,
+                step_tool,
+                step_ok,
+                step_status,
+                step_result,
+                Some(context),
+            )?);
+        }
+        return Ok(records);
+    }
+
+    match delegated_tool {
+        "chrome_debugger_bridge.domAction" => target_act_dom_action_provenance(result, context),
+        "chrome_debugger_bridge.coordinateClick" | "chrome_debugger_bridge.keyDispatch" => {
+            target_act_one_provenance(
+                context,
+                InputDeliveryOrigin::DomDispatch,
+                Some(false),
+                BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
+                required_result_string(result, "readback_backend", "bridge_dom_dispatch")?,
+                "chrome_tabs_extension+chrome.scripting",
+                if delegated_tool.ends_with("coordinateClick") {
+                    "dispatchEvent(PointerEvent/MouseEvent sequence)"
+                } else {
+                    "dispatchEvent(KeyboardEvent sequence)"
+                },
+                false,
+                false,
+            )
+        }
+        "chrome_debugger_bridge.cdpInput" => target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::ChromeDebuggerProtocol,
+            Some(true),
+            BrowserDefaultActionSemantics::UserAgentInput,
+            required_result_string(result, "readback_backend", "bridge_cdp_input")?,
+            "chrome_tabs_extension+chrome.debugger",
+            required_result_string(result, "method", "bridge_cdp_input")?,
+            false,
+            false,
+        ),
+        "synapse_a11y.cdp_click_node"
+        | "synapse_a11y.cdp_aim_node"
+        | "synapse_a11y.cdp_touch_tap" => target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::CdpProtocol,
+            Some(true),
+            BrowserDefaultActionSemantics::UserAgentInput,
+            required_result_string(result, "readback_backend", "raw_cdp_input")?,
+            "raw_cdp_websocket",
+            required_result_string(result, "method", "raw_cdp_input")?,
+            false,
+            false,
+        ),
+        "synapse_a11y.cdp_dom_primitive_node" => {
+            target_act_cdp_dom_primitive_provenance(verb, result, context)
+        }
+        "synapse_a11y.cdp_evaluate_on_element" => {
+            target_act_selection_script_provenance(result, context)
+        }
+        "synapse_a11y.append_element_text"
+        | "synapse_a11y.replace_element_text_selection"
+        | "synapse_a11y.set_element_text_selection" => {
+            target_act_native_method_provenance(result, context)
+        }
+        "act_click" | "act_type" | "act_press" | "act_scroll" | "act_set_field_text" => {
+            target_act_delegated_lane_provenance(delegated_tool, result, context)
+        }
+        other => Err(input_provenance_error(
+            "target_act_success_unclassified",
+            format!("successful input verb={verb:?} used unclassified delegated_tool={other:?}"),
+            Some(context.target()),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn target_act_one_provenance(
+    context: &InputProvenanceContext,
+    delivery_origin: InputDeliveryOrigin,
+    expected_dom_event_is_trusted: Option<bool>,
+    browser_default_actions: BrowserDefaultActionSemantics,
+    backend: &str,
+    transport: &str,
+    protocol_method: &str,
+    required_foreground: bool,
+    per_emission_fence_verified: bool,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    context
+        .finish(InputProvenanceSpec {
+            delivery_origin,
+            expected_dom_event_is_trusted,
+            browser_default_actions,
+            backend,
+            transport,
+            protocol_method: Some(protocol_method),
+            required_foreground,
+            per_emission_fence_verified,
+        })
+        .map(|provenance| vec![provenance])
+}
+
+fn target_act_dom_action_provenance(
+    result: &Value,
+    context: &InputProvenanceContext,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    let action = required_result_string(result, "action", "bridge_dom_action")?;
+    let events = result
+        .get("events_dispatched")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            input_provenance_error(
+                "bridge_dom_action",
+                "successful DOM action omitted events_dispatched[]",
+                Some(context.target()),
+            )
+        })?;
+    if events.is_empty() {
+        return Ok(Vec::new());
+    }
+    let backend = "chrome.scripting.executeScript";
+    let transport = "chrome_tabs_extension+chrome.scripting";
+    let has_focus = events.iter().any(|event| event.as_str() == Some("focus"));
+    let mut records = Vec::new();
+    if has_focus && !matches!(action, "click" | "press" | "dblclick") {
+        records.extend(target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlElementMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+            backend,
+            transport,
+            "HTMLElement.focus",
+            false,
+            false,
+        )?);
+    }
+    match action {
+        "click" | "press" | "dblclick" => {
+            let readback = result.get("action_readback").ok_or_else(|| {
+                input_provenance_error(
+                    "bridge_dom_action_click",
+                    "successful click omitted action_readback",
+                    Some(context.target()),
+                )
+            })?;
+            if result_bool(readback, "synthetic_press_sequence") == Some(true) {
+                records.extend(target_act_one_provenance(
+                    context,
+                    InputDeliveryOrigin::DomDispatch,
+                    Some(false),
+                    BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
+                    backend,
+                    transport,
+                    "dispatchEvent(PointerEvent/MouseEvent press sequence)",
+                    false,
+                    false,
+                )?);
+            }
+            if result_bool(readback, "native_click_method") == Some(true) {
+                records.extend(target_act_one_provenance(
+                    context,
+                    InputDeliveryOrigin::HtmlActivationMethod,
+                    Some(false),
+                    BrowserDefaultActionSemantics::SyntheticClickMayRunActivationBehavior,
+                    backend,
+                    transport,
+                    "HTMLElement.click",
+                    false,
+                    false,
+                )?);
+            } else {
+                records.extend(target_act_one_provenance(
+                    context,
+                    InputDeliveryOrigin::DomDispatch,
+                    Some(false),
+                    BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
+                    backend,
+                    transport,
+                    "dispatchEvent(PointerEvent/MouseEvent sequence)",
+                    false,
+                    false,
+                )?);
+            }
+        }
+        "check" | "uncheck" => records.extend(target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlActivationMethod,
+            Some(false),
+            BrowserDefaultActionSemantics::SyntheticClickMayRunActivationBehavior,
+            backend,
+            transport,
+            "HTMLElement.click",
+            false,
+            false,
+        )?),
+        "submit" => records.extend(target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlActivationMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlActivationBehavior,
+            backend,
+            transport,
+            "HTMLFormElement.requestSubmit",
+            false,
+            false,
+        )?),
+        "focus" | "blur" => records.extend(target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlElementMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+            backend,
+            transport,
+            if action == "focus" {
+                "HTMLElement.focus"
+            } else {
+                "HTMLElement.blur"
+            },
+            false,
+            false,
+        )?),
+        "select" | "dispatch_event" | "clear" | "select_text" => {
+            records.extend(target_act_one_provenance(
+                context,
+                InputDeliveryOrigin::DomDispatch,
+                Some(false),
+                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+                backend,
+                transport,
+                "DOM mutation+dispatchEvent",
+                false,
+                false,
+            )?);
+        }
+        other => {
+            return Err(input_provenance_error(
+                "bridge_dom_action",
+                format!("unclassified successful DOM action {other:?}"),
+                Some(context.target()),
+            ));
+        }
+    }
+    Ok(records)
+}
+
+fn target_act_cdp_dom_primitive_provenance(
+    verb: &str,
+    result: &Value,
+    context: &InputProvenanceContext,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    let _ = result;
+    let method = "Runtime.callFunctionOn";
+    match verb {
+        "focus" | "blur" => target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlElementMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+            "raw_cdp_runtime",
+            "raw_cdp_websocket",
+            method,
+            false,
+            false,
+        ),
+        "clear" | "select_text" | "selecttext" => target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::DomDispatch,
+            Some(false),
+            BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+            "raw_cdp_runtime",
+            "raw_cdp_websocket",
+            method,
+            false,
+            false,
+        ),
+        other => Err(input_provenance_error(
+            "raw_cdp_dom_primitive",
+            format!("unclassified successful primitive verb={other:?}"),
+            Some(context.target()),
+        )),
+    }
+}
+
+fn target_act_selection_script_provenance(
+    result: &Value,
+    context: &InputProvenanceContext,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    let method = required_result_string(result, "method", "raw_cdp_selection_script")?;
+    let mut records = target_act_one_provenance(
+        context,
+        InputDeliveryOrigin::HtmlElementMethod,
+        Some(true),
+        BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+        "raw_cdp_runtime",
+        "raw_cdp_websocket",
+        "HTMLElement.focus",
+        false,
+        false,
+    )?;
+    records.extend(target_act_one_provenance(
+        context,
+        InputDeliveryOrigin::DomDispatch,
+        Some(false),
+        BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+        "raw_cdp_runtime",
+        "raw_cdp_websocket",
+        method,
+        false,
+        false,
+    )?);
+    Ok(records)
+}
+
+fn target_act_native_method_provenance(
+    result: &Value,
+    context: &InputProvenanceContext,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    let method = required_result_string(result, "method", "native_input_method")?;
+    let (origin, defaults, transport) = if method.to_ascii_lowercase().contains("uia")
+        || method.to_ascii_lowercase().contains("value_pattern")
+        || method.to_ascii_lowercase().contains("text_pattern")
+    {
+        (
+            InputDeliveryOrigin::UiaPattern,
+            BrowserDefaultActionSemantics::UiaProviderDefined,
+            "windows_uia_com",
+        )
+    } else if method.to_ascii_lowercase().contains("wm_")
+        || method.to_ascii_lowercase().contains("message")
+        || method.to_ascii_lowercase().starts_with("native_edit_")
+    {
+        (
+            InputDeliveryOrigin::Win32PostMessage,
+            BrowserDefaultActionSemantics::Win32MessageProcessing,
+            "win32_window_message",
+        )
+    } else {
+        return Err(input_provenance_error(
+            "native_input_method",
+            format!("unclassified successful native method={method:?}"),
+            Some(context.target()),
+        ));
+    };
+    target_act_one_provenance(
+        context, origin, None, defaults, method, transport, method, false, false,
+    )
+}
+
+fn target_act_delegated_lane_provenance(
+    delegated_tool: &str,
+    result: &Value,
+    context: &InputProvenanceContext,
+) -> Result<Vec<InputProvenance>, ErrorData> {
+    let tier = required_result_string(result, "backend_tier_used", "delegated_input_lane")?;
+    let required_foreground =
+        required_result_bool(result, "required_foreground", "delegated_input_lane")?;
+    match tier {
+        "cdp" | "chrome_bridge_active_element" => {
+            let raw = context.raw_cdp_endpoint_present() && tier == "cdp";
+            let origin = if raw {
+                InputDeliveryOrigin::CdpProtocol
+            } else {
+                InputDeliveryOrigin::ChromeDebuggerProtocol
+            };
+            let backend = if raw { "raw_cdp" } else { "chrome.debugger" };
+            let transport = if raw {
+                "raw_cdp_websocket"
+            } else {
+                "chrome_tabs_extension+chrome.debugger"
+            };
+            let method = match delegated_tool {
+                "act_click" => "Input.dispatchMouseEvent",
+                "act_press" => "Input.dispatchKeyEvent",
+                "act_scroll" => "Input.dispatchMouseEvent(mouseWheel)",
+                "act_type" | "act_set_field_text" => {
+                    required_result_string(result, "method", "delegated_cdp_input")?
+                }
+                other => {
+                    return Err(input_provenance_error(
+                        "delegated_cdp_input",
+                        format!("unclassified CDP delegated tool {other:?}"),
+                        Some(context.target()),
+                    ));
+                }
+            };
+            target_act_one_provenance(
+                context,
+                origin,
+                Some(true),
+                BrowserDefaultActionSemantics::UserAgentInput,
+                backend,
+                transport,
+                method,
+                false,
+                false,
+            )
+        }
+        "uia" | "uia_invoke_hidden_desktop_worker" => {
+            let method = required_any_result_string(
+                result,
+                &["method", "backend_used"],
+                "delegated_uia_input",
+            )?;
+            target_act_one_provenance(
+                context,
+                InputDeliveryOrigin::UiaPattern,
+                None,
+                BrowserDefaultActionSemantics::UiaProviderDefined,
+                method,
+                "windows_uia_com",
+                method,
+                false,
+                false,
+            )
+        }
+        "postmessage" | "postmessage_hidden_desktop_worker" | "win32_message" | "wm_settext" => {
+            let method = required_any_result_string(
+                result,
+                &["method", "backend_used"],
+                "delegated_win32_message_input",
+            )?;
+            target_act_one_provenance(
+                context,
+                InputDeliveryOrigin::Win32PostMessage,
+                None,
+                BrowserDefaultActionSemantics::Win32MessageProcessing,
+                method,
+                "win32_window_message",
+                method,
+                false,
+                false,
+            )
+        }
+        "foreground" | "foreground_keys" => {
+            if !required_foreground {
+                return Err(input_provenance_error(
+                    "delegated_input_lane",
+                    format!("foreground tier {tier:?} contradicted required_foreground=false"),
+                    Some(context.target()),
+                ));
+            }
+            let backend = required_any_result_string(
+                result,
+                &["backend_used", "method"],
+                "delegated_foreground_input",
+            )?;
+            let (origin, transport, protocol_method) = if backend == "hardware" {
+                (
+                    InputDeliveryOrigin::VirtualHid,
+                    "synapse_action+virtual_hid",
+                    "virtual HID report",
+                )
+            } else {
+                (
+                    InputDeliveryOrigin::OsSendInput,
+                    "synapse_action+win32_sendinput",
+                    "SendInput",
+                )
+            };
+            let expected_trust =
+                (context.target().kind == InputTargetKind::BrowserTab).then_some(true);
+            target_act_one_provenance(
+                context,
+                origin,
+                expected_trust,
+                BrowserDefaultActionSemantics::OsInputPipeline,
+                backend,
+                transport,
+                protocol_method,
+                true,
+                true,
+            )
+        }
+        "none" if delegated_tool == "act_scroll" => Ok(Vec::new()),
+        other => Err(input_provenance_error(
+            "delegated_input_lane",
+            format!(
+                "successful {delegated_tool} returned unclassified backend_tier_used={other:?}"
+            ),
+            Some(context.target()),
+        )),
+    }
+}
+
 fn target_act_unknown_verb_error(verb: &str) -> ErrorData {
     mcp_error(
         error_codes::TOOL_PARAMS_INVALID,
@@ -8785,7 +9482,10 @@ fn target_act_secret_safe_structural_key(lower: &str) -> bool {
             | "requirement"
             | "predicate"
             | "predicate_detail"
-            | "input_trust"
+            | "dom_event_is_trusted"
+            | "physical_device_origin"
+            | "browser_default_actions"
+            | "forced_dom_dispatch"
             | "forced_actionability_bypass"
             | "auto_wait"
             | "text_truncated"
@@ -9169,7 +9869,7 @@ async fn target_act_key_press(
     // A11Y_CDP_UNREACHABLE - while `click` on the identical target dispatched
     // fine. An agent could therefore open a modal it had no way to leave.
     // Route keyboard input through the same bridge, reporting the input-trust
-    // downgrade explicitly rather than implying trusted OS input.
+    // report its synthetic DOM semantics explicitly.
     #[cfg(windows)]
     if let Some(result) =
         target_act_bridge_key_dispatch(service, params, request_context, &keys, verb).await?
@@ -9188,8 +9888,8 @@ async fn target_act_key_press(
 /// tab (#1824).
 ///
 /// Returns `Ok(None)` when this is not a bridge-only CDP target - a raw-CDP
-/// endpoint or a native window target keeps the existing trusted `act_press`
-/// path, which is strictly better input. Only the case that previously had no
+/// endpoint or a native window target keeps the existing CDP/OS `act_press`
+/// path. Only the case that previously had no
 /// route at all is served here.
 #[cfg(windows)]
 async fn target_act_bridge_key_dispatch(
@@ -9208,8 +9908,8 @@ async fn target_act_bridge_key_dispatch(
         return Ok(None);
     };
     if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
-        // A raw-CDP endpoint exists: Input.dispatchKeyEvent delivers TRUSTED key
-        // input, which is strictly better. Never downgrade it.
+        // A raw-CDP endpoint exists: Input.dispatchKeyEvent creates
+        // `isTrusted=true` DOM events while remaining software-originated.
         return Ok(None);
     }
     let target = SessionTarget::Cdp {
@@ -9223,8 +9923,9 @@ async fn target_act_bridge_key_dispatch(
         "window_hwnd": window_hwnd,
         "cdp_target_id": &cdp_target_id,
         "keys": keys,
-        "real_trusted_input": false,
-        "input_trust": "synthetic_dom_dispatch",
+        "dom_event_is_trusted": false,
+        "physical_device_origin": false,
+        "browser_default_actions": "synthetic_dispatch_no_user_agent_input_defaults",
         "required_foreground": false,
         "secret_safe": params.secret_safe,
     });

@@ -6,7 +6,11 @@ use crate::m1::mcp_error;
 use rmcp::{RoleServer, schemars::JsonSchema, service::RequestContext};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use synapse_core::error_codes;
+use synapse_core::{
+    BrowserDefaultActionSemantics, InputDeliveryOrigin, InputProvenance, error_codes,
+};
+
+use super::input_provenance::{InputProvenanceContext, InputProvenanceSpec};
 
 const BROWSER_DRAG_TOOL: &str = "browser_drag";
 const BROWSER_DROP_TOOL: &str = "browser_drop";
@@ -25,7 +29,7 @@ pub enum BrowserDndMode {
     /// object. Drives JS DnD libraries that do not check trust (e.g. react-dnd's
     /// HTML5 backend); does NOT drive isTrusted-gating native drop zones.
     Html5,
-    /// Real, trusted (isTrusted=true) HTML5 drop via CDP
+    /// Chrome-generated (`isTrusted=true`) HTML5 drop via CDP
     /// `Input.dispatchDragEvent` (dragEnter/dragOver/drop) onto the target with a
     /// constructed DragData built from `data_mime_type`/`data_text` (or the
     /// source element's text). Drives native drop zones that gate on
@@ -111,6 +115,7 @@ pub struct BrowserDndResponse {
     pub delegated_tool: String,
     pub status: String,
     pub result: Value,
+    pub input_provenance: InputProvenance,
 }
 
 #[derive(Clone, Debug)]
@@ -214,7 +219,7 @@ impl SynapseService {
         });
         self.audit_action_started_with_details_for_session(tool, &request_details, &session_id)?;
         let result = self
-            .browser_dnd_run(tool, window_hwnd, &cdp_target_id, &dnd)
+            .browser_dnd_run(tool, &session_id, window_hwnd, &cdp_target_id, &dnd)
             .await;
         self.audit_action_result_for_session(tool, &result, &session_id)?;
         result.map(Json)
@@ -249,10 +254,13 @@ impl SynapseService {
     async fn browser_dnd_run(
         &self,
         tool: &'static str,
+        session_id: &str,
         window_hwnd: i64,
         cdp_target_id: &str,
         dnd: &NormalizedBrowserDndParams,
     ) -> Result<BrowserDndResponse, ErrorData> {
+        let provenance_context =
+            InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id)?;
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_drag_drop_before_bridge_input",
         )?;
@@ -300,6 +308,39 @@ impl SynapseService {
         super::operator_panic_boundary::ensure_mcp_mutation(
             "browser_drag_drop_after_bridge_input",
         )?;
+        let (delivery_origin, expected_trust, default_actions, transport, method) = match dnd.mode {
+            BrowserDndMode::Mouse => (
+                InputDeliveryOrigin::ChromeDebuggerProtocol,
+                Some(true),
+                BrowserDefaultActionSemantics::UserAgentInput,
+                "chrome_tabs_extension+chrome.debugger",
+                "Input.dispatchMouseEvent(mouseMoved,mousePressed,dragMove,mouseReleased)",
+            ),
+            BrowserDndMode::Html5 => (
+                InputDeliveryOrigin::DomDispatch,
+                Some(false),
+                BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
+                "chrome_tabs_extension+chrome.scripting",
+                "dispatchEvent(DragEvent sequence)",
+            ),
+            BrowserDndMode::Html5Real => (
+                InputDeliveryOrigin::ChromeDebuggerProtocol,
+                Some(true),
+                BrowserDefaultActionSemantics::UserAgentInput,
+                "chrome_tabs_extension+chrome.debugger",
+                "Input.dispatchDragEvent(dragEnter,dragOver,drop)",
+            ),
+        };
+        let input_provenance = provenance_context.finish(InputProvenanceSpec {
+            delivery_origin,
+            expected_dom_event_is_trusted: expected_trust,
+            browser_default_actions: default_actions,
+            backend: dnd.mode.delegated_method(),
+            transport,
+            protocol_method: Some(method),
+            required_foreground: false,
+            per_emission_fence_verified: false,
+        })?;
 
         Ok(BrowserDndResponse {
             ok: true,
@@ -315,6 +356,7 @@ impl SynapseService {
             delegated_tool: dnd.mode.delegated_method().to_owned(),
             status: "dispatched_with_bridge_readback".to_owned(),
             result,
+            input_provenance,
         })
     }
 }
