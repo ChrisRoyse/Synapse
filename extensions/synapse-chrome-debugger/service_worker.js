@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-websocket-terminal-evaluate-exception-v13";
-const BRIDGE_DECLARED_BUILD_SHA256 = "5878a1f4e4f4142104c2953aedc4f70eef960e3e625ab32ec32dad4269967b7d";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-durable-schema6-migration-v14";
+const BRIDGE_DECLARED_BUILD_SHA256 = "9da173baa076a4c413f9bcac4dd86b2679b5f6b775927203990ee694e8dbbff7";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -244,6 +244,9 @@ let IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = 0;
 let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
 let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
 const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV4";
+const DURABLE_OWNER_STORAGE_SCHEMA_VERSION = 6;
+const LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY =
+  "synapseOperatorPanicDurableOwnerLedgerSchema5ArchiveV1";
 const LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
 const LEGACY_DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV1";
 const DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY =
@@ -270,6 +273,7 @@ let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
 let RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = null;
 let REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = null;
 let RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION = null;
+let DURABLE_OWNER_SCHEMA5_MIGRATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 
 function recordDurableOwnerLifecycleEvent(kind, reason = null) {
@@ -1332,7 +1336,7 @@ function enqueueImmediateOperatorPanicDisable(command) {
 
 function emptyDurableOwnerLedger() {
   return {
-    version: 4,
+    version: DURABLE_OWNER_STORAGE_SCHEMA_VERSION,
     revision: 0,
     browserSessionId: "",
     enabled: true,
@@ -1341,6 +1345,7 @@ function emptyDurableOwnerLedger() {
     commandTerminalSequence: 0,
     commandTerminalOutbox: [],
     lastCommandTerminalAck: null,
+    legacySchema5Migration: null,
     captureVisibleTabLease: null,
     lastCaptureVisibleTabSettlement: null,
     openedTabs: [],
@@ -1530,6 +1535,121 @@ function normalizeStoredCommandTerminalAck(value) {
   return ack;
 }
 
+function isLowerSha256Hex(value) {
+  return typeof value === "string" && /^[0-9a-f]{64}$/.test(value);
+}
+
+function normalizeLegacySchema5MigrationMetadata(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable owner ledger schema-5 migration metadata is malformed");
+  }
+  const metadata = {
+    archiveVersion: Number(value.archiveVersion),
+    sourceSchemaVersion: Number(value.sourceSchemaVersion),
+    sourceRevision: Number(value.sourceRevision),
+    sourceSha256: String(value.sourceSha256 || "").trim(),
+    sourceBytes: Number(value.sourceBytes),
+    sourceTerminalSequence: Number(value.sourceTerminalSequence),
+    archiveKey: String(value.archiveKey || "").trim(),
+    archivedAtUnixMs: Number(value.archivedAtUnixMs),
+    migratedAtUnixMs: Number(value.migratedAtUnixMs)
+  };
+  if (metadata.archiveVersion !== 1 || metadata.sourceSchemaVersion !== 5 ||
+      !Number.isSafeInteger(metadata.sourceRevision) || metadata.sourceRevision < 0 ||
+      !isLowerSha256Hex(metadata.sourceSha256) ||
+      !Number.isSafeInteger(metadata.sourceBytes) || metadata.sourceBytes <= 0 ||
+      !Number.isSafeInteger(metadata.sourceTerminalSequence) ||
+      metadata.sourceTerminalSequence < 0 ||
+      metadata.archiveKey !== LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY ||
+      !Number.isSafeInteger(metadata.archivedAtUnixMs) ||
+      metadata.archivedAtUnixMs <= 0 ||
+      !Number.isSafeInteger(metadata.migratedAtUnixMs) ||
+      metadata.migratedAtUnixMs < metadata.archivedAtUnixMs) {
+    throw new Error("durable owner ledger schema-5 migration metadata fields are malformed");
+  }
+  return metadata;
+}
+
+function normalizeLegacySchema5LastTerminalAcknowledgement(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("schema-5 durable owner last terminal acknowledgement is malformed");
+  }
+  const row = {
+    commandId: String(value.commandId || "").trim(),
+    commandKind: String(value.commandKind || "").trim(),
+    ownerHostId: String(value.ownerHostId || "").trim(),
+    acceptedHostId: String(value.acceptedHostId || "").trim(),
+    browserSessionSha256: String(value.browserSessionSha256 || "").trim(),
+    terminalSequence: Number(value.terminalSequence),
+    wireSha256: String(value.wireSha256 || "").trim(),
+    wireBytes: Number(value.wireBytes),
+    status: String(value.status || "").trim(),
+    responseOk: value.responseOk,
+    responseErrorCode: String(value.responseErrorCode || ""),
+    acceptedAtUnixMs: Number(value.acceptedAtUnixMs),
+    recordedAtUnixMs: Number(value.recordedAtUnixMs)
+  };
+  if (!row.commandId || !row.commandKind || !row.ownerHostId ||
+      !row.acceptedHostId || !isLowerSha256Hex(row.browserSessionSha256) ||
+      !Number.isSafeInteger(row.terminalSequence) || row.terminalSequence <= 0 ||
+      !isLowerSha256Hex(row.wireSha256) ||
+      !Number.isSafeInteger(row.wireBytes) || row.wireBytes <= 0 ||
+      !["accepted", "duplicate"].includes(row.status) ||
+      typeof row.responseOk !== "boolean" ||
+      !Number.isSafeInteger(row.acceptedAtUnixMs) || row.acceptedAtUnixMs <= 0 ||
+      !Number.isSafeInteger(row.recordedAtUnixMs) || row.recordedAtUnixMs <= 0) {
+    throw new Error("schema-5 durable owner last terminal acknowledgement fields are malformed");
+  }
+  return row;
+}
+
+function normalizeLegacySchema5LastCaptureSettlement(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("schema-5 durable owner last capture settlement is malformed");
+  }
+  const row = {
+    id: String(value.id || "").trim(),
+    status: String(value.status || "").trim(),
+    tabId: normalizeStoredTabId(value.tabId),
+    windowId: Number(value.windowId),
+    tileIndex: Number(value.tileIndex),
+    tileCount: Number(value.tileCount),
+    workerBootId: String(value.workerBootId || "").trim(),
+    browserSessionSha256: String(value.browserSessionSha256 || "").trim(),
+    rawStartedAtUnixMs: Number(value.rawStartedAtUnixMs),
+    rawSettledAtUnixMs: Number(value.rawSettledAtUnixMs),
+    callerTimedOut: value.callerTimedOut,
+    resultDiscarded: value.resultDiscarded,
+    errorCode: value.errorCode === null ? null : String(value.errorCode || "").trim(),
+    errorDetail: value.errorDetail === null ? null : String(value.errorDetail || "")
+  };
+  if (!row.id || !["fulfilled", "rejected", "postcondition_failed"].includes(row.status) ||
+      row.tabId === null || !Number.isSafeInteger(row.windowId) || row.windowId < 0 ||
+      !Number.isSafeInteger(row.tileIndex) || row.tileIndex < 1 ||
+      !Number.isSafeInteger(row.tileCount) || row.tileCount < row.tileIndex ||
+      !row.workerBootId || !isLowerSha256Hex(row.browserSessionSha256) ||
+      !Number.isSafeInteger(row.rawStartedAtUnixMs) || row.rawStartedAtUnixMs <= 0 ||
+      !Number.isSafeInteger(row.rawSettledAtUnixMs) ||
+      row.rawSettledAtUnixMs < row.rawStartedAtUnixMs ||
+      typeof row.callerTimedOut !== "boolean" ||
+      typeof row.resultDiscarded !== "boolean" ||
+      (row.status === "fulfilled" && row.errorCode !== null) ||
+      (row.status !== "fulfilled" && !row.errorCode) ||
+      (row.errorDetail !== null && row.errorDetail.length > 2048)) {
+    throw new Error("schema-5 durable owner last capture settlement fields are malformed");
+  }
+  return row;
+}
+
 function normalizeDurableOwnerLedger(value) {
   if (value === undefined) {
     return emptyDurableOwnerLedger();
@@ -1538,7 +1658,7 @@ function normalizeDurableOwnerLedger(value) {
     throw new Error("durable owner ledger is not an object");
   }
   const source = value;
-  if (![2, 4].includes(source.version)) {
+  if (![2, 4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
     throw new Error(`durable owner ledger version is unsupported: ${String(source.version)}`);
   }
   if (source.version === 2 && source.inFlightMutation) {
@@ -1605,7 +1725,7 @@ function normalizeDurableOwnerLedger(value) {
     }
     ledger.inFlightMutation = { id, kind, activitySequence, workerBootId };
   }
-  if (source.version === 4) {
+  if ([4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
     if (!Number.isSafeInteger(source.commandTerminalSequence) ||
         source.commandTerminalSequence < 0) {
       throw new Error("durable owner ledger command terminal sequence is malformed");
@@ -1635,6 +1755,11 @@ function normalizeDurableOwnerLedger(value) {
     ledger.lastCommandTerminalAck = source.lastCommandTerminalAck === null
       ? null
       : normalizeStoredCommandTerminalAck(source.lastCommandTerminalAck);
+  }
+  if (source.version === DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
+    ledger.legacySchema5Migration = normalizeLegacySchema5MigrationMetadata(
+      source.legacySchema5Migration
+    );
   }
   const initKeys = new Set();
   for (const entry of source.initScripts) {
@@ -1894,30 +2019,393 @@ function canonicalDurableOwnerJson(value) {
   return JSON.stringify(canonicalize(value));
 }
 
-async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
-  if (v4Stored?.version !== 4 || v2Stored?.version !== 2) {
+async function analyzeLegacySchema5DurableOwnerLedger(source) {
+  if (!source || typeof source !== "object" || Array.isArray(source) || source.version !== 5) {
+    throw new Error("schema-5 durable owner migration source is not an exact schema-5 object");
+  }
+  const requiredFields = [
+    "revision",
+    "browserSessionId",
+    "browserSessionSha256",
+    "enabled",
+    "disableSequence",
+    "inFlightMutation",
+    "terminalSequence",
+    "pendingTerminalResponses",
+    "lastTerminalAcknowledgement",
+    "captureVisibleTabLease",
+    "lastCaptureVisibleTabSettlement",
+    "openedTabs",
+    "initScripts",
+    "bindings",
+    "debuggerTabs",
+    "unresolvedDebuggerCommandTimeouts",
+    "dialogTabs",
+    "fileChooserTabs",
+    "clockTabs",
+    "executedInitScriptEffects",
+    "viewportOverrides",
+    "deviceOverrides",
+    "geolocationOverrides",
+    "localeOverrides",
+    "mediaOverrides",
+    "networkOverrides"
+  ];
+  const missingFields = requiredFields.filter(
+    (field) => !Object.prototype.hasOwnProperty.call(source, field)
+  );
+  if (missingFields.length > 0) {
     throw new Error(
-      "both durable owner ledger keys exist but do not carry exact v4/v2 versions; " +
-        `v4_version=${String(v4Stored?.version)} v2_version=${String(v2Stored?.version)}; ` +
+      `schema-5 durable owner ledger is missing required fields: ${missingFields.join(",")}`
+    );
+  }
+  if (!Number.isSafeInteger(source.revision) || source.revision < 0 ||
+      typeof source.browserSessionId !== "string" || !source.browserSessionId.trim() ||
+      !isLowerSha256Hex(source.browserSessionSha256) ||
+      typeof source.enabled !== "boolean" ||
+      !Number.isSafeInteger(source.disableSequence) || source.disableSequence < 0 ||
+      !Number.isSafeInteger(source.terminalSequence) || source.terminalSequence < 0) {
+    throw new Error("schema-5 durable owner ledger scalar fields are malformed");
+  }
+  const actualBrowserSessionSha256 = await sha256HexText(source.browserSessionId.trim());
+  if (actualBrowserSessionSha256 !== source.browserSessionSha256) {
+    throw new Error(
+      "schema-5 durable owner browser-session digest does not match its session id; " +
+        `expected_sha256=${actualBrowserSessionSha256} ` +
+        `actual_sha256=${source.browserSessionSha256}`
+    );
+  }
+  if (!Array.isArray(source.pendingTerminalResponses)) {
+    throw new Error("schema-5 durable owner pending terminal responses is not an array");
+  }
+  if (source.inFlightMutation !== null || source.pendingTerminalResponses.length !== 0 ||
+      source.captureVisibleTabLease !== null) {
+    throw new Error(
+      "schema-5 durable owner ledger is not quiescent; migration cannot translate live " +
+        "command/capture ownership without changing execution semantics; " +
+        `in_flight_mutation=${source.inFlightMutation ? "present" : "none"} ` +
+        `pending_terminal_response_count=${source.pendingTerminalResponses.length} ` +
+        `capture_visible_tab_lease=${source.captureVisibleTabLease ? "present" : "none"}`
+    );
+  }
+  const lastTerminalAcknowledgement =
+    normalizeLegacySchema5LastTerminalAcknowledgement(source.lastTerminalAcknowledgement);
+  const lastCaptureVisibleTabSettlement =
+    normalizeLegacySchema5LastCaptureSettlement(source.lastCaptureVisibleTabSettlement);
+  if (lastTerminalAcknowledgement &&
+      (lastTerminalAcknowledgement.terminalSequence > source.terminalSequence ||
+       lastTerminalAcknowledgement.browserSessionSha256 !== source.browserSessionSha256)) {
+    throw new Error(
+      "schema-5 durable owner last terminal acknowledgement contradicts the ledger " +
+        "sequence or browser-session lineage"
+    );
+  }
+  if (lastCaptureVisibleTabSettlement &&
+      lastCaptureVisibleTabSettlement.browserSessionSha256 !== source.browserSessionSha256) {
+    throw new Error(
+      "schema-5 durable owner last capture settlement contradicts browser-session lineage"
+    );
+  }
+
+  const ledger = normalizeDurableOwnerLedger({
+    ...source,
+    version: 4,
+    commandTerminalSequence: source.terminalSequence,
+    commandTerminalOutbox: [],
+    lastCommandTerminalAck: null,
+    captureVisibleTabLease: null,
+    lastCaptureVisibleTabSettlement: null
+  });
+  const sourceJson = canonicalDurableOwnerJson(source);
+  return {
+    ledger,
+    sourceJson,
+    sourceSha256: await sha256HexText(sourceJson),
+    sourceBytes: new TextEncoder().encode(sourceJson).byteLength,
+    sourceRevision: source.revision,
+    sourceTerminalSequence: source.terminalSequence
+  };
+}
+
+async function validateLegacySchema5Archive(archive, analysis) {
+  if (!archive || typeof archive !== "object" || Array.isArray(archive) ||
+      archive.archiveVersion !== 1 || archive.sourceSchemaVersion !== 5 ||
+      !Number.isSafeInteger(archive.archivedAtUnixMs) || archive.archivedAtUnixMs <= 0 ||
+      !Number.isSafeInteger(archive.sourceRevision) || archive.sourceRevision < 0 ||
+      !Number.isSafeInteger(archive.sourceBytes) || archive.sourceBytes <= 0 ||
+      !isLowerSha256Hex(archive.sourceSha256) ||
+      !archive.source || typeof archive.source !== "object" || Array.isArray(archive.source)) {
+    throw new Error("durable owner schema-5 archive wrapper is malformed");
+  }
+  const archivedAnalysis = await analyzeLegacySchema5DurableOwnerLedger(archive.source);
+  if (archive.sourceRevision !== analysis.sourceRevision ||
+      archive.sourceRevision !== archivedAnalysis.sourceRevision ||
+      archive.sourceBytes !== analysis.sourceBytes ||
+      archive.sourceBytes !== archivedAnalysis.sourceBytes ||
+      archive.sourceSha256 !== analysis.sourceSha256 ||
+      archive.sourceSha256 !== archivedAnalysis.sourceSha256 ||
+      archivedAnalysis.sourceJson !== analysis.sourceJson) {
+    throw new Error(
+      "durable owner schema-5 archive does not exactly match the migration source; " +
+        `expected_revision=${analysis.sourceRevision} actual_revision=${archive.sourceRevision} ` +
+        `expected_sha256=${analysis.sourceSha256} actual_sha256=${archive.sourceSha256} ` +
+        `expected_bytes=${analysis.sourceBytes} actual_bytes=${archive.sourceBytes}`
+    );
+  }
+  return archive;
+}
+
+async function writeAndVerifyLegacySchema5Archive(analysis, existingArchive) {
+  let archive = existingArchive;
+  if (archive === undefined) {
+    archive = {
+      archiveVersion: 1,
+      sourceSchemaVersion: 5,
+      sourceRevision: analysis.sourceRevision,
+      sourceSha256: analysis.sourceSha256,
+      sourceBytes: analysis.sourceBytes,
+      archivedAtUnixMs: Date.now(),
+      source: JSON.parse(analysis.sourceJson)
+    };
+    await chrome.storage.local.set({
+      [LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]: archive
+    });
+  }
+  const readback = await chrome.storage.local.get(
+    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
+  );
+  const stored = await validateLegacySchema5Archive(
+    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
+    analysis
+  );
+  if (canonicalDurableOwnerJson(stored) !== canonicalDurableOwnerJson(archive)) {
+    throw new Error(
+      "durable owner schema-5 archive write postcondition failed after exact readback"
+    );
+  }
+  return stored;
+}
+
+async function migrateLegacySchema5DurableOwnerLedger(
+  source,
+  existingArchive,
+  sourceStorageKey
+) {
+  const analysis = await analyzeLegacySchema5DurableOwnerLedger(source);
+  const archive = await writeAndVerifyLegacySchema5Archive(analysis, existingArchive);
+  const ledger = analysis.ledger;
+  ledger.revision = analysis.sourceRevision + 1;
+  ledger.legacySchema5Migration = {
+    archiveVersion: 1,
+    sourceSchemaVersion: 5,
+    sourceRevision: analysis.sourceRevision,
+    sourceSha256: analysis.sourceSha256,
+    sourceBytes: analysis.sourceBytes,
+    sourceTerminalSequence: analysis.sourceTerminalSequence,
+    archiveKey: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
+    archivedAtUnixMs: archive.archivedAtUnixMs,
+    migratedAtUnixMs: Math.max(Date.now(), archive.archivedAtUnixMs)
+  };
+  await writeAndVerifyDurableOwnerSnapshot(ledger);
+  const readback = await chrome.storage.local.get([
+    DURABLE_OWNER_STORAGE_KEY,
+    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
+  ]);
+  const persistedLedger = normalizeDurableOwnerLedger(
+    readback?.[DURABLE_OWNER_STORAGE_KEY]
+  );
+  await validateLegacySchema5Archive(
+    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
+    analysis
+  );
+  const expectedJson = canonicalDurableOwnerJson(ledger);
+  const actualJson = canonicalDurableOwnerJson(persistedLedger);
+  if (actualJson !== expectedJson) {
+    throw new Error(
+      "schema-5 to schema-6 durable owner migration postcondition failed; " +
+        `expected_sha256=${await sha256HexText(expectedJson)} ` +
+        `actual_sha256=${await sha256HexText(actualJson)}`
+    );
+  }
+  if (sourceStorageKey === LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY) {
+    await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
+    const removalReadback = await chrome.storage.local.get([
+      DURABLE_OWNER_STORAGE_KEY,
+      LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
+      LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
+    ]);
+    const legacyAbsent =
+      removalReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
+    const currentJson = canonicalDurableOwnerJson(
+      normalizeDurableOwnerLedger(removalReadback?.[DURABLE_OWNER_STORAGE_KEY])
+    );
+    await validateLegacySchema5Archive(
+      removalReadback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
+      analysis
+    );
+    if (!legacyAbsent || currentJson !== expectedJson) {
+      throw new Error(
+        "schema-5 migration cleanup postcondition failed; canonical schema-6 must " +
+          "remain exact and the legacy source key must be absent; " +
+          `legacy_absent=${legacyAbsent}`
+      );
+    }
+  } else if (sourceStorageKey !== DURABLE_OWNER_STORAGE_KEY) {
+    throw new Error(
+      `schema-5 migration source key is unsupported: ${String(sourceStorageKey)}`
+    );
+  }
+  return {
+    ledger: persistedLedger,
+    readback: {
+      migrated: true,
+      reason: "validated_quiescent_schema_5_to_schema_6",
+      source_revision: analysis.sourceRevision,
+      accepted_revision: persistedLedger.revision,
+      source_terminal_sequence: analysis.sourceTerminalSequence,
+      source_sha256: analysis.sourceSha256,
+      source_bytes: analysis.sourceBytes,
+      archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
+      archive_readback_verified: true,
+      migrated_at_unix_ms: ledger.legacySchema5Migration.migratedAtUnixMs
+    }
+  };
+}
+
+async function reconcileInterruptedLegacySchema5Migration(
+  canonicalStored,
+  legacyStored,
+  archiveStored
+) {
+  const canonicalLedger = normalizeDurableOwnerLedger(canonicalStored);
+  if (canonicalStored?.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION ||
+      legacyStored?.version !== 5 || !canonicalLedger.legacySchema5Migration) {
+    throw new Error(
+      "canonical and legacy durable owner rows do not form a schema-5 migration pair; " +
+        `canonical_version=${String(canonicalStored?.version)} ` +
+        `legacy_version=${String(legacyStored?.version)}`
+    );
+  }
+  const analysis = await analyzeLegacySchema5DurableOwnerLedger(legacyStored);
+  await validateLegacySchema5Archive(archiveStored, analysis);
+  const metadata = canonicalLedger.legacySchema5Migration;
+  await verifyLegacySchema5MigrationArchive(metadata, archiveStored);
+  const expectedLedger = analysis.ledger;
+  expectedLedger.revision = analysis.sourceRevision + 1;
+  expectedLedger.legacySchema5Migration = metadata;
+  const expectedJson = canonicalDurableOwnerJson(expectedLedger);
+  const actualJson = canonicalDurableOwnerJson(canonicalLedger);
+  if (actualJson !== expectedJson) {
+    throw new Error(
+      "canonical schema-6 row is not the exact one-revision product of the retained " +
+        "schema-5 source; refusing ambiguous authority; " +
+        `expected_sha256=${await sha256HexText(expectedJson)} ` +
+        `actual_sha256=${await sha256HexText(actualJson)}`
+    );
+  }
+  await chrome.storage.local.remove(LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY);
+  const readback = await chrome.storage.local.get([
+    DURABLE_OWNER_STORAGE_KEY,
+    LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
+    LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
+  ]);
+  const legacyAbsent =
+    readback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
+  const persistedLedger = normalizeDurableOwnerLedger(
+    readback?.[DURABLE_OWNER_STORAGE_KEY]
+  );
+  await validateLegacySchema5Archive(
+    readback?.[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
+    analysis
+  );
+  if (!legacyAbsent || canonicalDurableOwnerJson(persistedLedger) !== actualJson) {
+    throw new Error(
+      "interrupted schema-5 migration cleanup postcondition failed; canonical schema-6 " +
+        `must remain exact and legacy source must be absent; legacy_absent=${legacyAbsent}`
+    );
+  }
+  return {
+    ledger: persistedLedger,
+    readback: {
+      migrated: true,
+      reconciled_interrupted_migration: true,
+      reason: "exact_one_revision_schema_5_to_schema_6_migration_product",
+      source_revision: analysis.sourceRevision,
+      accepted_revision: persistedLedger.revision,
+      source_terminal_sequence: analysis.sourceTerminalSequence,
+      source_sha256: analysis.sourceSha256,
+      source_bytes: analysis.sourceBytes,
+      archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
+      archive_readback_verified: true,
+      legacy_source_absent_after: true,
+      migrated_at_unix_ms: metadata.migratedAtUnixMs
+    }
+  };
+}
+
+async function verifyLegacySchema5MigrationArchive(metadata, archive) {
+  if (!metadata) {
+    if (archive !== undefined) {
+      throw new Error(
+        "durable owner schema-5 archive exists without canonical schema-6 migration metadata; " +
+          "refusing ambiguous authority"
+      );
+    }
+    return null;
+  }
+  const analysis = await analyzeLegacySchema5DurableOwnerLedger(archive?.source);
+  await validateLegacySchema5Archive(archive, analysis);
+  if (metadata.sourceRevision !== analysis.sourceRevision ||
+      metadata.sourceSha256 !== analysis.sourceSha256 ||
+      metadata.sourceBytes !== analysis.sourceBytes ||
+      metadata.sourceTerminalSequence !== analysis.sourceTerminalSequence ||
+      metadata.archivedAtUnixMs !== archive.archivedAtUnixMs) {
+    throw new Error(
+      "canonical schema-6 migration metadata contradicts the immutable schema-5 archive"
+    );
+  }
+  return {
+    migrated: false,
+    reason: "existing_schema_5_archive_verified",
+    source_revision: analysis.sourceRevision,
+    accepted_revision: null,
+    source_terminal_sequence: analysis.sourceTerminalSequence,
+    source_sha256: analysis.sourceSha256,
+    source_bytes: analysis.sourceBytes,
+    archive_key: LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY,
+    archive_readback_verified: true,
+    migrated_at_unix_ms: metadata.migratedAtUnixMs
+  };
+}
+
+async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
+  if (![4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(v4Stored?.version) ||
+      v2Stored?.version !== 2) {
+    throw new Error(
+      "both durable owner ledger keys exist but do not carry exact canonical/v2 versions; " +
+        `canonical_version=${String(v4Stored?.version)} ` +
+        `v2_version=${String(v2Stored?.version)}; ` +
         "refusing ambiguous authority"
     );
   }
-  const actualV4 = normalizeDurableOwnerLedger(v4Stored);
-  const expectedV4 = normalizeDurableOwnerLedger(v2Stored);
-  const sourceRevision = expectedV4.revision;
-  expectedV4.revision += 1;
-  const actualJson = canonicalDurableOwnerJson(actualV4);
-  const expectedJson = canonicalDurableOwnerJson(expectedV4);
+  const actualCanonical = normalizeDurableOwnerLedger(v4Stored);
+  const expectedCanonical = normalizeDurableOwnerLedger(v2Stored);
+  const sourceRevision = expectedCanonical.revision;
+  expectedCanonical.revision += 1;
+  const actualJson = canonicalDurableOwnerJson(actualCanonical);
+  const expectedJson = canonicalDurableOwnerJson(expectedCanonical);
   const actualSha256 = await sha256HexText(actualJson);
   const expectedSha256 = await sha256HexText(expectedJson);
   if (actualJson !== expectedJson) {
     throw new Error(
-      "both v4 and legacy v2 durable owner ledgers are present and the v4 row is not " +
+      "both canonical and legacy v2 durable owner ledgers are present and the canonical " +
+        "row is not " +
         "the exact one-revision migration product; refusing ambiguous authority; " +
-        `v2_revision=${sourceRevision} v4_revision=${actualV4.revision} ` +
-        `expected_v4_sha256=${expectedSha256} actual_v4_sha256=${actualSha256} ` +
-        `expected_v4_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
-        `actual_v4_bytes=${new TextEncoder().encode(actualJson).byteLength}`
+        `v2_revision=${sourceRevision} canonical_revision=${actualCanonical.revision} ` +
+        `expected_canonical_sha256=${expectedSha256} ` +
+        `actual_canonical_sha256=${actualSha256} ` +
+        `expected_canonical_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
+        `actual_canonical_bytes=${new TextEncoder().encode(actualJson).byteLength}`
     );
   }
 
@@ -1927,24 +2415,25 @@ async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
     LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
   ]);
   const v2Absent = readback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] === undefined;
-  const persistedV4Json = canonicalDurableOwnerJson(
+  const persistedCanonicalJson = canonicalDurableOwnerJson(
     normalizeDurableOwnerLedger(readback?.[DURABLE_OWNER_STORAGE_KEY])
   );
-  const persistedV4Sha256 = await sha256HexText(persistedV4Json);
-  if (!v2Absent || persistedV4Json !== actualJson) {
+  const persistedCanonicalSha256 = await sha256HexText(persistedCanonicalJson);
+  if (!v2Absent || persistedCanonicalJson !== actualJson) {
     throw new Error(
       "interrupted durable owner migration cleanup postcondition failed; " +
-        `legacy_v2_absent=${v2Absent} expected_v4_sha256=${actualSha256} ` +
-        `actual_v4_sha256=${persistedV4Sha256}; v4 must remain exact and v2 must be absent`
+        `legacy_v2_absent=${v2Absent} expected_canonical_sha256=${actualSha256} ` +
+        `actual_canonical_sha256=${persistedCanonicalSha256}; canonical row must remain ` +
+        "exact and v2 must be absent"
     );
   }
   return {
     reconciled: true,
-    reason: "exact_one_revision_v2_to_v4_migration_product",
+    reason: "exact_one_revision_v2_to_canonical_migration_product",
     source_v2_revision: sourceRevision,
-    accepted_v4_revision: actualV4.revision,
-    accepted_v4_sha256: actualSha256,
-    accepted_v4_bytes: new TextEncoder().encode(actualJson).byteLength,
+    accepted_canonical_revision: actualCanonical.revision,
+    accepted_canonical_sha256: actualSha256,
+    accepted_canonical_bytes: new TextEncoder().encode(actualJson).byteLength,
     legacy_v2_absent_after: true,
     reconciled_at_unix_ms: Date.now()
   };
@@ -2091,14 +2580,15 @@ async function restoreDurableOwnerLedger() {
     const [localStored, sessionStored] = await Promise.all([
       chrome.storage.local.get([
         DURABLE_OWNER_STORAGE_KEY,
-        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
+        LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY,
+        LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
       ]),
       chrome.storage.session.get([
         DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY,
         LEGACY_DURABLE_OWNER_STORAGE_KEY
       ])
     ]);
-    const hasV4LocalLedger = Object.prototype.hasOwnProperty.call(
+    const hasCurrentLocalLedger = Object.prototype.hasOwnProperty.call(
       localStored || {},
       DURABLE_OWNER_STORAGE_KEY
     );
@@ -2106,21 +2596,42 @@ async function restoreDurableOwnerLedger() {
       localStored || {},
       LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
     );
-    if (hasV4LocalLedger && hasV2LocalLedger) {
-      RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION =
-        await reconcileInterruptedDurableOwnerMigration(
+    const hasSchema5Archive = Object.prototype.hasOwnProperty.call(
+      localStored || {},
+      LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY
+    );
+    if (hasCurrentLocalLedger && hasV2LocalLedger) {
+      if (localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]?.version === 5) {
+        const reconciled = await reconcileInterruptedLegacySchema5Migration(
           localStored[DURABLE_OWNER_STORAGE_KEY],
-          localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]
+          localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY],
+          localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]
         );
+        localStored[DURABLE_OWNER_STORAGE_KEY] = reconciled.ledger;
+        DURABLE_OWNER_SCHEMA5_MIGRATION = reconciled.readback;
+      } else {
+        RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION =
+          await reconcileInterruptedDurableOwnerMigration(
+            localStored[DURABLE_OWNER_STORAGE_KEY],
+            localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY]
+          );
+      }
       delete localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
       hasV2LocalLedger = false;
       console.warn(
-        "synapse durable owner ledger: reconciled an interrupted v2-to-v4 migration " +
-          "only after proving the v4 row was the exact one-revision migration product",
-        RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION
+        "synapse durable owner ledger: reconciled an interrupted migration only after " +
+          "proving the canonical row was the exact one-revision product",
+        DURABLE_OWNER_SCHEMA5_MIGRATION ||
+          RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION
       );
     }
-    const hasLocalLedger = hasV4LocalLedger || hasV2LocalLedger;
+    const hasLocalLedger = hasCurrentLocalLedger || hasV2LocalLedger;
+    if (!hasLocalLedger && hasSchema5Archive) {
+      throw new Error(
+        "durable owner schema-5 archive exists without a canonical or legacy owner row; " +
+          "refusing to initialize a competing authority"
+      );
+    }
     const storedBrowserSessionId = typeof sessionStored?.[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]
       === "string"
       ? sessionStored[DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY].trim()
@@ -2156,13 +2667,35 @@ async function restoreDurableOwnerLedger() {
       }
       await persistDurableOwnerLedger({ duringRestore: true });
     } else {
-      const storedLedger = hasV4LocalLedger
+      const storedLedger = hasCurrentLocalLedger
         ? localStored[DURABLE_OWNER_STORAGE_KEY]
         : localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
+      const storedLedgerKey = hasCurrentLocalLedger
+        ? DURABLE_OWNER_STORAGE_KEY
+        : LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY;
       let repairedEmptyMissingSession = false;
       try {
-        DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(storedLedger);
-        schemaMigrated = hasV2LocalLedger && storedLedger?.version === 2;
+        if (storedLedger?.version === 5) {
+          const migration = await migrateLegacySchema5DurableOwnerLedger(
+            storedLedger,
+            localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY],
+            storedLedgerKey
+          );
+          DURABLE_OWNER_LEDGER = migration.ledger;
+          DURABLE_OWNER_SCHEMA5_MIGRATION = migration.readback;
+          localStored[DURABLE_OWNER_STORAGE_KEY] = migration.ledger;
+          delete localStored[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY];
+          hasV2LocalLedger = false;
+        } else {
+          DURABLE_OWNER_LEDGER = normalizeDurableOwnerLedger(storedLedger);
+          schemaMigrated =
+            storedLedger?.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION;
+          DURABLE_OWNER_SCHEMA5_MIGRATION =
+            await verifyLegacySchema5MigrationArchive(
+              DURABLE_OWNER_LEDGER.legacySchema5Migration,
+              localStored[LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY]
+            );
+        }
       } catch (error) {
         if (errorMessage(error) !== "durable owner ledger browser session id is missing") {
           throw error;
@@ -2477,11 +3010,12 @@ async function restoreDurableOwnerLedger() {
         DURABLE_OWNER_STORAGE_KEY,
         LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY
       ]);
-      if (migrationReadback?.[DURABLE_OWNER_STORAGE_KEY]?.version !== 4 ||
+      if (migrationReadback?.[DURABLE_OWNER_STORAGE_KEY]?.version !==
+            DURABLE_OWNER_STORAGE_SCHEMA_VERSION ||
           migrationReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] !== undefined) {
         throw new Error(
-          "durable owner ledger v2-to-v4 migration postcondition failed; " +
-            "v4 must exist and v2 must be absent after the verified v4 write"
+          "durable owner ledger schema migration postcondition failed; canonical schema-6 " +
+            "must exist and the legacy v2 key must be absent after the verified write"
         );
       }
     }
@@ -3678,6 +4212,7 @@ function bridgeIdentity() {
         browser_session_continuity_matched:
           DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED,
         stale_browser_session_owner_count: STALE_BROWSER_SESSION_OWNER_COUNT,
+        persisted_schema_version: DURABLE_OWNER_LEDGER.version,
         persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
         persisted_in_flight_mutation_present: Boolean(
           DURABLE_OWNER_LEDGER.inFlightMutation
@@ -3697,6 +4232,7 @@ function bridgeIdentity() {
         owner_continuity_healthy: durableOwnerContinuityHealthy,
         interrupted_migration_reconciliation:
           RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
+        schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
         empty_missing_session_repair:
           REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION
       },
@@ -15077,6 +15613,8 @@ function operatorPanicOwnerReadback() {
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     interrupted_migration_reconciliation:
       RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
+    schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
+    persisted_schema_version: DURABLE_OWNER_LEDGER.version,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
     command_terminal_outbox: DURABLE_OWNER_LEDGER.commandTerminalOutbox.map((entry) => ({

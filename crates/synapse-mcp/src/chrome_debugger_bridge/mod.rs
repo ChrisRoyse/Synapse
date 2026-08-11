@@ -45,9 +45,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-websocket-terminal-evaluate-exception-v13";
+    "synapse-chrome-bridge-2026-08-11-durable-schema6-migration-v14";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "5878a1f4e4f4142104c2953aedc4f70eef960e3e625ab32ec32dad4269967b7d";
+    "9da173baa076a4c413f9bcac4dd86b2679b5f6b775927203990ee694e8dbbff7";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
