@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-explicit-error-code-contract-v6";
-const BRIDGE_DECLARED_BUILD_SHA256 = "62182aa411e7ed626c9254204277e040f9f3b75f2daeadd4e565d71b6a75969f";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-native-message-body-contract-v7";
+const BRIDGE_DECLARED_BUILD_SHA256 = "919f6ab2230f2462b89551a1963b6f29d9b3fad9a7d54825ed40608cd64de832";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -17,7 +17,14 @@ const PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS = 25000;
 // an extension-to-native-host message at 64 MiB; reserve 4 MiB for the command
 // envelope and evidence rather than treating the transport limit as headroom.
 const PAGE_SCREENSHOT_PIPELINE_PEAK_BUDGET_BYTES = 384 * 1024 * 1024;
-const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES = 60 * 1024 * 1024;
+// >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
+const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB = 64;
+const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB = 60;
+// <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
+const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES =
+  NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
+const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES =
+  PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
 const PAGE_SCREENSHOT_NATIVE_MESSAGE_METADATA_RESERVE_BYTES = 256 * 1024;
 let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
@@ -90,6 +97,7 @@ const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 const ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT = "CAPTURE_PLAN_EXCEEDS_LIMIT";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
+const ERROR_MESSAGE_BODY_EXCEEDS_LIMIT = "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
 const ERROR_DAEMON_UNAVAILABLE = "SYNAPSE_CHROME_DAEMON_UNAVAILABLE";
 const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
@@ -129,6 +137,7 @@ const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
   "CHROME_BEFOREINPUT_CANCELLED",
   "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
   "CHROME_BRIDGE_EXTENSION_STALE",
+  "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT",
   "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
   "CHROME_CLOCK_FAILED",
   "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
@@ -27041,10 +27050,23 @@ async function postDaemonMessage(message) {
       }
     });
   } catch (error) {
-    scheduleReconnect(
-      `direct daemon message failed: ${errorMessage(error)}`,
-      ERROR_DAEMON_UNAVAILABLE
-    );
+    const status = Number(error?.status);
+    const hasHttpStatus = Number.isInteger(status) && status >= 100 && status <= 599;
+    const requestWasRejected =
+      error?.code === ERROR_MESSAGE_BODY_EXCEEDS_LIMIT ||
+      (hasHttpStatus && status >= 400 && status < 500 && status !== 401 && status !== 403);
+    if (requestWasRejected) {
+      console.error(
+        "Synapse daemon rejected one direct message while the command WebSocket " +
+          `remained authoritative: status=${String(error?.status ?? "none")} ` +
+          `code=${String(error?.code || "none")} detail=${errorMessage(error)}`
+      );
+    } else {
+      scheduleReconnect(
+        `direct daemon message failed: ${errorMessage(error)}`,
+        ERROR_DAEMON_UNAVAILABLE
+      );
+    }
     throw error;
   }
 }
@@ -27072,7 +27094,26 @@ async function daemonFetchJson(path, options = {}) {
   }
   if (Object.prototype.hasOwnProperty.call(options, "body")) {
     init.headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(options.body);
+    const serializedBody = JSON.stringify(options.body);
+    if (path === "/chrome-debugger/native/message") {
+      if (typeof TextEncoder !== "function") {
+        throw bridgeError(
+          ERROR_MESSAGE_BODY_EXCEEDS_LIMIT,
+          "direct Chrome bridge cannot prove the native-message HTTP body length because TextEncoder is unavailable"
+        );
+      }
+      const bodyBytes = new TextEncoder().encode(serializedBody).byteLength;
+      if (bodyBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
+        throw bridgeError(
+          ERROR_MESSAGE_BODY_EXCEEDS_LIMIT,
+          "direct Chrome bridge refused a native-message HTTP body before fetch: " +
+            `body_bytes=${bodyBytes} limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}; ` +
+            "remediation=reduce the command response below the declared transport budget; " +
+            "pageScreenshot callers must reduce the clip dimensions or set maxPixels/maxLongEdge"
+        );
+      }
+    }
+    init.body = serializedBody;
   }
   const response = await fetch(`${DAEMON_BASE_URL}${path}`, init);
   const text = await response.text();
@@ -27080,19 +27121,27 @@ async function daemonFetchJson(path, options = {}) {
   if (text) {
     try {
       value = JSON.parse(text);
-    } catch (_) {
-      throw new Error(
-        `daemon ${init.method} ${path} returned non-JSON status=${response.status} body=${JSON.stringify(text.slice(0, 512))}`
-      );
+    } catch (parseError) {
+      if (response.ok) {
+        throw bridgeError(
+          ERROR_DAEMON_UNAVAILABLE,
+          `daemon ${init.method} ${path} returned non-JSON success status=${response.status} ` +
+            `body=${JSON.stringify(text.slice(0, 512))} parse_error=${errorMessage(parseError)}`
+        );
+      }
     }
   }
   if (!response.ok) {
-    const error = new Error(
-      `daemon ${init.method} ${path} failed status=${response.status} body=${JSON.stringify(value ?? text)}`
+    const code = typeof value?.code === "string" && value.code
+      ? value.code
+      : (response.status === 413
+          ? ERROR_MESSAGE_BODY_EXCEEDS_LIMIT
+          : ERROR_DAEMON_UNAVAILABLE);
+    const error = bridgeError(
+      code,
+      `daemon ${init.method} ${path} failed status=${response.status} ` +
+        `body=${JSON.stringify(value ?? text.slice(0, 512))}`
     );
-    if (value?.code) {
-      error.code = value.code;
-    }
     error.status = response.status;
     error.responseBody = value ?? text;
     throw error;

@@ -621,7 +621,7 @@ catch {
 }
 
 # ---------------------------------------------------------------------------
-# Gate 0c — authenticated Chrome error-code contract (#2217)
+# Gate 0c — authenticated Chrome error/body-budget contract (#2217/#2219)
 # ---------------------------------------------------------------------------
 #
 # The extension and daemon are different languages joined by string-valued
@@ -633,7 +633,7 @@ catch {
 # literal that is absent from the public command registry. Runtime enforcement
 # independently turns any missing/dynamic code into an explicit contract error.
 
-Write-Gate 'Gate 0c    authenticated Chrome error-code contract (#2217)'
+Write-Gate 'Gate 0c    authenticated Chrome error/body-budget contract (#2217/#2219)'
 try {
     $contractFailureCountBefore = $script:Failures.Count
     $workerPath = Join-Path $RepoRoot 'extensions/synapse-chrome-debugger/service_worker.js'
@@ -675,6 +675,38 @@ try {
         return $values
     }
 
+    function Get-ChromeNativeMessageBudgetValues {
+        param([string]$Path)
+        $lines = [IO.File]::ReadAllLines($Path)
+        $begin = -1
+        $end = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '>>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT') {
+                if ($begin -ge 0) { throw "duplicate native-message budget contract begin marker in $Path" }
+                $begin = $i
+            }
+            if ($lines[$i] -match '<<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<') {
+                if ($end -ge 0) { throw "duplicate native-message budget contract end marker in $Path" }
+                $end = $i
+            }
+        }
+        if ($begin -lt 0 -or $end -le $begin) {
+            throw "missing or inverted SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT markers in $Path"
+        }
+        $values = [System.Collections.Generic.List[string]]::new()
+        for ($i = $begin + 1; $i -lt $end; $i++) {
+            $match = [regex]::Match(
+                $lines[$i],
+                '^\s*(?:pub\s+)?const\s+([A-Z][A-Z0-9_]+)(?:\s*:\s*(?:usize|u64))?\s*=\s*(\d+);\s*$'
+            )
+            if (-not $match.Success) {
+                throw "unparseable Chrome native-message budget contract line $Path`:$($i + 1): $($lines[$i])"
+            }
+            $values.Add("$($match.Groups[1].Value)=$($match.Groups[2].Value)")
+        }
+        return $values
+    }
+
     $workerContract = @(Get-ChromeErrorContractValues -Path $workerPath)
     $bridgeContract = @(Get-ChromeErrorContractValues -Path $bridgePath)
     $workerJoined = $workerContract -join "`n"
@@ -685,6 +717,23 @@ try {
         Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_CONTRACT_DIVERGED' `
             "extension and daemon trusted error registries differ; extension_only=$($onlyWorker -join ',') daemon_only=$($onlyBridge -join ',')" `
             'update PUBLIC_COMMAND_ERROR_CODES and TRUSTED_EXTENSION_ERROR_CODES together, add every value to synapse_core::error_codes, and bump the bridge build ID/SHA'
+    }
+
+    $workerBudgets = @(Get-ChromeNativeMessageBudgetValues -Path $workerPath)
+    $bridgeBudgets = @(Get-ChromeNativeMessageBudgetValues -Path $bridgePath)
+    $expectedBudgets = @(
+        'NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB=64',
+        'PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB=60'
+    )
+    if (($workerBudgets -join "`n") -ne ($bridgeBudgets -join "`n")) {
+        Add-Failure 'SYNAPSE_LINT_CHROME_NATIVE_MESSAGE_BUDGET_DIVERGED' `
+            "extension and daemon native-message budget contracts differ; extension=$($workerBudgets -join ',') daemon=$($bridgeBudgets -join ',')" `
+            'keep the exact HTTP envelope limit and screenshot payload budget synchronized across service_worker.js and chrome_debugger_bridge/mod.rs, preserving explicit envelope headroom'
+    }
+    if (($workerBudgets -join "`n") -ne ($expectedBudgets -join "`n")) {
+        Add-Failure 'SYNAPSE_LINT_CHROME_NATIVE_MESSAGE_BUDGET_INVALID' `
+            "native-message budget contract must retain the documented 64 MiB body ceiling and 60 MiB screenshot payload ceiling; actual=$($workerBudgets -join ',')" `
+            'restore NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB=64 and PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB=60 in both languages; the 4 MiB difference is required envelope/evidence headroom'
     }
 
     $sortedUnique = @($workerContract | Sort-Object -Unique)
@@ -722,7 +771,7 @@ try {
     }
 
     if ($script:Failures.Count -eq $contractFailureCountBefore) {
-        Write-Host "   OK   $($workerContract.Count) registered Chrome error codes agree across JavaScript, Rust trust, and synapse-core; no unregistered code literal exists" -ForegroundColor Green
+        Write-Host "   OK   $($workerContract.Count) registered Chrome error codes and the 64/60 MiB native-message budget contract agree across JavaScript/Rust/synapse-core" -ForegroundColor Green
     }
 }
 catch {
@@ -733,7 +782,7 @@ catch {
 if ($PolicyOnly) {
     Write-Host ''
     if ($script:Failures.Count -eq 0) {
-        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, and Gate 0c proved the Chrome error-code contract.' -ForegroundColor Green
+        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, and Gate 0c proved the Chrome error/body-budget contract.' -ForegroundColor Green
         exit 0
     }
 

@@ -44,9 +44,17 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-explicit-error-code-contract-v6";
+    "synapse-chrome-bridge-2026-08-11-native-message-body-contract-v7";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "62182aa411e7ed626c9254204277e040f9f3b75f2daeadd4e565d71b6a75969f";
+    "919f6ab2230f2462b89551a1963b6f29d9b3fad9a7d54825ed40608cd64de832";
+// >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
+pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
+pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
+// <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
+pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES: usize =
+    NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
+pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES: u64 =
+    PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -134,6 +142,7 @@ const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
     "CHROME_BEFOREINPUT_CANCELLED",
     "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
     "CHROME_BRIDGE_EXTENSION_STALE",
+    "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT",
     "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
     "CHROME_CLOCK_FAILED",
     "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
@@ -190,7 +199,7 @@ const MAX_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 900_000;
 const DEFAULT_MAINTENANCE_RECONNECT_RESUME_PROBE_AFTER_MS: u64 = 30_000;
 const RELOAD_RECONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
-const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = 64 * 1024 * 1024;
+const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
 const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension with scripts\\install-synapse-chrome-debugger.ps1; the installer atomically deploys every build to the one persistent %LOCALAPPDATA%\\synapse\\chrome-extension\\active directory and auto-loads that exact unpacked directory into the already-open active Chrome profile while refusing to launch a second Chrome profile; the constant profile path survives browser/OS restart while the build ID and service-worker SHA prove the loaded bytes; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus a persisted/read-verified chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, exposes browser_file_upload with target-scoped DOM.setFileInputFiles/Page.fileChooserOpened for session-owned Chrome bridge tabs, and has explicit browser_debugger-profile chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, Runtime.evaluate page evaluation, Page.addScriptToEvaluateOnNewDocument init scripts, Runtime.addBinding/Runtime.bindingCalled binding capture, Page.handleJavaScriptDialog dialog handling, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; browser_debugger facade operations require profile operation=set profile=browser_debugger with confirm_break_glass=true and a reason; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";

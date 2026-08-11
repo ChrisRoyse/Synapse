@@ -3581,7 +3581,9 @@ fn router(
         )
         .route(
             "/chrome-debugger/native/message",
-            post(crate::chrome_debugger_bridge::http_message),
+            post(crate::chrome_debugger_bridge::http_message).layer(DefaultBodyLimit::max(
+                crate::chrome_debugger_bridge::NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES,
+            )),
         )
         .route(
             "/chrome-debugger/native/next",

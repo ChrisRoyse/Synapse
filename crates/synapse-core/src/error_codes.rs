@@ -28,6 +28,10 @@ pub const CHROME_BRIDGE_EXTENSION_STALE: &str = "CHROME_BRIDGE_EXTENSION_STALE";
 /// reclassified as an unrelated browser failure.
 pub const CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION: &str =
     "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION";
+/// The authenticated Chrome bridge refused a command response because its
+/// exact serialized HTTP envelope exceeded the shared bounded transport limit.
+pub const CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT: &str =
+    "CHROME_BRIDGE_MESSAGE_BODY_EXCEEDS_LIMIT";
 pub const CHROME_CAPTURE_VISIBLE_TAB_PENDING: &str = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 /// The host-side exact Chrome extension management control could not reload or
 /// install the normal-profile bridge, or its independent profile/host readback

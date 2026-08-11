@@ -18130,7 +18130,8 @@ fn decode_browser_screenshot_bounded_composite(
     const PLAN_SCHEMA: &str = "synapse_page_screenshot_capture_plan/v1";
     const COMPOSITION_MODE: &str = "bounded_offscreen_canvas_v1";
     const HARD_PEAK_BUDGET_BYTES: u64 = 384 * 1024 * 1024;
-    const NATIVE_MESSAGE_BUDGET_BYTES: u64 = 60 * 1024 * 1024;
+    const NATIVE_MESSAGE_BUDGET_BYTES: u64 =
+        crate::chrome_debugger_bridge::PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES;
     let plan = &captured.capture_plan;
     let fail = |detail: String| {
         mcp_error(
