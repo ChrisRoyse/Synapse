@@ -70,7 +70,6 @@ pub const SYNAPSE_DRIFT_MIN_WINDOW: usize = 4;
 pub const SYNAPSE_DRIFT_MAX_WINDOW: usize = 1_024;
 /// Default fraction of the most-recent records forming the recent window.
 pub const SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION: f32 = 0.3;
-
 const REACTIVE_DRIFT_PREFIX: &[u8; 8] = b"RDRIFT1\0";
 const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
 const REACTIVE_NOVELTY_PREFIX: &[u8; 8] = b"RNOVEL1\0";
@@ -1073,57 +1072,61 @@ impl SynapseCalyxVault {
         panel_version: u32,
         max_records: usize,
     ) -> Result<DriftCorpus, SynapseCalyxError> {
-        let snapshot = self.read_snapshot();
-        let mut selected = BTreeSet::new();
-        let mut records_scanned = 0usize;
-        // Base keys are content hashes, not chronology (#2003). Retain the
-        // newest bounded set by the server-stamped creation time and use cx_id
-        // as the deterministic tie-breaker. Slot hydration happens only after
-        // selection, so a large panel costs O(max_records) memory and reads.
-        let walk = self.walk_cf_latest(
-            ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-            |_key, value| {
-                let base = decode_constellation_base(value).map_err(|error| {
-                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                })?;
-                if base.panel_version != panel_version {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                records_scanned += 1;
-                selected.insert((base.created_at, base.cx_id));
-                if selected.len() > max_records {
-                    let oldest = selected.first().copied().ok_or_else(|| {
-                        SynapseCalyxError::new(
-                            "SYNAPSE_CALYX_DRIFT_SELECTION_EMPTY",
-                            "bounded chronological drift selection lost its oldest candidate",
-                            "preserve the vault and inspect the Base CF selection invariant",
-                        )
+        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            let mut selected = BTreeSet::new();
+            let mut records_scanned = 0usize;
+            // Base keys are content hashes, not chronology (#2003). Retain the
+            // newest bounded set by the server-stamped creation time and use cx_id
+            // as the deterministic tie-breaker. Slot hydration happens only after
+            // selection, so a large panel costs O(max_records) memory and reads.
+            // The page scan and every hydration share this scope's one registered
+            // snapshot lease: no latest read can introduce a post-pin id.
+            let walk = self.walk_cf_snapshot(
+                snapshot,
+                ColumnFamily::Base,
+                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                |_key, value| {
+                    let base = decode_constellation_base(value).map_err(|error| {
+                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
-                    selected.remove(&oldest);
-                }
-                Ok(crate::SynapseCalyxWalkStep::Continue)
-            },
-        )?;
-        let mut records = Vec::with_capacity(selected.len());
-        for (_, cx_id) in selected {
-            // Slot vectors live in the per-slot CFs; Base carries their typed
-            // absence only (#1894), so hydrate exactly the selected records.
-            let constellation = self.hydrated_constellation(cx_id, snapshot)?;
-            let slots = constellation
-                .slots
-                .iter()
-                .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
-                .collect();
-            records.push(DriftRecord {
-                cx_id: constellation.cx_id,
-                slots,
-            });
-        }
-        Ok(DriftCorpus {
-            records,
-            records_scanned,
-            walk,
+                    if base.panel_version != panel_version {
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    records_scanned += 1;
+                    selected.insert((base.created_at, base.cx_id));
+                    if selected.len() > max_records {
+                        let oldest = selected.first().copied().ok_or_else(|| {
+                            SynapseCalyxError::new(
+                                "SYNAPSE_CALYX_DRIFT_SELECTION_EMPTY",
+                                "bounded chronological drift selection lost its oldest candidate",
+                                "preserve the vault and inspect the Base CF selection invariant",
+                            )
+                        })?;
+                        selected.remove(&oldest);
+                    }
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                },
+            )?;
+            let mut records = Vec::with_capacity(selected.len());
+            for (_, cx_id) in selected {
+                // Slot vectors live in the per-slot CFs; Base carries their typed
+                // absence only (#1894), so hydrate exactly the selected records.
+                let constellation = self.hydrated_constellation_at_snapshot(cx_id, snapshot)?;
+                let slots = constellation
+                    .slots
+                    .iter()
+                    .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
+                    .collect();
+                records.push(DriftRecord {
+                    cx_id: constellation.cx_id,
+                    slots,
+                });
+            }
+            Ok(DriftCorpus {
+                records,
+                records_scanned,
+                walk,
+            })
         })
     }
 }

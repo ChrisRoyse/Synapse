@@ -849,6 +849,10 @@ impl SynapseCalyxVault {
     /// Above it the slot is reported unusable with the measured support in the
     /// reason — never silently narrowed, and never densified into a width the
     /// bounded estimators cannot finish.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the bounded snapshot scan and its sparse-support postprocessing share one corpus accumulator; splitting them would obscure that the derived shapes come only from the pinned scan"
+    )]
     fn load_panel_dense_corpus_in_window(
         &self,
         panel_version: u32,
@@ -862,7 +866,6 @@ impl SynapseCalyxVault {
         // so `n_lenses` was structurally always 0 and weave/abundance/bits/
         // redundancy/kernel were all vacuously zero — reported honestly, but
         // measuring nothing (issue #1894). Hydrate the slots from their CFs.
-        let snapshot = self.read_snapshot();
         let mut records: Vec<DenseRecord> = Vec::new();
         let mut records_scanned = 0usize;
         let mut records_outside_window = 0usize;
@@ -872,51 +875,54 @@ impl SynapseCalyxVault {
         // `Base` CF resident — it walks each row once — and holding the `Base`
         // row-guard across a 106k-row materialization stalled every constellation
         // writer behind it for ~204 ms.
-        self.walk_cf_latest(
-            ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-            |_key, value| {
-                let base = decode_constellation_base(value).map_err(|error| {
-                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                })?;
-                if base.panel_version != panel_version {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                if !window.contains_created_at_ms(base.created_at) {
-                    records_outside_window += 1;
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                records_scanned += 1;
-                if records.len() >= max_records {
-                    // Deliberately `Continue`, matching the pre-paging `continue`:
-                    // `records_scanned` is a count over the whole panel-and-window
-                    // population and `max_records` bounds only the *loaded*
-                    // subset, so the walk must reach the end of the CF for that
-                    // denominator to mean what it says.
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                let hydrated = self.hydrated_constellation(base.cx_id, snapshot)?;
-                for (slot, vector) in &hydrated.slots {
-                    let kind = SynapseCalyxSlotKind::of(vector);
-                    // A slot that is `Absent` on this record but present on
-                    // another must not be recorded as absent for the panel:
-                    // `Absent` is an explicit per-record absence, never a
-                    // statement about the lens.
-                    let entry = panel_slots.entry(*slot).or_insert(kind);
-                    if *entry == SynapseCalyxSlotKind::Absent {
-                        *entry = kind;
+        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            self.walk_cf_snapshot(
+                snapshot,
+                ColumnFamily::Base,
+                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                |_key, value| {
+                    let base = decode_constellation_base(value).map_err(|error| {
+                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                    })?;
+                    if base.panel_version != panel_version {
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
                     }
-                    if let SlotVector::Sparse { entries, .. } = vector {
-                        let support = sparse_support.entry(*slot).or_default();
-                        for entry in entries {
-                            support.insert(entry.idx);
+                    if !window.contains_created_at_ms(base.created_at) {
+                        records_outside_window += 1;
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    records_scanned += 1;
+                    if records.len() >= max_records {
+                        // Deliberately `Continue`, matching the pre-paging `continue`:
+                        // `records_scanned` is a count over the whole panel-and-window
+                        // population and `max_records` bounds only the *loaded*
+                        // subset, so the walk must reach the end of the CF for that
+                        // denominator to mean what it says.
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    let hydrated = self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
+                    for (slot, vector) in &hydrated.slots {
+                        let kind = SynapseCalyxSlotKind::of(vector);
+                        // A slot that is `Absent` on this record but present on
+                        // another must not be recorded as absent for the panel:
+                        // `Absent` is an explicit per-record absence, never a
+                        // statement about the lens.
+                        let entry = panel_slots.entry(*slot).or_insert(kind);
+                        if *entry == SynapseCalyxSlotKind::Absent {
+                            *entry = kind;
+                        }
+                        if let SlotVector::Sparse { entries, .. } = vector {
+                            let support = sparse_support.entry(*slot).or_default();
+                            for entry in entries {
+                                support.insert(entry.idx);
+                            }
                         }
                     }
-                }
-                records.push(DenseRecord::from_constellation(&hydrated));
-                Ok(crate::SynapseCalyxWalkStep::Continue)
-            },
-        )?;
+                    records.push(DenseRecord::from_constellation(&hydrated));
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                },
+            )
+        })?;
 
         // Densify every sparse slot whose observed support fits the bound. This
         // happens after the scan because the support is a property of the
@@ -6326,79 +6332,84 @@ impl SynapseCalyxVault {
         let mut anchors: Vec<CxId> = Vec::new();
         let mut vault_corpus_size = 0usize;
         let mut rejects = ContentSlotRejects::default();
-        let snapshot = self.read_snapshot();
         // #1968: paged rather than materialized. Each row is decoded once and
         // then either hydrated or discarded, so the whole-CF `Vec` bought
         // nothing and cost every constellation writer a ~204 ms `Base` row-guard
         // stall for the duration.
-        self.walk_cf_latest(
-            ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-            |_key, value| {
-                let base = decode_constellation_base(value).map_err(|error| {
-                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                })?;
-                if base.panel_version != params.panel_version {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                vault_corpus_size += 1;
-                // The Base row says whether the content slot exists on this record;
-                // it cannot supply the vector, which lives in the slot CF. Reading
-                // the vector straight off the Base row yielded `Absent` for every
-                // record, so every concept was excluded and the kernel reported
-                // `0 embedded concept(s)` over a panel full of measurements (#1894).
-                if !base.slots.contains_key(&content_slot.slot_id()) {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                let constellation = self.hydrated_constellation(base.cx_id, snapshot)?;
-                let stored = constellation.slots.get(&content_slot.slot_id());
-                let Some(vector) = stored else {
-                    rejects.record("absent");
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                };
-                match vector {
-                    SlotVector::Dense { data, .. } if data.iter().all(|value| *value == 0.0) => {
-                        rejects.record("empty");
+        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            self.walk_cf_snapshot(
+                snapshot,
+                ColumnFamily::Base,
+                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                |_key, value| {
+                    let base = decode_constellation_base(value).map_err(|error| {
+                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                    })?;
+                    if base.panel_version != params.panel_version {
                         return Ok(crate::SynapseCalyxWalkStep::Continue);
                     }
-                    SlotVector::Sparse { entries, .. } if entries.is_empty() => {
-                        rejects.record("empty");
+                    vault_corpus_size += 1;
+                    // The Base row says whether the content slot exists on this record;
+                    // it cannot supply the vector, which lives in the slot CF. Reading
+                    // the vector straight off the Base row yielded `Absent` for every
+                    // record, so every concept was excluded and the kernel reported
+                    // `0 embedded concept(s)` over a panel full of measurements (#1894).
+                    if !base.slots.contains_key(&content_slot.slot_id()) {
                         return Ok(crate::SynapseCalyxWalkStep::Continue);
                     }
-                    SlotVector::Multi { .. } => {
-                        rejects.record("multi");
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    SlotVector::Absent { .. } => {
+                    let constellation =
+                        self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
+                    let stored = constellation.slots.get(&content_slot.slot_id());
+                    let Some(vector) = stored else {
                         rejects.record("absent");
                         return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    };
+                    match vector {
+                        SlotVector::Dense { data, .. }
+                            if data.iter().all(|value| *value == 0.0) =>
+                        {
+                            rejects.record("empty");
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        SlotVector::Sparse { entries, .. } if entries.is_empty() => {
+                            rejects.record("empty");
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        SlotVector::Multi { .. } => {
+                            rejects.record("multi");
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        SlotVector::Absent { .. } => {
+                            rejects.record("absent");
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
                     }
-                    SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
-                }
-                // Domain scope: with `anchor_kind` set only that outcome axis
-                // anchors the kernel, so a per-domain sweep selects one kernel per
-                // domain instead of one blended kernel over every anchored concept.
-                let has_anchor = constellation.anchors.iter().any(|anchor| {
-                    anchor.confidence > 0.0
-                        && params.anchor_kind.as_deref().is_none_or(|kind| {
-                            crate::grounding::anchor_kind_label(&anchor.kind) == kind
-                        })
-                });
-                let cx_id = constellation.cx_id;
-                measured_rows.push((cx_id, vector.clone()));
-                if has_anchor {
-                    anchors.push(cx_id);
-                }
-                // The pre-paging form `break`s here, after both pushes, so
-                // `vault_corpus_size` is truncated at exactly the same row it was
-                // before. It counts the population the loader *reached*, not the
-                // whole panel, and that has not changed.
-                if measured_rows.len() >= max_records {
-                    return Ok(crate::SynapseCalyxWalkStep::Stop);
-                }
-                Ok(crate::SynapseCalyxWalkStep::Continue)
-            },
-        )?;
+                    // Domain scope: with `anchor_kind` set only that outcome axis
+                    // anchors the kernel, so a per-domain sweep selects one kernel per
+                    // domain instead of one blended kernel over every anchored concept.
+                    let has_anchor = constellation.anchors.iter().any(|anchor| {
+                        anchor.confidence > 0.0
+                            && params.anchor_kind.as_deref().is_none_or(|kind| {
+                                crate::grounding::anchor_kind_label(&anchor.kind) == kind
+                            })
+                    });
+                    let cx_id = constellation.cx_id;
+                    measured_rows.push((cx_id, vector.clone()));
+                    if has_anchor {
+                        anchors.push(cx_id);
+                    }
+                    // The pre-paging form `break`s here, after both pushes, so
+                    // `vault_corpus_size` is truncated at exactly the same row it was
+                    // before. It counts the population the loader *reached*, not the
+                    // whole panel, and that has not changed.
+                    if measured_rows.len() >= max_records {
+                        return Ok(crate::SynapseCalyxWalkStep::Stop);
+                    }
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                },
+            )
+        })?;
         // Multi vectors require MaxSim and are deliberately not interpreted as
         // either dense or sparse cosine. Sparse vectors are native kernel
         // content and stay sparse end-to-end (#1979).

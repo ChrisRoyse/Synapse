@@ -23,6 +23,29 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Runs one read operation against a single latest snapshot whose reader
+    /// lease remains registered for the entire closure.
+    ///
+    /// The scoped handle releases the lease on success, error, or unwind. This
+    /// is the composition boundary for callers that must scan candidate ids and
+    /// subsequently hydrate those ids from the exact same MVCC view: passing a
+    /// numeric sequence between separately pinned reads leaves a gap in which
+    /// version GC can advance, while taking a fresh implicit snapshot for each
+    /// read can mix committed states.
+    pub fn with_scoped_latest_snapshot<T, E>(
+        &self,
+        freshness: Freshness,
+        max_age_ms: u64,
+        read: impl FnOnce(Snapshot) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let snapshot = self.rows.pin_snapshot(freshness, &self.clock, max_age_ms);
+        let snapshot = ScopedSnapshot {
+            rows: &self.rows,
+            snapshot,
+        };
+        read(snapshot.snapshot())
+    }
+
     pub(crate) fn snapshot_handle(&self, seq: Seq) -> ScopedSnapshot<'_> {
         let snapshot =
             self.rows

@@ -596,6 +596,9 @@ const fn classify_search_generation(
 /// Bounded and short: the scan is a bulk read on a maintenance tick, and a
 /// reader lease held longer than it needs pins the GC frontier.
 const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
+/// Reader-lease lifetime for bounded off-runtime corpus scans that enumerate
+/// Base rows and hydrate their slot rows from the same MVCC view.
+pub(crate) const INTELLIGENCE_CORPUS_READER_LEASE_MS: u64 = 30_000;
 
 pub const SEARCH_GENERATION_REFRESH_DELTA_KEYS: u64 =
     (calyx_search::MAX_RECONCILED_DELTA_KEYS as u64) / 2;
@@ -3392,6 +3395,17 @@ impl SynapseCalyxVault {
         self.vault.snapshot()
     }
 
+    /// Runs a multi-read intelligence operation against one registered latest
+    /// reader lease. The lease is released by Calyx on every exit path.
+    pub(crate) fn with_read_snapshot<T>(
+        &self,
+        max_age_ms: u64,
+        read: impl FnOnce(Snapshot) -> Result<T, SynapseCalyxError>,
+    ) -> Result<T, SynapseCalyxError> {
+        self.vault
+            .with_scoped_latest_snapshot(Freshness::FreshDerived, max_age_ms, read)
+    }
+
     /// Reads one constellation with its slot vectors hydrated from the per-slot
     /// CFs (issue #1894).
     ///
@@ -3423,6 +3437,23 @@ impl SynapseCalyxVault {
                 &error,
             )
         })
+    }
+
+    /// Hydrates one constellation through an already-registered snapshot
+    /// lease, preserving the caller's exact multi-read MVCC view.
+    pub(crate) fn hydrated_constellation_at_snapshot(
+        &self,
+        cx_id: CxId,
+        snapshot: Snapshot,
+    ) -> Result<Constellation, SynapseCalyxError> {
+        self.vault
+            .get_at_snapshot(cx_id, snapshot)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("hydrate slot vectors for constellation {cx_id}"),
+                    &error,
+                )
+            })
     }
 
     /// Reads one latest physical Base row and hydrates every declared Slot CF
@@ -6634,6 +6665,84 @@ impl SynapseCalyxVault {
         self.vault.router_latest_readback()
     }
 
+    fn walk_cf_with_page_reader<V, P>(
+        cf: ColumnFamily,
+        page_rows: usize,
+        mut read_page: P,
+        mut visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+        P: FnMut(Option<&[u8]>, usize) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError>,
+    {
+        if page_rows == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CF_WALK_PAGE_ROWS_ZERO",
+                format!(
+                    "a bounded-hold walk over {} needs a positive page size; zero rows per page cannot make forward progress",
+                    cf.name()
+                ),
+                "pass SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, or another positive page size",
+            ));
+        }
+        let mut cursor: Option<Vec<u8>> = None;
+        let mut walk = SynapseCalyxCfWalk {
+            column_family: cf.name(),
+            page_rows,
+            pages: 0,
+            rows_examined: 0,
+            rows_visited: 0,
+            stopped_early: false,
+            snapshot_seq_first: 0,
+            snapshot_seq_last: 0,
+        };
+        loop {
+            let page = read_page(cursor.as_deref(), page_rows)?;
+            if walk.pages == 0 {
+                walk.snapshot_seq_first = page.snapshot_seq;
+            }
+            walk.snapshot_seq_last = page.snapshot_seq;
+            walk.pages += 1;
+            walk.rows_examined += page.examined_rows;
+            for (key, value) in &page.rows {
+                walk.rows_visited += 1;
+                if visit(key, value)? == SynapseCalyxWalkStep::Stop {
+                    walk.stopped_early = true;
+                    return Ok(walk);
+                }
+            }
+            if !page.more {
+                return Ok(walk);
+            }
+            let Some(resume) = page.resume_after else {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_CF_WALK_CURSOR_MISSING",
+                    format!(
+                        "page {} of the {} walk reported more rows but returned no resume cursor, so the walk cannot advance",
+                        walk.pages,
+                        cf.name()
+                    ),
+                    "repair the range pager so a page reporting `more` always carries `resume_after`",
+                ));
+            };
+            if cursor
+                .as_deref()
+                .is_some_and(|previous| resume.as_slice() <= previous)
+            {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_CF_WALK_CURSOR_STALLED",
+                    format!(
+                        "page {} of the {} walk returned a resume cursor that does not advance past the previous one, so the walk would re-read the same page forever",
+                        walk.pages,
+                        cf.name()
+                    ),
+                    "repair the range pager so `resume_after` is strictly greater than the exclusive `after_key` it was given",
+                ));
+            }
+            cursor = Some(resume);
+        }
+    }
+
     /// Folds over every visible row of one column family with a **bounded**
     /// row-table read-guard hold (#1968).
     ///
@@ -6773,6 +6882,30 @@ impl SynapseCalyxVault {
             }
             cursor = Some(resume);
         }
+    }
+
+    /// Walks one column family in bounded pages through an already-registered
+    /// reader lease. Every page and any point reads performed by the visitor's
+    /// enclosing scope therefore describe the same committed state.
+    pub(crate) fn walk_cf_snapshot<V>(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        let range = KeyRange::all();
+        Self::walk_cf_with_page_reader(
+            cf,
+            page_rows,
+            |after_key, limit| {
+                self.scan_cf_range_page_snapshot(snapshot, cf, &range, after_key, limit)
+            },
+            visit,
+        )
     }
 
     /// Counts the visible rows of one column family with a **bounded** row-guard
