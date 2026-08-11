@@ -407,13 +407,15 @@ fn run_bounded_drain(trigger: &'static str, budget: Duration) -> ! {
                 Ok(mut state) => {
                     match state.close_calyx_vault_for_shutdown(trigger, false) {
                         Ok(readback) => {
-                            vault_safe_to_unlock = readback.safe_to_unlock;
+                            vault_safe_to_unlock = readback.safe_to_terminate;
                             vault_latest_seq = readback.latest_seq;
                             vault_status = "closed".to_owned();
                             tracing::warn!(
                                 code = "MCP_DAEMON_OS_SHUTDOWN_VAULT_CLOSED",
                                 trigger,
                                 safe_to_unlock = readback.safe_to_unlock,
+                                safe_to_terminate = readback.safe_to_terminate,
+                                lock_retained_until_process_exit = readback.lock_retained_until_process_exit,
                                 latest_seq = ?readback.latest_seq,
                                 elapsed_ms = started.elapsed().as_millis(),
                                 "Calyx vault flushed and closed inside the OS shutdown budget"

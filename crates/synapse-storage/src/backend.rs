@@ -720,6 +720,10 @@ pub trait StorageBackend: Send + Sync {
         &self,
         reason: &'static str,
     ) -> StorageResult<SynapseCalyxVaultCloseReadback>;
+    fn close_calyx_vault_for_process_exit(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<SynapseCalyxVaultCloseReadback>;
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>>;
     fn backup_calyx_vault(
         &self,
@@ -2024,7 +2028,11 @@ impl CalyxVaultRuntime {
         Ok(released)
     }
 
-    fn close(&self, reason: &'static str) -> StorageResult<SynapseCalyxVaultCloseReadback> {
+    fn close(
+        &self,
+        reason: &'static str,
+        terminal_process: bool,
+    ) -> StorageResult<SynapseCalyxVaultCloseReadback> {
         let vault = {
             let mut slot = self.vault.write().map_err(|poisoned| {
                 calyx_write_failed_detail(
@@ -2056,7 +2064,12 @@ impl CalyxVaultRuntime {
                 }
             }
         };
-        vault.close(reason).map_err(|source| {
+        let close = if terminal_process {
+            vault.close_for_process_exit(reason)
+        } else {
+            vault.close(reason)
+        };
+        close.map_err(|source| {
             calyx_write_failed("<calyx-vault>", "flush and close live Calyx vault", &source)
         })
     }
@@ -4894,7 +4907,14 @@ impl StorageBackend for CalyxBackend {
         &self,
         reason: &'static str,
     ) -> StorageResult<SynapseCalyxVaultCloseReadback> {
-        self.vault.close(reason)
+        self.vault.close(reason, false)
+    }
+
+    fn close_calyx_vault_for_process_exit(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<SynapseCalyxVaultCloseReadback> {
+        self.vault.close(reason, true)
     }
 
     fn calyx_vault_inspect(&self) -> StorageResult<Option<CalyxVaultInspect>> {

@@ -2103,6 +2103,21 @@ impl Db {
         self.backend.close_calyx_vault(reason)
     }
 
+    /// Completes the durable Calyx close boundary for a process that is
+    /// committed to terminate. The resident graph and exact vault lock remain
+    /// owned until operating-system process reclamation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the storage-owned Calyx error when the final flush/drain or
+    /// exact process-exit lock identity proof fails.
+    pub fn close_calyx_vault_for_process_exit(
+        &self,
+        reason: &'static str,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxVaultCloseReadback> {
+        self.backend.close_calyx_vault_for_process_exit(reason)
+    }
+
     /// Atomically publishes structural positions computed from one coherent
     /// source snapshot into Graph, Registry, Base, Slot, and Ledger families.
     ///

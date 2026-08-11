@@ -65,6 +65,7 @@ pub async fn serve(
     m2_config: &M2ServiceConfig,
     m3_config: M3ServiceConfig,
     m4_config: M4ServiceConfig,
+    parent_watchdog: Option<tokio::sync::oneshot::Receiver<crate::connect::ParentWatchdogEvent>>,
 ) -> anyhow::Result<ExitCode> {
-    transport::serve(bind_addr, m2_config, m3_config, m4_config).await
+    transport::serve(bind_addr, m2_config, m3_config, m4_config, parent_watchdog).await
 }

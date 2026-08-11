@@ -327,6 +327,11 @@ $script:SynapsePostExitStartOnly = ($PostExitParentPid -gt 0 -and $PostExitConti
 $script:SynapseManualInstallHealthRollbackProbe = [bool]$ManualInstallHealthRollbackProbe
 $script:SynapseManualInstallHealthRollbackPauseMode = $ManualInstallHealthRollbackPauseMode
 $script:SynapseSetupRepairManifestPath = $env:SYNAPSE_SETUP_REPAIR_MANIFEST
+$script:SynapseSetupInvocationId = if (-not [string]::IsNullOrWhiteSpace($env:SYNAPSE_SETUP_INVOCATION_ID)) {
+    $env:SYNAPSE_SETUP_INVOCATION_ID.Trim()
+} else {
+    "setup-$PID-$([guid]::NewGuid().ToString('N'))"
+}
 $script:SynapseChromeBridgePendingPath = $ChromeBridgePendingPath
 $script:SynapseSetupPartialState = $null
 $script:SynapseSetupPartialReadback = $null
@@ -1887,6 +1892,8 @@ $rapidFailureWindowSeconds = 60
 $rapidFailureLimit = 5
 $deadOwnerBindDrainSeconds = 30
 $deadOwnerBindDrainPollMilliseconds = 500
+$daemonStartupSeconds = 300
+$daemonStartupPollMilliseconds = 250
 $generation = 0
 $rapidFailures = New-Object 'System.Collections.Generic.Queue[datetime]'
 
@@ -2029,7 +2036,10 @@ function Normalize-PathArgument {
 }
 
 function Test-ExpectedDaemonProcess {
-    param([AllowNull()][object]$ProcessInfo)
+    param(
+        [AllowNull()][object]$ProcessInfo,
+        [AllowNull()][object]$ExpectedParentPid = $null
+    )
     if ($null -eq $ProcessInfo) {
         return $false
     }
@@ -2042,6 +2052,11 @@ function Test-ExpectedDaemonProcess {
     $actualDb = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--db')
     $actualProfiles = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--profile-dir')
     $actualCalyxConfig = Normalize-PathArgument -Value (Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--calyx-config')
+    $actualParentPidRaw = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--parent-pid'
+    $actualParentPid = 0
+    if (-not [int]::TryParse([string]$actualParentPidRaw, [ref]$actualParentPid) -or $actualParentPid -le 0) {
+        return $false
+    }
     $actualEnableAudio = $commandLine -match '(?i)(?:^|\s)--enable-audio(?:\s|$)'
     $baseMatches = ($actualMode -ieq 'http') -and
         ($actualBind -ieq $Bind) -and
@@ -2056,7 +2071,63 @@ function Test-ExpectedDaemonProcess {
     $actualAllowedRaw = Get-CommandLineArgumentValue -CommandLine $commandLine -Name '--allowed-permissions'
     $actualAllowed = Normalize-AllowedPermissionsArgument -Value $actualAllowedRaw
     $expectedAllowed = Normalize-AllowedPermissionsArgument -Value $ExpectedAllowedPermissions
-    return ($actualAllowed -ceq $expectedAllowed)
+    if ($actualAllowed -cne $expectedAllowed) {
+        return $false
+    }
+    if ($null -ne $ExpectedParentPid -and $actualParentPid -ne [int]$ExpectedParentPid) {
+        return $false
+    }
+    return $true
+}
+
+function Get-ExactChildIdentityState {
+    param(
+        [Parameter(Mandatory=$true)][int]$ChildPid,
+        [Parameter(Mandatory=$true)][string]$CreationDate
+    )
+    $current = Get-ProcessInfoForPid -ProcessId $ChildPid
+    if ($null -eq $current) {
+        return [pscustomobject]@{ Live = $false; Terminal = $true; Reason = 'pid_absent'; ProcessInfo = $null }
+    }
+    if ([string]$current.CreationDate -cne $CreationDate) {
+        return [pscustomobject]@{ Live = $false; Terminal = $true; Reason = 'pid_reused'; ProcessInfo = $current }
+    }
+    if (-not (Test-ExpectedDaemonProcess -ProcessInfo $current -ExpectedParentPid $PID)) {
+        return [pscustomobject]@{ Live = $false; Terminal = $false; Reason = 'identity_mismatch'; ProcessInfo = $current }
+    }
+    return [pscustomobject]@{ Live = $true; Terminal = $false; Reason = 'exact_child_live'; ProcessInfo = $current }
+}
+
+function Test-ExactChildReady {
+    param(
+        [Parameter(Mandatory=$true)][int]$ChildPid,
+        [Parameter(Mandatory=$true)][string]$CreationDate,
+        [Parameter(Mandatory=$true)][string]$Token,
+        [Parameter(Mandatory=$true)]$BindParts
+    )
+    $identity = Get-ExactChildIdentityState -ChildPid $ChildPid -CreationDate $CreationDate
+    if ($identity.Live -ne $true) {
+        return [pscustomobject]@{ Ready = $false; Terminal = $identity.Terminal; Reason = $identity.Reason }
+    }
+    $listeners = @(Get-NetTCPConnection -LocalAddress $BindParts.Address -LocalPort $BindParts.Port -State Listen -ErrorAction SilentlyContinue)
+    $owners = @($listeners | ForEach-Object { [int]$_.OwningProcess } | Sort-Object -Unique)
+    if ($owners.Count -ne 1 -or $owners[0] -ne $ChildPid) {
+        return [pscustomobject]@{ Ready = $false; Terminal = $false; Reason = "listener_owners_$($owners -join ',')" }
+    }
+    try {
+        $headers = @{ Authorization = "Bearer $Token" }
+        $response = Invoke-WebRequest -UseBasicParsing -Uri ("http://{0}/health" -f $Bind) -Headers $headers -TimeoutSec 2
+        if ([int]$response.StatusCode -ne 200) {
+            return [pscustomobject]@{ Ready = $false; Terminal = $false; Reason = "health_status_$([int]$response.StatusCode)" }
+        }
+    } catch {
+        return [pscustomobject]@{ Ready = $false; Terminal = $false; Reason = "health_failed:$($_.Exception.Message)" }
+    }
+    $identityAfterHealth = Get-ExactChildIdentityState -ChildPid $ChildPid -CreationDate $CreationDate
+    if ($identityAfterHealth.Live -ne $true) {
+        return [pscustomobject]@{ Ready = $false; Terminal = $identityAfterHealth.Terminal; Reason = "post_health_$($identityAfterHealth.Reason)" }
+    }
+    return [pscustomobject]@{ Ready = $true; Terminal = $false; Reason = 'exact_identity_listener_health' }
 }
 
 function Test-SetupMaintenanceLockActive {
@@ -2379,12 +2450,13 @@ while ($true) {
         foreach ($old in $staleStderr) { Remove-Item -LiteralPath $old.FullName -Force -ErrorAction SilentlyContinue }
     } catch { }
 
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $DaemonArgumentText"
-    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $DaemonArgumentText; stderr_log = $stderrLog }
+    $daemonArgumentTextForGeneration = "$DaemonArgumentText --parent-pid $PID"
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_START generation=$generation command=$ExePath $daemonArgumentTextForGeneration"
+    Write-SupervisorEvent 'launch_start' @{ generation = $generation; exe_path = $ExePath; arguments = $daemonArgumentTextForGeneration; stderr_log = $stderrLog; parent_pid = $PID }
     Write-SupervisorState -State 'launching' -Generation $generation -ChildPid $null -ExitCode $null -Message 'Starting synapse-mcp daemon.'
 
     $startTime = Get-Date
-    $process = Start-Process -FilePath $ExePath -ArgumentList $DaemonArgumentText -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -RedirectStandardError $stderrLog -PassThru
+    $process = Start-Process -FilePath $ExePath -ArgumentList $daemonArgumentTextForGeneration -WorkingDirectory (Split-Path -Parent $ExePath) -WindowStyle Hidden -RedirectStandardError $stderrLog -PassThru
     # #2090: touching .Handle caches the native process handle in the
     # System.Diagnostics.Process object. Without it, `Start-Process -PassThru`
     # does not keep a handle open, the kernel object is released when the child
@@ -2398,22 +2470,84 @@ while ($true) {
     try {
         $daemonProcessHandle = $process.Handle
     } catch {
-        Write-LogLine "SYNAPSE_DAEMON_LAUNCH_HANDLE_CACHE_FAILED generation=$generation pid=$($process.Id) error=$($_.Exception.Message)"
+        throw "SYNAPSE_DAEMON_LAUNCH_HANDLE_CACHE_FAILED generation=$generation pid=$($process.Id) error=$($_.Exception.Message) remediation=repair process-handle access; the supervisor cannot distinguish clean exit from crash without the exact retained handle"
     }
-    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) stderr_log=$stderrLog exit_code_observable=$($null -ne $daemonProcessHandle)"
-    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id; stderr_log = $stderrLog }
-    Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon child process is running.'
+    $childInfo = Get-ProcessInfoForPid -ProcessId $process.Id
+    if ($null -eq $childInfo) {
+        throw "SYNAPSE_DAEMON_LAUNCH_IDENTITY_MISSING generation=$generation pid=$($process.Id) remediation=inspect the retained process handle and stderr; a child that disappeared before identity capture is not a running generation"
+    }
+    if (-not (Test-ExpectedDaemonProcess -ProcessInfo $childInfo -ExpectedParentPid $PID)) {
+        throw "SYNAPSE_DAEMON_LAUNCH_IDENTITY_MISMATCH generation=$generation pid=$($process.Id) exe=$($childInfo.ExecutablePath) command=$(([string]$childInfo.CommandLine -replace '\s+', ' ').Trim()) remediation=inspect the generated daemon arguments; the supervisor will not monitor an unverified child"
+    }
+    $childCreationDate = [string]$childInfo.CreationDate
+    if ([string]::IsNullOrWhiteSpace($childCreationDate)) {
+        throw "SYNAPSE_DAEMON_LAUNCH_CREATION_TIME_MISSING generation=$generation pid=$($process.Id) remediation=repair Win32_Process identity reads; PID alone cannot identify a daemon generation"
+    }
+    Write-LogLine "SYNAPSE_DAEMON_LAUNCH_OK generation=$generation pid=$($process.Id) creation_date=$childCreationDate parent_pid=$PID stderr_log=$stderrLog exit_code_observable=true"
+    Write-SupervisorEvent 'launch_ok' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; parent_pid = $PID; stderr_log = $stderrLog }
+    Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child identity exists; waiting up to ${daemonStartupSeconds}s for exact listener ownership and authenticated health before publishing running."
 
+    $startupDeadline = (Get-Date).AddSeconds($daemonStartupSeconds)
+    $startupAttempts = 0
+    while ($true) {
+        $startupAttempts += 1
+        $readiness = Test-ExactChildReady -ChildPid $process.Id -CreationDate $childCreationDate -Token $token -BindParts $bindParts
+        if ($readiness.Ready -eq $true) {
+            break
+        }
+        if ($readiness.Terminal -eq $true) {
+            Write-LogLine "SYNAPSE_DAEMON_STARTING_EXITED generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts reason=$($readiness.Reason)"
+            Write-SupervisorEvent 'starting_exited' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; attempts = $startupAttempts; reason = $readiness.Reason }
+            break
+        }
+        if ((Get-Date) -ge $startupDeadline) {
+            throw "SYNAPSE_DAEMON_STARTUP_TIMEOUT generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts timeout_seconds=$daemonStartupSeconds last_readiness=$($readiness.Reason) remediation=inspect daemon stderr, exact listener ownership, authenticated /health, and vault-open progress; no replacement is launched while this exact child remains alive"
+        }
+        if ($startupAttempts -eq 1 -or ($startupAttempts % 20) -eq 0) {
+            $startupElapsedMs = [int64]((Get-Date) - $startTime).TotalMilliseconds
+            Write-LogLine "SYNAPSE_DAEMON_STARTING generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts readiness=$($readiness.Reason)"
+            Write-SupervisorEvent 'starting_progress' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; attempts = $startupAttempts; elapsed_ms = $startupElapsedMs; readiness = $readiness.Reason }
+            Write-SupervisorState -State 'starting' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message "Daemon exact child remains live; readiness=$($readiness.Reason) attempts=$startupAttempts elapsed_ms=$startupElapsedMs. No replacement is eligible."
+        }
+        Start-Sleep -Milliseconds $daemonStartupPollMilliseconds
+    }
+    if ($readiness.Ready -eq $true) {
+        Write-LogLine "SYNAPSE_DAEMON_READY generation=$generation pid=$($process.Id) creation_date=$childCreationDate attempts=$startupAttempts evidence=$($readiness.Reason)"
+        Write-SupervisorEvent 'ready' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; attempts = $startupAttempts; evidence = $readiness.Reason }
+        Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon exact PID/creation/image/arguments own the listener and authenticated health returned 200.'
+    }
+
+    while ($true) {
+        $handleReportedTerminal = $process.WaitForExit($daemonStartupPollMilliseconds)
+        $identity = Get-ExactChildIdentityState -ChildPid $process.Id -CreationDate $childCreationDate
+        if ($handleReportedTerminal -eq $true -and $identity.Live -eq $true) {
+            $daemonLockOwner = '<missing>'
+            $daemonPidPath = Join-Path $DbPath 'daemon.pid'
+            if (Test-Path -LiteralPath $daemonPidPath -PathType Leaf) {
+                try { $daemonLockOwner = (Get-Content -Raw -LiteralPath $daemonPidPath).Trim() }
+                catch { $daemonLockOwner = "<read_failed:$($_.Exception.Message)>" }
+            }
+            $progressTail = '<none>'
+            if (Test-Path -LiteralPath $stderrLog -PathType Leaf) {
+                try { $progressTail = ((Get-Content -LiteralPath $stderrLog -Tail 5 -ErrorAction Stop) -join ' | ').Trim() }
+                catch { $progressTail = "<read_failed:$($_.Exception.Message)>" }
+            }
+            throw "SYNAPSE_DAEMON_CHILD_TERMINALITY_CONTRADICTION generation=$generation pid=$($process.Id) creation_date=$childCreationDate retained_handle_wait=terminal exact_identity=live daemon_lock_owner=$daemonLockOwner stderr_tail=[$progressTail] remediation=the supervisor refuses to launch a replacement while the exact PID/creation/image/arguments remain live; inspect the retained native handle and Win32_Process state"
+        }
+        if ($identity.Terminal -eq $true) {
+            Write-LogLine "SYNAPSE_DAEMON_TERMINAL_IDENTITY_PROVED generation=$generation pid=$($process.Id) creation_date=$childCreationDate reason=$($identity.Reason)"
+            Write-SupervisorEvent 'terminal_identity_proved' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; reason = $identity.Reason }
+            break
+        }
+        if ($identity.Live -ne $true) {
+            throw "SYNAPSE_DAEMON_CHILD_IDENTITY_DRIFT generation=$generation pid=$($process.Id) creation_date=$childCreationDate reason=$($identity.Reason) remediation=inspect Win32_Process executable and command line; the supervisor refuses to infer terminality or launch a duplicate"
+        }
+    }
     $process.WaitForExit()
     $endTime = Get-Date
     $exitCode = $process.ExitCode
     if ($null -eq $exitCode) {
-        # Fail closed, loudly. An unobservable exit code is NOT a clean exit, so
-        # the supervisor must treat it as a failure and restart -- but it must
-        # say so, because "the daemon exited and I could not tell how" is a
-        # different fact from "the daemon crashed".
-        Write-LogLine "SYNAPSE_DAEMON_EXIT_CODE_UNOBSERVABLE generation=$generation pid=$($process.Id) handle_cached=$($null -ne $daemonProcessHandle) effect=treated as a non-zero exit; the supervisor will restart rather than park"
-        Write-SupervisorEvent 'exit_code_unobservable' @{ generation = $generation; child_pid = $process.Id; handle_cached = ($null -ne $daemonProcessHandle) }
+        throw "SYNAPSE_DAEMON_EXIT_CODE_UNOBSERVABLE generation=$generation pid=$($process.Id) creation_date=$childCreationDate handle_cached=$($null -ne $daemonProcessHandle) remediation=inspect the retained process handle; the supervisor cannot choose clean-stop versus restart without the physical exit code"
     }
     $runtimeMs = [int64](($endTime - $startTime).TotalMilliseconds)
     $stderrTail = ''
@@ -7334,9 +7468,10 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 $checkpointPath = [System.IO.Path]::GetFullPath($script:SynapseChromeBridgePendingPath)
                 $checkpointResumeCommand = "pwsh -NoProfile -File $(Quote-PowerShellSingleQuotedString -Value $checkpointSetupScript) -ResumeChromeBridgePending -ChromeBridgePendingPath $(Quote-PowerShellSingleQuotedString -Value $checkpointPath) -MaintenanceLockPath $(Quote-PowerShellSingleQuotedString -Value ([System.IO.Path]::GetFullPath($MaintenanceLockPath)))"
                 $pendingReadback = [ordered]@{
-                    schema = 'synapse_setup_bridge_pending/v2'
+                    schema = 'synapse_setup_bridge_pending/v3'
                     state = 'pending'
                     phase = 'chrome_bridge_activation'
+                    checkpoint_generation_id = $script:SynapseSetupInvocationId
                     daemon_handoff = 'committed'
                     daemon_pid = $checkpointDaemonPid
                     bind = $Bind
@@ -7345,6 +7480,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                     installed_binary_sha256 = (Get-SynapseFileSha256 -Path $ExePath)
                     daemon_process_executable_path = $checkpointDaemonProcess.ExecutablePath
                     daemon_process_command_line = $checkpointDaemonProcess.CommandLine
+                    daemon_process_creation_date = $checkpointDaemonProcess.CreationDate
                     daemon_run_current_path = $checkpointDaemonRun
                     daemon_run_current_sha256 = (Get-SynapseFileSha256 -Path $checkpointDaemonRun)
                     token_path = $TokenPath
@@ -10103,8 +10239,11 @@ function Write-SynapseChromeBridgeCheckpoint {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 
     $now = [DateTime]::UtcNow.ToString('o')
-    $Checkpoint['schema'] = 'synapse_setup_bridge_pending/v2'
+    $Checkpoint['schema'] = 'synapse_setup_bridge_pending/v3'
     $Checkpoint['phase'] = 'chrome_bridge_activation'
+    if (-not $Checkpoint.Contains('checkpoint_generation_id') -or [string]::IsNullOrWhiteSpace([string]$Checkpoint['checkpoint_generation_id'])) {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_GENERATION_MISSING path=$resolvedPath state=$($Checkpoint['state']) remediation=a bridge checkpoint must retain the exact setup generation that created the pending transaction"
+    }
     if (-not $Checkpoint.Contains('created_at_utc') -or [string]::IsNullOrWhiteSpace([string]$Checkpoint['created_at_utc'])) {
         $Checkpoint['created_at_utc'] = $now
     }
@@ -10149,10 +10288,11 @@ function Write-SynapseChromeBridgeCheckpoint {
     } catch {
         throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint storage device; the atomically written JSON could not be read back"
     }
-    if ([string]$readback.schema -ne 'synapse_setup_bridge_pending/v2' -or
+    if ([string]$readback.schema -ne 'synapse_setup_bridge_pending/v3' -or
         [string]$readback.phase -ne 'chrome_bridge_activation' -or
-        [string]$readback.state -ne [string]$Checkpoint['state']) {
-        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_MISMATCH path=$resolvedPath expected_schema=synapse_setup_bridge_pending/v2 actual_schema=$($readback.schema) expected_phase=chrome_bridge_activation actual_phase=$($readback.phase) expected_state=$($Checkpoint['state']) actual_state=$($readback.state) remediation=repair the checkpoint storage path before retrying"
+        [string]$readback.state -ne [string]$Checkpoint['state'] -or
+        [string]$readback.checkpoint_generation_id -ne [string]$Checkpoint['checkpoint_generation_id']) {
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_MISMATCH path=$resolvedPath expected_schema=synapse_setup_bridge_pending/v3 actual_schema=$($readback.schema) expected_phase=chrome_bridge_activation actual_phase=$($readback.phase) expected_state=$($Checkpoint['state']) actual_state=$($readback.state) expected_generation=$($Checkpoint['checkpoint_generation_id']) actual_generation=$($readback.checkpoint_generation_id) remediation=repair the checkpoint storage path before retrying"
     }
     return [pscustomobject]([ordered]@{
         Path = $resolvedPath
@@ -10186,16 +10326,17 @@ function Read-SynapseChromeBridgeCheckpoint {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_JSON_INVALID path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint bytes; resume refuses to infer state from malformed JSON"
     }
 
-    if ([string]$checkpoint.schema -ne 'synapse_setup_bridge_pending/v2') {
-        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID path=$resolvedPath expected=synapse_setup_bridge_pending/v2 actual=$($checkpoint.schema) remediation=resume the checkpoint with the repo version that wrote its exact schema"
+    if ([string]$checkpoint.schema -ne 'synapse_setup_bridge_pending/v3') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID path=$resolvedPath expected=synapse_setup_bridge_pending/v3 actual=$($checkpoint.schema) remediation=v2 and unknown checkpoints have no trustworthy deployment-generation binding; preserve them and run a new full setup"
     }
     if ([string]$checkpoint.phase -ne 'chrome_bridge_activation') {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PHASE_INVALID path=$resolvedPath expected=chrome_bridge_activation actual=$($checkpoint.phase) remediation=resume refuses to infer or replay an unknown phase"
     }
-    if ([string]$checkpoint.state -notin @('pending','completed')) {
-        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_STATE_INVALID path=$resolvedPath expected=pending_or_completed actual=$($checkpoint.state) remediation=inspect the checkpoint state before retrying"
+    if ([string]$checkpoint.state -ne 'pending') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_NOT_PENDING path=$resolvedPath actual=$($checkpoint.state) remediation=completed and superseded records are terminal evidence, not resumable work; run ordinary full setup if repair is still required"
     }
     foreach ($required in @(
+        'checkpoint_generation_id',
         'daemon_handoff',
         'daemon_pid',
         'bind',
@@ -10204,6 +10345,7 @@ function Read-SynapseChromeBridgeCheckpoint {
         'installed_binary_sha256',
         'daemon_process_executable_path',
         'daemon_process_command_line',
+        'daemon_process_creation_date',
         'daemon_run_current_path',
         'daemon_run_current_sha256',
         'token_path',
@@ -10271,6 +10413,7 @@ function Get-SynapseDaemonProcessIdentity {
     return [pscustomobject]([ordered]@{
         Pid = [int]$process.ProcessId
         ParentPid = [int]$process.ParentProcessId
+        CreationDate = [string]$process.CreationDate
         Name = [string]$process.Name
         ExecutablePath = [string]$process.ExecutablePath
         CommandLine = [string]$process.CommandLine
@@ -10369,6 +10512,9 @@ function Invoke-SynapseChromeBridgePendingResume {
     if ($daemonProcess.CommandLine -cne [string]$checkpoint.daemon_process_command_line) {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_ARGUMENT_DRIFT pid=$actualPid expected=[$($checkpoint.daemon_process_command_line)] actual=[$($daemonProcess.CommandLine)] remediation=the live daemon arguments changed after the checkpoint; perform a new full setup repair"
     }
+    if ($daemonProcess.CreationDate -cne [string]$checkpoint.daemon_process_creation_date) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_DAEMON_CREATION_DRIFT pid=$actualPid expected=$($checkpoint.daemon_process_creation_date) actual=$($daemonProcess.CreationDate) remediation=the checkpoint PID belongs to a different process generation; perform a new full setup repair"
+    }
 
     $taskIdentity = Get-SynapseScheduledTaskIdentity -Name $TaskName
     if ($taskIdentity.State -ne 'Running') {
@@ -10425,6 +10571,90 @@ function Invoke-SynapseChromeBridgePendingResume {
         -ExitCode 0 `
         -Readback $completion
     Info "SYNAPSE_SETUP_BRIDGE_RESUME_COMPLETED checkpoint=$($checkpointFile.Path) checkpoint_sha256=$($checkpointFile.Sha256) daemon_pid=$actualPid tool_count=$($toolSurface.tool_count) tool_surface_sha256=$($toolSurface.tool_surface_sha256)"
+}
+
+function Complete-SynapseObsoleteChromeBridgeCheckpoint {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][int]$DaemonPid,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$DbPath,
+        [Parameter(Mandatory=$true)][string]$InstalledBinaryPath,
+        [Parameter(Mandatory=$true)][string]$InstalledBinarySha256,
+        [Parameter(Mandatory=$true)]$ToolSurface,
+        [Parameter(Mandatory=$true)]$ChromeBridge
+    )
+
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $resolvedPath -PathType Leaf)) {
+        Info "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_ABSENT path=$resolvedPath terminalizing_generation=$($script:SynapseSetupInvocationId)"
+        return [ordered]@{ state = 'absent'; path = $resolvedPath; terminalizing_generation_id = $script:SynapseSetupInvocationId }
+    }
+    try {
+        $priorBytes = [System.IO.File]::ReadAllBytes($resolvedPath)
+        $prior = [System.Text.Encoding]::UTF8.GetString($priorBytes) | ConvertFrom-Json
+    } catch {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_READ_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=the current setup succeeded but refuses to conceal malformed historical transaction state; inspect and repair the named checkpoint"
+    }
+    $priorSha256 = Get-SynapseFileSha256 -Path $resolvedPath
+    $priorSchema = [string]$prior.schema
+    $priorState = [string]$prior.state
+    if ($priorSchema -notin @('synapse_setup_bridge_pending/v2','synapse_setup_bridge_pending/v3')) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_SCHEMA_UNKNOWN path=$resolvedPath schema=$priorSchema sha256=$priorSha256 remediation=setup refuses to reinterpret or delete an unknown transaction schema"
+    }
+    if ($priorState -in @('completed','superseded')) {
+        Info "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_ALREADY_TERMINAL path=$resolvedPath schema=$priorSchema state=$priorState sha256=$priorSha256"
+        return [ordered]@{ state = $priorState; path = $resolvedPath; sha256 = $priorSha256; schema = $priorSchema }
+    }
+    if ($priorState -ne 'pending') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_STATE_UNKNOWN path=$resolvedPath schema=$priorSchema state=$priorState sha256=$priorSha256 remediation=setup refuses to reinterpret or delete an unknown transaction state"
+    }
+
+    $checkpointMap = [ordered]@{}
+    foreach ($property in $prior.PSObject.Properties) {
+        $checkpointMap[$property.Name] = $property.Value
+    }
+    if ($priorSchema -eq 'synapse_setup_bridge_pending/v2' -or [string]::IsNullOrWhiteSpace([string]$checkpointMap['checkpoint_generation_id'])) {
+        $checkpointMap['checkpoint_generation_id'] = "legacy-unbound-$($priorSha256.ToLowerInvariant())"
+    }
+    $daemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $DaemonPid
+    $daemonRunPath = Join-Path $DbPath 'daemon-run-current.json'
+    if (-not (Test-Path -LiteralPath $daemonRunPath -PathType Leaf)) {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_DAEMON_RUN_MISSING path=$daemonRunPath daemon_pid=$DaemonPid remediation=the newer deployment generation is not physically proven; repair its lifecycle ledger before terminalizing older work"
+    }
+    $checkpointMap['state'] = 'superseded'
+    $checkpointMap['terminal_generation_id'] = $script:SynapseSetupInvocationId
+    $checkpointMap['terminalized_at_utc'] = [DateTime]::UtcNow.ToString('o')
+    $checkpointMap['supersession'] = [ordered]@{
+        reason = 'newer_full_setup_completed_and_physically_verified'
+        prior_schema = $priorSchema
+        prior_state = $priorState
+        prior_checkpoint_sha256 = $priorSha256
+        daemon_pid = $DaemonPid
+        daemon_process_creation_date = $daemonProcess.CreationDate
+        daemon_process_executable_path = $daemonProcess.ExecutablePath
+        daemon_process_command_line = $daemonProcess.CommandLine
+        bind = $Bind
+        daemon_run_current_path = $daemonRunPath
+        daemon_run_current_sha256 = (Get-SynapseFileSha256 -Path $daemonRunPath)
+        installed_binary_path = $InstalledBinaryPath
+        installed_binary_sha256 = $InstalledBinarySha256
+        tool_count = $ToolSurface.tool_count
+        tool_surface_sha256 = $ToolSurface.tool_surface_sha256
+        chrome_bridge_status = [string]$ChromeBridge.status
+        chrome_bridge_detail = [string]$ChromeBridge.detail
+    }
+    $terminal = Write-SynapseChromeBridgeCheckpoint -Path $resolvedPath -Checkpoint $checkpointMap
+    Info "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SUPERSEDED path=$($terminal.Path) sha256=$($terminal.Sha256) prior_sha256=$priorSha256 prior_schema=$priorSchema checkpoint_generation=$($checkpointMap['checkpoint_generation_id']) terminal_generation=$($script:SynapseSetupInvocationId) daemon_pid=$DaemonPid"
+    return [ordered]@{
+        state = 'superseded'
+        path = $terminal.Path
+        sha256 = $terminal.Sha256
+        len_bytes = $terminal.LenBytes
+        prior_sha256 = $priorSha256
+        checkpoint_generation_id = [string]$checkpointMap['checkpoint_generation_id']
+        terminal_generation_id = $script:SynapseSetupInvocationId
+    }
 }
 
 function Get-SynapseHandoffGitReadback {
@@ -15358,6 +15588,39 @@ function Remove-SynapseLegacyLogDirLauncherArtifacts {
     }
 }
 
+function Remove-SynapseLegacyEnsureDaemonSupervisor {
+    param(
+        [Parameter(Mandatory=$true)][string]$RuntimeBinDir,
+        [Parameter(Mandatory=$true)][string]$CanonicalSupervisorPath
+    )
+
+    $runtimeRoot = Split-Path -Parent (Resolve-NormalizedPath -Path $RuntimeBinDir)
+    $legacyPath = Join-Path $runtimeRoot 'ensure-daemon-supervisor.ps1'
+    if (-not (Test-Path -LiteralPath $legacyPath)) {
+        Info "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_ABSENT path=$legacyPath"
+        return
+    }
+    if (-not (Test-Path -LiteralPath $legacyPath -PathType Leaf)) {
+        Die "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_NOT_FILE path=$legacyPath remediation=inspect this unexpected filesystem object; setup will not remove it"
+    }
+    if (-not (Test-Path -LiteralPath $CanonicalSupervisorPath -PathType Leaf)) {
+        Die "SYNAPSE_CANONICAL_SUPERVISOR_MISSING path=$CanonicalSupervisorPath legacy_path=$legacyPath remediation=repair the canonical runtime-bin supervisor before retiring any legacy entry point"
+    }
+    $legacyText = Get-Content -Raw -LiteralPath $legacyPath
+    $legacyHash = (Get-FileHash -LiteralPath $legacyPath -Algorithm SHA256).Hash
+    $legacyShape = $legacyText -match 'Idempotent entry point for the SynapseMcpDaemon scheduled task' -and
+        $legacyText -match [regex]::Escape("synapse\logs\synapse-daemon-supervisor.ps1") -and
+        $legacyText -match 'SYNAPSE_DAEMON_ENSURE_SUPERVISOR_MISSING'
+    if (-not $legacyShape) {
+        Die "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_IDENTITY_UNKNOWN path=$legacyPath sha256=$legacyHash remediation=inspect this operator-modified or foreign script; setup will not delete bytes it cannot identify as the obsolete pre-#1862 launcher"
+    }
+    Remove-Item -LiteralPath $legacyPath -Force
+    if (Test-Path -LiteralPath $legacyPath) {
+        Die "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_REMOVE_FAILED path=$legacyPath sha256=$legacyHash remediation=repair file permissions and rerun setup"
+    }
+    Info "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_RETIRED path=$legacyPath sha256=$legacyHash canonical_supervisor=$CanonicalSupervisorPath state=absent_after_readback"
+}
+
 # ---------------------------------------------------------------------------
 # 7. Verify adoption or register + start the auto-start HTTP daemon
 # ---------------------------------------------------------------------------
@@ -15478,6 +15741,7 @@ if (-not $liveDaemonHandoffRequired) {
     Start-ScheduledTask -TaskName $TaskName
     Info "Task registered and started."
     [void](Assert-SynapseAutostartLauncherIntegrity -TaskName $TaskName -ExpectedLauncherPath $hiddenLauncher -LogDir $LogDir -Phase 'post_register')
+    Remove-SynapseLegacyEnsureDaemonSupervisor -RuntimeBinDir $RuntimeBinDir -CanonicalSupervisorPath $daemonSupervisorPath
     Remove-SynapseLegacyLogDirLauncherArtifacts -LogDir $LogDir -RuntimeBinDir $RuntimeBinDir
 }
 
@@ -15942,6 +16206,16 @@ if (-not $SkipClientWiring) {
     }
 }
 
+$checkpointTerminalization = Complete-SynapseObsoleteChromeBridgeCheckpoint `
+    -Path $script:SynapseChromeBridgePendingPath `
+    -DaemonPid $healthPid `
+    -Bind $Bind `
+    -DbPath $DbPath `
+    -InstalledBinaryPath $ExePath `
+    -InstalledBinarySha256 $installedHash `
+    -ToolSurface $toolSurface `
+    -ChromeBridge $h.subsystems.chrome_bridge
+
 if ($script:SynapsePostExitStartOnly) {
     $completionReadback = [ordered]@{
         daemon_pid = $healthPid
@@ -15955,6 +16229,7 @@ if ($script:SynapsePostExitStartOnly) {
         tool_surface_sha256 = $toolSurface.tool_surface_sha256
         chrome_bridge_status = $h.subsystems.chrome_bridge.status
         chrome_bridge_detail = $h.subsystems.chrome_bridge.detail
+        chrome_bridge_checkpoint = $checkpointTerminalization
     }
     Write-SynapsePostExitManifestState `
         -State 'completed' `
@@ -15976,6 +16251,7 @@ $setupRepairCompletionReadback = [ordered]@{
     tool_surface_sha256 = $toolSurface.tool_surface_sha256
     chrome_bridge_status = $h.subsystems.chrome_bridge.status
     chrome_bridge_detail = $h.subsystems.chrome_bridge.detail
+    chrome_bridge_checkpoint = $checkpointTerminalization
 }
 Write-SynapseSetupRepairManifestState `
     -State 'completed' `

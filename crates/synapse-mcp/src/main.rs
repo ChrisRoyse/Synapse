@@ -189,6 +189,11 @@ struct Cli {
     mode: Mode,
     #[arg(long, default_value = "127.0.0.1:7700", env = "SYNAPSE_BIND")]
     bind: String,
+    /// Exact lifecycle-owner PID for an HTTP daemon. When set, parent exit is a
+    /// first-class graceful shutdown source; PID reuse is rejected by the
+    /// retained process handle and creation-time identity.
+    #[arg(long, env = "SYNAPSE_PARENT_PID")]
+    parent_pid: Option<u32>,
     #[arg(long, env = "SYNAPSE_ALLOW_NON_LOOPBACK")]
     allow_non_loopback: bool,
     #[arg(long, env = "SYNAPSE_DB")]
@@ -472,10 +477,22 @@ async fn run() -> anyhow::Result<ExitCode> {
             }
         }
     } else {
+        if let Some(parent_pid) = cli.parent_pid {
+            eprintln!(
+                "synapse-mcp error: MCP_PARENT_PID_MODE_INVALID parent_pid={parent_pid} mode={:?}; --parent-pid is valid only for --mode http",
+                cli.mode
+            );
+            return Ok(ExitCode::from(2));
+        }
         CliTransportPreflight::NonHttp
     };
 
     let telemetry_guard = configure_telemetry(&cli)?;
+    let http_parent_watchdog = cli
+        .parent_pid
+        .map(connect::install_explicit_parent_watchdog)
+        .transpose()
+        .context("arm exact HTTP daemon parent watchdog before subsystem startup")?;
 
     // The connect bridge is a thin stdio<->HTTP proxy; it does not initialize
     // perception/action/storage, so return before the daemon-only setup below.
@@ -675,7 +692,14 @@ async fn run() -> anyhow::Result<ExitCode> {
             run_stdio(telemetry_guard, &m2_config, m3_config, m4_config).await
         }
         CliTransportPreflight::Http(bind_addr) => {
-            let code = http::serve(bind_addr, &m2_config, m3_config, m4_config).await?;
+            let code = Box::pin(http::serve(
+                bind_addr,
+                &m2_config,
+                m3_config,
+                m4_config,
+                http_parent_watchdog,
+            ))
+            .await?;
             drop(telemetry_guard);
             Ok(code)
         }
@@ -983,18 +1007,18 @@ async fn close_stdio_calyx_vault(
             "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
         ))
     };
-    let safe_to_unlock = result
+    let safe_to_terminate = result
         .as_ref()
-        .is_ok_and(|readback| readback.safe_to_unlock);
+        .is_ok_and(|readback| readback.safe_to_terminate);
     tracing::info!(
         code = "MCP_STDIO_CALYX_VAULT_CLOSE_READBACK",
         reason,
         expected_open,
-        safe_to_unlock,
+        safe_to_terminate,
         result = ?result,
         "readback=calyx_vault edge=stdio_shutdown after_flush_close"
     );
-    (safe_to_unlock, result)
+    (safe_to_terminate, result)
 }
 
 #[derive(Clone, Debug)]

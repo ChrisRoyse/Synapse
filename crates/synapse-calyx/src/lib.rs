@@ -39,6 +39,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -2735,6 +2736,10 @@ impl SynapseCalyxVaultStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the close readback preserves independent physical facts rather than collapsing them into one inferred state"
+)]
 pub struct SynapseCalyxVaultCloseReadback {
     pub enabled: bool,
     pub reason: &'static str,
@@ -2747,6 +2752,13 @@ pub struct SynapseCalyxVaultCloseReadback {
     pub re_lock_probe_succeeded: Option<bool>,
     pub latest_seq: Option<u64>,
     pub gpu_reservation_release: Option<HostGpuReservationSnapshot>,
+    /// True when every durable close obligation completed and process
+    /// termination is the remaining resource-reclamation boundary.
+    pub safe_to_terminate: bool,
+    /// True only when the terminal-process close deliberately retained the
+    /// resident vault graph and exclusive vault lock for OS reclamation.
+    pub terminal_process_reclaim: bool,
+    pub lock_retained_until_process_exit: bool,
 }
 
 impl SynapseCalyxVaultCloseReadback {
@@ -2764,6 +2776,9 @@ impl SynapseCalyxVaultCloseReadback {
             re_lock_probe_succeeded: None,
             latest_seq: None,
             gpu_reservation_release: None,
+            safe_to_terminate: true,
+            terminal_process_reclaim: false,
+            lock_retained_until_process_exit: false,
         }
     }
 
@@ -2781,6 +2796,9 @@ impl SynapseCalyxVaultCloseReadback {
             re_lock_probe_succeeded: None,
             latest_seq: None,
             gpu_reservation_release: None,
+            safe_to_terminate: true,
+            terminal_process_reclaim: false,
+            lock_retained_until_process_exit: false,
         }
     }
 }
@@ -7270,13 +7288,39 @@ impl SynapseCalyxVault {
     ///
     /// Returns an error when flush, the sealed-memtable drain, PID-sidecar
     /// cleanup, lock release, or the re-lock proof fails.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "close fencing, durable drain, lock release, and re-lock proof are one ordered shutdown transaction"
-    )]
     pub fn close(
         self,
         reason: &'static str,
+    ) -> Result<SynapseCalyxVaultCloseReadback, SynapseCalyxError> {
+        self.close_with_mode(reason, false)
+    }
+
+    /// Completes every durable close obligation for a daemon that is committed
+    /// to terminate, then retains the resident vault graph and exclusive vault
+    /// lock until operating-system process reclamation.
+    ///
+    /// This path is intentionally separate from [`Self::close`]. Calling it for
+    /// an in-process reopen would strand the vault lock and is a lifecycle bug.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any durable flush/drain, lineage record, math
+    /// runtime close, or exact retained-lock identity proof fails.
+    pub fn close_for_process_exit(
+        self,
+        reason: &'static str,
+    ) -> Result<SynapseCalyxVaultCloseReadback, SynapseCalyxError> {
+        self.close_with_mode(reason, true)
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "close fencing, durable drain, lock disposition, and re-lock proof are one ordered shutdown transaction"
+    )]
+    fn close_with_mode(
+        self,
+        reason: &'static str,
+        terminal_process: bool,
     ) -> Result<SynapseCalyxVaultCloseReadback, SynapseCalyxError> {
         let Self {
             config,
@@ -7299,7 +7343,7 @@ impl SynapseCalyxVault {
         // every parked waiter is released; the close then reserves at the head
         // of the admission queue on a 10 s budget instead of the periodic lane's
         // 120 s. A refused admission is reported, not fatal — see that method.
-        let phase_started = std::time::Instant::now();
+        let phase_started = begin_close_phase(reason, "fanout_prepare", close_started, &vault_dir)?;
         let close_compaction = vault
             .compact_native_fanout_for_close(reason)
             .map_err(|error| {
@@ -7310,13 +7354,13 @@ impl SynapseCalyxVault {
             })?;
         let fanout_prepared = close_compaction.is_some();
         let compaction_attempts = close_compaction.map_or(0, |results| results.len());
-        record_close_phase(
+        complete_close_phase(
             reason,
             "fanout_prepare",
             phase_started,
             close_started,
             &vault_dir,
-        );
+        )?;
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_CLOSE_FANOUT_READY",
             reason,
@@ -7327,11 +7371,11 @@ impl SynapseCalyxVault {
         );
 
         // Phase 2: the final flush.
-        let phase_started = std::time::Instant::now();
+        let phase_started = begin_close_phase(reason, "flush", close_started, &vault_dir)?;
         vault.flush().map_err(|error| {
             SynapseCalyxError::from_calyx("flush durable Calyx Aster vault", &error)
         })?;
-        record_close_phase(reason, "flush", phase_started, close_started, &vault_dir);
+        complete_close_phase(reason, "flush", phase_started, close_started, &vault_dir)?;
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_FLUSHED",
             reason,
@@ -7342,9 +7386,13 @@ impl SynapseCalyxVault {
 
         // Phase 3: the teardown. This is the 63-87 s region, and it used to be
         // the single statement `drop(vault)`.
-        let phase_started = std::time::Instant::now();
-        let teardown = vault.close_teardown(reason);
-        record_close_phase(reason, "teardown", phase_started, close_started, &vault_dir);
+        let phase_started = begin_close_phase(reason, "teardown", close_started, &vault_dir)?;
+        let teardown = if terminal_process {
+            vault.close_teardown_for_process_exit(reason)
+        } else {
+            vault.close_teardown(reason)
+        };
+        complete_close_phase(reason, "teardown", phase_started, close_started, &vault_dir)?;
         teardown.verdict().map_err(|error| {
             SynapseCalyxError::from_calyx(
                 "drain sealed Calyx memtables during vault teardown",
@@ -7357,7 +7405,7 @@ impl SynapseCalyxVault {
         // rows — but it must fail loudly, because after the directory is deleted
         // this sibling journal is the only surviving evidence of how much was
         // there (#1875).
-        let phase_started = std::time::Instant::now();
+        let phase_started = begin_close_phase(reason, "lineage_record", close_started, &vault_dir)?;
         let lineage_after_close = lineage::evaluate_and_record(
             &config.vault_dir,
             &closing_vault_id,
@@ -7368,13 +7416,13 @@ impl SynapseCalyxVault {
             // open, so this call always takes the existing-generation path.
             lineage::VaultOpenGenesis::PreExisting,
         )?;
-        record_close_phase(
+        complete_close_phase(
             reason,
             "lineage_record",
             phase_started,
             close_started,
             &vault_dir,
-        );
+        )?;
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_LINEAGE_CLOSE_RECORDED",
             reason,
@@ -7386,7 +7434,8 @@ impl SynapseCalyxVault {
             latest_seq,
             "recorded the closing durable high-water mark in the vault lineage journal"
         );
-        let phase_started = std::time::Instant::now();
+        let phase_started =
+            begin_close_phase(reason, "math_runtime_close", close_started, &vault_dir)?;
         let gpu_reservation_release = match math_runtime.close() {
             Ok(readback) => readback,
             Err(error) => {
@@ -7401,22 +7450,26 @@ impl SynapseCalyxVault {
                 return Err(error);
             }
         };
-        record_close_phase(
+        complete_close_phase(
             reason,
             "math_runtime_close",
             phase_started,
             close_started,
             &vault_dir,
-        );
-        let phase_started = std::time::Instant::now();
-        let lock_readback = lock.close(reason)?;
-        record_close_phase(
+        )?;
+        let phase_started = begin_close_phase(reason, "lock_release", close_started, &vault_dir)?;
+        let lock_readback = if terminal_process {
+            lock.retain_until_process_exit(reason)?
+        } else {
+            lock.close(reason)?
+        };
+        complete_close_phase(
             reason,
             "lock_release",
             phase_started,
             close_started,
             &vault_dir,
-        );
+        )?;
         let readback = SynapseCalyxVaultCloseReadback {
             enabled: true,
             reason,
@@ -7429,6 +7482,9 @@ impl SynapseCalyxVault {
             re_lock_probe_succeeded: Some(lock_readback.re_lock_probe_succeeded),
             latest_seq: Some(latest_seq),
             gpu_reservation_release,
+            safe_to_terminate: lock_readback.safe_to_terminate,
+            terminal_process_reclaim: teardown.terminal_process_reclaim,
+            lock_retained_until_process_exit: lock_readback.lock_retained_until_process_exit,
         };
         tracing::info!(
             code = "SYNAPSE_CALYX_VAULT_CLOSED",
@@ -7439,12 +7495,166 @@ impl SynapseCalyxVault {
             re_lock_probe_succeeded = readback.re_lock_probe_succeeded,
             gpu_reservation_release = ?readback.gpu_reservation_release,
             latest_seq,
+            safe_to_terminate = readback.safe_to_terminate,
+            terminal_process_reclaim = readback.terminal_process_reclaim,
+            lock_retained_until_process_exit = readback.lock_retained_until_process_exit,
             close_total_ms = u64::try_from(close_started.elapsed().as_millis())
                 .unwrap_or(u64::MAX),
             "closed durable Calyx Aster vault"
         );
         Ok(readback)
     }
+}
+
+const CLOSE_PHASE_SEQUENCE_SHIFT: u32 = 8;
+const CLOSE_PHASE_INDEX_SHIFT: u32 = 1;
+const CLOSE_PHASE_STATE_COMPLETE: u64 = 1;
+static CLOSE_PHASE_BEACON: AtomicU64 = AtomicU64::new(0);
+
+/// One lock-free, process-global view of the exact Calyx close phase (#2148,
+/// #2149). One atomic word carries phase, begin/complete state, and a monotonic
+/// sequence so readers cannot observe a torn pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxClosePhaseSnapshot {
+    pub sequence: u64,
+    pub phase: &'static str,
+    pub transition: &'static str,
+}
+
+/// Reads the exact current close phase. `None` means no Calyx close has begun in
+/// this process; callers must not substitute log volume as phase progress.
+#[must_use]
+pub fn current_close_phase_snapshot() -> Option<SynapseCalyxClosePhaseSnapshot> {
+    decode_close_phase(CLOSE_PHASE_BEACON.load(Ordering::Acquire))
+}
+
+const fn close_phase_index(phase: &str) -> Option<u8> {
+    match phase.as_bytes() {
+        b"fanout_prepare" => Some(1),
+        b"flush" => Some(2),
+        b"teardown" => Some(3),
+        b"lineage_record" => Some(4),
+        b"math_runtime_close" => Some(5),
+        b"lock_release" => Some(6),
+        _ => None,
+    }
+}
+
+const fn close_phase_name(index: u8) -> Option<&'static str> {
+    match index {
+        1 => Some("fanout_prepare"),
+        2 => Some("flush"),
+        3 => Some("teardown"),
+        4 => Some("lineage_record"),
+        5 => Some("math_runtime_close"),
+        6 => Some("lock_release"),
+        _ => None,
+    }
+}
+
+fn decode_close_phase(packed: u64) -> Option<SynapseCalyxClosePhaseSnapshot> {
+    if packed == 0 {
+        return None;
+    }
+    let sequence = packed >> CLOSE_PHASE_SEQUENCE_SHIFT;
+    let index = u8::try_from((packed >> CLOSE_PHASE_INDEX_SHIFT) & 0x7f).ok()?;
+    let phase = close_phase_name(index)?;
+    let transition = if packed & CLOSE_PHASE_STATE_COMPLETE == 0 {
+        "begin"
+    } else {
+        "complete"
+    };
+    Some(SynapseCalyxClosePhaseSnapshot {
+        sequence,
+        phase,
+        transition,
+    })
+}
+
+fn publish_close_phase(
+    phase: &'static str,
+    complete: bool,
+) -> Result<SynapseCalyxClosePhaseSnapshot, SynapseCalyxError> {
+    let index = close_phase_index(phase).ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_CLOSE_PHASE_UNKNOWN",
+            format!("close attempted to publish unknown phase {phase:?}"),
+            "use the fixed ordered Calyx close-phase table",
+        )
+    })?;
+    loop {
+        let previous_packed = CLOSE_PHASE_BEACON.load(Ordering::Acquire);
+        let previous = decode_close_phase(previous_packed);
+        let valid = match (previous, complete) {
+            (None, false) => index == 1,
+            (Some(snapshot), true) => snapshot.phase == phase && snapshot.transition == "begin",
+            (Some(snapshot), false) => {
+                snapshot.transition == "complete"
+                    && close_phase_index(snapshot.phase)
+                        .is_some_and(|previous_index| index == previous_index.saturating_add(1))
+            }
+            (None, true) => false,
+        };
+        if !valid {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CLOSE_PHASE_REGRESSION",
+                format!(
+                    "refused close-phase transition phase={phase} transition={} previous={previous:?}",
+                    if complete { "complete" } else { "begin" }
+                ),
+                "preserve the fixed begin/complete order for every Calyx close phase; restart after inspecting the last phase",
+            ));
+        }
+        let previous_sequence = previous.map_or(0, |snapshot| snapshot.sequence);
+        let sequence = previous_sequence.checked_add(1).ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CLOSE_PHASE_SEQUENCE_EXHAUSTED",
+                "the process-global Calyx close-phase sequence exhausted u64",
+                "restart the daemon; a process performs at most one terminal vault close",
+            )
+        })?;
+        if sequence > (u64::MAX >> CLOSE_PHASE_SEQUENCE_SHIFT) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CLOSE_PHASE_SEQUENCE_EXHAUSTED",
+                format!("close-phase sequence {sequence} cannot fit in the atomic beacon"),
+                "restart the daemon; a process performs at most one terminal vault close",
+            ));
+        }
+        let next = (sequence << CLOSE_PHASE_SEQUENCE_SHIFT)
+            | (u64::from(index) << CLOSE_PHASE_INDEX_SHIFT)
+            | u64::from(complete);
+        if CLOSE_PHASE_BEACON
+            .compare_exchange(previous_packed, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return decode_close_phase(next).ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_CLOSE_PHASE_ENCODE_FAILED",
+                    format!("published undecodable close-phase word {next}"),
+                    "inspect the close-phase encoder; never infer progress from logs",
+                )
+            });
+        }
+    }
+}
+
+fn begin_close_phase(
+    reason: &'static str,
+    phase: &'static str,
+    close_started: std::time::Instant,
+    vault_dir: &std::path::Path,
+) -> Result<std::time::Instant, SynapseCalyxError> {
+    let snapshot = publish_close_phase(phase, false)?;
+    tracing::info!(
+        code = "SYNAPSE_CALYX_VAULT_CLOSE_PHASE_BEGIN",
+        reason,
+        phase,
+        phase_sequence = snapshot.sequence,
+        close_elapsed_ms = u64::try_from(close_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        vault_dir = %vault_dir.display(),
+        "began one exact Calyx vault close phase"
+    );
+    Ok(std::time::Instant::now())
 }
 
 /// Above this, one close phase is reported as slow rather than merely recorded.
@@ -7463,13 +7673,14 @@ const CLOSE_PHASE_SLOW_BUDGET_MS: u128 = 2_000;
 /// reads off the daemon log's last-write timestamp. A phase that emitted only
 /// when slow would leave the drain unable to tell a working close from a hung
 /// one, which is the exact ambiguity #2100 ask 1 exists to remove.
-fn record_close_phase(
+fn complete_close_phase(
     reason: &'static str,
     phase: &'static str,
     phase_started: std::time::Instant,
     close_started: std::time::Instant,
     vault_dir: &std::path::Path,
-) {
+) -> Result<(), SynapseCalyxError> {
+    let snapshot = publish_close_phase(phase, true)?;
     let phase_ms = phase_started.elapsed().as_millis();
     let close_elapsed_ms = close_started.elapsed().as_millis();
     if phase_ms > CLOSE_PHASE_SLOW_BUDGET_MS {
@@ -7477,6 +7688,7 @@ fn record_close_phase(
             code = "SYNAPSE_CALYX_VAULT_CLOSE_PHASE_SLOW",
             reason,
             phase,
+            phase_sequence = snapshot.sequence,
             phase_ms = u64::try_from(phase_ms).unwrap_or(u64::MAX),
             close_elapsed_ms = u64::try_from(close_elapsed_ms).unwrap_or(u64::MAX),
             slow_budget_ms = u64::try_from(CLOSE_PHASE_SLOW_BUDGET_MS).unwrap_or(u64::MAX),
@@ -7484,17 +7696,19 @@ fn record_close_phase(
             "a Calyx vault close phase exceeded its reporting budget; the drain's exit-wait extends \
              while these records keep advancing and escalates when they stop"
         );
-        return;
+        return Ok(());
     }
     tracing::info!(
         code = "SYNAPSE_CALYX_VAULT_CLOSE_PHASE",
         reason,
         phase,
+        phase_sequence = snapshot.sequence,
         phase_ms = u64::try_from(phase_ms).unwrap_or(u64::MAX),
         close_elapsed_ms = u64::try_from(close_elapsed_ms).unwrap_or(u64::MAX),
         vault_dir = %vault_dir.display(),
         "completed one Calyx vault close phase"
     );
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7533,12 +7747,18 @@ struct VaultLockGuard {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the internal lock readback preserves each separately observed lock/PID/relock fact"
+)]
 struct VaultLockCloseReadback {
     lock_path: PathBuf,
     pid_path: PathBuf,
     pid_sidecar_present_after_close: bool,
     re_lock_probe_succeeded: bool,
     safe_to_unlock: bool,
+    safe_to_terminate: bool,
+    lock_retained_until_process_exit: bool,
 }
 
 impl VaultLockGuard {
@@ -7629,6 +7849,8 @@ impl VaultLockGuard {
             pid_sidecar_present_after_close,
             re_lock_probe_succeeded,
             safe_to_unlock: !pid_sidecar_present_after_close && re_lock_probe_succeeded,
+            safe_to_terminate: !pid_sidecar_present_after_close && re_lock_probe_succeeded,
+            lock_retained_until_process_exit: false,
         };
         if !readback.safe_to_unlock {
             return Err(SynapseCalyxError::new(
@@ -7638,6 +7860,142 @@ impl VaultLockGuard {
             ));
         }
         Ok(readback)
+    }
+
+    fn retain_until_process_exit(
+        self,
+        reason: &'static str,
+    ) -> Result<VaultLockCloseReadback, SynapseCalyxError> {
+        let path = self.path.clone();
+        let pid_path = self.pid_path.clone();
+        let identity = self.verify_process_exit_owner();
+        let (current_pid, canonical_current_exe) = match identity {
+            Ok(identity) => identity,
+            Err(error) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_PROCESS_EXIT_LOCK_RETENTION_FAILED",
+                    reason,
+                    lock_path = %path.display(),
+                    pid_path = %pid_path.display(),
+                    error = %error,
+                    "retaining the unverified vault-lock handle until process exit and failing the close"
+                );
+                std::mem::forget(self);
+                return Err(error);
+            }
+        };
+
+        tracing::info!(
+            code = "SYNAPSE_CALYX_LOCK_RETAINED_FOR_PROCESS_EXIT",
+            reason,
+            pid = current_pid,
+            lock_path = %path.display(),
+            pid_path = %pid_path.display(),
+            executable = %canonical_current_exe.display(),
+            "retaining the exact verified Calyx vault lock owner until operating-system process reclamation"
+        );
+        std::mem::forget(self);
+        Ok(VaultLockCloseReadback {
+            lock_path: path,
+            pid_path,
+            pid_sidecar_present_after_close: true,
+            re_lock_probe_succeeded: false,
+            safe_to_unlock: false,
+            safe_to_terminate: true,
+            lock_retained_until_process_exit: true,
+        })
+    }
+
+    fn verify_process_exit_owner(&self) -> Result<(u64, PathBuf), SynapseCalyxError> {
+        let sidecar = read_optional_to_string(&self.pid_path).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PROCESS_EXIT_PID_SIDECAR_READ_FAILED",
+                format!(
+                    "read retained Calyx vault PID sidecar {} before process exit: {error}",
+                    self.pid_path.display()
+                ),
+                CLOSE_REMEDIATION,
+            )
+        })?;
+        if sidecar.trim().is_empty() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PROCESS_EXIT_PID_SIDECAR_EMPTY",
+                format!(
+                    "retained Calyx vault lock {} has an empty PID sidecar {}",
+                    self.path.display(),
+                    self.pid_path.display()
+                ),
+                CLOSE_REMEDIATION,
+            ));
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&sidecar).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PROCESS_EXIT_PID_SIDECAR_INVALID",
+                format!(
+                    "decode retained Calyx vault PID sidecar {}: {error}",
+                    self.pid_path.display()
+                ),
+                CLOSE_REMEDIATION,
+            )
+        })?;
+        let recorded_pid = parsed.get("pid").and_then(serde_json::Value::as_u64);
+        let recorded_exe = parsed
+            .get("exe")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_PROCESS_EXIT_PID_SIDECAR_IDENTITY_MISSING",
+                    format!(
+                        "retained Calyx vault PID sidecar {} does not contain an executable identity",
+                        self.pid_path.display()
+                    ),
+                    CLOSE_REMEDIATION,
+                )
+            })?;
+        let current_pid = u64::from(std::process::id());
+        let current_exe = std::env::current_exe().map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PROCESS_EXIT_EXE_READ_FAILED",
+                format!("read current executable before retaining vault lock: {error}"),
+                CLOSE_REMEDIATION,
+            )
+        })?;
+        let canonical_recorded_exe = fs::canonicalize(recorded_exe).map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_PROCESS_EXIT_RECORDED_EXE_CANONICALIZE_FAILED",
+                "canonicalize recorded vault-owner executable",
+                Path::new(recorded_exe),
+                &error,
+                CLOSE_REMEDIATION,
+            )
+        })?;
+        let canonical_current_exe = fs::canonicalize(&current_exe).map_err(|error| {
+            SynapseCalyxError::with_io(
+                "SYNAPSE_CALYX_PROCESS_EXIT_CURRENT_EXE_CANONICALIZE_FAILED",
+                "canonicalize current vault-owner executable",
+                &current_exe,
+                &error,
+                CLOSE_REMEDIATION,
+            )
+        })?;
+        #[cfg(windows)]
+        let executable_matches = canonical_recorded_exe
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&canonical_current_exe.to_string_lossy());
+        #[cfg(not(windows))]
+        let executable_matches = canonical_recorded_exe == canonical_current_exe;
+        if recorded_pid != Some(current_pid) || !executable_matches {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PROCESS_EXIT_LOCK_IDENTITY_MISMATCH",
+                format!(
+                    "refused terminal lock retention: sidecar_pid={recorded_pid:?} current_pid={current_pid} sidecar_exe={} current_exe={}",
+                    canonical_recorded_exe.display(),
+                    canonical_current_exe.display()
+                ),
+                CLOSE_REMEDIATION,
+            ));
+        }
+        Ok((current_pid, canonical_current_exe))
     }
 }
 

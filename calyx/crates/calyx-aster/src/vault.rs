@@ -241,6 +241,12 @@ pub struct VaultTeardownReport {
     pub residual_teardown_ms: u128,
     /// Whole teardown, end to end.
     pub total_ms: u128,
+    /// True only for the terminal-process close path, where durable work and
+    /// pending flush joins completed but the resident graph was deliberately
+    /// left for the operating system to reclaim at process exit.
+    ///
+    /// Reusable in-process close always reports false and runs every destructor.
+    pub terminal_process_reclaim: bool,
     /// The first background flush failure, if the drain surfaced one.
     ///
     /// Held rather than returned as `Err` so the timings are never lost to the
@@ -835,6 +841,7 @@ where
             durable_teardown_ms,
             residual_teardown_ms,
             total_ms: started.elapsed().as_millis(),
+            terminal_process_reclaim: false,
             drain_error,
         };
         tracing::info!(
@@ -849,6 +856,55 @@ where
             drain_ok = report.drain_error.is_none(),
             "tore the Calyx vault down in named steps; this region was one unlogged `drop` before \
              #2100 and carried 63-87 s of the production close"
+        );
+        report
+    }
+
+    /// Completes the durable close boundary for a process that is committed to
+    /// terminate, without walking the resident MVCC graph's destructors.
+    ///
+    /// The final flush happens in the caller before this method. This method
+    /// still joins every sealed-memtable flush and returns its real error. Only
+    /// after that bounded durable work is complete is the owned vault forgotten.
+    /// The process-exit caller must retain the physical vault lock until the OS
+    /// terminates the process; using this path for an in-process reopen would be
+    /// a lifecycle violation.
+    #[must_use]
+    pub fn close_teardown_for_process_exit(self, reason: &'static str) -> VaultTeardownReport {
+        let started = Instant::now();
+        let outstanding_before = self.rows.flush_status().outstanding;
+        let drain_started = Instant::now();
+        let drain = self.rows.drain_pending_flushes();
+        let flush_drain_ms = drain_started.elapsed().as_millis();
+        let drain_error = drain.err();
+
+        // Rust does not guarantee destructors at process exit. This is a
+        // deliberate terminal-lifecycle boundary, not a general leak: the
+        // caller retains the exclusive vault lock and the process exits after
+        // recording its terminal lifecycle state. Windows then reclaims the
+        // complete address space and its handles as one operation.
+        std::mem::forget(self);
+
+        let report = VaultTeardownReport {
+            reason,
+            sealed_outstanding_before: outstanding_before,
+            flush_drain_ms,
+            rows_teardown_ms: 0,
+            durable_teardown_ms: 0,
+            residual_teardown_ms: 0,
+            total_ms: started.elapsed().as_millis(),
+            terminal_process_reclaim: true,
+            drain_error,
+        };
+        tracing::info!(
+            code = "CALYX_ASTER_VAULT_PROCESS_EXIT_TEARDOWN",
+            reason,
+            sealed_outstanding_before = report.sealed_outstanding_before,
+            flush_drain_ms = report.flush_drain_ms,
+            total_ms = report.total_ms,
+            drain_ok = report.drain_error.is_none(),
+            terminal_process_reclaim = true,
+            "completed durable terminal-process teardown and retained the resident vault graph for operating-system reclamation"
         );
         report
     }

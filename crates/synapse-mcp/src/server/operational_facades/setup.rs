@@ -210,6 +210,22 @@ struct SetupBridgeCheckpointEnvelope {
     state: String,
     phase: String,
     maintenance_lock_path: String,
+    #[serde(default)]
+    checkpoint_generation_id: String,
+    #[serde(default)]
+    daemon_pid: u32,
+    #[serde(default)]
+    installed_binary_path: String,
+    #[serde(default)]
+    installed_binary_sha256: String,
+    #[serde(default)]
+    daemon_run_current_path: String,
+    #[serde(default)]
+    daemon_run_current_sha256: String,
+    #[serde(default)]
+    setup_script_path: String,
+    #[serde(default)]
+    setup_script_sha256: String,
 }
 
 fn launch_setup_repair(
@@ -277,7 +293,8 @@ fn launch_setup_repair(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .env("SYNAPSE_SETUP_REPAIR_REASON", reason)
-        .env("SYNAPSE_SETUP_REPAIR_MANIFEST", &manifest_path);
+        .env("SYNAPSE_SETUP_REPAIR_MANIFEST", &manifest_path)
+        .env("SYNAPSE_SETUP_INVOCATION_ID", &run_id);
     if let Some(active_issue) = active_issue.as_deref() {
         command.env("SYNAPSE_ACTIVE_ISSUE", active_issue);
     }
@@ -498,7 +515,13 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
                 "inspect and repair the checkpoint JSON; setup refuses to replace a possibly pending phase with an unrelated full repair",
             )
         })?;
-    if checkpoint.schema != "synapse_setup_bridge_pending/v2" {
+    if checkpoint.schema == "synapse_setup_bridge_pending/v2" {
+        // v2 predates deployment-generation binding. Its identity fields can
+        // describe real bytes, but cannot prove which later successful setup
+        // owns the file. It is historical evidence, never resumable authority.
+        return Ok(SetupRepairPlan::Full);
+    }
+    if checkpoint.schema != "synapse_setup_bridge_pending/v3" {
         return Err(setup_repair_error(
             "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID",
             "chrome_bridge_checkpoint",
@@ -507,7 +530,7 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
                 checkpoint.schema,
                 checkpoint_path.display()
             ),
-            "inspect the checkpoint and resume it with the repo version that wrote its exact schema",
+            "inspect the checkpoint; setup refuses to delete or reinterpret an unknown transaction schema",
         ));
     }
     if checkpoint.phase != "chrome_bridge_activation" {
@@ -522,6 +545,32 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
             "inspect the checkpoint phase; setup refuses to infer or replay an unknown continuation",
         ));
     }
+    if matches!(checkpoint.state.as_str(), "completed" | "superseded") {
+        return Ok(SetupRepairPlan::Full);
+    }
+    if checkpoint.state != "pending" {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_STATE_INVALID",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found unsupported Chrome bridge checkpoint state={} path={}",
+                checkpoint.state,
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint state; only pending can resume and terminal completed/superseded records permit a new full repair",
+        ));
+    }
+    if checkpoint.checkpoint_generation_id.trim().is_empty() {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_GENERATION_MISSING",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found a pending Chrome bridge checkpoint without checkpoint_generation_id path={}",
+                checkpoint_path.display()
+            ),
+            "inspect the checkpoint; a pending phase without an owning setup generation is never resumable",
+        ));
+    }
     if checkpoint.maintenance_lock_path.trim().is_empty() {
         return Err(setup_repair_error(
             "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_MAINTENANCE_LOCK_MISSING",
@@ -533,23 +582,123 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
             "inspect the checkpoint; a phase resume must reacquire the exact setup maintenance lock that protected the committed daemon handoff",
         ));
     }
-    match checkpoint.state.as_str() {
-        "pending" => Ok(SetupRepairPlan::ResumeChromeBridge {
-            checkpoint_path,
-            maintenance_lock_path: PathBuf::from(checkpoint.maintenance_lock_path),
-        }),
-        "completed" => Ok(SetupRepairPlan::Full),
-        state => Err(setup_repair_error(
-            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_STATE_INVALID",
+    if checkpoint.daemon_pid != std::process::id() {
+        return Ok(SetupRepairPlan::Full);
+    }
+    for (kind, path, expected_sha256) in [
+        (
+            "installed_binary",
+            checkpoint.installed_binary_path.as_str(),
+            checkpoint.installed_binary_sha256.as_str(),
+        ),
+        (
+            "daemon_run_current",
+            checkpoint.daemon_run_current_path.as_str(),
+            checkpoint.daemon_run_current_sha256.as_str(),
+        ),
+        (
+            "setup_script",
+            checkpoint.setup_script_path.as_str(),
+            checkpoint.setup_script_sha256.as_str(),
+        ),
+    ] {
+        if path.trim().is_empty() || expected_sha256.trim().is_empty() {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_IDENTITY_MISSING",
+                "chrome_bridge_checkpoint",
+                format!(
+                    "setup repair found a current-PID pending checkpoint with incomplete identity kind={} path={}",
+                    kind,
+                    checkpoint_path.display()
+                ),
+                "inspect the checkpoint; a pending phase resumes only when every generation-bound file identity is present",
+            ));
+        }
+        let actual = fs::read(path).map_err(|error| {
+            setup_repair_error(
+                "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_IDENTITY_READ_FAILED",
+                "chrome_bridge_checkpoint",
+                format!(
+                    "setup repair could not read current-PID checkpoint identity kind={} file={} checkpoint={} error={}",
+                    kind,
+                    path,
+                    checkpoint_path.display(),
+                    error
+                ),
+                "repair the exact unreadable checkpointed file or perform a new full setup after preserving the stale record",
+            )
+        })?;
+        let actual_sha256 = sha256_hex(&actual);
+        if !actual_sha256.eq_ignore_ascii_case(expected_sha256.trim_start_matches("sha256:")) {
+            return Err(setup_repair_error(
+                "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_IDENTITY_DRIFT",
+                "chrome_bridge_checkpoint",
+                format!(
+                    "setup repair found a current-generation pending checkpoint with changed bytes kind={} file={} expected_sha256={} actual_sha256={} checkpoint={}",
+                    kind,
+                    path,
+                    expected_sha256,
+                    actual_sha256,
+                    checkpoint_path.display()
+                ),
+                "preserve the checkpoint and inspect the named identity drift; a current-generation pending transaction is never silently replaced",
+            ));
+        }
+    }
+    let current_executable = std::env::current_exe().map_err(|error| {
+        setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CURRENT_EXE_READ_FAILED",
+            "chrome_bridge_checkpoint",
+            format!("setup repair could not resolve the live daemon executable: {error}"),
+            "repair process executable-path access and retry setup status",
+        )
+    })?;
+    let checkpoint_executable = fs::canonicalize(&checkpoint.installed_binary_path).map_err(|error| {
+        setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_EXE_CANONICALIZE_FAILED",
             "chrome_bridge_checkpoint",
             format!(
-                "setup repair found unsupported Chrome bridge checkpoint state={} path={}",
-                state,
+                "setup repair could not canonicalize checkpoint executable path={} error={}",
+                checkpoint.installed_binary_path, error
+            ),
+            "repair the checkpointed executable path or perform a new full setup after preserving the stale record",
+        )
+    })?;
+    let current_executable = fs::canonicalize(&current_executable).map_err(|error| {
+        setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CURRENT_EXE_CANONICALIZE_FAILED",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair could not canonicalize live daemon executable path={} error={}",
+                current_executable.display(),
+                error
+            ),
+            "repair process executable-path access and retry setup status",
+        )
+    })?;
+    #[cfg(windows)]
+    let executable_matches = current_executable
+        .to_string_lossy()
+        .eq_ignore_ascii_case(&checkpoint_executable.to_string_lossy());
+    #[cfg(not(windows))]
+    let executable_matches = current_executable == checkpoint_executable;
+    if !executable_matches {
+        return Err(setup_repair_error(
+            "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_EXE_DRIFT",
+            "chrome_bridge_checkpoint",
+            format!(
+                "setup repair found a current-generation pending checkpoint executable mismatch expected={} actual={} checkpoint={}",
+                checkpoint_executable.display(),
+                current_executable.display(),
                 checkpoint_path.display()
             ),
-            "inspect the checkpoint state; only pending can resume and completed permits a new full repair",
-        )),
+            "preserve the checkpoint and inspect executable identity drift; a current-generation pending transaction is never silently replaced",
+        ));
     }
+    Ok(SetupRepairPlan::ResumeChromeBridge {
+        checkpoint_path,
+        maintenance_lock_path: PathBuf::from(checkpoint.maintenance_lock_path),
+    })
 }
 
 fn setup_repair_active_issue_from_reason(reason: &str) -> Option<String> {

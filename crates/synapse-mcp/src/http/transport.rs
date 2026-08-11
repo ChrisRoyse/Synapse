@@ -864,18 +864,18 @@ async fn close_http_calyx_vault(
             "refused to close Calyx vault because periodic storage-maintenance owner terminality is unproven: {maintenance:?}"
         ))
     };
-    let safe_to_unlock = result
+    let safe_to_terminate = result
         .as_ref()
-        .is_ok_and(|readback| readback.safe_to_unlock);
+        .is_ok_and(|readback| readback.safe_to_terminate);
     tracing::info!(
         code = "MCP_HTTP_CALYX_VAULT_CLOSE_READBACK",
         reason,
         expected_open,
-        safe_to_unlock,
+        safe_to_terminate,
         result = ?result,
         "readback=calyx_vault edge=http_shutdown after_flush_close"
     );
-    (safe_to_unlock, result)
+    (safe_to_terminate, result)
 }
 
 async fn drain_http_operator_owners(
@@ -1205,103 +1205,38 @@ fn configured_positive_seconds(name: &'static str, default: Duration) -> anyhow:
     }
 }
 
-/// One sample of the physical evidence that a commanded shutdown is still doing
-/// something (#2131).
+/// One exact sample of Calyx close progress (#2148, #2149).
 ///
-/// Both witnesses are the same ones `Get-SynapseDaemonLivenessSample` reads from
-/// outside the process, deliberately: the daemon's own watchdog and the deploy
-/// drain must not be able to disagree about whether a close is alive.
-///
-/// 1. **The daemon's own stderr byte count.** The supervisor redirects stderr to
-///    `daemon-stderr-gen*.log`, and the close emits
-///    `SYNAPSE_CALYX_VAULT_CLOSE_PHASE` per phase precisely so a working close
-///    always advances it. Read through the inherited handle rather than by path,
-///    so the watchdog needs no knowledge of where the supervisor put the file —
-///    and so it degrades honestly to "no witness" when stderr is a console or a
-///    pipe instead of a file.
-/// 2. **`daemon-run-current.json`'s size and mtime.** The phase-one exit-intent
-///    marker and any later phase refresh rewrite it atomically.
-///
-/// Equality is the progress test: *any* change in *any* witness is progress.
+/// The atomic snapshot is published at each phase begin and completion. Log
+/// volume and lifecycle-file mtime are deliberately absent: unrelated work must
+/// never buy extra shutdown time for a wedged close.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ShutdownLivenessWitness {
-    stderr_bytes: Option<u64>,
-    run_current_bytes: Option<u64>,
-    run_current_mtime_unix_ms: Option<u64>,
+    close_phase: Option<synapse_calyx::SynapseCalyxClosePhaseSnapshot>,
 }
 
 impl ShutdownLivenessWitness {
-    fn sample(run_current_path: &std::path::Path) -> Self {
-        let (run_current_bytes, run_current_mtime_unix_ms) = fs::metadata(run_current_path)
-            .ok()
-            .map_or((None, None), |metadata| {
-                let mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-                    .and_then(|since| u64::try_from(since.as_millis()).ok());
-                (Some(metadata.len()), mtime)
-            });
+    fn sample() -> Self {
         Self {
-            stderr_bytes: stderr_file_len(),
-            run_current_bytes,
-            run_current_mtime_unix_ms,
+            close_phase: synapse_calyx::current_close_phase_snapshot(),
         }
     }
 
-    /// True when at least one witness could be read at all. When none can, the
-    /// watchdog says so and falls back to the flat wall-clock budget instead of
-    /// pretending a constant fingerprint is evidence of a stall.
+    /// True only after the exact Calyx close beacon exists.
     const fn available(&self) -> bool {
-        self.stderr_bytes.is_some()
-            || self.run_current_bytes.is_some()
-            || self.run_current_mtime_unix_ms.is_some()
+        self.close_phase.is_some()
     }
 
     fn describe(&self) -> String {
-        format!(
-            "stderr_bytes={} run_current_bytes={} run_current_mtime_unix_ms={}",
-            self.stderr_bytes
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-            self.run_current_bytes
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
-            self.run_current_mtime_unix_ms
-                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        self.close_phase.map_or_else(
+            || "close_phase=none".to_owned(),
+            |snapshot| {
+                format!(
+                    "close_phase={} close_transition={} close_sequence={}",
+                    snapshot.phase, snapshot.transition, snapshot.sequence
+                )
+            },
         )
-    }
-}
-
-/// Byte length of this process's stderr when — and only when — it is a regular
-/// file (#2131).
-///
-/// The handle is borrowed, never owned: dropping a `File` built from it would
-/// close the daemon's stderr, which is the sort of cure that is worse than any
-/// disease a watchdog could diagnose. `ManuallyDrop` is what guarantees that.
-fn stderr_file_len() -> Option<u64> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _};
-        let raw = io::stderr().as_raw_handle();
-        if raw.is_null() {
-            return None;
-        }
-        // SAFETY: `raw` is this process's live stderr handle, obtained from the
-        // std handle that owns it. The `File` is wrapped in `ManuallyDrop` so it
-        // is never closed here, and it is only ever read through `metadata`,
-        // which does not move the file pointer or mutate any state.
-        let file = std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_handle(raw) });
-        let metadata = file.metadata().ok()?;
-        metadata.is_file().then(|| metadata.len())
-    }
-    #[cfg(not(windows))]
-    {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _};
-        // SAFETY: same contract as the Windows arm — a borrowed fd wrapped in
-        // `ManuallyDrop` so it is never closed, read only through `metadata`.
-        let file =
-            std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(io::stderr().as_raw_fd()) });
-        let metadata = file.metadata().ok()?;
-        metadata.is_file().then(|| metadata.len())
     }
 }
 
@@ -1309,29 +1244,16 @@ fn stderr_file_len() -> Option<u64> {
 /// `None` when the watchdog was disarmed because the shutdown reached a terminal
 /// decision (#2131).
 ///
-/// The three verdicts are the same vocabulary the deploy drain's exit-wait
-/// reports, and they are the whole point: an expiry that cannot say *why* it
-/// fired is indistinguishable from the flat timeout it replaced.
+/// The verdict vocabulary names whether an exact close beacon existed and why
+/// the bounded wait ended.
 ///
-/// * `stalled` — witnesses were readable and stopped advancing for the whole
+/// * `stalled` — the close beacon was readable and stopped advancing for the whole
 ///   stall budget. This is the honest kill.
-/// * `ceiling` — witnesses kept advancing right up to the absolute backstop. The
-///   close was doing something; it was simply not allowed to do it forever.
-/// * `no_liveness_witness` — neither witness could be read, so the wait degraded
-///   to the flat wall-clock budget. Reported as its own verdict rather than
-///   silently masquerading as `stalled`.
-///
-/// # Self-observation is bounded, not excluded
-///
-/// The extension record below goes to stderr, which is one of the witnesses, so
-/// the watchdog can observe its own writing. It cannot bootstrap itself out of a
-/// stall: the record is only ever emitted *after* genuine external progress, and
-/// the rate limit means one such record buys at most one further poll interval
-/// of extension. A daemon that has actually gone silent still writes nothing,
-/// observes nothing, and dies on schedule.
+/// * `ceiling` — exact close phases kept advancing up to the absolute backstop.
+/// * `no_close_phase_witness` — the close had not published its first exact
+///   phase, so the flat budget expired without substituting a proxy signal.
 fn run_http_shutdown_watchdog_wait(
     disarmed: &AtomicBool,
-    run_current_path: &std::path::Path,
     source: &'static str,
     stall_budget: Duration,
     max_wait: Duration,
@@ -1339,8 +1261,7 @@ fn run_http_shutdown_watchdog_wait(
     let armed_at = Instant::now();
     let ceiling = armed_at + max_wait;
     let mut deadline = (armed_at + stall_budget).min(ceiling);
-    let mut witness = ShutdownLivenessWitness::sample(run_current_path);
-    let witness_available = witness.available();
+    let mut witness = ShutdownLivenessWitness::sample();
     let mut last_progress_at = armed_at;
     let mut progress_observations: u64 = 0;
     // `None` so the FIRST extension always reports. An operator watching a slow
@@ -1354,8 +1275,9 @@ fn run_http_shutdown_watchdog_wait(
         }
         let now = Instant::now();
         if now >= deadline {
+            let witness_available = witness.available();
             let verdict = if !witness_available {
-                "no_liveness_witness"
+                "no_close_phase_witness"
             } else if deadline >= ceiling {
                 "ceiling"
             } else {
@@ -1375,11 +1297,12 @@ fn run_http_shutdown_watchdog_wait(
             });
         }
         std::thread::sleep(HTTP_SHUTDOWN_WATCHDOG_POLL_INTERVAL.min(deadline - now));
-        if !witness_available {
+        let next = ShutdownLivenessWitness::sample();
+        if next == witness {
             continue;
         }
-        let next = ShutdownLivenessWitness::sample(run_current_path);
-        if next == witness {
+        if !next.available() {
+            witness = next;
             continue;
         }
         witness = next;
@@ -1448,18 +1371,31 @@ fn spawn_http_shutdown_watchdog(
     match std::thread::Builder::new()
         .name("synapse-http-shutdown-watchdog".to_owned())
         .spawn(move || {
-            let run_current_path = db_path_for_thread
-                .join(synapse_calyx::vault_runtime::DAEMON_RUN_CURRENT_FILE);
             let Some(expiry) = run_http_shutdown_watchdog_wait(
                 &disarmed_for_thread,
-                &run_current_path,
                 source,
                 timeout,
                 max_wait,
             ) else {
                 return;
             };
-            // The phase-one marker, read from memory. A watchdog kill after this
+            let close_phase = synapse_calyx::current_close_phase_snapshot();
+            if let Some(snapshot) = close_phase
+                && let Err(error) =
+                    crate::daemon_lifecycle::record_exit_intent(source, snapshot.phase)
+            {
+                tracing::error!(
+                    code = "MCP_HTTP_SHUTDOWN_EXACT_PHASE_PERSIST_FAILED",
+                    source,
+                    phase = snapshot.phase,
+                    phase_transition = snapshot.transition,
+                    phase_sequence = snapshot.sequence,
+                    error = %error,
+                    "the watchdog could read the exact Calyx close phase but could not persist it before forced exit"
+                );
+            }
+            // The phase-one marker, refreshed above with the exact in-flight
+            // Calyx phase when one exists. A watchdog kill after this
             // marker is `interrupted_graceful` at the next boot, never `clean`
             // — see `daemon_lifecycle::classify_previous_shutdown`. Reporting it
             // here means the exit event names the phase that was in progress
@@ -1483,6 +1419,7 @@ fn spawn_http_shutdown_watchdog(
                 "progress_observations": expiry.progress_observations,
                 "liveness_witness_available": expiry.witness_available,
                 "liveness_witness": expiry.witness,
+                "calyx_close_phase": close_phase,
                 "ending_at_unix_ms": ending_at_unix_ms,
                 "ending_reason": ending_reason,
                 "ending_phase": ending_phase,
@@ -2362,6 +2299,7 @@ pub(super) async fn serve(
     m2_config: &M2ServiceConfig,
     m3_config: M3ServiceConfig,
     m4_config: M4ServiceConfig,
+    parent_watchdog: Option<tokio::sync::oneshot::Receiver<crate::connect::ParentWatchdogEvent>>,
 ) -> anyhow::Result<ExitCode> {
     synapse_action::install_panic_hook();
     let mut startup_timer = StartupPhaseTimer::new();
@@ -2916,7 +2854,10 @@ pub(super) async fn serve(
     );
     let m2_done_after_server_stop = m2_emitter_done.clone();
     let m2_done_after_signal = m2_emitter_done.clone();
+    let m2_done_after_parent = m2_emitter_done.clone();
     let m2_done_after_http_endpoint = m2_emitter_done;
+    let parent_watchdog = crate::connect::wait_for_parent_watchdog(parent_watchdog);
+    tokio::pin!(parent_watchdog);
     let (
         code,
         shutdown_source,
@@ -3018,6 +2959,113 @@ pub(super) async fn serve(
             } else {
                 ExitCode::SUCCESS
             };
+            (
+                exit_code,
+                source,
+                failures,
+                authority_finalizers_quiescent,
+                session_input_owners_quiescent,
+                operator_owner_drain,
+                shutdown_watchdog,
+            )
+        }
+        parent_event = &mut parent_watchdog => {
+            let mut failures = HttpShutdownFailures::default();
+            let (source, exit_code) = match parent_event {
+                crate::connect::ParentWatchdogEvent::ParentExited {
+                    parent_pid,
+                    parent_creation_time_100ns,
+                } => {
+                    tracing::warn!(
+                        code = "MCP_HTTP_PARENT_EXITED",
+                        source = "parent_exit",
+                        parent_pid,
+                        parent_creation_time_100ns,
+                        "the exact HTTP daemon lifecycle owner exited; beginning ordinary graceful shutdown"
+                    );
+                    ("parent_exit", ExitCode::SUCCESS)
+                }
+                crate::connect::ParentWatchdogEvent::Failed {
+                    code,
+                    parent_pid,
+                    detail,
+                } => {
+                    tracing::error!(
+                        code,
+                        source = "parent_watchdog_failure",
+                        parent_pid,
+                        detail = %detail,
+                        "the exact HTTP parent watchdog failed; draining the daemon and returning nonzero"
+                    );
+                    failures.push(
+                        "parent_watchdog",
+                        format!("code={code} parent_pid={parent_pid:?} detail={detail}"),
+                    );
+                    ("parent_watchdog_failure", ExitCode::from(1))
+                }
+            };
+            let shutdown_watchdog = spawn_http_shutdown_watchdog(
+                local_addr,
+                db_path.clone(),
+                source,
+                shutdown_watchdog_timeout,
+                shutdown_watchdog_max_wait,
+            );
+            let drain = runtime.drain_state.mark_draining(source);
+            let shutdown_on_drop = active_http_sockets.begin_shutdown_on_drop(source);
+            tracing::warn!(
+                code = "MCP_HTTP_SOCKET_SHUTDOWN_ON_DROP_ENABLED",
+                source,
+                shutdown_on_drop = ?shutdown_on_drop,
+                "accepted HTTP socket drop now performs socket shutdown during parent-owned daemon drain"
+            );
+            shutdown_cancel.cancel();
+            connection_closed_cancel.cancel();
+            let operator_owner_drain =
+                drain_http_operator_owners(&mut operator_hotkey_guard, source).await;
+            let session_close =
+                close_active_mcp_sessions_for_shutdown(&runtime.session_manager, source).await;
+            tracing::warn!(
+                code = "MCP_HTTP_SHUTDOWN_SESSIONS_CLOSED",
+                source,
+                session_close = ?session_close,
+                "active MCP sessions received close attempts after exact parent termination"
+            );
+            failures.inspect_session_close(&session_close);
+            let socket_shutdown = active_http_sockets.shutdown_all(source);
+            tracing::warn!(
+                code = "MCP_HTTP_ACTIVE_SOCKETS_SHUTDOWN",
+                source,
+                socket_shutdown = ?socket_shutdown,
+                "accepted HTTP sockets explicitly shut down during parent-owned daemon drain"
+            );
+            failures.inspect_socket_shutdown(&socket_shutdown);
+            let server_stop = wait_for_server_stop(&mut server_task, source).await;
+            let cleanup = cleanup_active_session_inputs_for_shutdown(
+                &runtime.session_lifecycle,
+                &runtime.session_manager,
+                &session_close.session_ids,
+                source,
+            )
+            .await;
+            tracing::info!(
+                code = "MCP_HTTP_SHUTDOWN_INPUT_CLEANUP",
+                source,
+                drain = ?drain,
+                cleanup = ?cleanup,
+                "readback=session_input_ownership edge=parent_shutdown after_cleanup"
+            );
+            let authority_finalizers_quiescent =
+                cleanup.authority_finalizer_owners_quiescent();
+            let session_input_owners_quiescent = cleanup.all_input_owners_quiescent();
+            failures.inspect_input_cleanup(&cleanup);
+            let emitter_drain =
+                wait_for_m2_emitter_done(m2_done_after_parent, "http", source).await;
+            failures.inspect_result("server_stop", server_stop);
+            failures.inspect_result(
+                "m2_emitter_drain",
+                emitter_drain.context("drain M2 emitter after exact HTTP parent termination"),
+            );
             (
                 exit_code,
                 source,

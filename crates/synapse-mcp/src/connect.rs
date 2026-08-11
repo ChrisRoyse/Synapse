@@ -59,7 +59,7 @@ const SESSION_ABSENCE_BODY_LIMIT: usize = 16 * 1024;
 const WINDOWS_TO_UNIX_EPOCH_100NS: u64 = 116_444_736_000_000_000;
 
 #[derive(Debug)]
-enum ParentWatchdogEvent {
+pub(crate) enum ParentWatchdogEvent {
     ParentExited {
         parent_pid: u32,
         parent_creation_time_100ns: u64,
@@ -877,6 +877,55 @@ fn install_parent_watchdog() -> anyhow::Result<Option<oneshot::Receiver<ParentWa
     }
 }
 
+/// Arms the same exact process-handle + creation-time watchdog for an explicit
+/// lifecycle owner. HTTP daemons use this when their supervisor supplies
+/// `--parent-pid`; the bridge continues to discover its parent from the kernel.
+pub(crate) fn install_explicit_parent_watchdog(
+    parent_pid: u32,
+) -> anyhow::Result<oneshot::Receiver<ParentWatchdogEvent>> {
+    #[cfg(windows)]
+    {
+        if parent_pid == 0 || parent_pid == std::process::id() {
+            anyhow::bail!(
+                "MCP_PARENT_PID_INVALID: parent_pid={parent_pid} current_pid={} must name a distinct live process",
+                std::process::id()
+            );
+        }
+        let parent_identity = capture_process_identity(parent_pid)
+            .with_context(|| format!("capture explicit parent pid {parent_pid}"))?;
+        let parent_creation_time_100ns = parent_identity.creation_time_100ns;
+        let parent_start_time_unix_secs = creation_time_unix_secs(parent_creation_time_100ns)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MCP_PARENT_CREATION_TIME_INVALID: parent_pid={parent_pid} creation_time_100ns={parent_creation_time_100ns} predates the Unix epoch"
+                )
+            })?;
+        let (sender, receiver) = oneshot::channel();
+        std::thread::Builder::new()
+            .name("synapse-http-parent-watchdog".to_owned())
+            .spawn(move || {
+                let event = wait_for_parent_exit(parent_identity, parent_start_time_unix_secs);
+                let _receiver_was_dropped = sender.send(event);
+            })
+            .with_context(|| format!("spawn explicit parent watchdog for pid {parent_pid}"))?;
+        tracing::info!(
+            code = "MCP_HTTP_PARENT_WATCHDOG_ARMED",
+            parent_pid,
+            parent_creation_time_100ns,
+            parent_start_time_unix_secs,
+            "exact HTTP daemon parent-death watchdog armed"
+        );
+        Ok(receiver)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = parent_pid;
+        anyhow::bail!(
+            "MCP_PARENT_WATCHDOG_UNSUPPORTED: explicit HTTP parent ownership requires Windows process handles"
+        )
+    }
+}
+
 #[cfg(windows)]
 fn wait_for_parent_exit(
     parent_identity: ParentProcessIdentity,
@@ -991,7 +1040,7 @@ fn parent_watchdog_failure_with_close(
     }
 }
 
-async fn wait_for_parent_watchdog(
+pub(crate) async fn wait_for_parent_watchdog(
     receiver: Option<oneshot::Receiver<ParentWatchdogEvent>>,
 ) -> ParentWatchdogEvent {
     match receiver {

@@ -35,7 +35,10 @@ use std::{
     collections::BTreeMap,
     num::NonZeroUsize,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use synapse_action::ActionHandle;
@@ -77,6 +80,55 @@ const AUDIO_LOOPBACK_ENV: &str = "SYNAPSE_AUDIO_LOOPBACK";
 const MAX_SUBSCRIPTIONS_ENV: &str = "SYNAPSE_MAX_SUBSCRIPTIONS";
 const DEFAULT_BIND: &str = "127.0.0.1:7700";
 pub type SharedM3State = Arc<Mutex<M3State>>;
+
+struct CalyxClosePhaseObserver {
+    stop: Arc<AtomicBool>,
+    worker: std::thread::JoinHandle<std::result::Result<(), String>>,
+}
+
+impl CalyxClosePhaseObserver {
+    fn spawn(reason: &'static str) -> std::io::Result<Self> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_worker = Arc::clone(&stop);
+        let worker = std::thread::Builder::new()
+            .name("synapse-calyx-close-phase-observer".to_owned())
+            .spawn(move || {
+                let mut recorded_sequence = 0;
+                loop {
+                    if let Some(snapshot) = synapse_calyx::current_close_phase_snapshot()
+                        && snapshot.sequence > recorded_sequence
+                    {
+                        crate::daemon_lifecycle::record_exit_intent(reason, snapshot.phase)
+                            .map_err(|error| {
+                                format!(
+                                    "persist exact Calyx close phase={} transition={} sequence={}: {error:#}",
+                                    snapshot.phase, snapshot.transition, snapshot.sequence
+                                )
+                            })?;
+                        recorded_sequence = snapshot.sequence;
+                    }
+                    if stop_for_worker.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })?;
+        Ok(Self { stop, worker })
+    }
+
+    fn finish(self) -> std::result::Result<(), String> {
+        self.stop.store(true, Ordering::Release);
+        self.worker.join().map_err(|panic| {
+            if let Some(message) = panic.downcast_ref::<&str>() {
+                format!("Calyx close-phase observer panicked: {message}")
+            } else if let Some(message) = panic.downcast_ref::<String>() {
+                format!("Calyx close-phase observer panicked: {message}")
+            } else {
+                "Calyx close-phase observer panicked with a non-string payload".to_owned()
+            }
+        })?
+    }
+}
 
 #[derive(Clone, Debug)]
 #[expect(
@@ -1119,9 +1171,27 @@ impl M3State {
                  the next boot"
             );
         }
-        match db.close_calyx_vault(reason).map_err(|error| {
-            storage_owned_calyx_error("flush and close sole Calyx storage vault", &error)
-        }) {
+        let phase_observer = CalyxClosePhaseObserver::spawn(reason).map_err(|error| {
+            synapse_calyx::SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CLOSE_PHASE_OBSERVER_SPAWN_FAILED",
+                format!("spawn exact Calyx close-phase lifecycle observer: {error}"),
+                "repair local thread/process resources; shutdown cannot proceed without an exact phase witness",
+            )
+        })?;
+        let close_result = db
+            .close_calyx_vault_for_process_exit(reason)
+            .map_err(|error| {
+                storage_owned_calyx_error("flush and close sole Calyx storage vault", &error)
+            });
+        let observer_result = phase_observer.finish();
+        if let Err(error) = observer_result {
+            return Err(synapse_calyx::SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CLOSE_PHASE_PERSIST_FAILED",
+                error,
+                "inspect daemon lifecycle storage and the exact close-phase record before restarting",
+            ));
+        }
+        match close_result {
             Ok(readback) => {
                 self.calyx_vault_status = synapse_calyx::SynapseCalyxVaultStatus {
                     enabled: true,
