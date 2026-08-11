@@ -8,23 +8,11 @@ pub mod topk;
 use crate::{Backend, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result};
 
 #[derive(Clone, Debug)]
-pub struct CpuBackend {
-    avx512: bool,
-}
+pub struct CpuBackend;
 
 impl CpuBackend {
     pub fn new() -> Self {
-        let avx512 = avx512_available();
-        if !avx512 {
-            tracing::warn!(
-                "CALYX_FORGE_CPU_AVX512_UNAVAILABLE falling back to f32x8-compatible path"
-            );
-        }
-        Self { avx512 }
-    }
-
-    pub fn avx512_available(&self) -> bool {
-        self.avx512
+        Self
     }
 
     /// Which CPU kernel family the reductions actually dispatched to on this host.
@@ -106,7 +94,6 @@ impl Backend for CpuBackend {
         DeviceInfo {
             kind: crate::BackendKind::Cpu,
             name: "calyx-cpu".to_string(),
-            avx512: self.avx512,
             vram_mib: None,
         }
     }
@@ -222,14 +209,4 @@ fn rank_scores(scores: &[f32], k: usize, metric: KnnMetric) -> Result<Vec<(usize
                 .collect())
         }
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-fn avx512_available() -> bool {
-    std::arch::is_x86_feature_detected!("avx512f")
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-fn avx512_available() -> bool {
-    false
 }

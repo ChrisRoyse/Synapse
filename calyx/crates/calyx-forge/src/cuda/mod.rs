@@ -57,11 +57,8 @@ pub use postprocess::{
 };
 pub use profile::{ProfilePairwiseCudaStats, pairwise_euclidean_gram_tiled_host};
 pub use quant::{
-    BINARY_CUDA_MIN_ELEMENTS, CudaBinaryBatch, CudaBinaryScores, CudaInt8Batch, CudaMxFpBatch,
-    CudaQuantContext, CudaQuantScores, CudaQuantStats, CudaTurboQuantBatch, CudaTurboQuantScores,
-    INT8_CUDA_MIN_ELEMENTS, MXFP4_CUDA_MIN_ELEMENTS, MXFP8_CUDA_MIN_ELEMENTS, QuantDispatch,
-    TURBOQUANT_CUDA_MIN_ELEMENTS, binary_dispatch, int8_dispatch, mxfp4_dispatch, mxfp8_dispatch,
-    turboquant_dispatch,
+    CudaBinaryBatch, CudaBinaryScores, CudaInt8Batch, CudaMxFpBatch, CudaQuantContext,
+    CudaQuantScores, CudaQuantStats, CudaTurboQuantBatch, CudaTurboQuantScores,
 };
 pub use ragged_gemm::{
     RaggedBatch, build_ragged_batch, build_ragged_batch_from_slabs, extract_ragged_results,

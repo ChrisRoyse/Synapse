@@ -51,8 +51,6 @@ pub struct SynapseCalyxMathBackendStatus {
     pub cuda_compiled: bool,
     pub device_name: String,
     pub device_vram_mib: Option<u64>,
-    pub device_avx512: bool,
-    pub cpu_avx512_available: bool,
     pub cpu_simd_path: String,
     pub vram_budget_bytes: u64,
     pub vram_dispatch: Option<SynapseCalyxVramDispatchStatus>,
@@ -78,14 +76,12 @@ impl SynapseCalyxMathBackendStatus {
                 .find(|row| row.reservation_id == reservation_id)
         });
         format!(
-            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} device_avx512={} cpu_avx512_available={} cpu_simd_path={} vram_budget_bytes={} vram_budget_enforced={} dispatch_soft_cap_bytes={:?} dispatch_allocated_bytes={:?} dispatch_device_free_bytes={:?} host_reservation_basis={} host_reservation_state_path={} host_reservation_sha256={} host_reservation_id={} host_reservation_pid={:?} host_reservation_requested_mib={:?} runtime_readback_code={} runtime_readback_error={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
+            "requested_backend={} selected_backend={} cuda_compiled={} device_name={} device_vram_mib={:?} cpu_simd_path={} vram_budget_bytes={} vram_budget_enforced={} dispatch_soft_cap_bytes={:?} dispatch_allocated_bytes={:?} dispatch_device_free_bytes={:?} host_reservation_basis={} host_reservation_state_path={} host_reservation_sha256={} host_reservation_id={} host_reservation_pid={:?} host_reservation_requested_mib={:?} runtime_readback_code={} runtime_readback_error={} fallback_code={} fallback_source_code={} probe_status={} probe_detail={}",
             self.requested_backend.as_str(),
             self.selected_backend,
             self.cuda_compiled,
             self.device_name,
             self.device_vram_mib,
-            self.device_avx512,
-            self.cpu_avx512_available,
             self.cpu_simd_path,
             self.vram_budget_bytes,
             self.vram_dispatch.is_some(),
@@ -305,14 +301,12 @@ fn error_proves_cuda_absent(error: &SynapseCalyxError) -> bool {
 
 #[derive(Clone, Debug)]
 struct CpuReadback {
-    avx512_available: bool,
     simd_path: String,
 }
 
 impl CpuReadback {
     fn from_backend(backend: &CpuBackend) -> Self {
         Self {
-            avx512_available: backend.avx512_available(),
             simd_path: backend.simd_path().to_owned(),
         }
     }
@@ -653,8 +647,6 @@ where
         cuda_compiled = status.cuda_compiled,
         device_name = status.device_name.as_str(),
         device_vram_mib = status.device_vram_mib,
-        device_avx512 = status.device_avx512,
-        cpu_avx512_available = status.cpu_avx512_available,
         cpu_simd_path = status.cpu_simd_path.as_str(),
         vram_budget_bytes = status.vram_budget_bytes,
         vram_budget_enforced = status.vram_dispatch.is_some(),
@@ -705,8 +697,6 @@ fn status_from_device_info(
         cuda_compiled: CUDA_COMPILED,
         device_name: info.name.clone(),
         device_vram_mib: info.vram_mib,
-        device_avx512: info.avx512,
-        cpu_avx512_available: cpu_readback.avx512_available,
         cpu_simd_path: cpu_readback.simd_path,
         vram_budget_bytes: config.vram_budget_bytes,
         vram_dispatch,

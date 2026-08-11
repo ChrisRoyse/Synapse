@@ -3675,10 +3675,6 @@ impl SynapseCalyxVault {
                 .math_backend
                 .as_ref()
                 .and_then(|math| math.device_vram_mib),
-            math_backend_cpu_avx512_available = status
-                .math_backend
-                .as_ref()
-                .map(|math| math.cpu_avx512_available),
             math_backend_fallback_code = status
                 .math_backend
                 .as_ref()

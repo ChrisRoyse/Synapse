@@ -200,7 +200,9 @@ extern "C" __global__ __launch_bounds__(256) void paired_cosine_f32(
     float norm_left = 0.0f;
     float norm_right = 0.0f;
     int bad = dim <= 0;
-    const int base = pair * dim;
+    // Widen before multiplication: pair_count * dim can exceed INT_MAX even
+    // though both launch dimensions are individually representable as int.
+    const long long base = (long long)pair * (long long)dim;
 
     for (int i = tid; i < dim; i += blockDim.x) {
         const float left_value = left[base + i];

@@ -170,9 +170,10 @@ fn portable_kernels() -> Kernels {
 /// return **bit-identical** results for the supplied vectors.
 ///
 /// The determinism claim in this module's documentation is falsifiable, so it is
-/// checked rather than asserted. `CpuBackend::new` runs it over a fixed probe at
-/// startup, and the FSV instrument runs it over its measured corpus. Returns the
-/// name of the first kernel that disagreed, or `None` when every kernel agrees.
+/// checked rather than asserted. Synapse calls it over a fixed startup probe;
+/// other consumers can call it over their own representative corpus. Returns
+/// the name of the first kernel that disagreed, or `None` when every kernel
+/// agrees.
 #[must_use]
 pub fn reduction_paths_agree(left: &[f32], right: &[f32]) -> Option<&'static str> {
     let dispatched = kernels();

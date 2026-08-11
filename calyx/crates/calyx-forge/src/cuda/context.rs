@@ -183,7 +183,6 @@ pub fn query_device_info(ctx: &CudaContext) -> DeviceInfo {
     DeviceInfo {
         kind: BackendKind::Cuda,
         name: ctx.name.clone(),
-        avx512: false,
         vram_mib: Some(ctx.total_mem_mib),
     }
 }

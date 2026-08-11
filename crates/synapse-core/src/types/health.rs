@@ -1014,10 +1014,6 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_device_vram_mib: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_math_device_avx512: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_math_cpu_avx512_available: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_cpu_simd_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_fallback_code: Option<String>,

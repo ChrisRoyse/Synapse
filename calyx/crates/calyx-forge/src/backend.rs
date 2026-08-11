@@ -104,7 +104,6 @@ pub struct BestConfig {
 pub struct DeviceInfo {
     pub kind: BackendKind,
     pub name: String,
-    pub avx512: bool,
     pub vram_mib: Option<u64>,
 }
 
@@ -195,7 +194,6 @@ impl Default for DeviceInfo {
         Self {
             kind: BackendKind::Cpu,
             name: "cpu".to_string(),
-            avx512: false,
             vram_mib: None,
         }
     }

@@ -19,59 +19,6 @@ pub use scores::CudaQuantScores;
 pub use turboquant::CudaTurboQuantBatch;
 pub type CudaTurboQuantScores = CudaQuantScores;
 
-/// Measured TurboQuant policy boundary from issue 1766.
-pub const TURBOQUANT_CUDA_MIN_ELEMENTS: usize = 32 * 1024;
-/// The issue-1767 dim-768 release sweep crossed over by 8K binary rows; this
-/// rounded-up element cutoff keeps the noisy boundary on CPU.
-pub const BINARY_CUDA_MIN_ELEMENTS: usize = 8 * 1024 * 1024;
-/// The issue-1767 dim-768 release sweep crossed over by 2K INT8 rows; this
-/// rounded-up element cutoff keeps the losing 1K shape on CPU.
-pub const INT8_CUDA_MIN_ELEMENTS: usize = 2 * 1024 * 1024;
-/// The issue-1768 dim-768 release sweep crossed over by 384 MXFP4 rows; this
-/// rounded-up element cutoff keeps the noisy boundary on CPU.
-pub const MXFP4_CUDA_MIN_ELEMENTS: usize = 512 * 1024;
-/// The issue-1768 dim-768 release sweep crossed over by 192 MXFP8 rows; this
-/// rounded-up element cutoff keeps the near-parity 128-row shape on CPU.
-pub const MXFP8_CUDA_MIN_ELEMENTS: usize = 256 * 1024;
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QuantDispatch {
-    Cpu,
-    Cuda,
-}
-
-pub fn turboquant_dispatch(rows: usize, dim: usize) -> QuantDispatch {
-    quant_dispatch(rows, dim, TURBOQUANT_CUDA_MIN_ELEMENTS)
-}
-
-pub fn binary_dispatch(rows: usize, dim: usize) -> QuantDispatch {
-    quant_dispatch(rows, dim, BINARY_CUDA_MIN_ELEMENTS)
-}
-
-pub fn int8_dispatch(rows: usize, dim: usize) -> QuantDispatch {
-    quant_dispatch(rows, dim, INT8_CUDA_MIN_ELEMENTS)
-}
-
-pub fn mxfp4_dispatch(rows: usize, dim: usize) -> QuantDispatch {
-    quant_dispatch(rows, dim, MXFP4_CUDA_MIN_ELEMENTS)
-}
-
-pub fn mxfp8_dispatch(rows: usize, dim: usize) -> QuantDispatch {
-    quant_dispatch(rows, dim, MXFP8_CUDA_MIN_ELEMENTS)
-}
-
-fn quant_dispatch(rows: usize, dim: usize, threshold: usize) -> QuantDispatch {
-    if rows
-        .checked_mul(dim)
-        .is_some_and(|elements| elements >= threshold)
-    {
-        QuantDispatch::Cuda
-    } else {
-        QuantDispatch::Cpu
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CudaQuantStats {
     pub kernel_launches: u64,
