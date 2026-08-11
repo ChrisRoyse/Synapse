@@ -456,16 +456,7 @@ fn fetch_browser_websocket_url(port: u16, timeout: Duration) -> Result<String, S
         "GET /json/version HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
     )
     .map_err(|error| format!("write CDP version request: {error}"))?;
-    let mut bytes = Vec::new();
-    stream
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| format!("read CDP version response: {error}"))?;
-    if bytes.len() > 1024 * 1024 {
-        return Err(format!(
-            "CDP /json/version response exceeds 1048576-byte limit on port {port}"
-        ));
-    }
+    let bytes = read_bounded_http_response(&mut stream, port)?;
     let response = std::str::from_utf8(&bytes)
         .map_err(|error| format!("CDP version response is not UTF-8: {error}"))?;
     let (head, body) = response
@@ -483,6 +474,100 @@ fn fetch_browser_websocket_url(port: u16, timeout: Duration) -> Result<String, S
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .ok_or_else(|| "CDP /json/version omitted webSocketDebuggerUrl".to_owned())
+}
+
+fn read_bounded_http_response(stream: &mut TcpStream, port: u16) -> Result<Vec<u8>, String> {
+    const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+    const MAX_HEADER_BYTES: usize = 64 * 1024;
+    let mut bytes = Vec::new();
+    let mut expected_total = None;
+    loop {
+        let mut chunk = [0_u8; 8192];
+        let read = stream
+            .read(&mut chunk)
+            .map_err(|error| format!("read CDP version response: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+        if bytes.len() > MAX_RESPONSE_BYTES {
+            return Err(format!(
+                "CDP /json/version response exceeds {MAX_RESPONSE_BYTES}-byte limit on port {port}"
+            ));
+        }
+        if expected_total.is_none() {
+            if let Some(header_end) = find_http_header_end(&bytes) {
+                if header_end > MAX_HEADER_BYTES {
+                    return Err(format!(
+                        "CDP /json/version HTTP headers exceed {MAX_HEADER_BYTES} bytes on port {port}"
+                    ));
+                }
+                let header = std::str::from_utf8(&bytes[..header_end])
+                    .map_err(|error| format!("CDP version HTTP headers are not UTF-8: {error}"))?;
+                let content_length = strict_http_content_length(header)?;
+                let total = header_end
+                    .checked_add(4)
+                    .and_then(|value| value.checked_add(content_length))
+                    .ok_or_else(|| "CDP version HTTP response length overflow".to_owned())?;
+                if total > MAX_RESPONSE_BYTES {
+                    return Err(format!(
+                        "CDP /json/version framed response length {total} exceeds {MAX_RESPONSE_BYTES} bytes on port {port}"
+                    ));
+                }
+                expected_total = Some(total);
+            } else if bytes.len() > MAX_HEADER_BYTES {
+                return Err(format!(
+                    "CDP /json/version HTTP header terminator not found within {MAX_HEADER_BYTES} bytes on port {port}"
+                ));
+            }
+        }
+        if expected_total.is_some_and(|total| bytes.len() >= total) {
+            break;
+        }
+    }
+    let Some(expected_total) = expected_total else {
+        return Err("CDP version response ended before complete HTTP headers".to_owned());
+    };
+    if bytes.len() != expected_total {
+        return Err(format!(
+            "CDP version HTTP framing mismatch: expected_total={expected_total} actual_total={}",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn find_http_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn strict_http_content_length(header: &str) -> Result<usize, String> {
+    let mut content_length = None;
+    for line in header.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            return Err(format!("malformed CDP version HTTP header line: {line:?}"));
+        };
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(format!(
+                "CDP version HTTP response uses unsupported transfer-encoding {value:?}; expected one bounded Content-Length"
+            ));
+        }
+        if !name.eq_ignore_ascii_case("content-length") {
+            continue;
+        }
+        if content_length.is_some() {
+            return Err(
+                "CDP version HTTP response contains duplicate Content-Length headers".to_owned(),
+            );
+        }
+        content_length =
+            Some(value.trim().parse::<usize>().map_err(|error| {
+                format!("invalid CDP version Content-Length {value:?}: {error}")
+            })?);
+    }
+    content_length.ok_or_else(|| {
+        "CDP version HTTP response omitted the required bounded Content-Length header".to_owned()
+    })
 }
 
 #[cfg(windows)]
