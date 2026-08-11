@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use calyx_core::{CxId, SlotId, SlotVector};
 use calyx_sextant::index::{IndexSearchHit, ranked};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use super::{DenseSlotRows, cosine};
@@ -81,11 +82,21 @@ pub(super) fn search(
             index.header.dim
         )));
     }
+    // Score every physical row independently through Sextant's dispatched
+    // cosine kernel. The indexed Option vector retains sidecar row order even
+    // when candidate filtering is active; selection below owns the final total
+    // order and tie break exactly as before.
     let mut scored = index
         .rows
-        .iter()
-        .filter(|(cx_id, _)| candidates.is_none_or(|allowed| allowed.contains(cx_id)))
-        .map(|(cx_id, values)| (*cx_id, cosine(data, values)))
+        .par_iter()
+        .map(|(cx_id, values)| {
+            candidates
+                .is_none_or(|allowed| allowed.contains(cx_id))
+                .then(|| (*cx_id, cosine(data, values)))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
     let compare = |left: &(CxId, f32), right: &(CxId, f32)| {
         right

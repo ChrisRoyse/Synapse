@@ -18,9 +18,13 @@ impl RawL2CentroidGraph {
         if centroids.is_empty() {
             return Self::default();
         }
+        let scratch_capacity = centroids.len().saturating_sub(1);
         let directed: Vec<Vec<u32>> = (0..centroids.len())
             .into_par_iter()
-            .map(|idx| nearest_neighbors(idx, centroids, RAW_L2_GRAPH_DEGREE))
+            .map_init(
+                || Vec::with_capacity(scratch_capacity),
+                |scored, idx| nearest_neighbors(idx, centroids, RAW_L2_GRAPH_DEGREE, scored),
+            )
             .collect();
         let mut neighbors = directed.clone();
         for (idx, row) in directed.iter().enumerate() {
@@ -79,14 +83,24 @@ impl RawL2CentroidGraph {
     }
 }
 
-fn nearest_neighbors(idx: usize, centroids: &[Vec<f32>], limit: usize) -> Vec<u32> {
-    let mut scored: Vec<(u32, f32)> = centroids
-        .iter()
-        .enumerate()
-        .filter(|(other, _)| *other != idx)
-        .map(|(other, centroid)| (other as u32, l2_sq(&centroids[idx], centroid)))
-        .collect();
-    take_nearest(&mut scored, limit)
+fn nearest_neighbors(
+    idx: usize,
+    centroids: &[Vec<f32>],
+    limit: usize,
+    scored: &mut Vec<(u32, f32)>,
+) -> Vec<u32> {
+    // The old map/collect allocated an R-wide buffer for every centroid. Rayon
+    // now retains one scratch allocation per job and refills it, while exact
+    // distance and total-order selection remain unchanged.
+    scored.clear();
+    scored.extend(
+        centroids
+            .iter()
+            .enumerate()
+            .filter(|(other, _)| *other != idx)
+            .map(|(other, centroid)| (other as u32, l2_sq(&centroids[idx], centroid))),
+    );
+    take_nearest(scored, limit)
 }
 
 fn prune_neighbors(idx: usize, centroids: &[Vec<f32>], candidates: Vec<u32>) -> Vec<u32> {

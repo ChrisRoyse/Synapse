@@ -1,6 +1,7 @@
 use std::time::Instant;
 
 use calyx_core::Result;
+use rayon::prelude::*;
 
 use super::{
     BuildOutput, DISKANN_PQ_SMALL_CORPUS_ROWS, DiskAnnPqBuildDiagnostics, DiskAnnPqBuildExecution,
@@ -36,7 +37,7 @@ pub(super) fn build(
         codebook,
         codes,
         diagnostics: DiskAnnPqBuildDiagnostics {
-            backend: "cpu-reference-v1".to_string(),
+            backend: "cpu-rayon-reference-v2".to_string(),
             requested_execution: requested.as_str().to_string(),
             strict_gpu_required: false,
             small_corpus_cpu_max_rows: DISKANN_PQ_SMALL_CORPUS_ROWS,
@@ -87,15 +88,24 @@ fn train_subspace(
     for _ in 0..iterations {
         sums.fill(0.0);
         counts.fill(0);
-        for (_, vector) in rows {
+        // Assignment is independent per row. Collect it in source order, then
+        // retain the original serial accumulation order below: changing that
+        // float reduction would change the reference codebook. This is the CPU
+        // reference path (and Auto's <=1,024-row path); larger Auto builds use
+        // the resident CUDA PQ implementation instead of dispatching host
+        // slices through Forge once per subspace/iteration.
+        let assignments = {
+            let current = &codebook[codebook_start..codebook_start + centroids * subdim];
+            rows.par_iter()
+                .map(|(_, vector)| {
+                    let offset = subvector * subdim;
+                    nearest(&vector[offset..offset + subdim], current, centroids, subdim)
+                })
+                .collect::<Vec<_>>()
+        };
+        for ((_, vector), nearest) in rows.iter().zip(assignments) {
             let offset = subvector * subdim;
             let values = &vector[offset..offset + subdim];
-            let nearest = nearest(
-                values,
-                &codebook[codebook_start..codebook_start + centroids * subdim],
-                centroids,
-                subdim,
-            );
             counts[nearest] += 1;
             let sum_at = nearest * subdim;
             for (destination, source) in sums[sum_at..sum_at + subdim].iter_mut().zip(values) {
@@ -123,18 +133,21 @@ fn encode(
     codebook: &[f32],
 ) -> Vec<u8> {
     let mut codes = vec![0; rows.len() * subvectors];
-    for (row, (_, vector)) in rows.iter().enumerate() {
-        for subvector in 0..subvectors {
-            let vector_at = subvector * subdim;
-            let codebook_at = subvector * centroids * subdim;
-            codes[row * subvectors + subvector] = nearest(
-                &vector[vector_at..vector_at + subdim],
-                &codebook[codebook_at..codebook_at + centroids * subdim],
-                centroids,
-                subdim,
-            ) as u8;
-        }
-    }
+    codes
+        .par_chunks_mut(subvectors)
+        .zip_eq(rows.par_iter())
+        .for_each(|(row_codes, (_, vector))| {
+            for (subvector, code) in row_codes.iter_mut().enumerate() {
+                let vector_at = subvector * subdim;
+                let codebook_at = subvector * centroids * subdim;
+                *code = nearest(
+                    &vector[vector_at..vector_at + subdim],
+                    &codebook[codebook_at..codebook_at + centroids * subdim],
+                    centroids,
+                    subdim,
+                ) as u8;
+            }
+        });
     codes
 }
 

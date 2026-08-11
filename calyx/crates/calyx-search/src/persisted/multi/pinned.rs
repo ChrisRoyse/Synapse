@@ -2,12 +2,14 @@
 //! generation is loaded once: whole-file reads, one-shot sha256 against the
 //! manifest, full structural validation (header, duplicate rows, token
 //! counts, finiteness, trailing bytes), then a flattened token matrix with
-//! precomputed token norms is pinned. Queries score with the exact
-//! arithmetic of `MaxSimIndex::maxsim` / `cosine`, so results are bit-identical.
+//! precomputed token norms is pinned. Queries score with the exact dispatched
+//! dot/norm arithmetic of `MaxSimIndex::maxsim`, so results are bit-identical
+//! between the live and persisted paths on the same host.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
+use calyx_sextant::index::distance::dot;
 use rayon::prelude::*;
 
 use super::*;
@@ -309,10 +311,12 @@ fn parse_segment(
                     stale("persistent binary multi sidecar token byte count overflow")
                 })?,
         )?;
-        // Single pass: decode, finite-check, accumulate the norm, and append
-        // to the flat matrix without an intermediate per-row allocation.
+        // Decode and finite-check directly into the flat matrix without an
+        // intermediate per-row allocation. Norms use the same dispatched dot
+        // kernel as `MaxSimIndex::maxsim`, which is the cross-path arithmetic
+        // contract for live and persisted MaxSim scoring.
         for token_bytes in payload_bytes.chunks_exact(dim * 4) {
-            let mut squared = 0.0f32;
+            let token_start = tokens.len();
             for value_bytes in token_bytes.chunks_exact(4) {
                 let value = f32::from_le_bytes(value_bytes.try_into().expect("len 4"));
                 if !value.is_finite() {
@@ -321,10 +325,10 @@ fn parse_segment(
                     ))
                     .into());
                 }
-                squared += value * value;
                 tokens.push(value);
             }
-            norms.push(squared.sqrt());
+            let token = &tokens[token_start..token_start + dim];
+            norms.push(dot(token, token).sqrt());
         }
         rows.push((cx_id, row_tokens));
     }
@@ -352,7 +356,7 @@ impl PinnedMultiIndex {
     }
 
     /// MaxSim over the pinned matrix; arithmetic mirrors
-    /// `MaxSimIndex::maxsim` + `cosine` exactly (same accumulation order and
+    /// `MaxSimIndex::maxsim` exactly (same dispatched dot/norm reduction and
     /// zero-norm semantics), parallelized across rows.
     pub(super) fn score(
         &self,
@@ -362,13 +366,7 @@ impl PinnedMultiIndex {
         let dim = self.token_dim as usize;
         let query_norms = query
             .iter()
-            .map(|token| {
-                let mut squared = 0.0f32;
-                for value in token {
-                    squared += value * value;
-                }
-                squared.sqrt()
-            })
+            .map(|token| dot(token, token).sqrt())
             .collect::<Vec<_>>();
         self.rows
             .par_iter()
@@ -383,10 +381,7 @@ impl PinnedMultiIndex {
                     .map(|(q, q_norm)| {
                         let mut best = f32::NEG_INFINITY;
                         for (token, t_norm) in tokens.chunks_exact(dim).zip(norms) {
-                            let mut dot = 0.0f32;
-                            for (left, right) in q.iter().zip(token) {
-                                dot += left * right;
-                            }
+                            let dot = dot(q, token);
                             let cosine = if *q_norm == 0.0 || *t_norm == 0.0 {
                                 0.0
                             } else {

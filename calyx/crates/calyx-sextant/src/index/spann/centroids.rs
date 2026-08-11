@@ -370,10 +370,9 @@ fn kmeans_pp(vectors: &[(u32, Vec<f32>)], k: usize, seed: u64) -> Vec<Vec<f32>> 
 fn farthest_vector<'a>(vectors: &'a [(u32, Vec<f32>)], centroids: &[Vec<f32>]) -> &'a Vec<f32> {
     vectors
         .iter()
-        .max_by(|(_, a), (_, b)| {
-            nearest_distance_sq(centroids, a).total_cmp(&nearest_distance_sq(centroids, b))
-        })
-        .map(|(_, vector)| vector)
+        .map(|(_, vector)| (vector, nearest_distance_sq(centroids, vector)))
+        .max_by(|(_, a_distance), (_, b_distance)| a_distance.total_cmp(b_distance))
+        .map(|(vector, _)| vector)
         .expect("non-empty vectors")
 }
 
@@ -381,12 +380,13 @@ fn nearest_by_l2(centroids: &[Vec<f32>], vector: &[f32]) -> Option<u32> {
     centroids
         .iter()
         .enumerate()
-        .min_by(|(a_idx, a), (b_idx, b)| {
-            l2_sq(a, vector)
-                .total_cmp(&l2_sq(b, vector))
+        .map(|(idx, centroid)| (idx, l2_sq(centroid, vector)))
+        .min_by(|(a_idx, a_distance), (b_idx, b_distance)| {
+            a_distance
+                .total_cmp(b_distance)
                 .then_with(|| a_idx.cmp(b_idx))
         })
-        .map(|(idx, _)| idx as u32)
+        .map(|(idx, _distance)| idx as u32)
 }
 
 fn nearest_distance_sq(centroids: &[Vec<f32>], vector: &[f32]) -> f32 {

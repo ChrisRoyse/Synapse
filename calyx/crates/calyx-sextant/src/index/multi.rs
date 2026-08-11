@@ -2,8 +2,8 @@
 
 use calyx_core::{CxId, Result, SlotId, SlotShape, SlotVector};
 
-use super::{IndexSearchHit, IndexStats, SextantIndex, ranked};
-use crate::util::{cosine, top_k};
+use super::{IndexSearchHit, IndexStats, SextantIndex, distance::dot, ranked};
+use crate::util::top_k;
 
 #[derive(Clone, Debug)]
 pub struct MaxSimIndex {
@@ -26,11 +26,32 @@ impl MaxSimIndex {
     }
 
     pub fn maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f32 {
+        // This and the persisted pinned scorer intentionally share Sextant's
+        // runtime-dispatched dot reduction. Norms are computed once per token,
+        // rather than once per query/document-token pair. AVX2 and scalar hosts
+        // may differ in their last bits, but the live and persisted paths on a
+        // given host remain bit-identical because both use this same kernel.
+        let query_norms = query
+            .iter()
+            .map(|token| dot(token, token).sqrt())
+            .collect::<Vec<_>>();
+        let doc_norms = doc
+            .iter()
+            .map(|token| dot(token, token).sqrt())
+            .collect::<Vec<_>>();
         query
             .iter()
-            .map(|q| {
+            .zip(query_norms)
+            .map(|(q, q_norm)| {
                 doc.iter()
-                    .map(|d| cosine(q, d))
+                    .zip(&doc_norms)
+                    .map(|(d, d_norm)| {
+                        if q_norm == 0.0 || *d_norm == 0.0 {
+                            0.0
+                        } else {
+                            dot(q, d) / (q_norm * d_norm)
+                        }
+                    })
                     .fold(f32::NEG_INFINITY, f32::max)
             })
             .sum()
