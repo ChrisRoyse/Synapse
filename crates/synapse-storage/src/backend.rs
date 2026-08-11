@@ -10872,6 +10872,40 @@ fn calyx_ordered_prefix_from_range(
     }))
 }
 
+/// Hard ceiling on physical candidates one ordered logical page may walk while
+/// skipping an unbroken run of TTL-expired rows.
+///
+/// A logical page is bounded by *live rows returned*, but the physical rows it
+/// must step over to find them is a property of the corpus, not of the caller.
+/// TTL-expired rows are filtered at read time and are only reclaimed later by
+/// retention GC, so a column family whose writer stamps a per-session TTL
+/// accumulates dead rows in contiguous key-order runs — every row of one
+/// expired session sits adjacent to its siblings. Production measured 62,016
+/// expired rows in `CF_AGENT_TRANSCRIPTS` and 17,674 in `CF_ACTION_LOG` against
+/// 2,317 live, so a run far longer than any caller's page size is the normal
+/// steady state, not an anomaly.
+///
+/// This bounds the resulting walk without capping it below what the corpus can
+/// legitimately require. It is a safety net against a pathological vault, not a
+/// tuning knob: exhausting it is reported as a hard error carrying the exact
+/// resume position, never as a short read.
+const CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES: usize = 1_000_000;
+
+/// Reads one ordered logical page, stepping over runs of TTL-expired rows.
+///
+/// The page is bounded by live rows, and it advances through dead candidates on
+/// the vault's **opaque physical cursor** rather than on a logical key. That
+/// distinction is the whole correctness argument. A logical cursor can only name
+/// a row the caller was handed, so a page whose every candidate was expired
+/// yields no key to resume from: the caller re-issues the identical request, gets
+/// the identical empty page, and the scan is wedged permanently. The physical
+/// cursor names a position in the keyspace whether or not the row at it is live,
+/// so forward progress no longer depends on finding something to return.
+///
+/// This previously failed with `CALYX_ORDERED_KEY_PAGE_NO_LOGICAL_PROGRESS`
+/// whenever one page of candidates was entirely expired, which is why the
+/// ambient transcript ingest and the agent cost rollup retried the same wedged
+/// scan every few seconds indefinitely.
 fn read_ordered_rows_from_vault_page(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
@@ -10884,32 +10918,72 @@ fn read_ordered_rows_from_vault_page(
         start: encode_calyx_key_for_read(cf_name, collection_id, start_key)?,
         end: namespace_range.end,
     };
-    let page = vault
-        .scan_kv_range_page_latest(&range, None, max_rows)
-        .map_err(|source| {
-            calyx_read_failed(
-                cf_name,
-                "scan candidate-bounded ordered Calyx logical page",
-                &source,
-            )
-        })?;
     let now_ms = vault
         .clock_now_ms()
         .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
-    let mut decoded = Vec::with_capacity(page.rows.len());
-    for (physical_key, value) in page.rows {
-        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &physical_key)?;
-        let envelope = decode_calyx_value_raw(&value).map_err(|detail| StorageError::ReadFailed {
-            cf_name: cf_name.to_owned(),
-            detail: format!(
-                "decode candidate-bounded ordered Calyx logical page value: key_sha256={} detail={detail}",
-                sha256_hex(&user_key)
-            ),
-        })?;
-        if !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-            decoded.push((user_key, envelope.payload.to_vec()));
+
+    let mut decoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut after_physical: Option<Vec<u8>> = None;
+    let mut candidates_examined = 0usize;
+    let mut skipped_pages = 0u64;
+
+    let (more, expired_skipped) = loop {
+        let page = vault
+            .scan_kv_range_page_latest(&range, after_physical.as_deref(), max_rows)
+            .map_err(|source| {
+                calyx_read_failed(
+                    cf_name,
+                    "scan candidate-bounded ordered Calyx logical page",
+                    &source,
+                )
+            })?;
+        let page_candidates = page.rows.len();
+        candidates_examined = candidates_examined.saturating_add(page_candidates);
+        decoded.reserve(page_candidates);
+        for (physical_key, value) in page.rows {
+            let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &physical_key)?;
+            let envelope =
+                decode_calyx_value_raw(&value).map_err(|detail| StorageError::ReadFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: format!(
+                        "decode candidate-bounded ordered Calyx logical page value: key_sha256={} detail={detail}",
+                        sha256_hex(&user_key)
+                    ),
+                })?;
+            if !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+                decoded.push((user_key, envelope.payload.to_vec()));
+            }
         }
-    }
+
+        if !decoded.is_empty() || !page.more {
+            break (page.more, candidates_examined.saturating_sub(decoded.len()));
+        }
+
+        // Every candidate on this page was expired and the range continues.
+        // Step the physical cursor past them; a logical key cannot express this
+        // position because no live row was decoded to name one.
+        let Some(resume_after) = page.resume_after else {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_ORDERED_KEY_PAGE_CURSOR_ABSENT: vault reported more candidates after {candidates_examined} fully expired rows but returned no physical resume cursor; remediation=inspect the Calyx range-page contract for {cf_name}, which must yield a resume cursor whenever more=true"
+                ),
+            });
+        };
+        skipped_pages = skipped_pages.saturating_add(1);
+
+        if candidates_examined >= CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_ORDERED_KEY_PAGE_EXPIRED_RUN_EXCEEDS_BUDGET: walked {candidates_examined} consecutive TTL-expired physical candidates across {skipped_pages} pages without reaching a live row, exceeding the {CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES} candidate ceiling; resume_after_physical_sha256={}; remediation=run retention GC for {cf_name} to reclaim the expired run, then retry",
+                    sha256_hex(&resume_after)
+                ),
+            });
+        }
+        after_physical = Some(resume_after);
+    };
+
     if !decoded
         .windows(2)
         .all(|pair| pair[0].0.as_slice() < pair[1].0.as_slice())
@@ -10920,15 +10994,20 @@ fn read_ordered_rows_from_vault_page(
                 .to_owned(),
         });
     }
-    if decoded.is_empty() && page.more {
-        return Err(StorageError::ReadFailed {
-            cf_name: cf_name.to_owned(),
-            detail: format!(
-                "CALYX_ORDERED_KEY_PAGE_NO_LOGICAL_PROGRESS: {max_rows} physical candidates produced no live logical row while more candidates remain; remediation=run retention GC or migrate this caller to the opaque ordered-page cursor before retrying"
-            ),
-        });
+
+    if skipped_pages > 0 {
+        tracing::warn!(
+            code = "STORAGE_CALYX_ORDERED_PAGE_SKIPPED_EXPIRED_RUN",
+            cf = cf_name,
+            skipped_pages,
+            candidates_examined,
+            expired_skipped,
+            live_rows = decoded.len(),
+            "ordered Calyx logical page stepped over a run of TTL-expired rows on the physical cursor; retention GC has not reclaimed them"
+        );
     }
-    Ok((decoded, page.more))
+
+    Ok((decoded, more))
 }
 
 fn fixed_width_user_key_len(cf_name: &str) -> Option<usize> {
