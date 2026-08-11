@@ -2068,6 +2068,14 @@ pub struct CdpNavigateTabResponse {
     pub navigation_error_text: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_download: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_claim_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub navigation_correlation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_document_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_document_id: Option<String>,
     /// #1344: when the navigate started a Chrome download instead of changing the
     /// tab URL, the structured outcome — `download_started` or `download_completed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

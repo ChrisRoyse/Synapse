@@ -938,6 +938,11 @@ const MAX_BROWSER_NAV_DEDUPE_KEYS: usize = 128;
 pub struct BrowserNavigationEvent {
     pub actor: TimelineActor,
     pub app: Option<String>,
+    pub event_id: Option<String>,
+    pub initiator: Option<String>,
+    pub claim_id: Option<String>,
+    pub claim_status: Option<String>,
+    pub correlation_verdict: Option<String>,
     pub source: String,
     pub event: String,
     pub action: Option<String>,
@@ -952,6 +957,17 @@ pub struct BrowserNavigationEvent {
     pub requested_url: Option<String>,
     pub before_url: Option<String>,
     pub before_title: Option<String>,
+    pub before_document_id: Option<String>,
+    pub frame_id: Option<i64>,
+    pub parent_frame_id: Option<i64>,
+    pub document_id: Option<String>,
+    pub parent_document_id: Option<String>,
+    pub document_lifecycle: Option<String>,
+    pub frame_type: Option<String>,
+    pub transition_type: Option<String>,
+    pub transition_qualifiers: Vec<String>,
+    pub navigation_error: Option<String>,
+    pub navigation_timestamp_ms: Option<u64>,
     pub ready_state: Option<String>,
     pub observed_at_unix_ms: Option<u64>,
     pub active: Option<bool>,
@@ -1772,6 +1788,14 @@ fn redact_browser_navigation_event(mut event: BrowserNavigationEvent) -> Browser
 }
 
 fn browser_nav_dedupe_key(event: &BrowserNavigationEvent) -> String {
+    if let Some(event_id) = event
+        .event_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("event_id\n{event_id}");
+    }
     let url_sha256 = sha256_hex(event.url.trim());
     format!(
         "{:?}\n{:?}\n{:?}\n{:?}\n{}\n{}",
@@ -2813,6 +2837,11 @@ impl ActivityRecorder {
             return false;
         }
         let mut payload = json!({
+            "event_id": event.event_id.as_deref(),
+            "initiator": event.initiator.as_deref(),
+            "claim_id": event.claim_id.as_deref(),
+            "claim_status": event.claim_status.as_deref(),
+            "correlation_verdict": event.correlation_verdict.as_deref(),
             "url": url,
             "title": event.title.as_str(),
             "tab_id": event.tab_id,
@@ -2827,6 +2856,17 @@ impl ActivityRecorder {
             "requested_url": event.requested_url.as_deref(),
             "before_url": event.before_url.as_deref(),
             "before_title": event.before_title.as_deref(),
+            "before_document_id": event.before_document_id.as_deref(),
+            "frame_id": event.frame_id,
+            "parent_frame_id": event.parent_frame_id,
+            "document_id": event.document_id.as_deref(),
+            "parent_document_id": event.parent_document_id.as_deref(),
+            "document_lifecycle": event.document_lifecycle.as_deref(),
+            "frame_type": event.frame_type.as_deref(),
+            "transition_type": event.transition_type.as_deref(),
+            "transition_qualifiers": event.transition_qualifiers.as_slice(),
+            "navigation_error": event.navigation_error.as_deref(),
+            "navigation_timestamp_ms": event.navigation_timestamp_ms,
             "ready_state": event.ready_state.as_deref(),
             "observed_at_unix_ms": event.observed_at_unix_ms,
             "active": event.active,

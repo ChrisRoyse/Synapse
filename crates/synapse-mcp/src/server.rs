@@ -744,12 +744,42 @@ fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
             }
         };
         if let Some(recorder) = recorder {
+            let actor = if event.initiator == "agent" {
+                match event
+                    .agent_session_id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    Some(session_id) => TimelineActor::Agent {
+                        session_id: session_id.to_owned(),
+                    },
+                    None => {
+                        tracing::error!(
+                            code = "TIMELINE_BROWSER_NAV_AGENT_SESSION_MISSING",
+                            event_id = %event.event_id,
+                            claim_id = ?event.claim_id,
+                            correlation_verdict = %event.correlation_verdict,
+                            "refusing contradictory agent navigation event without an exact session id"
+                        );
+                        return;
+                    }
+                }
+            } else {
+                TimelineActor::Human
+            };
             let _ = recorder.record_browser_navigation(BrowserNavigationEvent {
-                actor: TimelineActor::Human,
+                actor,
                 app: Some("chrome.exe".to_owned()),
+                event_id: (!event.event_id.is_empty()).then_some(event.event_id),
+                initiator: (!event.initiator.is_empty()).then_some(event.initiator),
+                claim_id: event.claim_id,
+                claim_status: event.claim_status,
+                correlation_verdict: (!event.correlation_verdict.is_empty())
+                    .then_some(event.correlation_verdict),
                 source: event.source,
                 event: event.event,
-                action: None,
+                action: event.action,
                 url: event.url,
                 title: event.title,
                 tab_id: event.tab_id,
@@ -758,9 +788,20 @@ fn install_chrome_browser_navigation_sink(m3_state: &SharedM3State) {
                 cdp_target_id: event.cdp_target_id,
                 endpoint: event.endpoint,
                 transport: event.transport,
-                requested_url: None,
-                before_url: None,
+                requested_url: event.requested_url,
+                before_url: event.before_url,
                 before_title: None,
+                before_document_id: event.before_document_id,
+                frame_id: event.frame_id,
+                parent_frame_id: event.parent_frame_id,
+                document_id: event.document_id,
+                parent_document_id: event.parent_document_id,
+                document_lifecycle: event.document_lifecycle,
+                frame_type: event.frame_type,
+                transition_type: event.transition_type,
+                transition_qualifiers: event.transition_qualifiers,
+                navigation_error: event.navigation_error,
+                navigation_timestamp_ms: event.navigation_timestamp_ms,
                 ready_state: event.ready_state,
                 observed_at_unix_ms: event.observed_at_unix_ms,
                 active: event.active,

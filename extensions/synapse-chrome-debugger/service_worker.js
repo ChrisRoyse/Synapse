@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-csp-independent-wait-v8";
-const BRIDGE_DECLARED_BUILD_SHA256 = "3c81c9f1ba6042d283cff649999a6fb50eb93a7e72435f8adac75982a34581d6";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-truthful-navigation-events-v9";
+const BRIDGE_DECLARED_BUILD_SHA256 = "fd72131dc2ca91f5bcfb825aa91207f109e7e398e9b2258dc429238b0c7ea272";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -192,7 +192,6 @@ const MAINTENANCE_RECONNECT_PAUSE_MIN_MS = 1000;
 const MAINTENANCE_RECONNECT_PAUSE_MAX_MS = 900000;
 const MAINTENANCE_RECONNECT_RESUME_PROBE_MIN_MS = 30000;
 const AGENT_NAVIGATION_CLAIM_TTL_MS = 30000;
-const MAX_RECENT_NAVIGATION_KEYS = 128;
 const MAX_PAGE_TEXT_CHARS = 4096;
 const MAX_PAGE_EVENT_BUFFER = 1000;
 const MAX_NETWORK_EVENT_BUFFER = 2000;
@@ -350,7 +349,8 @@ let reconnectWakeAlarmState = {
   error: null
 };
 const agentNavigationClaims = new Map();
-const recentNavigationKeys = [];
+let navigationEventSequence = 0;
+let navigationEventTail = Promise.resolve();
 const pageEventBuffers = new Map();
 const networkEventBuffers = new Map();
 const downloadEventBuffer = [];
@@ -2936,6 +2936,11 @@ chrome.tabs.onCreated.addListener((tab) => {
   recordTabCreatedForPageEvents(tab);
 });
 chrome.tabs.onRemoved.addListener((tabId) => {
+  settleAgentNavigationClaim(tabId, "target_closed", {
+    correlationVerdict: "claim_target_closed_before_terminal_navigation"
+  }).catch((error) => {
+    console.error(`Synapse navigation-claim close settlement failed: ${errorMessage(error)}`);
+  });
   recordTabRemovedForPageEvents(tabId);
   forgetCdpDomainsForTab(tabId);
   INIT_SCRIPT_DEBUGGER_SESSIONS.delete(tabId);
@@ -2988,6 +2993,9 @@ chrome.tabs.onActivated.addListener((activeInfo) => {
 if (chrome.webNavigation?.onBeforeNavigate?.addListener) {
   chrome.webNavigation.onBeforeNavigate.addListener((details) => {
     recordWebNavigationPageEvent("framestartednavigating", details);
+    postWebNavigationEvent("webNavigation.onBeforeNavigate", details).catch((error) => {
+      console.error(`Synapse onBeforeNavigate event persistence failed: ${errorMessage(error)}`);
+    });
   });
 }
 if (chrome.webNavigation?.onCommitted?.addListener) {
@@ -2995,23 +3003,55 @@ if (chrome.webNavigation?.onCommitted?.addListener) {
     recordWebNavigationPageEvent("framenavigated", details, {
       navigation_type: webNavigationTransition(details)
     });
+    postWebNavigationEvent("webNavigation.onCommitted", details).catch((error) => {
+      console.error(`Synapse onCommitted event persistence failed: ${errorMessage(error)}`);
+    });
   });
 }
 if (chrome.webNavigation?.onDOMContentLoaded?.addListener) {
   chrome.webNavigation.onDOMContentLoaded.addListener((details) => {
     recordWebNavigationPageEvent("domcontentloaded", details);
+    postWebNavigationEvent("webNavigation.onDOMContentLoaded", details).catch((error) => {
+      console.error(`Synapse onDOMContentLoaded event persistence failed: ${errorMessage(error)}`);
+    });
   });
 }
 if (chrome.webNavigation?.onCompleted?.addListener) {
   chrome.webNavigation.onCompleted.addListener((details) => {
     recordWebNavigationPageEvent("load", details);
     recordWebNavigationPageEvent("framestoppedloading", details);
+    postWebNavigationEvent("webNavigation.onCompleted", details).catch((error) => {
+      console.error(`Synapse onCompleted event persistence failed: ${errorMessage(error)}`);
+    });
   });
 }
 if (chrome.webNavigation?.onHistoryStateUpdated?.addListener) {
   chrome.webNavigation.onHistoryStateUpdated.addListener((details) => {
     recordWebNavigationPageEvent("framenavigated", details, {
       navigation_type: webNavigationTransition(details) || "history_api"
+    });
+    postWebNavigationEvent("webNavigation.onHistoryStateUpdated", details).catch((error) => {
+      console.error(`Synapse onHistoryStateUpdated event persistence failed: ${errorMessage(error)}`);
+    });
+  });
+}
+if (chrome.webNavigation?.onReferenceFragmentUpdated?.addListener) {
+  chrome.webNavigation.onReferenceFragmentUpdated.addListener((details) => {
+    recordWebNavigationPageEvent("framenavigated", details, {
+      navigation_type: webNavigationTransition(details) || "reference_fragment"
+    });
+    postWebNavigationEvent("webNavigation.onReferenceFragmentUpdated", details).catch((error) => {
+      console.error(`Synapse onReferenceFragmentUpdated event persistence failed: ${errorMessage(error)}`);
+    });
+  });
+}
+if (chrome.webNavigation?.onErrorOccurred?.addListener) {
+  chrome.webNavigation.onErrorOccurred.addListener((details) => {
+    recordWebNavigationPageEvent("navigationerror", details, {
+      navigation_type: String(details?.error || "navigation_error")
+    });
+    postWebNavigationEvent("webNavigation.onErrorOccurred", details).catch((error) => {
+      console.error(`Synapse webNavigation error-event persistence failed: ${errorMessage(error)}`);
     });
   });
 }
@@ -3089,7 +3129,7 @@ async function handleCommand(command) {
     } else if (kind === "nodeValue") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "openTab") {
-      result = await handleOpenTab(params);
+      result = await handleOpenTab(params, id);
     } else if (kind === "listTabs") {
       result = await handleListTabs(params);
     } else if (kind === "closeTab") {
@@ -3113,7 +3153,7 @@ async function handleCommand(command) {
     } else if (kind === "storageState") {
       result = await handleStorageState(params);
     } else if (kind === "setContent") {
-      result = await handleSetContent(params);
+      result = await handleSetContent(params, id);
     } else if (kind === "ariaSnapshot") {
       result = await handleAriaSnapshot(params);
     } else if (kind === "assertPoll") {
@@ -3190,7 +3230,7 @@ async function handleCommand(command) {
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
-      result = await handleNavigateTab(params);
+      result = await handleNavigateTab(params, id);
     } else if (kind === "activateTab") {
       result = await handleActivateTab(params);
     } else if (kind === "keyDispatch") {
@@ -3435,7 +3475,7 @@ function rejectAttachCommand(kind, params) {
   );
 }
 
-async function handleOpenTab(params) {
+async function handleOpenTab(params, commandId) {
   const requestedUrl = normalizeOpenUrl(params.url);
   const agentSessionId = normalizeOptionalSessionId(params.agentSessionId);
   const openWindow = await selectOpenWindowForHwndHint(params);
@@ -3467,10 +3507,14 @@ async function handleOpenTab(params) {
     // any later await leaves both the mutation-in-flight marker and, once this
     // write completes, the concrete tab owner available to panic cleanup.
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
-    markAgentNavigation(tab.id, {
+    await markAgentNavigation(tab.id, {
+      claimId: commandId,
       action: "open",
       requestedUrl: requestedUrl || "about:blank",
-      sessionId: agentSessionId
+      sessionId: agentSessionId,
+      beforeUrl: "",
+      beforeDocumentId: null,
+      tab
     });
     const target = await waitForTabTarget(tab.id, 10000);
     const state = await tabPageState(tab.id, target);
@@ -4353,7 +4397,7 @@ async function handleStorageState(params) {
   };
 }
 
-async function handleSetContent(params) {
+async function handleSetContent(params, commandId) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const html = String(params.html ?? "");
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
@@ -4368,7 +4412,14 @@ async function handleSetContent(params) {
     );
   }
   const before = await tabPageState(selected.tabId, selected.target);
-  const execution = await executeSetContentScript(selected, html, waitTimeoutMs, agentSessionId, before);
+  const execution = await executeSetContentScript(
+    selected,
+    html,
+    waitTimeoutMs,
+    agentSessionId,
+    before,
+    commandId
+  );
   const { injected, seed } = execution;
   const frameResults = frameExecutionResults(injected);
   const first = frameResults.find((frame) => frame.result) || null;
@@ -4418,7 +4469,14 @@ async function handleSetContent(params) {
   };
 }
 
-async function executeSetContentScript(selected, html, waitTimeoutMs, agentSessionId, before) {
+async function executeSetContentScript(
+  selected,
+  html,
+  waitTimeoutMs,
+  agentSessionId,
+  before,
+  commandId
+) {
   try {
     const injected = await runSetContentScript(selected.tabId, html, waitTimeoutMs);
     return { injected, seed: null };
@@ -4429,7 +4487,14 @@ async function executeSetContentScript(selected, html, waitTimeoutMs, agentSessi
         `chrome.scripting.executeScript setContent(${selected.tabId}) failed: ${errorMessage(error)}`
       );
     }
-    const seed = await seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, before, error);
+    const seed = await seedTabForSetContent(
+      selected,
+      waitTimeoutMs,
+      agentSessionId,
+      before,
+      commandId,
+      error
+    );
     try {
       const injected = await runSetContentScript(selected.tabId, html, waitTimeoutMs);
       return { injected, seed };
@@ -4452,12 +4517,23 @@ async function runSetContentScript(tabId, html, waitTimeoutMs) {
   }, "setContent");
 }
 
-async function seedTabForSetContent(selected, waitTimeoutMs, agentSessionId, before, cause) {
+async function seedTabForSetContent(
+  selected,
+  waitTimeoutMs,
+  agentSessionId,
+  before,
+  commandId,
+  cause
+) {
   const seedUrl = setContentSeedUrl(selected.tabId);
-  markAgentNavigation(selected.tabId, {
+  await markAgentNavigation(selected.tabId, {
+    claimId: `${commandId}:seed`,
     action: "setContentSeed",
     requestedUrl: seedUrl,
-    sessionId: agentSessionId
+    sessionId: agentSessionId,
+    beforeUrl: before.url,
+    beforeDocumentId: await mainFrameDocumentIdOrNull(selected.tabId),
+    tab: before
   });
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.update:setContentSeed:tab=${selected.tabId}`);
@@ -7757,7 +7833,7 @@ async function createDomActionPopupTabs(selected, beforeState, actionResult) {
   return created;
 }
 
-async function handleNavigateTab(params) {
+async function handleNavigateTab(params, commandId) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const action = normalizeNavigateAction(params.action);
   const requestedUrl = action === "navigate" ? requiredUrl(params.url) : null;
@@ -7765,6 +7841,16 @@ async function handleNavigateTab(params) {
   const waitTimeoutMs = normalizeWaitTimeout(params.waitTimeoutMs);
   const ignoreCache = Boolean(params.ignoreCache);
   const before = await tabPageState(selected.tabId, selected.target);
+  const beforeDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+  if (!beforeDocumentId) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `navigateTab refused ${action} before browser mutation because the exact main-frame ` +
+        `documentId is unavailable for tab ${selected.tabId}; remediation=wait for a committed ` +
+        `document or repair the webNavigation permission so navigation attribution cannot be guessed`
+    );
+  }
+  let navigationClaim = null;
   let readbackExpectation = null;
   // #1344: a navigate to a URL that triggers a Chrome download leaves the tab on
   // its current URL, so the url-change readback would (wrongly) time out. Snapshot
@@ -7773,14 +7859,17 @@ async function handleNavigateTab(params) {
   let downloadSeqBefore = null;
   try {
     if (action === "navigate") {
-      markAgentNavigation(selected.tabId, {
+      navigationClaim = await markAgentNavigation(selected.tabId, {
+        claimId: commandId,
         action,
         requestedUrl,
-        sessionId: agentSessionId
+        sessionId: agentSessionId,
+        beforeUrl: before.url,
+        beforeDocumentId,
+        tab: before
       });
       downloadSeqBefore = downloadEventSeq;
       const sameUrlNavigate = requestedUrl === before.url;
-      const beforeDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
       if (sameUrlNavigate && beforeDocumentId === null) {
         // Fail closed and immediately: without a main-frame documentId there is
         // no observable that can distinguish "the same-URL navigation committed"
@@ -7800,70 +7889,96 @@ async function handleNavigateTab(params) {
       readbackExpectation = {
         needsDocumentId: true,
         before_document_id: beforeDocumentId,
-        description: sameUrlNavigate
-          ? `a committed navigation in tab ${selected.tabId}: main-frame documentId to differ from ` +
-            `${JSON.stringify(beforeDocumentId)} (the requested url equals the current url, so a ` +
-            `new document is the only proof the navigation occurred)`
-          : `a committed navigation in tab ${selected.tabId}: main-frame documentId to differ from ` +
-            `${JSON.stringify(beforeDocumentId)}, or tab url to become ` +
-            `${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
-            `or differ from ${JSON.stringify(diagnosticUrl(before.url))}`,
-        matches: (state) => {
-          const committed =
-            beforeDocumentId !== null &&
-            state.main_frame_document_id != null &&
-            state.main_frame_document_id !== beforeDocumentId;
-          if (committed) {
-            return true;
-          }
-          if (sameUrlNavigate) {
-            return false;
-          }
-          return state.url === requestedUrl || state.url !== before.url;
-        }
+        description: `the command-correlated committed document for claim ${JSON.stringify(commandId)} ` +
+          `in tab ${selected.tabId}; requested_url=${JSON.stringify(diagnosticUrl(requestedUrl))} ` +
+          `before_document_id=${JSON.stringify(beforeDocumentId)}`,
+        matches: (state) => Boolean(
+          navigationClaim?.committedDocumentId &&
+          state.main_frame_document_id === navigationClaim.committedDocumentId
+        )
       };
     } else if (action === "reload") {
-      markAgentNavigation(selected.tabId, {
+      navigationClaim = await markAgentNavigation(selected.tabId, {
+        claimId: commandId,
         action,
         requestedUrl: before.url,
-        sessionId: agentSessionId
+        sessionId: agentSessionId,
+        beforeUrl: before.url,
+        beforeDocumentId,
+        tab: before
       });
+      readbackExpectation = {
+        needsDocumentId: true,
+        before_document_id: beforeDocumentId,
+        description: `the command-correlated reload document for claim ${JSON.stringify(commandId)}`,
+        matches: (state) => Boolean(
+          navigationClaim?.committedDocumentId &&
+          state.main_frame_document_id === navigationClaim.committedDocumentId
+        )
+      };
       assertPhysicalMutationAdmission(`chrome.tabs.reload:navigate:tab=${selected.tabId}`);
       await chrome.tabs.reload(selected.tabId, { bypassCache: ignoreCache });
     } else if (action === "back") {
-      markAgentNavigation(selected.tabId, {
+      navigationClaim = await markAgentNavigation(selected.tabId, {
+        claimId: commandId,
         action,
         requestedUrl: null,
-        sessionId: agentSessionId
+        sessionId: agentSessionId,
+        beforeUrl: before.url,
+        beforeDocumentId,
+        tab: before
       });
       assertPhysicalMutationAdmission(`chrome.tabs.goBack:tab=${selected.tabId}`);
       await chrome.tabs.goBack(selected.tabId);
       readbackExpectation = {
-        description:
-          `tab url to change after chrome.tabs.goBack from ${JSON.stringify(diagnosticUrl(before.url))}`,
-        matches: (state) => state.url !== before.url
+        needsDocumentId: true,
+        before_document_id: beforeDocumentId,
+        description: `the command-correlated back history document for claim ${JSON.stringify(commandId)}`,
+        matches: (state) => Boolean(
+          navigationClaim?.committedDocumentId &&
+          state.main_frame_document_id === navigationClaim.committedDocumentId
+        )
       };
     } else if (action === "forward") {
-      markAgentNavigation(selected.tabId, {
+      navigationClaim = await markAgentNavigation(selected.tabId, {
+        claimId: commandId,
         action,
         requestedUrl: null,
-        sessionId: agentSessionId
+        sessionId: agentSessionId,
+        beforeUrl: before.url,
+        beforeDocumentId,
+        tab: before
       });
       assertPhysicalMutationAdmission(`chrome.tabs.goForward:tab=${selected.tabId}`);
       await chrome.tabs.goForward(selected.tabId);
       readbackExpectation = {
-        description:
-          `tab url to change after chrome.tabs.goForward from ${JSON.stringify(diagnosticUrl(before.url))}`,
-        matches: (state) => state.url !== before.url
+        needsDocumentId: true,
+        before_document_id: beforeDocumentId,
+        description: `the command-correlated forward history document for claim ${JSON.stringify(commandId)}`,
+        matches: (state) => Boolean(
+          navigationClaim?.committedDocumentId &&
+          state.main_frame_document_id === navigationClaim.committedDocumentId
+        )
       };
     }
   } catch (error) {
+    let claimSettlementError = null;
+    try {
+      await settleAgentNavigationClaim(selected.tabId, "command_failed", {
+        expectedClaimId: navigationClaim?.claimId || commandId,
+        correlationVerdict: "agent_command_failed_before_navigation_terminal"
+      });
+    } catch (settlementError) {
+      claimSettlementError = errorMessage(settlementError);
+    }
     throw bridgeError(
       ERROR_AXTREE_FAILED,
       `chrome.tabs.${tabsNavigationMethod(action)}(${selected.tabId}) failed: ${errorMessage(error)}; ` +
         `before url=${JSON.stringify(diagnosticUrl(before.url))} ` +
         `title=${JSON.stringify(diagnosticTitle(before.title))} ` +
-        `status=${JSON.stringify(before.ready_state)}`
+        `status=${JSON.stringify(before.ready_state)} ` +
+        `navigation_claim_id=${JSON.stringify(navigationClaim?.claimId || commandId)} ` +
+        `claim_settlement_error=${JSON.stringify(claimSettlementError)}`
     );
   }
   // #1344: for a navigate, race the tab-url readback against a Chrome download
@@ -7882,6 +7997,11 @@ async function handleNavigateTab(params) {
     if (outcome.kind === "download") {
       const dl = outcome.download;
       const after = outcome.state || before;
+      await settleAgentNavigationClaim(selected.tabId, "download", {
+        expectedClaimId: navigationClaim?.claimId || commandId,
+        correlationVerdict: "agent_navigation_resolved_as_download",
+        tab: after
+      });
       return {
         extension_id: chrome.runtime.id,
         target_id: after.target_id || selected.target.id,
@@ -7906,6 +8026,10 @@ async function handleNavigateTab(params) {
         download_filename: dl.filename,
         download_state: dl.state,
         download_match_reason: dl.match_reason,
+        navigation_claim_id: navigationClaim?.claimId || commandId,
+        navigation_correlation_status: navigationClaim?.status || "download",
+        initial_document_id: beforeDocumentId,
+        final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
         target_candidate_count: selected.targetCandidateCount,
         target_selection_reason: selected.selectionReason
       };
@@ -7928,6 +8052,10 @@ async function handleNavigateTab(params) {
       readback_backend: "chrome.tabs.get",
       navigation_error_text: null,
       is_download: false,
+      navigation_claim_id: navigationClaim?.claimId || commandId,
+      navigation_correlation_status: navigationClaim?.status || "pending_terminal_event",
+      initial_document_id: beforeDocumentId,
+      final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
       target_candidate_count: selected.targetCandidateCount,
       target_selection_reason: selected.selectionReason
     };
@@ -7950,6 +8078,10 @@ async function handleNavigateTab(params) {
     readback_backend: "chrome.tabs.get",
     navigation_error_text: null,
     is_download: null,
+    navigation_claim_id: navigationClaim?.claimId || commandId,
+    navigation_correlation_status: navigationClaim?.status || "pending_terminal_event",
+    initial_document_id: beforeDocumentId,
+    final_document_id: await mainFrameDocumentIdOrNull(selected.tabId),
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
   };
@@ -16583,6 +16715,9 @@ async function waitForTabPageState(tabId, fallbackTarget, waitTimeoutMs, expecta
   while (Date.now() - started <= waitTimeoutMs) {
     try {
       last = await tabPageState(tabId, fallbackTarget);
+      if (expectation?.needsDocumentId) {
+        last.main_frame_document_id = await mainFrameDocumentIdOrNull(tabId);
+      }
       lastError = null;
       const loaded = last.ready_state === "complete";
       if (loaded && (!expectation || expectation.matches(last))) {
@@ -16597,7 +16732,9 @@ async function waitForTabPageState(tabId, fallbackTarget, waitTimeoutMs, expecta
     ? `waiting for ${expectation?.description || "complete tab state"}; ` +
       `last url=${JSON.stringify(diagnosticUrl(last.url))} ` +
       `title=${JSON.stringify(diagnosticTitle(last.title))} ` +
-      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)}`
+      `status=${JSON.stringify(last.ready_state)} targetId=${JSON.stringify(last.target_id)} ` +
+      `before_document_id=${JSON.stringify(expectation?.before_document_id ?? null)} ` +
+      `last_document_id=${JSON.stringify(last.main_frame_document_id ?? null)}`
     : lastError
       ? `last readback error=${JSON.stringify(lastError)}`
     : "no tab state readback";
@@ -25251,37 +25388,315 @@ function normalizeOptionalSessionId(value) {
   return sessionId || null;
 }
 
-function markAgentNavigation(tabId, claim) {
-  if (!Number.isInteger(tabId) || !claim?.sessionId) {
+function canonicalNavigationUrl(value) {
+  const raw = String(value || "").trim();
+  if (!raw) {
+    return null;
+  }
+  try {
+    return new URL(raw).href;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function nextNavigationEventId() {
+  navigationEventSequence += 1;
+  return `${DURABLE_OWNER_WORKER_BOOT_ID}:navigation:${navigationEventSequence}`;
+}
+
+function navigationTabSnapshot(tabId, tab) {
+  return {
+    id: tabId,
+    windowId: Number.isInteger(tab?.windowId)
+      ? tab.windowId
+      : Number.isInteger(tab?.chrome_window_id)
+        ? tab.chrome_window_id
+        : null,
+    url: String(tab?.pendingUrl || tab?.url || ""),
+    title: String(tab?.title || ""),
+    status: String(tab?.status || tab?.ready_state || ""),
+    active: Boolean(tab?.active),
+    highlighted: Boolean(tab?.highlighted),
+    pinned: Boolean(tab?.pinned)
+  };
+}
+
+async function readNavigationTabSnapshot(tabId, fallback = null) {
+  try {
+    return navigationTabSnapshot(tabId, await chrome.tabs.get(tabId));
+  } catch (_error) {
+    return navigationTabSnapshot(tabId, fallback);
+  }
+}
+
+async function postNavigationObservation({
+  event = "tabNavigation",
+  source,
+  tab,
+  details = null,
+  initiator = "page_or_operator",
+  claim = null,
+  correlationVerdict = "unmatched_no_agent_claim",
+  claimStatus = null
+}) {
+  const tabId = Number.isInteger(details?.tabId) ? details.tabId : tab?.id;
+  if (!Number.isInteger(tabId) || tabId < 0) {
     return;
   }
-  agentNavigationClaims.set(tabId, {
-    action: String(claim.action || ""),
-    requestedUrl: claim.requestedUrl === null ? null : String(claim.requestedUrl || ""),
-    sessionId: claim.sessionId,
-    at: Date.now()
+  const qualifiers = Array.isArray(details?.transitionQualifiers)
+    ? details.transitionQualifiers.map(String).sort()
+    : [];
+  await postDaemonMessage({
+    type: "event",
+    event,
+    event_id: nextNavigationEventId(),
+    source: String(source || ""),
+    target_id: targetIdForTabId(tabId),
+    tab_id: tabId,
+    chrome_window_id: Number.isInteger(tab?.windowId) ? tab.windowId : null,
+    url: String(details?.url || tab?.pendingUrl || tab?.url || claim?.requestedUrl || claim?.beforeUrl || ""),
+    title: String(tab?.title || ""),
+    status: String(tab?.status || ""),
+    active: Boolean(tab?.active),
+    highlighted: Boolean(tab?.highlighted),
+    pinned: Boolean(tab?.pinned),
+    initiator,
+    claim_id: claim?.claimId || null,
+    claim_status: claimStatus || claim?.status || null,
+    agent_session_id: claim?.sessionId || null,
+    action: claim?.action || null,
+    requested_url: claim?.requestedUrl || null,
+    before_url: claim?.beforeUrl || null,
+    before_document_id: claim?.beforeDocumentId || null,
+    correlation_verdict: correlationVerdict,
+    frame_id: Number.isSafeInteger(details?.frameId) ? details.frameId : null,
+    parent_frame_id: Number.isSafeInteger(details?.parentFrameId) ? details.parentFrameId : null,
+    document_id: details?.documentId == null ? null : String(details.documentId),
+    parent_document_id: details?.parentDocumentId == null ? null : String(details.parentDocumentId),
+    document_lifecycle: details?.documentLifecycle == null ? null : String(details.documentLifecycle),
+    frame_type: details?.frameType == null ? null : String(details.frameType),
+    transition_type: details?.transitionType == null ? null : String(details.transitionType),
+    transition_qualifiers: qualifiers,
+    navigation_error: details?.error == null ? null : String(details.error),
+    navigation_timestamp_ms: Number.isFinite(details?.timeStamp)
+      ? Math.max(0, Math.floor(details.timeStamp))
+      : null,
+    observed_at_unix_ms: Date.now()
   });
 }
 
-function matchingAgentNavigationClaim(tabId, url, status) {
+async function settleAgentNavigationClaim(tabId, status, options = {}) {
   const claim = agentNavigationClaims.get(tabId);
   if (!claim) {
     return null;
   }
-  const ageMs = Date.now() - claim.at;
-  if (ageMs > AGENT_NAVIGATION_CLAIM_TTL_MS) {
-    agentNavigationClaims.delete(tabId);
+  if (options.expectedClaimId && claim.claimId !== options.expectedClaimId) {
     return null;
   }
-  const requestedUrl = claim.requestedUrl || "";
-  const matchesUrl = !requestedUrl || !url || url === requestedUrl || url.startsWith(requestedUrl) || requestedUrl.startsWith(url);
-  if (!matchesUrl) {
-    return null;
+  claim.status = status;
+  claim.terminalAtUnixMs = Date.now();
+  const tab = await readNavigationTabSnapshot(tabId, options.tab || claim.tab);
+  try {
+    await postNavigationObservation({
+      event: "navigationClaim",
+      source: "synapse.navigationClaim",
+      tab,
+      initiator: "agent",
+      claim,
+      correlationVerdict: options.correlationVerdict || `claim_${status}`,
+      claimStatus: status
+    });
+  } catch (error) {
+    claim.status = "terminal_delivery_failed";
+    claim.terminalDeliveryError = errorMessage(error);
+    throw error;
   }
-  if (status === "complete") {
-    agentNavigationClaims.delete(tabId);
+  if (claim.expiryTimer) {
+    clearTimeout(claim.expiryTimer);
   }
+  agentNavigationClaims.delete(tabId);
   return claim;
+}
+
+async function markAgentNavigation(tabId, claim) {
+  const claimId = String(claim?.claimId || "").trim();
+  const sessionId = String(claim?.sessionId || "").trim();
+  if (!Number.isInteger(tabId) || tabId < 0 || !claimId || !sessionId) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `navigation claim requires exact tab_id, command claim_id, and agent session_id; ` +
+        `tab_id=${String(tabId)} claim_id=${JSON.stringify(claimId)} ` +
+        `session_id_present=${Boolean(sessionId)}; no browser mutation was admitted`
+    );
+  }
+  const existing = agentNavigationClaims.get(tabId);
+  if (existing) {
+    await settleAgentNavigationClaim(tabId, "superseded", {
+      expectedClaimId: existing.claimId,
+      correlationVerdict: `claim_superseded_by_${claimId}`
+    });
+  }
+  const at = Date.now();
+  const record = {
+    claimId,
+    action: String(claim.action || ""),
+    requestedUrl: claim.requestedUrl === null ? null : String(claim.requestedUrl || ""),
+    requestedCanonicalUrl: canonicalNavigationUrl(claim.requestedUrl),
+    beforeUrl: String(claim.beforeUrl || ""),
+    beforeCanonicalUrl: canonicalNavigationUrl(claim.beforeUrl),
+    beforeDocumentId: claim.beforeDocumentId == null ? null : String(claim.beforeDocumentId),
+    sessionId,
+    at,
+    deadlineAtUnixMs: at + AGENT_NAVIGATION_CLAIM_TTL_MS,
+    status: "created",
+    sawExactRequestedBeforeNavigate: false,
+    committedDocumentId: null,
+    committedUrl: null,
+    tab: navigationTabSnapshot(tabId, claim.tab),
+    expiryTimer: null
+  };
+  agentNavigationClaims.set(tabId, record);
+  record.expiryTimer = setTimeout(() => {
+    settleAgentNavigationClaim(tabId, "expired", {
+      expectedClaimId: claimId,
+      correlationVerdict: "claim_ttl_expired_without_terminal_navigation"
+    }).catch((error) => {
+      console.error(`Synapse navigation-claim expiry persistence failed: ${errorMessage(error)}`);
+    });
+  }, AGENT_NAVIGATION_CLAIM_TTL_MS + 25);
+  await postNavigationObservation({
+    event: "navigationClaim",
+    source: "synapse.navigationClaim",
+    tab: record.tab,
+    initiator: "agent",
+    claim: record,
+    correlationVerdict: "claim_created_before_browser_mutation",
+    claimStatus: "created"
+  });
+  return record;
+}
+
+async function correlateAgentNavigation(tabId, source, url, details = null) {
+  const claim = agentNavigationClaims.get(tabId);
+  if (!claim) {
+    return {
+      claim: null,
+      initiator: "page_or_operator",
+      correlationVerdict: "unmatched_no_agent_claim",
+      terminalStatus: null
+    };
+  }
+  if (Date.now() > claim.deadlineAtUnixMs) {
+    await settleAgentNavigationClaim(tabId, "expired", {
+      expectedClaimId: claim.claimId,
+      correlationVerdict: "claim_ttl_expired_before_observed_event"
+    });
+    return {
+      claim: null,
+      initiator: "page_or_operator",
+      correlationVerdict: "unmatched_expired_agent_claim",
+      terminalStatus: null
+    };
+  }
+  const frameId = Number.isSafeInteger(details?.frameId) ? details.frameId : 0;
+  if (frameId !== 0) {
+    return {
+      claim,
+      initiator: "page_or_operator",
+      correlationVerdict: "unmatched_subframe_outside_top_level_claim",
+      terminalStatus: null
+    };
+  }
+  const canonicalUrl = canonicalNavigationUrl(url);
+  const documentId = details?.documentId == null ? null : String(details.documentId);
+  const transitionType = String(details?.transitionType || "");
+  const qualifiers = Array.isArray(details?.transitionQualifiers)
+    ? details.transitionQualifiers.map(String)
+    : [];
+  const newDocument = Boolean(documentId && documentId !== claim.beforeDocumentId);
+  const exactRequested = Boolean(
+    canonicalUrl && claim.requestedCanonicalUrl && canonicalUrl === claim.requestedCanonicalUrl
+  );
+  let correlated = false;
+  let verdict = "unmatched_active_agent_claim";
+  let initiator = "page_or_operator";
+  let terminalStatus = null;
+
+  if (source === "webNavigation.onBeforeNavigate") {
+    if (["navigate", "open", "setContentSeed"].includes(claim.action) && exactRequested) {
+      claim.sawExactRequestedBeforeNavigate = true;
+      claim.status = "started";
+      correlated = true;
+      verdict = "agent_exact_requested_url_before_navigation";
+    } else {
+      verdict = "claim_pending_unproven_before_navigation";
+    }
+  } else if (source === "webNavigation.onCommitted") {
+    if (["navigate", "open", "setContentSeed"].includes(claim.action)) {
+      const explicitRedirect = claim.sawExactRequestedBeforeNavigate &&
+        qualifiers.some((value) => value === "server_redirect" || value === "client_redirect");
+      correlated = newDocument && (exactRequested || explicitRedirect);
+      verdict = correlated
+        ? exactRequested
+          ? "agent_exact_requested_url_committed_document"
+          : "agent_explicit_redirect_chain_committed_document"
+        : "unmatched_commit_not_in_agent_url_or_redirect_chain";
+    } else if (claim.action === "reload") {
+      correlated = newDocument && transitionType === "reload" &&
+        canonicalUrl === claim.beforeCanonicalUrl;
+      verdict = correlated
+        ? "agent_reload_transition_committed_document"
+        : "unmatched_commit_not_proven_reload_transition";
+    } else if (claim.action === "back" || claim.action === "forward") {
+      correlated = newDocument && qualifiers.includes("forward_back") &&
+        canonicalUrl !== claim.beforeCanonicalUrl;
+      verdict = correlated
+        ? `agent_${claim.action}_history_transition_committed_document`
+        : "unmatched_commit_not_proven_history_transition";
+    }
+    if (correlated) {
+      claim.status = "committed";
+      claim.committedDocumentId = documentId;
+      claim.committedUrl = String(url || "");
+    }
+  } else if (
+    source === "webNavigation.onHistoryStateUpdated" ||
+    source === "webNavigation.onReferenceFragmentUpdated"
+  ) {
+    if (claim.committedDocumentId && documentId === claim.committedDocumentId) {
+      verdict = "within_agent_destination_document_but_not_agent_navigation_trigger";
+    } else {
+      verdict = "unmatched_in_document_transition";
+    }
+  } else if (
+    claim.committedDocumentId && documentId === claim.committedDocumentId
+  ) {
+    correlated = true;
+    verdict = "agent_committed_document_lifecycle";
+    if (source === "webNavigation.onCompleted") {
+      terminalStatus = "completed";
+    } else if (source === "webNavigation.onErrorOccurred") {
+      terminalStatus = "failed";
+    }
+  } else if (source === "tabs.onUpdated") {
+    const currentDocumentId = await mainFrameDocumentIdOrNull(tabId);
+    if (claim.committedDocumentId && currentDocumentId === claim.committedDocumentId) {
+      correlated = true;
+      verdict = "agent_committed_document_tab_update";
+    } else if (claim.sawExactRequestedBeforeNavigate && exactRequested) {
+      correlated = true;
+      verdict = "agent_exact_requested_url_tab_update_pending_commit";
+    } else {
+      verdict = "unmatched_tab_update_active_claim";
+    }
+  } else {
+    verdict = "unmatched_non_navigation_tab_event";
+  }
+  if (correlated) {
+    initiator = "agent";
+  }
+  return { claim, initiator, correlationVerdict: verdict, terminalStatus };
 }
 
 async function performHtml5DragDropInPage(request) {
@@ -26240,7 +26655,17 @@ function webNavigationTransition(details) {
   return [transitionType, ...qualifiers].filter(Boolean).join("+");
 }
 
-async function postTabNavigationEvent(source, tab) {
+function enqueueNavigationEventObservation(work) {
+  const queued = navigationEventTail.then(work, work);
+  navigationEventTail = queued.catch(() => undefined);
+  return queued;
+}
+
+function postTabNavigationEvent(source, tab) {
+  return enqueueNavigationEventObservation(() => postTabNavigationEventOrdered(source, tab));
+}
+
+async function postTabNavigationEventOrdered(source, tab) {
   if (!tab || typeof tab.id !== "number") {
     return;
   }
@@ -26250,33 +26675,49 @@ async function postTabNavigationEvent(source, tab) {
   }
   const title = String(tab.title || "");
   const status = String(tab.status || "");
-  const agentClaim = matchingAgentNavigationClaim(tab.id, url, status);
-  if (agentClaim) {
-    return;
-  }
-  const key = `${tab.id}\n${url}\n${title}\n${status}`;
-  if (recentNavigationKeys.includes(key)) {
-    return;
-  }
-  recentNavigationKeys.push(key);
-  while (recentNavigationKeys.length > MAX_RECENT_NAVIGATION_KEYS) {
-    recentNavigationKeys.shift();
-  }
-  await postDaemonMessage({
-    type: "event",
-    event: "tabNavigation",
+  const correlation = await correlateAgentNavigation(tab.id, source, url, null);
+  await postNavigationObservation({
     source,
-    target_id: targetIdForTabId(tab.id),
-    tab_id: tab.id,
-    chrome_window_id: Number.isInteger(tab.windowId) ? tab.windowId : null,
-    url,
-    title,
-    status,
-    active: Boolean(tab.active),
-    highlighted: Boolean(tab.highlighted),
-    pinned: Boolean(tab.pinned),
-    observed_at_unix_ms: Date.now()
+    tab: { ...tab, title, status },
+    initiator: correlation.initiator,
+    claim: correlation.claim,
+    correlationVerdict: correlation.correlationVerdict
   });
+}
+
+function postWebNavigationEvent(source, details) {
+  return enqueueNavigationEventObservation(() => postWebNavigationEventOrdered(source, details));
+}
+
+async function postWebNavigationEventOrdered(source, details) {
+  if (!details || !Number.isInteger(details.tabId) || details.tabId < 0) {
+    return;
+  }
+  const tab = await readNavigationTabSnapshot(details.tabId, {
+    url: details.url,
+    status: source === "webNavigation.onCompleted" ? "complete" : "loading"
+  });
+  const correlation = await correlateAgentNavigation(
+    details.tabId,
+    source,
+    String(details.url || tab.url || ""),
+    details
+  );
+  await postNavigationObservation({
+    source,
+    tab,
+    details,
+    initiator: correlation.initiator,
+    claim: correlation.claim,
+    correlationVerdict: correlation.correlationVerdict
+  });
+  if (correlation.terminalStatus && correlation.claim) {
+    await settleAgentNavigationClaim(details.tabId, correlation.terminalStatus, {
+      expectedClaimId: correlation.claim.claimId,
+      correlationVerdict: `claim_${correlation.terminalStatus}_after_${source}`,
+      tab
+    });
+  }
 }
 
 function requiredUrl(url) {

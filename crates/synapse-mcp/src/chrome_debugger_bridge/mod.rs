@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-csp-independent-wait-v8";
+    "synapse-chrome-bridge-2026-08-11-truthful-navigation-events-v9";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "3c81c9f1ba6042d283cff649999a6fb50eb93a7e72435f8adac75982a34581d6";
+    "fd72131dc2ca91f5bcfb825aa91207f109e7e398e9b2258dc429238b0c7ea272";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
@@ -3969,6 +3969,14 @@ pub struct ChromeDebuggerNavigateResult {
     pub readback_backend: String,
     pub navigation_error_text: Option<String>,
     pub is_download: Option<bool>,
+    #[serde(default)]
+    pub navigation_claim_id: Option<String>,
+    #[serde(default)]
+    pub navigation_correlation_status: Option<String>,
+    #[serde(default)]
+    pub initial_document_id: Option<String>,
+    #[serde(default)]
+    pub final_document_id: Option<String>,
     /// #1344: structured download outcome when the navigate started a Chrome
     /// download instead of changing the tab URL.
     #[serde(default)]
@@ -4579,6 +4587,8 @@ struct ChromeResponseError {
 #[derive(Clone, Debug, Deserialize)]
 struct ExtensionTabNavigationEvent {
     #[serde(default)]
+    event_id: String,
+    #[serde(default)]
     source: String,
     #[serde(default)]
     target_id: String,
@@ -4597,11 +4607,50 @@ struct ExtensionTabNavigationEvent {
     #[serde(default)]
     pinned: bool,
     #[serde(default)]
+    initiator: String,
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default)]
+    claim_status: Option<String>,
+    #[serde(default)]
+    agent_session_id: Option<String>,
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    requested_url: Option<String>,
+    #[serde(default)]
+    before_url: Option<String>,
+    #[serde(default)]
+    before_document_id: Option<String>,
+    #[serde(default)]
+    correlation_verdict: String,
+    #[serde(default)]
+    frame_id: Option<i64>,
+    #[serde(default)]
+    parent_frame_id: Option<i64>,
+    #[serde(default)]
+    document_id: Option<String>,
+    #[serde(default)]
+    parent_document_id: Option<String>,
+    #[serde(default)]
+    document_lifecycle: Option<String>,
+    #[serde(default)]
+    frame_type: Option<String>,
+    #[serde(default)]
+    transition_type: Option<String>,
+    #[serde(default)]
+    transition_qualifiers: Vec<String>,
+    #[serde(default)]
+    navigation_error: Option<String>,
+    #[serde(default)]
+    navigation_timestamp_ms: Option<u64>,
+    #[serde(default)]
     observed_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 pub struct ChromeDebuggerBrowserNavigationEvent {
+    pub event_id: String,
     pub source: String,
     pub event: String,
     pub url: String,
@@ -4616,6 +4665,25 @@ pub struct ChromeDebuggerBrowserNavigationEvent {
     pub active: Option<bool>,
     pub highlighted: Option<bool>,
     pub pinned: Option<bool>,
+    pub initiator: String,
+    pub claim_id: Option<String>,
+    pub claim_status: Option<String>,
+    pub agent_session_id: Option<String>,
+    pub action: Option<String>,
+    pub requested_url: Option<String>,
+    pub before_url: Option<String>,
+    pub before_document_id: Option<String>,
+    pub correlation_verdict: String,
+    pub frame_id: Option<i64>,
+    pub parent_frame_id: Option<i64>,
+    pub document_id: Option<String>,
+    pub parent_document_id: Option<String>,
+    pub document_lifecycle: Option<String>,
+    pub frame_type: Option<String>,
+    pub transition_type: Option<String>,
+    pub transition_qualifiers: Vec<String>,
+    pub navigation_error: Option<String>,
+    pub navigation_timestamp_ms: Option<u64>,
 }
 
 struct PendingResponse {
@@ -6735,14 +6803,15 @@ impl ChromeDebuggerBridge {
                         delivered_mutations_preserved = stats.delivered_mutations_preserved,
                         "Chrome debugger native port disconnected"
                     );
-                } else if event == "tabNavigation" {
+                } else if event == "tabNavigation" || event == "navigationClaim" {
                     let decoded = serde_json::from_value::<ExtensionTabNavigationEvent>(
                         request.message.clone(),
                     )
                     .map_err(|error| format!("decode Chrome tabNavigation event: {error}"))?;
                     browser_navigation_event = Some(ChromeDebuggerBrowserNavigationEvent {
+                        event_id: decoded.event_id,
                         source: decoded.source,
-                        event: "tabNavigation".to_owned(),
+                        event: event.to_owned(),
                         url: decoded.url,
                         title: decoded.title,
                         tab_id: Some(decoded.tab_id),
@@ -6758,10 +6827,31 @@ impl ChromeDebuggerBridge {
                         active: Some(decoded.active),
                         highlighted: Some(decoded.highlighted),
                         pinned: Some(decoded.pinned),
+                        initiator: decoded.initiator,
+                        claim_id: decoded.claim_id,
+                        claim_status: decoded.claim_status,
+                        agent_session_id: decoded.agent_session_id,
+                        action: decoded.action,
+                        requested_url: decoded.requested_url,
+                        before_url: decoded.before_url,
+                        before_document_id: decoded.before_document_id,
+                        correlation_verdict: decoded.correlation_verdict,
+                        frame_id: decoded.frame_id,
+                        parent_frame_id: decoded.parent_frame_id,
+                        document_id: decoded.document_id,
+                        parent_document_id: decoded.parent_document_id,
+                        document_lifecycle: decoded.document_lifecycle,
+                        frame_type: decoded.frame_type,
+                        transition_type: decoded.transition_type,
+                        transition_qualifiers: decoded.transition_qualifiers,
+                        navigation_error: decoded.navigation_error,
+                        navigation_timestamp_ms: decoded.navigation_timestamp_ms,
                     });
                     tracing::info!(
                         code = "CHROME_DEBUGGER_BROWSER_NAVIGATION_EVENT",
                         host_id = %request.host_id,
+                        event_id = %browser_navigation_event.as_ref().map_or("", |value| value.event_id.as_str()),
+                        correlation_verdict = %browser_navigation_event.as_ref().map_or("", |value| value.correlation_verdict.as_str()),
                         "Chrome debugger tab navigation event accepted"
                     );
                 } else {
