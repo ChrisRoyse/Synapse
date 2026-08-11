@@ -2,7 +2,7 @@
 
 Date: 2026-08-11 (America/Chicago)  
 Implementation commit: `9081d95e798dcf45aa3a8c2ff987b7a7454ac925` on `main`  
-Acceptance comment: pending final GitHub readback
+Acceptance comment: https://github.com/ChrisRoyse/Synapse/issues/2177#issuecomment-5251892024
 
 ## Source of Truth
 
@@ -233,8 +233,10 @@ deleted with an independent `Test-Path=false` readback.
 A final `chrome.tabs.query` returned only the two original tabs: the GitHub
 issues tab `chrome-tab:589710129` and Gmail `chrome-tab:589710138`. Gmail was
 the sole active/highlighted tab, Chrome state was `normal`, and Gmail document
-contents were never read or mutated. The GitHub acceptance permalink is added
-in the post-closure documentation commit.
+contents were never read or mutated. A fresh GitHub document reload found the
+acceptance comment permalink above, the implementation marker, zero `Close
+issue` buttons, one `Reopen issue` button, and the physical timeline event
+`ChrisRoyse closed this as completed`.
 
 No automated test, mock data, fallback lane, second browser, branch, worktree,
 alternate target directory, screenshot artifact, or temporary repository FSV
