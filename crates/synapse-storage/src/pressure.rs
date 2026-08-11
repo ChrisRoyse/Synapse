@@ -159,8 +159,14 @@ impl Default for PressureConfig {
     }
 }
 
-pub trait PressureMaintenance: Send + Sync {
-    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>>;
+/// Physical compaction available to the disk-pressure monitor.
+///
+/// Implementations may rewrite or reclaim native storage files, but must not
+/// insert/delete logical rows or write MVCC tombstones (#2150). Logical
+/// retention belongs to [`crate::gc::GcRunner`], which keeps row-cap eviction
+/// and the reclamation of the versions it creates in one ordered operation.
+pub trait PressureCompaction: Send + Sync {
+    fn compact_native_for_pressure(&self) -> StorageResult<Vec<&'static str>>;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -241,21 +247,21 @@ pub fn spawn(
     state: Arc<PressureState>,
     path: PathBuf,
     config: PressureConfig,
-    maintenance: Arc<dyn PressureMaintenance>,
+    compaction: Arc<dyn PressureCompaction>,
 ) -> StorageResult<PressureTask> {
-    spawn_with_probe(state, path, config, Arc::new(Fs2DiskProbe), maintenance)
+    spawn_with_probe(state, path, config, Arc::new(Fs2DiskProbe), compaction)
 }
 
 pub fn run_once(
     state: &PressureState,
     path: &Path,
     config: &PressureConfig,
-    maintenance: &dyn PressureMaintenance,
+    compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
     let result = Fs2DiskProbe
         .available_space(path)
-        .and_then(|free_bytes| apply_free_bytes(state, config, free_bytes, maintenance));
+        .and_then(|free_bytes| apply_free_bytes(state, config, free_bytes, compaction));
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
@@ -264,10 +270,10 @@ pub fn run_once_with_free_bytes(
     state: &PressureState,
     config: &PressureConfig,
     free_bytes: u64,
-    maintenance: &dyn PressureMaintenance,
+    compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let started = mark_pressure_probe_started(state);
-    let result = apply_free_bytes(state, config, free_bytes, maintenance);
+    let result = apply_free_bytes(state, config, free_bytes, compaction);
     mark_pressure_probe_completed(state, started, result.as_ref());
     result
 }
@@ -277,7 +283,7 @@ fn spawn_with_probe(
     path: PathBuf,
     config: PressureConfig,
     probe: Arc<dyn DiskProbe>,
-    maintenance: Arc<dyn PressureMaintenance>,
+    compaction: Arc<dyn PressureCompaction>,
 ) -> StorageResult<PressureTask> {
     let handle =
         tokio::runtime::Handle::try_current().map_err(|error| StorageError::WriteFailed {
@@ -304,7 +310,7 @@ fn spawn_with_probe(
                     let tick_state = Arc::clone(&state);
                     let tick_config = config.clone();
                     let tick_probe = Arc::clone(&probe);
-                    let tick_maintenance = Arc::clone(&maintenance);
+                    let tick_compaction = Arc::clone(&compaction);
                     let tick_path = path.clone();
                     let result = crate::maintenance::run_admitted_maintenance(
                         "storage_disk_pressure",
@@ -313,7 +319,7 @@ fn spawn_with_probe(
                                 &tick_state,
                                 &tick_config,
                                 free_bytes,
-                                tick_maintenance.as_ref(),
+                                tick_compaction.as_ref(),
                             ),
                             Err(error) => Err(error),
                         },
@@ -337,7 +343,7 @@ fn apply_free_bytes(
     state: &PressureState,
     config: &PressureConfig,
     free_bytes: u64,
-    maintenance: &dyn PressureMaintenance,
+    compaction: &dyn PressureCompaction,
 ) -> StorageResult<PressureReport> {
     let current_level = config.thresholds.level_for(free_bytes);
     synapse_telemetry::metrics::gauge!(STORAGE_DISK_PRESSURE_LEVEL)
@@ -346,7 +352,7 @@ fn apply_free_bytes(
     let transitioned = previous_level != current_level;
     let gc_advised = transitioned && current_level >= DiskPressureLevel::Level1;
     let compacted_cfs = if transitioned && current_level >= DiskPressureLevel::Level2 {
-        maintenance.compact_for_pressure()?
+        compaction.compact_native_for_pressure()?
     } else {
         Vec::new()
     };

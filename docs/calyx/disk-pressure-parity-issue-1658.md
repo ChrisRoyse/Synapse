@@ -22,7 +22,7 @@ and shedding could not become real until #1658 and #1659 both landed.
 ## Design
 
 The storage crate now keeps a single Synapse pressure state machine and injects
-backend-specific physical maintenance through `PressureMaintenance`.
+backend-specific physical maintenance through `PressureCompaction`.
 
 Legacy behavior remains the same:
 

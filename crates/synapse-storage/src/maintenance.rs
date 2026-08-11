@@ -32,11 +32,17 @@ use tokio::sync::Semaphore;
 use crate::{Db, StorageError, StorageResult};
 
 /// Maximum heavy storage-maintenance passes admitted concurrently onto the
-/// blocking pool. Kept small on purpose: native-CF compaction and tombstone
-/// purge already serialize cross-process on Calyx's native-compaction file lock,
-/// so this only needs to keep the periodic GC and disk-pressure loops from
-/// stacking long passes onto the blocking pool at once while still letting an
-/// urgent pressure pass proceed alongside a routine GC pass.
+/// blocking pool.
+///
+/// This is a throughput/back-pressure limit, never a correctness or ordering
+/// primitive (#2150). At two permits, *any* pair of operations can already run
+/// together. Dependent steps therefore belong in one admitted closure (for
+/// example row-cap eviction followed by snapshot-version reclamation in
+/// `CalyxGcRunner::run_full_once`) or behind their own data-level lock. Disk
+/// pressure is physical native-CF compaction only and performs no logical row
+/// mutation; the MVCC row-shard guards serialize reclamation with foreground
+/// commits. Changing this number requires a blocking-pool/load measurement, but
+/// must never be used to create or preserve an ordering guarantee.
 const MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS: usize = 2;
 
 static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {

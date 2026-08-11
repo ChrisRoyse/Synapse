@@ -258,9 +258,12 @@ const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
 //   #1832 lock topology). Their CPU-parallel fix is #2105's intra-page
 //   mechanism, which is a different change to a different function.
 // * **Snapshot-version GC** (#2122) is not on this tick at all; it runs at the
-//   end of `storage_gc` behind row-cap eviction, whose tombstones it must see.
-//   Nothing here may be allowed to overlap it, which is also why
-//   `MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS` is deliberately left at 2.
+//   end of `storage_gc` behind that tick's row-cap eviction so it can reclaim
+//   the versions those tombstones create. The global maintenance semaphore may
+//   admit this tick alongside GC even at its current width of two; it is a load
+//   bound, not an ordering primitive (#2150). Concurrent commits and
+//   reclamation synchronize at the MVCC row-shard write guards. Any future
+//   cross-operation dependency needs one admitted closure or its own lock.
 
 /// Worker threads one parallel sub-pass group may occupy.
 ///

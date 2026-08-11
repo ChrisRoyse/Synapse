@@ -2804,18 +2804,18 @@ fn prepare_calyx_open_fanout(
     Ok(())
 }
 
-struct CalyxPressureMaintenance {
+struct CalyxPressureCompaction {
     vault: Arc<CalyxVaultRuntime>,
 }
 
-impl CalyxPressureMaintenance {
+impl CalyxPressureCompaction {
     const fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
         Self { vault }
     }
 }
 
-impl pressure::PressureMaintenance for CalyxPressureMaintenance {
-    fn compact_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
+impl pressure::PressureCompaction for CalyxPressureCompaction {
+    fn compact_native_for_pressure(&self) -> StorageResult<Vec<&'static str>> {
         self.vault.with_vault(
             pressure::PRESSURE_CF,
             "compact Calyx KV for pressure",
@@ -3079,12 +3079,19 @@ impl CalyxGcRunner {
 
     /// Logical row-cap eviction followed by in-RAM MVCC version reclamation.
     ///
-    /// The order is load-bearing: eviction deletes by **writing tombstones**,
-    /// and every tombstone is a commit that appends another full value clone to
-    /// another version chain (#2122 — the GC we were already running made the
-    /// leak grow faster). Reclaiming afterwards sweeps this pass's own
-    /// tombstone versions instead of leaving them resident until some later
-    /// cadence happens to land on them.
+    /// The local order is load-bearing for same-tick debt convergence: eviction
+    /// deletes by **writing tombstones**, and every tombstone is a commit that
+    /// appends another full value clone to another version chain (#2122 — the
+    /// GC we were already running made the leak grow faster). Reclaiming
+    /// afterwards can sweep this pass's own tombstone versions instead of
+    /// leaving them resident until a later cadence.
+    ///
+    /// This sequence is deliberately one operation; the global maintenance
+    /// permit count does not order operation classes (#2150). Concurrent
+    /// foreground commits remain correct because commit and reclamation take
+    /// the same MVCC row-shard write guard. A future pressure path that needs
+    /// logical eviction must route through this sequence rather than adding
+    /// logical mutation to `PressureCompaction`.
     fn run_full_once(&self) -> StorageResult<gc::GcReport> {
         let mut report = self.run_default_once()?;
         report.snapshot_version_gc = Some(self.reclaim_snapshot_versions_once()?);
@@ -7905,7 +7912,7 @@ impl StorageBackend for CalyxBackend {
             &self.pressure,
             storage_path,
             &pressure::PressureConfig::default(),
-            &CalyxPressureMaintenance::new(Arc::clone(&self.vault)),
+            &CalyxPressureCompaction::new(Arc::clone(&self.vault)),
         )
     }
 
@@ -7917,7 +7924,7 @@ impl StorageBackend for CalyxBackend {
             &self.pressure,
             &pressure::PressureConfig::default(),
             free_bytes,
-            &CalyxPressureMaintenance::new(Arc::clone(&self.vault)),
+            &CalyxPressureCompaction::new(Arc::clone(&self.vault)),
         )
     }
 
@@ -7926,7 +7933,7 @@ impl StorageBackend for CalyxBackend {
             Arc::clone(&self.pressure),
             storage_path.to_path_buf(),
             pressure::PressureConfig::default(),
-            Arc::new(CalyxPressureMaintenance::new(Arc::clone(&self.vault))),
+            Arc::new(CalyxPressureCompaction::new(Arc::clone(&self.vault))),
         )
     }
 
