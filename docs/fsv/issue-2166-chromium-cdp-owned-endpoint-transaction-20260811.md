@@ -339,3 +339,15 @@ removed; `%TEMP%\synapse-cdp-profiles` is absent at final readback.
 - Every temporary FSV profile and the now-empty ephemeral profile root is absent.
 - The user’s already-open Chrome/Gmail state was not used or modified by these
   headless Edge launch tests.
+
+## GitHub acceptance and closure
+
+The acceptance evidence was posted through the already-open authenticated
+Chrome tab and independently read back from GitHub's rendered DOM:
+
+- acceptance permalink:
+  <https://github.com/ChrisRoyse/Synapse/issues/2166#issuecomment-5254974773>
+- marker `SYNAPSE_FSV_ACCEPTANCE_2166_20260811` matched exactly one rendered
+  element after submission;
+- after the close trigger, `Close issue` was absent and `Reopen issue` matched
+  exactly one enabled button, independently proving issue #2166 is closed.
