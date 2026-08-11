@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-trusted-pixel-redaction-v1";
-const BRIDGE_DECLARED_BUILD_SHA256 = "0d5c06ee444c7e2ab8937b9a3403dacca73dd67271df0c1f6f6f83ecab6bbab9";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-10-durable-capture-lease-v4";
+const BRIDGE_DECLARED_BUILD_SHA256 = "d10f938d10e56eafc36afc859a2c984cf4736f94130f401c00fb43b0abd7afbd";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -77,6 +77,7 @@ const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
+const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
 const ERROR_EXTENSION_STALE = "CHROME_BRIDGE_EXTENSION_STALE";
 const ERROR_EXTENSION_ID_MISMATCH = "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH";
@@ -179,6 +180,7 @@ let UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 0;
 let DURABLE_OWNER_STALE_SESSION_REPAIR = null;
 let RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS = null;
 let RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION = null;
+let RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = null;
 let REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
 
@@ -1228,6 +1230,8 @@ function emptyDurableOwnerLedger() {
     enabled: true,
     disableSequence: 0,
     inFlightMutation: null,
+    captureVisibleTabLease: null,
+    lastCaptureVisibleTabSettlement: null,
     openedTabs: [],
     initScripts: [],
     bindings: [],
@@ -1249,6 +1253,111 @@ function emptyDurableOwnerLedger() {
 function normalizeStoredTabId(value) {
   const tabId = Number(value);
   return Number.isSafeInteger(tabId) && tabId >= 0 ? tabId : null;
+}
+
+function normalizeStoredCaptureVisibleTabLease(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable owner ledger capture-visible-tab lease is malformed");
+  }
+  const id = String(value.id || "").trim();
+  const browserSessionId = String(value.browserSessionId || "").trim();
+  const workerBootId = String(value.workerBootId || "").trim();
+  const targetId = String(value.targetId || "").trim();
+  const status = String(value.status || "").trim();
+  const tabId = normalizeStoredTabId(value.tabId);
+  const windowId = Number(value.windowId);
+  const tileIndex = Number(value.tileIndex);
+  const tileCount = Number(value.tileCount);
+  const requestedTimeoutMs = Number(value.requestedTimeoutMs);
+  const effectiveTimeoutMs = Number(value.effectiveTimeoutMs);
+  const queuedAtUnixMs = Number(value.queuedAtUnixMs);
+  const startedAtUnixMs = value.startedAtUnixMs === null ||
+      value.startedAtUnixMs === undefined
+    ? null
+    : Number(value.startedAtUnixMs);
+  const deadlineUnixMs = Number(value.deadlineUnixMs);
+  const callerTimedOutAtUnixMs = value.callerTimedOutAtUnixMs === null ||
+      value.callerTimedOutAtUnixMs === undefined
+    ? null
+    : Number(value.callerTimedOutAtUnixMs);
+  if (
+    !id || !browserSessionId || !workerBootId ||
+    tabId === null || targetId !== targetIdForTabId(tabId) ||
+    !Number.isSafeInteger(windowId) || windowId < 0 ||
+    !Number.isSafeInteger(tileIndex) || tileIndex <= 0 ||
+    !Number.isSafeInteger(tileCount) || tileCount <= 0 || tileIndex > tileCount ||
+    !Number.isSafeInteger(requestedTimeoutMs) || requestedTimeoutMs <= 0 ||
+    !Number.isSafeInteger(effectiveTimeoutMs) || effectiveTimeoutMs <= 0 ||
+    !Number.isSafeInteger(queuedAtUnixMs) || queuedAtUnixMs <= 0 ||
+    !Number.isSafeInteger(deadlineUnixMs) || deadlineUnixMs <= queuedAtUnixMs ||
+    !["admitted", "active", "quarantined_worker_restart"].includes(status) ||
+    (status === "admitted" && startedAtUnixMs !== null) ||
+    (status !== "admitted" &&
+      (!Number.isSafeInteger(startedAtUnixMs) || startedAtUnixMs < queuedAtUnixMs)) ||
+    (callerTimedOutAtUnixMs !== null &&
+      (!Number.isSafeInteger(callerTimedOutAtUnixMs) ||
+       startedAtUnixMs === null || callerTimedOutAtUnixMs < startedAtUnixMs))
+  ) {
+    throw new Error("durable owner ledger capture-visible-tab lease fields are malformed");
+  }
+  return {
+    id,
+    browserSessionId,
+    workerBootId,
+    tabId,
+    windowId,
+    targetId,
+    tileIndex,
+    tileCount,
+    requestedTimeoutMs,
+    effectiveTimeoutMs,
+    queuedAtUnixMs,
+    startedAtUnixMs,
+    deadlineUnixMs,
+    callerTimedOutAtUnixMs,
+    status
+  };
+}
+
+function normalizeStoredCaptureVisibleTabSettlement(value) {
+  if (value === undefined || value === null) {
+    return null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("durable owner ledger capture-visible-tab settlement is malformed");
+  }
+  const leaseId = String(value.leaseId || "").trim();
+  const outcome = String(value.outcome || "").trim();
+  const workerBootId = String(value.workerBootId || "").trim();
+  const tabId = normalizeStoredTabId(value.tabId);
+  const startedAtUnixMs = Number(value.startedAtUnixMs);
+  const settledAtUnixMs = Number(value.settledAtUnixMs);
+  const elapsedMs = Number(value.elapsedMs);
+  if (
+    !leaseId || !workerBootId || tabId === null ||
+    !["fulfilled", "rejected", "browser_session_ended"].includes(outcome) ||
+    !Number.isSafeInteger(startedAtUnixMs) || startedAtUnixMs <= 0 ||
+    !Number.isSafeInteger(settledAtUnixMs) || settledAtUnixMs < startedAtUnixMs ||
+    !Number.isSafeInteger(elapsedMs) || elapsedMs < 0 ||
+    typeof value.callerTimedOut !== "boolean"
+  ) {
+    throw new Error("durable owner ledger capture-visible-tab settlement fields are malformed");
+  }
+  return {
+    leaseId,
+    outcome,
+    workerBootId,
+    tabId,
+    startedAtUnixMs,
+    settledAtUnixMs,
+    elapsedMs,
+    callerTimedOut: value.callerTimedOut,
+    errorCode: typeof value.errorCode === "string" ? value.errorCode : null,
+    errorDetail: typeof value.errorDetail === "string" ? value.errorDetail : null
+  };
 }
 
 function normalizeDurableOwnerLedger(value) {
@@ -1305,6 +1414,10 @@ function normalizeDurableOwnerLedger(value) {
   ledger.browserSessionId = source.browserSessionId.trim();
   ledger.enabled = source.enabled;
   ledger.disableSequence = source.disableSequence;
+  ledger.captureVisibleTabLease =
+    normalizeStoredCaptureVisibleTabLease(source.captureVisibleTabLease);
+  ledger.lastCaptureVisibleTabSettlement =
+    normalizeStoredCaptureVisibleTabSettlement(source.lastCaptureVisibleTabSettlement);
   if (source.inFlightMutation) {
     const activitySequence = source.inFlightMutation.activitySequence;
     const id = String(source.inFlightMutation.id || "").trim();
@@ -1461,12 +1574,14 @@ function normalizeRecoverableEmptyLedgerMissingBrowserSession(value) {
   if (
     ownerCount !== 0 ||
     ledger.inFlightMutation !== null ||
+    ledger.captureVisibleTabLease !== null ||
     ledger.disableSequence !== 0
   ) {
     throw new Error(
       "durable owner ledger browser session id is missing and the row is not a pristine " +
         `unowned ledger; owner_count=${ownerCount} ` +
         `in_flight_mutation=${ledger.inFlightMutation ? "present" : "none"} ` +
+        `capture_visible_tab_lease=${ledger.captureVisibleTabLease ? "present" : "none"} ` +
         `disable_sequence=${ledger.disableSequence} enabled=${ledger.enabled}; refusing repair`
     );
   }
@@ -1850,6 +1965,50 @@ async function restoreDurableOwnerLedger() {
           DURABLE_OWNER_LEDGER.browserSessionId ===
             DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
       }
+      if (
+        DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+        DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement
+      ) {
+        lastCaptureVisibleTabAtMs = Math.max(
+          lastCaptureVisibleTabAtMs,
+          DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement.startedAtUnixMs
+        );
+      }
+      if (
+        !DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+        DURABLE_OWNER_LEDGER.captureVisibleTabLease
+      ) {
+        const strandedLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
+        const startedAtUnixMs =
+          strandedLease.startedAtUnixMs ?? strandedLease.queuedAtUnixMs;
+        const settledAtUnixMs = Math.max(Date.now(), startedAtUnixMs);
+        RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE = {
+          ...strandedLease,
+          ledger_browser_session_id: DURABLE_OWNER_LEDGER.browserSessionId || null,
+          current_browser_session_id: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+          resolved_at_unix_ms: settledAtUnixMs,
+          resolution: "browser_session_ended"
+        };
+        DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = {
+          leaseId: strandedLease.id,
+          outcome: "browser_session_ended",
+          workerBootId: strandedLease.workerBootId,
+          tabId: strandedLease.tabId,
+          startedAtUnixMs,
+          settledAtUnixMs,
+          elapsedMs: settledAtUnixMs - startedAtUnixMs,
+          callerTimedOut: strandedLease.callerTimedOutAtUnixMs !== null,
+          errorCode: null,
+          errorDetail: null
+        };
+        DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
+        console.warn(
+          "synapse durable capture ledger: resolved captureVisibleTab lease from a prior " +
+            "browser session because its Chrome process and promise cannot still be live",
+          RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE
+        );
+        await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
+      }
       let staleOwners = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
         (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
       if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED && staleOwners > 0) {
@@ -1943,6 +2102,22 @@ async function restoreDurableOwnerLedger() {
           `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)} ` +
           `resolved_prior_session_in_flight_mutation=${RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION ? "resolved" : "none"}`;
       }
+    }
+    if (
+      DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
+      DURABLE_OWNER_LEDGER.captureVisibleTabLease &&
+      DURABLE_OWNER_LEDGER.captureVisibleTabLease.workerBootId !==
+        DURABLE_OWNER_WORKER_BOOT_ID
+    ) {
+      DURABLE_OWNER_LEDGER.captureVisibleTabLease.status =
+        "quarantined_worker_restart";
+      await persistDurableOwnerLedgerRepairSnapshot({ duringRestore: true });
+      console.error(
+        "synapse durable capture ledger: captureVisibleTab settlement became " +
+          "unobservable across a service-worker restart; capture remains quarantined " +
+          "until Chrome establishes a new browser session",
+        DURABLE_OWNER_LEDGER.captureVisibleTabLease
+      );
     }
     if (
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
@@ -3067,6 +3242,12 @@ async function sha256HexText(value) {
 }
 
 function bridgeIdentity() {
+  const captureLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
+  const captureLeaseContinuityHealthy = !captureLease || (
+    captureLease.workerBootId === DURABLE_OWNER_WORKER_BOOT_ID &&
+    captureLease.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
+    ["admitted", "active"].includes(captureLease.status)
+  );
   const durableOwnerContinuityHealthy = DURABLE_OWNER_STATE_LOADED &&
     !DURABLE_OWNER_STATE_LOAD_ERROR &&
     DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
@@ -3075,7 +3256,8 @@ function bridgeIdentity() {
     STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
     !DURABLE_OWNER_LEDGER.inFlightMutation &&
     DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length === 0 &&
-    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0;
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
+    captureLeaseContinuityHealthy;
   return {
     extensionId: chrome.runtime.id,
     version: chrome.runtime.getManifest().version,
@@ -3130,6 +3312,10 @@ function bridgeIdentity() {
         ),
         unresolved_debugger_command_timeout_count:
           DURABLE_OWNER_LEDGER.unresolvedDebuggerCommandTimeouts.length,
+        capture_visible_tab_lease: captureLease,
+        last_capture_visible_tab_settlement:
+          DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement,
+        capture_visible_tab_continuity_healthy: captureLeaseContinuityHealthy,
         unresolved_worker_restart_mutation_count:
           UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
         owner_continuity_healthy: durableOwnerContinuityHealthy,
@@ -5087,6 +5273,10 @@ async function handleCapturePageScreenshot(params) {
 async function handlePageScreenshot(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const request = normalizePageScreenshotRequest(params, selected.tabId);
+  await DURABLE_OWNER_STATE_READY;
+  if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
+    throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
+  }
   const commandStartedAtMs = Date.now();
   const commandDeadlineMs =
     commandStartedAtMs + Math.min(request.waitTimeoutMs, PAGE_SCREENSHOT_COMMAND_RESPONSE_BUDGET_MS);
@@ -5229,8 +5419,13 @@ async function handlePageScreenshot(params) {
       } catch (error) {
         attempt.error_detail = errorMessage(error);
         attempt.retryable = error?.code === ERROR_EXTENSION_TIMEOUT;
+        const captureErrorCode =
+          error?.code === ERROR_EXTENSION_TIMEOUT ||
+          error?.code === ERROR_CAPTURE_VISIBLE_TAB_PENDING
+            ? error.code
+            : ERROR_ATTACH_FAILED;
         throw bridgeError(
-          error?.code === ERROR_EXTENSION_TIMEOUT ? ERROR_EXTENSION_TIMEOUT : ERROR_ATTACH_FAILED,
+          captureErrorCode,
           `pageScreenshot chrome.tabs.captureVisibleTab(window=${before.chrome_window_id}) failed: ${errorMessage(error)}`
         );
       } finally {
@@ -13556,12 +13751,25 @@ function operatorPanicActiveOwners() {
     locale_override_count: DURABLE_OWNER_LEDGER.localeOverrides.length,
     media_override_count: DURABLE_OWNER_LEDGER.mediaOverrides.length,
     network_override_count: DURABLE_OWNER_LEDGER.networkOverrides.length,
+    capture_visible_tab_pending_count:
+      ["admitted", "active"].includes(
+        DURABLE_OWNER_LEDGER.captureVisibleTabLease?.status
+      ) ? 1 : 0,
+    capture_visible_tab_quarantined_count:
+      DURABLE_OWNER_LEDGER.captureVisibleTabLease?.status ===
+        "quarantined_worker_restart" ? 1 : 0,
     mutation_handler_in_flight_count: MUTATION_HANDLER_IN_FLIGHT_COUNT
   };
 }
 
 function operatorPanicOwnerReadback() {
   const activeAfter = operatorPanicActiveOwners();
+  const captureLease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
+  const captureLeaseContinuityHealthy = !captureLease || (
+    captureLease.workerBootId === DURABLE_OWNER_WORKER_BOOT_ID &&
+    captureLease.browserSessionId === DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID &&
+    ["admitted", "active"].includes(captureLease.status)
+  );
   return {
     enabled: DURABLE_MUTATION_OWNERS_ENABLED,
     disable_sequence: DURABLE_MUTATION_DISABLE_SEQUENCE,
@@ -13583,6 +13791,9 @@ function operatorPanicOwnerReadback() {
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     persisted_state_revision: DURABLE_OWNER_LEDGER.revision,
     persisted_in_flight_mutation: DURABLE_OWNER_LEDGER.inFlightMutation,
+    capture_visible_tab_lease: captureLease,
+    last_capture_visible_tab_settlement:
+      DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement,
     resolved_prior_session_in_flight_mutation:
       RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION,
     unresolved_debugger_command_timeouts:
@@ -13597,12 +13808,15 @@ function operatorPanicOwnerReadback() {
       })),
     resolved_prior_session_debugger_command_timeouts:
       RESOLVED_PRIOR_SESSION_DEBUGGER_COMMAND_TIMEOUTS,
+    resolved_prior_session_capture_visible_tab_lease:
+      RESOLVED_PRIOR_SESSION_CAPTURE_VISIBLE_TAB_LEASE,
     unresolved_worker_restart_mutation_count: UNRESOLVED_WORKER_RESTART_MUTATION_COUNT,
     owner_continuity_healthy: DURABLE_OWNER_STATE_LOADED &&
       !DURABLE_OWNER_STATE_LOAD_ERROR &&
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED &&
       STALE_BROWSER_SESSION_OWNER_COUNT === 0 &&
-      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0,
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT === 0 &&
+      captureLeaseContinuityHealthy,
     active_after: activeAfter,
     fully_drained: !DURABLE_MUTATION_OWNERS_ENABLED &&
       DURABLE_OWNER_STATE_LOADED &&
@@ -25818,60 +26032,303 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function captureVisibleTabPendingError(lease) {
+  const ageMs = Math.max(0, Date.now() - (lease.startedAtUnixMs ?? lease.queuedAtUnixMs));
+  const remediation = lease.status === "quarantined_worker_restart"
+    ? "fully restart Chrome so a new browser-session identity proves the prior Chrome API operation cannot still be live"
+    : "wait for this exact lease to settle; do not retry or start a parallel capture";
+  return bridgeError(
+    ERROR_CAPTURE_VISIBLE_TAB_PENDING,
+    "chrome.tabs.captureVisibleTab admission refused because an earlier uncancellable Chrome " +
+      `promise still owns the capture slot; lease_id=${lease.id} status=${lease.status} ` +
+      `age_ms=${ageMs} browser_session_id=${lease.browserSessionId} ` +
+      `worker_boot_id=${lease.workerBootId} tab_id=${lease.tabId} window_id=${lease.windowId} ` +
+      `target_id=${lease.targetId} tile=${lease.tileIndex}/${lease.tileCount} ` +
+      `started_at_unix_ms=${String(lease.startedAtUnixMs ?? "not_started")} ` +
+      `deadline_unix_ms=${lease.deadlineUnixMs} ` +
+      `caller_timed_out_at_unix_ms=${String(lease.callerTimedOutAtUnixMs ?? "none")} ` +
+      `queue_recovered=false remediation=${remediation}`
+  );
+}
+
+async function markCaptureVisibleTabCallerTimedOut(leaseId) {
+  const lease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
+  if (!lease || lease.id !== leaseId) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      "captureVisibleTab deadline fired after durable lease identity changed; " +
+        `expected_lease_id=${leaseId} actual_lease_id=${String(lease?.id || "none")}; ` +
+        "the caller outcome is unprovable; inspect operatorPanicReadback before retrying"
+    );
+  }
+  if (lease.callerTimedOutAtUnixMs === null) {
+    lease.callerTimedOutAtUnixMs = Date.now();
+  }
+  try {
+    await persistDurableOwnerLedger();
+  } catch (error) {
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `persist captureVisibleTab caller deadline failed: ${errorMessage(error)}`;
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      "captureVisibleTab caller deadline could not be persisted; " +
+        `lease_id=${leaseId} error=${errorMessage(error)}; ` +
+        "capture remains quarantined in memory and the caller outcome is unprovable"
+    );
+  }
+  return lease.callerTimedOutAtUnixMs;
+}
+
+async function settleCaptureVisibleTabLease(leaseId, outcome, error = null) {
+  const lease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
+  if (!lease || lease.id !== leaseId) {
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `captureVisibleTab raw settlement lost durable lease identity expected=${leaseId} ` +
+      `actual=${String(lease?.id || "none")}`;
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `${DURABLE_OWNER_STATE_LOAD_ERROR}; refusing to publish a caller result`
+    );
+  }
+  const priorSettlement = DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement;
+  const startedAtUnixMs = lease.startedAtUnixMs ?? lease.queuedAtUnixMs;
+  const settledAtUnixMs = Math.max(Date.now(), startedAtUnixMs);
+  const settlement = {
+    leaseId: lease.id,
+    outcome,
+    workerBootId: lease.workerBootId,
+    tabId: lease.tabId,
+    startedAtUnixMs,
+    settledAtUnixMs,
+    elapsedMs: settledAtUnixMs - startedAtUnixMs,
+    callerTimedOut: lease.callerTimedOutAtUnixMs !== null,
+    errorCode: error?.code ? String(error.code) : null,
+    errorDetail: error ? redactPublicErrorDetail(errorMessage(error)).slice(0, 1024) : null
+  };
+  DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
+  DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = settlement;
+  try {
+    await persistDurableOwnerLedger();
+  } catch (persistError) {
+    DURABLE_OWNER_LEDGER.captureVisibleTabLease = lease;
+    DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = priorSettlement;
+    DURABLE_OWNER_STATE_LOAD_ERROR =
+      `persist captureVisibleTab raw settlement failed: ${errorMessage(persistError)}`;
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      "captureVisibleTab raw Chrome promise settled, but its durable terminal transition " +
+        `failed; lease_id=${lease.id} outcome=${outcome} ` +
+        `error=${errorMessage(persistError)}; the slot remains quarantined`
+    );
+  }
+  return settlement;
+}
+
 async function captureVisibleTabWithQuota(windowId, options, timeoutMs, context = {}) {
+  await DURABLE_OWNER_STATE_READY;
+  if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      "chrome.tabs.captureVisibleTab refused because its durable lease ledger is unavailable; " +
+        `loaded=${DURABLE_OWNER_STATE_LOADED} ` +
+        `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}`
+    );
+  }
+  if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
+    throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
+  }
+
   const queuedAtMs = Date.now();
-  let queueWaitMs = 0;
-  let quotaWaitMs = 0;
-  let effectiveTimeoutMs = 0;
-  let captureStartedAtMs = 0;
-  let captureElapsedMs = 0;
-  const run = captureVisibleTabQueue.catch(() => undefined).then(async () => {
-    queueWaitMs = Date.now() - queuedAtMs;
-    quotaWaitMs = Math.max(
+  const requestedTimeoutMs = Math.floor(Number(timeoutMs));
+  if (!Number.isSafeInteger(requestedTimeoutMs) || requestedTimeoutMs <= 0) {
+    throw bridgeError(
+      ERROR_EXTENSION_TIMEOUT,
+      `chrome.tabs.captureVisibleTab received invalid timeout_ms=${String(timeoutMs)}`
+    );
+  }
+  const callerDeadlineMs = queuedAtMs + requestedTimeoutMs;
+  // Reserve a place in the queue synchronously, before the first queue/quota
+  // await. Without this reservation, two callers can both observe an empty
+  // lease, sleep for the same quota interval, and then overwrite each other's
+  // durable admission row. Each reservation resolves only after its raw Chrome
+  // promise and durable terminal transition settle.
+  const priorCaptureQueue = captureVisibleTabQueue.catch(() => undefined);
+  let releaseCaptureQueue;
+  const captureQueueOwnership = new Promise((resolve) => {
+    releaseCaptureQueue = resolve;
+  });
+  captureVisibleTabQueue = priorCaptureQueue.then(() => captureQueueOwnership);
+  let queueReleaseBoundToRawSettlement = false;
+  try {
+    await priorCaptureQueue;
+    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+      throw bridgeError(
+        ERROR_ACTION_TARGET_INVALID,
+        "chrome.tabs.captureVisibleTab queue admission refused because the durable lease " +
+          `ledger became unavailable while waiting; loaded=${DURABLE_OWNER_STATE_LOADED} ` +
+          `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}; ` +
+          "remediation=fully restart Chrome so a new browser session independently reconciles storage"
+      );
+    }
+    if (DURABLE_OWNER_LEDGER.captureVisibleTabLease) {
+      throw captureVisibleTabPendingError(DURABLE_OWNER_LEDGER.captureVisibleTabLease);
+    }
+    const queueWaitMs = Date.now() - queuedAtMs;
+    const quotaWaitMs = Math.max(
       0,
       lastCaptureVisibleTabAtMs + CAPTURE_VISIBLE_TAB_MIN_INTERVAL_MS - Date.now()
     );
     if (quotaWaitMs > 0) {
       await sleep(quotaWaitMs);
     }
-    effectiveTimeoutMs = Math.floor(Number(timeoutMs) - queueWaitMs - quotaWaitMs);
-    if (!Number.isFinite(effectiveTimeoutMs) || effectiveTimeoutMs <= 0) {
+    let effectiveTimeoutMs = callerDeadlineMs - Date.now();
+    if (effectiveTimeoutMs <= 0) {
       throw bridgeError(
         ERROR_EXTENSION_TIMEOUT,
-        "chrome.tabs.captureVisibleTab was not started because queue/quota wait exhausted the screenshot deadline; " +
-          `${formatPageScreenshotCaptureContext(context)} timeout_ms=${timeoutMs} ` +
+        "chrome.tabs.captureVisibleTab was not started because queue/quota wait exhausted the " +
+          `screenshot deadline; ${formatPageScreenshotCaptureContext(context)} ` +
+          `timeout_ms=${requestedTimeoutMs} queue_wait_ms=${queueWaitMs} ` +
+          `quota_wait_ms=${quotaWaitMs} queue_recovered=true`
+      );
+    }
+
+    const lease = {
+      id: typeof globalThis.crypto?.randomUUID === "function"
+        ? globalThis.crypto.randomUUID()
+        : `capture-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      browserSessionId: DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID,
+      workerBootId: DURABLE_OWNER_WORKER_BOOT_ID,
+      tabId: Number(context.tabId),
+      windowId: Number(windowId),
+      targetId: String(context.targetId || ""),
+      tileIndex: Number(context.tileIndex),
+      tileCount: Number(context.tileCount),
+      requestedTimeoutMs,
+      effectiveTimeoutMs,
+      queuedAtUnixMs: queuedAtMs,
+      startedAtUnixMs: null,
+      deadlineUnixMs: callerDeadlineMs,
+      callerTimedOutAtUnixMs: null,
+      status: "admitted"
+    };
+    normalizeStoredCaptureVisibleTabLease(lease);
+    DURABLE_OWNER_LEDGER.captureVisibleTabLease = lease;
+    try {
+      await persistDurableOwnerLedger();
+    } catch (error) {
+      DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist captureVisibleTab durable admission failed: ${errorMessage(error)}`;
+      throw bridgeError(
+        ERROR_ACTION_TARGET_INVALID,
+        "chrome.tabs.captureVisibleTab was not started because durable admission could not " +
+          `be proven; lease_id=${lease.id} raw_promise_started=false ` +
+          `error=${errorMessage(error)}; remediation=fully restart Chrome so the next browser ` +
+          "session independently reconciles any ambiguous storage row before retrying"
+      );
+    }
+
+    effectiveTimeoutMs = callerDeadlineMs - Date.now();
+    if (effectiveTimeoutMs <= 0) {
+      await settleCaptureVisibleTabLease(
+        lease.id,
+        "rejected",
+        bridgeError(ERROR_EXTENSION_TIMEOUT, "durable lease persistence exhausted deadline")
+      );
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        "chrome.tabs.captureVisibleTab was not started because durable admission exhausted the " +
+          `screenshot deadline; lease_id=${lease.id} ` +
+          `${formatPageScreenshotCaptureContext(context)} timeout_ms=${requestedTimeoutMs} ` +
           `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} queue_recovered=true`
       );
     }
-    captureStartedAtMs = Date.now();
+
+    lease.startedAtUnixMs = Date.now();
+    lease.effectiveTimeoutMs = callerDeadlineMs - lease.startedAtUnixMs;
+    lease.status = "active";
+    lastCaptureVisibleTabAtMs = lease.startedAtUnixMs;
+    let rawPromise;
     try {
-      return await withTimeout(
-        chrome.tabs.captureVisibleTab(windowId, options),
-        effectiveTimeoutMs,
-        "chrome.tabs.captureVisibleTab"
-      );
-    } finally {
-      captureElapsedMs = Date.now() - captureStartedAtMs;
-      lastCaptureVisibleTabAtMs = Date.now();
+      rawPromise = chrome.tabs.captureVisibleTab(windowId, options);
+    } catch (error) {
+      await settleCaptureVisibleTabLease(lease.id, "rejected", error);
+      throw error;
     }
-  });
-  captureVisibleTabQueue = run.catch(() => undefined);
-  try {
-    return await run;
-  } catch (error) {
-    const detail = errorMessage(error);
-    if (detail.includes("timed out after")) {
+    const activeLeasePersisted = persistDurableOwnerLedger();
+    const settlementPromise = rawPromise.then(
+      async (result) => {
+        await activeLeasePersisted;
+        await settleCaptureVisibleTabLease(lease.id, "fulfilled");
+        return result;
+      },
+      async (error) => {
+        await activeLeasePersisted;
+        await settleCaptureVisibleTabLease(lease.id, "rejected", error);
+        throw error;
+      }
+    );
+    settlementPromise.then(releaseCaptureQueue, releaseCaptureQueue);
+    queueReleaseBoundToRawSettlement = true;
+    try {
+      await activeLeasePersisted;
+    } catch (error) {
+      DURABLE_OWNER_STATE_LOAD_ERROR =
+        `persist captureVisibleTab active lease failed: ${errorMessage(error)}`;
       throw bridgeError(
-        ERROR_EXTENSION_TIMEOUT,
-        "chrome.tabs.captureVisibleTab did not settle before the screenshot command deadline; " +
-          `${formatPageScreenshotCaptureContext(context)} ` +
-          `timeout_ms=${timeoutMs} effective_timeout_ms=${effectiveTimeoutMs} ` +
-          `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} ` +
-          `capture_elapsed_ms=${captureElapsedMs || Math.max(0, Date.now() - captureStartedAtMs)} ` +
-          `queue_recovered=true`
+        ERROR_ACTION_TARGET_INVALID,
+        "chrome.tabs.captureVisibleTab raw promise started, but its active durable lease could " +
+          `not be proven; lease_id=${lease.id} error=${errorMessage(error)}; ` +
+          "the queue remains bound to the raw promise settlement and the bridge is fail-closed; " +
+          "remediation=fully restart Chrome after this call returns"
       );
     }
-    throw error;
+
+    let callerTimeoutTriggered = false;
+    let callerTimeoutCompletion = null;
+    let timeoutId = null;
+    const timeoutPromise = new Promise((_, reject) => {
+      const remainingMs = Math.max(0, callerDeadlineMs - Date.now());
+      timeoutId = setTimeout(() => {
+        callerTimeoutTriggered = true;
+        callerTimeoutCompletion = markCaptureVisibleTabCallerTimedOut(lease.id)
+          .then((timedOutAtUnixMs) => bridgeError(
+            ERROR_EXTENSION_TIMEOUT,
+            "chrome.tabs.captureVisibleTab did not settle before the screenshot command " +
+              `deadline; lease_id=${lease.id} ${formatPageScreenshotCaptureContext(context)} ` +
+              `timeout_ms=${requestedTimeoutMs} effective_timeout_ms=${lease.effectiveTimeoutMs} ` +
+              `queue_wait_ms=${queueWaitMs} quota_wait_ms=${quotaWaitMs} ` +
+              `capture_elapsed_ms=${Math.max(0, timedOutAtUnixMs - lease.startedAtUnixMs)} ` +
+              "queue_recovered=false late_fulfillment_discarded=true"
+          ));
+        callerTimeoutCompletion.then(reject, reject);
+      }, remainingMs);
+    });
+    const callerSettlement = settlementPromise.then(
+      async (result) => {
+        if (callerTimeoutTriggered) {
+          throw await callerTimeoutCompletion;
+        }
+        return result;
+      },
+      async (error) => {
+        if (callerTimeoutTriggered) {
+          throw await callerTimeoutCompletion;
+        }
+        throw error;
+      }
+    );
+    try {
+      return await Promise.race([callerSettlement, timeoutPromise]);
+    } finally {
+      if (timeoutId !== null && !callerTimeoutTriggered) {
+        clearTimeout(timeoutId);
+      }
+    }
+  } finally {
+    if (!queueReleaseBoundToRawSettlement) {
+      releaseCaptureQueue();
+    }
   }
 }
 

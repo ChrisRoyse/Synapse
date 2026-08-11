@@ -38,6 +38,11 @@ fn main() {
         .and_then(Path::parent)
         .unwrap_or(&manifest_dir)
         .to_path_buf();
+    verify_chrome_bridge_declared_identity(&source_dir).unwrap_or_else(|reason| {
+        panic!(
+            "SYNAPSE_CHROME_BRIDGE_DECLARED_IDENTITY_MISMATCH: {reason}; remediation=update the service-worker BRIDGE_BUILD_ID/BRIDGE_DECLARED_BUILD_SHA256 and daemon EXPECTED_EXTENSION_BUILD_ID/EXPECTED_EXTENSION_DECLARED_BUILD_SHA256 together"
+        )
+    });
 
     let build_unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -130,6 +135,88 @@ fn main() {
          source, Git, or input error. Only a deliberate source-tarball build may set \
          SYNAPSE_BUILD_ALLOW_UNKNOWN_PROVENANCE=1; that binary reports status=error at runtime."
     );
+}
+
+fn verify_chrome_bridge_declared_identity(source_dir: &Path) -> Result<(), String> {
+    let worker_path = source_dir
+        .join("extensions")
+        .join("synapse-chrome-debugger")
+        .join("service_worker.js");
+    let daemon_path = source_dir
+        .join("crates")
+        .join("synapse-mcp")
+        .join("src")
+        .join("chrome_debugger_bridge")
+        .join("mod.rs");
+    rerun_if_changed(&worker_path);
+    rerun_if_changed(&daemon_path);
+    let worker = std::fs::read_to_string(&worker_path).map_err(|error| {
+        format!(
+            "read extension identity source {} failed: {error}",
+            worker_path.display()
+        )
+    })?;
+    let daemon = std::fs::read_to_string(&daemon_path).map_err(|error| {
+        format!(
+            "read daemon identity source {} failed: {error}",
+            daemon_path.display()
+        )
+    })?;
+    let worker_build = extract_string_constant(&worker, "BRIDGE_BUILD_ID")?;
+    let daemon_build = extract_string_constant(&daemon, "EXPECTED_EXTENSION_BUILD_ID")?;
+    let worker_declared = extract_string_constant(&worker, "BRIDGE_DECLARED_BUILD_SHA256")?;
+    let daemon_declared =
+        extract_string_constant(&daemon, "EXPECTED_EXTENSION_DECLARED_BUILD_SHA256")?;
+    if worker_build != daemon_build {
+        return Err(format!(
+            "build_id extension={worker_build:?} daemon={daemon_build:?}"
+        ));
+    }
+    if worker_declared != daemon_declared {
+        return Err(format!(
+            "declared_sha256 extension={worker_declared:?} daemon={daemon_declared:?}"
+        ));
+    }
+    if worker_declared.len() != 64
+        || !worker_declared
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "declared_sha256 is not exactly 64 lowercase hexadecimal characters: {worker_declared:?}"
+        ));
+    }
+    let computed = sha256_hex(worker_build.as_bytes());
+    if worker_declared != computed {
+        return Err(format!(
+            "declared_sha256 does not commit to build_id: build_id={worker_build:?} declared={worker_declared:?} computed={computed:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn extract_string_constant<'a>(source: &'a str, name: &str) -> Result<&'a str, String> {
+    let marker = format!("const {name}");
+    let matches = source.match_indices(&marker).collect::<Vec<_>>();
+    if matches.len() != 1 {
+        return Err(format!(
+            "constant {name} must have exactly one declaration; found {}",
+            matches.len()
+        ));
+    }
+    let declaration = &source[matches[0].0 + marker.len()..];
+    let assignment = declaration
+        .find('=')
+        .map(|offset| &declaration[offset + 1..])
+        .ok_or_else(|| format!("constant {name} has no assignment"))?;
+    let opening = assignment
+        .find('"')
+        .ok_or_else(|| format!("constant {name} has no opening string quote"))?;
+    let value = &assignment[opening + 1..];
+    let closing = value
+        .find('"')
+        .ok_or_else(|| format!("constant {name} has no closing string quote"))?;
+    Ok(&value[..closing])
 }
 
 struct InputAttestation {

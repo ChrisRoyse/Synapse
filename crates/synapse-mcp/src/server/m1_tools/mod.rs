@@ -66,14 +66,14 @@ use rmcp::{RoleServer, model::ErrorCode, service::RequestContext};
 
 use std::{
     collections::HashMap,
-    io::Read as _,
+    io::{self, Read as _, Write as _},
     path::{Path, PathBuf},
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(windows)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use chrono::{DateTime, Utc};
@@ -18489,7 +18489,12 @@ fn write_screenshot_bitmap_with_quality(
     let (captured, scale) =
         downscale_captured_bitmap(captured, params.max_pixels, params.max_long_edge)?;
     save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
-    install_screenshot_file(&temp_path, &output_path, params.overwrite)?;
+    let (published_bytes, published_sha256) = publish_atomic_artifact(
+        &temp_path,
+        &output_path,
+        params.overwrite,
+        "capture_screenshot",
+    )?;
     let metadata = std::fs::metadata(&output_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,
@@ -18508,27 +18513,24 @@ fn write_screenshot_bitmap_with_quality(
             ),
         ));
     }
-    let file_bytes = std::fs::read(&output_path).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "capture_screenshot file hash readback failed for {}: {error}",
-                output_path.display()
-            ),
-        )
-    })?;
-    if u64::try_from(file_bytes.len()).unwrap_or(u64::MAX) != metadata.len() {
+    let (readback_bytes, bitmap_sha256) = sha256_artifact_file(&output_path, "capture_screenshot")?;
+    if readback_bytes != metadata.len()
+        || published_bytes != metadata.len()
+        || published_sha256 != bitmap_sha256
+    {
         return Err(mcp_error(
             error_codes::STORAGE_READ_FAILED,
             format!(
-                "capture_screenshot file readback length mismatch for {}: metadata={} read={}",
+                "capture_screenshot file readback mismatch for {}: metadata={} published_bytes={} readback_bytes={} published_sha256={} readback_sha256={}",
                 output_path.display(),
                 metadata.len(),
-                file_bytes.len()
+                published_bytes,
+                readback_bytes,
+                published_sha256,
+                bitmap_sha256
             ),
         ));
     }
-    let bitmap_sha256 = sha256_hex(&file_bytes);
     Ok(CaptureScreenshotResponse {
         path: output_path.to_string_lossy().into_owned(),
         format,
@@ -18870,6 +18872,490 @@ fn ensure_download_output_path_available(path: &Path, overwrite: bool) -> Result
     Ok(())
 }
 
+const ARTIFACT_QUARANTINE_PREFIX: &str = ".synapse-publish-quarantine.";
+const ARTIFACT_QUARANTINE_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
+const ARTIFACT_QUARANTINE_SCAN_LIMIT: usize = 256;
+
+#[derive(Debug)]
+struct ArtifactPublishFailure {
+    error: io::Error,
+    attempts: u32,
+    elapsed_ms: u128,
+}
+
+fn cleanup_expired_artifact_quarantines(parent: &Path, label: &'static str) {
+    let now = SystemTime::now();
+    let entries = match std::fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::error!(
+                code = "SYNAPSE_ARTIFACT_QUARANTINE_SCAN_FAILED",
+                label,
+                parent = %parent.display(),
+                error = %error,
+                "age-bounded artifact quarantine cleanup could not scan its exact parent"
+            );
+            return;
+        }
+    };
+    let mut candidates = 0_usize;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::error!(
+                    code = "SYNAPSE_ARTIFACT_QUARANTINE_ENTRY_FAILED",
+                    label,
+                    parent = %parent.display(),
+                    error = %error,
+                    "age-bounded artifact quarantine cleanup could not read a directory entry"
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if !name
+            .to_string_lossy()
+            .starts_with(ARTIFACT_QUARANTINE_PREFIX)
+        {
+            continue;
+        }
+        candidates = candidates.saturating_add(1);
+        if candidates > ARTIFACT_QUARANTINE_SCAN_LIMIT {
+            tracing::error!(
+                code = "SYNAPSE_ARTIFACT_QUARANTINE_SCAN_LIMIT_EXCEEDED",
+                label,
+                parent = %parent.display(),
+                scan_limit = ARTIFACT_QUARANTINE_SCAN_LIMIT,
+                "artifact quarantine population exceeds the bounded cleanup scan; inspect and archive the exact directory"
+            );
+            break;
+        }
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::error!(
+                    code = "SYNAPSE_ARTIFACT_QUARANTINE_METADATA_FAILED",
+                    label,
+                    path = %path.display(),
+                    error = %error,
+                    "artifact quarantine cleanup could not read file age"
+                );
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            tracing::error!(
+                code = "SYNAPSE_ARTIFACT_QUARANTINE_NOT_FILE",
+                label,
+                path = %path.display(),
+                "artifact quarantine namespace contains a non-file entry; refusing removal"
+            );
+            continue;
+        }
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age.as_secs() >= ARTIFACT_QUARANTINE_MAX_AGE_SECS);
+        if !old_enough {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::info!(
+                code = "SYNAPSE_ARTIFACT_QUARANTINE_EXPIRED_REMOVED",
+                label,
+                path = %path.display(),
+                max_age_secs = ARTIFACT_QUARANTINE_MAX_AGE_SECS,
+                "removed expired atomic-publication evidence"
+            ),
+            Err(error) => tracing::error!(
+                code = "SYNAPSE_ARTIFACT_QUARANTINE_EXPIRED_REMOVE_FAILED",
+                label,
+                path = %path.display(),
+                error = %error,
+                max_age_secs = ARTIFACT_QUARANTINE_MAX_AGE_SECS,
+                "expired atomic-publication evidence could not be removed"
+            ),
+        }
+    }
+}
+
+fn create_artifact_staging_file(
+    path: &Path,
+    label: &'static str,
+) -> Result<std::fs::File, ErrorData> {
+    let parent = path.parent().ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!("{label} staging path has no parent: {}", path.display()),
+        )
+    })?;
+    if !parent.is_dir() {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "{label} staging parent is not a directory: {}",
+                parent.display()
+            ),
+        ));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+        options.share_mode(FILE_SHARE_READ_DELETE);
+    }
+    options.open(path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "{label} failed to create exclusive staging file {} with share-delete semantics: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn open_artifact_file_for_read(
+    path: &Path,
+    label: &'static str,
+) -> Result<std::fs::File, ErrorData> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        const FILE_SHARE_READ_DELETE: u32 = 0x1 | 0x4;
+        options.share_mode(FILE_SHARE_READ_DELETE);
+    }
+    options.open(path).map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{label} failed to open artifact {} with share-delete semantics: {error}",
+                path.display()
+            ),
+        )
+    })
+}
+
+fn flush_artifact_staging_file(
+    file: std::fs::File,
+    path: &Path,
+    label: &'static str,
+) -> Result<(), ErrorData> {
+    file.sync_all().map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "{label} failed to flush encoded staging bytes at {}: {error}",
+                path.display()
+            ),
+        )
+    })?;
+    drop(file);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn path_to_nul_terminated_wide(path: &Path) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt as _;
+    path.as_os_str().encode_wide().chain(Some(0)).collect()
+}
+
+#[cfg(windows)]
+fn move_artifact_write_through(
+    source: &Path,
+    destination: &Path,
+    overwrite: bool,
+    label: &'static str,
+) -> Result<(u32, u128), ArtifactPublishFailure> {
+    use windows::{
+        Win32::{
+            Foundation::ERROR_SHARING_VIOLATION,
+            Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        },
+        core::PCWSTR,
+    };
+
+    const MAX_ATTEMPTS: u32 = 24;
+    const BACKOFF_START_MS: u64 = 1;
+    const BACKOFF_CAP_MS: u64 = 50;
+    let source_wide = path_to_nul_terminated_wide(source);
+    let destination_wide = path_to_nul_terminated_wide(destination);
+    let flags = if overwrite {
+        MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING
+    } else {
+        MOVEFILE_WRITE_THROUGH
+    };
+    let started = Instant::now();
+    let mut backoff_ms = BACKOFF_START_MS;
+    for attempt in 1..=MAX_ATTEMPTS {
+        // SAFETY: both path buffers are NUL-terminated and remain alive for the call.
+        match unsafe {
+            MoveFileExW(
+                PCWSTR(source_wide.as_ptr()),
+                PCWSTR(destination_wide.as_ptr()),
+                flags,
+            )
+        } {
+            Ok(()) => return Ok((attempt, started.elapsed().as_millis())),
+            Err(error) => {
+                let low_code = (error.code().0 as u32) & 0xFFFF;
+                let retryable = low_code == ERROR_SHARING_VIOLATION.0;
+                tracing::warn!(
+                    code = "SYNAPSE_ARTIFACT_PUBLISH_MOVE_FAILED",
+                    label,
+                    source = %source.display(),
+                    destination = %destination.display(),
+                    overwrite,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    os_error = low_code,
+                    retryable,
+                    destination_exists = destination.try_exists().ok(),
+                    "write-through atomic artifact publication attempt failed"
+                );
+                if retryable && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(Duration::from_millis(backoff_ms));
+                    backoff_ms = backoff_ms.saturating_mul(2).min(BACKOFF_CAP_MS);
+                    continue;
+                }
+                return Err(ArtifactPublishFailure {
+                    error: io::Error::from_raw_os_error(low_code as i32),
+                    attempts: attempt,
+                    elapsed_ms: started.elapsed().as_millis(),
+                });
+            }
+        }
+    }
+    Err(ArtifactPublishFailure {
+        error: io::Error::other("atomic publication exhausted without terminal result"),
+        attempts: MAX_ATTEMPTS,
+        elapsed_ms: started.elapsed().as_millis(),
+    })
+}
+
+#[cfg(not(windows))]
+fn move_artifact_write_through(
+    source: &Path,
+    destination: &Path,
+    overwrite: bool,
+    _label: &'static str,
+) -> Result<(u32, u128), ArtifactPublishFailure> {
+    let started = std::time::Instant::now();
+    let result = if overwrite {
+        std::fs::rename(source, destination)
+    } else {
+        std::fs::hard_link(source, destination).and_then(|()| std::fs::remove_file(source))
+    };
+    result
+        .map(|()| (1, started.elapsed().as_millis()))
+        .map_err(|error| ArtifactPublishFailure {
+            error,
+            attempts: 1,
+            elapsed_ms: started.elapsed().as_millis(),
+        })
+}
+
+fn artifact_quarantine_path(output_path: &Path) -> PathBuf {
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    output_path.with_file_name(format!(
+        "{ARTIFACT_QUARANTINE_PREFIX}{}.{}.bin",
+        std::process::id(),
+        now_ns
+    ))
+}
+
+fn artifact_path_state(path: &Path, label: &'static str) -> String {
+    match path.try_exists() {
+        Ok(false) => "absent".to_owned(),
+        Err(error) => format!("existence_error={error}"),
+        Ok(true) => match sha256_artifact_file(path, label) {
+            Ok((bytes, sha256)) => format!("present bytes={bytes} sha256={sha256}"),
+            Err(error) => format!("present readback_error={}", error.message),
+        },
+    }
+}
+
+fn quarantine_artifact_publish_failure(
+    temp_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+    label: &'static str,
+    expected_bytes: u64,
+    expected_sha256: &str,
+    failure: ArtifactPublishFailure,
+) -> ErrorData {
+    if let Some(parent) = output_path.parent() {
+        // Keep the hot publication path scan-free. Cleanup runs only after a
+        // real terminal publication failure, and only for evidence older than
+        // the documented retention window.
+        cleanup_expired_artifact_quarantines(parent, label);
+    }
+    let quarantine_path = artifact_quarantine_path(output_path);
+    let quarantine_transition = match std::fs::rename(temp_path, &quarantine_path) {
+        Ok(()) => format!(
+            "retained path={} state={}",
+            quarantine_path.display(),
+            artifact_path_state(&quarantine_path, label)
+        ),
+        Err(error) => format!(
+            "retain_failed error={error} original_temp_path={} original_temp_state={}",
+            temp_path.display(),
+            artifact_path_state(temp_path, label)
+        ),
+    };
+    let destination_state = artifact_path_state(output_path, label);
+    tracing::error!(
+        code = "SYNAPSE_ARTIFACT_PUBLISH_TERMINAL",
+        label,
+        source = %temp_path.display(),
+        destination = %output_path.display(),
+        overwrite,
+        attempts = failure.attempts,
+        elapsed_ms = failure.elapsed_ms,
+        error = %failure.error,
+        os_error = failure.error.raw_os_error(),
+        expected_bytes,
+        expected_sha256,
+        quarantine = %quarantine_transition,
+        destination_state = %destination_state,
+        "atomic artifact publication failed and encoded evidence was retained"
+    );
+    mcp_error(
+        error_codes::STORAGE_WRITE_FAILED,
+        format!(
+            concat!(
+                "SYNAPSE_ARTIFACT_PUBLISH_TERMINAL label={} source={} destination={} ",
+                "overwrite={} attempts={} elapsed_ms={} os_error={} error={} ",
+                "encoded_bytes={} encoded_sha256={} ",
+                "destination_state=[{}] quarantine=[{}]; ",
+                "remediation=close or reopen the exact destination handle with FILE_SHARE_DELETE, ",
+                "then inspect the retained encoded artifact before retrying; quarantine files are ",
+                "removed only after {} seconds by the bounded publication cleanup"
+            ),
+            label,
+            temp_path.display(),
+            output_path.display(),
+            overwrite,
+            failure.attempts,
+            failure.elapsed_ms,
+            failure
+                .error
+                .raw_os_error()
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+            failure.error,
+            expected_bytes,
+            expected_sha256,
+            destination_state,
+            quarantine_transition,
+            ARTIFACT_QUARANTINE_MAX_AGE_SECS,
+        ),
+    )
+}
+
+fn publish_atomic_artifact(
+    temp_path: &Path,
+    output_path: &Path,
+    overwrite: bool,
+    label: &'static str,
+) -> Result<(u64, String), ErrorData> {
+    let (expected_bytes, expected_sha256) = sha256_artifact_file(temp_path, label)?;
+    if expected_bytes == 0 {
+        return Err(mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "{label} refused to publish empty encoded staging file {}",
+                temp_path.display()
+            ),
+        ));
+    }
+    let (attempts, elapsed_ms) =
+        match move_artifact_write_through(temp_path, output_path, overwrite, label) {
+            Ok(readback) => readback,
+            Err(failure) => {
+                return Err(quarantine_artifact_publish_failure(
+                    temp_path,
+                    output_path,
+                    overwrite,
+                    label,
+                    expected_bytes,
+                    &expected_sha256,
+                    failure,
+                ));
+            }
+        };
+    if temp_path.try_exists().map_err(|error| {
+        mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "{label} could not verify staging-path absence after atomic publish {}: {error}",
+                temp_path.display()
+            ),
+        )
+    })? {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                "{label} atomic publication left staging path present after success: {}",
+                temp_path.display()
+            ),
+        ));
+    }
+    let (actual_bytes, actual_sha256) = sha256_artifact_file(output_path, label)?;
+    if actual_bytes != expected_bytes || actual_sha256 != expected_sha256 {
+        tracing::error!(
+            code = "SYNAPSE_ARTIFACT_PUBLISH_READBACK_MISMATCH",
+            label,
+            destination = %output_path.display(),
+            overwrite,
+            attempts,
+            elapsed_ms,
+            expected_bytes,
+            actual_bytes,
+            expected_sha256,
+            actual_sha256,
+            "atomic artifact destination did not match encoded staging evidence"
+        );
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            format!(
+                concat!(
+                    "SYNAPSE_ARTIFACT_PUBLISH_READBACK_MISMATCH label={} destination={} ",
+                    "expected_bytes={} actual_bytes={} ",
+                    "expected_sha256={} actual_sha256={}"
+                ),
+                label,
+                output_path.display(),
+                expected_bytes,
+                actual_bytes,
+                expected_sha256,
+                actual_sha256
+            ),
+        ));
+    }
+    tracing::info!(
+        code = "SYNAPSE_ARTIFACT_PUBLISH_VERIFIED",
+        label,
+        destination = %output_path.display(),
+        overwrite,
+        attempts,
+        elapsed_ms,
+        bytes = actual_bytes,
+        sha256 = %actual_sha256,
+        "atomic artifact publication physically matched encoded staging evidence"
+    );
+    Ok((actual_bytes, actual_sha256))
+}
+
 fn save_screenshot_bitmap_with_quality(
     captured: &synapse_capture::CapturedBgraBitmap,
     path: &Path,
@@ -18915,30 +19401,16 @@ fn save_screenshot_bitmap_with_quality(
             ),
         )
     })?;
+    let mut file = create_artifact_staging_file(path, "capture_screenshot")?;
     let result = match format {
-        CaptureScreenshotFormat::Png => image.save_with_format(path, ImageFormat::Png),
+        CaptureScreenshotFormat::Png => {
+            DynamicImage::ImageRgba8(image).write_to(&mut file, ImageFormat::Png)
+        }
         CaptureScreenshotFormat::Jpeg => {
             let rgb = DynamicImage::ImageRgba8(image).to_rgb8();
-            let file = std::fs::File::create(path).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
-                    format!(
-                        "capture_screenshot failed to create {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
             let quality = jpeg_quality.unwrap_or(90);
-            let mut encoder = JpegEncoder::new_with_quality(file, quality);
-            return encoder.encode_image(&rgb).map_err(|error| {
-                mcp_error(
-                    error_codes::STORAGE_WRITE_FAILED,
-                    format!(
-                        "capture_screenshot failed to encode {}: {error}",
-                        path.display()
-                    ),
-                )
-            });
+            let mut encoder = JpegEncoder::new_with_quality(&mut file, quality);
+            encoder.encode_image(&rgb)
         }
     };
     result.map_err(|error| {
@@ -18949,7 +19421,8 @@ fn save_screenshot_bitmap_with_quality(
                 path.display()
             ),
         )
-    })
+    })?;
+    flush_artifact_staging_file(file, path, "capture_screenshot")
 }
 
 fn browser_download_source_path(selected: &BrowserDownloadEntry) -> Result<PathBuf, ErrorData> {
@@ -19029,7 +19502,9 @@ fn copy_or_move_download_file(
             ),
         ));
     }
-    std::fs::copy(source_path, &temp_path).map_err(|error| {
+    let mut source = open_artifact_file_for_read(source_path, "browser_downloads")?;
+    let mut staging = create_artifact_staging_file(&temp_path, "browser_downloads")?;
+    std::io::copy(&mut source, &mut staging).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
@@ -19039,8 +19514,10 @@ fn copy_or_move_download_file(
             ),
         )
     })?;
-    install_download_file(&temp_path, output_path, overwrite)?;
-    let (saved_bytes, saved_sha256) = sha256_file(output_path)?;
+    flush_artifact_staging_file(staging, &temp_path, "browser_downloads")?;
+    drop(source);
+    publish_atomic_artifact(&temp_path, output_path, overwrite, "browser_downloads")?;
+    let (saved_bytes, saved_sha256) = sha256_artifact_file(output_path, "browser_downloads")?;
     if saved_bytes != source_metadata.len() {
         return Err(mcp_error(
             error_codes::ACTION_POSTCONDITION_FAILED,
@@ -19066,46 +19543,8 @@ fn copy_or_move_download_file(
     Ok((saved_bytes, saved_sha256))
 }
 
-fn install_download_file(
-    temp_path: &Path,
-    output_path: &Path,
-    overwrite: bool,
-) -> Result<(), ErrorData> {
-    if overwrite && output_path.exists() {
-        std::fs::remove_file(output_path).map_err(|error| {
-            let _ = std::fs::remove_file(temp_path);
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "browser_downloads failed to replace existing file {}: {error}",
-                    output_path.display()
-                ),
-            )
-        })?;
-    }
-    std::fs::rename(temp_path, output_path).map_err(|error| {
-        let _ = std::fs::remove_file(temp_path);
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "browser_downloads failed to move {} to {}: {error}",
-                temp_path.display(),
-                output_path.display()
-            ),
-        )
-    })
-}
-
-fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
-    let mut file = std::fs::File::open(path).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_READ_FAILED,
-            format!(
-                "browser_downloads failed to open {}: {error}",
-                path.display()
-            ),
-        )
-    })?;
+fn sha256_artifact_file(path: &Path, label: &'static str) -> Result<(u64, String), ErrorData> {
+    let mut file = open_artifact_file_for_read(path, label)?;
     let mut hasher = Sha256::new();
     let mut buf = [0_u8; 64 * 1024];
     let mut total = 0_u64;
@@ -19114,7 +19553,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
             mcp_error(
                 error_codes::STORAGE_READ_FAILED,
                 format!(
-                    "browser_downloads failed to read {}: {error}",
+                    "{label} failed to read {} for SHA-256 readback: {error}",
                     path.display()
                 ),
             )
@@ -19132,36 +19571,6 @@ fn sha256_file(path: &Path) -> Result<(u64, String), ErrorData> {
         let _ = write!(&mut hex, "{byte:02x}");
     }
     Ok((total, hex))
-}
-
-fn install_screenshot_file(
-    temp_path: &Path,
-    output_path: &Path,
-    overwrite: bool,
-) -> Result<(), ErrorData> {
-    if overwrite && output_path.exists() {
-        std::fs::remove_file(output_path).map_err(|error| {
-            let _ = std::fs::remove_file(temp_path);
-            mcp_error(
-                error_codes::STORAGE_WRITE_FAILED,
-                format!(
-                    "capture_screenshot failed to replace existing file {}: {error}",
-                    output_path.display()
-                ),
-            )
-        })?;
-    }
-    std::fs::rename(temp_path, output_path).map_err(|error| {
-        let _ = std::fs::remove_file(temp_path);
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "capture_screenshot failed to move {} to {}: {error}",
-                temp_path.display(),
-                output_path.display()
-            ),
-        )
-    })
 }
 
 fn write_pdf_bytes(
@@ -19196,7 +19605,8 @@ fn write_pdf_bytes(
             ),
         ));
     }
-    std::fs::write(&temp_path, pdf_bytes).map_err(|error| {
+    let mut staging = create_artifact_staging_file(&temp_path, "browser_pdf")?;
+    staging.write_all(pdf_bytes).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_WRITE_FAILED,
             format!(
@@ -19205,7 +19615,8 @@ fn write_pdf_bytes(
             ),
         )
     })?;
-    install_screenshot_file(&temp_path, output_path, overwrite)?;
+    flush_artifact_staging_file(staging, &temp_path, "browser_pdf")?;
+    publish_atomic_artifact(&temp_path, output_path, overwrite, "browser_pdf")?;
     let metadata = std::fs::metadata(output_path).map_err(|error| {
         mcp_error(
             error_codes::STORAGE_READ_FAILED,

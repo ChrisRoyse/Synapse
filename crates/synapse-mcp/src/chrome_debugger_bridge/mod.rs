@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-10-trusted-pixel-redaction-v1";
+    "synapse-chrome-bridge-2026-08-10-durable-capture-lease-v4";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "35908d1a0237fe49181794c18ba3e7e4df04d2322ce281cbd093f8e45e897aa6";
+    "d10f938d10e56eafc36afc859a2c984cf4736f94130f401c00fb43b0abd7afbd";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -109,6 +109,8 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "setFieldValue",
 ];
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS: u64 = 25_000;
+const PAGE_SCREENSHOT_DAEMON_RESPONSE_HEADROOM_MS: u64 = 7_000;
 /// Extra daemon-side response headroom added on top of a caller's evaluate
 /// `timeout_ms` so the daemon waits out the in-extension evaluate budget (plus
 /// attach/round-trip overhead) before declaring a transport timeout (#1596).
@@ -238,6 +240,9 @@ impl ChromeDebuggerBridgeError {
             Some(error_codes::CHROME_BRIDGE_EXTENSION_STALE) => {
                 error_codes::CHROME_BRIDGE_EXTENSION_STALE
             }
+            Some(error_codes::CHROME_CAPTURE_VISIBLE_TAB_PENDING) => {
+                error_codes::CHROME_CAPTURE_VISIBLE_TAB_PENDING
+            }
             Some(error_codes::A11Y_CDP_AXTREE_FAILED) => error_codes::A11Y_CDP_AXTREE_FAILED,
             Some(error_codes::A11Y_CDP_ATTACH_FAILED) => error_codes::A11Y_CDP_ATTACH_FAILED,
             Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED) => {
@@ -286,10 +291,15 @@ impl ChromeDebuggerBridgeError {
                 || "<none>".to_owned(),
                 |path| quote_detail_value(&path.join("service_worker.js").to_string_lossy()),
             );
+        let remediation = if reason.contains("capture_visible_tab_lease_quarantined") {
+            "fully restart Chrome so chrome.storage.session establishes a new browser-session identity proving the prior uncancellable Chrome API promise cannot still be live; do not reload only the extension or retry the capture"
+        } else {
+            "call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon uses the exact Chrome extension management Reload control and separately verifies the profile row and replacement authenticated host without calling chrome.runtime.reload"
+        };
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
             detail: format!(
-                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation=call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon uses the exact Chrome extension management Reload control and separately verifies the profile row and replacement authenticated host without calling chrome.runtime.reload",
+                "Chrome bridge extension is stale for command {command_kind:?}; host_id={host_id} reason={reason} extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} extension_declared_build_sha256={} extension_service_worker_sha256={} extension_service_worker_sha256_status={} extension_service_worker_sha256_error={} expected_build_id={} expected_service_worker_sha256={} expected_service_worker_path={} capabilities={} required_capabilities={} setup_repair_guidance={} remediation={remediation}",
                 host.extension_id.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_version.as_deref().unwrap_or("not_seen_yet"),
                 host.extension_protocol_version
@@ -4603,6 +4613,10 @@ pub struct ChromeDebuggerExtensionOwnerCounts {
     pub locale_override_count: usize,
     pub media_override_count: usize,
     pub network_override_count: usize,
+    #[serde(default)]
+    pub capture_visible_tab_pending_count: usize,
+    #[serde(default)]
+    pub capture_visible_tab_quarantined_count: usize,
     pub mutation_handler_in_flight_count: usize,
 }
 
@@ -4625,6 +4639,8 @@ impl ChromeDebuggerExtensionOwnerCounts {
             && self.locale_override_count == 0
             && self.media_override_count == 0
             && self.network_override_count == 0
+            && self.capture_visible_tab_pending_count == 0
+            && self.capture_visible_tab_quarantined_count == 0
             && self.mutation_handler_in_flight_count == 0
     }
 }
@@ -4647,6 +4663,10 @@ pub struct ChromeDebuggerExtensionOwnerReadback {
     pub storage_state_load_error: Option<String>,
     pub persisted_state_revision: u64,
     pub persisted_in_flight_mutation: Option<serde_json::Value>,
+    #[serde(default)]
+    pub capture_visible_tab_lease: Option<serde_json::Value>,
+    #[serde(default)]
+    pub last_capture_visible_tab_settlement: Option<serde_json::Value>,
     pub unresolved_debugger_command_timeouts:
         Vec<ChromeDebuggerExtensionUnresolvedDebuggerCommandTimeout>,
     pub unresolved_worker_restart_mutation_count: usize,
@@ -5309,6 +5329,44 @@ fn durable_owner_startup_stale_reason(startup_readback: Option<&Value>) -> Optio
         .get("unresolved_worker_restart_mutation_count")
         .and_then(Value::as_u64)
         .unwrap_or(u64::MAX);
+    let capture_continuity = owner
+        .get("capture_visible_tab_continuity_healthy")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let capture_lease = owner.get("capture_visible_tab_lease");
+    let capture_lease_status = capture_lease
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    if !capture_continuity && capture_lease_status == "quarantined_worker_restart" {
+        return Some(format!(
+            "capture_visible_tab_lease_quarantined status={capture_lease_status} lease_id={} worker_boot_id={} tab_id={} window_id={} caller_timed_out_at_unix_ms={} remediation=fully_restart_Chrome_to_establish_a_new_browser_session; extension_reload_cannot_prove_raw_promise_settlement",
+            quote_detail_value(
+                capture_lease
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing")
+            ),
+            quote_detail_value(
+                capture_lease
+                    .and_then(|value| value.get("workerBootId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing")
+            ),
+            capture_lease
+                .and_then(|value| value.get("tabId"))
+                .and_then(Value::as_i64)
+                .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+            capture_lease
+                .and_then(|value| value.get("windowId"))
+                .and_then(Value::as_i64)
+                .map_or_else(|| "missing".to_owned(), |value| value.to_string()),
+            capture_lease
+                .and_then(|value| value.get("callerTimedOutAtUnixMs"))
+                .and_then(Value::as_i64)
+                .map_or_else(|| "none".to_owned(), |value| value.to_string()),
+        ));
+    }
     let load_error = owner
         .get("storage_state_load_error")
         .and_then(Value::as_str)
@@ -5324,6 +5382,7 @@ fn durable_owner_startup_stale_reason(startup_readback: Option<&Value>) -> Optio
         && !in_flight
         && unresolved_timeouts == 0
         && unresolved_restart == 0
+        && capture_continuity
         && owner
             .get("storage_state_load_error")
             .is_some_and(Value::is_null)
@@ -5331,7 +5390,7 @@ fn durable_owner_startup_stale_reason(startup_readback: Option<&Value>) -> Optio
         return None;
     }
     Some(format!(
-        "durable_owner_state_unhealthy loaded={loaded} enabled={enabled} current_session_present={current_present} ledger_session_present={ledger_present} session_ids_match={ids_match} continuity={continuity} healthy={healthy} stale_owners={stale_owners} in_flight={in_flight} unresolved_timeouts={unresolved_timeouts} unresolved_worker_restart={unresolved_restart} load_error={}",
+        "durable_owner_state_unhealthy loaded={loaded} enabled={enabled} current_session_present={current_present} ledger_session_present={ledger_present} session_ids_match={ids_match} continuity={continuity} healthy={healthy} stale_owners={stale_owners} in_flight={in_flight} unresolved_timeouts={unresolved_timeouts} unresolved_worker_restart={unresolved_restart} capture_visible_tab_continuity={capture_continuity} load_error={}",
         quote_detail_value(load_error),
     ))
 }
@@ -8651,12 +8710,26 @@ pub async fn page_screenshot(
     };
     payload["hwnd"] = json!(hwnd);
     payload["targetIdHint"] = json!(target_id);
-    let result = bridge().send_command("pageScreenshot", payload).await?;
+    let command_timeout = page_screenshot_command_timeout(&payload);
+    let result = bridge()
+        .send_command_with_timeout("pageScreenshot", payload, command_timeout)
+        .await?;
     serde_json::from_value::<ChromeDebuggerPageScreenshotResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger pageScreenshot response: {error}"
         ))
     })
+}
+
+fn page_screenshot_command_timeout(payload: &Value) -> Duration {
+    let caller_wait_ms = payload
+        .get("waitTimeoutMs")
+        .and_then(Value::as_u64)
+        .unwrap_or(PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS);
+    let extension_budget_ms = caller_wait_ms.min(PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS);
+    Duration::from_millis(
+        extension_budget_ms.saturating_add(PAGE_SCREENSHOT_DAEMON_RESPONSE_HEADROOM_MS),
+    )
 }
 
 pub async fn page_pdf(

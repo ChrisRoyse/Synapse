@@ -17,6 +17,7 @@ pub const A11Y_CDP_EXTENSION_DETACHED: &str = "A11Y_CDP_EXTENSION_DETACHED";
 pub const A11Y_CDP_EXTENSION_TIMEOUT: &str = "A11Y_CDP_EXTENSION_TIMEOUT";
 pub const A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED: &str = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 pub const CHROME_BRIDGE_EXTENSION_STALE: &str = "CHROME_BRIDGE_EXTENSION_STALE";
+pub const CHROME_CAPTURE_VISIBLE_TAB_PENDING: &str = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 /// The host-side exact Chrome extension management control could not reload or
 /// install the normal-profile bridge, or its independent profile/host readback
 /// did not prove the requested transition.
