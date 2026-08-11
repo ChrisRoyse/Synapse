@@ -23816,7 +23816,7 @@ fn capture_local_process_identity(pid: u32) -> Result<ActRunShellLocalProcessIde
 #[cfg(windows)]
 fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> Result<(), String> {
     use windows::Win32::{
-        Foundation::{CloseHandle, FILETIME, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        Foundation::{CloseHandle, FILETIME},
         System::{
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First,
@@ -23824,8 +23824,7 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
             },
             Threading::{
                 GetProcessTimes, OpenProcess, OpenThread, PROCESS_QUERY_LIMITED_INFORMATION,
-                PROCESS_SYNCHRONIZE, ResumeThread, THREAD_QUERY_LIMITED_INFORMATION,
-                THREAD_SUSPEND_RESUME, WaitForSingleObject,
+                ResumeThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
             },
         },
     };
@@ -23833,14 +23832,8 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
     let thread_entry_size = u32::try_from(std::mem::size_of::<THREADENTRY32>())
         .map_err(|error| format!("THREADENTRY32 size conversion failed: {error}"))?;
 
-    let process = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
-            false,
-            identity.pid,
-        )
-    }
-    .map_err(|error| format!("open suspended child pid {} failed: {error}", identity.pid))?;
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, identity.pid) }
+        .map_err(|error| format!("open suspended child pid {} failed: {error}", identity.pid))?;
     let mut creation = FILETIME::default();
     let mut exit = FILETIME::default();
     let mut kernel = FILETIME::default();
@@ -23919,46 +23912,22 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
         )
     })?;
     let previous_suspend_count = unsafe { ResumeThread(thread) };
-    let thread_close = unsafe { CloseHandle(thread) }.map_err(|error| error.to_string());
-    let initial_wait = unsafe { WaitForSingleObject(process, 0) };
-    let wait_error = (initial_wait == WAIT_FAILED)
+    // ResumeThread's return is the transition readback. Capture GetLastError
+    // before CloseHandle can overwrite the calling thread's last-error slot.
+    let resume_error = (previous_suspend_count == u32::MAX)
         .then(windows::core::Error::from_thread)
         .map(|error| error.to_string());
-    let (state_valid, state_detail) = if initial_wait == WAIT_OBJECT_0 {
-        (
-            true,
-            "exact_process_handle_signaled_after_resume".to_owned(),
-        )
-    } else if initial_wait == WAIT_TIMEOUT {
-        let states = process_tree_suspend_state_platform(&[identity.pid]);
-        if states.len() == 1 && states[0].suspended_threads == 0 {
-            (true, format!("live_thread_state={states:?}"))
-        } else {
-            // The process may have exited between the initial exact-handle wait
-            // and the thread-table read. Keep the exact handle open and accept
-            // only a now-signaled readback; an empty state alone is ambiguous.
-            let post_state_wait = unsafe { WaitForSingleObject(process, 0) };
-            (
-                post_state_wait == WAIT_OBJECT_0,
-                format!(
-                    "thread_state={states:?}; post_state_exact_handle_wait={post_state_wait:?}"
-                ),
-            )
-        }
-    } else {
-        (
-            false,
-            format!("unexpected_exact_handle_wait={initial_wait:?}"),
-        )
+    let thread_close = unsafe { CloseHandle(thread) }.map_err(|error| error.to_string());
+    let resume_verdict = match previous_suspend_count {
+        u32::MAX => "resume_thread_api_failed",
+        0 => "primary_thread_was_not_suspended",
+        1 => "primary_thread_restarted",
+        _ => "primary_thread_remains_suspended",
     };
     let process_close = unsafe { CloseHandle(process) }.map_err(|error| error.to_string());
-    if previous_suspend_count != 1
-        || thread_close.is_err()
-        || process_close.is_err()
-        || !state_valid
-    {
+    if previous_suspend_count != 1 || thread_close.is_err() || process_close.is_err() {
         return Err(format!(
-            "documented primary-thread resume readback failed for pid {}: previous_suspend_count={previous_suspend_count}; thread_close={thread_close:?}; initial_process_wait={initial_wait:?}; wait_error={wait_error:?}; state_detail={state_detail}; process_close={process_close:?}",
+            "CREATE_SUSPENDED primary-thread transition failed for pid {}: resume_verdict={resume_verdict}; previous_suspend_count={previous_suspend_count}; resume_error={resume_error:?}; thread_close={thread_close:?}; process_close={process_close:?}",
             identity.pid
         ));
     }
