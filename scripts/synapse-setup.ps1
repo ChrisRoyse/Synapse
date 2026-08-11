@@ -15594,7 +15594,15 @@ function Remove-SynapseLegacyEnsureDaemonSupervisor {
         [Parameter(Mandatory=$true)][string]$CanonicalSupervisorPath
     )
 
-    $runtimeRoot = Split-Path -Parent (Resolve-NormalizedPath -Path $RuntimeBinDir)
+    try {
+        $resolvedRuntimeBinDir = (Resolve-Path -LiteralPath $RuntimeBinDir -ErrorAction Stop).Path
+    } catch {
+        Die "SYNAPSE_RUNTIME_BIN_RESOLVE_FAILED path=$RuntimeBinDir error=$($_.Exception.Message) remediation=repair the configured runtime-bin path before setup attempts legacy-artifact retirement"
+    }
+    $runtimeRoot = Split-Path -Parent $resolvedRuntimeBinDir
+    if ([string]::IsNullOrWhiteSpace($runtimeRoot)) {
+        Die "SYNAPSE_RUNTIME_ROOT_EMPTY runtime_bin=$resolvedRuntimeBinDir remediation=configure RuntimeBinDir as a concrete child directory before setup attempts legacy-artifact retirement"
+    }
     $legacyPath = Join-Path $runtimeRoot 'ensure-daemon-supervisor.ps1'
     if (-not (Test-Path -LiteralPath $legacyPath)) {
         Info "SYNAPSE_LEGACY_ENSURE_SUPERVISOR_ABSENT path=$legacyPath"
