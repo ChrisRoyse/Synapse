@@ -45,9 +45,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-durable-schema6-migration-v14";
+    "synapse-chrome-bridge-2026-08-11-bounded-error-causality-v15";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "9da173baa076a4c413f9bcac4dd86b2679b5f6b775927203990ee694e8dbbff7";
+    "5815f03740a703b9dedd569badfcd94ce18bfd9b9c604524e73ef1541e817434";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
@@ -4837,7 +4837,13 @@ pub struct ChromeDebuggerExtensionOwnerReadback {
     pub stale_browser_session_owner_count: usize,
     pub storage_state_loaded: bool,
     pub storage_state_load_error: Option<String>,
+    #[serde(default)]
+    pub storage_state_failure_diagnostic: Option<serde_json::Value>,
+    #[serde(default)]
+    pub persisted_schema_version: u64,
     pub persisted_state_revision: u64,
+    #[serde(default)]
+    pub schema_5_migration: Option<serde_json::Value>,
     pub persisted_in_flight_mutation: Option<serde_json::Value>,
     #[serde(default)]
     pub command_terminal_outbox: Vec<serde_json::Value>,

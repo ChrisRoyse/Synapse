@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-durable-schema6-migration-v14";
-const BRIDGE_DECLARED_BUILD_SHA256 = "9da173baa076a4c413f9bcac4dd86b2679b5f6b775927203990ee694e8dbbff7";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-bounded-error-causality-v15";
+const BRIDGE_DECLARED_BUILD_SHA256 = "5815f03740a703b9dedd569badfcd94ce18bfd9b9c604524e73ef1541e817434";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -262,6 +262,8 @@ const DURABLE_OWNER_LIFECYCLE_SIGNAL = new Promise((resolve) => {
 });
 let DURABLE_OWNER_STATE_LOADED = false;
 let DURABLE_OWNER_STATE_LOAD_ERROR = null;
+const DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS = 4096;
+let DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = null;
 let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
 let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = null;
@@ -275,6 +277,75 @@ let REPAIRED_EMPTY_LEDGER_MISSING_BROWSER_SESSION = null;
 let RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION = null;
 let DURABLE_OWNER_SCHEMA5_MIGRATION = null;
 let DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
+
+function boundedDurableOwnerFailureDetail(error) {
+  const full = redactPublicErrorDetail(errorMessage(error));
+  return {
+    text: full.slice(0, DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS),
+    original_char_count: full.length,
+    truncated: full.length > DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS
+  };
+}
+
+function recordDurableOwnerSecondaryFailure(stage, error) {
+  const detail = boundedDurableOwnerFailureDetail(error);
+  const previous = DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC;
+  const primary = previous || {
+    schema_version: 1,
+    primary_stage: "preexisting_unclassified_failure",
+    primary_recorded_at_unix_ms: null,
+    primary_error_char_count: String(DURABLE_OWNER_STATE_LOAD_ERROR || "").length,
+    primary_error_truncated: false,
+    secondary_occurrence_count: 0,
+    last_secondary_failure: null
+  };
+  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = {
+    ...primary,
+    secondary_occurrence_count:
+      Number(primary.secondary_occurrence_count || 0) + 1,
+    last_secondary_failure: {
+      stage: String(stage),
+      observed_at_unix_ms: Date.now(),
+      cause: detail.text,
+      cause_char_count: detail.original_char_count,
+      cause_truncated: detail.truncated
+    }
+  };
+  console.error("synapse durable owner secondary failure recorded without replacing first cause", {
+    stage: String(stage),
+    secondary_occurrence_count:
+      DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC.secondary_occurrence_count,
+    cause: detail.text,
+    cause_char_count: detail.original_char_count,
+    cause_truncated: detail.truncated,
+    primary_error_preserved: Boolean(DURABLE_OWNER_STATE_LOAD_ERROR)
+  });
+  return DURABLE_OWNER_STATE_LOAD_ERROR;
+}
+
+function recordDurableOwnerStateFailure(stage, error) {
+  if (DURABLE_OWNER_STATE_LOAD_ERROR) {
+    return recordDurableOwnerSecondaryFailure(stage, error);
+  }
+  const detail = boundedDurableOwnerFailureDetail(error);
+  DURABLE_OWNER_STATE_LOAD_ERROR = detail.text;
+  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = {
+    schema_version: 1,
+    primary_stage: String(stage),
+    primary_recorded_at_unix_ms: Date.now(),
+    primary_error_char_count: detail.original_char_count,
+    primary_error_truncated: detail.truncated,
+    secondary_occurrence_count: 0,
+    last_secondary_failure: null
+  };
+  console.error("synapse durable owner state entered fail-closed state", {
+    stage: String(stage),
+    cause: detail.text,
+    cause_char_count: detail.original_char_count,
+    cause_truncated: detail.truncated
+  });
+  return DURABLE_OWNER_STATE_LOAD_ERROR;
+}
 
 function recordDurableOwnerLifecycleEvent(kind, reason = null) {
   const event = {
@@ -301,9 +372,11 @@ function recordDurableOwnerLifecycleEvent(kind, reason = null) {
     };
     STALE_BROWSER_SESSION_OWNER_COUNT = durableOwnerRowCount(DURABLE_OWNER_LEDGER) +
       (DURABLE_OWNER_LEDGER.inFlightMutation ? 1 : 0);
-    DURABLE_OWNER_STATE_LOAD_ERROR =
+    recordDurableOwnerStateFailure(
+      "late_runtime_on_startup",
       "runtime.onStartup arrived after durable-owner initialization; refusing mutation " +
-      "until the browser-session ledger is reloaded against the new profile session";
+        "until the browser-session ledger is reloaded against the new profile session"
+    );
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
       1,
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
@@ -312,8 +385,10 @@ function recordDurableOwnerLifecycleEvent(kind, reason = null) {
       [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
         DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
     }).catch((error) => {
-      DURABLE_OWNER_STATE_LOAD_ERROR +=
-        `; failed to persist late browser-session token: ${errorMessage(error)}`;
+      recordDurableOwnerSecondaryFailure(
+        "persist_late_browser_session_token",
+        `failed to persist late browser-session token: ${errorMessage(error)}`
+      );
     });
   }
   return event;
@@ -1313,8 +1388,10 @@ function enqueueImmediateOperatorPanicDisable(command) {
       try {
         await persistDurableOwnerLedger({ mergeLiveOwners: true });
       } catch (error) {
-        DURABLE_OWNER_STATE_LOAD_ERROR =
-          `persist immediate operator panic disable failed: ${errorMessage(error)}`;
+        recordDurableOwnerStateFailure(
+          "persist_immediate_operator_panic_disable",
+          `persist immediate operator panic disable failed: ${errorMessage(error)}`
+        );
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       }
       return DURABLE_MUTATION_DISABLE_SEQUENCE;
@@ -2534,6 +2611,7 @@ function rebaseDurableOwnerLedgerAfterStaleOwnerDrain() {
   DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
   STALE_BROWSER_SESSION_OWNER_COUNT = 0;
   DURABLE_OWNER_STATE_LOAD_ERROR = null;
+  DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = null;
   if (DURABLE_OWNER_LEDGER.disableSequence === 0) {
     DURABLE_OWNER_LEDGER.enabled = true;
     DURABLE_MUTATION_OWNERS_ENABLED =
@@ -2947,14 +3025,16 @@ async function restoreDurableOwnerLedger() {
       } else if (!DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
         STALE_BROWSER_SESSION_OWNER_COUNT = staleOwners;
         DURABLE_MUTATION_OWNERS_ENABLED = false;
-        DURABLE_OWNER_STATE_LOAD_ERROR =
+        recordDurableOwnerStateFailure(
+          "stale_browser_session_owners",
           "durable owners belong to a prior browser session; stale tab ids will not be mutated; " +
-          `stale_owner_count=${staleOwners} ` +
-          `stale_repair_absent_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.absent_tab_ids?.length || 0)} ` +
-          `stale_repair_closed_matching_opened_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.closed_matching_opened_tabs?.length || 0)} ` +
-          `stale_repair_live_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.live_tabs?.length || 0)} ` +
-          `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)} ` +
-          `resolved_prior_session_in_flight_mutation=${RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION ? "resolved" : "none"}`;
+            `stale_owner_count=${staleOwners} ` +
+            `stale_repair_absent_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.absent_tab_ids?.length || 0)} ` +
+            `stale_repair_closed_matching_opened_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.closed_matching_opened_tabs?.length || 0)} ` +
+            `stale_repair_live_tab_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.live_tabs?.length || 0)} ` +
+            `stale_repair_failure_count=${Number(DURABLE_OWNER_STALE_SESSION_REPAIR?.failures?.length || 0)} ` +
+            `resolved_prior_session_in_flight_mutation=${RESOLVED_PRIOR_SESSION_IN_FLIGHT_MUTATION ? "resolved" : "none"}`
+        );
       }
     }
     if (
@@ -3021,7 +3101,7 @@ async function restoreDurableOwnerLedger() {
     }
     DURABLE_OWNER_STATE_LOADED = true;
   } catch (error) {
-    DURABLE_OWNER_STATE_LOAD_ERROR = errorMessage(error);
+    recordDurableOwnerStateFailure("restore_durable_owner_state", error);
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   }
@@ -3272,7 +3352,10 @@ function enqueueClosedTabLedgerPrune(tabId) {
         await persistDurableOwnerLedgerRepairSnapshot();
       }
     } catch (error) {
-      DURABLE_OWNER_STATE_LOAD_ERROR = `persist closed-tab owner prune failed: ${errorMessage(error)}`;
+      recordDurableOwnerStateFailure(
+        "persist_closed_tab_owner_prune",
+        `persist closed-tab owner prune failed: ${errorMessage(error)}`
+      );
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
@@ -3283,6 +3366,18 @@ function enqueueClosedTabLedgerPrune(tabId) {
 function enqueueInitScriptEffectNavigationReconcile(tabId) {
   const queued = COMMAND_EXECUTION_TAIL.then(async () => {
     await DURABLE_OWNER_STATE_READY;
+    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
+        1,
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
+      );
+      recordDurableOwnerSecondaryFailure(
+        "init_script_navigation_reconciliation_skipped",
+        "durable owner state is unavailable; reconciliation persistence was not attempted"
+      );
+      return;
+    }
     mergeLiveOwnersIntoDurableLedger();
     const registered = new Set(
       DURABLE_OWNER_LEDGER.initScripts
@@ -3296,8 +3391,10 @@ function enqueueInitScriptEffectNavigationReconcile(tabId) {
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (error) {
-      DURABLE_OWNER_STATE_LOAD_ERROR =
-        `persist init-script navigation reconciliation failed: ${errorMessage(error)}`;
+      recordDurableOwnerStateFailure(
+        "persist_init_script_navigation_reconciliation",
+        `persist init-script navigation reconciliation failed: ${errorMessage(error)}`
+      );
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
@@ -3330,8 +3427,10 @@ function enqueuePersistedBackgroundMutation(kind, operation) {
         await beginPersistedMutationCommand(command, activitySequence);
         persistedMutationMarker = true;
       } catch (error) {
-        DURABLE_OWNER_STATE_LOAD_ERROR =
-          `persist background mutation admission failed: ${errorMessage(error)}`;
+        recordDurableOwnerStateFailure(
+          "persist_background_mutation_admission",
+          `persist background mutation admission failed: ${errorMessage(error)}`
+        );
         DURABLE_MUTATION_OWNERS_ENABLED = false;
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
         throw bridgeError(ERROR_ACTION_TARGET_INVALID, DURABLE_OWNER_STATE_LOAD_ERROR);
@@ -3352,8 +3451,10 @@ function enqueuePersistedBackgroundMutation(kind, operation) {
         try {
           await finishPersistedMutationCommand();
         } catch (error) {
-          DURABLE_OWNER_STATE_LOAD_ERROR =
-            `persist background mutation completion failed: ${errorMessage(error)}`;
+          recordDurableOwnerStateFailure(
+            "persist_background_mutation_completion",
+            `persist background mutation completion failed: ${errorMessage(error)}`
+          );
           DURABLE_MUTATION_OWNERS_ENABLED = false;
           UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
         }
@@ -3422,7 +3523,10 @@ async function handleTrackedCommand(command) {
       try {
         await beginPersistedMutationCommand(command, activitySequence);
       } catch (error) {
-        DURABLE_OWNER_STATE_LOAD_ERROR = `persist mutation admission failed: ${errorMessage(error)}`;
+        recordDurableOwnerStateFailure(
+          "persist_mutation_admission",
+          `persist mutation admission failed: ${errorMessage(error)}`
+        );
         DURABLE_MUTATION_OWNERS_ENABLED = false;
         UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       }
@@ -4202,6 +4306,8 @@ function bridgeIdentity() {
       durable_owner_state: {
         storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
         storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
+        storage_state_failure_diagnostic:
+          DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
         mutation_admission_enabled: DURABLE_MUTATION_OWNERS_ENABLED,
         browser_session_id_present: Boolean(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID),
         ledger_browser_session_id_present: Boolean(DURABLE_OWNER_LEDGER.browserSessionId),
@@ -14687,8 +14793,10 @@ async function recordUnresolvedDebuggerCommandTimeout(
   const tabId = normalizeStoredTabId(debuggee?.tabId);
   const context = ACTIVE_COMMAND_MUTATION_CONTEXT;
   if (tabId === null || !context?.activitySequence) {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`;
+    recordDurableOwnerStateFailure(
+      "unresolved_debugger_timeout_identity",
+      `unresolved debugger timeout lacks exact tab/activity identity: method=${method}`
+    );
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     return;
@@ -14707,8 +14815,10 @@ async function recordUnresolvedDebuggerCommandTimeout(
   try {
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
   } catch (error) {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      `persist unresolved debugger timeout failed: ${errorMessage(error)}`;
+    recordDurableOwnerStateFailure(
+      "persist_unresolved_debugger_timeout",
+      `persist unresolved debugger timeout failed: ${errorMessage(error)}`
+    );
     DURABLE_MUTATION_OWNERS_ENABLED = false;
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     return;
@@ -14736,8 +14846,10 @@ async function recordUnresolvedDebuggerCommandTimeout(
     try {
       await persistDurableOwnerLedger({ mergeLiveOwners: true });
     } catch (persistError) {
-      DURABLE_OWNER_STATE_LOAD_ERROR =
-        `persist failed input neutralization owner failed: ${errorMessage(persistError)}`;
+      recordDurableOwnerStateFailure(
+        "persist_failed_input_neutralization_owner",
+        `persist failed input neutralization owner failed: ${errorMessage(persistError)}`
+      );
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     }
@@ -15611,6 +15723,8 @@ function operatorPanicOwnerReadback() {
     stale_browser_session_repair: DURABLE_OWNER_STALE_SESSION_REPAIR,
     storage_state_loaded: DURABLE_OWNER_STATE_LOADED,
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
+    storage_state_failure_diagnostic:
+      DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
     interrupted_migration_reconciliation:
       RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
     schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
@@ -15699,8 +15813,10 @@ function operatorPanicGateErrorSummary() {
 async function handleOperatorPanicDisable(admission) {
   DURABLE_MUTATION_OWNERS_ENABLED = false;
   if (!admission || typeof admission.then !== "function") {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      "operator panic disable reached dispatch without receipt-time persisted admission";
+    recordDurableOwnerStateFailure(
+      "operator_panic_disable_admission_missing",
+      "operator panic disable reached dispatch without receipt-time persisted admission"
+    );
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
   } else {
     await admission;
@@ -16159,7 +16275,10 @@ async function handleOperatorPanicCleanup(params) {
   try {
     await persistDurableOwnerLedger({ mergeLiveOwners: true });
   } catch (error) {
-    DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic cleanup failed: ${errorMessage(error)}`;
+    recordDurableOwnerStateFailure(
+      "persist_operator_panic_cleanup",
+      `persist operator panic cleanup failed: ${errorMessage(error)}`
+    );
     UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
     failures.push(DURABLE_OWNER_STATE_LOAD_ERROR);
   }
@@ -16274,7 +16393,10 @@ async function handleOperatorPanicEnable(params) {
     } catch (error) {
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       enabled = false;
-      DURABLE_OWNER_STATE_LOAD_ERROR = `persist operator panic enable failed: ${errorMessage(error)}`;
+      recordDurableOwnerStateFailure(
+        "persist_operator_panic_enable",
+        `persist operator panic enable failed: ${errorMessage(error)}`
+      );
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
       try {
         await persistDurableOwnerLedger({ mergeLiveOwners: true });
@@ -28331,8 +28453,10 @@ async function markCaptureVisibleTabCallerTimedOut(leaseId) {
   try {
     await persistDurableOwnerLedger();
   } catch (error) {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      `persist captureVisibleTab caller deadline failed: ${errorMessage(error)}`;
+    recordDurableOwnerStateFailure(
+      "persist_capture_visible_tab_caller_deadline",
+      `persist captureVisibleTab caller deadline failed: ${errorMessage(error)}`
+    );
     throw bridgeError(
       ERROR_ACTION_TARGET_INVALID,
       "captureVisibleTab caller deadline could not be persisted; " +
@@ -28346,9 +28470,11 @@ async function markCaptureVisibleTabCallerTimedOut(leaseId) {
 async function settleCaptureVisibleTabLease(leaseId, outcome, error = null) {
   const lease = DURABLE_OWNER_LEDGER.captureVisibleTabLease;
   if (!lease || lease.id !== leaseId) {
-    DURABLE_OWNER_STATE_LOAD_ERROR =
+    recordDurableOwnerStateFailure(
+      "capture_visible_tab_settlement_identity_lost",
       `captureVisibleTab raw settlement lost durable lease identity expected=${leaseId} ` +
-      `actual=${String(lease?.id || "none")}`;
+        `actual=${String(lease?.id || "none")}`
+    );
     throw bridgeError(
       ERROR_ACTION_TARGET_INVALID,
       `${DURABLE_OWNER_STATE_LOAD_ERROR}; refusing to publish a caller result`
@@ -28376,8 +28502,10 @@ async function settleCaptureVisibleTabLease(leaseId, outcome, error = null) {
   } catch (persistError) {
     DURABLE_OWNER_LEDGER.captureVisibleTabLease = lease;
     DURABLE_OWNER_LEDGER.lastCaptureVisibleTabSettlement = priorSettlement;
-    DURABLE_OWNER_STATE_LOAD_ERROR =
-      `persist captureVisibleTab raw settlement failed: ${errorMessage(persistError)}`;
+    recordDurableOwnerStateFailure(
+      "persist_capture_visible_tab_raw_settlement",
+      `persist captureVisibleTab raw settlement failed: ${errorMessage(persistError)}`
+    );
     throw bridgeError(
       ERROR_ACTION_TARGET_INVALID,
       "captureVisibleTab raw Chrome promise settled, but its durable terminal transition " +
@@ -28481,8 +28609,10 @@ async function captureVisibleTabWithQuota(windowId, options, timeoutMs, context 
       await persistDurableOwnerLedger();
     } catch (error) {
       DURABLE_OWNER_LEDGER.captureVisibleTabLease = null;
-      DURABLE_OWNER_STATE_LOAD_ERROR =
-        `persist captureVisibleTab durable admission failed: ${errorMessage(error)}`;
+      recordDurableOwnerStateFailure(
+        "persist_capture_visible_tab_durable_admission",
+        `persist captureVisibleTab durable admission failed: ${errorMessage(error)}`
+      );
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
         "chrome.tabs.captureVisibleTab was not started because durable admission could not " +
@@ -28537,8 +28667,10 @@ async function captureVisibleTabWithQuota(windowId, options, timeoutMs, context 
     try {
       await activeLeasePersisted;
     } catch (error) {
-      DURABLE_OWNER_STATE_LOAD_ERROR =
-        `persist captureVisibleTab active lease failed: ${errorMessage(error)}`;
+      recordDurableOwnerStateFailure(
+        "persist_capture_visible_tab_active_lease",
+        `persist captureVisibleTab active lease failed: ${errorMessage(error)}`
+      );
       throw bridgeError(
         ERROR_ACTION_TARGET_INVALID,
         "chrome.tabs.captureVisibleTab raw promise started, but its active durable lease could " +
