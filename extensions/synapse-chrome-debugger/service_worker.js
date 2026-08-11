@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-native-message-body-contract-v7";
-const BRIDGE_DECLARED_BUILD_SHA256 = "919f6ab2230f2462b89551a1963b6f29d9b3fad9a7d54825ed40608cd64de832";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-csp-independent-wait-v8";
+const BRIDGE_DECLARED_BUILD_SHA256 = "3c81c9f1ba6042d283cff649999a6fb50eb93a7e72435f8adac75982a34581d6";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -93,6 +93,7 @@ const ERROR_ATTACH_FAILED = "A11Y_CDP_ATTACH_FAILED";
 const ERROR_AXTREE_FAILED = "A11Y_CDP_AXTREE_FAILED";
 const ERROR_DEBUGGER_WARNING_UNSUPPRESSED = "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED";
 const ERROR_EXTENSION_TIMEOUT = "A11Y_CDP_EXTENSION_TIMEOUT";
+const ERROR_EXTENSION_DETACHED = "A11Y_CDP_EXTENSION_DETACHED";
 const ERROR_CAPTURE_VISIBLE_TAB_PENDING = "CHROME_CAPTURE_VISIBLE_TAB_PENDING";
 const ERROR_SCREENSHOT_PLAN_EXCEEDS_LIMIT = "CAPTURE_PLAN_EXCEEDS_LIMIT";
 const ERROR_EVALUATE_TIMEOUT = "BROWSER_EVALUATE_TIMEOUT";
@@ -105,6 +106,7 @@ const ERROR_MAINTENANCE_PAUSE_PERSIST_FAILED =
 const ERROR_RECONNECT_WAKE_ALARM_INVALID =
   "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID";
 const ERROR_CHROME_SCRIPTING_EXECUTE_FAILED = "CHROME_SCRIPTING_EXECUTE_FAILED";
+const ERROR_CHROME_WAIT_PREDICATE_INVALID = "CHROME_WAIT_PREDICATE_INVALID";
 const ERROR_CHROME_DOM_SELECTOR_INVALID = "CHROME_DOM_SELECTOR_INVALID";
 const ERROR_CHROME_DOM_ELEMENT_NOT_FOUND = "CHROME_DOM_ELEMENT_NOT_FOUND";
 const ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
@@ -160,6 +162,7 @@ const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
   "CHROME_STORAGE_OPERATION_UNSUPPORTED",
   "CHROME_STORAGE_STATE_LOAD_FAILED",
   "CHROME_STORAGE_STATE_READ_FAILED",
+  "CHROME_WAIT_PREDICATE_INVALID",
   "PAGE_VITALS_READ_FAILED",
   "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
   "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID",
@@ -4947,53 +4950,257 @@ async function handleWaitForFunction(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const expression = String(params.expression ?? "");
   if (expression.trim().length === 0) {
-    throw bridgeError(ERROR_ATTACH_FAILED, "waitForFunction expression must be non-empty");
+    throw bridgeError(
+      ERROR_CHROME_WAIT_PREDICATE_INVALID,
+      "waitForFunction expression must be non-empty; remediation=pass a JavaScript expression or function declaration"
+    );
   }
   const args = Array.isArray(params.args) ? params.args : [];
   const timeoutMs = normalizeWaitTimeout(params.timeoutMs);
   const pollingIntervalMs = normalizePollingInterval(params.pollingIntervalMs);
   const startedAt = Date.now();
   let pollCount = 0;
-  let last = null;
-  while (true) {
-    pollCount += 1;
-    const poll = await waitForFunctionProbe(selected, expression, args);
-    last = poll;
-    if (poll.condition_met) {
-      const pageState = await tabPageState(selected.tabId, selected.target);
-      return waitForFunctionResult(
-        selected,
-        pageState,
-        poll,
-        true,
-        false,
-        elapsedSince(startedAt),
-        timeoutMs,
-        pollingIntervalMs,
-        pollCount,
-        expression,
-        args
+  let last = {
+    condition_met: false,
+    value: null,
+    value_type: "undefined",
+    value_description: "undefined",
+    unserializable_value: null
+  };
+  let attachment = null;
+  let result = null;
+  let primaryError = null;
+  let initialDocumentId = null;
+  let currentDocumentId = null;
+  let navigationCount = 0;
+  let isolatedContextId = null;
+  try {
+    initialDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+    if (!initialDocumentId) {
+      throw bridgeError(
+        ERROR_ATTACH_FAILED,
+        `waitForFunction could not read the exact main-frame document identity before debugger attach; ` +
+          `tab=${selected.tabId} remediation=wait for a committed page document or repair the webNavigation permission; no predicate was executed`
       );
     }
-    const elapsed = elapsedSince(startedAt);
-    if (elapsed >= timeoutMs) {
-      const pageState = await tabPageState(selected.tabId, selected.target);
-      return waitForFunctionResult(
-        selected,
-        pageState,
-        last,
-        false,
-        true,
-        elapsed,
-        timeoutMs,
-        pollingIntervalMs,
-        pollCount,
-        expression,
-        args
+    currentDocumentId = initialDocumentId;
+    try {
+      attachment = await attachDebuggerForCommand(selected.tabId);
+    } catch (error) {
+      throw bridgeError(
+        ERROR_ATTACH_FAILED,
+        `waitForFunction could not attach chrome.debugger to tab ${selected.tabId}: ${errorMessage(error)}`
       );
     }
-    await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
+    while (true) {
+      pollCount += 1;
+      const beforePollDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+      if (!beforePollDocumentId) {
+        throw bridgeError(
+          ERROR_ATTACH_FAILED,
+          `waitForFunction lost the exact main-frame document identity before poll ${pollCount}; ` +
+            `tab=${selected.tabId} initial_document_id=${initialDocumentId} ` +
+            `last_document_id=${String(currentDocumentId || "missing")}; no alternate target was used`
+        );
+      }
+      if (beforePollDocumentId !== currentDocumentId) {
+        navigationCount += 1;
+        currentDocumentId = beforePollDocumentId;
+        isolatedContextId = null;
+      }
+      const elapsedBeforePoll = elapsedSince(startedAt);
+      const remainingMs = Math.max(1, timeoutMs - Math.min(timeoutMs, elapsedBeforePoll));
+      let poll;
+      try {
+        if (!Number.isInteger(isolatedContextId)) {
+          isolatedContextId = await waitForFunctionIsolatedContext(
+            selected,
+            attachment.debuggee,
+            remainingMs
+          );
+        }
+        const remainingAfterContextMs = Math.max(
+          1,
+          timeoutMs - Math.min(timeoutMs, elapsedSince(startedAt))
+        );
+        poll = await waitForFunctionProbe(
+          selected,
+          attachment.debuggee,
+          isolatedContextId,
+          expression,
+          args,
+          remainingAfterContextMs
+        );
+      } catch (error) {
+        const afterErrorDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+        if (
+          waitForFunctionRuntimeWasInterruptedByNavigation(error) &&
+          afterErrorDocumentId &&
+          afterErrorDocumentId !== currentDocumentId
+        ) {
+          navigationCount += 1;
+          currentDocumentId = afterErrorDocumentId;
+          isolatedContextId = null;
+          const elapsedAfterNavigation = elapsedSince(startedAt);
+          if (elapsedAfterNavigation >= timeoutMs) {
+            const pageState = await tabPageState(selected.tabId, selected.target);
+            last.initial_document_id = initialDocumentId;
+            last.final_document_id = currentDocumentId;
+            last.navigation_count = navigationCount;
+            result = waitForFunctionResult(
+              selected,
+              pageState,
+              last,
+              false,
+              true,
+              elapsedAfterNavigation,
+              timeoutMs,
+              pollingIntervalMs,
+              pollCount,
+              expression,
+              args
+            );
+            break;
+          }
+          await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsedAfterNavigation)));
+          continue;
+        }
+        if (error?.code === ERROR_EXTENSION_TIMEOUT) {
+          const pageState = await tabPageState(selected.tabId, selected.target);
+          if (afterErrorDocumentId && afterErrorDocumentId !== currentDocumentId) {
+            navigationCount += 1;
+            currentDocumentId = afterErrorDocumentId;
+            isolatedContextId = null;
+          }
+          last.initial_document_id = initialDocumentId;
+          last.final_document_id = currentDocumentId;
+          last.navigation_count = navigationCount;
+          result = waitForFunctionResult(
+            selected,
+            pageState,
+            last,
+            false,
+            true,
+            elapsedSince(startedAt),
+            timeoutMs,
+            pollingIntervalMs,
+            pollCount,
+            expression,
+            args
+          );
+          break;
+        }
+        throw error;
+      }
+      const afterPollDocumentId = await mainFrameDocumentIdOrNull(selected.tabId);
+      if (!afterPollDocumentId) {
+        throw bridgeError(
+          ERROR_ATTACH_FAILED,
+          `waitForFunction lost the exact main-frame document identity after poll ${pollCount}; ` +
+            `tab=${selected.tabId} initial_document_id=${initialDocumentId}; predicate result was not accepted`
+        );
+      }
+      if (afterPollDocumentId !== currentDocumentId) {
+        navigationCount += 1;
+        currentDocumentId = afterPollDocumentId;
+        isolatedContextId = null;
+        const elapsedAfterNavigation = elapsedSince(startedAt);
+        if (elapsedAfterNavigation >= timeoutMs) {
+          const pageState = await tabPageState(selected.tabId, selected.target);
+          last.initial_document_id = initialDocumentId;
+          last.final_document_id = currentDocumentId;
+          last.navigation_count = navigationCount;
+          result = waitForFunctionResult(
+            selected,
+            pageState,
+            last,
+            false,
+            true,
+            elapsedAfterNavigation,
+            timeoutMs,
+            pollingIntervalMs,
+            pollCount,
+            expression,
+            args
+          );
+          break;
+        }
+        // This result belongs to the previous document. Never accept it as
+        // evidence about the independently observed current document.
+        await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsedAfterNavigation)));
+        continue;
+      }
+      last = {
+        ...poll,
+        initial_document_id: initialDocumentId,
+        final_document_id: currentDocumentId,
+        navigation_count: navigationCount
+      };
+      if (poll.condition_met) {
+        const pageState = await tabPageState(selected.tabId, selected.target);
+        result = waitForFunctionResult(
+          selected,
+          pageState,
+          last,
+          true,
+          false,
+          elapsedSince(startedAt),
+          timeoutMs,
+          pollingIntervalMs,
+          pollCount,
+          expression,
+          args
+        );
+        break;
+      }
+      const elapsed = elapsedSince(startedAt);
+      if (elapsed >= timeoutMs) {
+        const pageState = await tabPageState(selected.tabId, selected.target);
+        result = waitForFunctionResult(
+          selected,
+          pageState,
+          last,
+          false,
+          true,
+          elapsed,
+          timeoutMs,
+          pollingIntervalMs,
+          pollCount,
+          expression,
+          args
+        );
+        break;
+      }
+      await sleep(Math.min(pollingIntervalMs, Math.max(1, timeoutMs - elapsed)));
+    }
+  } catch (error) {
+    primaryError = error;
   }
+  if (attachment?.shouldDetach) {
+    try {
+      await chrome.debugger.detach(attachment.debuggee);
+      forgetCdpDomainsForTab(selected.tabId);
+    } catch (error) {
+      const priorCode = primaryError?.code ? String(primaryError.code) : "none";
+      const priorDetail = primaryError ? errorMessage(primaryError) : "none";
+      throw bridgeError(
+        ERROR_EXTENSION_DETACHED,
+        `waitForFunction could not prove transient debugger detach for tab ${selected.tabId}: ` +
+          `${errorMessage(error)}; prior_error_code=${priorCode} ` +
+          `prior_error_detail=${JSON.stringify(priorDetail)}; ` +
+          "remediation=inspect chrome.debugger target attachment state before another debugger command"
+      );
+    }
+  }
+  if (primaryError) throw primaryError;
+  if (!result) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `waitForFunction reached no terminal result for tab ${selected.tabId}; ` +
+        `poll_count=${pollCount} navigation_count=${navigationCount}`
+    );
+  }
+  return result;
 }
 
 async function handleWaitForLoadState(params) {
@@ -17118,39 +17325,207 @@ function waitForTextResult(
   };
 }
 
-async function waitForFunctionProbe(selected, expression, args) {
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
-    );
-  }
-  let injected;
+function waitForFunctionRuntimeExpression(expression, args) {
+  let argsJson;
   try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId },
-      world: "MAIN",
-      func: runWaitForFunctionProbeInPage,
-      args: [{ expression, args }]
-    });
+    argsJson = JSON.stringify(args);
   } catch (error) {
     throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `chrome.scripting.executeScript waitForFunction(${selected.tabId}) failed: ${errorMessage(error)}`
+      ERROR_CHROME_WAIT_PREDICATE_INVALID,
+      `waitForFunction args could not be serialized before debugger dispatch: ${errorMessage(error)}; ` +
+        `expression_len=${expression.length} arg_count=${args.length}; ` +
+        "remediation=pass only JSON-serializable predicate arguments"
     );
   }
-  const frames = frameExecutionResults(injected);
-  const first = frames.find((frame) => frame.result && typeof frame.result === "object");
-  if (!first) {
-    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "chrome.scripting.executeScript waitForFunction returned no structured result");
-  }
-  if (first.result.ok === false) {
+  // Runtime.evaluate compiles this source in a dedicated CDP isolated world.
+  // No page-world eval/new Function or chrome.scripting MAIN-world injection
+  // is involved, so the host page's script-src policy cannot disable the tool.
+  return `(() => {
+    const __synapseArgs = ${argsJson};
+    const __synapseCandidate = (${expression});
+    const __synapseValue = typeof __synapseCandidate === "function"
+      ? __synapseCandidate(...__synapseArgs)
+      : __synapseCandidate;
+    return Promise.resolve(__synapseValue).then((__synapseResolved) => {
+      const __synapseType = typeof __synapseResolved;
+      let __synapseSerialized = null;
+      let __synapseDescription = null;
+      let __synapseUnserializable = null;
+      if (__synapseResolved === undefined) {
+        __synapseDescription = "undefined";
+      } else if (__synapseType === "bigint") {
+        __synapseSerialized = String(__synapseResolved);
+        __synapseDescription = String(__synapseResolved) + "n";
+        __synapseUnserializable = __synapseDescription;
+      } else if (__synapseType === "number" && !Number.isFinite(__synapseResolved)) {
+        __synapseDescription = String(__synapseResolved);
+        __synapseUnserializable = __synapseDescription;
+      } else if (__synapseType === "function" || __synapseType === "symbol") {
+        __synapseDescription = String(__synapseResolved);
+      } else {
+        try {
+          __synapseSerialized = JSON.parse(JSON.stringify(__synapseResolved));
+        } catch (__synapseSerializationError) {
+          __synapseDescription = String(__synapseResolved);
+        }
+      }
+      return {
+        condition_met: Boolean(__synapseResolved),
+        value: __synapseSerialized,
+        value_type: __synapseType,
+        value_description: __synapseDescription,
+        unserializable_value: __synapseUnserializable
+      };
+    });
+  })()
+  //# sourceURL=synapse://browser-wait/function-predicate`;
+}
+
+function waitForFunctionRuntimeWasInterruptedByNavigation(error) {
+  const message = errorMessage(error);
+  return [
+    "Execution context was destroyed",
+    "Cannot find context with specified id",
+    "Cannot find default execution context",
+    "Inspected target navigated"
+  ].some((fragment) => message.includes(fragment));
+}
+
+function waitForFunctionDebuggerCommandTimedOut(error) {
+  const message = errorMessage(error);
+  return message.includes("timed out after") || message.includes("Script execution timed out");
+}
+
+async function waitForFunctionIsolatedContext(selected, debuggee, remainingMs) {
+  let frameTree;
+  try {
+    frameTree = await sendDebuggerCommand(debuggee, "Page.getFrameTree", {}, remainingMs);
+  } catch (error) {
+    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) throw error;
+    if (waitForFunctionDebuggerCommandTimedOut(error)) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        `waitForFunction could not resolve the main frame before the ${remainingMs} ms remaining deadline; ` +
+          `tab=${selected.tabId}; no predicate was executed`
+      );
+    }
     throw bridgeError(
-      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
-      `waitForFunction failed: ${String(first.result.error_detail || "")}`
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Page.getFrameTree waitForFunction failed for tab ${selected.tabId}: ${errorMessage(error)}`
     );
   }
-  return first.result;
+  const frameId = frameTree?.frameTree?.frame?.id;
+  if (typeof frameId !== "string" || frameId.length === 0) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Page.getFrameTree returned no exact main-frame id for waitForFunction; ` +
+        `tab=${selected.tabId} remediation=inspect the Chrome DevTools Protocol response`
+    );
+  }
+  let isolated;
+  try {
+    isolated = await sendDebuggerCommand(
+      debuggee,
+      "Page.createIsolatedWorld",
+      {
+        frameId,
+        worldName: "synapse_browser_wait",
+        grantUniveralAccess: false
+      },
+      remainingMs
+    );
+  } catch (error) {
+    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) throw error;
+    if (waitForFunctionDebuggerCommandTimedOut(error)) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        `waitForFunction could not create its isolated execution world before the ${remainingMs} ms remaining deadline; ` +
+          `tab=${selected.tabId} frame_id=${frameId}; no predicate was executed`
+      );
+    }
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Page.createIsolatedWorld waitForFunction failed for tab ${selected.tabId} ` +
+        `frame_id=${frameId}: ${errorMessage(error)}`
+    );
+  }
+  if (!Number.isInteger(isolated?.executionContextId)) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Page.createIsolatedWorld returned no executionContextId for waitForFunction; ` +
+        `tab=${selected.tabId} frame_id=${frameId} response=${JSON.stringify(isolated || null)}`
+    );
+  }
+  return isolated.executionContextId;
+}
+
+async function waitForFunctionProbe(
+  selected,
+  debuggee,
+  isolatedContextId,
+  expression,
+  args,
+  remainingMs
+) {
+  const runtimeExpression = waitForFunctionRuntimeExpression(expression, args);
+  const runtimeTimeoutMs = Math.max(1, Math.floor(remainingMs));
+  let evaluation;
+  try {
+    evaluation = await sendDebuggerCommand(
+      debuggee,
+      "Runtime.evaluate",
+      {
+        expression: runtimeExpression,
+        contextId: isolatedContextId,
+        awaitPromise: true,
+        returnByValue: true,
+        userGesture: false,
+        timeout: runtimeTimeoutMs,
+        disableBreaks: true,
+        allowUnsafeEvalBlockedByCSP: false
+      },
+      runtimeTimeoutMs + 1000
+    );
+  } catch (error) {
+    if (waitForFunctionRuntimeWasInterruptedByNavigation(error)) {
+      throw error;
+    }
+    const message = errorMessage(error);
+    if (waitForFunctionDebuggerCommandTimedOut(error)) {
+      throw bridgeError(
+        ERROR_EXTENSION_TIMEOUT,
+        `waitForFunction predicate remained unresolved at the ${runtimeTimeoutMs} ms remaining deadline; ` +
+          `tab=${selected.tabId} expression_len=${expression.length} arg_count=${args.length}; ` +
+          "the debugger execution timeout bounded the exact predicate and no alternate lane was attempted"
+      );
+    }
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Runtime.evaluate waitForFunction failed for tab ${selected.tabId}: ${message}`
+    );
+  }
+  if (evaluation?.exceptionDetails) {
+    throw bridgeError(
+      ERROR_CHROME_WAIT_PREDICATE_INVALID,
+      `waitForFunction predicate failed through chrome.debugger.Runtime.evaluate: ` +
+        `${formatDebuggerExceptionDetails(evaluation.exceptionDetails)}; ` +
+        `tab=${selected.tabId} expression_len=${expression.length} arg_count=${args.length}; ` +
+        "remediation=repair the predicate syntax/runtime error; the target page CSP and debugger transport were not the failure"
+    );
+  }
+  const remote = evaluation?.result || {};
+  const value = remote.value;
+  if (remote.type !== "object" || value === null || typeof value !== "object" ||
+      typeof value.condition_met !== "boolean" || typeof value.value_type !== "string") {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      `chrome.debugger Runtime.evaluate waitForFunction returned an invalid protocol payload; ` +
+        `tab=${selected.tabId} remote_type=${JSON.stringify(remote.type || null)} ` +
+        `remote_subtype=${JSON.stringify(remote.subtype || null)} ` +
+        "remediation=inspect the authenticated bridge/Chrome protocol versions; do not treat this as a false predicate"
+    );
+  }
+  return value;
 }
 
 function waitForFunctionResult(
@@ -17187,8 +17562,13 @@ function waitForFunctionResult(
     value_type: String(current.value_type || "undefined"),
     value_description: current.value_description ?? null,
     unserializable_value: current.unserializable_value ?? null,
-    readback_backend: "chrome.scripting.executeScript(MAIN waitForFunction predicate polling)",
-    backend_tier_used: "chrome_tabs_extension",
+    initial_document_id: current.initial_document_id ?? null,
+    final_document_id: current.final_document_id ?? null,
+    navigation_count: Number.isSafeInteger(current.navigation_count)
+      ? current.navigation_count
+      : 0,
+    readback_backend: "chrome.debugger.Runtime.evaluate(isolated-world waitForFunction predicate polling; page CSP independent)",
+    backend_tier_used: "chrome_debugger_protocol",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
@@ -18005,87 +18385,6 @@ function runLoadStateProbeInPage(request) {
     quiet_window_ms: quietMs,
     latest_resource_activity_ms: Math.floor(latestResourceMs)
   };
-}
-
-async function runWaitForFunctionProbeInPage(request) {
-  const expression = String(request?.expression ?? "");
-  const args = Array.isArray(request?.args) ? request.args : [];
-  const serializeValue = (value) => {
-    const valueType = typeof value;
-    if (value === undefined) {
-      return {
-        value: null,
-        value_type: "undefined",
-        value_description: "undefined",
-        unserializable_value: null
-      };
-    }
-    if (valueType === "bigint") {
-      return {
-        value: String(value),
-        value_type: valueType,
-        value_description: `${String(value)}n`,
-        unserializable_value: `${String(value)}n`
-      };
-    }
-    if (valueType === "number" && !Number.isFinite(value)) {
-      return {
-        value: null,
-        value_type: valueType,
-        value_description: String(value),
-        unserializable_value: String(value)
-      };
-    }
-    if (valueType === "function" || valueType === "symbol") {
-      return {
-        value: null,
-        value_type: valueType,
-        value_description: String(value),
-        unserializable_value: null
-      };
-    }
-    try {
-      return {
-        value: JSON.parse(JSON.stringify(value)),
-        value_type: valueType,
-        value_description: null,
-        unserializable_value: null
-      };
-    } catch (_error) {
-      return {
-        value: null,
-        value_type: valueType,
-        value_description: String(value),
-        unserializable_value: null
-      };
-    }
-  };
-  try {
-    const candidate = (0, eval)(`(${expression})`);
-    const value = typeof candidate === "function" ? candidate(...args) : candidate;
-    const resolved = await Promise.resolve(value);
-    const serialized = serializeValue(resolved);
-    return {
-      ok: true,
-      condition_met: Boolean(resolved),
-      value: serialized.value,
-      value_type: serialized.value_type,
-      value_description: serialized.value_description,
-      unserializable_value: serialized.unserializable_value,
-      url: String(location.href || ""),
-      title: document && typeof document.title === "string" ? document.title : "",
-      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
-    };
-  } catch (error) {
-    return {
-      ok: false,
-      error_code: "CHROME_SCRIPTING_EXECUTE_FAILED",
-      error_detail: error && error.stack ? String(error.stack) : String(error && error.message ? error.message : error),
-      url: String(location.href || ""),
-      title: document && typeof document.title === "string" ? document.title : "",
-      ready_state: document && typeof document.readyState === "string" ? document.readyState : ""
-    };
-  }
 }
 
 async function tabPageVitalsState(tabId) {

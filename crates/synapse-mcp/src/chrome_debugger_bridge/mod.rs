@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-native-message-body-contract-v7";
+    "synapse-chrome-bridge-2026-08-11-csp-independent-wait-v8";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "919f6ab2230f2462b89551a1963b6f29d9b3fad9a7d54825ed40608cd64de832";
+    "3c81c9f1ba6042d283cff649999a6fb50eb93a7e72435f8adac75982a34581d6";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
@@ -165,6 +165,7 @@ const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
     "CHROME_STORAGE_OPERATION_UNSUPPORTED",
     "CHROME_STORAGE_STATE_LOAD_FAILED",
     "CHROME_STORAGE_STATE_READ_FAILED",
+    "CHROME_WAIT_PREDICATE_INVALID",
     "PAGE_VITALS_READ_FAILED",
     "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
     "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID",
@@ -2318,6 +2319,12 @@ pub struct ChromeDebuggerWaitForFunctionResult {
     pub value_description: Option<String>,
     #[serde(default)]
     pub unserializable_value: Option<String>,
+    #[serde(default)]
+    pub initial_document_id: Option<String>,
+    #[serde(default)]
+    pub final_document_id: Option<String>,
+    #[serde(default)]
+    pub navigation_count: u64,
     #[serde(default)]
     pub readback_backend: String,
     #[serde(default)]
@@ -9329,8 +9336,14 @@ pub async fn wait_for_function(
     polling_interval_ms: u64,
 ) -> Result<ChromeDebuggerWaitForFunctionResult, ChromeDebuggerBridgeError> {
     ensure_normal_bridge_external_popup_suppressed(hwnd, "waitForFunction")?;
+    // The daemon response envelope must outlive the caller's in-extension
+    // polling budget so a structured predicate/timeout outcome remains
+    // authoritative instead of being masked by a generic bridge timeout.
+    let command_timeout = COMMAND_TIMEOUT.max(Duration::from_millis(
+        timeout_ms.saturating_add(EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS),
+    ));
     let result = bridge()
-        .send_command(
+        .send_command_with_timeout(
             "waitForFunction",
             json!({
                 "hwnd": hwnd,
@@ -9340,6 +9353,7 @@ pub async fn wait_for_function(
                 "timeoutMs": timeout_ms,
                 "pollingIntervalMs": polling_interval_ms,
             }),
+            command_timeout,
         )
         .await?;
     serde_json::from_value::<ChromeDebuggerWaitForFunctionResult>(result).map_err(|error| {

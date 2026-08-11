@@ -9952,11 +9952,14 @@ impl SynapseService {
                     return Err(mcp_error(
                         error_codes::BROWSER_WAIT_TIMEOUT,
                         format!(
-                            "browser_wait_for_function timed out after {} ms; poll_count={} value_type={} value_description={:?}",
+                            "browser_wait_for_function timed out after {} ms; poll_count={} value_type={} value_description={:?} initial_document_id={:?} final_document_id={:?} navigation_count={}",
                             wait.timeout_ms,
                             waited.poll_count,
                             waited.value_type,
-                            waited.value_description
+                            waited.value_description,
+                            waited.initial_document_id,
+                            waited.final_document_id,
+                            waited.navigation_count
                         ),
                     ));
                 }
@@ -9971,7 +9974,10 @@ impl SynapseService {
                     poll_count = waited.poll_count,
                     value_type = %waited.value_type,
                     target_url = %waited.url,
-                    "readback=chrome.scripting.executeScript(MAIN waitForFunction predicate polling) outcome=wait_satisfied"
+                    initial_document_id = ?waited.initial_document_id,
+                    final_document_id = ?waited.final_document_id,
+                    navigation_count = waited.navigation_count,
+                    "readback=chrome.debugger.Runtime.evaluate(isolated-world waitForFunction predicate polling) outcome=wait_satisfied"
                 );
                 return Ok(BrowserWaitForFunctionResponse {
                     session_id: session_id.to_owned(),
@@ -9998,11 +10004,18 @@ impl SynapseService {
                     value_type: waited.value_type,
                     value_description: waited.value_description,
                     unserializable_value: waited.unserializable_value,
+                    initial_document_id: waited.initial_document_id,
+                    final_document_id: waited.final_document_id,
+                    navigation_count: waited.navigation_count,
                     url: redact_url_for_public_readback(&waited.url),
                     title: waited.title,
                     ready_state: waited.ready_state,
                     readback_backend: waited.readback_backend,
-                    backend_tier_used: "chrome_tabs_extension".to_owned(),
+                    backend_tier_used: if waited.backend_tier_used.is_empty() {
+                        "chrome_debugger_protocol".to_owned()
+                    } else {
+                        waited.backend_tier_used
+                    },
                     required_foreground: false,
                 });
             }
@@ -10076,6 +10089,9 @@ impl SynapseService {
             value_type: payload.value_type,
             value_description: payload.value_description,
             unserializable_value: payload.unserializable_value,
+            initial_document_id: None,
+            final_document_id: None,
+            navigation_count: 0,
             url: redact_url_for_public_readback(&evaluated.url),
             title: evaluated.title,
             ready_state: evaluated.ready_state,

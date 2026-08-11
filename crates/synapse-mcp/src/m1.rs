@@ -2926,6 +2926,14 @@ pub struct BrowserWaitForFunctionResponse {
     pub value_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unserializable_value: Option<String>,
+    /// Exact Chrome main-frame document identity before polling began.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_document_id: Option<String>,
+    /// Exact Chrome main-frame document identity that owns the accepted result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_document_id: Option<String>,
+    /// Number of independently observed main-frame document transitions.
+    pub navigation_count: u64,
     pub url: String,
     pub title: String,
     pub ready_state: String,
