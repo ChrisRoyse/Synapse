@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 1;
 const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-11-bounded-screenshot-compositor-v5";
+    "synapse-chrome-bridge-2026-08-11-explicit-error-code-contract-v6";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "b0b4e4aed354a4bce254ca3028bc8c496ff62c4e267a6d70f60bfd2d5726cd8f";
+    "62182aa411e7ed626c9254204277e040f9f3b75f2daeadd4e565d71b6a75969f";
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
 const SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE: &str = "Synapse blocked this extension on this host because debugger/nativeMessaging permissions can surface Chrome debugger or native-host popups during background automation.";
@@ -108,6 +108,66 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "typeActiveElement",
     "setFieldValue",
 ];
+/// Exact machine-readable failures the authenticated extension may send across
+/// the command-response boundary. Keep this closed: arbitrary strings are not
+/// trusted merely because they arrived in an `error.code` field. The canonical
+/// lint gate compares this registry with the JavaScript runtime registry and
+/// `synapse_core::error_codes` so cross-language drift cannot ship again
+/// (#2217).
+const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
+    // >>> SHARED-CHROME-ERROR-CODE-CONTRACT
+    "A11Y_CDP_ATTACH_FAILED",
+    "A11Y_CDP_AXTREE_FAILED",
+    "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED",
+    "A11Y_CDP_EXTENSION_DETACHED",
+    "A11Y_CDP_EXTENSION_TIMEOUT",
+    "A11Y_CDP_EXTENSION_UNAVAILABLE",
+    "ACTION_TARGET_INVALID",
+    "BROWSER_EVALUATE_TIMEOUT",
+    "BROWSER_NAVIGATION_FAILED",
+    "BROWSER_WAIT_TIMEOUT",
+    "CAPTURE_PLAN_EXCEEDS_LIMIT",
+    "CAPTURE_TARGET_INVALID",
+    "CHROME_ACTIVE_ELEMENT_MISSING",
+    "CHROME_ACTIVE_ELEMENT_NOT_EDITABLE",
+    "CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH",
+    "CHROME_BEFOREINPUT_CANCELLED",
+    "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
+    "CHROME_BRIDGE_EXTENSION_STALE",
+    "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
+    "CHROME_CLOCK_FAILED",
+    "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
+    "CHROME_DOM_ACTION_UNSUPPORTED",
+    "CHROME_DOM_ELEMENT_AMBIGUOUS",
+    "CHROME_DOM_ELEMENT_NOT_ACTIONABLE",
+    "CHROME_DOM_ELEMENT_NOT_FOUND",
+    "CHROME_DOM_SELECTOR_INVALID",
+    "CHROME_FRAME_METADATA_FAILED",
+    "CHROME_SCRIPTING_EMPTY_RESULT",
+    "CHROME_SCRIPTING_EXECUTE_FAILED",
+    "CHROME_SCRIPTING_UNAVAILABLE",
+    "CHROME_SET_FIELD_BAD_LOCATOR",
+    "CHROME_SET_FIELD_NOT_FOUND",
+    "CHROME_SET_FIELD_NOT_UNIQUE",
+    "CHROME_SET_FIELD_SELECTOR_INVALID",
+    "CHROME_SET_FIELD_VALUE_MISMATCH",
+    "CHROME_STORAGE_ACTION_FAILED",
+    "CHROME_STORAGE_KEY_INVALID",
+    "CHROME_STORAGE_OPERATION_UNSUPPORTED",
+    "CHROME_STORAGE_STATE_LOAD_FAILED",
+    "CHROME_STORAGE_STATE_READ_FAILED",
+    "PAGE_VITALS_READ_FAILED",
+    "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
+    "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID",
+    "SYNAPSE_CHROME_DAEMON_UNAVAILABLE",
+    "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH",
+    // <<< SHARED-CHROME-ERROR-CODE-CONTRACT <<<
+];
+
+fn trusted_extension_error_code(code: &str) -> Option<&'static str> {
+    let index = TRUSTED_EXTENSION_ERROR_CODES.binary_search(&code).ok()?;
+    Some(TRUSTED_EXTENSION_ERROR_CODES[index])
+}
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS: u64 = 25_000;
 const PAGE_SCREENSHOT_DAEMON_RESPONSE_HEADROOM_MS: u64 = 7_000;
@@ -224,57 +284,15 @@ impl ChromeDebuggerBridgeError {
     }
 
     fn extension(code: Option<&str>, detail: impl Into<String>) -> Self {
-        let code = match code {
-            Some(error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE) => {
-                error_codes::A11Y_CDP_EXTENSION_UNAVAILABLE
-            }
-            Some(error_codes::A11Y_CDP_EXTENSION_DETACHED) => {
-                error_codes::A11Y_CDP_EXTENSION_DETACHED
-            }
-            Some(error_codes::A11Y_CDP_EXTENSION_TIMEOUT) => {
-                error_codes::A11Y_CDP_EXTENSION_TIMEOUT
-            }
-            Some(error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED) => {
-                error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED
-            }
-            Some(error_codes::CHROME_BRIDGE_EXTENSION_STALE) => {
-                error_codes::CHROME_BRIDGE_EXTENSION_STALE
-            }
-            Some(error_codes::CHROME_CAPTURE_VISIBLE_TAB_PENDING) => {
-                error_codes::CHROME_CAPTURE_VISIBLE_TAB_PENDING
-            }
-            Some(error_codes::A11Y_CDP_AXTREE_FAILED) => error_codes::A11Y_CDP_AXTREE_FAILED,
-            Some(error_codes::A11Y_CDP_ATTACH_FAILED) => error_codes::A11Y_CDP_ATTACH_FAILED,
-            Some(error_codes::CHROME_SCRIPTING_EXECUTE_FAILED) => {
-                error_codes::CHROME_SCRIPTING_EXECUTE_FAILED
-            }
-            Some(error_codes::CHROME_DOM_SELECTOR_INVALID) => {
-                error_codes::CHROME_DOM_SELECTOR_INVALID
-            }
-            Some(error_codes::CHROME_DOM_ELEMENT_NOT_FOUND) => {
-                error_codes::CHROME_DOM_ELEMENT_NOT_FOUND
-            }
-            Some(error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS) => {
-                error_codes::CHROME_DOM_ELEMENT_AMBIGUOUS
-            }
-            Some(error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE) => {
-                error_codes::CHROME_DOM_ELEMENT_NOT_ACTIONABLE
-            }
-            Some(error_codes::CHROME_DOM_ACTION_UNSUPPORTED) => {
-                error_codes::CHROME_DOM_ACTION_UNSUPPORTED
-            }
-            Some(error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED) => {
-                error_codes::CHROME_DOM_ACTION_POSTCONDITION_FAILED
-            }
-            Some(error_codes::ACTION_TARGET_INVALID) => error_codes::ACTION_TARGET_INVALID,
-            Some(error_codes::BROWSER_WAIT_TIMEOUT) => error_codes::BROWSER_WAIT_TIMEOUT,
-            Some(error_codes::BROWSER_EVALUATE_TIMEOUT) => error_codes::BROWSER_EVALUATE_TIMEOUT,
-            Some(error_codes::BROWSER_NAVIGATION_FAILED) => error_codes::BROWSER_NAVIGATION_FAILED,
-            _ => error_codes::A11Y_CDP_ATTACH_FAILED,
-        };
+        let detail = detail.into();
+        if let Some(code) = code.and_then(trusted_extension_error_code) {
+            return Self { code, detail };
+        }
         Self {
-            code,
-            detail: detail.into(),
+            code: error_codes::CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION,
+            detail: format!(
+                "Chrome debugger extension error-code contract violated; received_code={code:?} original_detail={detail:?}; remediation=register the exact machine code in PUBLIC_COMMAND_ERROR_CODES, TRUSTED_EXTENSION_ERROR_CODES, and synapse_core::error_codes in one change, then bump/redeploy the bridge build identity"
+            ),
         }
     }
 

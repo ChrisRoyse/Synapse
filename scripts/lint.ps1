@@ -620,10 +620,120 @@ catch {
         'repair the source inventory or gate implementation; the public tool surface cannot be certified when its structural sweep did not complete'
 }
 
+# ---------------------------------------------------------------------------
+# Gate 0c — authenticated Chrome error-code contract (#2217)
+# ---------------------------------------------------------------------------
+#
+# The extension and daemon are different languages joined by string-valued
+# machine error identifiers. A missing Rust allowlist arm used to collapse the
+# extension's precise CAPTURE_PLAN_EXCEEDS_LIMIT into A11Y_CDP_ATTACH_FAILED.
+# This is a structural contract check, not a behavioural test: compare the two
+# source registries, require one sorted occurrence of each value, require every
+# value in synapse_core::error_codes, and reject any code-shaped extension
+# literal that is absent from the public command registry. Runtime enforcement
+# independently turns any missing/dynamic code into an explicit contract error.
+
+Write-Gate 'Gate 0c    authenticated Chrome error-code contract (#2217)'
+try {
+    $contractFailureCountBefore = $script:Failures.Count
+    $workerPath = Join-Path $RepoRoot 'extensions/synapse-chrome-debugger/service_worker.js'
+    $bridgePath = Join-Path $RepoRoot 'crates/synapse-mcp/src/chrome_debugger_bridge/mod.rs'
+    $coreErrorPath = Join-Path $RepoRoot 'crates/synapse-core/src/error_codes.rs'
+    foreach ($path in @($workerPath, $bridgePath, $coreErrorPath)) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw "SYNAPSE_LINT_CHROME_ERROR_CONTRACT_SOURCE_MISSING: $path"
+        }
+    }
+
+    function Get-ChromeErrorContractValues {
+        param([string]$Path)
+        $lines = [IO.File]::ReadAllLines($Path)
+        $begin = -1
+        $end = -1
+        for ($i = 0; $i -lt $lines.Count; $i++) {
+            if ($lines[$i] -match '>>> SHARED-CHROME-ERROR-CODE-CONTRACT') {
+                if ($begin -ge 0) { throw "duplicate contract begin marker in $Path" }
+                $begin = $i
+            }
+            if ($lines[$i] -match '<<< SHARED-CHROME-ERROR-CODE-CONTRACT <<<') {
+                if ($end -ge 0) { throw "duplicate contract end marker in $Path" }
+                $end = $i
+            }
+        }
+        if ($begin -lt 0 -or $end -le $begin) {
+            throw "missing or inverted SHARED-CHROME-ERROR-CODE-CONTRACT markers in $Path"
+        }
+        $values = [System.Collections.Generic.List[string]]::new()
+        for ($i = $begin + 1; $i -lt $end; $i++) {
+            $match = [regex]::Match($lines[$i], '^\s*"([A-Z][A-Z0-9_]+)",?\s*$')
+            if (-not $match.Success) {
+                throw "unparseable Chrome error contract line $Path`:$($i + 1): $($lines[$i])"
+            }
+            $values.Add($match.Groups[1].Value)
+        }
+        if ($values.Count -eq 0) { throw "empty Chrome error contract in $Path" }
+        return $values
+    }
+
+    $workerContract = @(Get-ChromeErrorContractValues -Path $workerPath)
+    $bridgeContract = @(Get-ChromeErrorContractValues -Path $bridgePath)
+    $workerJoined = $workerContract -join "`n"
+    $bridgeJoined = $bridgeContract -join "`n"
+    if ($workerJoined -ne $bridgeJoined) {
+        $onlyWorker = @($workerContract | Where-Object { $_ -notin $bridgeContract })
+        $onlyBridge = @($bridgeContract | Where-Object { $_ -notin $workerContract })
+        Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_CONTRACT_DIVERGED' `
+            "extension and daemon trusted error registries differ; extension_only=$($onlyWorker -join ',') daemon_only=$($onlyBridge -join ',')" `
+            'update PUBLIC_COMMAND_ERROR_CODES and TRUSTED_EXTENSION_ERROR_CODES together, add every value to synapse_core::error_codes, and bump the bridge build ID/SHA'
+    }
+
+    $sortedUnique = @($workerContract | Sort-Object -Unique)
+    if (($sortedUnique -join "`n") -ne $workerJoined) {
+        Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_CONTRACT_UNSORTED_OR_DUPLICATED' `
+            'PUBLIC_COMMAND_ERROR_CODES must contain each code exactly once in ordinal sorted order so source diffs and binary search remain authoritative' `
+            'sort the registry values, remove duplicates, and copy the exact sequence to the Rust trusted registry'
+    }
+
+    $coreText = [IO.File]::ReadAllText($coreErrorPath)
+    $coreValues = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($match in [regex]::Matches(
+            $coreText,
+            'pub\s+const\s+[A-Z][A-Z0-9_]*\s*:\s*&str\s*=\s*"([A-Z][A-Z0-9_]+)"\s*;',
+            [Text.RegularExpressions.RegexOptions]::Singleline)) {
+        [void]$coreValues.Add($match.Groups[1].Value)
+    }
+    $missingCore = @($workerContract | Where-Object { -not $coreValues.Contains($_) })
+    if ($missingCore.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_CONTRACT_CORE_MISSING' `
+            "registered Chrome command error code(s) have no synapse_core::error_codes definition: $($missingCore -join ',')" `
+            'define each exact machine identifier in crates/synapse-core/src/error_codes.rs; error identities are shared protocol, not bridge-local prose'
+    }
+
+    $workerText = [IO.File]::ReadAllText($workerPath)
+    $codeLiterals = @([regex]::Matches(
+            $workerText,
+            '"([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)"') |
+        ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    $unregistered = @($codeLiterals | Where-Object { $_ -notin $workerContract })
+    if ($unregistered.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_LITERAL_UNREGISTERED' `
+            "extension source contains code-shaped machine identifier(s) outside PUBLIC_COMMAND_ERROR_CODES: $($unregistered -join ',')" `
+            'classify each identifier explicitly: register real command/readback errors across all three contract surfaces, or stop encoding non-error data as an uppercase underscore-delimited error token'
+    }
+
+    if ($script:Failures.Count -eq $contractFailureCountBefore) {
+        Write-Host "   OK   $($workerContract.Count) registered Chrome error codes agree across JavaScript, Rust trust, and synapse-core; no unregistered code literal exists" -ForegroundColor Green
+    }
+}
+catch {
+    Add-Failure 'SYNAPSE_LINT_CHROME_ERROR_CONTRACT_SWEEP_FAILED' $_.Exception.Message `
+        'repair the contract markers/parser inputs; canonical lint cannot certify machine error identity while the cross-language source contract is unreadable'
+}
+
 if ($PolicyOnly) {
     Write-Host ''
     if ($script:Failures.Count -eq 0) {
-        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface and Gate 0b found no forbidden public tool projection.' -ForegroundColor Green
+        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, and Gate 0c proved the Chrome error-code contract.' -ForegroundColor Green
         exit 0
     }
 

@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 1;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-bounded-screenshot-compositor-v5";
-const BRIDGE_DECLARED_BUILD_SHA256 = "b0b4e4aed354a4bce254ca3028bc8c496ff62c4e267a6d70f60bfd2d5726cd8f";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-explicit-error-code-contract-v6";
+const BRIDGE_DECLARED_BUILD_SHA256 = "62182aa411e7ed626c9254204277e040f9f3b75f2daeadd4e565d71b6a75969f";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -104,6 +104,61 @@ const ERROR_CHROME_DOM_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONAB
 const ERROR_CHROME_DOM_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
 const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
 const ERROR_ACTION_TARGET_INVALID = "ACTION_TARGET_INVALID";
+const ERROR_CODE_CONTRACT_VIOLATION = "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION";
+// Every machine-readable code that may cross the authenticated command-response
+// boundary. errorPayload rejects anything outside this registry as an explicit
+// contract violation; the canonical lint gate compares the same sorted values
+// with Rust's trusted registry and synapse_core::error_codes (#2217).
+const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
+  // >>> SHARED-CHROME-ERROR-CODE-CONTRACT
+  "A11Y_CDP_ATTACH_FAILED",
+  "A11Y_CDP_AXTREE_FAILED",
+  "A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED",
+  "A11Y_CDP_EXTENSION_DETACHED",
+  "A11Y_CDP_EXTENSION_TIMEOUT",
+  "A11Y_CDP_EXTENSION_UNAVAILABLE",
+  "ACTION_TARGET_INVALID",
+  "BROWSER_EVALUATE_TIMEOUT",
+  "BROWSER_NAVIGATION_FAILED",
+  "BROWSER_WAIT_TIMEOUT",
+  "CAPTURE_PLAN_EXCEEDS_LIMIT",
+  "CAPTURE_TARGET_INVALID",
+  "CHROME_ACTIVE_ELEMENT_MISSING",
+  "CHROME_ACTIVE_ELEMENT_NOT_EDITABLE",
+  "CHROME_ACTIVE_ELEMENT_VALUE_MISMATCH",
+  "CHROME_BEFOREINPUT_CANCELLED",
+  "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION",
+  "CHROME_BRIDGE_EXTENSION_STALE",
+  "CHROME_CAPTURE_VISIBLE_TAB_PENDING",
+  "CHROME_CLOCK_FAILED",
+  "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
+  "CHROME_DOM_ACTION_UNSUPPORTED",
+  "CHROME_DOM_ELEMENT_AMBIGUOUS",
+  "CHROME_DOM_ELEMENT_NOT_ACTIONABLE",
+  "CHROME_DOM_ELEMENT_NOT_FOUND",
+  "CHROME_DOM_SELECTOR_INVALID",
+  "CHROME_FRAME_METADATA_FAILED",
+  "CHROME_SCRIPTING_EMPTY_RESULT",
+  "CHROME_SCRIPTING_EXECUTE_FAILED",
+  "CHROME_SCRIPTING_UNAVAILABLE",
+  "CHROME_SET_FIELD_BAD_LOCATOR",
+  "CHROME_SET_FIELD_NOT_FOUND",
+  "CHROME_SET_FIELD_NOT_UNIQUE",
+  "CHROME_SET_FIELD_SELECTOR_INVALID",
+  "CHROME_SET_FIELD_VALUE_MISMATCH",
+  "CHROME_STORAGE_ACTION_FAILED",
+  "CHROME_STORAGE_KEY_INVALID",
+  "CHROME_STORAGE_OPERATION_UNSUPPORTED",
+  "CHROME_STORAGE_STATE_LOAD_FAILED",
+  "CHROME_STORAGE_STATE_READ_FAILED",
+  "PAGE_VITALS_READ_FAILED",
+  "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
+  "SYNAPSE_CHROME_BRIDGE_RECONNECT_WAKE_ALARM_INVALID",
+  "SYNAPSE_CHROME_DAEMON_UNAVAILABLE",
+  "SYNAPSE_CHROME_EXTENSION_ID_MISMATCH",
+  // <<< SHARED-CHROME-ERROR-CODE-CONTRACT <<<
+]);
+const PUBLIC_COMMAND_ERROR_CODE_SET = new Set(PUBLIC_COMMAND_ERROR_CODES);
 const TAB_TARGET_PREFIX = "chrome-tab:";
 const BRIDGE_TOKEN_HEADER = "X-Synapse-Bridge-Token";
 const DAEMON_WS_BASE_URL = "ws://127.0.0.1:7700";
@@ -27065,9 +27120,25 @@ function redactPublicErrorDetail(detail) {
 }
 
 function errorPayload(error) {
+  const receivedCode = typeof error?.code === "string" && error.code.trim()
+    ? error.code.trim()
+    : null;
+  const originalDetail = redactPublicErrorDetail(errorMessage(error));
+  if (!receivedCode || !PUBLIC_COMMAND_ERROR_CODE_SET.has(receivedCode)) {
+    return {
+      code: ERROR_CODE_CONTRACT_VIOLATION,
+      detail:
+        "Chrome bridge produced an unregistered command error code; " +
+        `received_code=${JSON.stringify(receivedCode)} ` +
+        `original_detail=${JSON.stringify(originalDetail)}; ` +
+        "remediation=register the exact machine code in PUBLIC_COMMAND_ERROR_CODES, " +
+        "TRUSTED_EXTENSION_ERROR_CODES, and synapse_core::error_codes in one change, " +
+        "then bump/redeploy the bridge build identity"
+    };
+  }
   return {
-    code: error?.code || ERROR_ATTACH_FAILED,
-    detail: redactPublicErrorDetail(errorMessage(error))
+    code: receivedCode,
+    detail: originalDetail
   };
 }
 
