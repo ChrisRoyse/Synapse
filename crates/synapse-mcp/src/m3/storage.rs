@@ -113,6 +113,10 @@ pub struct StorageTranscriptOrderStatusResponse {
     pub meta_readable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub meta_decode_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_source_rows_at_build: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_source_digest_at_build: Option<String>,
     pub progress_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_complete: Option<bool>,
@@ -120,6 +124,14 @@ pub struct StorageTranscriptOrderStatusResponse {
     pub progress_rows_indexed: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress_decode_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_resume_cursor_present: Option<bool>,
+    /// Whether the durable metadata and progress rows coherently describe one
+    /// completed publication. This is independent of later atomic source/index
+    /// changes, whose current validity is established by `exact_match`.
+    pub publication_consistent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publication_error: Option<String>,
     pub repair_in_progress: bool,
     pub state_token_sha256: String,
     /// Token accepted by `transcript_order_rebuild`. While a crash-recovery

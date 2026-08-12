@@ -195,7 +195,8 @@ fn projection_publication_complete(
     let Some(progress) = read_progress(db)? else {
         return Ok(false);
     };
-    Ok(status.exact_match && validate_published_rows(&meta, &progress).is_ok())
+    validate_published_rows(&meta, &progress)?;
+    Ok(status.exact_match)
 }
 
 pub(super) fn lock_projection() -> Result<MutexGuard<'static, ProjectionLockState>, String> {
@@ -468,6 +469,8 @@ fn build_projection(db: &Db) -> Result<(), String> {
 
     let (source_rows, digest) = reconcile_complete_sets(db)?;
     progress.complete = true;
+    progress.resume_after_physical_hex = None;
+    progress.rows_indexed = source_rows;
     let meta = ProjectionMeta {
         schema_version: SCHEMA_VERSION,
         readable: true,
@@ -554,41 +557,83 @@ fn projection_status_locked(db: &Db) -> Result<TranscriptOrderStatus, String> {
     let meta_bytes = db
         .get_cf(cf::CF_KV, META_KEY)
         .map_err(|error| format!("AGENT_TRANSCRIPT_ORDER_META_READ_FAILED: {error}"))?;
-    let (meta, meta_schema_version, meta_readable, meta_decode_error) = match meta_bytes.as_deref()
-    {
+    let (
+        meta,
+        meta_schema_version,
+        meta_readable,
+        meta_decode_error,
+        meta_source_rows_at_build,
+        meta_source_digest_at_build,
+    ) = match meta_bytes.as_deref() {
         Some(bytes) => match decode_json::<ProjectionMeta>(bytes) {
             Ok(meta) => {
                 let schema_version = meta.schema_version;
                 let readable = meta.readable;
-                (Some(meta), Some(schema_version), Some(readable), None)
+                let source_rows_at_build = meta.source_rows_at_build;
+                let source_digest_at_build = meta.source_digest_at_build.clone();
+                (
+                    Some(meta),
+                    Some(schema_version),
+                    Some(readable),
+                    None,
+                    Some(source_rows_at_build),
+                    Some(source_digest_at_build),
+                )
             }
-            Err(error) => (None, None, None, Some(error.to_string())),
+            Err(error) => (None, None, None, Some(error.to_string()), None, None),
         },
-        None => (None, None, None, None),
+        None => (None, None, None, None, None, None),
     };
     let progress_bytes = db
         .get_cf(cf::CF_KV, PROGRESS_KEY)
         .map_err(|error| format!("AGENT_TRANSCRIPT_ORDER_PROGRESS_READ_FAILED: {error}"))?;
-    let (progress, progress_complete, progress_rows_indexed, progress_decode_error) =
-        match progress_bytes.as_deref() {
-            Some(bytes) => match decode_json::<ProjectionProgress>(bytes) {
-                Ok(progress) => {
-                    let complete = progress.complete;
-                    let rows_indexed = progress.rows_indexed;
-                    (Some(progress), Some(complete), Some(rows_indexed), None)
-                }
-                Err(error) => (None, None, None, Some(error.to_string())),
-            },
-            None => (None, None, None, None),
-        };
+    let (
+        progress,
+        progress_complete,
+        progress_rows_indexed,
+        progress_decode_error,
+        progress_resume_cursor_present,
+    ) = match progress_bytes.as_deref() {
+        Some(bytes) => match decode_json::<ProjectionProgress>(bytes) {
+            Ok(progress) => {
+                let complete = progress.complete;
+                let rows_indexed = progress.rows_indexed;
+                let resume_cursor_present = progress.resume_after_physical_hex.is_some();
+                (
+                    Some(progress),
+                    Some(complete),
+                    Some(rows_indexed),
+                    None,
+                    Some(resume_cursor_present),
+                )
+            }
+            Err(error) => (None, None, None, Some(error.to_string()), None),
+        },
+        None => (None, None, None, None, None),
+    };
     let marker = read_repair_marker(db)?;
     let exact_match = expected == index_rows;
-    let ready = exact_match
-        && meta
-            .as_ref()
-            .zip(progress.as_ref())
-            .is_some_and(|(meta, progress)| validate_published_rows(meta, progress).is_ok())
-        && marker.is_none();
+    let publication_validation = match (meta.as_ref(), progress.as_ref()) {
+        (Some(meta), Some(progress)) => validate_published_rows(meta, progress),
+        (None, _) if meta_decode_error.is_some() => Err(format!(
+            "AGENT_TRANSCRIPT_ORDER_META_CORRUPT: {}",
+            meta_decode_error.as_deref().unwrap_or("<unknown>")
+        )),
+        (None, _) => Err(
+            "AGENT_TRANSCRIPT_ORDER_META_MISSING: no durable publication metadata row".to_owned(),
+        ),
+        (_, None) if progress_decode_error.is_some() => Err(format!(
+            "AGENT_TRANSCRIPT_ORDER_PROGRESS_CORRUPT: {}",
+            progress_decode_error.as_deref().unwrap_or("<unknown>")
+        )),
+        (_, None) => Err(
+            "AGENT_TRANSCRIPT_ORDER_PROGRESS_MISSING: no durable publication progress row"
+                .to_owned(),
+        ),
+    };
+    let publication_consistent = publication_validation.is_ok();
+    let publication_error = publication_validation.err();
+    let ready = exact_match && publication_consistent && marker.is_none();
     let source_digest_sha256 = rows_digest(&source_rows);
     let expected_index_digest_sha256 = rows_digest(&expected);
     let actual_index_digest_sha256 = rows_digest(&index_rows);
@@ -634,10 +679,15 @@ fn projection_status_locked(db: &Db) -> Result<TranscriptOrderStatus, String> {
         meta_schema_version,
         meta_readable,
         meta_decode_error,
+        meta_source_rows_at_build,
+        meta_source_digest_at_build,
         progress_present: progress_bytes.is_some(),
         progress_complete,
         progress_rows_indexed,
         progress_decode_error,
+        progress_resume_cursor_present,
+        publication_consistent,
+        publication_error,
         repair_in_progress: marker.is_some(),
         state_token_sha256,
         repair_token_sha256,
