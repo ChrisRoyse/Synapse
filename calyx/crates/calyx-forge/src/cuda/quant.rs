@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::CudaContext;
 
 pub use mxfp::CudaMxFpBatch;
-pub use packed::{CudaBinaryBatch, CudaBinaryScores, CudaInt8Batch};
+pub use packed::{CudaBinaryBatch, CudaBinaryScores};
 pub use scores::CudaQuantScores;
 pub use turboquant::CudaTurboQuantBatch;
 pub type CudaTurboQuantScores = CudaQuantScores;
@@ -98,15 +98,6 @@ impl CudaQuantContext {
 
     pub fn stats(&self) -> CudaQuantStats {
         self.counters.snapshot()
-    }
-
-    pub fn reset_stats(&self) {
-        self.counters.kernel_launches.store(0, Ordering::Relaxed);
-        self.counters.h2d_bytes.store(0, Ordering::Relaxed);
-        self.counters.d2h_bytes.store(0, Ordering::Relaxed);
-        self.counters.encoded_rows.store(0, Ordering::Relaxed);
-        self.counters.scored_candidates.store(0, Ordering::Relaxed);
-        self.counters.compact_topk_rows.store(0, Ordering::Relaxed);
     }
 
     pub(super) fn counters(&self) -> Arc<QuantCounters> {

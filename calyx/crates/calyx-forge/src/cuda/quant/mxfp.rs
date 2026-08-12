@@ -4,7 +4,7 @@ use cudarc::driver::CudaSlice;
 
 use super::{CudaQuantContext, CudaQuantScores, QuantCounters, mxfp_launch};
 use crate::mxfp4::{MXFP4_BLOCK_SIZE, MXFP4_PACKED_BYTES};
-use crate::mxfp8::{MXFP8_BLOCK_BYTES, MXFP8_BLOCK_SIZE};
+use crate::mxfp8::MXFP8_BLOCK_BYTES;
 use crate::quant::{AssayQuantSafety, MxFp4Codec, QuantLevel, QuantizedVec, Quantizer};
 use crate::{ForgeError, Result};
 
@@ -141,39 +141,6 @@ impl CudaQuantContext {
         self.encode_mxfp(codec, input, QuantLevel::Bits8Fp)
     }
 
-    pub fn upload_mxfp(&self, codec: &MxFp4Codec, rows: &[QuantizedVec]) -> Result<CudaMxFpBatch> {
-        if rows.is_empty() {
-            return Err(shape("MXFP upload requires at least one packed row"));
-        }
-        let dim = codec.dim();
-        validate_dim(dim, "cuda_mxfp_upload")?;
-        let level = rows[0].level;
-        let stride = row_stride(dim, level)?;
-        let encoded_len = checked_mul(rows.len(), stride, "uploaded rows")?;
-        let mut flattened = Vec::with_capacity(encoded_len);
-        for (row, quantized) in rows.iter().enumerate() {
-            validate_quantized(quantized, dim, level, row)?;
-            flattened.extend_from_slice(&quantized.bytes);
-        }
-        let encoded = self
-            .context()
-            .inner()
-            .default_stream()
-            .clone_htod(&flattened)
-            .map_err(|error| device(self, format!("MXFP upload failed: {error}")))?;
-        let counters = self.counters();
-        counters.add_h2d(flattened.len());
-        counters.add_encoded_rows(rows.len());
-        Ok(CudaMxFpBatch {
-            quant: self.clone(),
-            rows: rows.len(),
-            dim,
-            level,
-            stride,
-            encoded,
-        })
-    }
-
     fn encode_mxfp(
         &self,
         codec: &MxFp4Codec,
@@ -236,67 +203,6 @@ fn validate_input(dim: usize, input: &[f32], op: &str) -> Result<usize> {
 fn validate_dim(dim: usize, op: &str) -> Result<()> {
     if dim == 0 || dim > MAX_MXFP_DIM {
         return Err(shape(format!("{op} requires dimension 1..={MAX_MXFP_DIM}")));
-    }
-    Ok(())
-}
-
-fn validate_quantized(
-    quantized: &QuantizedVec,
-    dim: usize,
-    level: QuantLevel,
-    row: usize,
-) -> Result<()> {
-    if quantized.level != level || quantized.dim != dim {
-        return Err(shape(format!(
-            "MXFP upload row {row} must share level and dimension"
-        )));
-    }
-    let expected = row_stride(dim, level)?;
-    if quantized.bytes.len() != expected || quantized.scale != 0.0 || quantized.seed_id != ZERO_SEED
-    {
-        return Err(quant_error(format!(
-            "MXFP upload row {row} has malformed length, scale, or seed"
-        )));
-    }
-    validate_payload(&quantized.bytes, dim, level, row)
-}
-
-fn validate_payload(bytes: &[u8], dim: usize, level: QuantLevel, row: usize) -> Result<()> {
-    let (block_bytes, scale_offset) = match level {
-        QuantLevel::Bits4Fp => (MXFP4_BLOCK_BYTES, MXFP4_PACKED_BYTES),
-        QuantLevel::Bits8Fp => (MXFP8_BLOCK_BYTES, MXFP8_BLOCK_SIZE),
-        _ => return Err(quant_error("MXFP upload level must be Bits4Fp or Bits8Fp")),
-    };
-    if bytes
-        .chunks_exact(block_bytes)
-        .any(|block| block[scale_offset] == u8::MAX)
-    {
-        return Err(quant_error(format!(
-            "MXFP upload row {row} contains non-finite E8M0 scale"
-        )));
-    }
-    let used = dim % MXFP4_BLOCK_SIZE;
-    if used == 0 {
-        return Ok(());
-    }
-    let last = &bytes[bytes.len() - block_bytes..];
-    let valid_padding = match level {
-        QuantLevel::Bits4Fp => (used..MXFP4_BLOCK_SIZE).all(|index| {
-            let byte = last[index / 2];
-            let code = if index.is_multiple_of(2) {
-                byte & 0x0f
-            } else {
-                byte >> 4
-            };
-            code == 7
-        }),
-        QuantLevel::Bits8Fp => last[used..MXFP8_BLOCK_SIZE].iter().all(|code| *code == 0),
-        _ => false,
-    };
-    if !valid_padding {
-        return Err(quant_error(format!(
-            "MXFP upload row {row} contains non-canonical partial-block padding"
-        )));
     }
     Ok(())
 }

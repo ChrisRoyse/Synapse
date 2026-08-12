@@ -46,7 +46,7 @@ pub use cuda::{
     CudaAutocorrelationSums, CudaBackend, CudaBinaryBatch, CudaBinaryScores, CudaByteFeatureRaw,
     CudaByteRaggedBatch, CudaCcmPredictions, CudaContext, CudaCorrelationPrecision,
     CudaCrossCorrelationBatch, CudaDcorResult, CudaGrangerLagBatch, CudaGrangerLagSummary,
-    CudaGreenContextStream, CudaHawkesFit, CudaHsicResult, CudaInt8Batch, CudaKsgContinuousCounts,
+    CudaGreenContextStream, CudaHawkesFit, CudaHsicResult, CudaKsgContinuousCounts,
     CudaLinearCkaPairEstimates, CudaLogisticConfig, CudaLogisticDataset, CudaLogisticSplits,
     CudaLogisticSummaries, CudaMixedKsgCounts, CudaMmdChangePointResult, CudaMmdResult,
     CudaMxFpBatch, CudaPeriodogramBatch, CudaQuantContext, CudaQuantScores, CudaQuantStats,

@@ -57,8 +57,8 @@ pub use postprocess::{
 };
 pub use profile::{ProfilePairwiseCudaStats, pairwise_euclidean_gram_tiled_host};
 pub use quant::{
-    CudaBinaryBatch, CudaBinaryScores, CudaInt8Batch, CudaMxFpBatch, CudaQuantContext,
-    CudaQuantScores, CudaQuantStats, CudaTurboQuantBatch, CudaTurboQuantScores,
+    CudaBinaryBatch, CudaBinaryScores, CudaMxFpBatch, CudaQuantContext, CudaQuantScores,
+    CudaQuantStats, CudaTurboQuantBatch, CudaTurboQuantScores,
 };
 pub use ragged_gemm::{
     RaggedBatch, build_ragged_batch, build_ragged_batch_from_slabs, extract_ragged_results,

@@ -1,5 +1,4 @@
 mod binary;
-mod int8;
 
 use std::sync::Arc;
 
@@ -9,7 +8,6 @@ use super::{CudaQuantContext, QuantCounters};
 use crate::{ForgeError, Result};
 
 pub use binary::{CudaBinaryBatch, CudaBinaryScores};
-pub use int8::CudaInt8Batch;
 
 const MAX_PACKED_DIM: usize = 4_096;
 
