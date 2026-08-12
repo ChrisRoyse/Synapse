@@ -434,7 +434,7 @@ async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
 
     match chrome_debugger_bridge::reload_bridge(30_000).await {
         Ok(result) => Ok(format!(
-            "chrome_bridge_preflight=host_ui_reload_ok before_host={} after_host={} reconnected={} waited_ms={} control_surface={} active_profile={}",
+            "chrome_bridge_preflight=background_runtime_reload_ok before_host={} after_host={} reconnected={} waited_ms={} control_surface={} active_profile={}",
             result
                 .before
                 .as_ref()
@@ -455,14 +455,14 @@ async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
             )
         }
         Err(error) => Err(setup_repair_error(
-            "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_HOST_UI_RELOAD_FAILED",
-            "chrome_bridge_host_ui_reload",
+            "SYNAPSE_SETUP_REPAIR_CHROME_BRIDGE_BACKGROUND_RELOAD_FAILED",
+            "chrome_bridge_background_reload",
             format!(
-                "setup repair could not reconcile the Chrome bridge through the exact host UI control before external maintenance handoff; code={} detail={}",
+                "setup repair could not reconcile the Chrome bridge through its background runtime lifecycle before external maintenance handoff; code={} detail={}",
                 error.code(),
                 error.detail()
             ),
-            "repair the exact PowerShell/Chrome/profile/UI condition in detail and retry setup repair; chrome.runtime.reload is never used",
+            "repair the exact connected-host, PowerShell deployment, Chrome profile-row, service-worker SHA, or replacement-host condition in detail and retry setup repair; setup never touches a human Chrome window",
         )),
     }
 }

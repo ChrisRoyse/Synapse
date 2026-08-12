@@ -33,7 +33,7 @@ Every facade call uses a strict `operation` enum. Unknown operations fail closed
 
 Mutating operations must name the physical readback source of truth: file path, Calyx vault row, process id, tab id, target id, event cursor, or profile row.
 
-Raw browser debugger capability is explicit: switch to `browser_debugger` before using raw CDP/chrome.debugger operations.
+Advanced browser instrumentation is explicit: switch to `browser_debugger` before using isolated raw-CDP operations. The normal authenticated Chrome bridge never declares or invokes `chrome.debugger`.
 
 Raw human OS foreground capability is explicit: acquire the needed foreground/control lease, switch to `break_glass`, give a non-empty reason, and read the post-action source of truth. Normal-agent routes must prefer target-scoped action through `act` and target/session state through `target`.
 

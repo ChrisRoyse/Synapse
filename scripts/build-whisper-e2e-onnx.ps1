@@ -14,7 +14,10 @@
 
     Ordering is binding. Quantizing after BeamSearch corrupts contrib-domain
     subgraphs. Transformers is pinned below 4.43 because Microsoft's recipe
-    records that later versions export graphs which decode to empty text.
+    records that later versions export graphs which decode to empty text. The
+    Windows ONNX Runtime Extensions pin is the CPython 3.9 wheel's native DLL,
+    so the recipe requires that exact interpreter ABI instead of accepting a
+    different wheel and weakening the binary identity check.
 
     The upstream recipe files are downloaded by immutable commit and checked
     against committed SHA-256 values. The candidate is not published or pinned
@@ -50,6 +53,10 @@ $pythonPackages = @(
     'librosa==0.10.2.post1',
     'datasets==3.2.0'
 )
+$pythonBootstrapPackages = @(
+    'pip==25.0.1',
+    'setuptools==80.9.0'
+)
 
 $oliveCommit = '6ab9d8bb9284a89ccc87c63ca323c0f3386f6426'
 $oliveWhisperFiles = [ordered]@{
@@ -76,19 +83,46 @@ foreach ($required in @($pinPath, $registryPath)) {
     }
 }
 
-$python = Get-Command python -ErrorAction SilentlyContinue
-if (-not $python) { $python = Get-Command python3 -ErrorAction SilentlyContinue }
-if (-not $python) {
-    Die 'SYNAPSE_WHISPER_BUILD_PYTHON_MISSING remediation=install CPython 3.9-3.12 and ensure python resolves on PATH'
+function Resolve-Python39 {
+    $launcher = Get-Command py -ErrorAction SilentlyContinue
+    if ($launcher) {
+        $candidate = (& $launcher.Source -3.9 -c 'import sys; print(sys.executable)' 2>$null) -join ''
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($candidate) -and
+            (Test-Path -LiteralPath $candidate.Trim() -PathType Leaf)) {
+            return [System.IO.Path]::GetFullPath($candidate.Trim())
+        }
+    }
+
+    foreach ($commandName in @('python', 'python3')) {
+        $command = Get-Command $commandName -ErrorAction SilentlyContinue
+        if (-not $command) { continue }
+        $candidate = (& $command.Source -c 'import json,sys; print(json.dumps({"executable":sys.executable,"major":sys.version_info.major,"minor":sys.version_info.minor}))' 2>$null) -join ''
+        if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($candidate)) { continue }
+        try { $identity = $candidate | ConvertFrom-Json } catch { continue }
+        if ([int]$identity.major -eq 3 -and [int]$identity.minor -eq 9 -and
+            (Test-Path -LiteralPath ([string]$identity.executable) -PathType Leaf)) {
+            return [System.IO.Path]::GetFullPath([string]$identity.executable)
+        }
+    }
+    return $null
 }
-Info "Python: $($python.Source) ($((& $python.Source --version 2>&1) -join ''))"
+
+$python = Resolve-Python39
+if (-not $python) {
+    Die 'SYNAPSE_WHISPER_BUILD_PYTHON_39_MISSING required_version=3.9 reason=the pinned ONNX Runtime Extensions DLL is the CPython-3.9 Windows artifact remediation=install CPython 3.9 and retry; newer or older interpreters are intentionally rejected'
+}
+$pythonVersion = ((& $python --version 2>&1) -join '').Trim()
+if ($LASTEXITCODE -ne 0 -or $pythonVersion -notmatch '^Python 3\.9\.') {
+    Die "SYNAPSE_WHISPER_BUILD_PYTHON_39_IDENTITY_INVALID path=$python observed_version=$pythonVersion remediation=repair the CPython 3.9 installation and retry"
+}
+Info "Python: $python ($pythonVersion)"
 
 New-Item -ItemType Directory -Force -Path $WorkRoot | Out-Null
 $venvDir = Join-Path $WorkRoot 'venv'
 $venvPython = Join-Path $venvDir 'Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     Info "Creating isolated environment -> $venvDir"
-    & $python.Source -m venv $venvDir
+    & $python -m venv $venvDir
     if ($LASTEXITCODE -ne 0) {
         Die "SYNAPSE_WHISPER_BUILD_VENV_FAILED path=$venvDir exit_code=$LASTEXITCODE remediation=repair the CPython venv module and retry"
     }
@@ -97,11 +131,23 @@ if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
     Die "SYNAPSE_WHISPER_BUILD_VENV_INCOMPLETE path=$venvPython remediation=delete only this incomplete build venv and retry"
 }
 
-Info "Installing pinned toolchain: $($pythonPackages -join ', ')"
-& $venvPython -m pip install --disable-pip-version-check --no-input --upgrade pip
+$venvIdentityText = (& $venvPython -c 'import json,sys; print(json.dumps({"executable":sys.executable,"major":sys.version_info.major,"minor":sys.version_info.minor}))' 2>&1) -join ''
 if ($LASTEXITCODE -ne 0) {
-    Die "SYNAPSE_WHISPER_BUILD_PIP_UPGRADE_FAILED exit_code=$LASTEXITCODE remediation=inspect network access to PyPI"
+    Die "SYNAPSE_WHISPER_BUILD_VENV_IDENTITY_UNREADABLE path=$venvPython detail=$venvIdentityText remediation=delete only $venvDir and retry with CPython 3.9"
 }
+try { $venvIdentity = $venvIdentityText | ConvertFrom-Json } catch {
+    Die "SYNAPSE_WHISPER_BUILD_VENV_IDENTITY_INVALID path=$venvPython detail=$venvIdentityText remediation=delete only $venvDir and retry with CPython 3.9"
+}
+if ([int]$venvIdentity.major -ne 3 -or [int]$venvIdentity.minor -ne 9) {
+    Die "SYNAPSE_WHISPER_BUILD_VENV_VERSION_MISMATCH path=$venvPython observed=$($venvIdentity.major).$($venvIdentity.minor) required=3.9 remediation=delete only $venvDir and retry; reusing a venv from another Python ABI is forbidden"
+}
+
+Info "Installing pinned bootstrap: $($pythonBootstrapPackages -join ', ')"
+& $venvPython -m pip install --disable-pip-version-check --no-input @pythonBootstrapPackages
+if ($LASTEXITCODE -ne 0) {
+    Die "SYNAPSE_WHISPER_BUILD_BOOTSTRAP_INSTALL_FAILED exit_code=$LASTEXITCODE remediation=repair access to the exact pinned pip/setuptools distributions; no model or pin was changed"
+}
+Info "Installing pinned toolchain: $($pythonPackages -join ', ')"
 & $venvPython -m pip install --disable-pip-version-check --no-input @pythonPackages
 if ($LASTEXITCODE -ne 0) {
     Die "SYNAPSE_WHISPER_BUILD_PIP_INSTALL_FAILED exit_code=$LASTEXITCODE remediation=repair the pinned Python package installation; no model or pin was changed"

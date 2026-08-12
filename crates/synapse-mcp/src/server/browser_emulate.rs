@@ -5,8 +5,8 @@ use std::collections::BTreeSet;
 use super::{
     ErrorData, Json, Parameters, SynapseService,
     m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
-        require_target_session_id, validate_cdp_target_id,
+        browser_raw_cdp_required_error, cdp_target_id_audit_ref, require_target_session_id,
+        validate_cdp_target_id,
     },
     tool, tool_router,
 };
@@ -17,8 +17,6 @@ use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 const TOOL: &str = "browser_emulate";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
-const DEFAULT_BRIDGE_WAIT_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -222,7 +220,7 @@ struct NormalizedBrowserEmulateParams {
 #[tool_router(router = browser_emulate_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Set or reset multiple target-scoped browser emulation overrides in one call for the calling session's owned browser tab. Raw CDP targets use the CDP emulation domains directly; normal Chrome bridge chrome-tab:* targets use the already-open authenticated Chrome profile's viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions lanes with same-target MAIN-world readback. operation=set accepts nested viewport, device, geolocation, locale, media, and network sections and returns each domain's same-target readback; viewport and device are mutually exclusive because device includes viewport metrics. operation=reset clears the listed domains, or all domains when domains is empty. Target-scoped and foreground-capable without activating the human OS foreground tab; never falls back to the human foreground tab. Use page text/evaluate/network readback as independent manual FSV evidence."
+        description = "Set or reset multiple target-scoped browser emulation overrides in one call for the calling session's owned raw-CDP browser tab. operation=set accepts nested viewport, device, geolocation, locale, media, and network sections and returns each domain's same-target readback; viewport and device are mutually exclusive because device includes viewport metrics. operation=reset clears the listed domains, or all domains when domains is empty. The debugger-free normal authenticated Chrome bridge refuses this operation before Chrome mutation. Target-scoped and background-safe without activating the human OS foreground tab; never falls back to the human foreground tab. Use page text/evaluate/network readback as independent manual FSV evidence."
     )]
     pub async fn browser_emulate(
         &self,
@@ -282,11 +280,6 @@ impl SynapseService {
         params: &NormalizedBrowserEmulateParams,
     ) -> Result<BrowserEmulateResponse, ErrorData> {
         let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-            if cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
-                return self
-                    .browser_emulate_bridge_impl(session_id, window_hwnd, cdp_target_id, params)
-                    .await;
-            }
             return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
         };
         super::operator_panic_boundary::ensure_mcp_mutation(
@@ -523,334 +516,6 @@ impl SynapseService {
             readback_backend: "raw CDP domain command + same-target Runtime.evaluate readback"
                 .to_owned(),
             backend_tier_used: "cdp".to_owned(),
-            required_foreground: false,
-        })
-    }
-
-    #[cfg(windows)]
-    async fn browser_emulate_bridge_impl(
-        &self,
-        session_id: &str,
-        window_hwnd: i64,
-        cdp_target_id: &str,
-        params: &NormalizedBrowserEmulateParams,
-    ) -> Result<BrowserEmulateResponse, ErrorData> {
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_emulate_before_bridge_domain_command",
-        )?;
-        let mut results = Vec::new();
-        match params.operation {
-            BrowserEmulateOperation::Set => {
-                if let Some(viewport) = params.viewport.as_ref() {
-                    let result = crate::chrome_debugger_bridge::viewport_emulation(
-                        crate::chrome_debugger_bridge::ChromeDebuggerViewportEmulationRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id,
-                            operation: "set",
-                            width: Some(viewport.width),
-                            height: Some(viewport.height),
-                            device_scale_factor: viewport.device_scale_factor,
-                            is_mobile: None,
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Viewport, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_viewport_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Viewport,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(device) = params.device.as_ref() {
-                    let has_touch = device.has_touch.unwrap_or(false);
-                    let result = crate::chrome_debugger_bridge::device_emulation(
-                        crate::chrome_debugger_bridge::ChromeDebuggerDeviceEmulationRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id,
-                            operation: "set",
-                            user_agent: Some(device.user_agent.as_str()),
-                            width: Some(device.width),
-                            height: Some(device.height),
-                            device_scale_factor: Some(device.device_scale_factor.unwrap_or(1.0)),
-                            is_mobile: Some(device.is_mobile.unwrap_or(false)),
-                            has_touch: Some(has_touch),
-                            max_touch_points: Some(
-                                device
-                                    .max_touch_points
-                                    .unwrap_or(if has_touch { 5 } else { 0 }),
-                            ),
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Device, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_device_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Device,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(geolocation) = params.geolocation.as_ref() {
-                    let result = crate::chrome_debugger_bridge::geolocation_emulation(
-                        crate::chrome_debugger_bridge::ChromeDebuggerGeolocationEmulationRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id.to_owned(),
-                            operation: "set".to_owned(),
-                            latitude: Some(geolocation.latitude),
-                            longitude: Some(geolocation.longitude),
-                            accuracy: Some(geolocation.accuracy.unwrap_or(0.0)),
-                            altitude: geolocation.altitude,
-                            altitude_accuracy: geolocation.altitude_accuracy,
-                            heading: geolocation.heading,
-                            speed: geolocation.speed,
-                            grant_permission: Some(geolocation.grant_permission.unwrap_or(true)),
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| {
-                        emulate_bridge_error(BrowserEmulateDomain::Geolocation, error)
-                    })?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_geolocation_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Geolocation,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(locale) = params.locale.as_ref() {
-                    let result = crate::chrome_debugger_bridge::locale_emulation(
-                        crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id,
-                            operation: "set",
-                            locale: locale.locale.as_deref(),
-                            timezone_id: locale.timezone_id.as_deref(),
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Locale, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_locale_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Locale,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(media) = params.media.as_ref() {
-                    let result = crate::chrome_debugger_bridge::media_emulation(
-                        crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id,
-                            operation: "set",
-                            media: media.media.as_deref(),
-                            color_scheme: media.color_scheme.as_deref(),
-                            reduced_motion: media.reduced_motion.as_deref(),
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Media, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_media_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Media,
-                        params.operation,
-                        result,
-                    )?);
-                }
-                if let Some(network) = params.network.as_ref() {
-                    let result = crate::chrome_debugger_bridge::network_conditions(
-                        crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsRequest {
-                            hwnd: window_hwnd,
-                            target_id: cdp_target_id,
-                            operation: "set",
-                            offline: Some(network.offline.unwrap_or(false)),
-                            latency_ms: Some(network.latency_ms.unwrap_or(0.0)),
-                            download_throughput_bytes_per_sec: Some(
-                                network.download_throughput_bytes_per_sec.unwrap_or(-1.0),
-                            ),
-                            upload_throughput_bytes_per_sec: Some(
-                                network.upload_throughput_bytes_per_sec.unwrap_or(-1.0),
-                            ),
-                            connection_type: network.connection_type.as_deref(),
-                            wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                        },
-                    )
-                    .await
-                    .map_err(|error| emulate_bridge_error(BrowserEmulateDomain::Network, error))?;
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_network_command",
-                    )?;
-                    results.push(domain_result(
-                        BrowserEmulateDomain::Network,
-                        params.operation,
-                        result,
-                    )?);
-                }
-            }
-            BrowserEmulateOperation::Reset => {
-                for domain in &params.domains {
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_before_bridge_reset_domain",
-                    )?;
-                    let result = match domain {
-                        BrowserEmulateDomain::Viewport => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::viewport_emulation(
-                                crate::chrome_debugger_bridge::ChromeDebuggerViewportEmulationRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id,
-                                    operation: "reset",
-                                    width: None,
-                                    height: None,
-                                    device_scale_factor: None,
-                                    is_mobile: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                        BrowserEmulateDomain::Device => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::device_emulation(
-                                crate::chrome_debugger_bridge::ChromeDebuggerDeviceEmulationRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id,
-                                    operation: "reset",
-                                    user_agent: None,
-                                    width: None,
-                                    height: None,
-                                    device_scale_factor: None,
-                                    is_mobile: None,
-                                    has_touch: None,
-                                    max_touch_points: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                        BrowserEmulateDomain::Geolocation => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::geolocation_emulation(
-                                crate::chrome_debugger_bridge::ChromeDebuggerGeolocationEmulationRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id.to_owned(),
-                                    operation: "reset".to_owned(),
-                                    latitude: None,
-                                    longitude: None,
-                                    accuracy: None,
-                                    altitude: None,
-                                    altitude_accuracy: None,
-                                    heading: None,
-                                    speed: None,
-                                    grant_permission: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                        BrowserEmulateDomain::Locale => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::locale_emulation(
-                                crate::chrome_debugger_bridge::ChromeDebuggerLocaleEmulationRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id,
-                                    operation: "reset",
-                                    locale: None,
-                                    timezone_id: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                        BrowserEmulateDomain::Media => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::media_emulation(
-                                crate::chrome_debugger_bridge::ChromeDebuggerMediaEmulationRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id,
-                                    operation: "reset",
-                                    media: None,
-                                    color_scheme: None,
-                                    reduced_motion: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                        BrowserEmulateDomain::Network => domain_result(
-                            *domain,
-                            params.operation,
-                            crate::chrome_debugger_bridge::network_conditions(
-                                crate::chrome_debugger_bridge::ChromeDebuggerNetworkConditionsRequest {
-                                    hwnd: window_hwnd,
-                                    target_id: cdp_target_id,
-                                    operation: "reset",
-                                    offline: None,
-                                    latency_ms: None,
-                                    download_throughput_bytes_per_sec: None,
-                                    upload_throughput_bytes_per_sec: None,
-                                    connection_type: None,
-                                    wait_timeout_ms: DEFAULT_BRIDGE_WAIT_TIMEOUT_MS,
-                                },
-                            )
-                            .await
-                            .map_err(|error| emulate_bridge_error(*domain, error))?,
-                        )?,
-                    };
-                    super::operator_panic_boundary::ensure_mcp_mutation(
-                        "browser_emulate_after_bridge_reset_domain",
-                    )?;
-                    results.push(result);
-                }
-            }
-        }
-
-        tracing::info!(
-            code = "CHROME_BRIDGE_BROWSER_EMULATE",
-            session_id = %session_id,
-            hwnd = window_hwnd,
-            cdp_target_id,
-            operation = ?params.operation,
-            domain_count = params.domains.len(),
-            "readback=normal_bridge_per_domain_same_target_readbacks outcome=emulation_returned"
-        );
-        Ok(BrowserEmulateResponse {
-            session_id: session_id.to_owned(),
-            window_hwnd,
-            transport: "chrome_tabs_extension".to_owned(),
-            endpoint: chrome_debugger_default_endpoint(),
-            cdp_target_id: cdp_target_id.to_owned(),
-            operation: params.operation,
-            domains: params.domains.clone(),
-            results,
-            readback_backend:
-                "normal Chrome bridge per-domain debugger lanes + MAIN-world readback".to_owned(),
-            backend_tier_used: "chrome_tabs_extension_debugger".to_owned(),
             required_foreground: false,
         })
     }
@@ -1265,20 +930,6 @@ fn emulate_error(domain: BrowserEmulateDomain, error: synapse_a11y::A11yError) -
         format!(
             "{TOOL} {} raw CDP emulation failed: {error}",
             domain.as_str()
-        ),
-    )
-}
-
-fn emulate_bridge_error(
-    domain: BrowserEmulateDomain,
-    error: crate::chrome_debugger_bridge::ChromeDebuggerBridgeError,
-) -> ErrorData {
-    mcp_error(
-        error.code(),
-        format!(
-            "{TOOL} {} normal Chrome bridge emulation failed: {}",
-            domain.as_str(),
-            error.detail()
         ),
     )
 }

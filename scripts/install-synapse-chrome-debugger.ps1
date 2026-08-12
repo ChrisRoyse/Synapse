@@ -38,6 +38,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($ReloadExistingExtensionViaUi -or $CleanupOwnedMaintenanceTabViaUi) {
+    throw "SYNAPSE_CHROME_BACKGROUND_ONLY_POLICY reload_existing_via_ui=$ReloadExistingExtensionViaUi cleanup_via_ui=$CleanupOwnedMaintenanceTabViaUi remediation=unattended Synapse lifecycle operations never activate, navigate, restore, minimize, unminimize, click, type into, or otherwise alter a human Chrome window; deploy bytes with -SkipAutoInstall and reload an already-connected bridge through chrome.runtime.reload"
+}
 if ($SkipAutoInstall -and $ReloadExistingExtensionViaUi) {
     throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_RELOAD_CONFLICT skip_auto_install=true reload_existing_extension_via_ui=true remediation=choose either the read-only skip path or the existing-extension UI reload path; setup must not silently ignore one of these mutually exclusive modes"
 }
@@ -1051,11 +1054,8 @@ $extensionDeploy = [pscustomobject]@{
 $requiredPermissions = @($extensionManifest.permissions)
 $optionalPermissions = @($extensionManifest.optional_permissions)
 $hostPermissions = @($extensionManifest.host_permissions)
-if ($optionalPermissions -contains 'debugger') {
-    throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=the Synapse bridge must request debugger as a required permission so target-scoped CDP input support is deterministic after auto-install"
-}
-if (-not ($requiredPermissions -contains 'debugger')) {
-    throw "SYNAPSE_CHROME_EXTENSION_DEBUGGER_PERMISSION_REQUIRED path=$manifestPath remediation=manual FSV of normal-profile hover/tap/active-tab drag and viewport emulation requires the bundled bridge to expose narrow chrome.debugger lanes for already-open Chrome tabs; inactive-tab drag uses the bundled chrome.scripting synthetic mouse path"
+if (($requiredPermissions -contains 'debugger') -or ($optionalPermissions -contains 'debugger')) {
+    throw "SYNAPSE_CHROME_EXTENSION_DEBUGGER_PERMISSION_FORBIDDEN path=$manifestPath remediation=the normal authenticated Chrome bridge is permanently debugger-free because any chrome.debugger attachment can display a layout-shifting infobar; use Synapse's dedicated non-default raw-CDP automation profile for deep browser instrumentation"
 }
 if ($requiredPermissions -contains 'nativeMessaging') {
     throw "SYNAPSE_CHROME_EXTENSION_NATIVE_MESSAGING_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must use direct localhost HTTP registration plus WebSocket command delivery; nativeMessaging can launch a visible cmd.exe wrapper on Windows"
@@ -1063,8 +1063,8 @@ if ($requiredPermissions -contains 'nativeMessaging') {
 if ($optionalPermissions -contains 'nativeMessaging') {
     throw "SYNAPSE_CHROME_EXTENSION_OPTIONAL_NATIVE_MESSAGING_FORBIDDEN path=$manifestPath remediation=normal end-user bridge must not request nativeMessaging"
 }
-if (-not ($requiredPermissions -contains 'management')) {
-    throw "SYNAPSE_CHROME_EXTENSION_MANAGEMENT_PERMISSION_REQUIRED path=$manifestPath remediation=normal end-user bridge must request chrome.management so it can disable external debugger/nativeMessaging extensions or fail closed with exact readback before any browser command"
+if (($requiredPermissions -contains 'management') -or ($optionalPermissions -contains 'management')) {
+    throw "SYNAPSE_CHROME_EXTENSION_MANAGEMENT_PERMISSION_FORBIDDEN path=$manifestPath remediation=the normal bridge must not inspect, disable, or reconfigure unrelated extensions; remove chrome.management from required and optional permissions"
 }
 if (-not ($requiredPermissions -contains 'alarms')) {
     throw "SYNAPSE_CHROME_EXTENSION_ALARMS_PERMISSION_MISSING path=$manifestPath remediation=normal end-user bridge requires chrome.alarms so an MV3 service worker suspended after daemon restart can wake and re-register without foreground Chrome automation"
@@ -4758,6 +4758,7 @@ function Invoke-SynapseChromeBridgeAutoInstall {
             changed = $false
             reason = 'skip_auto_install_requested'
             active_profile = $activeProfile
+            required_foreground = $false
             before = $before
             after = $before
         }
@@ -4776,9 +4777,9 @@ function Invoke-SynapseChromeBridgeAutoInstall {
         }
         if ($before.ready) {
             return [pscustomobject]@{
-                attempted = $true
+                attempted = $false
                 changed = $false
-                reason = 'existing_ready_extension_host_ui_reload_deferred'
+                reason = 'existing_ready_extension_background_reload_required'
                 active_profile = $activeProfile
                 required_foreground = $false
                 bridge_host_reload_command = 'browser_debugger.reload_bridge'
@@ -4786,28 +4787,13 @@ function Invoke-SynapseChromeBridgeAutoInstall {
                 after = $before
             }
         }
-        if ($before.permission_activation_pending -and -not $ReloadExistingExtensionViaUi) {
-            return [pscustomobject]@{
-                attempted = $true
-                changed = $false
-                reason = 'existing_extension_permission_activation_host_ui_reload_deferred'
-                active_profile = $activeProfile
-                required_foreground = $false
-                bridge_host_reload_command = 'browser_debugger.reload_bridge'
-                before = $before
-                after = $before
-            }
-        }
-
         $missing = if ($before.missing_active_api_permissions.Count -eq 0) { '<none>' } else { $before.missing_active_api_permissions -join ',' }
         $disableReasons = if ($before.disable_reasons.Count -eq 0) { '<none>' } else { $before.disable_reasons -join ',' }
-        $remediation = if ($before.permission_activation_pending) {
-            'invoke browser_debugger operation=reload_bridge against the handed-off daemon; the exact enabled/path-matching row is eligible for UI Reload and strict durable permission readback'
-        } else {
-            'repair the named disabled/missing-path profile condition before retrying; setup never reloads an ineligible extension row'
-        }
+        $remediation = 'repair the named disabled or missing-permission profile condition through an explicit operator-authorized Chrome interaction; unattended setup fails before touching any human window'
         throw "SYNAPSE_CHROME_BRIDGE_AUTOINSTALL_EXISTING_EXTENSION_NOT_READY active_profile=$activeProfile ready=$($before.ready) enabled=$($before.enabled) permission_activation_pending=$($before.permission_activation_pending) missing_active_api_permissions=$missing disable_reasons=$disableReasons remediation=$remediation"
     }
+
+    throw "SYNAPSE_CHROME_BRIDGE_BACKGROUND_INSTALL_UNAVAILABLE active_profile=$activeProfile installed=$($before.installed) manifest_path_matches=$($before.manifest_path_matches) ready=$($before.ready) remediation=the normal Chrome bridge must already have a ready physical profile row before unattended setup; Synapse failed before creating, selecting, navigating, or focusing any Chrome tab or window"
 
     # Same extension ID already loaded, enabled, and fully permissioned, but registered
     # from a directory other than the current stable dir (e.g. a repo-checkout install).
@@ -5455,8 +5441,8 @@ $synapseChromeProfileInstallState = [pscustomobject]@{
     active_profile = $activeChromeProfile
     active_profile_installed = $synapseChromeActiveProfileInstalled
     reason = $synapseChromeProfileInstallReason
-    browser_debugger_reload_bridge_can_install_absent_extension = $true
-    remediation = 'call browser_debugger operation=reload_bridge with profile=browser_debugger; the host-controlled path deploys the bundled bridge, invokes the exact Reload or Load unpacked control in the already-open active profile, and separately verifies the physical profile row plus a new authenticated daemon host'
+    browser_debugger_reload_bridge_can_install_absent_extension = $false
+    remediation = 'when an authenticated host advertising reloadSelf is connected, call browser_debugger operation=reload_bridge with profile=browser_debugger; the background-only path deploys the bundled bridge in a hidden process, invokes chrome.runtime.reload, and separately verifies the physical profile row, service-worker SHA, and replacement authenticated host. First installation requires a separate explicit operator-authorized action'
 }
 $staleBridgeBuildCleanup = Remove-SynapseStaleChromeBridgeBuildDirs `
     -StableRoot $stableRootFull `
@@ -5528,58 +5514,25 @@ $synapseSelfShieldRow = [pscustomobject]@{
     active_api = @()
     granted_api = @()
     manifest_api = @()
-    hazard_api = @('nativeMessaging')
+    hazard_api = @('debugger', 'nativeMessaging')
     runtime_enabled = $true
     source = 'synapse_self_bridge_invariant'
 }
 
-# External extensions and native-messaging hosts that use debugger/nativeMessaging
-# can surface layout-changing Chrome popups independently of Synapse's tabs-only
-# bridge. Setup tries to apply a reversible HKCU ExtensionSettings shield for
-# those permissions by default. If this host denies that policy write, the
-# installed bridge must suppress the hazards through chrome.management or normal
-# tabs/scripting commands fail closed before queueing any Chrome command.
-#
-# As a one-way remediation we remove stale Synapse-authored blockers from prior
-# builds, then write the current self-shield for the Synapse extension ID. The
-# current bridge intentionally requests debugger for a narrow target-scoped CDP
-# input lane, so the self-shield blocks nativeMessaging only.
-$chromePolicyCleanup = Remove-SynapseChromeExternalDebuggerPolicy -PreserveExtensionIds @(
-    @($externalHazardExtensionIds)
-)
-$policyShieldExtensions = @($synapseSelfShieldRow)
-if (-not $PreserveExternalDebuggerExtensions) {
-    $policyShieldExtensions += @($allExternalDebuggerOrNativeExtensions)
+# Non-interference invariant: installation reads external extension/process rows
+# for diagnostics but never modifies Chrome policy and never disables or
+# reconfigures another extension. The normal bridge lacks debugger,
+# nativeMessaging, and management permissions; deep browser instrumentation is
+# isolated to a Synapse-owned non-default raw-CDP profile.
+$chromePolicyCleanup = [pscustomobject]@{
+    attempted = $false
+    changed = $false
+    reason = 'noninterference_no_chrome_policy_mutation'
 }
-$chromePolicyPopupShield = Set-SynapseChromeExternalDebuggerPolicy -Extensions $policyShieldExtensions
-# The popup shield writes HKCU\Software\Policies\Google\Chrome\ExtensionSettings — a
-# Chrome MANAGED-POLICY key. On a correctly-secured Windows install that key is
-# admin-only (owner SYSTEM, standard users get ReadKey) BY DESIGN, precisely so a
-# non-admin process cannot grant itself Chrome policy. A non-elevated setup therefore
-# cannot write it, and that denial is expected hardening — not a misconfiguration to
-# "repair". Crucially, the popup shield is NOT the hazard enforcement boundary: the
-# bridge manifest is REQUIRED to hold chrome.management (enforced earlier in this
-# script), and the daemon uses it to suppress the same debugger/nativeMessaging hazards
-# at runtime and to FAIL CLOSED before any Chrome command if suppression is not
-# confirmed — this is verified post-handoff by the live /health chrome_bridge check in
-# synapse-setup.ps1. Making an admin-only, defense-in-depth policy write a hard
-# dependency would brick `synapse-update` on every properly-secured machine. So a
-# write-denied shield is surfaced LOUDLY (with exact failure + remediation) but is
-# non-fatal; only an UNEXPECTED shield failure (not the known admin-only policy-root
-# denial) still aborts setup.
-$popupShieldWriteDeniedRows = @($chromePolicyPopupShield | Where-Object {
-    [string]$_.warning_code -eq 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
-})
-$unexpectedBlockingShieldRows = @($chromePolicyPopupShield | Where-Object {
-    $_.blocking -eq $true -and [string]$_.warning_code -ne 'SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED'
-})
-if ($unexpectedBlockingShieldRows.Count -gt 0) {
-    $detail = ConvertTo-CompressedJson -Value $unexpectedBlockingShieldRows -Depth 10
-    throw "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_FAILED detail=$detail remediation=the Synapse popup shield failed for an unexpected reason (not the admin-only HKCU managed-policy-root write denial); inspect detail.error/detail.acl and repair before rerunning setup"
-}
-if ($popupShieldWriteDeniedRows.Count -gt 0) {
-    $deniedDetail = ConvertTo-CompressedJson -Value $popupShieldWriteDeniedRows -Depth 10
-    Write-Warning "SYNAPSE_CHROME_POLICY_POPUP_SHIELD_WRITE_DENIED_NONBLOCKING the HKCU Chrome managed-policy key is admin-only on this host, so the non-elevated popup shield could not be written. This is not fatal: the bridge's required chrome.management permission enforces the same debugger/nativeMessaging hazard suppression at runtime and fails closed if suppression is not confirmed (verified post-handoff by /health chrome_bridge). To also apply the policy-level defense-in-depth, run setup once from an elevated PowerShell. detail=$deniedDetail"
+$chromePolicyPopupShield = [pscustomobject]@{
+    attempted = $false
+    changed = $false
+    reason = 'noninterference_no_chrome_policy_mutation'
 }
 
 if ($staleSynapseActivePermissions.Count -gt 0) {
@@ -5588,7 +5541,7 @@ if ($staleSynapseActivePermissions.Count -gt 0) {
         stale_active_permissions = $staleSynapseActivePermissions
         chrome_policy_popup_shield = $chromePolicyPopupShield
     } | ConvertTo-Json -Depth 8 -Compress
-    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; call browser_debugger operation=reload_bridge through the real Synapse MCP public facade so the host controls the exact Chrome extension management Reload action and verifies the replacement profile/host state"
+    throw "SYNAPSE_CHROME_EXTENSION_STALE_ACTIVE_NATIVE_MESSAGING_PERMISSION extension_id=$ExtensionId detail=$detail remediation=Synapse attempted to apply/preserve the HKCU ExtensionSettings self-shield for nativeMessaging and included the physical policy write result in detail.chrome_policy_popup_shield; after restoring a connected authenticated host that advertises reloadSelf, call browser_debugger operation=reload_bridge through the real Synapse MCP public facade so chrome.runtime.reload performs the background lifecycle transition and the daemon verifies the replacement profile/host state"
 }
 
 $result = [pscustomobject]@{
@@ -5604,25 +5557,26 @@ $result = [pscustomobject]@{
     daemon_bridge_transport = 'direct_localhost_websocket'
     daemon_bridge_origin = "chrome-extension://$ExtensionId"
     bridge_host_reload_command = 'browser_debugger.reload_bridge'
-    bridge_host_reload_control_surface = 'chrome_extensions_exact_reload_button'
+    bridge_host_reload_control_surface = 'authenticated_chrome_runtime_reload'
     bridge_build_id_expected = $bridgeBuildId
     bridge_declared_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_build_sha256_expected = $bridgeDeclaredBuildSha256
     bridge_service_worker_sha256_expected = $extensionDeploy.service_worker_sha256
-    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'cdpInput', 'evaluateScript', 'initScript', 'exposeBinding', 'handleDialog', 'fileUpload', 'operatorPanicDisable', 'operatorPanicCleanup', 'operatorPanicReadback', 'operatorPanicEnable', 'viewportEmulation', 'deviceEmulation', 'geolocationEmulation', 'localeEmulation', 'mediaEmulation', 'networkConditions', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'keyDispatch', 'externalPopupRiskSuppression', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'pageScreenshot', 'pagePdf', 'scrollIntoView', 'setContent', 'storageState', 'waitForFunction', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue')
-    background_navigation_backend = 'chrome.tabs_plus_chrome.scripting_executeScript_plus_chrome.cookies_plus_chrome.downloads_plus_chrome.webNavigation_plus_chrome.webRequest_plus_chrome_tabs_captureVisibleTab_for_typed_dom_actions_storage_cookies_downloads_waits_page_screenshots_and_chrome_debugger_runtime_evaluate_init_scripts_handle_dialog_file_upload_cdp_input_hover_tap_drag_page_print_to_pdf_viewport_emulation_device_emulation_geolocation_emulation_locale_emulation_media_emulation_and_network_conditions_no_native_messaging_plus_chrome.management_external_popup_suppression'
+    bridge_required_capabilities = @('alarmReconnect', 'activateTab', 'ariaSnapshot', 'assertPoll', 'closeTab', 'clock', 'coordinateClick', 'cookies', 'downloads', 'domAction', 'keyDispatch', 'frameLocators', 'frames', 'inspectElement', 'listTabs', 'locateElements', 'navigateTab', 'openTab', 'pageEvents', 'pageVitals', 'pageContent', 'scrollIntoView', 'setContent', 'storageState', 'waitForLoadState', 'waitForUrl', 'waitForRequest', 'waitForResponse', 'waitForSelector', 'waitForText', 'targetInfo', 'targetInfoPageText', 'typeActiveElement', 'setFieldValue', 'maintenancePauseReconnect', 'reloadSelf')
+    background_navigation_backend = 'debugger_free_chrome_tabs_plus_chrome_scripting_plus_chrome_cookies_plus_chrome_downloads_plus_chrome_webNavigation_plus_chrome_webRequest_plus_chrome_storage'
     reconnect_driver = 'bounded_websocket_reconnect_with_persisted_read_verified_chrome_alarms_mv3_wake'
-    attach_popup_prevention = 'normal_bridge_debugger_permission_scoped_to_Runtime_evaluate_Page_addScriptToEvaluateOnNewDocument_Runtime_addBinding_Page_handleJavaScriptDialog_DOM_setFileInputFiles_Page_fileChooserOpened_cdpInput_hover_tap_active_drag_pagePdf_printToPDF_viewportEmulation_deviceEmulation_geolocationEmulation_localeEmulation_mediaEmulation_and_networkConditions_inactive_synthetic_drag_no_helper_windows_no_nativeMessaging_permission_plus_external_popup_risk_suppression'
-    normal_bridge_attach_commands_available = $true
-    normal_bridge_debugger_api_calls_present = $true
+    attach_popup_prevention = 'normal_bridge_manifest_forbids_debugger_and_nativeMessaging_deep_instrumentation_requires_dedicated_non_default_raw_cdp_profile'
+    normal_bridge_attach_commands_available = $false
+    normal_bridge_debugger_api_calls_present = $false
     expected_extension_id_guard_present = $true
     required_alarms_permission_present = ($requiredPermissions -contains 'alarms')
     recurring_wakeup_permission_present = ($requiredPermissions -contains 'alarms')
     required_cookies_permission_present = ($requiredPermissions -contains 'cookies')
     required_downloads_permission_present = ($requiredPermissions -contains 'downloads')
-    required_debugger_permission_present = ($requiredPermissions -contains 'debugger')
+    required_debugger_permission_present = $false
     optional_debugger_permission_present = $false
-    required_management_permission_present = ($requiredPermissions -contains 'management')
+    required_management_permission_present = $false
+    optional_management_permission_present = $false
     required_web_navigation_permission_present = ($requiredPermissions -contains 'webNavigation')
     required_native_messaging_permission_present = $false
     optional_native_messaging_permission_present = $false
@@ -5636,11 +5590,11 @@ $result = [pscustomobject]@{
     current_chrome_processes = $chromeProcesses
     chrome_policy_cleanup = $chromePolicyCleanup
     chrome_policy_popup_shield = $chromePolicyPopupShield
-    external_popup_risk_blocks_popup_free_commands = ($allExternalDebuggerOrNativeExtensions.Count -gt 0)
-    external_popup_risk_scope = 'runtime_bridge_management_suppression_or_fail_closed'
-    external_popup_risk_block_reason = if ($allExternalDebuggerOrNativeExtensions.Count -gt 0) { 'external_debugger_or_native_hazards_require_chrome_management_suppression_or_policy_shield' } else { 'none' }
-    external_popup_risk_bridge_management_required = ($allExternalDebuggerOrNativeExtensions.Count -gt 0)
-    external_popup_risk_bridge_management_permission_present = ($requiredPermissions -contains 'management')
+    external_popup_risk_blocks_popup_free_commands = $false
+    external_popup_risk_scope = 'diagnostic_only_noninterference'
+    external_popup_risk_block_reason = 'none'
+    external_popup_risk_bridge_management_required = $false
+    external_popup_risk_bridge_management_permission_present = $false
     synapse_chrome_auto_install = $chromeBridgeAutoInstall
     synapse_chrome_profile_install_state = $synapseChromeProfileInstallState
     stale_bridge_build_cleanup = $staleBridgeBuildCleanup

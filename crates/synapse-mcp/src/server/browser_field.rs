@@ -647,37 +647,18 @@ impl SynapseService {
         let before_len = char_len(&before_value);
         let after_len = char_len(&after_value);
         let changed = before_value != after_value;
-        let chrome_generated_text_backend =
-            result.readback_backend.contains("chrome.debugger.Input");
-        let source_of_truth = if chrome_generated_text_backend {
-            "chrome.debugger.Input text dispatch + chrome.scripting editable readback + separate chrome.tabs active-element readback"
-        } else {
-            SOURCE_OF_TRUTH
-        };
-        let input_provenance = if chrome_generated_text_backend {
-            provenance_context.finish(InputProvenanceSpec {
-                delivery_origin: InputDeliveryOrigin::ChromeDebuggerProtocol,
-                expected_dom_event_is_trusted: Some(true),
-                browser_default_actions: BrowserDefaultActionSemantics::UserAgentInput,
-                backend: &result.readback_backend,
-                transport: "chrome_tabs_extension+chrome.debugger",
-                protocol_method: result.method.as_deref().or(Some("Input.insertText")),
-                required_foreground: false,
-                per_emission_fence_verified: false,
-            })?
-        } else {
-            provenance_context.finish(InputProvenanceSpec {
-                delivery_origin: InputDeliveryOrigin::DomDispatch,
-                expected_dom_event_is_trusted: Some(false),
-                browser_default_actions:
-                    BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
-                backend: &result.readback_backend,
-                transport: "chrome_tabs_extension+chrome.scripting",
-                protocol_method: Some("native_value_setter+dispatchEvent(input,change)"),
-                required_foreground: false,
-                per_emission_fence_verified: false,
-            })?
-        };
+        let source_of_truth = SOURCE_OF_TRUTH;
+        let input_provenance = provenance_context.finish(InputProvenanceSpec {
+            delivery_origin: InputDeliveryOrigin::DomDispatch,
+            expected_dom_event_is_trusted: Some(false),
+            browser_default_actions:
+                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+            backend: &result.readback_backend,
+            transport: "chrome_tabs_extension+chrome.scripting",
+            protocol_method: Some("native_value_setter+dispatchEvent(input,change)"),
+            required_foreground: false,
+            per_emission_fence_verified: false,
+        })?;
 
         tracing::info!(
             code = "BROWSER_SET_VALUE_READBACK",
@@ -688,7 +669,6 @@ impl SynapseService {
             match_count = result.match_count,
             tag_name = %result.tag_name,
             readback_backend = %result.readback_backend,
-            chrome_generated_text_backend,
             before_len,
             after_len,
             requested_len,

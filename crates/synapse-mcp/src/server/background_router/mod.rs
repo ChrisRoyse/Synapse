@@ -2357,7 +2357,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with Input.dispatchTouchEvent touchStart/touchEnd through raw CDP or the normal-profile Chrome bridge cdpInput lane, and never falls back to mouse click; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
+        description = "High-level capability-preserving computer-use router (#1005/#1033/#1207/#1219/#1261/#1267/#1299/#1300). One verb, routed to the correct session-targeted primitive: background/target-scoped when sufficient, agent_logical_foreground/foreground_lane when foreground-equivalent semantics are required, and never implicit fallback to the human OS foreground. verb=read observes the target; verb=screenshot captures it; verb=navigate drives the owned browser target (Chrome bridge/CDP); verb=set_field replaces a web/UIA field's text by element id via target-capable tiers, by native/UIA role/name/automation_id resolved at action time, or by CSS selector through the safe normal-Chrome bridge; verb=insert_text replaces the current selection/caret text on an observed native editable element_id via exact native readback, or types text at the current caret after an optional target focus/click; verb=append_text appends to an observed native editable element_id via exact native readback, or moves the current caret to the end with Ctrl+End and types text; verb=set_selection sets an exact start/end selection on an observed web/native editable element; verb=click clicks a target element by observed element_id, selector/role/name DOM action, or x/y coordinate fallback on the owned target; verb=tap touch-taps a browser target element or viewport coordinate with raw-CDP Input.dispatchTouchEvent touchStart/touchEnd and fails before Chrome mutation on a normal authenticated target; verb=dispatch_event dispatches a caller-specified DOM event_type with event_init directly on a matched element through the session-owned normal Chrome bridge, bypassing actionability and reporting dispatchEvent's default_allowed result; verb=clear empties a matched editable element and fires input/change; verb=focus calls DOM.focus and verifies activeElement; verb=blur calls DOM.blur and verifies activeElement moved away; verb=select_text/selectText selects all text in the matched element and verifies the selection; verb=check/uncheck set a native checkbox/radio to the requested checked state, no-op if already there, and verify checked-property readback; verb=type optionally focuses x/y then types text into the session-owned browser active element or leased foreground target; verb=key presses a raw key/chord such as Ctrl+End or Tab; verb=press presses a named button/link in the session-owned tab, or a raw key/chord when key/keys is supplied; verb=select chooses native <select> option(s) by value, label, or zero-based index via option/value/option_label/option_index/options[] and fires input/change; verb=submit calls HTMLFormElement.requestSubmit() for a matched form/submitter; verb=save persists an already-owned Notepad target to an existing file path and verifies file bytes as the Source of Truth; verb=cleanup_notepad_tabs removes stale restored tabs from an owned hidden-desktop Notepad target while keeping the requested file tab; verb=run_shell runs a command in the session workspace; verb=focus_window intentionally activates the session target's top-level HWND only after the session is already break_glass/full_capability and holds the foreground input lease, so Codex clients can use an existing target_act schema when they cannot hot-add act_focus_window after tools/list_changed; verb=set_window_bounds moves/resizes the bound top-level window (native Window target, or the browser window behind a Cdp target) via background-safe SetWindowPos without activation, accepts x/y and/or width/height, and returns requested-vs-actual outer bounds (GetWindowRect readback) plus minimized state and size_satisfied so manual responsive-UI/layout FSV can drive a window through boundary sizes. Prefer this over raw act_* primitives: it inherits target resolution, action audit, lane/lease guards, and structured refusals, so a normal session can keep valid foreground-equivalent capability without seizing the human foreground. Mutating failures are returned as ok=false with status=verify_needed/refused/error and the original structured error in result; no optimistic success. Bind a target first with set_target (discover one with window_list/cdp_open_tab)."
     )]
     pub async fn target_act(
         &self,
@@ -6370,7 +6370,7 @@ async fn target_act_touch_tap(
         "role": params.role.as_deref(),
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "requires_cdp_input": true,
-        "delegated_tool": "synapse_a11y.cdp_touch_tap_or_chrome_debugger_bridge.cdpInput",
+        "delegated_tool": "synapse_a11y.cdp_touch_tap",
         "method": "Input.dispatchTouchEvent",
         "non_touch_fallback": "none; use verb=click explicitly for mouse behavior",
         "required_foreground": false,
@@ -6432,17 +6432,24 @@ async fn target_act_touch_tap(
         ));
     };
     let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-        return target_act_bridge_cdp_input(
-            service,
-            "tap",
-            window_hwnd,
-            &cdp_target_id,
-            coordinate,
-            params,
+        let error = mcp_error(
+            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            format!(
+                "target_act verb=tap refused normal authenticated Chrome target {cdp_target_id:?} before Chrome mutation; trusted touch input requires a session-owned target in Synapse's dedicated non-default raw-CDP profile"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
             &request_details,
             &session_id,
-        )
-        .await;
+        );
+        return Ok((
+            "synapse_a11y.cdp_touch_tap",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
     };
 
     let mut request_details = request_details;
@@ -6677,7 +6684,7 @@ async fn target_act_hover(
         "role": params.role.as_deref(),
         "name_present": params.name.as_ref().is_some_and(|value| !value.trim().is_empty()),
         "requires_cdp_input": true,
-        "delegated_tool": "synapse_a11y.cdp_aim_node_or_chrome_debugger_bridge.cdpInput",
+        "delegated_tool": "synapse_a11y.cdp_aim_node",
         "method": "Input.dispatchMouseEvent(mouseMoved)",
         "required_foreground": false,
     });
@@ -6738,17 +6745,24 @@ async fn target_act_hover(
         ));
     };
     let Some(endpoint) = synapse_a11y::endpoint_for_window(window_hwnd) else {
-        return target_act_bridge_cdp_input(
-            service,
-            "hover",
-            window_hwnd,
-            &cdp_target_id,
-            None,
-            params,
+        let error = mcp_error(
+            error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            format!(
+                "target_act verb=hover refused normal authenticated Chrome target {cdp_target_id:?} before Chrome mutation; real browser hover state requires a session-owned target in Synapse's dedicated non-default raw-CDP profile"
+            ),
+        );
+        service.audit_action_denied_with_details_for_session(
+            "target_act",
+            &error,
             &request_details,
             &session_id,
-        )
-        .await;
+        );
+        return Ok((
+            "synapse_a11y.cdp_aim_node",
+            false,
+            target_act_error_status(&error),
+            target_act_error_result("target_act", error),
+        ));
     };
 
     let mut request_details = request_details;
@@ -6797,13 +6811,10 @@ async fn target_act_hover(
     ))
 }
 
-/// Route a DOM-locator click/dblclick/press to the Chrome-generated CDP lane
-/// (#1348 headline #1/#2). For the normal Chrome bridge target this dispatches
-/// chrome.debugger `Input.dispatchMouseEvent` (isTrusted=true) instead of the
-/// synthetic `performClick` that guarded handlers ignore. Raw-CDP and
-/// native/window targets keep their exact transport. `bridge_action` is the cdpInput action ("click"/
-/// "dblclick"); `fallback_action` is the DOM-action verb used when the real lane
-/// does not apply (so verb=press keeps its named-button fallback semantics).
+/// Route a DOM-locator click/dblclick/press to trusted raw-CDP input when the
+/// target is an isolated automation profile. Normal authenticated Chrome uses
+/// its debugger-free typed DOM action, which preserves HTML activation behavior
+/// and verifies page state without attaching DevTools.
 #[cfg(windows)]
 async fn target_act_dom_locator_pointer(
     service: &SynapseService,
@@ -6842,8 +6853,8 @@ async fn target_act_dom_locator_pointer(
     // a non-bridge raw-CDP target outright). #1348: closes the last
     // synthetic/broken input lane — raw-CDP locator clicks now have
     // `isTrusted=true` while remaining software-originated, mirroring the
-    // verb=tap raw-CDP path. Bridge-only targets fall
-    // through to the cdpInput lane below.
+    // verb=tap raw-CDP path. Bridge-only targets use the typed debugger-free
+    // DOM action below.
     #[cfg(windows)]
     if let Some(endpoint) = synapse_a11y::endpoint_for_window(*window_hwnd) {
         let raw_details = json!({
@@ -6902,42 +6913,7 @@ async fn target_act_dom_locator_pointer(
             )),
         };
     }
-    let request_details = json!({
-        "session_id": &session_id,
-        "verb": bridge_action,
-        "fallback_verb": fallback_action,
-        "lane": "chrome_debugger_bridge.cdpInput",
-        "dom_event_is_trusted": true,
-        "physical_device_origin": false,
-        "required_foreground": false,
-    });
-    if let Err(error) =
-        service.ensure_target_claim_allows_session("target_act", &session_id, &target)
-    {
-        service.audit_action_denied_with_details_for_session(
-            "target_act",
-            &error,
-            &request_details,
-            &session_id,
-        );
-        return Ok((
-            "chrome_debugger_bridge.cdpInput",
-            false,
-            target_act_error_status(&error),
-            target_act_error_result("target_act", error),
-        ));
-    }
-    target_act_bridge_cdp_input(
-        service,
-        bridge_action,
-        *window_hwnd,
-        cdp_target_id,
-        None,
-        params,
-        &request_details,
-        &session_id,
-    )
-    .await
+    target_act_browser_dom_action(service, fallback_action, params, request_context).await
 }
 
 #[cfg(not(windows))]
@@ -6949,167 +6925,6 @@ async fn target_act_dom_locator_pointer(
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
     target_act_browser_dom_action(service, fallback_action, params, request_context).await
-}
-
-#[cfg(windows)]
-async fn target_act_bridge_cdp_input(
-    service: &SynapseService,
-    action: &'static str,
-    window_hwnd: i64,
-    cdp_target_id: &str,
-    coordinate: Option<TargetActCoordinate>,
-    params: &TargetActParams,
-    request_details: &Value,
-    session_id: &str,
-) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    target_act_validate_bridge_cdp_input(action, coordinate, params)?;
-    // Mouse-click options apply only to the real-mouse click/dblclick lane;
-    // hover/tap/drag ignore them (left None).
-    let is_click = matches!(action, "click" | "dblclick");
-    let click_count = if is_click {
-        Some(target_act_click_count_for_action(action, params.clicks)?)
-    } else {
-        None
-    };
-    let click_button = if is_click {
-        params.button.map(TargetActMouseButton::as_str)
-    } else {
-        None
-    };
-    let click_modifiers = if is_click {
-        Some(target_act_click_modifiers_bridge_value(&params.modifiers)?)
-    } else {
-        None
-    };
-    let mut request_details = request_details.clone();
-    if let Some(object) = request_details.as_object_mut() {
-        object.insert("window_hwnd".to_owned(), json!(window_hwnd));
-        object.insert("cdp_target_id".to_owned(), json!(cdp_target_id));
-        object.insert(
-            "delegated_tool".to_owned(),
-            json!("chrome_debugger_bridge.cdpInput"),
-        );
-        object.insert("bridge_debugger_lane".to_owned(), json!("chrome.debugger"));
-        object.insert("required_foreground".to_owned(), json!(false));
-        object.insert("secret_safe".to_owned(), json!(params.secret_safe));
-    }
-    service.audit_action_started_with_details_for_session(
-        "target_act",
-        &request_details,
-        session_id,
-    )?;
-    let coordinate_space = coordinate.map(|value| value.space.as_bridge_str());
-    ensure_target_act_operator_panic_boundary("bridge_cdp_input_before_dispatch")?;
-    let result = crate::chrome_debugger_bridge::cdp_input(
-        crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
-            hwnd: window_hwnd,
-            target_id: cdp_target_id,
-            action,
-            selector: params.selector.as_deref(),
-            element_id: params.element_id.as_deref(),
-            active_element: false,
-            role: params.role.as_deref(),
-            name: params.name.as_deref(),
-            value: params.value.as_deref(),
-            text: params.text.as_deref(),
-            x: coordinate.map(|value| value.x),
-            y: coordinate.map(|value| value.y),
-            coordinate_space,
-            source_selector: None,
-            target_selector: None,
-            drag_steps: None,
-            drag_duration_ms: None,
-            drag_data_mime_type: None,
-            drag_data_text: None,
-            button: click_button,
-            modifiers: click_modifiers.as_ref(),
-            clicks: click_count,
-            wait_timeout_ms: target_act_dom_wait_timeout(params.wait_timeout_ms)?,
-            auto_wait: params.auto_wait,
-            auto_wait_timeout_ms: params.auto_wait_timeout_ms,
-            suppress_page_text: params.secret_safe,
-        },
-    )
-    .await
-    .map_err(|error| mcp_error(error.code(), error.detail().to_owned()));
-    target_act_audit_result_for_session(
-        service,
-        "chrome_debugger_bridge.cdpInput",
-        &result,
-        session_id,
-        params.secret_safe,
-    )?;
-    match result {
-        Ok(value) => {
-            let value = target_act_maybe_secret_safe_result(
-                "chrome_debugger_bridge.cdpInput",
-                value,
-                params.secret_safe,
-            )?;
-            Ok((
-                "chrome_debugger_bridge.cdpInput",
-                true,
-                TARGET_ACT_STATUS_OK,
-                value,
-            ))
-        }
-        Err(error) => Ok((
-            "chrome_debugger_bridge.cdpInput",
-            false,
-            target_act_error_status(&error),
-            target_act_maybe_secret_safe_error_result(
-                "chrome_debugger_bridge.cdpInput",
-                error,
-                params.secret_safe,
-            ),
-        )),
-    }
-}
-
-#[cfg(windows)]
-fn target_act_validate_bridge_cdp_input(
-    action: &str,
-    coordinate: Option<TargetActCoordinate>,
-    params: &TargetActParams,
-) -> Result<(), ErrorData> {
-    if let Some(coordinate) = coordinate
-        && coordinate.space != TargetActCoordinateSpace::Viewport
-    {
-        return Err(mcp_error(
-            error_codes::TOOL_PARAMS_INVALID,
-            format!(
-                "target_act verb={action} coordinate input must use coordinate_space=viewport because CDP Input consumes viewport CSS pixels; got {}",
-                coordinate.space.as_bridge_str()
-            ),
-        ));
-    }
-    if coordinate.is_none() {
-        target_act_validate_dom_locator(action, params)?;
-    }
-    if let Some(raw) = params
-        .element_id
-        .as_ref()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-    {
-        if ElementId::parse(raw).is_ok() {
-            return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
-                format!(
-                    "target_act verb={action} observed raw-CDP element_id {raw:?} requires a raw CDP endpoint; re-resolve the element through browser_locate for a chrome-tab:... bridge element id or use selector/role/name"
-                ),
-            ));
-        }
-        if !target_act_click_element_id_can_be_dom_id(raw) {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "target_act verb={action} element_id must be a chrome-tab:... bridge element id or plain DOM id for the normal Chrome bridge cdpInput lane"
-                ),
-            ));
-        }
-    }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -8612,17 +8427,6 @@ fn target_act_input_provenance(
                 false,
             )
         }
-        "chrome_debugger_bridge.cdpInput" => target_act_one_provenance(
-            context,
-            InputDeliveryOrigin::ChromeDebuggerProtocol,
-            Some(true),
-            BrowserDefaultActionSemantics::UserAgentInput,
-            required_result_string(result, "readback_backend", "bridge_cdp_input")?,
-            "chrome_tabs_extension+chrome.debugger",
-            required_result_string(result, "method", "bridge_cdp_input")?,
-            false,
-            false,
-        ),
         "synapse_a11y.cdp_click_node"
         | "synapse_a11y.cdp_aim_node"
         | "synapse_a11y.cdp_touch_tap" => target_act_one_provenance(
@@ -8940,19 +8744,14 @@ fn target_act_delegated_lane_provenance(
     let required_foreground =
         required_result_bool(result, "required_foreground", "delegated_input_lane")?;
     match tier {
-        "cdp" | "chrome_bridge_active_element" => {
-            let raw = context.raw_cdp_endpoint_present() && tier == "cdp";
-            let origin = if raw {
-                InputDeliveryOrigin::CdpProtocol
-            } else {
-                InputDeliveryOrigin::ChromeDebuggerProtocol
-            };
-            let backend = if raw { "raw_cdp" } else { "chrome.debugger" };
-            let transport = if raw {
-                "raw_cdp_websocket"
-            } else {
-                "chrome_tabs_extension+chrome.debugger"
-            };
+        "cdp" => {
+            if !context.raw_cdp_endpoint_present() {
+                return Err(input_provenance_error(
+                    "delegated_cdp_input",
+                    "successful cdp tier lacked a raw-CDP endpoint; the normal authenticated Chrome profile is debugger-free",
+                    Some(context.target()),
+                ));
+            }
             let method = match delegated_tool {
                 "act_click" => "Input.dispatchMouseEvent",
                 "act_press" => "Input.dispatchKeyEvent",
@@ -8970,11 +8769,25 @@ fn target_act_delegated_lane_provenance(
             };
             target_act_one_provenance(
                 context,
-                origin,
+                InputDeliveryOrigin::CdpProtocol,
                 Some(true),
                 BrowserDefaultActionSemantics::UserAgentInput,
-                backend,
-                transport,
+                "raw_cdp",
+                "raw_cdp_websocket",
+                method,
+                false,
+                false,
+            )
+        }
+        "chrome_bridge_active_element" => {
+            let method = required_result_string(result, "method", "bridge_active_element_input")?;
+            target_act_one_provenance(
+                context,
+                InputDeliveryOrigin::DomDispatch,
+                Some(false),
+                BrowserDefaultActionSemantics::ScriptedMutationPlusSyntheticNotifications,
+                required_result_string(result, "backend_used", "bridge_active_element_input")?,
+                "chrome_tabs_extension+chrome.scripting",
                 method,
                 false,
                 false,

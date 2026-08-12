@@ -1,5 +1,6 @@
-//! Browser drag-and-drop tools (#1144/#1145) for the normal authenticated
-//! Chrome bridge.
+//! Browser drag-and-drop tools (#1144/#1145) for Synapse-owned raw-CDP targets.
+
+use std::time::{Duration, Instant};
 
 use super::{ErrorData, Json, Parameters, SessionTarget, SynapseService, tool, tool_router};
 use crate::m1::mcp_error;
@@ -14,7 +15,6 @@ use super::input_provenance::{InputProvenanceContext, InputProvenanceSpec};
 
 const BROWSER_DRAG_TOOL: &str = "browser_drag";
 const BROWSER_DROP_TOOL: &str = "browser_drop";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_MOUSE_STEPS: u32 = 12;
 const DEFAULT_MOUSE_DURATION_MS: u64 = 350;
 const MAX_SELECTOR_CHARS: usize = 4096;
@@ -38,19 +38,11 @@ pub enum BrowserDndMode {
 }
 
 impl BrowserDndMode {
-    const fn bridge_action(self) -> &'static str {
-        match self {
-            Self::Mouse => "drag",
-            Self::Html5 => "html5_drag",
-            Self::Html5Real => "html5_real_drag",
-        }
-    }
-
     const fn delegated_method(self) -> &'static str {
         match self {
-            Self::Mouse => "chrome_debugger_bridge.cdpInput.drag",
-            Self::Html5 => "chrome_debugger_bridge.cdpInput.html5_drag",
-            Self::Html5Real => "chrome_debugger_bridge.cdpInput.html5_real_drag",
+            Self::Mouse => "raw_cdp.Input.dispatchMouseEvent.drag",
+            Self::Html5 => "raw_cdp.Runtime.evaluate.DragEvent",
+            Self::Html5Real => "raw_cdp.Input.dispatchDragEvent",
         }
     }
 }
@@ -79,8 +71,7 @@ pub struct BrowserDndParams {
     /// DataTransfer text payload for mode=html5. Defaults to source text in the page.
     #[serde(default)]
     pub data_text: Option<String>,
-    /// Chrome bridge tab target id (`chrome-tab:<id>`). Defaults to this
-    /// session's active CDP target.
+    /// Raw CDP target id. Defaults to this session's active CDP target.
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Required only with explicit cdp_target_id
@@ -135,7 +126,7 @@ struct NormalizedBrowserDndParams {
 #[tool_router(router = browser_dnd_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Drag one element to another in the calling session's owned normal Chrome bridge tab (#1144). Defaults to a target-scoped chrome.debugger CDP Input mouse sequence: mouseMoved to source, mousePressed, configurable dragMove steps, mouseReleased on target. Source and target are strict CSS selectors resolved/actionability-checked in the already-open authenticated Chrome profile. Background-safe: no OS foreground input, no helper Chrome process, and no human foreground fallback."
+        description = "Drag one element to another in the calling session's owned raw-CDP tab on Synapse's dedicated non-default automation profile (#1144). Defaults to a target-scoped Input.dispatchMouseEvent sequence: mouseMoved to source, mousePressed, configurable dragMove steps, mouseReleased on target. Source and target are strict CSS selectors resolved and actionability-checked on the exact target. The debugger-free normal authenticated Chrome bridge fails closed before any Chrome command. Background-safe: no OS foreground input and no human foreground fallback."
     )]
     pub async fn browser_drag(
         &self,
@@ -152,7 +143,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Dispatch an HTML5 drag-and-drop from one element to another in the calling session's owned normal Chrome bridge tab (#1145). Defaults to in-page DragEvent dragstart/dragenter/dragover/drop/dragend with a real DataTransfer payload, reporting whether dragover was cancelled so drop-capable zones can be verified. Set mode=mouse to use the same CDP mouse sequence as browser_drag. Background-safe and scoped to the already-open authenticated Chrome profile."
+        description = "Dispatch an HTML5 drag-and-drop in the calling session's owned raw-CDP tab on Synapse's dedicated non-default automation profile (#1145). Defaults to an in-page DragEvent sequence with DataTransfer and exact dispatch readback; mode=html5_real uses Chrome-generated Input.dispatchDragEvent, and mode=mouse uses the same trusted pointer sequence as browser_drag. The debugger-free normal authenticated Chrome bridge fails closed before any Chrome command. Background-safe and target-scoped."
     )]
     pub async fn browser_drop(
         &self,
@@ -189,19 +180,19 @@ impl SynapseService {
             })?;
         let dnd = validate_browser_dnd_params(&params, default_mode)?;
         let (window_hwnd, cdp_target_id) = self.resolve_browser_dnd_target(&session_id, &params)?;
-        if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
+        if cdp_target_id.starts_with("chrome-tab:") {
             return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
+                error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
                 format!(
-                    "{tool} targets the normal Chrome extension bridge, but window {window_hwnd} exposes a raw CDP debug endpoint; use raw-CDP primitives for a Synapse automation profile"
+                    "{tool} refused normal authenticated Chrome target {cdp_target_id:?} before queueing any Chrome command; the normal profile permanently forbids debugger permission. Launch a session-owned raw-CDP browser on Synapse's dedicated non-default automation profile"
                 ),
             ));
         }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        if synapse_a11y::endpoint_for_window(window_hwnd).is_none() {
             return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
+                error_codes::A11Y_CDP_UNREACHABLE,
                 format!(
-                    "{tool} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{tool} requires a reachable raw-CDP endpoint for window {window_hwnd:#x}; launch the browser with act_launch so Synapse owns a dedicated non-default profile"
                 ),
             ));
         }
@@ -261,52 +252,94 @@ impl SynapseService {
     ) -> Result<BrowserDndResponse, ErrorData> {
         let provenance_context =
             InputProvenanceContext::browser_tab(session_id, window_hwnd, cdp_target_id)?;
-        super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_drag_drop_before_bridge_input",
-        )?;
-        let result = crate::chrome_debugger_bridge::cdp_input(
-            crate::chrome_debugger_bridge::ChromeDebuggerCdpInputRequest {
-                hwnd: window_hwnd,
-                target_id: cdp_target_id,
-                action: dnd.mode.bridge_action(),
-                selector: None,
-                element_id: None,
-                active_element: false,
-                role: None,
-                name: None,
-                value: None,
-                text: None,
-                x: None,
-                y: None,
-                coordinate_space: None,
-                source_selector: Some(dnd.source_selector.as_str()),
-                target_selector: Some(dnd.target_selector.as_str()),
-                drag_steps: Some(dnd.steps),
-                drag_duration_ms: Some(dnd.duration_ms),
-                drag_data_mime_type: dnd.data_mime_type.as_deref(),
-                drag_data_text: dnd.data_text.as_deref(),
-                button: None,
-                modifiers: None,
-                clicks: None,
-                wait_timeout_ms: dnd.wait_timeout_ms,
-                auto_wait: dnd.auto_wait,
-                auto_wait_timeout_ms: dnd.auto_wait_timeout_ms,
-                suppress_page_text: false,
-            },
-        )
-        .await
-        .map_err(|error| {
+        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
             mcp_error(
-                error.code(),
-                format!(
-                    "{tool} bridge {} failed for target {cdp_target_id:?}: {}",
-                    dnd.mode.bridge_action(),
-                    error.detail()
-                ),
+                error_codes::A11Y_CDP_UNREACHABLE,
+                format!("{tool} lost raw-CDP endpoint for window {window_hwnd:#x}"),
             )
         })?;
+        let geometry = resolve_raw_dnd_geometry(&endpoint, cdp_target_id, dnd).await?;
         super::operator_panic_boundary::ensure_mcp_mutation(
-            "browser_drag_drop_after_bridge_input",
+            "browser_drag_drop_before_raw_cdp_input",
+        )?;
+        let result = match dnd.mode {
+            BrowserDndMode::Mouse => {
+                let point_count = usize::try_from(dnd.steps).unwrap_or(100).saturating_add(1);
+                let denominator = f64::from(dnd.steps.max(1));
+                let points = (0..point_count)
+                    .map(|index| {
+                        let ratio =
+                            f64::from(u32::try_from(index).unwrap_or(dnd.steps)) / denominator;
+                        synapse_a11y::CdpMouseStrokePoint {
+                            x: (geometry.target_x - geometry.source_x)
+                                .mul_add(ratio, geometry.source_x),
+                            y: (geometry.target_y - geometry.source_y)
+                                .mul_add(ratio, geometry.source_y),
+                            elapsed_ms: Duration::from_millis(dnd.duration_ms).as_secs_f64()
+                                * 1000.0
+                                * ratio,
+                        }
+                    })
+                    .collect();
+                let stroke = synapse_a11y::cdp_mouse_stroke_target(
+                    &endpoint,
+                    cdp_target_id,
+                    points,
+                    Some(synapse_a11y::CdpMouseButton::Left),
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{tool} raw CDP mouse drag failed: {error}"),
+                    )
+                })?;
+                json!({
+                    "target_id": stroke.target_id,
+                    "point_count": stroke.point_count,
+                    "source": stroke.start,
+                    "target": stroke.end,
+                    "duration_ms": stroke.duration_ms,
+                    "geometry": geometry,
+                })
+            }
+            BrowserDndMode::Html5 => {
+                dispatch_synthetic_html5_drag(&endpoint, cdp_target_id, dnd, &geometry).await?
+            }
+            BrowserDndMode::Html5Real => {
+                let mime = dnd.data_mime_type.as_deref().unwrap_or("text/plain");
+                let data = dnd.data_text.as_deref().unwrap_or(&geometry.source_text);
+                let dispatched = synapse_a11y::cdp_html5_drag_target(
+                    &endpoint,
+                    cdp_target_id,
+                    synapse_a11y::CdpActionPoint {
+                        x: geometry.source_x,
+                        y: geometry.source_y,
+                    },
+                    synapse_a11y::CdpActionPoint {
+                        x: geometry.target_x,
+                        y: geometry.target_y,
+                    },
+                    mime,
+                    data,
+                )
+                .await
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{tool} raw CDP HTML5 drag failed: {error}"),
+                    )
+                })?;
+                serde_json::to_value(dispatched).map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("{tool} could not serialize raw CDP drag readback: {error}"),
+                    )
+                })?
+            }
+        };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_drag_drop_after_raw_cdp_input",
         )?;
         super::input_provenance::reject_legacy_input_provenance_fragments(
             &result,
@@ -315,24 +348,24 @@ impl SynapseService {
         )?;
         let (delivery_origin, expected_trust, default_actions, transport, method) = match dnd.mode {
             BrowserDndMode::Mouse => (
-                InputDeliveryOrigin::ChromeDebuggerProtocol,
+                InputDeliveryOrigin::CdpProtocol,
                 Some(true),
                 BrowserDefaultActionSemantics::UserAgentInput,
-                "chrome_tabs_extension+chrome.debugger",
+                "raw_cdp",
                 "Input.dispatchMouseEvent(mouseMoved,mousePressed,dragMove,mouseReleased)",
             ),
             BrowserDndMode::Html5 => (
                 InputDeliveryOrigin::DomDispatch,
                 Some(false),
                 BrowserDefaultActionSemantics::SyntheticDispatchNoUserAgentInputDefaults,
-                "chrome_tabs_extension+chrome.scripting",
+                "raw_cdp",
                 "dispatchEvent(DragEvent sequence)",
             ),
             BrowserDndMode::Html5Real => (
-                InputDeliveryOrigin::ChromeDebuggerProtocol,
+                InputDeliveryOrigin::CdpProtocol,
                 Some(true),
                 BrowserDefaultActionSemantics::UserAgentInput,
-                "chrome_tabs_extension+chrome.debugger",
+                "raw_cdp",
                 "Input.dispatchDragEvent(dragEnter,dragOver,drop)",
             ),
         };
@@ -350,7 +383,7 @@ impl SynapseService {
         Ok(BrowserDndResponse {
             ok: true,
             required_foreground: false,
-            transport: "chrome_tabs_extension".to_owned(),
+            transport: "raw_cdp".to_owned(),
             window_hwnd,
             cdp_target_id: cdp_target_id.to_owned(),
             mode: dnd.mode,
@@ -359,11 +392,197 @@ impl SynapseService {
             steps: dnd.steps,
             duration_ms: dnd.duration_ms,
             delegated_tool: dnd.mode.delegated_method().to_owned(),
-            status: "dispatched_with_bridge_readback".to_owned(),
+            status: "dispatched_with_raw_cdp_readback".to_owned(),
             result,
             input_provenance,
         })
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RawDndGeometry {
+    ok: bool,
+    reason: String,
+    source_count: usize,
+    target_count: usize,
+    source_x: f64,
+    source_y: f64,
+    target_x: f64,
+    target_y: f64,
+    source_text: String,
+}
+
+async fn resolve_raw_dnd_geometry(
+    endpoint: &str,
+    cdp_target_id: &str,
+    dnd: &NormalizedBrowserDndParams,
+) -> Result<RawDndGeometry, ErrorData> {
+    let source = serde_json::to_string(&dnd.source_selector).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser drag source selector serialization failed: {error}"),
+        )
+    })?;
+    let target = serde_json::to_string(&dnd.target_selector).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("browser drag target selector serialization failed: {error}"),
+        )
+    })?;
+    let expression = format!(
+        r#"(() => {{
+          let sources, targets;
+          try {{
+            sources = Array.from(document.querySelectorAll({source}));
+            targets = Array.from(document.querySelectorAll({target}));
+          }} catch (error) {{
+            return {{ok:false,reason:`invalid_selector:${{String(error && error.message || error)}}`,source_count:0,target_count:0,source_x:0,source_y:0,target_x:0,target_y:0,source_text:""}};
+          }}
+          if (sources.length !== 1 || targets.length !== 1) {{
+            return {{ok:false,reason:"strict_match_count",source_count:sources.length,target_count:targets.length,source_x:0,source_y:0,target_x:0,target_y:0,source_text:""}};
+          }}
+          const inspect = (element) => {{
+            const rect = element.getBoundingClientRect();
+            const style = getComputedStyle(element);
+            const actionable = element.isConnected && rect.width > 0 && rect.height > 0 &&
+              style.display !== "none" && style.visibility !== "hidden" &&
+              style.pointerEvents !== "none" && !element.disabled;
+            return {{actionable,x:rect.left + rect.width / 2,y:rect.top + rect.height / 2}};
+          }};
+          const sourceState = inspect(sources[0]);
+          const targetState = inspect(targets[0]);
+          return {{
+            ok: sourceState.actionable && targetState.actionable,
+            reason: sourceState.actionable ? (targetState.actionable ? "ready" : "target_not_actionable") : "source_not_actionable",
+            source_count: sources.length,
+            target_count: targets.length,
+            source_x: sourceState.x,
+            source_y: sourceState.y,
+            target_x: targetState.x,
+            target_y: targetState.y,
+            source_text: String(sources[0].innerText || sources[0].textContent || "")
+          }};
+        }})()"#
+    );
+    let started = Instant::now();
+    let wait_budget = Duration::from_millis(u64::from(dnd.auto_wait_timeout_ms))
+        .min(Duration::from_millis(dnd.wait_timeout_ms));
+    loop {
+        let evaluated = synapse_a11y::cdp_evaluate_expression_with_timeout(
+            endpoint,
+            cdp_target_id,
+            &expression,
+            false,
+            true,
+            dnd.wait_timeout_ms,
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("browser drag/drop actionability readback failed: {error}"),
+            )
+        })?;
+        let geometry: RawDndGeometry =
+            serde_json::from_value(evaluated.value).map_err(|error| {
+                mcp_error(
+                    error_codes::ACTION_POSTCONDITION_FAILED,
+                    format!("browser drag/drop geometry readback was malformed: {error}"),
+                )
+            })?;
+        if geometry.ok {
+            return Ok(geometry);
+        }
+        if geometry.reason.starts_with("invalid_selector")
+            || !dnd.auto_wait
+            || started.elapsed() >= wait_budget
+        {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser drag/drop source/target failed strict actionability: reason={} source_selector={:?} source_count={} target_selector={:?} target_count={} waited_ms={}",
+                    geometry.reason,
+                    dnd.source_selector,
+                    geometry.source_count,
+                    dnd.target_selector,
+                    geometry.target_count,
+                    started.elapsed().as_millis()
+                ),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn dispatch_synthetic_html5_drag(
+    endpoint: &str,
+    cdp_target_id: &str,
+    dnd: &NormalizedBrowserDndParams,
+    geometry: &RawDndGeometry,
+) -> Result<Value, ErrorData> {
+    let source = serde_json::to_string(&dnd.source_selector)
+        .map_err(|error| mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string()))?;
+    let target = serde_json::to_string(&dnd.target_selector)
+        .map_err(|error| mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string()))?;
+    let mime = serde_json::to_string(dnd.data_mime_type.as_deref().unwrap_or("text/plain"))
+        .map_err(|error| mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string()))?;
+    let data = serde_json::to_string(dnd.data_text.as_deref().unwrap_or(&geometry.source_text))
+        .map_err(|error| mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string()))?;
+    let expression = format!(
+        r#"(() => {{
+          const sources = Array.from(document.querySelectorAll({source}));
+          const targets = Array.from(document.querySelectorAll({target}));
+          if (sources.length !== 1 || targets.length !== 1) {{
+            throw new Error(`drag target drift: source_count=${{sources.length}} target_count=${{targets.length}}`);
+          }}
+          const source = sources[0];
+          const target = targets[0];
+          const transfer = new DataTransfer();
+          transfer.setData({mime}, {data});
+          const plan = [
+            [source,"dragstart"], [target,"dragenter"], [target,"dragover"],
+            [target,"drop"], [source,"dragend"]
+          ];
+          const events = plan.map(([node,type]) => {{
+            const event = new DragEvent(type, {{bubbles:true,cancelable:true,dataTransfer:transfer}});
+            const defaultAllowed = node.dispatchEvent(event);
+            return {{type,default_allowed:defaultAllowed,default_prevented:event.defaultPrevented,is_trusted:event.isTrusted}};
+          }});
+          return {{
+            target_id:{target_id},
+            events,
+            mime_type:{mime},
+            data_length:{data_length},
+            source_connected:source.isConnected,
+            target_connected:target.isConnected,
+            target_text:String(target.innerText || target.textContent || ""),
+            target_class:String(target.className || "")
+          }};
+        }})()"#,
+        target_id = serde_json::to_string(cdp_target_id)
+            .map_err(|error| mcp_error(error_codes::TOOL_PARAMS_INVALID, error.to_string()))?,
+        data_length = dnd
+            .data_text
+            .as_deref()
+            .unwrap_or(&geometry.source_text)
+            .len(),
+    );
+    let evaluated = synapse_a11y::cdp_evaluate_expression_with_timeout(
+        endpoint,
+        cdp_target_id,
+        &expression,
+        false,
+        true,
+        dnd.wait_timeout_ms,
+    )
+    .await
+    .map_err(|error| {
+        mcp_error(
+            error.code(),
+            format!("browser_drop synthetic raw-CDP DragEvent dispatch failed: {error}"),
+        )
+    })?;
+    Ok(evaluated.value)
 }
 
 fn validate_browser_dnd_params(

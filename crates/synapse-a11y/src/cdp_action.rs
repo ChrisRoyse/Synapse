@@ -30,13 +30,14 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use chromiumoxide::Browser;
 use chromiumoxide::cdp::browser_protocol::dom::{
-    BackendNodeId, GetBoxModelParams, ResolveNodeParams, ScrollIntoViewIfNeededParams,
+    BackendNodeId, GetBoxModelParams, ResolveNodeParams, Rgba, ScrollIntoViewIfNeededParams,
 };
+use chromiumoxide::cdp::browser_protocol::emulation::SetDefaultBackgroundColorOverrideParams;
 use chromiumoxide::cdp::browser_protocol::input::{
-    DispatchKeyEventParams, DispatchKeyEventType, DispatchMouseEventParams, DispatchMouseEventType,
-    DispatchTouchEventParams, DispatchTouchEventType, InsertTextParams, MouseButton, TouchPoint,
+    DispatchDragEventParams, DispatchDragEventType, DispatchKeyEventParams, DispatchKeyEventType,
+    DispatchMouseEventParams, DispatchMouseEventType, DispatchTouchEventParams,
+    DispatchTouchEventType, DragData, DragDataItem, InsertTextParams, MouseButton, TouchPoint,
 };
 use chromiumoxide::cdp::browser_protocol::network::{
     EnableParams as NetworkEnableParams, EventLoadingFailed, EventLoadingFinished,
@@ -47,12 +48,14 @@ use chromiumoxide::cdp::browser_protocol::page::{
     EnableParams as PageEnableParams, EventDomContentEventFired, EventFrameNavigated,
     EventLifecycleEvent, EventLoadEventFired, EventNavigatedWithinDocument, GetFrameTreeParams,
     GetLayoutMetricsParams, GetNavigationHistoryParams, NavigateParams,
-    NavigateToHistoryEntryParams, ReloadParams, RemoveScriptToEvaluateOnNewDocumentParams,
-    ScriptIdentifier, SetDocumentContentParams, SetLifecycleEventsEnabledParams, Viewport,
+    NavigateToHistoryEntryParams, PrintToPdfParams, ReloadParams,
+    RemoveScriptToEvaluateOnNewDocumentParams, ScriptIdentifier, SetDocumentContentParams,
+    SetLifecycleEventsEnabledParams, Viewport,
 };
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::cdp::js_protocol::runtime::{CallArgument, CallFunctionOnParams};
 use chromiumoxide::page::ScreenshotParams;
+use chromiumoxide::{Browser, Page};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -109,6 +112,17 @@ pub struct CdpMouseStrokeResult {
     pub start: CdpActionPoint,
     pub end: CdpActionPoint,
     pub duration_ms: f64,
+}
+
+/// Dispatch summary for a trusted CDP HTML5 drag sequence.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CdpHtml5DragResult {
+    pub target_id: String,
+    pub source: CdpActionPoint,
+    pub target: CdpActionPoint,
+    pub mime_type: String,
+    pub data_length: usize,
+    pub dispatched_events: Vec<String>,
 }
 
 /// Dispatch summary for a CDP touch tap.
@@ -250,6 +264,32 @@ pub struct CdpPageState {
     pub ready_state: String,
     pub history_current_index: i64,
     pub history_entry_count: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CdpPrintToPdfOptions {
+    pub landscape: bool,
+    pub display_header_footer: bool,
+    pub print_background: bool,
+    pub scale: Option<f64>,
+    pub paper_width: Option<f64>,
+    pub paper_height: Option<f64>,
+    pub margin_top: Option<f64>,
+    pub margin_bottom: Option<f64>,
+    pub margin_left: Option<f64>,
+    pub margin_right: Option<f64>,
+    pub page_ranges: Option<String>,
+    pub header_template: Option<String>,
+    pub footer_template: Option<String>,
+    pub prefer_css_page_size: bool,
+    pub timeout_ms: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CdpPrintToPdfResult {
+    pub target_id: String,
+    pub pdf_bytes: Vec<u8>,
+    pub page_state: CdpPageState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1377,6 +1417,79 @@ pub async fn cdp_mouse_stroke_target(
         end,
         duration_ms,
     })
+}
+
+/// Dispatches Chrome-generated HTML5 dragEnter/dragOver/drop events to an exact
+/// raw-CDP target without activating its browser window.
+///
+/// # Errors
+///
+/// Fails before dispatch for an empty MIME type, invalid coordinates, or an
+/// unreachable/mismatched target; any CDP acknowledgement failure is returned.
+pub async fn cdp_html5_drag_target(
+    endpoint: &str,
+    target_id: &str,
+    source: CdpActionPoint,
+    target: CdpActionPoint,
+    mime_type: &str,
+    data: &str,
+) -> A11yResult<CdpHtml5DragResult> {
+    validate_cdp_action_point(source, "HTML5 drag source")?;
+    validate_cdp_action_point(target, "HTML5 drag target")?;
+    let mime_type = mime_type.trim();
+    if mime_type.is_empty() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "HTML5 drag MIME type must not be empty".to_owned(),
+        });
+    }
+    let mime_type_owned = mime_type.to_owned();
+    let data_owned = data.to_owned();
+    let target_id_owned = target_id.to_owned();
+    with_target_page(endpoint, target_id, |page| async move {
+        let actual_target_id = page.target_id().inner().clone();
+        if actual_target_id != target_id_owned {
+            return Err(A11yError::CdpAttachFailed {
+                detail: format!(
+                    "HTML5 drag resolved target {actual_target_id:?}, expected {target_id_owned:?}"
+                ),
+            });
+        }
+        let drag_data = DragData::new(
+            vec![DragDataItem::new(
+                mime_type_owned.clone(),
+                data_owned.clone(),
+            )],
+            1,
+        );
+        let events = [
+            (DispatchDragEventType::DragEnter, source, "dragEnter"),
+            (DispatchDragEventType::DragOver, target, "dragOver"),
+            (DispatchDragEventType::Drop, target, "drop"),
+        ];
+        let mut dispatched_events = Vec::with_capacity(events.len());
+        for (event_type, point, label) in events {
+            page.execute(DispatchDragEventParams::new(
+                event_type,
+                point.x,
+                point.y,
+                drag_data.clone(),
+            ))
+            .await
+            .map_err(|error| A11yError::CdpAxtreeFailed {
+                detail: format!("Input.dispatchDragEvent {label}: {error}"),
+            })?;
+            dispatched_events.push(label.to_owned());
+        }
+        Ok(CdpHtml5DragResult {
+            target_id: actual_target_id,
+            source,
+            target,
+            mime_type: mime_type_owned,
+            data_length: data_owned.len(),
+            dispatched_events,
+        })
+    })
+    .await
 }
 
 /// Touch-taps viewport CSS coordinates in a specific CDP page target without
@@ -4125,6 +4238,90 @@ fn format_evaluate_exception(
     )
 }
 
+/// Prints an exact session-owned raw-CDP page target without activating its
+/// browser window or touching a normal authenticated Chrome profile.
+///
+/// # Errors
+///
+/// Returns a fail-loud CDP error when the endpoint/target cannot be reached,
+/// `Page.printToPDF` fails or times out, or the returned bytes are not a PDF.
+pub async fn cdp_print_to_pdf(
+    endpoint: &str,
+    target_id: &str,
+    options: CdpPrintToPdfOptions,
+) -> A11yResult<CdpPrintToPdfResult> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    if options.timeout_ms == 0 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "Page.printToPDF timeout_ms must be greater than zero".to_owned(),
+        });
+    }
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|error| A11yError::CdpAttachFailed {
+                detail: format!("connect {endpoint}: {error}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let result = async {
+        let page = get_target_page_with_discovery(&browser, target_id).await?;
+        let params = PrintToPdfParams {
+            landscape: Some(options.landscape),
+            display_header_footer: Some(options.display_header_footer),
+            print_background: Some(options.print_background),
+            scale: options.scale,
+            paper_width: options.paper_width,
+            paper_height: options.paper_height,
+            margin_top: options.margin_top,
+            margin_bottom: options.margin_bottom,
+            margin_left: options.margin_left,
+            margin_right: options.margin_right,
+            page_ranges: options.page_ranges,
+            header_template: options.header_template,
+            footer_template: options.footer_template,
+            prefer_css_page_size: Some(options.prefer_css_page_size),
+            transfer_mode: None,
+            generate_tagged_pdf: None,
+            generate_document_outline: None,
+        };
+        let pdf_bytes = tokio::time::timeout(
+            Duration::from_millis(options.timeout_ms),
+            page.pdf(params),
+        )
+        .await
+        .map_err(|_| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Page.printToPDF timed out for target {target_id} after {} ms",
+                options.timeout_ms
+            ),
+        })?
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.printToPDF for target {target_id}: {error}"),
+        })?;
+        if !pdf_bytes.starts_with(b"%PDF-") {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "Page.printToPDF for target {target_id} returned {} bytes without a %PDF- header",
+                    pdf_bytes.len()
+                ),
+            });
+        }
+        let page_state = read_page_state(&page).await?;
+        Ok(CdpPrintToPdfResult {
+            target_id: target_id.to_owned(),
+            pdf_bytes,
+            page_state,
+        })
+    }
+    .await;
+    finish_chromiumoxide_handler(result, handler_task, "Page.printToPDF").await
+}
+
 /// Waits for a page lifecycle state on a specific CDP page target without
 /// activating the browser window.
 ///
@@ -5866,6 +6063,484 @@ pub struct CdpNodeBitmap {
     pub bgra: Vec<u8>,
 }
 
+/// Maximum decoded screenshot surface retained in process memory. The gate is
+/// evaluated from page geometry before `Page.captureScreenshot` and again from
+/// the PNG header before allocating the decode buffer.
+pub const CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES: u64 = 384 * 1024 * 1024;
+const CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES_F64: f64 = 402_653_184.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CdpPageScreenshotRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CdpPageScreenshotScope {
+    Viewport,
+    FullPage,
+    Clip(synapse_core::Rect),
+    Element(i64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CdpPageScreenshotMaskTarget {
+    Selector(String),
+    BackendNode(i64),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CdpPageScreenshotMaskSpec {
+    pub target: CdpPageScreenshotMaskTarget,
+    pub color: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CdpPageScreenshotMaskReadback {
+    pub index: usize,
+    pub rect: CdpPageScreenshotRect,
+    pub color_rgba: [u8; 4],
+}
+
+#[derive(Clone, Debug)]
+pub struct CdpPageScreenshotResult {
+    pub target_id: String,
+    pub bitmap: CdpNodeBitmap,
+    pub clip: CdpPageScreenshotRect,
+    pub device_pixel_ratio: f64,
+    pub viewport_width_css: f64,
+    pub viewport_height_css: f64,
+    pub document_width_css: f64,
+    pub document_height_css: f64,
+    pub document_generation: String,
+    pub page_state: CdpPageState,
+    pub masks: Vec<CdpPageScreenshotMaskReadback>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpPageScreenshotGeometry {
+    url: String,
+    device_pixel_ratio: f64,
+    viewport_width: f64,
+    viewport_height: f64,
+    page_x: f64,
+    page_y: f64,
+    document_width: f64,
+    document_height: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpSelectorScreenshotRect {
+    match_count: usize,
+    rect: Option<CdpPageScreenshotRectWire>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpPageScreenshotRectWire {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpCssColorReadback {
+    supported: bool,
+    rgba: Option<Vec<u8>>,
+}
+
+/// Captures an exact raw-CDP page target without activating its tab or touching
+/// the OS foreground. Geometry, masks, capture, and document-generation
+/// readback share one CDP connection, and navigation during the transaction
+/// fails closed before any artifact can be published.
+pub async fn cdp_capture_page_surface_bgra(
+    endpoint: &str,
+    target_id: &str,
+    scope: CdpPageScreenshotScope,
+    masks: &[CdpPageScreenshotMaskSpec],
+    omit_background: bool,
+    timeout_ms: u64,
+) -> A11yResult<CdpPageScreenshotResult> {
+    if timeout_ms == 0 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "page screenshot timeout_ms must be greater than zero".to_owned(),
+        });
+    }
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|error| A11yError::CdpAttachFailed {
+                detail: format!("page screenshot connect {endpoint}: {error}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let result = async {
+        let page = get_target_page_with_discovery(&browser, target_id).await?;
+        let loader_before = main_frame_loader_id(&page, "before screenshot").await?;
+        let geometry = page_screenshot_geometry(&page).await?;
+        validate_screenshot_geometry(&geometry)?;
+        let clip = match scope {
+            CdpPageScreenshotScope::Viewport => CdpPageScreenshotRect {
+                x: geometry.page_x,
+                y: geometry.page_y,
+                width: geometry.viewport_width,
+                height: geometry.viewport_height,
+            },
+            CdpPageScreenshotScope::FullPage => CdpPageScreenshotRect {
+                x: 0.0,
+                y: 0.0,
+                width: geometry.document_width,
+                height: geometry.document_height,
+            },
+            CdpPageScreenshotScope::Clip(rect) => CdpPageScreenshotRect {
+                x: f64::from(rect.x),
+                y: f64::from(rect.y),
+                width: f64::from(rect.w),
+                height: f64::from(rect.h),
+            },
+            CdpPageScreenshotScope::Element(backend_node_id) => {
+                backend_node_document_rect(&page, backend_node_id, &geometry).await?
+            }
+        };
+        validate_page_screenshot_rect(clip, "capture clip")?;
+        validate_page_screenshot_capture_budget(clip, geometry.device_pixel_ratio)?;
+        let mut mask_readbacks = Vec::with_capacity(masks.len());
+        for (index, mask) in masks.iter().enumerate() {
+            let rect = match &mask.target {
+                CdpPageScreenshotMaskTarget::Selector(selector) => {
+                    selector_document_rect(&page, selector).await?
+                }
+                CdpPageScreenshotMaskTarget::BackendNode(backend_node_id) => {
+                    backend_node_document_rect(&page, *backend_node_id, &geometry).await?
+                }
+            };
+            validate_page_screenshot_rect(rect, &format!("mask[{index}] rectangle"))?;
+            let color_rgba = resolve_page_screenshot_css_color(&page, &mask.color).await?;
+            mask_readbacks.push(CdpPageScreenshotMaskReadback {
+                index,
+                rect,
+                color_rgba,
+            });
+        }
+
+        let screenshot_params = ScreenshotParams::builder()
+            .format(CaptureScreenshotFormat::Png)
+            .clip(Viewport {
+                x: clip.x,
+                y: clip.y,
+                width: clip.width,
+                height: clip.height,
+                scale: 1.0,
+            })
+            .from_surface(true)
+            .capture_beyond_viewport(true)
+            .build();
+        if omit_background {
+            page.execute(
+                SetDefaultBackgroundColorOverrideParams::builder()
+                    .color(Rgba::builder().r(0).g(0).b(0).a(0.0).build().map_err(|error| {
+                        A11yError::CdpAxtreeFailed {
+                            detail: format!("build transparent background override: {error}"),
+                        }
+                    })?)
+                    .build(),
+            )
+            .await
+            .map_err(|error| A11yError::CdpAxtreeFailed {
+                detail: format!("Emulation.setDefaultBackgroundColorOverride transparent: {error}"),
+            })?;
+        }
+        let capture_result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            page.screenshot(screenshot_params),
+        )
+        .await
+        .map_err(|_| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.captureScreenshot timed out after {timeout_ms} ms"),
+        })
+        .and_then(|result| {
+            result.map_err(|error| A11yError::CdpAxtreeFailed {
+                detail: format!("Page.captureScreenshot: {error}"),
+            })
+        });
+        let reset_result = if omit_background {
+            page.execute(SetDefaultBackgroundColorOverrideParams::default())
+                .await
+                .map(|_| ())
+                .map_err(|error| A11yError::CdpAxtreeFailed {
+                    detail: format!("clear Emulation.setDefaultBackgroundColorOverride: {error}"),
+                })
+        } else {
+            Ok(())
+        };
+        let png_bytes = match (capture_result, reset_result) {
+            (Ok(bytes), Ok(())) => bytes,
+            (Err(capture_error), Ok(())) => return Err(capture_error),
+            (Ok(_), Err(reset_error)) => return Err(reset_error),
+            (Err(capture_error), Err(reset_error)) => {
+                return Err(A11yError::CdpAxtreeFailed {
+                    detail: format!(
+                        "page screenshot failed and transparent-background cleanup also failed: capture_error={capture_error}; cleanup_error={reset_error}"
+                    ),
+                });
+            }
+        };
+        let bitmap = decode_png_to_bgra(&png_bytes)?;
+        let loader_after = main_frame_loader_id(&page, "after screenshot").await?;
+        if loader_after != loader_before {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "page navigated during screenshot transaction: loader_before={loader_before:?} loader_after={loader_after:?}"
+                ),
+            });
+        }
+        let after = page_screenshot_geometry(&page).await?;
+        if after.url != geometry.url {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "page URL changed during screenshot transaction: before={:?} after={:?}",
+                    geometry.url, after.url
+                ),
+            });
+        }
+        let page_state = read_page_state(&page).await?;
+        if page_state.url != geometry.url {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!(
+                    "independent page-state URL changed during screenshot transaction: before={:?} readback={:?}",
+                    geometry.url, page_state.url
+                ),
+            });
+        }
+        Ok(CdpPageScreenshotResult {
+            target_id: target_id.to_owned(),
+            bitmap,
+            clip,
+            device_pixel_ratio: geometry.device_pixel_ratio,
+            viewport_width_css: geometry.viewport_width,
+            viewport_height_css: geometry.viewport_height,
+            document_width_css: geometry.document_width,
+            document_height_css: geometry.document_height,
+            document_generation: format!("{loader_before}\n{}", geometry.url),
+            page_state,
+            masks: mask_readbacks,
+        })
+    }
+    .await;
+    finish_chromiumoxide_handler(result, handler_task, "page surface screenshot").await
+}
+
+async fn main_frame_loader_id(page: &Page, phase: &str) -> A11yResult<String> {
+    let tree = page
+        .execute(GetFrameTreeParams::default())
+        .await
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("Page.getFrameTree {phase}: {error}"),
+        })?;
+    Ok(tree.frame_tree.frame.loader_id.inner().clone())
+}
+
+async fn page_screenshot_geometry(page: &Page) -> A11yResult<CdpPageScreenshotGeometry> {
+    page.evaluate_expression(
+        r#"(() => {
+          const root = document.documentElement;
+          const body = document.body;
+          const width = Math.max(root ? root.scrollWidth : 0, root ? root.offsetWidth : 0,
+            body ? body.scrollWidth : 0, body ? body.offsetWidth : 0, innerWidth || 0);
+          const height = Math.max(root ? root.scrollHeight : 0, root ? root.offsetHeight : 0,
+            body ? body.scrollHeight : 0, body ? body.offsetHeight : 0, innerHeight || 0);
+          return { url:String(location.href || ""), device_pixel_ratio:Number(devicePixelRatio || 1),
+            viewport_width:Number(innerWidth || 0), viewport_height:Number(innerHeight || 0),
+            page_x:Number(scrollX || 0), page_y:Number(scrollY || 0),
+            document_width:Number(width), document_height:Number(height) };
+        })()"#,
+    )
+    .await
+    .map_err(|error| A11yError::CdpAxtreeFailed {
+        detail: format!("Runtime.evaluate screenshot geometry: {error}"),
+    })?
+    .into_value::<CdpPageScreenshotGeometry>()
+    .map_err(|error| A11yError::CdpAxtreeFailed {
+        detail: format!("decode screenshot geometry: {error}"),
+    })
+}
+
+fn validate_screenshot_geometry(geometry: &CdpPageScreenshotGeometry) -> A11yResult<()> {
+    for (label, value) in [
+        ("device_pixel_ratio", geometry.device_pixel_ratio),
+        ("viewport_width", geometry.viewport_width),
+        ("viewport_height", geometry.viewport_height),
+        ("document_width", geometry.document_width),
+        ("document_height", geometry.document_height),
+    ] {
+        if !value.is_finite() || value <= 0.0 {
+            return Err(A11yError::CdpAxtreeFailed {
+                detail: format!("invalid page screenshot {label}: {value}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_page_screenshot_rect(rect: CdpPageScreenshotRect, label: &str) -> A11yResult<()> {
+    if !rect.x.is_finite()
+        || !rect.y.is_finite()
+        || !rect.width.is_finite()
+        || !rect.height.is_finite()
+        || rect.x < 0.0
+        || rect.y < 0.0
+        || rect.width <= 0.0
+        || rect.height <= 0.0
+    {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "{label} is invalid: x={} y={} width={} height={}",
+                rect.x, rect.y, rect.width, rect.height
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_page_screenshot_capture_budget(
+    clip: CdpPageScreenshotRect,
+    device_pixel_ratio: f64,
+) -> A11yResult<()> {
+    let scale = device_pixel_ratio.max(1.0);
+    let width = (clip.width * scale).ceil();
+    let height = (clip.height * scale).ceil();
+    let decoded_bytes = width * height * 4.0;
+    if !width.is_finite() || !height.is_finite() || !decoded_bytes.is_finite() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "page screenshot decoded dimensions are not representable: clip={}x{} device_pixel_ratio={device_pixel_ratio}",
+                clip.width, clip.height
+            ),
+        });
+    }
+    if decoded_bytes > CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES_F64 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "page geometry preflight exceeds decoded screenshot hard limit: estimated_dimensions={width}x{height} estimated_decoded_bytes={decoded_bytes:.0} hard_limit_bytes={CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES} clip={}x{} device_pixel_ratio={device_pixel_ratio}",
+                clip.width, clip.height
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_screenshot_bitmap_budget(width: u32, height: u32, label: &str) -> A11yResult<()> {
+    let decoded_bytes = u64::from(width)
+        .checked_mul(u64::from(height))
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| A11yError::CdpAxtreeFailed {
+            detail: format!("{label} BGRA byte count overflowed for {width}x{height}"),
+        })?;
+    if decoded_bytes > CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "{label} exceeds decoded screenshot hard limit: dimensions={width}x{height} decoded_bytes={decoded_bytes} hard_limit_bytes={CDP_SCREENSHOT_BITMAP_HARD_LIMIT_BYTES}"
+            ),
+        });
+    }
+    Ok(())
+}
+
+async fn backend_node_document_rect(
+    page: &Page,
+    backend_node_id: i64,
+    geometry: &CdpPageScreenshotGeometry,
+) -> A11yResult<CdpPageScreenshotRect> {
+    let rect = node_content_rect(page, backend_node_id).await?;
+    Ok(CdpPageScreenshotRect {
+        x: f64::from(rect.x) + geometry.page_x,
+        y: f64::from(rect.y) + geometry.page_y,
+        width: f64::from(rect.w),
+        height: f64::from(rect.h),
+    })
+}
+
+async fn selector_document_rect(page: &Page, selector: &str) -> A11yResult<CdpPageScreenshotRect> {
+    let selector = serde_json::to_string(selector).map_err(|error| A11yError::CdpAxtreeFailed {
+        detail: format!("serialize screenshot mask selector: {error}"),
+    })?;
+    let expression = format!(
+        r"(() => {{ const matches = document.querySelectorAll({selector});
+          const element = matches.length === 1 ? matches[0] : null;
+          const rect = element ? element.getBoundingClientRect() : null;
+          return {{ match_count: matches.length, rect: rect ? {{
+            x:Number(rect.left + scrollX), y:Number(rect.top + scrollY),
+            width:Number(rect.width), height:Number(rect.height) }} : null }}; }})()"
+    );
+    let readback = page
+        .evaluate_expression(expression)
+        .await
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.evaluate screenshot mask selector: {error}"),
+        })?
+        .into_value::<CdpSelectorScreenshotRect>()
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("decode screenshot mask selector geometry: {error}"),
+        })?;
+    if readback.match_count != 1 {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "screenshot mask selector must resolve exactly one element; match_count={}",
+                readback.match_count
+            ),
+        });
+    }
+    let rect = readback.rect.ok_or_else(|| A11yError::CdpAxtreeFailed {
+        detail: "screenshot mask selector returned no rectangle".to_owned(),
+    })?;
+    Ok(CdpPageScreenshotRect {
+        x: rect.x,
+        y: rect.y,
+        width: rect.width,
+        height: rect.height,
+    })
+}
+
+async fn resolve_page_screenshot_css_color(page: &Page, color: &str) -> A11yResult<[u8; 4]> {
+    let color = serde_json::to_string(color).map_err(|error| A11yError::CdpAxtreeFailed {
+        detail: format!("serialize screenshot mask color: {error}"),
+    })?;
+    let expression = format!(
+        r#"(() => {{ const color = {color};
+          if (!globalThis.CSS || !CSS.supports("color", color)) return {{supported:false, rgba:null}};
+          const canvas = new OffscreenCanvas(1, 1); const ctx = canvas.getContext("2d");
+          if (!ctx) throw new Error("OffscreenCanvas 2D context unavailable");
+          ctx.clearRect(0, 0, 1, 1); ctx.fillStyle = color; ctx.fillRect(0, 0, 1, 1);
+          return {{supported:true, rgba:Array.from(ctx.getImageData(0, 0, 1, 1).data)}}; }})()"#
+    );
+    let readback = page
+        .evaluate_expression(expression)
+        .await
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("Runtime.evaluate screenshot mask color: {error}"),
+        })?
+        .into_value::<CdpCssColorReadback>()
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("decode screenshot mask color: {error}"),
+        })?;
+    if !readback.supported {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: format!("screenshot mask color {color} is not a valid CSS color"),
+        });
+    }
+    let rgba = readback.rgba.ok_or_else(|| A11yError::CdpAxtreeFailed {
+        detail: "screenshot mask color returned no RGBA bytes".to_owned(),
+    })?;
+    rgba.try_into()
+        .map_err(|rgba: Vec<u8>| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "screenshot mask color returned {} bytes, expected 4",
+                rgba.len()
+            ),
+        })
+}
+
 /// Captures just a web node's rendered pixels and returns them as a BGRA8 bitmap
 /// for OCR (#703).
 ///
@@ -6431,7 +7106,9 @@ async fn wait_for_pages(browser: &chromiumoxide::Browser) -> A11yResult<Vec<chro
     })
 }
 
-async fn finish_chromiumoxide_handler<T>(
+/// Joins a chromiumoxide handler after an operation and combines failures
+/// without losing the primary error.
+pub async fn finish_chromiumoxide_handler<T>(
     result: A11yResult<T>,
     handler_task: tokio::task::JoinHandle<()>,
     operation: &str,
@@ -6884,6 +7561,11 @@ fn decode_png_to_bgra(png_bytes: &[u8]) -> A11yResult<CdpNodeBitmap> {
         .map_err(|err| A11yError::CdpAxtreeFailed {
             detail: format!("screenshot PNG header decode failed: {err}"),
         })?;
+    validate_screenshot_bitmap_budget(
+        reader.info().width,
+        reader.info().height,
+        "screenshot PNG header",
+    )?;
     let buf_size = reader
         .output_buffer_size()
         .ok_or_else(|| A11yError::CdpAxtreeFailed {

@@ -49,12 +49,14 @@ Get-Process | ? {$_.MainWindowHandle -ne 0} | % { "{0} {1} {2}" -f [int64]$_.Mai
 
 The daemon ships the bridge extension on disk
 (`extensions/synapse-chrome-debugger`). Chrome 137+ branded builds ignore
-`--load-extension`, and an unpacked extension can remain unloaded after calling
-`chrome.runtime.reload()`. The worker therefore exposes no self-reload command.
-`browser_debugger operation=reload_bridge` owns the lifecycle transition from
-the host: it drives the exact Reload or Load unpacked control in the already-open
-authenticated Chrome profile, validates the physical profile row, and then
-waits for a new clean authenticated daemon host.
+`--load-extension` for normal profiles. First installation is therefore an
+explicit operator-authorized action. Once installed, `browser_debugger
+operation=reload_bridge` owns the background lifecycle transition: it atomically
+deploys the bridge through a hidden process, asks the authenticated worker to
+call `chrome.runtime.reload()`, validates the physical profile row and deployed
+service-worker SHA, and waits for a new clean authenticated daemon host. It must
+not activate, navigate, restore, minimize, unminimize, click, type into, or
+otherwise mutate a human Chrome window.
 
 The daemon already behaves correctly while stale (verified in `health`):
 - `chrome_bridge.status = "stale"`, `extension_stale = true`
@@ -67,9 +69,10 @@ The daemon already behaves correctly while stale (verified in `health`):
 1. Confirm the on-disk build matches the daemon's expected hash:
    `health` → `chrome_bridge.extension_build_sha256 expected=…`.
 2. Through the real wired MCP client, set `profile=browser_debugger`, then call
-   `browser_debugger operation=reload_bridge`. The tool declares foreground use,
-   selects only the authenticated Chrome profile, invokes the exact extension
-   management control, and returns installer path/hash/UI/profile evidence.
+   `browser_debugger operation=reload_bridge`. The tool declares
+   `required_foreground=false` and returns deployment hashes, runtime-reload
+   acknowledgement, zero foreground/tab/input mutation counters, and physical
+   profile readback.
 3. Re-read `health`: `chrome_bridge.status` must flip to `ok`,
    `extension_capabilities` must list the required commands, `extension_build_id`
    must equal the expected build.

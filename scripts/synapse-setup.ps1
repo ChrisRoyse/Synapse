@@ -122,27 +122,12 @@
   does not install or launch native messaging because Chrome may create a
   visible cmd.exe wrapper for native hosts.
 
-  Synapse applies a reversible HKCU Chrome ExtensionSettings popup shield for
-  external debugger/nativeMessaging hazards by default, identified by a
-  Synapse-authored blocked_install_message marker. It also preserves a
-  self-shield for the stable Synapse extension ID so an older loaded bridge
-  build cannot retain nativeMessaging capability. Background automation is
-  still achieved on Synapse's own side: the bundled bridge uses direct
-  localhost WebSocket, never nativeMessaging/helper Chrome windows, and exposes
-  narrow chrome.debugger lanes for target-scoped hover/tap/active-tab drag,
-  dialog handling, and viewport/device/geolocation/locale/media/network
-  emulation plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag
-  dispatch in the already-open authenticated Chrome profile.
-
-  A correctly hardened host can make
-  HKCU:\Software\Policies\Google\Chrome an admin-only managed-policy root even
-  for users who are local administrators but currently run under a medium
-  integrity UAC token. Non-elevated setup must not weaken that ACL. If the
-  policy-level defense-in-depth is required, run this setup script from an
-  elevated PowerShell and verify /health reports
-  synapse_chrome_self_policy_shield_present=true. If elevation is not used,
-  /health must still prove live chrome.management suppression is clear, and
-  normal browser commands fail closed if suppression is not confirmed.
+  Synapse does not mutate Chrome ExtensionSettings policy and does not inspect,
+  disable, or reconfigure unrelated extensions. The normal authenticated-
+  profile bridge has no debugger, nativeMessaging, or management permission and
+  reloads itself with chrome.runtime.reload. Deep evaluation, trusted input,
+  PDF, dialogs, file upload, drag/drop, and emulation run only on a session-owned
+  raw-CDP browser launched by Synapse with a dedicated non-default profile.
 
 .PARAMETER MaintenanceLockPath
   File-lock Source of Truth that serializes setup/remove across multiple
@@ -1188,55 +1173,6 @@ function Format-SynapseChromeBridgeProfileInstallState {
         $cleanupRemoved, `
         $cleanupPreserved, `
         $cleanupFailed)
-}
-
-function Invoke-SynapseChromeBridgeUiRepair {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$InstallerPath,
-        [Parameter(Mandatory = $true)]
-        [string]$NativeHostExePath
-    )
-
-    if (-not (Test-Path -LiteralPath $InstallerPath -PathType Leaf)) {
-        Die "SYNAPSE_CHROME_BRIDGE_INSTALLER_MISSING path=$InstallerPath remediation=setup requires the repo script that can repair the already-installed Chrome bridge through the already-open Chrome profile"
-    }
-    $readback = & $InstallerPath `
-        -SynapseNativeHostExe $NativeHostExePath `
-        -ReloadExistingExtensionViaUi `
-        -AutoInstallTimeoutSeconds 45
-    if (-not $readback.ok) {
-        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_INSTALLER_FAILED path=$InstallerPath remediation=installer did not return ok=true after the existing Chrome extension UI repair path"
-    }
-    $autoInstall = $readback.synapse_chrome_auto_install
-    if (-not $autoInstall) {
-        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_READBACK_MISSING path=$InstallerPath remediation=installer did not return synapse_chrome_auto_install readback for the UI repair path"
-    }
-    $allowedReasons = @(
-        'existing_extension_permission_activation_ui_reload_invoked',
-        'existing_ready_extension_ui_reload_invoked',
-        'existing_ready_extension_nonstable_path_ui_reload_invoked',
-        'migrated_existing_extension_to_credentialed_stable_path',
-        'installed_unpacked_extension_in_active_profile'
-    )
-    if ($allowedReasons -notcontains [string]$autoInstall.reason) {
-        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_NOT_PERFORMED reason=$($autoInstall.reason) attempted=$($autoInstall.attempted) changed=$($autoInstall.changed) remediation=post-start absent-host repair must either invoke the existing extension Reload control or install the bundled unpacked bridge into the already-open active profile"
-    }
-    $profileInstallState = $readback.synapse_chrome_profile_install_state
-    if (-not $profileInstallState -or $profileInstallState.active_profile_installed -ne $true) {
-        Die "SYNAPSE_CHROME_BRIDGE_UI_REPAIR_PROFILE_NOT_INSTALLED reason=$($autoInstall.reason) active_profile=$($profileInstallState.active_profile) remediation=post-start UI repair did not leave the active Chrome profile with the bundled Synapse bridge row installed"
-    }
-    $uiBefore = if ($autoInstall.ui_before) { ($autoInstall.ui_before | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
-    $uiAfter = if ($autoInstall.ui_after) { ($autoInstall.ui_after | ConvertTo-Json -Depth 8 -Compress) } else { '<none>' }
-    Info ("Chrome bridge UI repair completed reason={0} active_profile={1} chrome_window_pid={2} chrome_window_hwnd={3} ui_before={4} ui_after={5} {6}" -f `
-        $autoInstall.reason,
-        $autoInstall.active_profile,
-        $autoInstall.chrome_window_pid,
-        $autoInstall.chrome_window_hwnd,
-        $uiBefore,
-        $uiAfter,
-        (Format-SynapseChromeBridgeProfileInstallState -Readback $readback))
-    return $readback
 }
 
 $processTokenAtStart = $env:SYNAPSE_BEARER_TOKEN
@@ -7396,9 +7332,9 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $chromeBridge = $Health.subsystems.chrome_bridge
     $status = [string]$chromeBridge.status
     $detail = [string]$chromeBridge.detail
-    $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+    $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'reloadSelf'
     if ($isClean) {
-        Info "Chrome bridge OK after daemon start: stale=false capability=pageScreenshot"
+        Info "Chrome bridge OK after daemon start: stale=false capability=reloadSelf"
         return $Health
     }
 
@@ -7443,9 +7379,9 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
         $chromeBridge = $currentHealth.subsystems.chrome_bridge
         $status = [string]$chromeBridge.status
         $detail = [string]$chromeBridge.detail
-        $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
+        $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'reloadSelf'
         if ($isClean) {
-            Info "Chrome bridge OK after daemon start wait: stale=false capability=pageScreenshot"
+            Info "Chrome bridge OK after daemon start wait: stale=false capability=reloadSelf"
             return $currentHealth
         }
     }
@@ -7460,120 +7396,7 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
                 ($(if ($null -eq $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs) { '<none>' } else { $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs })),
                 ($(if ([string]::IsNullOrWhiteSpace($lastWaitHealthError)) { '<none>' } else { $lastWaitHealthError })))
         }
-        Info "Chrome bridge host still absent after alarmReconnect wait; invoking bounded existing-Chrome UI repair for the installed bridge. status=$status detail=$detail"
-        # #2031: prove the handed-off daemon is servable on the installer's own
-        # terms before handing control to the installer, so a still-cold daemon
-        # cannot fail a valid handoff on startup timing.
-        [void](Assert-SynapseDaemonBridgeReloadReadiness `
-            -Bind $Bind `
-            -Token $Token `
-            -Reason 'chrome_bridge_ui_repair' `
-            -ExpectedDaemonPid ([int]$currentHealth.pid))
-        try {
-            $uiRepairReadback = Invoke-SynapseChromeBridgeUiRepair `
-                -InstallerPath $ChromeBridgeInstallerPath `
-                -NativeHostExePath $ChromeNativeHostExePath
-        } catch {
-            $uiRepairError = $_.Exception.Message
-            # "no authenticated Chrome window is open" is a deferrable
-            # environment state, not an install failure: the daemon handoff is
-            # already committed above. It is checkpointed so the operator can
-            # open Chrome and resume just this phase.
-            #
-            # Both spellings are matched because they are the same physical
-            # condition reported by two layers. install-synapse-chrome-debugger.ps1
-            # raises SYNAPSE_CHROME_MAINTENANCE_NO_ELIGIBLE_WINDOW; the
-            # ..._UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW spelling this test
-            # originally used is thrown by nothing in the repository, so the
-            # checkpoint below was unreachable and every Chrome-closed deploy
-            # died with a bare rethrow and no resume command (#1870).
-            if ($uiRepairError -match 'SYNAPSE_CHROME_MAINTENANCE_NO_ELIGIBLE_WINDOW|SYNAPSE_CHROME_BRIDGE_UI_RELOAD_NO_ELIGIBLE_CHROME_WINDOW') {
-                $checkpointDaemonPid = [int]$currentHealth.pid
-                $checkpointDaemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $checkpointDaemonPid
-                $checkpointTask = Get-SynapseScheduledTaskIdentity -Name $TaskName
-                $checkpointSetupScript = [System.IO.Path]::GetFullPath($PSCommandPath)
-                $checkpointBridgeInstaller = [System.IO.Path]::GetFullPath($ChromeBridgeInstallerPath)
-                $checkpointDaemonRun = Join-Path $DbPath 'daemon-run-current.json'
-                $checkpointPath = [System.IO.Path]::GetFullPath($script:SynapseChromeBridgePendingPath)
-                $checkpointResumeCommand = "pwsh -NoProfile -File $(Quote-PowerShellSingleQuotedString -Value $checkpointSetupScript) -ResumeChromeBridgePending -ChromeBridgePendingPath $(Quote-PowerShellSingleQuotedString -Value $checkpointPath) -MaintenanceLockPath $(Quote-PowerShellSingleQuotedString -Value ([System.IO.Path]::GetFullPath($MaintenanceLockPath)))"
-                $pendingReadback = [ordered]@{
-                    schema = 'synapse_setup_bridge_pending/v3'
-                    state = 'pending'
-                    phase = 'chrome_bridge_activation'
-                    checkpoint_generation_id = $script:SynapseSetupInvocationId
-                    daemon_handoff = 'committed'
-                    daemon_pid = $checkpointDaemonPid
-                    bind = $Bind
-                    db_path = $DbPath
-                    installed_binary_path = $ExePath
-                    installed_binary_sha256 = (Get-SynapseFileSha256 -Path $ExePath)
-                    daemon_process_executable_path = $checkpointDaemonProcess.ExecutablePath
-                    daemon_process_command_line = $checkpointDaemonProcess.CommandLine
-                    daemon_process_creation_date = $checkpointDaemonProcess.CreationDate
-                    daemon_run_current_path = $checkpointDaemonRun
-                    daemon_run_current_sha256 = (Get-SynapseFileSha256 -Path $checkpointDaemonRun)
-                    token_path = $TokenPath
-                    token_sha256 = (Get-SynapseFileSha256 -Path $TokenPath)
-                    setup_script_path = $checkpointSetupScript
-                    setup_script_sha256 = (Get-SynapseFileSha256 -Path $checkpointSetupScript)
-                    chrome_bridge_installer_path = $checkpointBridgeInstaller
-                    chrome_bridge_installer_sha256 = (Get-SynapseFileSha256 -Path $checkpointBridgeInstaller)
-                    chrome_native_host_exe_path = $ChromeNativeHostExePath
-                    task_name = $TaskName
-                    task_state = $checkpointTask.State
-                    task_definition_sha256 = $checkpointTask.DefinitionSha256
-                    task_action_execute = $checkpointTask.ActionExecute
-                    task_action_arguments = $checkpointTask.ActionArguments
-                    task_action_working_directory = $checkpointTask.ActionWorkingDirectory
-                    maintenance_lock_path = [System.IO.Path]::GetFullPath($MaintenanceLockPath)
-                    chrome_bridge_status = $status
-                    chrome_bridge_detail = $detail
-                    chrome_process_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue).Count
-                    chrome_visible_window_count = @(Get-Process -Name chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 }).Count
-                    resume_attempt_count = 0
-                    resume_command = $checkpointResumeCommand
-                    repair = 'open the existing authenticated Chrome profile, then run resume_command; the phase-specific resume validates every recorded identity and performs only Chrome bridge activation'
-                }
-                Die-SynapseChromeBridgePending `
-                    -Message "SYNAPSE_SETUP_BRIDGE_PENDING daemon_handoff=committed daemon_pid=$($currentHealth.pid) bind=$Bind installed_sha256=$($pendingReadback.installed_binary_sha256) cause=[$uiRepairError] resume_command=[$($pendingReadback.resume_command)]" `
-                    -Readback $pendingReadback
-            }
-            throw
-        }
-        $repairReason = [string]$uiRepairReadback.synapse_chrome_auto_install.reason
-        $uiDeadlineMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + [int64]45000
-        $uiAttempt = 0
-        $lastUiHealthError = $null
-        do {
-            $uiAttempt += 1
-            Start-Sleep -Seconds 2
-            $waitRemainingMs = [Math]::Max(0, [int64]$uiDeadlineMs - [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())
-            $healthTimeoutSec = [Math]::Min(10, [Math]::Max(4, [int][Math]::Ceiling($waitRemainingMs / 1000)))
-            $healthRead = Read-SynapseHealthForRestartGuard -Bind $Bind -Token $Token -TimeoutSec $healthTimeoutSec
-            if (-not $healthRead.Ok) {
-                $lastUiHealthError = $healthRead.Error
-                Info "WARN: Chrome bridge UI repair health read failed attempt=$uiAttempt timeout_s=$($healthRead.TimeoutSec) wait_remaining_ms=$waitRemainingMs error=$lastUiHealthError"
-                continue
-            }
-            $currentHealth = $healthRead.Health
-            $chromeBridge = $currentHealth.subsystems.chrome_bridge
-            $status = [string]$chromeBridge.status
-            $detail = [string]$chromeBridge.detail
-            $isClean = $status -eq 'ok' -and $detail -match 'extension_stale=false' -and $detail -match 'pageScreenshot'
-            if ($isClean) {
-                Info "Chrome bridge OK after existing-Chrome UI repair: reason=$repairReason stale=false capability=pageScreenshot"
-                return $currentHealth
-            }
-            Info ("Chrome bridge still not clean after UI repair; waiting for registration attempt={0} repair_reason={1} status={2} wait_remaining_ms={3} detail={4}" -f `
-                $uiAttempt,
-                $repairReason,
-                $status,
-                $waitRemainingMs,
-                $detail)
-        } while ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -lt $uiDeadlineMs)
-
-        $repairAutoInstall = $uiRepairReadback.synapse_chrome_auto_install | ConvertTo-Json -Depth 12 -Compress
-        Die "SYNAPSE_CHROME_BRIDGE_HOST_ABSENT_AFTER_UI_REPAIR status=$status detail=$detail last_health_error=$(if ([string]::IsNullOrWhiteSpace($lastUiHealthError)) { '<none>' } else { $lastUiHealthError }) ui_repair=$repairAutoInstall remediation=setup invoked the already-open Chrome extension UI reload/install path and still did not observe an active bridge host in /health; inspect the Chrome extension details UI, service-worker console, and daemon chrome_bridge health before accepting setup"
+        Die "SYNAPSE_CHROME_BACKGROUND_RELOAD_HOST_UNAVAILABLE status=$status detail=$detail waited_ms=$([Math]::Max(0, [int64][DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$nowMs)) last_health_error=$(if ([string]::IsNullOrWhiteSpace($lastWaitHealthError)) { '<none>' } else { $lastWaitHealthError }) remediation=the installed alarmReconnect lifecycle did not restore an authenticated bridge host; setup failed before activating, navigating, restoring, minimizing, unminimizing, clicking, typing into, or otherwise altering any human Chrome window. Restore the installed bridge through a natural Chrome restart or an explicit operator-authorized install, then rerun setup"
     }
 
     Info "WARN: Chrome bridge not clean after daemon start; requesting in-place browser_debugger.reload_bridge through the new live MCP daemon. status=$status detail=$detail"
@@ -7625,10 +7448,10 @@ function Assert-SynapseChromeBridgeLiveAfterSetup {
     $afterBridge = $afterHealth.subsystems.chrome_bridge
     $afterStatus = [string]$afterBridge.status
     $afterDetail = [string]$afterBridge.detail
-    if ($afterStatus -ne 'ok' -or $afterDetail -notmatch 'extension_stale=false' -or $afterDetail -notmatch 'pageScreenshot') {
+    if ($afterStatus -ne 'ok' -or $afterDetail -notmatch 'extension_stale=false' -or $afterDetail -notmatch 'reloadSelf') {
         Die "SYNAPSE_CHROME_BRIDGE_STALE_AFTER_SETUP_RELOAD status=$afterStatus detail=$afterDetail remediation=setup requires the already-open Chrome profile to load the bundled bridge build; run scripts\\install-synapse-chrome-debugger.ps1 from the interactive desktop and keep normal bridge commands failed closed until health is clean"
     }
-    Info "Chrome bridge OK after setup reload: stale=false capability=pageScreenshot"
+    Info "Chrome bridge OK after setup reload: stale=false capability=reloadSelf"
     return $afterHealth
 }
 
@@ -10407,6 +10230,7 @@ function Read-SynapseChromeBridgeCheckpoint {
         'setup_script_sha256',
         'chrome_bridge_installer_path',
         'chrome_bridge_installer_sha256',
+        'chrome_native_host_exe_path',
         'task_name',
         'task_definition_sha256',
         'task_action_execute',
@@ -16140,12 +15964,65 @@ if (-not $ok) {
 
     Die $failureDetail
 }
-$h = Assert-SynapseChromeBridgeLiveAfterSetup `
-    -Bind $Bind `
-    -Token $token `
-    -Health $h `
-    -ChromeBridgeInstallerPath $chromeBridgeInstaller `
-    -ChromeNativeHostExePath $ChromeNativeHostExePath
+try {
+    $h = Assert-SynapseChromeBridgeLiveAfterSetup `
+        -Bind $Bind `
+        -Token $token `
+        -Health $h `
+        -ChromeBridgeInstallerPath $chromeBridgeInstaller `
+        -ChromeNativeHostExePath $ChromeNativeHostExePath
+} catch {
+    # A committed daemon handoff and a pending Chrome activation are two
+    # different transactions.  In particular, a legacy worker that predates
+    # reloadSelf cannot consume freshly deployed bytes without either a natural
+    # Chrome lifecycle transition or foreground UI.  Rolling the healthy daemon
+    # back does not repair that browser state, while trying UI violates the
+    # background-only contract.  Persist the exact committed identities and
+    # fail loudly so -ResumeChromeBridgePending can finish only this phase after
+    # Chrome has naturally loaded the debugger-free worker.
+    $bridgeActivationError = $_.Exception.Message
+    $pendingDaemonPid = [int]$h.pid
+    $pendingDaemonProcess = Get-SynapseDaemonProcessIdentity -ProcessId $pendingDaemonPid
+    $pendingTask = Get-SynapseScheduledTaskIdentity -Name $TaskName
+    $pendingDaemonRunPath = Join-Path $DbPath 'daemon-run-current.json'
+    if (-not (Test-Path -LiteralPath $pendingDaemonRunPath -PathType Leaf)) {
+        Die "SYNAPSE_SETUP_BRIDGE_PENDING_DAEMON_RUN_MISSING path=$pendingDaemonRunPath daemon_pid=$pendingDaemonPid bridge_error=$bridgeActivationError remediation=repair the daemon lifecycle ledger before setup can persist an identity-bound Chrome activation checkpoint"
+    }
+    $pendingReadback = [ordered]@{
+        state = 'pending'
+        checkpoint_generation_id = $script:SynapseSetupInvocationId
+        resume_attempt_count = 0
+        daemon_handoff = 'committed'
+        daemon_pid = $pendingDaemonPid
+        bind = $Bind
+        db_path = $DbPath
+        installed_binary_path = [System.IO.Path]::GetFullPath($ExePath)
+        installed_binary_sha256 = $installedHash
+        daemon_process_executable_path = $pendingDaemonProcess.ExecutablePath
+        daemon_process_command_line = $pendingDaemonProcess.CommandLine
+        daemon_process_creation_date = $pendingDaemonProcess.CreationDate
+        daemon_run_current_path = [System.IO.Path]::GetFullPath($pendingDaemonRunPath)
+        daemon_run_current_sha256 = Get-SynapseFileSha256 -Path $pendingDaemonRunPath
+        token_path = [System.IO.Path]::GetFullPath($TokenPath)
+        token_sha256 = Get-SynapseFileSha256 -Path $TokenPath
+        setup_script_path = [System.IO.Path]::GetFullPath($PSCommandPath)
+        setup_script_sha256 = Get-SynapseFileSha256 -Path $PSCommandPath
+        chrome_bridge_installer_path = [System.IO.Path]::GetFullPath($chromeBridgeInstaller)
+        chrome_bridge_installer_sha256 = Get-SynapseFileSha256 -Path $chromeBridgeInstaller
+        chrome_native_host_exe_path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+        task_name = $TaskName
+        task_definition_sha256 = $pendingTask.DefinitionSha256
+        task_action_execute = $pendingTask.ActionExecute
+        task_action_arguments = $pendingTask.ActionArguments
+        maintenance_lock_path = [System.IO.Path]::GetFullPath($MaintenanceLockPath)
+        chrome_bridge_activation_error = $bridgeActivationError
+        chrome_bridge_health = $h.subsystems.chrome_bridge
+        remediation = 'leave the healthy daemon running and normal Chrome bridge commands failed closed; after Chrome naturally loads the deployed debugger-free worker, run scripts\synapse-setup.ps1 -ResumeChromeBridgePending to verify the exact checkpointed daemon/task/binary/token/DB identities and complete only Chrome activation'
+    }
+    Die-SynapseChromeBridgePending `
+        -Message "SYNAPSE_CHROME_BRIDGE_ACTIVATION_PENDING daemon_pid=$pendingDaemonPid bind=$Bind checkpoint=$($script:SynapseChromeBridgePendingPath) bridge_error=$bridgeActivationError remediation=do not activate, restore, navigate, click, type into, or restart a human Chrome window; wait for a natural Chrome lifecycle transition, then run -ResumeChromeBridgePending" `
+        -Readback $pendingReadback
+}
 $healthPid = [int]$h.pid
 $daemonLineage = Get-ProcessLineage -StartPid $healthPid
 $cmdAncestor = $daemonLineage | Where-Object { $_.Name -ieq 'cmd.exe' } | Select-Object -First 1

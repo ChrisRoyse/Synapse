@@ -1,6 +1,6 @@
-//! File upload MCP tool (#1101-#1105) backed by the normal Chrome bridge.
+//! File upload MCP tool (#1101-#1105) backed by dedicated-profile raw CDP.
 //!
-//! The bridge path uses `DOM.setFileInputFiles` for direct input assignment and
+//! The raw-CDP path uses `DOM.setFileInputFiles` for direct input assignment and
 //! `Page.setInterceptFileChooserDialog`/`Page.fileChooserOpened` for chooser
 //! interception. It never opens an OS file picker and never activates Chrome.
 
@@ -8,10 +8,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     ErrorData, Json, Parameters, SynapseService,
-    m1_tools::{
-        browser_raw_cdp_required_error, cdp_target_id_audit_ref, chrome_debugger_default_endpoint,
-        chrome_debugger_endpoint, require_target_session_id, validate_cdp_target_id,
-    },
+    m1_tools::{cdp_target_id_audit_ref, require_target_session_id, validate_cdp_target_id},
     tool, tool_router,
 };
 use crate::m1::mcp_error;
@@ -21,7 +18,6 @@ use serde_json::json;
 use synapse_core::error_codes;
 
 const TOOL: &str = "browser_file_upload";
-const CHROME_TAB_PREFIX: &str = "chrome-tab:";
 const DEFAULT_CHOOSER_READ_LIMIT: usize = 20;
 const MAX_CHOOSER_READ_LIMIT: usize = 100;
 const MAX_FILE_UPLOAD_PATHS: usize = 256;
@@ -57,15 +53,14 @@ pub struct BrowserFileUploadParams {
     /// Strict CSS selector for direct `set_files`/`clear`.
     #[serde(default)]
     pub selector: Option<String>,
-    /// Synapse bridge element id for direct `set_files`/`clear`.
+    /// Raw-CDP element id for direct `set_files`/`clear`.
     #[serde(default)]
     pub element_id: Option<String>,
     /// Target the tab's current `document.activeElement` for direct
     /// `set_files`/`clear`.
     #[serde(default)]
     pub active_element: bool,
-    /// CDP TargetID to mutate. Defaults to the active session CDP target. Must
-    /// be a normal Chrome bridge target (`chrome-tab:<tabId>`).
+    /// Raw CDP TargetID to mutate. Defaults to the active session CDP target.
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     /// Browser HWND owning the target. Required only with an explicit target and
@@ -186,7 +181,7 @@ struct NormalizedBrowserFileUploadParams {
 #[tool_router(router = browser_files_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Set or clear input[type=file] files and intercept file chooser openings in the calling session's owned normal Chrome bridge tab. Direct operations use DOM.setFileInputFiles by selector, bridge element_id, or active_element; chooser operations arm Page.setInterceptFileChooserDialog so clicking an input records Page.fileChooserOpened without opening the OS picker, then set_chooser assigns files to the pending backend node. Paths are validated locally before Chrome is called. Background-safe: never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Set or clear input[type=file] files and intercept file chooser openings in the calling session's owned raw-CDP tab on Synapse's dedicated non-default automation profile. Direct operations use DOM.setFileInputFiles by strict selector, raw-CDP element_id, or active_element; chooser operations arm Page.setInterceptFileChooserDialog so clicking an input records Page.fileChooserOpened without opening the OS picker, then set_chooser assigns files to the pending backend node. Paths are validated locally before Chrome is called. The debugger-free normal authenticated Chrome bridge fails closed before any Chrome command. Background-safe: never activates Chrome, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_file_upload(
         &self,
@@ -255,74 +250,153 @@ impl SynapseService {
         cdp_target_id: &str,
         upload: &NormalizedBrowserFileUploadParams,
     ) -> Result<BrowserFileUploadResponse, ErrorData> {
-        if synapse_a11y::endpoint_for_window(window_hwnd).is_some() {
-            return Err(browser_raw_cdp_required_error(TOOL, window_hwnd));
-        }
-        if !cdp_target_id.starts_with(CHROME_TAB_PREFIX) {
+        if cdp_target_id.starts_with("chrome-tab:") {
             return Err(mcp_error(
-                error_codes::ACTION_TARGET_INVALID,
+                error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
                 format!(
-                    "{TOOL} requires a normal Chrome bridge tab target ({CHROME_TAB_PREFIX}<id>); got {cdp_target_id:?}"
+                    "{TOOL} refused normal authenticated Chrome target {cdp_target_id:?} before queueing any Chrome command; the normal profile permanently forbids debugger permission. Launch a session-owned raw-CDP browser on Synapse's dedicated non-default automation profile"
                 ),
             ));
         }
-        let operation = browser_file_upload_operation_name(upload.operation);
-        if upload.operation != BrowserFileUploadOperation::ReadChooser {
-            super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_file_upload_before_bridge_mutation",
-            )?;
-        }
-        let result = crate::chrome_debugger_bridge::file_upload(
-            crate::chrome_debugger_bridge::ChromeDebuggerFileUploadRequest {
-                hwnd: window_hwnd,
-                target_id: cdp_target_id,
-                operation,
-                files: &upload.files,
-                selector: upload.selector.as_deref(),
-                element_id: upload.element_id.as_deref(),
-                active_element: upload.active_element,
-                since_seq: upload.since_seq,
-                limit: upload.limit,
-            },
-        )
-        .await
-        .map_err(|error| {
+        let endpoint = synapse_a11y::endpoint_for_window(window_hwnd).ok_or_else(|| {
             mcp_error(
-                error.code(),
+                error_codes::A11Y_CDP_UNREACHABLE,
                 format!(
-                    "{TOOL} normal Chrome bridge DOM.setFileInputFiles/Page.fileChooserOpened failed for target {cdp_target_id:?}: {}",
-                    error.detail()
+                    "{TOOL} requires a reachable raw-CDP endpoint for window {window_hwnd:#x}; launch the browser with act_launch"
                 ),
             )
         })?;
         if upload.operation != BrowserFileUploadOperation::ReadChooser {
             super::operator_panic_boundary::ensure_mcp_mutation(
-                "browser_file_upload_after_bridge_mutation",
+                "browser_file_upload_before_raw_cdp_mutation",
             )?;
         }
-        let endpoint = result
-            .extension_id
-            .as_deref()
-            .map(chrome_debugger_endpoint)
-            .unwrap_or_else(chrome_debugger_default_endpoint);
+        let mut input = None;
+        let mut handled_chooser = None;
+        let mut canceled_chooser = None;
+        let status = match upload.operation {
+            BrowserFileUploadOperation::SetFiles | BrowserFileUploadOperation::Clear => {
+                let (backend_node_id, resolved_by, match_count) =
+                    resolve_raw_file_input(&endpoint, cdp_target_id, upload).await?;
+                let files = if upload.operation == BrowserFileUploadOperation::Clear {
+                    &[]
+                } else {
+                    upload.files.as_slice()
+                };
+                input = Some(
+                    synapse_a11y::cdp_set_file_input_files_target(
+                        &endpoint,
+                        cdp_target_id,
+                        backend_node_id,
+                        files,
+                        resolved_by,
+                        match_count,
+                    )
+                    .await
+                    .map_err(|error| {
+                        mcp_error(
+                            error.code(),
+                            format!("{TOOL} raw CDP DOM.setFileInputFiles failed: {error}"),
+                        )
+                    })?,
+                );
+                empty_raw_file_chooser_status(cdp_target_id)
+            }
+            BrowserFileUploadOperation::ArmChooser => synapse_a11y::cdp_file_chooser_ensure(
+                &endpoint,
+                cdp_target_id,
+                synapse_a11y::DEFAULT_FILE_CHOOSER_CAPACITY,
+            )
+            .await
+            .map_err(|error| {
+                mcp_error(error.code(), format!("{TOOL} arm chooser failed: {error}"))
+            })?,
+            BrowserFileUploadOperation::ReadChooser => synapse_a11y::cdp_file_chooser_read(
+                &endpoint,
+                cdp_target_id,
+                upload.since_seq,
+                upload.limit,
+            )
+            .map_err(|error| {
+                mcp_error(error.code(), format!("{TOOL} read chooser failed: {error}"))
+            })?,
+            BrowserFileUploadOperation::SetChooser => {
+                handled_chooser = Some(
+                    synapse_a11y::cdp_file_chooser_set_pending(
+                        &endpoint,
+                        cdp_target_id,
+                        &upload.files,
+                    )
+                    .await
+                    .map_err(|error| {
+                        mcp_error(error.code(), format!("{TOOL} set chooser failed: {error}"))
+                    })?,
+                );
+                synapse_a11y::cdp_file_chooser_read(
+                    &endpoint,
+                    cdp_target_id,
+                    upload.since_seq,
+                    upload.limit,
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{TOOL} post-set chooser read failed: {error}"),
+                    )
+                })?
+            }
+            BrowserFileUploadOperation::CancelChooser => {
+                canceled_chooser = Some(
+                    synapse_a11y::cdp_file_chooser_cancel_pending(&endpoint, cdp_target_id)
+                        .await
+                        .map_err(|error| {
+                            mcp_error(
+                                error.code(),
+                                format!("{TOOL} cancel chooser failed: {error}"),
+                            )
+                        })?,
+                );
+                synapse_a11y::cdp_file_chooser_read(
+                    &endpoint,
+                    cdp_target_id,
+                    upload.since_seq,
+                    upload.limit,
+                )
+                .map_err(|error| {
+                    mcp_error(
+                        error.code(),
+                        format!("{TOOL} post-cancel chooser read failed: {error}"),
+                    )
+                })?
+            }
+        };
+        if upload.operation != BrowserFileUploadOperation::ReadChooser {
+            super::operator_panic_boundary::ensure_mcp_mutation(
+                "browser_file_upload_after_raw_cdp_mutation",
+            )?;
+        }
         tracing::info!(
-            code = "CHROME_BRIDGE_FILE_UPLOAD_READBACK",
+            code = "RAW_CDP_FILE_UPLOAD_READBACK",
             session_id = %session_id,
             hwnd = window_hwnd,
             endpoint = %endpoint,
-            cdp_target_id = %result.target_id,
-            operation = %result.operation,
-            requested_file_count = result.requested_file_count,
-            opened_count = result.opened_count,
-            handled_count = result.handled_count,
-            "readback=chrome.debugger.DOM.setFileInputFiles+Page.fileChooserOpened outcome=file_upload_status"
+            cdp_target_id,
+            operation = %browser_file_upload_operation_name(upload.operation),
+            requested_file_count = upload.files.len(),
+            opened_count = status.opened_count,
+            handled_count = status.handled_count,
+            "readback=raw CDP DOM.setFileInputFiles+Page.fileChooserOpened outcome=file_upload_status"
         );
-        Ok(browser_file_upload_bridge_response(
+        Ok(raw_file_upload_response(
             session_id,
             window_hwnd,
             endpoint,
             upload.operation,
-            result,
+            upload.files.len(),
+            input,
+            handled_chooser,
+            canceled_chooser,
+            status,
         ))
     }
 
@@ -338,6 +412,213 @@ impl SynapseService {
             error_codes::A11Y_NOT_AVAILABLE,
             "browser_file_upload is only available on Windows in this build",
         ))
+    }
+}
+
+#[cfg(windows)]
+async fn resolve_raw_file_input<'a>(
+    endpoint: &str,
+    cdp_target_id: &str,
+    upload: &'a NormalizedBrowserFileUploadParams,
+) -> Result<(i64, &'a str, u32), ErrorData> {
+    if let Some(selector) = upload.selector.as_deref() {
+        let located = synapse_a11y::cdp_locate(
+            endpoint,
+            cdp_target_id,
+            synapse_a11y::CdpLocateRequest {
+                engine: synapse_a11y::CdpLocateEngine::Css,
+                query: selector.to_owned(),
+                strict: true,
+                limit: 2,
+                ..synapse_a11y::CdpLocateRequest::default()
+            },
+        )
+        .await
+        .map_err(|error| {
+            mcp_error(
+                error.code(),
+                format!("{TOOL} selector resolution failed: {error}"),
+            )
+        })?;
+        let backend = located.backend_node_ids.first().copied().ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("{TOOL} selector {selector:?} matched no elements"),
+            )
+        })?;
+        let count = u32::try_from(located.match_count).map_err(|_| {
+            mcp_error(
+                error_codes::ACTION_POSTCONDITION_FAILED,
+                format!("{TOOL} selector match count exceeded u32"),
+            )
+        })?;
+        return Ok((backend, "selector", count));
+    }
+    if let Some(element_id) = upload.element_id.as_deref() {
+        let parsed = synapse_core::ElementId::parse(element_id).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{TOOL} element_id {element_id:?} is invalid: {error}"),
+            )
+        })?;
+        let backend = synapse_a11y::cdp_backend_from_element_id(&parsed).ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("{TOOL} element_id {element_id:?} is not a raw-CDP element"),
+            )
+        })?;
+        let target = synapse_a11y::cdp_target_from_element_id(&parsed).ok_or_else(|| {
+            mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!("{TOOL} element_id {element_id:?} has no CDP target"),
+            )
+        })?;
+        if !target.eq_ignore_ascii_case(cdp_target_id) {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "{TOOL} element_id target {target:?} does not match requested target {cdp_target_id:?}"
+                ),
+            ));
+        }
+        return Ok((backend, "element_id", 1));
+    }
+    if upload.active_element {
+        let backend = synapse_a11y::cdp_active_element_backend_node(endpoint, cdp_target_id)
+            .await
+            .map_err(|error| {
+                mcp_error(
+                    error.code(),
+                    format!("{TOOL} active-element resolution failed: {error}"),
+                )
+            })?;
+        return Ok((backend, "active_element", 1));
+    }
+    Err(mcp_error(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!("{TOOL} direct operation has no locator"),
+    ))
+}
+
+#[cfg(windows)]
+fn empty_raw_file_chooser_status(target_id: &str) -> synapse_a11y::CdpFileChooserStatus {
+    synapse_a11y::CdpFileChooserStatus {
+        newly_armed: false,
+        target_id: target_id.to_owned(),
+        armed_at_unix_ms: 0,
+        pending_chooser: None,
+        entries: Vec::new(),
+        next_cursor: 0,
+        returned: 0,
+        total_buffered: 0,
+        dropped: 0,
+        opened_count: 0,
+        handled_count: 0,
+        canceled_count: 0,
+        error_count: 0,
+    }
+}
+
+#[cfg(windows)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "maps the independently-produced raw-CDP mutation and chooser readbacks into the public response"
+)]
+fn raw_file_upload_response(
+    session_id: &str,
+    window_hwnd: i64,
+    endpoint: String,
+    operation: BrowserFileUploadOperation,
+    requested_file_count: usize,
+    input: Option<synapse_a11y::CdpFileInputState>,
+    handled_chooser: Option<synapse_a11y::CdpFileChooserRecord>,
+    canceled_chooser: Option<synapse_a11y::CdpFileChooserRecord>,
+    status: synapse_a11y::CdpFileChooserStatus,
+) -> BrowserFileUploadResponse {
+    BrowserFileUploadResponse {
+        session_id: session_id.to_owned(),
+        window_hwnd,
+        transport: "raw_cdp".to_owned(),
+        endpoint,
+        cdp_target_id: status.target_id,
+        operation,
+        capture_newly_armed: status.newly_armed,
+        requested_file_count,
+        input: input.map(file_upload_input_from_raw),
+        handled_chooser: handled_chooser.map(file_chooser_entry_from_raw),
+        canceled_chooser: canceled_chooser.map(file_chooser_entry_from_raw),
+        pending_chooser: status.pending_chooser.map(file_chooser_entry_from_raw),
+        entries: status
+            .entries
+            .into_iter()
+            .map(file_chooser_entry_from_raw)
+            .collect(),
+        next_cursor: status.next_cursor,
+        returned: status.returned,
+        total_buffered: status.total_buffered,
+        dropped: status.dropped,
+        opened_count: status.opened_count,
+        handled_count: status.handled_count,
+        canceled_count: status.canceled_count,
+        error_count: status.error_count,
+        readback_backend:
+            "raw CDP DOM.setFileInputFiles + Runtime.callFunctionOn HTMLInputElement.files"
+                .to_owned(),
+        chooser_readback_backend:
+            "raw CDP Page.setInterceptFileChooserDialog + Page.fileChooserOpened".to_owned(),
+        backend_tier_used: "cdp".to_owned(),
+        required_foreground: false,
+    }
+}
+
+#[cfg(windows)]
+fn file_upload_input_from_raw(input: synapse_a11y::CdpFileInputState) -> BrowserFileUploadInput {
+    BrowserFileUploadInput {
+        resolved_by: input.resolved_by,
+        match_count: input.match_count,
+        frame_id: None,
+        element_path: None,
+        backend_node_id: Some(input.backend_node_id),
+        tag_name: input.tag_name,
+        type_attr: input.type_attr,
+        id: input.id,
+        name_attr: input.name_attr,
+        accept: input.accept,
+        multiple: input.multiple,
+        webkitdirectory: input.webkitdirectory,
+        disabled: input.disabled,
+        file_count: input.file_count,
+        files: input
+            .files
+            .into_iter()
+            .map(|file| BrowserFileUploadFile {
+                name: file.name,
+                size: file.size,
+                file_type: file.file_type,
+                last_modified: file.last_modified,
+            })
+            .collect(),
+        value: input.value,
+    }
+}
+
+#[cfg(windows)]
+fn file_chooser_entry_from_raw(
+    entry: synapse_a11y::CdpFileChooserRecord,
+) -> BrowserFileChooserEntry {
+    BrowserFileChooserEntry {
+        seq: entry.seq,
+        frame_id: entry.frame_id,
+        mode: entry.mode,
+        backend_node_id: entry.backend_node_id,
+        opened_at_unix_ms: entry.opened_at_unix_ms,
+        pending: entry.pending,
+        handled_at_unix_ms: entry.handled_at_unix_ms,
+        canceled_at_unix_ms: entry.canceled_at_unix_ms,
+        requested_file_count: entry.requested_file_count,
+        file_names: entry.file_names,
+        input: entry.input.map(file_upload_input_from_raw),
+        error: entry.error,
     }
 }
 
@@ -520,123 +801,5 @@ fn browser_file_upload_operation_name(operation: BrowserFileUploadOperation) -> 
         BrowserFileUploadOperation::ReadChooser => "read_chooser",
         BrowserFileUploadOperation::SetChooser => "set_chooser",
         BrowserFileUploadOperation::CancelChooser => "cancel_chooser",
-    }
-}
-
-fn browser_file_upload_operation_from_wire(
-    value: &str,
-    fallback: BrowserFileUploadOperation,
-) -> BrowserFileUploadOperation {
-    match value {
-        "set_files" => BrowserFileUploadOperation::SetFiles,
-        "clear" => BrowserFileUploadOperation::Clear,
-        "arm_chooser" => BrowserFileUploadOperation::ArmChooser,
-        "read_chooser" => BrowserFileUploadOperation::ReadChooser,
-        "set_chooser" => BrowserFileUploadOperation::SetChooser,
-        "cancel_chooser" => BrowserFileUploadOperation::CancelChooser,
-        _ => fallback,
-    }
-}
-
-fn browser_file_upload_bridge_response(
-    session_id: &str,
-    window_hwnd: i64,
-    endpoint: String,
-    requested_operation: BrowserFileUploadOperation,
-    result: crate::chrome_debugger_bridge::ChromeDebuggerFileUploadResult,
-) -> BrowserFileUploadResponse {
-    BrowserFileUploadResponse {
-        session_id: session_id.to_owned(),
-        window_hwnd,
-        transport: "chrome_tabs_extension".to_owned(),
-        endpoint,
-        cdp_target_id: result.target_id,
-        operation: browser_file_upload_operation_from_wire(&result.operation, requested_operation),
-        capture_newly_armed: result.capture_newly_armed,
-        requested_file_count: result.requested_file_count,
-        input: result.input.map(file_upload_input_from_bridge),
-        handled_chooser: result.handled_chooser.map(file_chooser_entry_from_bridge),
-        canceled_chooser: result.canceled_chooser.map(file_chooser_entry_from_bridge),
-        pending_chooser: result.pending_chooser.map(file_chooser_entry_from_bridge),
-        entries: result
-            .entries
-            .into_iter()
-            .map(file_chooser_entry_from_bridge)
-            .collect(),
-        next_cursor: result.next_cursor,
-        returned: result.returned,
-        total_buffered: result.total_buffered,
-        dropped: result.dropped,
-        opened_count: result.opened_count,
-        handled_count: result.handled_count,
-        canceled_count: result.canceled_count,
-        error_count: result.error_count,
-        readback_backend: if result.readback_backend.trim().is_empty() {
-            "chrome.debugger.DOM.setFileInputFiles+Runtime.callFunctionOn".to_owned()
-        } else {
-            result.readback_backend
-        },
-        chooser_readback_backend: if result.chooser_readback_backend.trim().is_empty() {
-            "chrome.debugger.Page.setInterceptFileChooserDialog+Page.fileChooserOpened".to_owned()
-        } else {
-            result.chooser_readback_backend
-        },
-        backend_tier_used: if result.backend_tier_used.trim().is_empty() {
-            "chrome_tabs_extension".to_owned()
-        } else {
-            result.backend_tier_used
-        },
-        required_foreground: result.required_foreground,
-    }
-}
-
-fn file_upload_input_from_bridge(
-    input: crate::chrome_debugger_bridge::ChromeDebuggerFileUploadInput,
-) -> BrowserFileUploadInput {
-    BrowserFileUploadInput {
-        resolved_by: input.resolved_by,
-        match_count: input.match_count,
-        frame_id: input.frame_id,
-        element_path: input.element_path,
-        backend_node_id: input.backend_node_id,
-        tag_name: input.tag_name,
-        type_attr: input.type_attr,
-        id: input.id,
-        name_attr: input.name_attr,
-        accept: input.accept,
-        multiple: input.multiple,
-        webkitdirectory: input.webkitdirectory,
-        disabled: input.disabled,
-        file_count: input.file_count,
-        files: input
-            .files
-            .into_iter()
-            .map(|file| BrowserFileUploadFile {
-                name: file.name,
-                size: file.size,
-                file_type: file.r#type,
-                last_modified: file.last_modified,
-            })
-            .collect(),
-        value: input.value,
-    }
-}
-
-fn file_chooser_entry_from_bridge(
-    entry: crate::chrome_debugger_bridge::ChromeDebuggerFileChooserEntry,
-) -> BrowserFileChooserEntry {
-    BrowserFileChooserEntry {
-        seq: entry.seq,
-        frame_id: entry.frame_id,
-        mode: entry.mode,
-        backend_node_id: entry.backend_node_id,
-        opened_at_unix_ms: entry.opened_at_unix_ms,
-        pending: entry.pending,
-        handled_at_unix_ms: entry.handled_at_unix_ms,
-        canceled_at_unix_ms: entry.canceled_at_unix_ms,
-        requested_file_count: entry.requested_file_count,
-        file_names: entry.file_names,
-        input: entry.input.map(file_upload_input_from_bridge),
-        error: entry.error,
     }
 }

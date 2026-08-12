@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-storage-authority-divergence-v16";
-const BRIDGE_DECLARED_BUILD_SHA256 = "da47ac28073a1531b3a21154b2dd5e288a79d59e039dca6739428f06363e1c25";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-noninterference-v19";
+const BRIDGE_DECLARED_BUILD_SHA256 = "14a9a7dd28a5ad63015265fa0b161884cff3976dd48e003a143a64967629db9a";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -34,7 +34,6 @@ let captureVisibleTabQueue = Promise.resolve();
 let lastCaptureVisibleTabAtMs = 0;
 const COMMAND_CAPABILITIES = Object.freeze([
   "alarmReconnect",
-  "externalPopupRiskSuppression",
   "listTabs",
   "openTab",
   "closeTab",
@@ -49,8 +48,6 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "activateTab",
   "pageVitals",
   "pageContent",
-  "pageScreenshot",
-  "pagePdf",
   "setContent",
   "ariaSnapshot",
   "assertPoll",
@@ -58,7 +55,6 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "inspectElement",
   "scrollIntoView",
   "waitForText",
-  "waitForFunction",
   "waitForLoadState",
   "waitForUrl",
   "waitForRequest",
@@ -66,25 +62,9 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "waitForSelector",
   "clock",
   "pageEvents",
-  "evaluateScript",
-  "initScript",
-  "exposeBinding",
-  "handleDialog",
-  "fileUpload",
-  "operatorPanicDisable",
-  "operatorPanicCleanup",
-  "operatorPanicCloseTab",
-  "operatorPanicReadback",
-  "operatorPanicEnable",
-  "cdpInput",
   "keyDispatch",
-  "viewportEmulation",
-  "deviceEmulation",
-  "geolocationEmulation",
-  "localeEmulation",
-  "mediaEmulation",
-  "networkConditions",
   "maintenancePauseReconnect",
+  "reloadSelf",
   "domAction",
   "coordinateClick",
   "typeActiveElement",
@@ -214,8 +194,6 @@ const MAX_FILE_CHOOSER_EVENT_BUFFER = 1000;
 const MAX_FILE_UPLOAD_PATHS = 256;
 const MAX_FILE_UPLOAD_PATH_CHARS = 32768;
 const OPEN_WINDOW_BOUNDS_TOLERANCE_PX = 96;
-const EXTERNAL_POPUP_RISK_PERMISSIONS = Object.freeze(["debugger", "nativeMessaging"]);
-const POPUP_RISK_SUPPRESSION_RECHECK_MS = 60000;
 const VIEWPORT_BASELINE_BY_TAB = new Map();
 const DEVICE_BASELINE_BY_TAB = new Map();
 const GEOLOCATION_OVERRIDE_BY_TAB = new Map();
@@ -567,22 +545,6 @@ const pageEventBuffers = new Map();
 const networkEventBuffers = new Map();
 const downloadEventBuffer = [];
 let downloadEventSeq = 0;
-let popupRiskSuppressionInFlight = null;
-let popupRiskSuppressionState = {
-  ok: false,
-  status: "not_checked",
-  reason: "not_checked",
-  checked_at_unix_ms: 0,
-  hazard_count: 0,
-  remaining_hazard_count: 0,
-  disabled_count: 0,
-  failure_count: 0,
-  management_available: Boolean(chrome.management?.getAll),
-  hazards: [],
-  disabled: [],
-  remaining_hazards: [],
-  failures: []
-};
 let serviceWorkerIntegrityState = {
   status: "not_checked",
   source: chrome.runtime.getURL("service_worker.js"),
@@ -831,7 +793,6 @@ async function startBridge() {
   await DURABLE_OWNER_STATE_READY;
   await requireReconnectWakeAlarm("startup");
   await loadMaintenanceReconnectPause("startup");
-  await ensureExternalPopupRiskSuppression("startup");
   connectDaemon();
 }
 
@@ -922,16 +883,8 @@ function connectDaemon() {
     return;
   }
   clearReconnectTimer();
-  connectInFlight = ensureExternalPopupRiskSuppression("connectDaemon")
-    .then(() => registerDaemon())
+  connectInFlight = registerDaemon()
     .catch((error) => {
-      if (error?.code === ERROR_DEBUGGER_WARNING_UNSUPPRESSED) {
-        scheduleReconnect(
-          `direct daemon register refused unsafe profile: ${errorMessage(error)}`,
-          ERROR_DEBUGGER_WARNING_UNSUPPRESSED
-        );
-        return;
-      }
       scheduleReconnect(
         `direct daemon register failed: ${errorMessage(error)}`,
         ERROR_DAEMON_UNAVAILABLE
@@ -1158,255 +1111,6 @@ async function attemptMaintenanceReconnectResumeFromAlarm(pauseRemainingMs) {
     maintenanceReconnectResumeProbeInFlight = null;
   });
   return maintenanceReconnectResumeProbeInFlight;
-}
-
-async function ensureExternalPopupRiskSuppression(reason) {
-  const now = Date.now();
-  if (
-    popupRiskSuppressionState.status !== "not_checked" &&
-    now - popupRiskSuppressionState.checked_at_unix_ms < POPUP_RISK_SUPPRESSION_RECHECK_MS
-  ) {
-    return popupRiskSuppressionState;
-  }
-  if (popupRiskSuppressionInFlight) {
-    return popupRiskSuppressionInFlight;
-  }
-  popupRiskSuppressionInFlight = refreshExternalPopupRiskSuppression(reason)
-    .catch((error) => {
-      popupRiskSuppressionState = {
-        ok: false,
-        status: "suppression_error",
-        reason,
-        checked_at_unix_ms: Date.now(),
-        hazard_count: 0,
-        remaining_hazard_count: 0,
-        disabled_count: 0,
-        failure_count: 1,
-        management_available: Boolean(chrome.management?.getAll),
-        hazards: [],
-        disabled: [],
-        remaining_hazards: [],
-        failures: [{
-          id: "<suppression_scan>",
-          name: "suppression_scan",
-          error: errorMessage(error)
-        }]
-      };
-      return popupRiskSuppressionState;
-    })
-    .finally(() => {
-      popupRiskSuppressionInFlight = null;
-    });
-  return popupRiskSuppressionInFlight;
-}
-
-async function requireExternalPopupRisksSuppressed(commandKind, params) {
-  if (!commandRequiresExternalPopupSuppression(commandKind)) {
-    return;
-  }
-  const state = await ensureExternalPopupRiskSuppression(`command:${String(commandKind)}`);
-  if (state.ok && state.remaining_hazard_count === 0) {
-    return;
-  }
-  throw bridgeError(
-    ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-    `normal Synapse Chrome Bridge refused ${String(commandKind)} before queueing a Chrome ` +
-      `tabs/scripting command because external debugger/nativeMessaging popup risk remains ` +
-      `unsuppressed; hwnd=${String(params?.hwnd ?? "unknown")} ` +
-      formatPopupRiskSuppressionForError(state)
-  );
-}
-
-function commandRequiresExternalPopupSuppression(kind) {
-  return [
-    "openTab",
-    "listTabs",
-    "closeTab",
-    "targetInfo",
-    "targetInfoPageText",
-    "frames",
-    "typeActiveElement",
-    "setFieldValue",
-    "pageVitals",
-    "pageContent",
-    "setContent",
-    "ariaSnapshot",
-    "assertPoll",
-    "locateElements",
-    "inspectElement",
-    "scrollIntoView",
-    "waitForText",
-    "waitForFunction",
-    "waitForSelector",
-    "clock",
-    "pageEvents",
-    "evaluateScript",
-    "initScript",
-    "exposeBinding",
-    "handleDialog",
-    "cdpInput",
-    "keyDispatch",
-    "viewportEmulation",
-    "deviceEmulation",
-    "geolocationEmulation",
-    "localeEmulation",
-    "mediaEmulation",
-    "networkConditions",
-    "navigateTab",
-    "activateTab",
-    "domAction",
-    "coordinateClick"
-  ].includes(kind);
-}
-
-async function refreshExternalPopupRiskSuppression(reason) {
-  const checkedAt = Date.now();
-  const managementAvailable = Boolean(chrome.management?.getAll);
-  if (!managementAvailable) {
-    popupRiskSuppressionState = {
-      ok: false,
-      status: "management_unavailable",
-      reason,
-      checked_at_unix_ms: checkedAt,
-      hazard_count: 0,
-      remaining_hazard_count: 0,
-      disabled_count: 0,
-      failure_count: 1,
-      management_available: false,
-      hazards: [],
-      disabled: [],
-      remaining_hazards: [],
-      failures: [{
-        id: "<chrome.management>",
-        name: "chrome.management",
-        error: "management permission/API unavailable"
-      }]
-    };
-    return popupRiskSuppressionState;
-  }
-
-  const before = await chrome.management.getAll();
-  const hazards = enabledExternalPopupRiskExtensions(before);
-  const disabled = [];
-  const failures = [];
-
-  for (const hazard of hazards) {
-    if (hazard.may_disable === false) {
-      failures.push({
-        ...hazard,
-        error: "chrome.management reports mayDisable=false"
-      });
-      continue;
-    }
-    try {
-      await chrome.management.setEnabled(hazard.id, false);
-      disabled.push(hazard);
-    } catch (error) {
-      failures.push({
-        ...hazard,
-        error: errorMessage(error)
-      });
-    }
-  }
-
-  const after = disabled.length > 0 ? await chrome.management.getAll() : before;
-  const remaining = enabledExternalPopupRiskExtensions(after);
-  const remainingIds = new Set(remaining.map((entry) => entry.id));
-  for (const entry of disabled) {
-    if (remainingIds.has(entry.id)) {
-      failures.push({
-        ...entry,
-        error: "chrome.management.setEnabled returned but extension remained enabled"
-      });
-    }
-  }
-
-  const ok = remaining.length === 0 && failures.length === 0;
-  popupRiskSuppressionState = {
-    ok,
-    status: ok ? (hazards.length > 0 ? "suppressed" : "clear") : "unsuppressed",
-    reason,
-    checked_at_unix_ms: checkedAt,
-    hazard_count: hazards.length,
-    remaining_hazard_count: remaining.length,
-    disabled_count: disabled.length,
-    failure_count: failures.length,
-    management_available: true,
-    hazards,
-    disabled,
-    remaining_hazards: remaining,
-    failures
-  };
-  if (!ok) {
-    console.warn(
-      `Synapse external popup risk suppression incomplete: ` +
-        formatPopupRiskSuppressionForError(popupRiskSuppressionState)
-    );
-  } else if (disabled.length > 0) {
-    console.warn(
-      `Synapse disabled ${disabled.length} external debugger/nativeMessaging extension(s): ` +
-        disabled.map((entry) => `${entry.id}:${entry.name}`).join(" | ")
-    );
-  }
-  return popupRiskSuppressionState;
-}
-
-function enabledExternalPopupRiskExtensions(items) {
-  return (Array.isArray(items) ? items : [])
-    .filter((info) => info?.id && info.id !== chrome.runtime.id && info.enabled === true)
-    .map((info) => {
-      const permissions = Array.isArray(info.permissions) ? info.permissions : [];
-      const hazardPermissions = permissions
-        .filter((permission) => EXTERNAL_POPUP_RISK_PERMISSIONS.includes(permission))
-        .sort();
-      return {
-        id: String(info.id),
-        name: String(info.name || ""),
-        type: String(info.type || ""),
-        install_type: String(info.installType || ""),
-        may_disable: info.mayDisable !== false,
-        permissions: permissions.map(String).sort(),
-        hazard_permissions: [...new Set(hazardPermissions)],
-        enabled: info.enabled === true,
-        disabled_reason: info.disabledReason ? String(info.disabledReason) : ""
-      };
-    })
-    .filter((info) => info.hazard_permissions.length > 0)
-    .sort((a, b) => a.id.localeCompare(b.id));
-}
-
-function popupRiskSuppressionSnapshot() {
-  return JSON.parse(JSON.stringify(popupRiskSuppressionState));
-}
-
-function formatPopupRiskSuppressionForError(state) {
-  const remaining = Array.isArray(state?.remaining_hazards) ? state.remaining_hazards : [];
-  const failures = Array.isArray(state?.failures) ? state.failures : [];
-  const remainingText = remaining.length > 0
-    ? remaining
-        .slice(0, 8)
-        .map((entry) => `${entry.id}:${entry.name}:${entry.hazard_permissions.join(",")}`)
-        .join(" | ")
-    : "<none>";
-  const failureText = failures.length > 0
-    ? failures
-        .slice(0, 8)
-        .map((entry) => `${entry.id}:${entry.name}:${entry.error || "unknown"}`)
-        .join(" | ")
-    : "<none>";
-  return (
-    `suppression_status=${String(state?.status || "unknown")} ` +
-    `suppression_reason=${String(state?.reason || "unknown")} ` +
-    `management_available=${Boolean(state?.management_available)} ` +
-    `hazard_count=${Number(state?.hazard_count || 0)} ` +
-    `disabled_count=${Number(state?.disabled_count || 0)} ` +
-    `remaining_hazard_count=${Number(state?.remaining_hazard_count || 0)} ` +
-    `failure_count=${Number(state?.failure_count || 0)} ` +
-    `remaining_hazards=${remainingText} failures=${failureText} ` +
-    `remediation=disable the named extension IDs in Chrome or repair ` +
-    `HKCU\\Software\\Policies\\Google\\Chrome ACL so Synapse can apply ` +
-    `ExtensionSettings blocked_permissions for debugger/nativeMessaging`
-  );
 }
 
 function connectWebSocket() {
@@ -3717,6 +3421,11 @@ function isMutationCapableCommand(kind) {
     "operatorPanicReadback",
     "operatorPanicEnable",
     "maintenancePauseReconnect",
+    // Extension reload is a browser-owned lifecycle transition. It never
+    // activates a tab/window, emits synthetic input, or mutates a page/owner.
+    // The fresh worker still re-reads every durable admission gate before it
+    // registers, so reload cannot launder operator panic or storage divergence.
+    "reloadSelf",
     "listTabs"
   ].includes(String(kind || ""));
 }
@@ -3961,22 +3670,6 @@ function handleReconnectWakeAlarm(alarm) {
     });
 }
 
-function handleManagementStateChanged(info) {
-  if (!info || info.id === chrome.runtime.id) {
-    return;
-  }
-  popupRiskSuppressionState = {
-    ...popupRiskSuppressionState,
-    ok: false,
-    status: "stale",
-    reason: "chrome.management event",
-    checked_at_unix_ms: 0
-  };
-  ensureExternalPopupRiskSuppression("chrome.management event").catch((error) => {
-    console.warn(`Synapse popup risk suppression refresh failed: ${errorMessage(error)}`);
-  });
-}
-
 function closeWebSocket(options = {}) {
   stopWebSocketKeepAlive();
   const socket = webSocket;
@@ -4037,15 +3730,6 @@ if (chrome.alarms?.onAlarm?.addListener) {
 // idempotent (requireReconnectWakeAlarm + connectDaemon both guard against duplicates),
 // so a reloaded worker reconnects immediately instead of waiting for an event.
 startBridgeFromEvent();
-if (chrome.management?.onEnabled?.addListener) {
-  chrome.management.onEnabled.addListener(handleManagementStateChanged);
-}
-if (chrome.management?.onInstalled?.addListener) {
-  chrome.management.onInstalled.addListener(handleManagementStateChanged);
-}
-if (chrome.management?.onDisabled?.addListener) {
-  chrome.management.onDisabled.addListener(handleManagementStateChanged);
-}
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo?.status === "loading") {
     enqueueInitScriptEffectNavigationReconcile(tabId);
@@ -4082,33 +3766,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   NETWORK_BASELINE_BY_TAB.delete(tabId);
   enqueueClosedTabLedgerPrune(tabId);
 });
-if (chrome.debugger?.onDetach?.addListener) {
-  chrome.debugger.onDetach.addListener((source, reason) => {
-    if (Number.isInteger(source?.tabId)) {
-      // Detach resets every domain on the target; drop the ledger so a later attach
-      // re-enables from a known-clean state instead of trusting stale ownership.
-      forgetCdpDomainsForTab(source.tabId);
-      INIT_SCRIPT_DEBUGGER_SESSIONS.delete(source.tabId);
-      markBindingDebuggerDetached(source.tabId);
-      markDialogDebuggerDetached(source.tabId);
-      markFileChooserDebuggerDetached(source.tabId);
-      console.warn(`Synapse persistent debugger session detached for tab ${source.tabId}: ${String(reason || "unknown")}`);
-    }
-  });
-}
-if (chrome.debugger?.onEvent?.addListener) {
-  chrome.debugger.onEvent.addListener((source, method, params) => {
-    if (method === "Runtime.bindingCalled" && Number.isInteger(source?.tabId)) {
-      recordBindingCalledEvent(source.tabId, params || {});
-    } else if (method === "Page.javascriptDialogOpening" && Number.isInteger(source?.tabId)) {
-      recordDialogOpeningEvent(source.tabId, params || {});
-    } else if (method === "Page.javascriptDialogClosed" && Number.isInteger(source?.tabId)) {
-      recordDialogClosedEvent(source.tabId, params || {});
-    } else if (method === "Page.fileChooserOpened" && Number.isInteger(source?.tabId)) {
-      recordFileChooserOpenedEvent(source.tabId, params || {});
-    }
-  });
-}
 chrome.tabs.onActivated.addListener((activeInfo) => {
   chrome.tabs.get(activeInfo.tabId)
     .then((tab) => postTabNavigationEvent("tabs.onActivated", tab))
@@ -4245,10 +3902,6 @@ async function handleCommand(command) {
           `refusing ${String(kind)} ${operatorPanicGateErrorSummary()}`
       );
     }
-    if (!["operatorPanicDisable", "operatorPanicCleanup", "operatorPanicCloseTab", "operatorPanicReadback", "operatorPanicEnable"]
-      .includes(String(kind || ""))) {
-      await requireExternalPopupRisksSuppressed(kind, params);
-    }
     if (kind === "snapshot") {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "clickNode") {
@@ -4271,10 +3924,8 @@ async function handleCommand(command) {
       result = await handleFrames(params);
     } else if (kind === "pageContent") {
       result = await handlePageContent(params);
-    } else if (kind === "pageScreenshot") {
-      result = await handlePageScreenshot(params);
-    } else if (kind === "pagePdf") {
-      result = await handlePagePdf(params);
+    } else if (kind === "pageScreenshot" || kind === "pagePdf") {
+      result = rejectAttachCommand(kind, params);
     } else if (kind === "downloads") {
       result = await handleDownloads(params);
     } else if (kind === "cookies") {
@@ -4296,7 +3947,7 @@ async function handleCommand(command) {
     } else if (kind === "waitForText") {
       result = await handleWaitForText(params);
     } else if (kind === "waitForFunction") {
-      result = await handleWaitForFunction(params);
+      result = rejectAttachCommand(kind, params);
     } else if (kind === "waitForLoadState") {
       result = await handleWaitForLoadState(params);
     } else if (kind === "waitForUrl") {
@@ -4311,51 +3962,40 @@ async function handleCommand(command) {
       result = await handleClock(params);
     } else if (kind === "pageEvents") {
       result = await handlePageEvents(params);
-    } else if (kind === "cdpInput") {
-      result = await handleCdpInput(params);
-    } else if (kind === "viewportEmulation") {
-      result = await handleViewportEmulation(params);
-    } else if (kind === "deviceEmulation") {
-      result = await handleDeviceEmulation(params);
-    } else if (kind === "geolocationEmulation") {
-      result = await handleGeolocationEmulation(params);
-    } else if (kind === "localeEmulation") {
-      result = await handleLocaleEmulation(params);
-    } else if (kind === "mediaEmulation") {
-      result = await handleMediaEmulation(params);
-    } else if (kind === "networkConditions") {
-      result = await handleNetworkConditions(params);
+    } else if (
+      kind === "cdpInput" ||
+      kind === "viewportEmulation" ||
+      kind === "deviceEmulation" ||
+      kind === "geolocationEmulation" ||
+      kind === "localeEmulation" ||
+      kind === "mediaEmulation" ||
+      kind === "networkConditions"
+    ) {
+      result = rejectAttachCommand(kind, params);
     } else if (kind === "maintenancePauseReconnect") {
       result = await handleMaintenancePauseReconnect(params);
       if (result?.websocket_close?.close_deferred === true) {
         closeWebSocketAfterResponse = "synapse maintenance reconnect pause";
       }
+    } else if (kind === "reloadSelf") {
+      result = handleReloadSelf(params);
     } else if (kind === "typeActiveElement") {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
       result = await handleSetFieldValue(params);
-    } else if (kind === "evaluateScript") {
-      result = await handleEvaluateScript(params);
-    } else if (kind === "initScript") {
-      result = await handleInitScript(params);
-    } else if (kind === "exposeBinding") {
-      result = await handleExposeBinding(params);
-    } else if (kind === "handleDialog") {
-      result = await handleDialog(params);
-    } else if (kind === "fileUpload") {
-      result = await handleFileUpload(params);
-    } else if (kind === "operatorPanicDisable") {
-      result = await handleOperatorPanicDisable(
-        command.__operatorPanicDisableAdmission
-      );
-    } else if (kind === "operatorPanicCleanup") {
-      result = await handleOperatorPanicCleanup(params);
-    } else if (kind === "operatorPanicCloseTab") {
-      result = await handleOperatorPanicCloseTab(params);
-    } else if (kind === "operatorPanicReadback") {
-      result = operatorPanicOwnerReadback();
-    } else if (kind === "operatorPanicEnable") {
-      result = await handleOperatorPanicEnable(params);
+    } else if (
+      kind === "evaluateScript" ||
+      kind === "initScript" ||
+      kind === "exposeBinding" ||
+      kind === "handleDialog" ||
+      kind === "fileUpload" ||
+      kind === "operatorPanicDisable" ||
+      kind === "operatorPanicCleanup" ||
+      kind === "operatorPanicCloseTab" ||
+      kind === "operatorPanicReadback" ||
+      kind === "operatorPanicEnable"
+    ) {
+      result = rejectAttachCommand(kind, params);
     } else if (kind === "pageVitals") {
       result = await handlePageVitals(params);
     } else if (kind === "navigateTab") {
@@ -4537,7 +4177,6 @@ function bridgeIdentity() {
     debuggerApiAvailable: runtimeDebuggerApiAvailable(),
     capabilities: [...COMMAND_CAPABILITIES],
     commandCapabilities: [...COMMAND_CAPABILITIES],
-    popupRiskSuppression: popupRiskSuppressionSnapshot(),
     startupReadback: {
       worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
       lifecycle_events: DURABLE_OWNER_LIFECYCLE_EVENTS.map((event) => ({ ...event })),
@@ -4589,32 +4228,28 @@ function bridgeIdentity() {
 }
 
 function runtimeDebuggerApiAvailable() {
-  return Boolean(
-    chrome.debugger &&
-    (chrome.debugger.attach || chrome.debugger.sendCommand || chrome.debugger.getTargets)
-  );
+  return false;
 }
 
-function requireDebuggerApiAvailable(kind, params) {
-  if (runtimeDebuggerApiAvailable()) {
-    return;
-  }
+function normalProfileDebuggerForbidden(...request) {
+  const method = typeof request[1] === "string" ? request[1] : "chrome.debugger API";
   throw bridgeError(
     ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-    `Synapse Chrome Bridge refused ${String(kind)} because chrome.debugger is unavailable ` +
-      `in the loaded extension runtime; hwnd=${String(params?.hwnd ?? "unknown")} ` +
-      `remediation=run scripts\\install-synapse-chrome-debugger.ps1 and cdp_bridge_reload ` +
-      `so the active already-open Chrome profile loads the debugger-capable bridge build`
+    `Synapse refused ${method} before invoking Chrome: the normal authenticated profile ` +
+      `does not declare the debugger permission and no service-worker path may attach to it. ` +
+      `Use a session-owned raw-CDP target launched in Synapse's dedicated non-default ` +
+      `automation profile.`
   );
 }
 
 function rejectAttachCommand(kind, params) {
   throw bridgeError(
     ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
-    `Synapse Chrome Bridge refused unsupported legacy attach command ${String(kind)}; ` +
-      `target-scoped CDP input is exposed through cdpInput, while full DOM snapshots and ` +
-      `element-scoped DOM CDP work still requires the dedicated raw-CDP automation profile. ` +
-      `hwnd=${String(params?.hwnd ?? "unknown")}`
+    `Synapse Chrome Bridge refused debugger-backed command ${String(kind)} before queueing ` +
+      `any Chrome action; the normal authenticated profile is permanently debugger-free so ` +
+      `Chrome cannot show a layout-shifting debugger infobar. Use the same public operation ` +
+      `against a session-owned raw-CDP target launched with Synapse's dedicated non-default ` +
+      `automation profile. hwnd=${String(params?.hwnd ?? "unknown")}`
   );
 }
 
@@ -4842,7 +4477,7 @@ async function handleEvaluateScript(params) {
   } finally {
     if (attachment?.shouldDetach) {
       try {
-        await chrome.debugger.detach(attachment.debuggee);
+        await normalProfileDebuggerForbidden(attachment.debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for evaluateScript tab ${selected.tabId}: ${errorMessage(error)}`);
       }
@@ -4948,7 +4583,7 @@ async function handleInitScript(params) {
       INIT_SCRIPT_DEBUGGER_SESSIONS.delete(selected.tabId);
       if (addAttachment.newlyAttached && !bindingSessionHasActiveNames(selected.tabId)) {
         try {
-          await chrome.debugger.detach(addAttachment.debuggee);
+          await normalProfileDebuggerForbidden(addAttachment.debuggee);
         } catch (detachError) {
           console.warn(`Synapse chrome.debugger detach failed after initScript add error for tab ${selected.tabId}: ${errorMessage(detachError)}`);
         }
@@ -4973,7 +4608,7 @@ async function handleInitScript(params) {
     }
     if (temporaryRemoveAttachment?.shouldDetach) {
       try {
-        await chrome.debugger.detach(temporaryRemoveAttachment.debuggee);
+        await normalProfileDebuggerForbidden(temporaryRemoveAttachment.debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for initScript tab ${selected.tabId}: ${errorMessage(error)}`);
       }
@@ -6399,7 +6034,7 @@ async function handleWaitForFunction(params) {
   }
   if (attachment?.shouldDetach) {
     try {
-      await chrome.debugger.detach(attachment.debuggee);
+      await normalProfileDebuggerForbidden(attachment.debuggee);
       forgetCdpDomainsForTab(selected.tabId);
     } catch (error) {
       const priorCode = primaryError?.code ? String(primaryError.code) : "none";
@@ -7616,7 +7251,7 @@ async function captureEmulatedPageSurface(tabId, clip, request, emulatedDpr, pla
   } finally {
     if (attachment.shouldDetach) {
       try {
-        await chrome.debugger.detach(attachment.debuggee);
+        await normalProfileDebuggerForbidden(attachment.debuggee);
       } catch (error) {
         console.warn(`Synapse pageScreenshot emulated surface detach failed for tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -8789,7 +8424,7 @@ async function dispatchPagePdf(tabId, request) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     const result = await sendDebuggerCommand(debuggee, "Page.printToPDF", {
       landscape: request.landscape,
@@ -8819,7 +8454,7 @@ async function dispatchPagePdf(tabId, request) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for pagePdf tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -10638,7 +10273,7 @@ async function dispatchCdpTextInput(tabId, action, text) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     if (action === "set_text" && text.length === 0) {
       await sendDebuggerCommand(debuggee, "Input.dispatchKeyEvent", {
@@ -10676,7 +10311,7 @@ async function dispatchCdpTextInput(tabId, action, text) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for text input tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11596,7 +11231,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setUserAgentOverride", {
       userAgent: descriptor.user_agent
@@ -11629,7 +11264,7 @@ async function dispatchDeviceEmulationSet(tabId, descriptor) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for deviceEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11642,7 +11277,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.clearDeviceMetricsOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
@@ -11679,7 +11314,7 @@ async function dispatchDeviceEmulationReset(tabId, restoredUserAgent) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for deviceEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11693,7 +11328,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
   let attached = false;
   let permissionMethod = `Browser.setPermission(${permissionSetting})`;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     try {
       await sendDebuggerCommand(debuggee, "Browser.setPermission", {
@@ -11734,7 +11369,7 @@ async function dispatchGeolocationEmulationSet(tabId, origin, requested, permiss
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11748,7 +11383,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
   let attached = false;
   let permissionMethod = "Browser.setPermission(prompt)";
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.clearGeolocationOverride", {});
     try {
@@ -11772,7 +11407,7 @@ async function dispatchGeolocationEmulationReset(tabId, origin) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for geolocationEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11786,7 +11421,7 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
   let attached = false;
   const methods = [];
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     if (requested.locale) {
       await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {
@@ -11812,7 +11447,7 @@ async function dispatchLocaleEmulationSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for localeEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11825,7 +11460,7 @@ async function dispatchLocaleEmulationReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setLocaleOverride", {});
     await sendDebuggerCommand(debuggee, "Emulation.setTimezoneOverride", {
@@ -11843,7 +11478,7 @@ async function dispatchLocaleEmulationReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for localeEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11856,7 +11491,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     const features = [];
     if (requested.color_scheme) {
@@ -11881,7 +11516,7 @@ async function dispatchMediaEmulationSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for mediaEmulation set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11894,7 +11529,7 @@ async function dispatchMediaEmulationReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setEmulatedMedia", {
       media: "",
@@ -11912,7 +11547,7 @@ async function dispatchMediaEmulationReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for mediaEmulation reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11925,7 +11560,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     const params = {
@@ -11950,7 +11585,7 @@ async function dispatchNetworkConditionsSet(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for networkConditions set tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -11963,7 +11598,7 @@ async function dispatchNetworkConditionsReset(tabId) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Network.enable", {});
     await sendDebuggerCommand(debuggee, "Network.emulateNetworkConditions", {
@@ -11984,7 +11619,7 @@ async function dispatchNetworkConditionsReset(tabId) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for networkConditions reset tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -12019,7 +11654,7 @@ async function dispatchViewportBaselineRestore(tabId, requested) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", {
       width: requested.width,
@@ -12041,7 +11676,7 @@ async function dispatchViewportBaselineRestore(tabId, requested) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for viewportEmulation baseline restore tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -12054,7 +11689,7 @@ async function dispatchViewportEmulation(tabId, operation, params) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     if (operation === "set") {
       await sendDebuggerCommand(debuggee, "Emulation.setDeviceMetricsOverride", params);
@@ -12077,7 +11712,7 @@ async function dispatchViewportEmulation(tabId, operation, params) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for viewportEmulation tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14638,7 +14273,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
   let attached = false;
   let touchEmulationEnabled = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     if (action === "hover") {
       await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
@@ -14728,7 +14363,7 @@ async function dispatchCdpInput(tabId, action, point, options = {}) {
         }
       }
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14743,7 +14378,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   const dispatched = [];
   const delayMs = steps > 0 && durationMs > 0 ? Math.max(0, Math.floor(durationMs / steps)) : 0;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     await sendDebuggerCommand(debuggee, "Input.dispatchMouseEvent", {
       type: "mouseMoved",
@@ -14803,7 +14438,7 @@ async function dispatchCdpInputMouseDrag(tabId, sourcePoint, targetPoint, steps,
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for drag tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14830,7 +14465,7 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
   const protocolVersion = "1.3";
   let attached = false;
   try {
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     attached = true;
     const dispatched = [];
     for (const type of ["dragEnter", "dragOver", "drop"]) {
@@ -14857,7 +14492,7 @@ async function dispatchRealHtml5Drop(tabId, targetPoint, params) {
   } finally {
     if (attached) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for html5_real_drag tab ${tabId}: ${errorMessage(error)}`);
       }
@@ -14956,10 +14591,10 @@ async function activateTabForCdpTouch(tabId, beforeState, action = "tap") {
 }
 
 async function sendDebuggerCommand(debuggee, method, params, timeoutMs = DEBUGGER_COMMAND_TIMEOUT_MS) {
-  assertPhysicalMutationAdmission(`chrome.debugger.sendCommand:${String(method)}`);
+  assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:${String(method)}`);
   try {
     return await promiseWithTimeout(
-      chrome.debugger.sendCommand(debuggee, method, params),
+      normalProfileDebuggerForbidden(debuggee, method, params),
       timeoutMs,
       `${method} timed out after ${timeoutMs}ms`
     );
@@ -15068,7 +14703,7 @@ async function recordUnresolvedDebuggerCommandTimeout(
   row.neutralizationMethod = neutralization.method;
   try {
     await promiseWithTimeout(
-      chrome.debugger.sendCommand(
+      normalProfileDebuggerForbidden(
         { tabId },
         neutralization.method,
         neutralization.params
@@ -15273,8 +14908,8 @@ async function attachDebuggerForCommand(tabId, protocolVersion = "1.3") {
       return { debuggee, shouldDetach: false, persistent: true, protocolVersion };
     }
   }
-  assertPhysicalMutationAdmission(`chrome.debugger.attach:tab=${tabId}`);
-  await chrome.debugger.attach(debuggee, protocolVersion);
+  assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:tab=${tabId}`);
+  await normalProfileDebuggerForbidden(debuggee, protocolVersion);
   return { debuggee, shouldDetach: true, persistent: false, protocolVersion };
 }
 
@@ -15286,8 +14921,8 @@ async function ensureInitScriptDebuggerSession(tabId, protocolVersion = "1.3") {
   }
   const reusePersistentDebugger = persistentDebuggerSessionIsAttached(tabId);
   if (!reusePersistentDebugger) {
-    assertPhysicalMutationAdmission(`chrome.debugger.attach:initScript:tab=${tabId}`);
-    await chrome.debugger.attach(debuggee, protocolVersion);
+    assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:initScript:tab=${tabId}`);
+    await normalProfileDebuggerForbidden(debuggee, protocolVersion);
   }
   session = {
     protocolVersion,
@@ -15328,7 +14963,7 @@ async function maybeDetachInitScriptDebuggerSession(tabId, debuggee, identifier)
     return false;
   }
   try {
-    await chrome.debugger.detach(debuggee);
+    await normalProfileDebuggerForbidden(debuggee);
     forgetCdpDomainsForTab(tabId);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
@@ -15400,8 +15035,8 @@ async function ensureBindingDebuggerSession(tabId, protocolVersion = "1.3") {
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`chrome.debugger.attach:binding:tab=${tabId}`);
-      await chrome.debugger.attach(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:binding:tab=${tabId}`);
+      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -15437,7 +15072,7 @@ async function detachBindingDebuggerSession(tabId, debuggee, session) {
     return false;
   }
   try {
-    await chrome.debugger.detach(debuggee);
+    await normalProfileDebuggerForbidden(debuggee);
     forgetCdpDomainsForTab(tabId);
     markBindingDebuggerDetached(tabId, false);
     markDialogDebuggerDetached(tabId, false);
@@ -15579,8 +15214,8 @@ async function ensureDialogDebuggerSession(tabId, defaultPolicy, protocolVersion
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`chrome.debugger.attach:dialog:tab=${tabId}`);
-      await chrome.debugger.attach(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:dialog:tab=${tabId}`);
+      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -16089,7 +15724,7 @@ async function operatorPanicTargetAbsentAfterReadback(error, tabId) {
 }
 
 async function debuggerAttachmentReadback(tabId) {
-  const targets = await chrome.debugger.getTargets();
+  const targets = await normalProfileDebuggerForbidden();
   const target = targets.find((candidate) => candidate?.tabId === tabId) || null;
   return {
     tab_id: tabId,
@@ -16123,7 +15758,7 @@ async function operatorPanicWithDebugger(tabId, operation) {
     }
     if (attachment?.shouldDetach) {
       try {
-        await chrome.debugger.detach(attachment.debuggee);
+        await normalProfileDebuggerForbidden(attachment.debuggee);
       } catch (_) {
         // The command readback is the verdict; detach is host hygiene only.
       }
@@ -16488,7 +16123,7 @@ async function handleOperatorPanicCleanup(params) {
   for (const tabId of Array.from(DURABLE_OWNER_LEDGER.debuggerTabs)) {
     try {
       try {
-        await chrome.debugger.detach({ tabId });
+        await normalProfileDebuggerForbidden({ tabId });
       } catch (error) {
         const detail = errorMessage(error).toLowerCase();
         if (!detail.includes("not attached") &&
@@ -16499,7 +16134,7 @@ async function handleOperatorPanicCleanup(params) {
       const attachment = await debuggerAttachmentReadback(tabId);
       if (attachment.attached) {
         throw new Error(
-          `chrome.debugger.getTargets still reports attached=true for tab ${tabId}`
+          `normalProfileDebuggerForbidden still reports attached=true for tab ${tabId}`
         );
       }
       removeLedgerDebuggerTab(tabId);
@@ -16684,7 +16319,7 @@ async function setFilesForLocator(selected, params, files, operation) {
     }
     if (attach.shouldDetach) {
       try {
-        await chrome.debugger.detach(debuggee);
+        await normalProfileDebuggerForbidden(debuggee);
       } catch (error) {
         console.warn(`Synapse chrome.debugger detach failed for fileUpload tab ${selected.tabId}: ${errorMessage(error)}`);
       }
@@ -16848,8 +16483,8 @@ async function ensureFileChooserDebuggerSession(tabId, intercept, protocolVersio
   let newlyArmed = false;
   if (!session.attached) {
     if (!persistentDebuggerSessionIsAttached(tabId)) {
-      assertPhysicalMutationAdmission(`chrome.debugger.attach:fileChooser:tab=${tabId}`);
-      await chrome.debugger.attach(debuggee, protocolVersion);
+      assertPhysicalMutationAdmission(`normalProfileDebuggerForbidden:fileChooser:tab=${tabId}`);
+      await normalProfileDebuggerForbidden(debuggee, protocolVersion);
     }
     session.attached = true;
     session.protocolVersion = protocolVersion;
@@ -17232,6 +16867,69 @@ async function handleMaintenancePauseReconnect(params = {}) {
     websocket_close: websocketClose,
     bridge_build_id: BRIDGE_BUILD_ID,
     extension_id: chrome.runtime.id
+  };
+}
+
+function normalizeReloadDelayMs(value) {
+  const parsed = Number(value ?? 500);
+  if (!Number.isSafeInteger(parsed) || parsed < 250 || parsed > 5000) {
+    throw bridgeError(
+      ERROR_EXTENSION_STALE,
+      `reloadSelf reloadDelayMs must be an integer in 250..=5000, got ${String(value)}`
+    );
+  }
+  return parsed;
+}
+
+function handleReloadSelf(params = {}) {
+  const expectedExtensionId = String(params.expectedExtensionId || "").trim();
+  const expectedLoadedBuildId = String(params.expectedLoadedBuildId || "").trim();
+  const expectedDeployedBuildId = String(params.expectedDeployedBuildId || "").trim();
+  const reloadDelayMs = normalizeReloadDelayMs(params.reloadDelayMs);
+  if (expectedExtensionId !== chrome.runtime.id || chrome.runtime.id !== EXPECTED_EXTENSION_ID) {
+    throw bridgeError(
+      ERROR_EXTENSION_ID_MISMATCH,
+      `reloadSelf extension identity mismatch: actual=${chrome.runtime.id} ` +
+        `expected_request=${expectedExtensionId || "<missing>"} expected_bridge=${EXPECTED_EXTENSION_ID}`
+    );
+  }
+  if (!expectedLoadedBuildId || expectedLoadedBuildId !== BRIDGE_BUILD_ID) {
+    throw bridgeError(
+      ERROR_EXTENSION_STALE,
+      `reloadSelf loaded build mismatch: actual=${BRIDGE_BUILD_ID} ` +
+        `expected_loaded=${expectedLoadedBuildId || "<missing>"}`
+    );
+  }
+  if (!expectedDeployedBuildId) {
+    throw bridgeError(
+      ERROR_EXTENSION_STALE,
+      `reloadSelf expectedDeployedBuildId is required: loaded=${BRIDGE_BUILD_ID}`
+    );
+  }
+  const scheduledAtUnixMs = Date.now();
+  setTimeout(() => {
+    try {
+      chrome.runtime.reload();
+    } catch (error) {
+      console.error(
+        `SYNAPSE_CHROME_BACKGROUND_RUNTIME_RELOAD_THROWN ` +
+          `loaded_build=${BRIDGE_BUILD_ID} deployed_build=${expectedDeployedBuildId} ` +
+          `error=${errorMessage(error)}`
+      );
+    }
+  }, reloadDelayMs);
+  return {
+    ok: true,
+    control_surface: "chrome.runtime.reload",
+    required_foreground: false,
+    extension_id: chrome.runtime.id,
+    loaded_build_id: BRIDGE_BUILD_ID,
+    deployed_build_id: expectedDeployedBuildId,
+    scheduled_at_unix_ms: scheduledAtUnixMs,
+    reload_delay_ms: reloadDelayMs,
+    foreground_api_calls: 0,
+    tab_mutations: 0,
+    synthetic_input_events: 0
   };
 }
 

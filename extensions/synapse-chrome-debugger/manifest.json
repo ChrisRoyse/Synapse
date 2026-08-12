@@ -8,9 +8,7 @@
   "permissions": [
     "alarms",
     "cookies",
-    "debugger",
     "downloads",
-    "management",
     "scripting",
     "storage",
     "unlimitedStorage",

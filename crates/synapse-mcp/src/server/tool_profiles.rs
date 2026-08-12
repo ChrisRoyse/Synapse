@@ -1139,7 +1139,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
     facade_contract(
         "browser_debugger",
         "BrowserDebuggerOperation",
-        "explicit browser_debugger profile + raw CDP/chrome.debugger readback",
+        "explicit browser_debugger profile + dedicated-profile raw CDP readback",
         &[
             op(
                 "evaluate",
@@ -1163,8 +1163,8 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "reload_bridge",
                 true,
                 false,
-                "browser_debugger profile row + exact host-controlled Chrome extension management Reload/Load unpacked control",
-                Some("bridge host before/after registration readback"),
+                "browser_debugger profile row + authenticated background chrome.runtime.reload lifecycle",
+                Some("bridge host plus physical profile/service-worker before/after readback"),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to browser_debugger and verify the bridge host reconnect readback",
             ),
@@ -3033,9 +3033,11 @@ const BREAK_GLASS_HAZARDOUS_TOOLS: &[&str] = &[
 pub(crate) enum ToolProfileKind {
     NormalAgent,
     BrowserControl,
-    /// Browser-only CDP / chrome.debugger capability lane. This keeps
-    /// attach-capable browser tools explicit without exposing raw OS foreground,
-    /// shell, or agent-spawn surfaces.
+    /// Browser-only raw-CDP capability lane for Synapse-owned dedicated
+    /// automation profiles. The normal authenticated Chrome profile never
+    /// carries the debugger permission. This keeps browser instrumentation
+    /// explicit without exposing raw OS foreground, shell, or agent-spawn
+    /// surfaces.
     BrowserDebugger,
     BreakGlass,
     /// Synapse-spawned local-model agent profile (gemma/DeepSeek/etc., #1031).
@@ -4091,7 +4093,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Read this MCP session's effective tool profile, visible tools/list names, durable CF_SESSIONS policy row, and capability-preserving routes for hidden raw foreground/browser-debugger primitives. The readback distinguishes human_os_foreground from agent_logical_foreground and the browser debugger lane: normal_agent/browser_control expose debugger-free already-open Chrome routes, browser_debugger explicitly exposes raw-CDP/chrome.debugger browser tools, and real OS foreground primitives stay reachable only through lease + break_glass.",
+        description = "Read this MCP session's effective tool profile, visible tools/list names, durable CF_SESSIONS policy row, and capability-preserving routes for hidden raw foreground/browser-debugger primitives. The readback distinguishes human_os_foreground from agent_logical_foreground and the browser debugger lane: normal_agent/browser_control expose debugger-free already-open Chrome routes, browser_debugger explicitly exposes raw-CDP tools for Synapse-owned dedicated automation profiles, and real OS foreground primitives stay reachable only through lease + break_glass.",
         input_schema = empty_input_schema()
     )]
     pub async fn tool_profile_status(
@@ -4686,7 +4688,7 @@ impl SynapseService {
                 "policy_row": row,
                 "visible_tool_count": visible_tool_names.len(),
                 "capability_route": capability_route,
-                "resolution": "use the named capability_route preferred tools for default agent work; call profile operation=set profile=browser_debugger with confirm_break_glass=true plus a non-empty reason for browser raw-CDP/chrome.debugger instrumentation; acquire the foreground input lease and call profile operation=set profile=break_glass with confirm_break_glass=true plus a non-empty reason for real human OS foreground work",
+                "resolution": "use the named capability_route preferred tools for default agent work; call profile operation=set profile=browser_debugger with confirm_break_glass=true plus a non-empty reason for dedicated-profile raw-CDP instrumentation; acquire the foreground input lease and call profile operation=set profile=break_glass with confirm_break_glass=true plus a non-empty reason for real human OS foreground work",
             })),
         );
         let command_payload = json!({
@@ -5364,7 +5366,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
             "browser_storage operation=read",
         ],
         tool if BROWSER_DEBUGGER_ONLY_EXACT.contains(&tool) => vec![
-            "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why chrome.debugger is required>",
+            "profile operation=set profile=browser_debugger confirm_break_glass=true reason=<why dedicated-profile raw CDP is required>",
             "browser_debugger operation=<matching operation>",
             "browser_tabs operation=list",
             "browser_dom operation=locate",
@@ -5381,7 +5383,7 @@ fn hidden_tool_capability_route(tool_name: &str) -> HiddenToolCapabilityRoute {
         preferred_tools: preferred_tools.into_iter().map(str::to_owned).collect(),
         agent_logical_foreground_policy: "use the preferred tools against this session's agent_logical_foreground/foreground_lane",
         human_os_foreground_policy: "never use the human OS foreground as an implicit fallback",
-        break_glass_policy: "for browser CDP/chrome.debugger instrumentation, call profile operation=set profile=browser_debugger with confirm_break_glass=true and a non-empty reason; for a real OS foreground primitive, first acquire the input lease, then call profile operation=set profile=break_glass with confirm_break_glass=true and a non-empty reason",
+        break_glass_policy: "for dedicated-profile raw-CDP instrumentation, call profile operation=set profile=browser_debugger with confirm_break_glass=true and a non-empty reason; for a real OS foreground primitive, first acquire the input lease, then call profile operation=set profile=break_glass with confirm_break_glass=true and a non-empty reason",
     }
 }
 

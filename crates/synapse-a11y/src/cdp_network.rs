@@ -58,6 +58,7 @@ pub struct CdpDurableBrowserMutationOwnersReadback {
     pub fetch_interception_active_count: usize,
     pub network_override_active_count: usize,
     pub dialog_auto_policy_active_count: usize,
+    pub file_chooser_active_count: usize,
     pub clock_active_count: usize,
     pub init_script_active_count: usize,
     pub persisted_cdp_mutation_owner_count: usize,
@@ -85,6 +86,10 @@ pub struct CdpDurableBrowserMutationOwnersDrainReadback {
     pub dialog_auto_policies_found: usize,
     pub dialog_listener_tasks_drained: usize,
     pub dialog_handler_tasks_drained: usize,
+    pub file_choosers_found: usize,
+    pub file_chooser_intercepts_disabled: usize,
+    pub file_chooser_listener_tasks_drained: usize,
+    pub file_chooser_handler_tasks_drained: usize,
     pub clocks_found: usize,
     pub clocks_uninstalled: usize,
     pub init_scripts_found: usize,
@@ -1873,6 +1878,14 @@ pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOw
                 usize::MAX
             }
         };
+    let file_chooser_active_count = match crate::cdp_files::cdp_file_chooser_active_count_readback()
+    {
+        Ok(count) => count,
+        Err(error) => {
+            registry_readback_failures.push(error);
+            usize::MAX
+        }
+    };
     let init_script_active_count =
         match crate::cdp_action::durable_init_script_active_count_readback() {
             Ok(count) => count,
@@ -1897,6 +1910,7 @@ pub fn durable_browser_mutation_owners_readback() -> CdpDurableBrowserMutationOw
         fetch_interception_active_count,
         network_override_active_count,
         dialog_auto_policy_active_count,
+        file_chooser_active_count,
         clock_active_count,
         init_script_active_count,
         persisted_cdp_mutation_owner_count: persisted.total_count,
@@ -1980,6 +1994,14 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
     let dialog_active_after = dialog.active_after;
     failures.extend(dialog.failures);
 
+    let file_choosers = crate::cdp_files::cdp_file_chooser_disable_and_drain_all().await;
+    let file_choosers_found = file_choosers.found;
+    let file_chooser_intercepts_disabled = file_choosers.intercepts_disabled;
+    let file_chooser_listener_tasks_drained = file_choosers.listener_tasks_drained;
+    let file_chooser_handler_tasks_drained = file_choosers.handler_tasks_drained;
+    let file_chooser_active_after = file_choosers.active_after;
+    failures.extend(file_choosers.failures);
+
     let clocks = crate::cdp_clock::durable_clocks_disable_and_drain_all().await;
     let clocks_found = clocks.found;
     let clocks_uninstalled = clocks.uninstalled;
@@ -2028,6 +2050,10 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         && dialog_listener_tasks_drained == dialog_auto_policies_found
         && dialog_handler_tasks_drained == dialog_auto_policies_found
         && dialog_active_after == 0
+        && file_chooser_intercepts_disabled == file_choosers_found
+        && file_chooser_listener_tasks_drained == file_choosers_found
+        && file_chooser_handler_tasks_drained == file_choosers_found
+        && file_chooser_active_after == 0
         && clocks_uninstalled == clocks_found
         && clocks_active_after == 0
         && init_scripts_removed == init_scripts_found
@@ -2042,6 +2068,7 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         && readback.fetch_interception_active_count == 0
         && readback.network_override_active_count == 0
         && readback.dialog_auto_policy_active_count == 0
+        && readback.file_chooser_active_count == 0
         && readback.clock_active_count == 0
         && readback.init_script_active_count == 0
         && readback.persisted_cdp_mutation_owner_count == 0
@@ -2061,6 +2088,10 @@ pub async fn durable_browser_mutation_owners_disable_and_drain()
         dialog_auto_policies_found,
         dialog_listener_tasks_drained,
         dialog_handler_tasks_drained,
+        file_choosers_found,
+        file_chooser_intercepts_disabled,
+        file_chooser_listener_tasks_drained,
+        file_chooser_handler_tasks_drained,
         clocks_found,
         clocks_uninstalled,
         init_scripts_found,

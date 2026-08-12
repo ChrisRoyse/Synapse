@@ -582,8 +582,9 @@ pub struct CaptureGifResponse {
 pub struct BrowserScreenshotParams {
     /// Output PNG/JPEG file path. Must be absolute.
     pub path: String,
-    /// CDP/normal-bridge target id. Defaults to this MCP session's active CDP
-    /// target. Normal Chrome bridge targets are shaped like `chrome-tab:<id>`.
+    /// Raw-CDP target id. Defaults to this MCP session's active target. Normal
+    /// authenticated Chrome bridge targets (`chrome-tab:<id>`) fail closed;
+    /// launch a dedicated non-default Synapse automation profile.
     #[serde(default)]
     pub cdp_target_id: Option<String>,
     /// Browser HWND that owns the target. Required only when passing an
@@ -597,7 +598,7 @@ pub struct BrowserScreenshotParams {
     /// scopes. Uses page/document coordinates, not viewport or screen coords.
     #[serde(default)]
     pub clip: Option<Rect>,
-    /// Normal bridge element id returned by `browser_locate` /
+    /// Raw-CDP element id returned by `browser_locate` /
     /// `browser_aria_snapshot`. Required with `scope=element`.
     #[serde(default)]
     pub element_id: Option<String>,
@@ -612,8 +613,8 @@ pub struct BrowserScreenshotParams {
     /// JPEG quality 0..=100. Ignored for PNG.
     #[serde(default)]
     pub quality: Option<u8>,
-    /// Request transparent page background for PNG. The normal bridge also
-    /// restores any inline background changes after capture.
+    /// Request transparent page background for PNG. The raw-CDP background
+    /// override is always cleared before the call returns.
     #[serde(default)]
     pub omit_background: bool,
     #[serde(default)]
@@ -675,7 +676,8 @@ pub struct BrowserScreenshotResponse {
     pub bytes_written: u64,
     pub bitmap_sha256: String,
     pub cdp_target_id: String,
-    pub tab_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_window_id: Option<i64>,
     pub url: String,
@@ -816,7 +818,8 @@ pub struct BrowserPdfResponse {
     pub pdf_sha256: String,
     pub capture_backend: String,
     pub cdp_target_id: String,
-    pub tab_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_window_id: Option<i64>,
     pub url: String,
@@ -1766,9 +1769,10 @@ pub struct WindowListResponse {
 #[serde(deny_unknown_fields)]
 pub struct CdpBridgeReloadParams {
     /// Optional reconnect wait budget. Defaults to 10000 ms and is capped at
-    /// 30000 ms. This budget starts after the bounded host-side Chrome extension
-    /// management control completes. The tool returns only after a separate
-    /// bridge host readback observes a new clean extension registration.
+    /// 30000 ms. This budget starts after the connected extension acknowledges
+    /// its bounded `chrome.runtime.reload` schedule. The tool returns only after
+    /// separate host, physical profile-row, and service-worker SHA readbacks
+    /// observe a new clean extension registration.
     #[serde(default)]
     pub wait_timeout_ms: Option<u64>,
 }
@@ -1841,173 +1845,17 @@ pub struct CdpBridgeReloadAckReadback {
     pub extension_service_worker_sha256: String,
     pub active_profile: String,
     pub reason: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chrome_window_pid: Option<u32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub chrome_window_hwnd: Option<i64>,
     pub profile_before_installed: bool,
     pub profile_before_ready: bool,
     pub profile_after_installed: bool,
     pub profile_after_ready: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_before_reload_button_present: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_before_enable_toggle_on: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_after_reload_button_present: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ui_after_enable_toggle_on: Option<bool>,
-    pub maintenance_tab: CdpBridgeMaintenanceTabReadback,
-    pub maintenance_cleanup: CdpBridgeMaintenanceCleanupReadback,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub durable_profile_readback: Option<CdpBridgeDurableProfileReadback>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeForegroundIdentityReadback {
-    pub hwnd: i64,
-    pub pid: u32,
-    pub process_started_at_100ns: u64,
-    pub executable_path_sha256: String,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeForegroundTransactionReadback {
-    pub required: bool,
-    pub attempted: bool,
-    pub restored: bool,
-    pub operator_superseded: bool,
-    pub outcome: String,
-    pub restore_method: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub initial_set_foreground_window_result: Option<bool>,
-    pub alt_unlock_attempted: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub alt_unlock_set_foreground_window_result: Option<bool>,
-    pub prior_foreground: CdpBridgeForegroundIdentityReadback,
-    pub acquired_chrome_foreground: CdpBridgeForegroundIdentityReadback,
-    pub current_before_restore: CdpBridgeForegroundIdentityReadback,
-    pub final_foreground: CdpBridgeForegroundIdentityReadback,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeMaintenanceTabReadback {
-    pub ownership_source: String,
-    /// Exact target-window tab count from the installer UIA HWND Source of Truth.
-    pub preexisting_tab_count: usize,
-    /// Browser-wide pre-operation count from the independent chrome.tabs lane.
-    pub bridge_preexisting_tab_count: usize,
-    pub owned_tab_runtime_id: String,
-    pub chrome_window_hwnd: i64,
-    pub chrome_window_pid: u32,
-    pub tab_count_after_marker: usize,
-    pub navigation_method: String,
-    pub navigation_destination: String,
-    pub prior_foreground: CdpBridgeForegroundIdentityReadback,
-    pub acquired_chrome_foreground: CdpBridgeForegroundIdentityReadback,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgePriorSelectionReadback {
-    pub attempted: bool,
-    pub restored: bool,
-    pub operator_superseded: bool,
-    pub reason: String,
-    pub expected_runtime_id: String,
-    pub before_runtime_id: String,
-    pub after_runtime_id: String,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeFullscreenControlReadback {
-    pub runtime_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub automation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub class_name: Option<String>,
-    pub name: String,
-    pub owner_runtime_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_automation_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_class_name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_name: Option<String>,
-    pub bounds_x: f64,
-    pub bounds_y: f64,
-    pub bounds_width: f64,
-    pub bounds_height: f64,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeFullscreenTransactionReadback {
-    pub mode: String,
-    pub detected: bool,
-    pub exit_attempted: bool,
-    pub exit_verified: bool,
-    pub restore_required: bool,
-    pub restore_attempted: bool,
-    pub restored: bool,
-    pub operator_superseded: bool,
-    pub outcome: String,
-    pub chrome_window_hwnd: i64,
-    pub chrome_window_pid: u32,
-    pub chrome_process_started_at_100ns: u64,
-    pub chrome_executable_path_sha256: String,
-    pub selected_runtime_id: String,
-    pub initial_tab_container_count: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post_exit_tab_container_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub post_restore_tab_container_count: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_control: Option<CdpBridgeFullscreenControlReadback>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inverse_control: Option<CdpBridgeFullscreenControlReadback>,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgePostCleanupReadback {
-    pub source_of_truth: String,
-    pub token_absent: bool,
-    pub preexisting_tab_count: usize,
-    pub missing_preexisting_count: usize,
-    pub concurrent_tab_count: usize,
-    pub post_cleanup_tab_count: usize,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeMaintenanceCleanupReadback {
-    pub attempted: bool,
-    pub closed: bool,
-    pub absent_verified: bool,
-    pub method: String,
-    pub tab_count_before_cleanup: usize,
-    pub tab_count_after_cleanup: usize,
-    pub missing_baseline_count: usize,
-    pub concurrent_tab_count: usize,
-    pub prior_selection_restore: CdpBridgePriorSelectionReadback,
-    pub fullscreen_transaction: CdpBridgeFullscreenTransactionReadback,
-    pub foreground_transaction: CdpBridgeForegroundTransactionReadback,
-    pub bridge_post_cleanup: CdpBridgePostCleanupReadback,
-}
-
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CdpBridgeDurableProfileReadback {
-    pub attempts: u32,
-    pub elapsed_ms: u64,
-    pub source_of_truth_sha256: String,
-    pub permission_activation_pending_before: bool,
-    pub permission_activation_complete_after: bool,
+    pub loaded_build_id: String,
+    pub deployed_build_id: String,
+    pub scheduled_at_unix_ms: u64,
+    pub reload_delay_ms: u64,
+    pub foreground_api_calls: u64,
+    pub tab_mutations: u64,
+    pub synthetic_input_events: u64,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

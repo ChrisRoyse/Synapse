@@ -44,20 +44,18 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str =
-    "synapse-chrome-bridge-2026-08-12-storage-authority-divergence-v16";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-12-noninterference-v19";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "da47ac28073a1531b3a21154b2dd5e288a79d59e039dca6739428f06363e1c25";
+    "14a9a7dd28a5ad63015265fa0b161884cff3976dd48e003a143a64967629db9a";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
-pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: u64 = 60;
+pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;
 // <<< SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT <<<
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES: usize =
     NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB * 1024 * 1024;
 pub const NATIVE_EVENT_HTTP_BODY_LIMIT_BYTES: usize = 1024 * 1024;
-pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_BYTES: u64 =
+const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES: usize =
     PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB * 1024 * 1024;
-const COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES: usize = 60 * 1024 * 1024;
 const COMMAND_TERMINAL_RECEIPT_LIMIT: usize = 64;
 const RECONNECT_WAKE_ALARM_NAME: &str = "synapse-daemon-bridge-reconnect";
 const RECONNECT_WAKE_ALARM_PERIOD_MINUTES: f64 = 0.5;
@@ -70,7 +68,6 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "cookies",
     "downloads",
     "domAction",
-    "externalPopupRiskSuppression",
     "frameLocators",
     "frames",
     "listTabs",
@@ -78,8 +75,6 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "openTab",
     "pageVitals",
     "pageContent",
-    "pageScreenshot",
-    "pagePdf",
     "setContent",
     "storageState",
     "ariaSnapshot",
@@ -88,7 +83,6 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "inspectElement",
     "scrollIntoView",
     "waitForText",
-    "waitForFunction",
     "waitForLoadState",
     "waitForUrl",
     "waitForRequest",
@@ -96,25 +90,9 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "waitForSelector",
     "clock",
     "pageEvents",
-    "evaluateScript",
-    "initScript",
-    "exposeBinding",
-    "handleDialog",
-    "fileUpload",
-    "operatorPanicDisable",
-    "operatorPanicCleanup",
-    "operatorPanicCloseTab",
-    "operatorPanicReadback",
-    "operatorPanicEnable",
-    "cdpInput",
     "keyDispatch",
-    "viewportEmulation",
-    "deviceEmulation",
-    "geolocationEmulation",
-    "localeEmulation",
-    "mediaEmulation",
-    "networkConditions",
     "maintenancePauseReconnect",
+    "reloadSelf",
     "targetInfo",
     "targetInfoPageText",
     "typeActiveElement",
@@ -186,21 +164,15 @@ fn trusted_extension_error_code(code: &str) -> Option<&'static str> {
     Some(TRUSTED_EXTENSION_ERROR_CODES[index])
 }
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS: u64 = 25_000;
-const PAGE_SCREENSHOT_DAEMON_RESPONSE_HEADROOM_MS: u64 = 7_000;
-/// Extra daemon-side response headroom added on top of a caller's evaluate
-/// `timeout_ms` so the daemon waits out the in-extension evaluate budget (plus
-/// attach/round-trip overhead) before declaring a transport timeout (#1596).
-const EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS: u64 = 5_000;
 const NATIVE_POLL_TIMEOUT: Duration = Duration::from_secs(15);
 const DIRECT_WS_COMMAND_WAIT: Duration = Duration::from_secs(25);
 const DEFAULT_RELOAD_WAIT_TIMEOUT_MS: u64 = 10_000;
 const MAX_RELOAD_WAIT_TIMEOUT_MS: u64 = 30_000;
-const HOST_UI_RELOAD_PROCESS_TIMEOUT: Duration = Duration::from_secs(75);
-const HOST_UI_RELOAD_INSTALLER_TIMEOUT_SECONDS: &str = "45";
-const HOST_UI_RELOAD_JSON_PREFIX: &str = "SYNAPSE_CHROME_BRIDGE_INSTALLER_JSON_V1=";
+const BACKGROUND_DEPLOY_PROCESS_TIMEOUT: Duration = Duration::from_secs(75);
+const BACKGROUND_DEPLOY_JSON_PREFIX: &str = "SYNAPSE_CHROME_BRIDGE_INSTALLER_JSON_V1=";
 const CHROME_PROFILE_SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
+const BACKGROUND_RUNTIME_RELOAD_COMMAND: &str = "reloadSelf";
 const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
 const MIN_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 1_000;
 const MAX_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 900_000;
@@ -210,8 +182,8 @@ const NATIVE_DAEMON_RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const MAX_NATIVE_MESSAGE_FROM_CHROME: usize = NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES;
 const MAX_NATIVE_MESSAGE_TO_CHROME: usize = 1024 * 1024;
 const UNKNOWN_NATIVE_HOST_ID_FRAGMENT: &str = "unknown chrome debugger native host_id";
-const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension with scripts\\install-synapse-chrome-debugger.ps1; the installer atomically deploys every build to the one persistent %LOCALAPPDATA%\\synapse\\chrome-extension\\active directory and auto-loads that exact unpacked directory into the already-open active Chrome profile while refusing to launch a second Chrome profile; the constant profile path survives browser/OS restart while the build ID and service-worker SHA prove the loaded bytes; the normal end-user bridge uses chrome.tabs/chrome.scripting/chrome.downloads/chrome.webNavigation/chrome.webRequest over direct localhost WebSocket plus a persisted/read-verified chrome.alarms MV3 reconnect wake, exposes debugger-free pageScreenshot capture through chrome.tabs.captureVisibleTab stitching, exposes chrome.downloads list/wait/event capture for browser_downloads save/move, exposes browser_file_upload with target-scoped DOM.setFileInputFiles/Page.fileChooserOpened for session-owned Chrome bridge tabs, and has explicit browser_debugger-profile chrome.debugger lanes for target-scoped hover/tap/active-tab drag, Page.printToPDF PDF rendering, Runtime.evaluate page evaluation, Page.addScriptToEvaluateOnNewDocument init scripts, Runtime.addBinding/Runtime.bindingCalled binding capture, Page.handleJavaScriptDialog dialog handling, viewport emulation, device emulation, geolocation emulation, locale/timezone emulation, media emulation, and network conditions plus inactive-tab synthetic mouse drag and HTML5 DataTransfer drag dispatch; browser_debugger facade operations require profile operation=set profile=browser_debugger with confirm_break_glass=true and a reason; it never uses nativeMessaging or helper Chrome windows; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
-const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon invokes the exact Reload or Load unpacked control in the already-open authenticated Chrome profile, never launches a second Chrome process/profile, and separately verifies the Chrome profile row plus a new authenticated bridge host";
+const INSTALL_GUIDANCE: &str = "install the bundled Synapse Chrome extension once through an explicit operator-authorized interaction, then use scripts\\install-synapse-chrome-debugger.ps1 -SkipAutoInstall for atomic background deployment and browser_debugger operation=reload_bridge for chrome.runtime.reload; unattended Synapse never focuses, activates, restores, minimizes, unminimizes, navigates, clicks, types into, or otherwise mutates a human Chrome window; the constant %LOCALAPPDATA%\\synapse\\chrome-extension\\active path survives browser/OS restart while the build ID and physical service-worker SHA prove the loaded bytes; expected_extension_id=leoocgnkjnplbfdbklajepahofecgfbk";
+const NO_ACTIVE_HOST_REPAIR_GUIDANCE: &str = "no_active_host_repair=the background-only lifecycle requires an already-connected ready bridge host; restore it through a natural Chrome restart or an explicit operator-authorized install, then retry browser_debugger operation=reload_bridge; Synapse fails before touching any human tab or window";
 const SETUP_REPAIR_MCP_GUIDANCE: &str = "mcp_setup_repair=call public MCP tool setup with operation=repair from profile=maintenance and repair.reason=chrome_bridge_build_skew";
 
 #[derive(Clone, Debug)]
@@ -329,7 +301,7 @@ impl ChromeDebuggerBridgeError {
         let remediation = if reason.contains("capture_visible_tab_lease_quarantined") {
             "fully restart Chrome so chrome.storage.session establishes a new browser-session identity proving the prior uncancellable Chrome API promise cannot still be live; do not reload only the extension or retry the capture"
         } else {
-            "call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon uses the exact Chrome extension management Reload control and separately verifies the profile row and replacement authenticated host without calling chrome.runtime.reload"
+            "call browser_debugger operation=reload_bridge through the public facade after setting profile=browser_debugger; the daemon atomically deploys the bridge in a hidden process, asks the connected extension to call chrome.runtime.reload, and separately verifies the profile row, service-worker SHA, and replacement authenticated host without touching a human Chrome window"
         };
         Self {
             code: error_codes::CHROME_BRIDGE_EXTENSION_STALE,
@@ -367,7 +339,7 @@ impl ChromeDebuggerBridgeError {
         Self {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "Synapse Chrome Bridge refused unsupported attach-capable command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=only explicit browser_debugger-profile lanes may use chrome.debugger for Runtime.evaluate page eval, Page.addScriptToEvaluateOnNewDocument init scripts, cdpInput target-scoped hover/tap/active-tab drag, viewportEmulation, deviceEmulation, geolocationEmulation, localeEmulation, mediaEmulation, and networkConditions plus inactive-tab synthetic mouse drag, while this command still requires a dedicated raw-CDP automation profile{external_surface_hint} remediation=run scripts\\install-synapse-chrome-debugger.ps1 and browser_debugger.reload_bridge to ensure the current bridge is installed, then set profile=browser_debugger through the public profile facade with confirm_break_glass=true and a reason for supported browser instrumentation, or use raw CDP from a dedicated Synapse-launched automation profile for full DOM/action CDP or screenshots"
+                "Synapse Chrome Bridge refused debugger-backed command {command_kind:?} before queueing any Chrome command; hwnd={hwnd} reason=the normal authenticated profile permanently forbids debugger and nativeMessaging permissions because an attachment can display a layout-shifting infobar{external_surface_hint} remediation=launch a session-owned raw-CDP target in Synapse's dedicated non-default automation profile and invoke the same public capability there"
             ),
         }
     }
@@ -411,7 +383,7 @@ fn synapse_chrome_self_permission_warning(rows: &[String], policy_shield_present
     let formatted = format_external_chrome_popup_risks(rows);
     if !active_rows.is_empty() {
         return format!(
-            "synapse_chrome_bridge_permission_blocking=true self_risk_scope=active_synapse_bridge_native_messaging_permission self_risk_count={} self_active_risk_count={} synapse_chrome_bridge_permission_risk={} remediation=normal bridge commands fail closed while the Synapse extension profile row still exposes active/manifest nativeMessaging; rerun scripts\\install-synapse-chrome-debugger.ps1 to preserve the self ExtensionSettings blocked_permissions shield and reload the existing Chrome extension through browser_debugger.reload_bridge when available",
+            "synapse_chrome_bridge_permission_blocking=true self_risk_scope=active_synapse_bridge_debugger_or_native_messaging_permission self_risk_count={} self_active_risk_count={} synapse_chrome_bridge_permission_risk={} remediation=normal bridge commands fail closed while the Synapse extension profile row still exposes active/manifest debugger or nativeMessaging; deploy the popup-free bridge and reload it through the authenticated background chrome.runtime.reload path",
             rows.len(),
             active_rows.len(),
             formatted
@@ -423,7 +395,7 @@ fn synapse_chrome_self_permission_warning(rows: &[String], policy_shield_present
         "granted_only_stale_permissions_without_policy_shield"
     };
     format!(
-        "synapse_chrome_bridge_permission_warning=true self_risk_scope={shield_scope} self_risk_count={} synapse_chrome_bridge_permission_risk={} remediation=granted-only profile residue is not active Chrome extension capability once the loaded bridge identity is current and extension_debugger_api_available=true with cdpInput advertised; setup still attempts the HKCU ExtensionSettings self-shield for nativeMessaging when ACLs allow it, and commands rely on exact bridge identity plus active/manifest nativeMessaging fail-closed gates",
+        "synapse_chrome_bridge_permission_warning=true self_risk_scope={shield_scope} self_risk_count={} synapse_chrome_bridge_permission_risk={} remediation=granted-only profile residue is not active Chrome extension capability once the loaded popup-free bridge reports extension_debugger_api_available=false; commands rely on exact bridge identity plus active/manifest debugger/nativeMessaging fail-closed gates",
         rows.len(),
         formatted
     )
@@ -1188,19 +1160,12 @@ fn format_external_chrome_popup_risks(rows: &[String]) -> String {
     format!("{shown}{suffix}")
 }
 
-fn external_chrome_popup_risk_warning(rows: &[String], suppression_ok: bool) -> String {
+fn external_chrome_popup_risk_warning(rows: &[String]) -> String {
     if rows.is_empty() {
         return "external_chrome_popup_risk_warning=false risk_count=0".to_owned();
     }
-    if suppression_ok {
-        return format!(
-            "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=covered_by_live_bridge_management risk_count={} external_chrome_popup_risk={} remediation=profile scan still names debugger/nativeMessaging rows, but live Chrome management readback from the installed Synapse bridge reported remaining_hazard_count=0 and failure_count=0 for the active Chrome profile; continue monitoring health and fail closed if suppression changes",
-            rows.len(),
-            format_external_chrome_popup_risks(rows)
-        );
-    }
     format!(
-        "external_chrome_popup_risk_blocking=true external_chrome_popup_risk_scope=external_suppression_required risk_count={} external_chrome_popup_risk={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named external debugger/nativeMessaging extensions, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings blocks debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL; normal bridge commands fail closed while this risk remains unsuppressed",
+        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=external_unmanaged_noninterference risk_count={} external_chrome_popup_risk={} disposition=informational_only normal_bridge_debugger_permission=false normal_bridge_management_permission=false remediation=none; Synapse neither attaches the debugger on the human profile nor disables or reconfigures unrelated extensions",
         rows.len(),
         format_external_chrome_popup_risks(rows)
     )
@@ -1211,7 +1176,7 @@ fn external_chrome_popup_risk_host_unavailable_warning(rows: &[String]) -> Strin
         return "external_chrome_popup_risk_warning=false risk_count=0".to_owned();
     }
     format!(
-        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=host_unavailable_no_live_management risk_count={} external_chrome_popup_risk={} remediation=the active Synapse Chrome Bridge host is absent, so live Chrome management suppression state cannot be read; call browser_debugger operation=reload_bridge with profile=browser_debugger to invoke the exact host-side Reload or Load unpacked control, then re-read health before classifying external debugger/nativeMessaging rows as suppressed or blocking",
+        "external_chrome_popup_risk_warning=true external_chrome_popup_risk_scope=external_unmanaged_noninterference risk_count={} external_chrome_popup_risk={} disposition=informational_only host_unavailable=true remediation=none; unrelated extensions are outside Synapse authority and do not gate the debugger-free normal bridge",
         rows.len(),
         format_external_chrome_popup_risks(rows)
     )
@@ -1226,46 +1191,6 @@ fn external_chrome_layout_infobar_warning(rows: &[String]) -> String {
         rows.len(),
         rows.join(";")
     )
-}
-
-fn active_host_available() -> bool {
-    let Ok(inner) = bridge().inner.lock() else {
-        return false;
-    };
-    inner
-        .active_host_id
-        .as_ref()
-        .is_some_and(|host_id| inner.hosts.contains_key(host_id))
-}
-
-fn active_host_popup_risk_suppression_covers(profile_risk_count: usize) -> bool {
-    let Ok(inner) = bridge().inner.lock() else {
-        return false;
-    };
-    inner
-        .active_host_id
-        .as_ref()
-        .and_then(|host_id| inner.hosts.get(host_id))
-        .is_some_and(|host| {
-            popup_risk_suppression_covers_profile_risks(
-                host.extension_popup_risk_suppression.as_ref(),
-                profile_risk_count,
-            )
-        })
-}
-
-fn active_host_popup_risk_suppression_summary() -> String {
-    let Ok(inner) = bridge().inner.lock() else {
-        return "state_lock_poisoned".to_owned();
-    };
-    inner
-        .active_host_id
-        .as_ref()
-        .and_then(|host_id| inner.hosts.get(host_id))
-        .map_or_else(
-            || "not_reported".to_owned(),
-            |host| popup_risk_suppression_summary(&host.extension_popup_risk_suppression),
-        )
 }
 
 fn ensure_normal_bridge_external_popup_suppressed(
@@ -1287,7 +1212,7 @@ fn ensure_normal_bridge_external_popup_suppressed(
         return Err(ChromeDebuggerBridgeError {
             code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
             detail: format!(
-                "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=Synapse Chrome Bridge profile still exposes active nativeMessaging permission synapse_chrome_bridge_permission_risk={} remediation=rerun scripts\\install-synapse-chrome-debugger.ps1 so the HKCU ExtensionSettings self-shield blocks nativeMessaging for the Synapse extension ID, then reload the existing bridge through browser_debugger.reload_bridge or keep commands failed closed until Chrome reloads it",
+                "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=Synapse Chrome Bridge profile still exposes active debugger or nativeMessaging permission synapse_chrome_bridge_permission_risk={} remediation=deploy the popup-free bridge and reload it through browser_debugger.reload_bridge, then verify the physical profile row no longer reports either active permission",
                 format_external_chrome_popup_risks(&self_active_risks)
             ),
         });
@@ -1304,108 +1229,10 @@ fn ensure_normal_bridge_external_popup_suppressed(
             risk_count = self_risks.len(),
             synapse_chrome_bridge_permission_risk = %format_external_chrome_popup_risks(&self_risks),
             synapse_chrome_self_policy_shield = %self_policy_shield.detail,
-            "normal Chrome bridge continuing because Synapse self nativeMessaging residue is granted-only and the live bridge identity/cdpInput capability is verified before commands are queued"
+            "normal Chrome bridge continuing because Synapse self debugger/nativeMessaging residue is granted-only and the live popup-free bridge identity reports debugger_api_available=false"
         );
     }
-    let risks = external_chrome_popup_risks();
-    if risks.is_empty() {
-        return Ok(());
-    }
-    if !active_host_available() {
-        tracing::warn!(
-            code = "CHROME_EXTERNAL_POPUP_RISK_STATE_UNAVAILABLE",
-            hwnd,
-            command_kind,
-            risk_count = risks.len(),
-            external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
-            "normal Chrome bridge command cannot classify external popup risk because no active bridge host is registered"
-        );
-        return Err(ChromeDebuggerBridgeError::unavailable());
-    }
-    let suppression_summary = active_host_popup_risk_suppression_summary();
-    if active_host_popup_risk_suppression_covers(risks.len()) {
-        tracing::warn!(
-            code = "CHROME_EXTERNAL_POPUP_RISK_SUPPRESSED_BY_BRIDGE",
-            hwnd,
-            command_kind,
-            risk_count = risks.len(),
-            external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
-            bridge_popup_risk_suppression = %suppression_summary,
-            "normal Chrome bridge continuing because Chrome management readback reported external popup risks suppressed"
-        );
-        return Ok(());
-    }
-    tracing::error!(
-        code = "CHROME_EXTERNAL_POPUP_RISK_WARNING",
-        hwnd,
-        command_kind,
-        risk_count = risks.len(),
-        external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
-        bridge_popup_risk_suppression = %suppression_summary,
-        "normal Chrome bridge refusing tabs/scripting command while external debugger/nativeMessaging risk remains unsuppressed"
-    );
-    Err(ChromeDebuggerBridgeError {
-        code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
-        detail: format!(
-            "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=external debugger/nativeMessaging popup risk remains unsuppressed external_chrome_popup_risk={} bridge_popup_risk_suppression={} remediation=let the installed Synapse Chrome Bridge management fallback disable the named extension IDs, disable them in Chrome, or rerun scripts\\synapse-setup.ps1 from an elevated PowerShell so ExtensionSettings can apply blocked_permissions for debugger/nativeMessaging; do not weaken the admin-only HKCU Chrome policy ACL",
-            format_external_chrome_popup_risks(&risks),
-            suppression_summary
-        ),
-    })
-}
-
-fn note_normal_bridge_registration_external_popup_risk() {
-    let risks = external_chrome_popup_risks();
-    if risks.is_empty() {
-        return;
-    }
-    tracing::warn!(
-        code = "CHROME_EXTERNAL_POPUP_RISK_WARNING",
-        risk_count = risks.len(),
-        external_chrome_popup_risk = %format_external_chrome_popup_risks(&risks),
-        "normal Chrome bridge accepting direct registration so the extension can report management suppression state for external debugger/nativeMessaging risk"
-    );
-}
-
-fn popup_risk_suppression_covers_profile_risks(
-    value: Option<&Value>,
-    profile_risk_count: usize,
-) -> bool {
-    let Some(value) = value else {
-        return false;
-    };
-    if value.get("ok").and_then(Value::as_bool) != Some(true) {
-        return false;
-    }
-    if value
-        .get("remaining_hazard_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        != 0
-    {
-        return false;
-    }
-    if profile_risk_count == 0 {
-        return true;
-    }
-    if value
-        .get("failure_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        != 0
-    {
-        return false;
-    }
-    if value.get("management_available").and_then(Value::as_bool) != Some(true) {
-        return false;
-    }
-    matches!(
-        value
-            .get("status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown"),
-        "clear" | "suppressed"
-    )
+    Ok(())
 }
 
 fn popup_risk_suppression_summary(value: &Option<Value>) -> String {
@@ -1542,7 +1369,7 @@ fn synapse_self_hazard_api_permissions<'a>(
 ) -> Vec<String> {
     let mut hazards = permissions
         .into_iter()
-        .filter(|permission| *permission == "nativeMessaging")
+        .filter(|permission| *permission == "debugger" || *permission == "nativeMessaging")
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     hazards.sort();
@@ -2298,60 +2125,6 @@ pub struct ChromeDebuggerWaitForTextResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerWaitForFunctionResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub condition_met: bool,
-    #[serde(default)]
-    pub timed_out: bool,
-    #[serde(default)]
-    pub elapsed_ms: u64,
-    #[serde(default)]
-    pub timeout_ms: u64,
-    #[serde(default)]
-    pub polling_interval_ms: u64,
-    #[serde(default)]
-    pub poll_count: u64,
-    #[serde(default)]
-    pub expression_len: usize,
-    #[serde(default)]
-    pub arg_count: usize,
-    #[serde(default)]
-    pub value: Value,
-    #[serde(default)]
-    pub value_type: String,
-    #[serde(default)]
-    pub value_description: Option<String>,
-    #[serde(default)]
-    pub unserializable_value: Option<String>,
-    #[serde(default)]
-    pub initial_document_id: Option<String>,
-    #[serde(default)]
-    pub final_document_id: Option<String>,
-    #[serde(default)]
-    pub navigation_count: u64,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeDebuggerWaitForLoadStateResult {
     pub target_id: String,
     pub tab_id: u32,
@@ -3005,352 +2778,6 @@ pub struct ChromeDebuggerTargetInfo {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerViewportOverride {
-    pub width: u32,
-    pub height: u32,
-    pub device_scale_factor: f64,
-    pub mobile: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerViewportReadback {
-    pub inner_width: i64,
-    pub inner_height: i64,
-    pub device_pixel_ratio: f64,
-    pub screen_width: i64,
-    pub screen_height: i64,
-    pub outer_width: i64,
-    pub outer_height: i64,
-    #[serde(default)]
-    pub scroll_width: i64,
-    #[serde(default)]
-    pub scroll_height: i64,
-    #[serde(default)]
-    pub visual_viewport_width: Option<f64>,
-    #[serde(default)]
-    pub visual_viewport_height: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerViewportEmulationResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub requested: Option<ChromeDebuggerViewportOverride>,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub viewport: ChromeDebuggerViewportReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerDeviceDescriptor {
-    pub user_agent: String,
-    pub width: u32,
-    pub height: u32,
-    pub device_scale_factor: f64,
-    pub is_mobile: bool,
-    pub has_touch: bool,
-    pub max_touch_points: u32,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerDeviceReadback {
-    pub viewport: ChromeDebuggerViewportReadback,
-    pub user_agent: String,
-    pub max_touch_points: i64,
-    pub ontouchstart_available: bool,
-    pub pointer_coarse: bool,
-    pub any_pointer_coarse: bool,
-    pub hover_none: bool,
-    pub any_hover_none: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerDeviceEmulationResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub descriptor: Option<ChromeDebuggerDeviceDescriptor>,
-    #[serde(default)]
-    pub restored_user_agent: Option<String>,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub device: ChromeDebuggerDeviceReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerGeolocationOverride {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub accuracy: f64,
-    #[serde(default)]
-    pub altitude: Option<f64>,
-    #[serde(default)]
-    pub altitude_accuracy: Option<f64>,
-    #[serde(default)]
-    pub heading: Option<f64>,
-    #[serde(default)]
-    pub speed: Option<f64>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerGeolocationCoordinatesReadback {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub accuracy: f64,
-    #[serde(default)]
-    pub altitude: Option<f64>,
-    #[serde(default)]
-    pub altitude_accuracy: Option<f64>,
-    #[serde(default)]
-    pub heading: Option<f64>,
-    #[serde(default)]
-    pub speed: Option<f64>,
-    pub timestamp: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerGeolocationErrorReadback {
-    pub code: i64,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerGeolocationReadback {
-    pub permission_state: String,
-    #[serde(default)]
-    pub position: Option<ChromeDebuggerGeolocationCoordinatesReadback>,
-    #[serde(default)]
-    pub error: Option<ChromeDebuggerGeolocationErrorReadback>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerGeolocationEmulationResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    pub origin: String,
-    #[serde(default)]
-    pub requested: Option<ChromeDebuggerGeolocationOverride>,
-    pub permission_setting: String,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub geolocation: ChromeDebuggerGeolocationReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerLocaleTimezoneOverride {
-    #[serde(default)]
-    pub locale: Option<String>,
-    #[serde(default)]
-    pub timezone_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerLocaleTimezoneReadback {
-    pub locale: String,
-    pub calendar: String,
-    pub numbering_system: String,
-    pub time_zone: String,
-    pub sample_number: String,
-    pub sample_date: String,
-    pub date_string: String,
-    pub timezone_offset_minutes: i64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerLocaleEmulationResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub requested: Option<ChromeDebuggerLocaleTimezoneOverride>,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub locale: ChromeDebuggerLocaleTimezoneReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerMediaOverride {
-    #[serde(default)]
-    pub media: Option<String>,
-    #[serde(default)]
-    pub color_scheme: Option<String>,
-    #[serde(default)]
-    pub reduced_motion: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerMediaReadback {
-    pub media_screen: bool,
-    pub media_print: bool,
-    pub color_scheme_dark: bool,
-    pub color_scheme_light: bool,
-    pub color_scheme_no_preference: bool,
-    pub reduced_motion_reduce: bool,
-    pub reduced_motion_no_preference: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerMediaEmulationResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub requested: Option<ChromeDebuggerMediaOverride>,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub media: ChromeDebuggerMediaReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerNetworkConditionsOverride {
-    pub offline: bool,
-    pub latency_ms: f64,
-    pub download_throughput_bytes_per_sec: f64,
-    pub upload_throughput_bytes_per_sec: f64,
-    #[serde(default)]
-    pub connection_type: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerNetworkConditionsReadback {
-    pub online: bool,
-    #[serde(default)]
-    pub connection_type: Option<String>,
-    #[serde(default)]
-    pub effective_type: Option<String>,
-    #[serde(default)]
-    pub downlink_mbps: Option<f64>,
-    #[serde(default)]
-    pub rtt_ms: Option<f64>,
-    #[serde(default)]
-    pub save_data: Option<bool>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerNetworkConditionsResult {
-    pub extension_id: Option<String>,
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub requested: Option<ChromeDebuggerNetworkConditionsOverride>,
-    pub page_url: String,
-    pub page_title: String,
-    pub ready_state: String,
-    pub network: ChromeDebuggerNetworkConditionsReadback,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub source_of_truth: String,
-    #[serde(default)]
-    pub method: String,
-    #[serde(default)]
-    pub debugger_protocol_version: Option<String>,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeDebuggerFrameEntry {
     #[serde(default)]
     pub frame_id: String,
@@ -3448,175 +2875,6 @@ pub struct ChromeDebuggerFramesResult {
     pub backend_tier_used: String,
     #[serde(default)]
     pub required_foreground: bool,
-    #[serde(default)]
-    pub target_candidate_count: u32,
-    #[serde(default)]
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerCaptureVisibleTabResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    #[serde(default)]
-    pub chrome_window_focused: Option<bool>,
-    #[serde(default)]
-    pub chrome_window_state: String,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub before_active: bool,
-    #[serde(default)]
-    pub active_for_capture: bool,
-    #[serde(default)]
-    pub before_highlighted: bool,
-    #[serde(default)]
-    pub highlighted_for_capture: bool,
-    #[serde(default)]
-    pub previous_active_tab_id: Option<u32>,
-    #[serde(default)]
-    pub restored_previous_active: bool,
-    #[serde(default)]
-    pub image_format: String,
-    pub image_data_url: String,
-    #[serde(default)]
-    pub image_data_url_len: usize,
-    #[serde(default)]
-    pub capture_attempt_count: usize,
-    #[serde(default)]
-    pub capture_attempts: Vec<ChromeDebuggerCaptureAttempt>,
-    #[serde(default)]
-    pub readback_backend: String,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageScreenshotResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub before_active: bool,
-    #[serde(default)]
-    pub active_for_capture: bool,
-    #[serde(default)]
-    pub previous_active_tab_id: Option<u32>,
-    #[serde(default)]
-    pub restored_previous_active: bool,
-    #[serde(default)]
-    pub image_format: String,
-    #[serde(default)]
-    pub quality: Option<u8>,
-    #[serde(default)]
-    pub omit_background: bool,
-    #[serde(default)]
-    pub scope: String,
-    pub clip_css: ChromeDebuggerPageScreenshotRect,
-    #[serde(default)]
-    pub output_css_width: f64,
-    #[serde(default)]
-    pub output_css_height: f64,
-    #[serde(default)]
-    pub device_pixel_ratio: f64,
-    #[serde(default)]
-    pub scroll_width_css: f64,
-    #[serde(default)]
-    pub scroll_height_css: f64,
-    #[serde(default)]
-    pub viewport_width_css: f64,
-    #[serde(default)]
-    pub viewport_height_css: f64,
-    pub composition_mode: String,
-    pub capture_plan: ChromeDebuggerPageScreenshotCapturePlan,
-    pub composite_image_data_url: String,
-    pub composite_image_data_url_len: usize,
-    pub tile_count: usize,
-    #[serde(default)]
-    pub capture_attempt_count: usize,
-    #[serde(default)]
-    pub capture_attempts: Vec<ChromeDebuggerCaptureAttempt>,
-    pub document_id: String,
-    pub cleanup_verified: bool,
-    #[serde(default)]
-    pub cleanup_document_id: Option<String>,
-    pub mask_count: usize,
-    pub masks: Vec<ChromeDebuggerPageScreenshotMask>,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    #[serde(default)]
-    pub target_candidate_count: u32,
-    #[serde(default)]
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerPagePdfResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    #[serde(default)]
-    pub url: String,
-    #[serde(default)]
-    pub title: String,
-    pub data_base64: String,
-    #[serde(default)]
-    pub data_base64_len: usize,
-    #[serde(default)]
-    pub pdf_byte_length: usize,
-    #[serde(default)]
-    pub landscape: bool,
-    #[serde(default)]
-    pub print_background: bool,
-    #[serde(default)]
-    pub display_header_footer: bool,
-    #[serde(default)]
-    pub scale: f64,
-    #[serde(default)]
-    pub paper_width: f64,
-    #[serde(default)]
-    pub paper_height: f64,
-    #[serde(default)]
-    pub margin_top: f64,
-    #[serde(default)]
-    pub margin_bottom: f64,
-    #[serde(default)]
-    pub margin_left: f64,
-    #[serde(default)]
-    pub margin_right: f64,
-    #[serde(default)]
-    pub page_ranges: String,
-    #[serde(default)]
-    pub prefer_css_page_size: bool,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub protocol_version: String,
     #[serde(default)]
     pub target_candidate_count: u32,
     #[serde(default)]
@@ -3735,79 +2993,6 @@ pub struct ChromeDebuggerDownloadEvent {
     pub file_size: i64,
     #[serde(default)]
     pub delta: Option<Value>,
-}
-
-#[derive(Copy, Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageScreenshotRect {
-    #[serde(default)]
-    pub x: f64,
-    #[serde(default)]
-    pub y: f64,
-    #[serde(default, alias = "width")]
-    pub w: f64,
-    #[serde(default, alias = "height")]
-    pub h: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageScreenshotMask {
-    pub index: usize,
-    pub rect: ChromeDebuggerPageScreenshotRect,
-    pub color_rgba: [u8; 4],
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerPageScreenshotCapturePlan {
-    pub schema: String,
-    pub composition_mode: String,
-    pub hard_peak_budget_bytes: u64,
-    pub native_message_budget_bytes: u64,
-    pub estimated_peak_bytes: u64,
-    pub estimated_native_message_bytes: u64,
-    pub native_width: u32,
-    pub native_height: u32,
-    pub output_width: u32,
-    pub output_height: u32,
-    pub output_scale_x: f64,
-    pub output_scale_y: f64,
-    pub applied_scale: f64,
-    pub tile_count: usize,
-    pub tile_width: u32,
-    pub tile_height: u32,
-    pub tile_raw_bytes: u64,
-    pub tile_encoded_upper_bound_bytes: u64,
-    pub tile_data_url_upper_bound_bytes: u64,
-    pub output_raw_bytes: u64,
-    pub output_encoded_upper_bound_bytes: u64,
-    pub output_data_url_upper_bound_bytes: u64,
-    pub max_pixels: Option<u64>,
-    pub max_long_edge: Option<u64>,
-    pub actual_max_tile_data_url_bytes: u64,
-    pub actual_composite_blob_bytes: u64,
-    pub actual_composite_data_url_bytes: u64,
-    pub actual_native_message_bytes: u64,
-    pub surface_released: bool,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-pub struct ChromeDebuggerCaptureAttempt {
-    #[serde(default)]
-    pub attempt: u32,
-    #[serde(default)]
-    pub ok: bool,
-    #[serde(default)]
-    pub elapsed_ms: u64,
-    #[serde(default, deserialize_with = "deserialize_null_default_string")]
-    pub error_detail: String,
-    #[serde(default)]
-    pub retryable: bool,
-}
-
-fn deserialize_null_default_string<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -4035,345 +3220,6 @@ pub struct ChromeDebuggerActivateTabResult {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerEvaluateScriptResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub scope: String,
-    #[serde(default)]
-    pub result_type: String,
-    #[serde(default)]
-    pub result_subtype: Option<String>,
-    #[serde(default)]
-    pub returned_by_value: bool,
-    #[serde(default)]
-    pub value: Value,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub unserializable_value: Option<String>,
-    #[serde(default)]
-    pub readback_backend: String,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerInitScriptResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    pub identifier: String,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub readback_backend: String,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerBindingCall {
-    pub seq: u64,
-    pub name: String,
-    pub payload: String,
-    pub payload_len: usize,
-    pub payload_truncated: bool,
-    #[serde(default)]
-    pub payload_json: Option<Value>,
-    pub execution_context_id: i64,
-    pub timestamp_ms: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerExposeBindingResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    pub name: String,
-    #[serde(default)]
-    pub newly_armed: bool,
-    #[serde(default)]
-    pub binding_newly_added: bool,
-    #[serde(default)]
-    pub binding_removed: bool,
-    #[serde(default)]
-    pub armed_at_unix_ms: f64,
-    #[serde(default)]
-    pub binding_active: bool,
-    #[serde(default)]
-    pub active_binding_count: usize,
-    #[serde(default)]
-    pub active_binding_names: Vec<String>,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub calls: Vec<ChromeDebuggerBindingCall>,
-    #[serde(default)]
-    pub next_cursor: u64,
-    #[serde(default)]
-    pub returned: usize,
-    #[serde(default)]
-    pub total_buffered: usize,
-    #[serde(default)]
-    pub dropped: u64,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerDialogEntry {
-    pub seq: u64,
-    pub url: String,
-    pub frame_id: String,
-    pub dialog_type: String,
-    pub message: String,
-    #[serde(default)]
-    pub default_prompt: Option<String>,
-    #[serde(default)]
-    pub has_browser_handler: bool,
-    pub opened_at_unix_ms: u64,
-    pub pending: bool,
-    pub default_policy: String,
-    #[serde(default)]
-    pub auto_action: Option<String>,
-    #[serde(default)]
-    pub auto_handled_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub auto_handle_error: Option<String>,
-    #[serde(default)]
-    pub manual_action: Option<String>,
-    #[serde(default)]
-    pub manual_prompt_text: Option<String>,
-    #[serde(default)]
-    pub manual_handled_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub manual_handle_error: Option<String>,
-    #[serde(default)]
-    pub closed_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub close_result: Option<bool>,
-    #[serde(default)]
-    pub user_input: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerHandleDialogResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    pub default_policy: String,
-    #[serde(default)]
-    pub capture_newly_armed: bool,
-    #[serde(default)]
-    pub handled: bool,
-    #[serde(default)]
-    pub handle_action: Option<String>,
-    #[serde(default)]
-    pub prompt_text: Option<String>,
-    #[serde(default)]
-    pub pending_dialog: Option<ChromeDebuggerDialogEntry>,
-    #[serde(default)]
-    pub handled_dialog: Option<ChromeDebuggerDialogEntry>,
-    #[serde(default)]
-    pub last_dialog: Option<ChromeDebuggerDialogEntry>,
-    #[serde(default)]
-    pub entries: Vec<ChromeDebuggerDialogEntry>,
-    #[serde(default)]
-    pub next_cursor: u64,
-    #[serde(default)]
-    pub returned: usize,
-    #[serde(default)]
-    pub total_buffered: usize,
-    #[serde(default)]
-    pub dropped: u64,
-    #[serde(default)]
-    pub opened_count: u64,
-    #[serde(default)]
-    pub closed_count: u64,
-    #[serde(default)]
-    pub auto_handled_count: u64,
-    #[serde(default)]
-    pub error_count: u64,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerFileUploadFile {
-    pub name: String,
-    #[serde(default)]
-    pub size: u64,
-    #[serde(default)]
-    pub r#type: String,
-    #[serde(default)]
-    pub last_modified: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerFileUploadInput {
-    #[serde(default)]
-    pub resolved_by: String,
-    #[serde(default)]
-    pub match_count: u32,
-    #[serde(default)]
-    pub frame_id: Option<i64>,
-    #[serde(default)]
-    pub element_path: Option<String>,
-    #[serde(default)]
-    pub backend_node_id: Option<i64>,
-    #[serde(default)]
-    pub tag_name: String,
-    #[serde(default)]
-    pub type_attr: String,
-    #[serde(default)]
-    pub id: String,
-    #[serde(default)]
-    pub name_attr: String,
-    #[serde(default)]
-    pub accept: String,
-    #[serde(default)]
-    pub multiple: bool,
-    #[serde(default)]
-    pub webkitdirectory: bool,
-    #[serde(default)]
-    pub disabled: bool,
-    #[serde(default)]
-    pub file_count: usize,
-    #[serde(default)]
-    pub files: Vec<ChromeDebuggerFileUploadFile>,
-    #[serde(default)]
-    pub value: String,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerFileChooserEntry {
-    pub seq: u64,
-    #[serde(default)]
-    pub frame_id: String,
-    #[serde(default)]
-    pub mode: String,
-    #[serde(default)]
-    pub backend_node_id: Option<i64>,
-    pub opened_at_unix_ms: u64,
-    #[serde(default)]
-    pub pending: bool,
-    #[serde(default)]
-    pub handled_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub canceled_at_unix_ms: Option<u64>,
-    #[serde(default)]
-    pub requested_file_count: Option<usize>,
-    #[serde(default)]
-    pub file_names: Vec<String>,
-    #[serde(default)]
-    pub input: Option<ChromeDebuggerFileUploadInput>,
-    #[serde(default)]
-    pub error: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct ChromeDebuggerFileUploadResult {
-    pub target_id: String,
-    pub tab_id: u32,
-    #[serde(default)]
-    pub chrome_window_id: Option<i64>,
-    pub operation: String,
-    #[serde(default)]
-    pub capture_newly_armed: bool,
-    #[serde(default)]
-    pub selector: Option<String>,
-    #[serde(default)]
-    pub element_id: Option<String>,
-    #[serde(default)]
-    pub active_element: bool,
-    #[serde(default)]
-    pub requested_file_count: usize,
-    #[serde(default)]
-    pub input: Option<ChromeDebuggerFileUploadInput>,
-    #[serde(default)]
-    pub handled_chooser: Option<ChromeDebuggerFileChooserEntry>,
-    #[serde(default)]
-    pub canceled_chooser: Option<ChromeDebuggerFileChooserEntry>,
-    #[serde(default)]
-    pub pending_chooser: Option<ChromeDebuggerFileChooserEntry>,
-    #[serde(default)]
-    pub entries: Vec<ChromeDebuggerFileChooserEntry>,
-    #[serde(default)]
-    pub next_cursor: u64,
-    #[serde(default)]
-    pub returned: usize,
-    #[serde(default)]
-    pub total_buffered: usize,
-    #[serde(default)]
-    pub dropped: u64,
-    #[serde(default)]
-    pub opened_count: u64,
-    #[serde(default)]
-    pub handled_count: u64,
-    #[serde(default)]
-    pub canceled_count: u64,
-    #[serde(default)]
-    pub error_count: u64,
-    pub url: String,
-    pub title: String,
-    #[serde(default)]
-    pub ready_state: String,
-    #[serde(default)]
-    pub readback_backend: String,
-    #[serde(default)]
-    pub chooser_readback_backend: String,
-    #[serde(default)]
-    pub backend_tier_used: String,
-    #[serde(default)]
-    pub required_foreground: bool,
-    pub target_candidate_count: u32,
-    pub target_selection_reason: String,
-    #[serde(default)]
-    pub extension_id: Option<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ChromeBridgeReloadCommandAck {
     pub ok: bool,
     pub control_surface: String,
@@ -4389,25 +3235,50 @@ pub struct ChromeBridgeReloadCommandAck {
     pub extension_service_worker_sha256: String,
     pub active_profile: String,
     pub reason: String,
-    pub chrome_window_pid: Option<u32>,
-    pub chrome_window_hwnd: Option<i64>,
     pub profile_before_installed: bool,
     pub profile_before_ready: bool,
     pub profile_after_installed: bool,
     pub profile_after_ready: bool,
-    pub ui_before_reload_button_present: Option<bool>,
-    pub ui_before_enable_toggle_on: Option<bool>,
-    pub ui_after_reload_button_present: Option<bool>,
-    pub ui_after_enable_toggle_on: Option<bool>,
-    pub maintenance_tab: Value,
-    pub maintenance_cleanup: Value,
-    pub durable_profile_readback: Value,
+    pub loaded_build_id: String,
+    pub deployed_build_id: String,
+    pub scheduled_at_unix_ms: u64,
+    pub reload_delay_ms: u64,
+    pub foreground_api_calls: u64,
+    pub tab_mutations: u64,
+    pub synthetic_input_events: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ChromeBridgeRuntimeReloadAck {
+    ok: bool,
+    control_surface: String,
+    required_foreground: bool,
+    extension_id: String,
+    loaded_build_id: String,
+    deployed_build_id: String,
+    scheduled_at_unix_ms: u64,
+    reload_delay_ms: u64,
+    foreground_api_calls: u64,
+    tab_mutations: u64,
+    synthetic_input_events: u64,
 }
 
 #[derive(Debug)]
-struct ChromeBridgeHostUiReloadAttempt {
-    ack: ChromeBridgeReloadCommandAck,
-    postcondition_error: Option<ChromeDebuggerBridgeError>,
+struct ChromeBridgeBackgroundDeployReadback {
+    installer_path: String,
+    installer_sha256: String,
+    installer_exit_code: i32,
+    installer_stdout_sha256: String,
+    installer_stderr_sha256: String,
+    installer_duration_ms: u64,
+    extension_dir: String,
+    extension_service_worker_sha256: String,
+    active_profile: String,
+    profile_before_installed: bool,
+    profile_before_ready: bool,
+    profile_after_installed: bool,
+    profile_after_ready: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -4450,36 +3321,6 @@ pub struct ChromeBridgeReloadResult {
     pub after: ChromeBridgeHostSnapshot,
     pub reconnected: bool,
     pub waited_ms: u64,
-}
-
-#[derive(Clone, Debug)]
-struct ChromeBridgeMaintenanceTabLease {
-    token: String,
-    marker_url: String,
-    marker_title: String,
-    tabs_before: Vec<ChromeDebuggerTabTarget>,
-}
-
-fn reload_preexisting_tabs_match(
-    expected: &[ChromeDebuggerTabTarget],
-    actual: &[ChromeDebuggerTabTarget],
-) -> bool {
-    if expected.len() != actual.len() {
-        return false;
-    }
-    expected.iter().all(|before| {
-        actual.iter().any(|after| {
-            before.target_id == after.target_id
-                && before.tab_id == after.tab_id
-                && before.chrome_window_id == after.chrome_window_id
-                && before.index == after.index
-                && before.target_type == after.target_type
-                && before.url == after.url
-                && before.active == after.active
-                && before.highlighted == after.highlighted
-                && before.pinned == after.pinned
-        })
-    })
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -5226,12 +4067,12 @@ fn bridge_command_stale_reason_with_profile_state(
             host.extension_id.as_deref().unwrap_or("not_seen_yet")
         ));
     }
-    if kind == MAINTENANCE_RECONNECT_PAUSE_COMMAND {
+    if kind == MAINTENANCE_RECONNECT_PAUSE_COMMAND || kind == BACKGROUND_RUNTIME_RELOAD_COMMAND {
         if host.extension_capabilities.contains(kind) {
             return None;
         }
         return Some(format!(
-            "missing_capability={MAINTENANCE_RECONNECT_PAUSE_COMMAND} loaded_capabilities={}",
+            "missing_capability={kind} loaded_capabilities={}",
             format_capabilities(&host.extension_capabilities)
         ));
     }
@@ -5286,9 +4127,9 @@ fn bridge_command_stale_reason_with_profile_state(
     if !identity_reasons.is_empty() {
         return Some(identity_reasons.join("|"));
     }
-    if host.extension_debugger_api_available != Some(true) {
+    if host.extension_debugger_api_available != Some(false) {
         return Some(format!(
-            "debugger_api_available={} expected=true",
+            "debugger_api_available={} expected=false",
             host.extension_debugger_api_available
                 .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string())
         ));
@@ -5432,9 +4273,9 @@ fn bridge_identity_stale_reasons(host: &ChromeBridgeHealthRecord) -> Vec<String>
     ) {
         reasons.push(reason);
     }
-    if host.extension_debugger_api_available != Some(true) {
+    if host.extension_debugger_api_available != Some(false) {
         reasons.push(format!(
-            "debugger_api_available={} expected=true",
+            "debugger_api_available={} expected=false",
             host.extension_debugger_api_available
                 .map_or_else(|| "not_seen_yet".to_owned(), |value| value.to_string())
         ));
@@ -5737,36 +4578,6 @@ fn json_pointer_required_bool(
         })
 }
 
-fn json_pointer_required_u32(
-    value: &Value,
-    pointer: &str,
-) -> Result<u32, ChromeDebuggerBridgeError> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_READBACK_INVALID field={pointer} expected=u32 remediation=inspect the framed installer JSON and repair the named missing, negative, overflowed, or mistyped field"
-            ))
-        })
-}
-
-fn json_pointer_optional_bool(value: &Value, pointer: &str) -> Option<bool> {
-    value.pointer(pointer).and_then(Value::as_bool)
-}
-
-fn json_pointer_optional_u32(value: &Value, pointer: &str) -> Option<u32> {
-    value
-        .pointer(pointer)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-}
-
-fn json_pointer_optional_i64(value: &Value, pointer: &str) -> Option<i64> {
-    value.pointer(pointer).and_then(Value::as_i64)
-}
-
 fn process_diagnostic(bytes: &[u8]) -> String {
     let text = String::from_utf8_lossy(bytes);
     let chars = text.chars().count();
@@ -5778,167 +4589,9 @@ fn process_diagnostic(bytes: &[u8]) -> String {
     bounded.replace(['\r', '\n'], " | ")
 }
 
-fn bounded_json_string<'a>(value: &'a Value, key: &str, max_chars: usize) -> Option<&'a str> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|text| text.chars().count() <= max_chars)
-}
-
-fn sanitize_chrome_fullscreen_control(value: &Value) -> Option<Value> {
-    let runtime_id = bounded_json_string(value, "runtime_id", 512)?.trim();
-    let automation_id = bounded_json_string(value, "automation_id", 512)?;
-    let class_name = bounded_json_string(value, "class_name", 512)?;
-    let name = bounded_json_string(value, "name", 512)?.trim();
-    let owner_runtime_id = bounded_json_string(value, "owner_runtime_id", 512)?.trim();
-    let owner_automation_id = bounded_json_string(value, "owner_automation_id", 512)?;
-    let owner_class_name = bounded_json_string(value, "owner_class_name", 512)?;
-    let owner_name = bounded_json_string(value, "owner_name", 512)?;
-    let is_enabled = value.get("is_enabled").and_then(Value::as_bool)?;
-    let is_offscreen = value.get("is_offscreen").and_then(Value::as_bool)?;
-    let invoke_pattern_supported = value
-        .get("invoke_pattern_supported")
-        .and_then(Value::as_bool)?;
-    let bounds = value.get("bounds")?;
-    let x = bounds.get("x").and_then(Value::as_f64)?;
-    let y = bounds.get("y").and_then(Value::as_f64)?;
-    let width = bounds.get("width").and_then(Value::as_f64)?;
-    let height = bounds.get("height").and_then(Value::as_f64)?;
-    if runtime_id.is_empty()
-        || name.is_empty()
-        || owner_runtime_id.is_empty()
-        || !is_enabled
-        || is_offscreen
-        || !invoke_pattern_supported
-        || !x.is_finite()
-        || !y.is_finite()
-        || !width.is_finite()
-        || !height.is_finite()
-        || width <= 0.0
-        || height <= 0.0
-    {
-        return None;
-    }
-    Some(json!({
-        "runtime_id": runtime_id,
-        "automation_id": automation_id,
-        "class_name": class_name,
-        "name": name,
-        "is_enabled": is_enabled,
-        "is_offscreen": is_offscreen,
-        "invoke_pattern_supported": invoke_pattern_supported,
-        "bounds": { "x": x, "y": y, "width": width, "height": height },
-        "owner_runtime_id": owner_runtime_id,
-        "owner_automation_id": owner_automation_id,
-        "owner_class_name": owner_class_name,
-        "owner_name": owner_name,
-    }))
-}
-
-fn sanitize_chrome_fullscreen_transaction(
-    value: &Value,
-    expected_hwnd: i64,
-    expected_pid: u64,
-) -> Option<Value> {
-    let mode = bounded_json_string(value, "mode", 64)?;
-    let detected = value.get("detected").and_then(Value::as_bool)?;
-    let exit_attempted = value.get("exit_attempted").and_then(Value::as_bool)?;
-    let exit_verified = value.get("exit_verified").and_then(Value::as_bool)?;
-    let restore_required = value.get("restore_required").and_then(Value::as_bool)?;
-    let restore_attempted = value.get("restore_attempted").and_then(Value::as_bool)?;
-    let restored = value.get("restored").and_then(Value::as_bool)?;
-    let operator_superseded = value.get("operator_superseded").and_then(Value::as_bool)?;
-    let outcome = bounded_json_string(value, "outcome", 96)?;
-    let chrome_window_hwnd = value.get("chrome_window_hwnd").and_then(Value::as_i64)?;
-    let chrome_window_pid = value.get("chrome_window_pid").and_then(Value::as_u64)?;
-    let chrome_process_started_at_100ns = value
-        .get("chrome_process_started_at_100ns")
-        .and_then(Value::as_u64)?;
-    let chrome_executable_path =
-        bounded_json_string(value, "chrome_executable_path", 32_768)?.trim();
-    let selected_runtime_id = bounded_json_string(value, "selected_runtime_id", 512)?.trim();
-    let initial_tab_container_count = value
-        .get("initial_tab_container_count")
-        .and_then(Value::as_u64)?;
-    let post_exit_tab_container_count = value
-        .get("post_exit_tab_container_count")
-        .and_then(Value::as_u64)?;
-    let post_restore_tab_container_count = value
-        .get("post_restore_tab_container_count")
-        .and_then(Value::as_u64);
-    if chrome_window_hwnd != expected_hwnd
-        || chrome_window_pid != expected_pid
-        || chrome_process_started_at_100ns == 0
-        || chrome_executable_path.is_empty()
-        || selected_runtime_id.is_empty()
-    {
-        return None;
-    }
-    let (exit_control, inverse_control) = match mode {
-        "none"
-            if !detected
-                && !exit_attempted
-                && exit_verified
-                && !restore_required
-                && !restore_attempted
-                && restored
-                && !operator_superseded
-                && outcome == "not_required"
-                && initial_tab_container_count == 1
-                && post_exit_tab_container_count == 1
-                && post_restore_tab_container_count == Some(1)
-                && value.get("exit_control").is_some_and(Value::is_null)
-                && value.get("inverse_control").is_some_and(Value::is_null) =>
-        {
-            (Value::Null, Value::Null)
-        }
-        "content_fullscreen_exact_uia_control"
-            if detected
-                && exit_attempted
-                && exit_verified
-                && restore_required
-                && !restore_attempted
-                && !restored
-                && !operator_superseded
-                && outcome == "exited_pending_restore"
-                && initial_tab_container_count == 0
-                && post_exit_tab_container_count == 1
-                && post_restore_tab_container_count.is_none() =>
-        {
-            (
-                sanitize_chrome_fullscreen_control(value.get("exit_control")?)?,
-                sanitize_chrome_fullscreen_control(value.get("inverse_control")?)?,
-            )
-        }
-        _ => return None,
-    };
-    Some(json!({
-        "mode": mode,
-        "detected": detected,
-        "exit_attempted": exit_attempted,
-        "exit_verified": exit_verified,
-        "restore_required": restore_required,
-        "restore_attempted": restore_attempted,
-        "restored": restored,
-        "operator_superseded": operator_superseded,
-        "outcome": outcome,
-        "chrome_window_hwnd": chrome_window_hwnd,
-        "chrome_window_pid": chrome_window_pid,
-        "chrome_process_started_at_100ns": chrome_process_started_at_100ns,
-        "chrome_executable_path": chrome_executable_path,
-        "selected_runtime_id": selected_runtime_id,
-        "initial_tab_container_count": initial_tab_container_count,
-        "post_exit_tab_container_count": post_exit_tab_container_count,
-        "post_restore_tab_container_count": post_restore_tab_container_count,
-        "exit_control": exit_control,
-        "inverse_control": inverse_control,
-    }))
-}
-
 #[cfg(windows)]
-async fn run_chrome_bridge_host_ui_reload(
-    maintenance: &ChromeBridgeMaintenanceTabLease,
-) -> Result<ChromeBridgeHostUiReloadAttempt, ChromeDebuggerBridgeError> {
+async fn run_chrome_bridge_background_deploy()
+-> Result<ChromeBridgeBackgroundDeployReadback, ChromeDebuggerBridgeError> {
     use std::os::windows::process::CommandExt;
 
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -5949,7 +4602,7 @@ async fn run_chrome_bridge_host_ui_reload(
         .and_then(Path::parent)
         .ok_or_else(|| {
             ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_SOURCE_DIR_INVALID cargo_manifest_dir={} remediation=rebuild synapse-mcp from a real Synapse checkout containing scripts\\install-synapse-chrome-debugger.ps1",
+                "SYNAPSE_CHROME_BACKGROUND_DEPLOY_SOURCE_DIR_INVALID cargo_manifest_dir={} remediation=rebuild synapse-mcp from a real Synapse checkout containing scripts\\install-synapse-chrome-debugger.ps1",
                 manifest_dir.display()
             ))
         })?;
@@ -5958,16 +4611,15 @@ async fn run_chrome_bridge_host_ui_reload(
         .join("install-synapse-chrome-debugger.ps1");
     let installer_bytes = std::fs::read(&installer_path).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_INSTALLER_READ_FAILED path={} error={} remediation=restore the repo installer at the compiled source checkout and retry browser_debugger reload_bridge",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_INSTALLER_READ_FAILED path={} error={} remediation=restore the repo installer at the compiled source checkout and retry browser_debugger reload_bridge",
             installer_path.display(),
             error
         ))
     })?;
     let installer_sha256 = sha256_hex_lower(&installer_bytes);
-
     let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
         ChromeDebuggerBridgeError::host_reload_failed(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_SYSTEM_ROOT_MISSING remediation=repair the Windows process environment so SystemRoot resolves Windows PowerShell",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_SYSTEM_ROOT_MISSING remediation=repair the Windows process environment so SystemRoot resolves Windows PowerShell",
         )
     })?;
     let powershell_path = PathBuf::from(system_root)
@@ -5977,7 +4629,7 @@ async fn run_chrome_bridge_host_ui_reload(
         .join("powershell.exe");
     if !powershell_path.is_file() {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POWERSHELL_MISSING path={} remediation=repair the configured Windows PowerShell installation before retrying the exact Chrome UI control",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_POWERSHELL_MISSING path={} remediation=repair the configured Windows PowerShell installation before retrying the background-only deploy",
             powershell_path.display()
         )));
     }
@@ -5986,19 +4638,7 @@ async fn run_chrome_bridge_host_ui_reload(
     command
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
         .arg(&installer_path)
-        .args([
-            "-ReloadExistingExtensionViaUi",
-            "-MaintenanceTabToken",
-            &maintenance.token,
-            "-MaintenanceMarkerUrl",
-            &maintenance.marker_url,
-            "-MaintenanceMarkerTitle",
-            &maintenance.marker_title,
-            "-AutoInstallTimeoutSeconds",
-            HOST_UI_RELOAD_INSTALLER_TIMEOUT_SECONDS,
-            "-OutputJson",
-        ]);
-    command
+        .args(["-SkipAutoInstall", "-OutputJson"])
         .current_dir(source_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -6009,27 +4649,27 @@ async fn run_chrome_bridge_host_ui_reload(
     let started = Instant::now();
     let child = command.spawn().map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_SPAWN_FAILED launcher={} installer={} error={} remediation=repair PowerShell or source-checkout process permissions and retry browser_debugger reload_bridge",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_PROCESS_SPAWN_FAILED launcher={} installer={} error={} remediation=repair PowerShell or source-checkout process permissions and retry browser_debugger reload_bridge",
             powershell_path.display(),
             installer_path.display(),
             error
         ))
     })?;
     let child_pid = child.id().unwrap_or(0);
-    let output = timeout(HOST_UI_RELOAD_PROCESS_TIMEOUT, child.wait_with_output())
+    let output = timeout(BACKGROUND_DEPLOY_PROCESS_TIMEOUT, child.wait_with_output())
         .await
         .map_err(|_| {
             ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_TIMEOUT pid={} timeout_ms={} installer={} installer_sha256={} remediation=the bounded exact Chrome UI control process was terminated; inspect the already-open Chrome window and rerun after repairing the named UI or profile condition",
+                "SYNAPSE_CHROME_BACKGROUND_DEPLOY_PROCESS_TIMEOUT pid={} timeout_ms={} installer={} installer_sha256={} remediation=the hidden background deploy process was terminated; inspect the installer output and physical extension directory without interacting with a human Chrome window",
                 child_pid,
-                HOST_UI_RELOAD_PROCESS_TIMEOUT.as_millis(),
+                BACKGROUND_DEPLOY_PROCESS_TIMEOUT.as_millis(),
                 installer_path.display(),
                 installer_sha256
             ))
         })?
         .map_err(|error| {
             ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_WAIT_FAILED pid={} installer={} error={} remediation=inspect Windows process state and retry the exact Chrome UI control",
+                "SYNAPSE_CHROME_BACKGROUND_DEPLOY_PROCESS_WAIT_FAILED pid={} installer={} error={} remediation=inspect Windows process state and retry the background-only deploy",
                 child_pid,
                 installer_path.display(),
                 error
@@ -6041,7 +4681,7 @@ async fn run_chrome_bridge_host_ui_reload(
     let installer_stderr_sha256 = sha256_hex_lower(&output.stderr);
     if !output.status.success() {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_PROCESS_FAILED pid={} exit_code={} installer={} installer_sha256={} stdout_sha256={} stderr_sha256={} stdout_tail={} stderr_tail={} remediation=repair the exact SYNAPSE_CHROME_* condition named by the installer output, then retry browser_debugger reload_bridge",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_PROCESS_FAILED pid={} exit_code={} installer={} installer_sha256={} stdout_sha256={} stderr_sha256={} stdout_tail={} stderr_tail={} remediation=repair the exact SYNAPSE_CHROME_* condition named by the installer; the deploy failed before any foreground API, tab mutation, or synthetic input",
             child_pid,
             installer_exit_code,
             installer_path.display(),
@@ -6052,35 +4692,34 @@ async fn run_chrome_bridge_host_ui_reload(
             process_diagnostic(&output.stderr)
         )));
     }
-
     let stdout = String::from_utf8(output.stdout).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_STDOUT_UTF8_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer process output encoding and retry"
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_STDOUT_UTF8_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer process output encoding and retry"
         ))
     })?;
     let payload_rows = stdout
         .lines()
-        .filter_map(|line| line.trim().strip_prefix(HOST_UI_RELOAD_JSON_PREFIX))
+        .filter_map(|line| line.trim().strip_prefix(BACKGROUND_DEPLOY_JSON_PREFIX))
         .collect::<Vec<_>>();
     if payload_rows.len() != 1 {
         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_FRAME_INVALID pid={} frame_count={} stdout_sha256={} stderr_sha256={} stdout_tail={} remediation=the installer must emit exactly one {} frame after the physical UI action",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_JSON_FRAME_INVALID pid={} frame_count={} stdout_sha256={} stderr_sha256={} stdout_tail={} remediation=the installer must emit exactly one {} frame after background deployment",
             child_pid,
             payload_rows.len(),
             installer_stdout_sha256,
             installer_stderr_sha256,
             process_diagnostic(stdout.as_bytes()),
-            HOST_UI_RELOAD_JSON_PREFIX
+            BACKGROUND_DEPLOY_JSON_PREFIX
         )));
     }
     let payload = BASE64_STANDARD.decode(payload_rows[0]).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_BASE64_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer JSON frame encoder and retry"
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_JSON_BASE64_INVALID pid={child_pid} stdout_sha256={installer_stdout_sha256} error={error} remediation=repair the installer JSON frame encoder and retry"
         ))
     })?;
     let readback: Value = serde_json::from_slice(&payload).map_err(|error| {
         ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_JSON_INVALID pid={} payload_sha256={} error={} remediation=repair the installer JSON serializer and retry",
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_JSON_INVALID pid={} payload_sha256={} error={} remediation=repair the installer JSON serializer and retry",
             child_pid,
             sha256_hex_lower(&payload),
             error
@@ -6088,25 +4727,39 @@ async fn run_chrome_bridge_host_ui_reload(
     })?;
 
     let ok = json_pointer_required_bool(&readback, "/ok")?;
-    let extension_id = json_pointer_required_str(&readback, "/extension_id")?.to_owned();
+    let extension_id = json_pointer_required_str(&readback, "/extension_id")?;
     let extension_dir = json_pointer_required_str(&readback, "/extension_dir")?.to_owned();
+    let deployed_build_id = json_pointer_required_str(&readback, "/extension_deploy/build_id")?;
+    let declared_build_sha256 =
+        json_pointer_required_str(&readback, "/extension_deploy/declared_build_sha256")?;
     let extension_service_worker_sha256 =
         json_pointer_required_str(&readback, "/extension_deploy/service_worker_sha256")?.to_owned();
-    let active_profile =
-        json_pointer_required_str(&readback, "/synapse_chrome_auto_install/active_profile")?
-            .to_owned();
-    let reason =
-        json_pointer_required_str(&readback, "/synapse_chrome_auto_install/reason")?.to_owned();
-    let attempted =
-        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/attempted")?;
-    let changed = json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/changed")?;
-    let required_foreground = json_pointer_required_bool(
+    let byte_exact = json_pointer_required_bool(
         &readback,
-        "/synapse_chrome_auto_install/required_foreground",
+        "/extension_deploy/service_worker_byte_exact_readback",
     )?;
+    let register_token_matches = json_pointer_required_bool(
+        &readback,
+        "/extension_deploy/bridge_register_token_matches_expected",
+    )?;
+    let profile_scanned =
+        json_pointer_required_bool(&readback, "/synapse_chrome_profile_install_state/scanned")?;
+    let profile_installed =
+        json_pointer_required_bool(&readback, "/synapse_chrome_profile_install_state/installed")?;
     let active_profile_installed = json_pointer_required_bool(
         &readback,
         "/synapse_chrome_profile_install_state/active_profile_installed",
+    )?;
+    let active_profile =
+        json_pointer_required_str(&readback, "/synapse_chrome_auto_install/active_profile")?
+            .to_owned();
+    let attempted =
+        json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/attempted")?;
+    let changed = json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/changed")?;
+    let reason = json_pointer_required_str(&readback, "/synapse_chrome_auto_install/reason")?;
+    let required_foreground = json_pointer_required_bool(
+        &readback,
+        "/synapse_chrome_auto_install/required_foreground",
     )?;
     let profile_before_installed =
         json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/before/installed")?;
@@ -6116,631 +4769,75 @@ async fn run_chrome_bridge_host_ui_reload(
         json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/installed")?;
     let profile_after_ready =
         json_pointer_required_bool(&readback, "/synapse_chrome_auto_install/after/ready")?;
-    let daemon_bridge_after_pid = json_pointer_required_u32(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/daemon_pid",
-    )?;
-    let daemon_bridge_after_host_id = json_pointer_required_str(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/active_host_id",
-    )?;
-    let daemon_bridge_after_host_count = json_pointer_required_u32(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/host_count",
-    )?;
-    let daemon_bridge_after_tab_control = json_pointer_required_bool(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/tab_control_available",
-    )?;
-    let daemon_bridge_after_extension_id = json_pointer_required_str(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/extension_id",
-    )?;
-    let daemon_bridge_after_build_id = json_pointer_required_str(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/extension_build_id",
-    )?;
-    let daemon_bridge_after_worker_sha256 = json_pointer_required_str(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/extension_service_worker_sha256",
-    )?;
-    let daemon_bridge_after_stale = json_pointer_required_bool(
-        &readback,
-        "/synapse_chrome_auto_install/daemon_bridge_after/extension_stale",
-    )?;
-    let reason_accepted = matches!(
-        reason.as_str(),
-        "existing_extension_permission_activation_ui_reload_invoked"
-            | "existing_ready_extension_ui_reload_invoked"
-            | "existing_ready_extension_nonstable_path_ui_reload_invoked"
-            | "migrated_existing_extension_to_credentialed_stable_path"
-            | "installed_unpacked_extension_in_active_profile"
-    );
-    let ui_preexisting_target_tab_count = json_pointer_required_u32(
-        &readback,
-        "/synapse_chrome_auto_install/maintenance_tab/tab_strip_before_create/count",
-    )?;
-    let postcondition_error = if !ok
+    if !ok
         || extension_id != EXTENSION_ID
+        || deployed_build_id != EXPECTED_EXTENSION_BUILD_ID
+        || declared_build_sha256 != EXPECTED_EXTENSION_DECLARED_BUILD_SHA256
         || extension_service_worker_sha256.len() != 64
-        || !attempted
-        || !changed
-        || !required_foreground
+        || !byte_exact
+        || !register_token_matches
+        || !profile_scanned
+        || !profile_installed
         || !active_profile_installed
+        || attempted
+        || changed
+        || reason != "skip_auto_install_requested"
+        || required_foreground
+        || !profile_before_installed
+        || !profile_before_ready
         || !profile_after_installed
         || !profile_after_ready
-        || daemon_bridge_after_pid != std::process::id()
-        || daemon_bridge_after_host_id.is_empty()
-        || daemon_bridge_after_host_count != 1
-        || !daemon_bridge_after_tab_control
-        || daemon_bridge_after_extension_id != EXTENSION_ID
-        || daemon_bridge_after_build_id != EXPECTED_EXTENSION_BUILD_ID
-        || daemon_bridge_after_worker_sha256 != extension_service_worker_sha256
-        || daemon_bridge_after_stale
-        || !reason_accepted
     {
-        Some(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} service_worker_sha256={} attempted={} changed={} required_foreground={} active_profile={} active_profile_installed={} profile_after_installed={} profile_after_ready={} daemon_bridge_after_pid={} expected_daemon_pid={} daemon_bridge_after_host_id={} daemon_bridge_after_host_count={} daemon_bridge_after_tab_control={} daemon_bridge_after_extension_id={} daemon_bridge_after_build_id={} daemon_bridge_after_worker_sha256={} daemon_bridge_after_stale={} reason={} reason_accepted={} installer={} installer_sha256={} remediation=inspect the physical Chrome profile row, replacement host, and exact extension management UI state; the daemon refuses to accept a partial or no-op repair",
+        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+            "SYNAPSE_CHROME_BACKGROUND_DEPLOY_POSTCONDITION_FAILED ok={} extension_id={} expected_extension_id={} deployed_build_id={} expected_build_id={} declared_build_sha256={} expected_declared_build_sha256={} service_worker_sha256={} byte_exact={} register_token_matches={} profile_scanned={} profile_installed={} active_profile={} active_profile_installed={} attempted={} changed={} reason={} required_foreground={} before_installed={} before_ready={} after_installed={} after_ready={} installer={} installer_sha256={} remediation=repair the exact deployed-file or physical Chrome profile-row mismatch; Synapse refuses to reload partial, unready, or foreground-dependent state",
             ok,
             extension_id,
             EXTENSION_ID,
+            deployed_build_id,
+            EXPECTED_EXTENSION_BUILD_ID,
+            declared_build_sha256,
+            EXPECTED_EXTENSION_DECLARED_BUILD_SHA256,
             extension_service_worker_sha256,
-            attempted,
-            changed,
-            required_foreground,
+            byte_exact,
+            register_token_matches,
+            profile_scanned,
+            profile_installed,
             active_profile,
             active_profile_installed,
+            attempted,
+            changed,
+            reason,
+            required_foreground,
+            profile_before_installed,
+            profile_before_ready,
             profile_after_installed,
             profile_after_ready,
-            daemon_bridge_after_pid,
-            std::process::id(),
-            daemon_bridge_after_host_id,
-            daemon_bridge_after_host_count,
-            daemon_bridge_after_tab_control,
-            daemon_bridge_after_extension_id,
-            daemon_bridge_after_build_id,
-            daemon_bridge_after_worker_sha256,
-            daemon_bridge_after_stale,
-            reason,
-            reason_accepted,
             installer_path.display(),
             installer_sha256
-        )))
-    } else {
-        None
-    };
-
-    let ack = ChromeBridgeReloadCommandAck {
-        ok,
-        control_surface: "chrome_extensions_exact_reload_or_load_unpacked_control".to_owned(),
-        required_foreground,
+        )));
+    }
+    Ok(ChromeBridgeBackgroundDeployReadback {
         installer_path: installer_path.display().to_string(),
         installer_sha256,
         installer_exit_code,
         installer_stdout_sha256,
         installer_stderr_sha256,
         installer_duration_ms,
-        extension_id,
         extension_dir,
         extension_service_worker_sha256,
         active_profile,
-        reason,
-        chrome_window_pid: json_pointer_optional_u32(
-            &readback,
-            "/synapse_chrome_auto_install/chrome_window_pid",
-        ),
-        chrome_window_hwnd: json_pointer_optional_i64(
-            &readback,
-            "/synapse_chrome_auto_install/chrome_window_hwnd",
-        ),
         profile_before_installed,
         profile_before_ready,
         profile_after_installed,
         profile_after_ready,
-        ui_before_reload_button_present: json_pointer_optional_bool(
-            &readback,
-            "/synapse_chrome_auto_install/ui_before/reload_button_present",
-        ),
-        ui_before_enable_toggle_on: json_pointer_optional_bool(
-            &readback,
-            "/synapse_chrome_auto_install/ui_before/enable_toggle_on",
-        ),
-        ui_after_reload_button_present: json_pointer_optional_bool(
-            &readback,
-            "/synapse_chrome_auto_install/ui_after/reload_button_present",
-        ),
-        ui_after_enable_toggle_on: json_pointer_optional_bool(
-            &readback,
-            "/synapse_chrome_auto_install/ui_after/enable_toggle_on",
-        ),
-        maintenance_tab: json!({
-            "token": maintenance.token,
-            "marker_url": maintenance.marker_url,
-            "marker_title": maintenance.marker_title,
-            "ownership_source": "verified_uia_new_tab_marker_then_exact_chrome_tabs_token_resolution",
-            // UI Automation scopes this count to the exact HWND selected by the
-            // installer. The read-only bridge snapshot is browser-wide and is
-            // deliberately carried separately; equating them breaks whenever a
-            // second Chrome window exists.
-            "preexisting_tab_count": ui_preexisting_target_tab_count,
-            "bridge_preexisting_tab_count": maintenance.tabs_before.len(),
-            "script_lease": readback.pointer("/synapse_chrome_auto_install/maintenance_tab"),
-            "operation_navigation": readback.pointer("/synapse_chrome_auto_install/navigation"),
-        }),
-        maintenance_cleanup: json!({
-            "attempted": false,
-            "absent_verified": false,
-            "reason": "pending_replacement_host_readback",
-        }),
-        durable_profile_readback: readback
-            .pointer("/synapse_chrome_auto_install/durable_profile_readback")
-            .cloned()
-            .unwrap_or(Value::Null),
-    };
-    Ok(ChromeBridgeHostUiReloadAttempt {
-        ack,
-        postcondition_error,
     })
 }
 
-#[cfg(windows)]
-async fn run_chrome_bridge_host_ui_cleanup(
-    maintenance: &ChromeBridgeMaintenanceTabLease,
-    ack: &ChromeBridgeReloadCommandAck,
-) -> Result<Value, ChromeDebuggerBridgeError> {
-    use std::os::windows::process::CommandExt;
-
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let installer_path = PathBuf::from(&ack.installer_path);
-    let installer_bytes = std::fs::read(&installer_path).map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_INSTALLER_READ_FAILED path={} error={} remediation=restore the exact installer used by the maintenance operation before cleanup",
-            installer_path.display(),
-            error
-        ))
-    })?;
-    let installer_sha256 = sha256_hex_lower(&installer_bytes);
-    if installer_sha256 != ack.installer_sha256 {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_INSTALLER_HASH_DRIFT path={} expected_sha256={} actual_sha256={} remediation=cleanup refuses to execute installer bytes that changed after maintenance-tab creation",
-            installer_path.display(),
-            ack.installer_sha256,
-            installer_sha256
-        )));
-    }
-    let lease = ack
-        .maintenance_tab
-        .get("script_lease")
-        .filter(|value| value.is_object())
-        .ok_or_else(|| {
-            ChromeDebuggerBridgeError::host_reload_failed(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_MISSING remediation=the first installer process must return its exact UIA maintenance lease before daemon cleanup may recover",
-            )
-        })?;
-    let lease_token = lease.get("token").and_then(Value::as_str).unwrap_or("");
-    let lease_marker_url = lease
-        .get("marker_url")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let lease_marker_title = lease
-        .get("marker_title")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    if lease_token != maintenance.token
-        || lease_marker_url != maintenance.marker_url
-        || lease_marker_title != maintenance.marker_title
-    {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_IDENTITY_MISMATCH token_matches={} marker_url_matches={} marker_title_matches={} remediation=cleanup refuses any lease that differs from the daemon-generated operation identity",
-            lease_token == maintenance.token,
-            lease_marker_url == maintenance.marker_url,
-            lease_marker_title == maintenance.marker_title,
-        )));
-    }
-    let ownership_source = lease
-        .get("ownership_source")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let created_via_ui = lease
-        .get("created_via_ui")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let chrome_window_hwnd = lease
-        .get("chrome_window_hwnd")
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let chrome_window_pid = lease
-        .get("chrome_window_pid")
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let expected_tab_count_after_cleanup = lease
-        .get("expected_tab_count_after_cleanup")
-        .and_then(Value::as_u64);
-    let owned_tab_runtime_id = lease
-        .get("owned_tab_runtime_id")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let baseline_tabs = lease
-        .pointer("/tab_strip_before_create/tabs")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let mut sanitized_baseline_tabs = Vec::with_capacity(baseline_tabs.len());
-    let mut baseline_runtime_ids = std::collections::HashSet::new();
-    let mut selected_before_count = 0_usize;
-    let mut baseline_invalid_count = 0_usize;
-    for tab in &baseline_tabs {
-        let runtime_id = tab.get("runtime_id").and_then(Value::as_str).unwrap_or("");
-        let selected = tab.get("selected").and_then(Value::as_bool);
-        if runtime_id.is_empty()
-            || runtime_id.chars().count() > 512
-            || selected.is_none()
-            || !baseline_runtime_ids.insert(runtime_id.to_owned())
-        {
-            baseline_invalid_count = baseline_invalid_count.saturating_add(1);
-            continue;
-        }
-        if selected == Some(true) {
-            selected_before_count = selected_before_count.saturating_add(1);
-        }
-        sanitized_baseline_tabs.push(json!({
-            "selected": selected,
-            "runtime_id": runtime_id,
-        }));
-    }
-    let foreground_lease = lease
-        .get("foreground_lease")
-        .filter(|value| value.is_object());
-    let prior_foreground_valid = foreground_lease
-        .and_then(|value| value.pointer("/prior_foreground/identity_valid"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    let prior_foreground_hwnd = foreground_lease
-        .and_then(|value| value.pointer("/prior_foreground/hwnd"))
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let prior_foreground_pid = foreground_lease
-        .and_then(|value| value.pointer("/prior_foreground/pid"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let prior_foreground_started = foreground_lease
-        .and_then(|value| value.pointer("/prior_foreground/process_started_at_100ns"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let prior_foreground_path = foreground_lease
-        .and_then(|value| value.pointer("/prior_foreground/executable_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let acquired_foreground_valid = foreground_lease
-        .and_then(|value| value.pointer("/acquired_chrome_foreground/identity_valid"))
-        .and_then(Value::as_bool)
-        == Some(true);
-    let acquired_foreground_hwnd = foreground_lease
-        .and_then(|value| value.pointer("/acquired_chrome_foreground/hwnd"))
-        .and_then(Value::as_i64)
-        .unwrap_or_default();
-    let acquired_foreground_pid = foreground_lease
-        .and_then(|value| value.pointer("/acquired_chrome_foreground/pid"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let acquired_foreground_started = foreground_lease
-        .and_then(|value| value.pointer("/acquired_chrome_foreground/process_started_at_100ns"))
-        .and_then(Value::as_u64)
-        .unwrap_or_default();
-    let acquired_foreground_path = foreground_lease
-        .and_then(|value| value.pointer("/acquired_chrome_foreground/executable_path"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let fullscreen_transaction = lease.get("fullscreen_transaction").and_then(|value| {
-        sanitize_chrome_fullscreen_transaction(value, chrome_window_hwnd, chrome_window_pid)
-    });
-    if ownership_source != "verified_uia_new_tab_marker"
-        || !created_via_ui
-        || chrome_window_hwnd <= 0
-        || chrome_window_pid == 0
-        || expected_tab_count_after_cleanup.is_none()
-        || owned_tab_runtime_id.is_empty()
-        || baseline_tabs.is_empty()
-        || baseline_tabs.len() > 512
-        || expected_tab_count_after_cleanup != u64::try_from(baseline_tabs.len()).ok()
-        || baseline_invalid_count != 0
-        || selected_before_count != 1
-        || baseline_runtime_ids.contains(owned_tab_runtime_id)
-        || foreground_lease.is_none()
-        || !prior_foreground_valid
-        || prior_foreground_hwnd <= 0
-        || prior_foreground_pid == 0
-        || prior_foreground_started == 0
-        || prior_foreground_path.is_empty()
-        || !acquired_foreground_valid
-        || acquired_foreground_hwnd != chrome_window_hwnd
-        || acquired_foreground_pid != chrome_window_pid
-        || acquired_foreground_started == 0
-        || acquired_foreground_path.is_empty()
-        || fullscreen_transaction.is_none()
-    {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_INCOMPLETE ownership_source={} created_via_ui={} hwnd={} pid={} expected_count_present={} expected_count_matches_baseline={} owned_runtime_id_present={} baseline_count={} baseline_invalid_count={} selected_before_count={} owned_absent_from_baseline={} foreground_lease_present={} prior_identity_valid={} prior_hwnd={} prior_pid={} prior_started={} prior_path_present={} acquired_identity_valid={} acquired_hwnd={} acquired_pid={} acquired_started={} acquired_path_present={} fullscreen_transaction_valid={} remediation=the first installer must return the complete bounded unique pre-operation UIA runtime-id set with one selected tab, exact prior/acquired HWND/PID/process-start/image foreground identities, and the exact sanitized fullscreen transaction",
-            ownership_source,
-            created_via_ui,
-            chrome_window_hwnd,
-            chrome_window_pid,
-            expected_tab_count_after_cleanup.is_some(),
-            expected_tab_count_after_cleanup == u64::try_from(baseline_tabs.len()).ok(),
-            !owned_tab_runtime_id.is_empty(),
-            baseline_tabs.len(),
-            baseline_invalid_count,
-            selected_before_count,
-            !baseline_runtime_ids.contains(owned_tab_runtime_id),
-            foreground_lease.is_some(),
-            prior_foreground_valid,
-            prior_foreground_hwnd,
-            prior_foreground_pid,
-            prior_foreground_started,
-            !prior_foreground_path.is_empty(),
-            acquired_foreground_valid,
-            acquired_foreground_hwnd,
-            acquired_foreground_pid,
-            acquired_foreground_started,
-            !acquired_foreground_path.is_empty(),
-            fullscreen_transaction.is_some(),
-        )));
-    }
-    let cleanup_lease = json!({
-        "token": lease_token,
-        "ownership_source": ownership_source,
-        "created_via_ui": true,
-        "owned_tab_runtime_id": owned_tab_runtime_id,
-        "chrome_tab_id": Value::Null,
-        "chrome_window_id": Value::Null,
-        "chrome_window_hwnd": chrome_window_hwnd,
-        "chrome_window_pid": chrome_window_pid,
-        "marker_url": lease_marker_url,
-        "marker_title": lease_marker_title,
-        "expected_tab_count_after_cleanup": expected_tab_count_after_cleanup,
-        "tab_strip_before_create": {
-            "count": sanitized_baseline_tabs.len(),
-            "tabs": sanitized_baseline_tabs,
-        },
-        "foreground_lease": foreground_lease.cloned().unwrap_or(Value::Null),
-        "fullscreen_transaction": fullscreen_transaction.unwrap_or(Value::Null),
-    });
-    let lease_json = serde_json::to_vec(&cleanup_lease).map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_LEASE_SERIALIZE_FAILED error={error} remediation=repair the installer lease JSON shape"
-        ))
-    })?;
-    let lease_base64 = BASE64_STANDARD.encode(lease_json);
-
-    let system_root = std::env::var_os("SystemRoot").ok_or_else(|| {
-        ChromeDebuggerBridgeError::host_reload_failed(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_SYSTEM_ROOT_MISSING remediation=repair the Windows process environment so SystemRoot resolves Windows PowerShell",
-        )
-    })?;
-    let powershell_path = PathBuf::from(system_root)
-        .join("System32")
-        .join("WindowsPowerShell")
-        .join("v1.0")
-        .join("powershell.exe");
-    if !powershell_path.is_file() {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POWERSHELL_MISSING path={} remediation=repair Windows PowerShell before retrying cleanup",
-            powershell_path.display()
-        )));
-    }
-
-    let mut command = Command::new(&powershell_path);
-    command
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
-        .arg(&installer_path)
-        .args([
-            "-CleanupOwnedMaintenanceTabViaUi",
-            "-MaintenanceTabToken",
-            &maintenance.token,
-            "-MaintenanceMarkerUrl",
-            &maintenance.marker_url,
-            "-MaintenanceMarkerTitle",
-            &maintenance.marker_title,
-            "-MaintenanceCleanupLeaseBase64",
-            &lease_base64,
-            "-AutoInstallTimeoutSeconds",
-            "30",
-            "-OutputJson",
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    if let Some(parent) = installer_path.parent() {
-        command.current_dir(parent);
-    }
-    command.as_std_mut().creation_flags(CREATE_NO_WINDOW);
-
-    let child = command.spawn().map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_SPAWN_FAILED launcher={} installer={} error={} remediation=repair PowerShell process launch and retry exact cleanup",
-            powershell_path.display(),
-            installer_path.display(),
-            error
-        ))
-    })?;
-    let child_pid = child.id().unwrap_or(0);
-    let output = timeout(HOST_UI_RELOAD_PROCESS_TIMEOUT, child.wait_with_output())
-        .await
-        .map_err(|_| {
-            ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_TIMEOUT pid={} timeout_ms={} remediation=the exact token-scoped UI cleanup did not finish within its bound",
-                child_pid,
-                HOST_UI_RELOAD_PROCESS_TIMEOUT.as_millis(),
-            ))
-        })?
-        .map_err(|error| {
-            ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_WAIT_FAILED pid={child_pid} error={error} remediation=inspect the exact spawned cleanup process"
-            ))
-        })?;
-    let stdout_sha256 = sha256_hex_lower(&output.stdout);
-    let stderr_sha256 = sha256_hex_lower(&output.stderr);
-    if !output.status.success() {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_PROCESS_FAILED pid={} exit_code={} stdout_sha256={} stderr_sha256={} stdout_tail={} stderr_tail={} remediation=repair the exact SYNAPSE_CHROME_MAINTENANCE_* condition; cleanup refuses to hide the surviving surface",
-            child_pid,
-            output.status.code().unwrap_or(-1),
-            stdout_sha256,
-            stderr_sha256,
-            process_diagnostic(&output.stdout),
-            process_diagnostic(&output.stderr),
-        )));
-    }
-    let stdout = String::from_utf8(output.stdout).map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_STDOUT_UTF8_INVALID pid={child_pid} stdout_sha256={stdout_sha256} error={error}"
-        ))
-    })?;
-    let payload_rows = stdout
-        .lines()
-        .filter_map(|line| line.trim().strip_prefix(HOST_UI_RELOAD_JSON_PREFIX))
-        .collect::<Vec<_>>();
-    if payload_rows.len() != 1 {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_FRAME_INVALID pid={} frame_count={} stdout_sha256={} stderr_sha256={} stdout_tail={} remediation=cleanup-only must emit exactly one framed JSON readback",
-            child_pid,
-            payload_rows.len(),
-            stdout_sha256,
-            stderr_sha256,
-            process_diagnostic(stdout.as_bytes()),
-        )));
-    }
-    let payload = BASE64_STANDARD.decode(payload_rows[0]).map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_BASE64_INVALID pid={child_pid} error={error}"
-        ))
-    })?;
-    let readback: Value = serde_json::from_slice(&payload).map_err(|error| {
-        ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_JSON_INVALID pid={} payload_sha256={} error={}",
-            child_pid,
-            sha256_hex_lower(&payload),
-            error
-        ))
-    })?;
-    let foreground_restored = readback
-        .pointer("/maintenance_cleanup/foreground_transaction/restored")
-        .and_then(Value::as_bool);
-    let operator_superseded = readback
-        .pointer("/maintenance_cleanup/foreground_transaction/operator_superseded")
-        .and_then(Value::as_bool);
-    let foreground_outcome = readback
-        .pointer("/maintenance_cleanup/foreground_transaction/outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let foreground_method = readback
-        .pointer("/maintenance_cleanup/foreground_transaction/restore_method")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let fullscreen_mode = readback
-        .pointer("/maintenance_cleanup/fullscreen_transaction/mode")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let fullscreen_restored = readback
-        .pointer("/maintenance_cleanup/fullscreen_transaction/restored")
-        .and_then(Value::as_bool);
-    let fullscreen_operator_superseded = readback
-        .pointer("/maintenance_cleanup/fullscreen_transaction/operator_superseded")
-        .and_then(Value::as_bool);
-    let fullscreen_outcome = readback
-        .pointer("/maintenance_cleanup/fullscreen_transaction/outcome")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let fullscreen_post_restore_tab_container_count = readback
-        .pointer("/maintenance_cleanup/fullscreen_transaction/post_restore_tab_container_count")
-        .and_then(Value::as_u64);
-    let fullscreen_postcondition_valid = match fullscreen_mode {
-        "none" => {
-            fullscreen_restored == Some(true)
-                && fullscreen_operator_superseded == Some(false)
-                && fullscreen_outcome == "not_required"
-                && fullscreen_post_restore_tab_container_count == Some(1)
-        }
-        "content_fullscreen_exact_uia_control" => {
-            match (fullscreen_restored, fullscreen_operator_superseded) {
-                (Some(true), Some(false)) => {
-                    matches!(
-                        fullscreen_outcome,
-                        "restored_content_fullscreen" | "already_restored_content_fullscreen"
-                    ) && fullscreen_post_restore_tab_container_count == Some(0)
-                }
-                (Some(false), Some(true)) => {
-                    fullscreen_outcome == "operator_superseded"
-                        && fullscreen_post_restore_tab_container_count.is_none()
-                }
-                _ => false,
-            }
-        }
-        _ => false,
-    };
-    let missing_baseline_count = readback
-        .pointer("/maintenance_cleanup/missing_baseline_runtime_ids")
-        .and_then(Value::as_array)
-        .map(Vec::len);
-    if readback.get("ok").and_then(Value::as_bool) != Some(true)
-        || readback.get("operation").and_then(Value::as_str)
-            != Some("cleanup_owned_maintenance_tab_via_ui")
-        || readback
-            .pointer("/maintenance_cleanup/absent_verified")
-            .and_then(Value::as_bool)
-            != Some(true)
-        || readback
-            .pointer("/maintenance_cleanup/token")
-            .and_then(Value::as_str)
-            != Some(maintenance.token.as_str())
-        || missing_baseline_count != Some(0)
-        || foreground_method.is_empty()
-        || foreground_outcome.is_empty()
-        || !matches!(
-            (foreground_restored, operator_superseded),
-            (Some(true), Some(false)) | (Some(false), Some(true))
-        )
-        || !fullscreen_postcondition_valid
-    {
-        return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-            "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_POSTCONDITION_FAILED payload_sha256={} missing_baseline_count={:?} foreground_restored={:?} operator_superseded={:?} foreground_outcome={} foreground_method={} fullscreen_mode={} fullscreen_restored={:?} fullscreen_operator_superseded={:?} fullscreen_outcome={} fullscreen_post_restore_tab_container_count={:?} remediation=cleanup-only must prove exact token/runtime-id absence, every baseline tab present, and independently classified fullscreen plus foreground restoration or operator supersession",
-            sha256_hex_lower(&payload),
-            missing_baseline_count,
-            foreground_restored,
-            operator_superseded,
-            foreground_outcome,
-            foreground_method,
-            fullscreen_mode,
-            fullscreen_restored,
-            fullscreen_operator_superseded,
-            fullscreen_outcome,
-            fullscreen_post_restore_tab_container_count,
-        )));
-    }
-    Ok(readback
-        .get("maintenance_cleanup")
-        .cloned()
-        .unwrap_or(Value::Null))
-}
-
 #[cfg(not(windows))]
-async fn run_chrome_bridge_host_ui_reload(
-    _maintenance: &ChromeBridgeMaintenanceTabLease,
-) -> Result<ChromeBridgeHostUiReloadAttempt, ChromeDebuggerBridgeError> {
+async fn run_chrome_bridge_background_deploy()
+-> Result<ChromeBridgeBackgroundDeployReadback, ChromeDebuggerBridgeError> {
     Err(ChromeDebuggerBridgeError::host_reload_failed(
-        "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_UNSUPPORTED_OS os=non_windows remediation=run the Chrome bridge host-control operation on the configured Windows Synapse host",
-    ))
-}
-
-#[cfg(not(windows))]
-async fn run_chrome_bridge_host_ui_cleanup(
-    _maintenance: &ChromeBridgeMaintenanceTabLease,
-    _ack: &ChromeBridgeReloadCommandAck,
-) -> Result<Value, ChromeDebuggerBridgeError> {
-    Err(ChromeDebuggerBridgeError::host_reload_failed(
-        "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_UNSUPPORTED platform=non_windows remediation=the exact Chrome foreground UI cleanup is supported only on Windows",
+        "SYNAPSE_CHROME_BACKGROUND_DEPLOY_UNSUPPORTED_OS os=non_windows remediation=run the normal-profile Chrome bridge lifecycle on its configured Windows host",
     ))
 }
 
@@ -7134,450 +5231,248 @@ impl ChromeDebuggerBridge {
         ))
     }
 
-    async fn list_tabs_for_reload_maintenance(
-        &self,
-    ) -> Result<ChromeDebuggerListTabsResult, ChromeDebuggerBridgeError> {
-        let result = self
-            .send_reload_maintenance_command("listTabs", json!({}))
-            .await?;
-        serde_json::from_value::<ChromeDebuggerListTabsResult>(result).map_err(|error| {
-            ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_TAB_LIST_DECODE_FAILED error={error} remediation=the loaded bridge must return typed chrome.tabs.query readback before maintenance may mutate any tab"
-            ))
-        })
-    }
-
-    async fn prepare_reload_maintenance_tab(
-        &self,
-        has_active_host: bool,
-    ) -> Result<ChromeBridgeMaintenanceTabLease, ChromeDebuggerBridgeError> {
-        let token = Uuid::new_v4().simple().to_string();
-        let marker_title = format!("Synapse Bridge Maintenance {token}");
-        let marker_url =
-            format!("data:text/html,<title>Synapse%20Bridge%20Maintenance%20{token}</title>");
-        // Repair must not depend on the mutation lane that it is repairing.
-        // Only a current, healthy bridge may contribute the optional read-only
-        // pre-operation snapshot. The installer creates and proves its own
-        // exact UIA marker tab, and the replacement bridge resolves that
-        // session-unique marker to a Chrome tab identity before closing it.
-        let tabs_before = if has_active_host {
-            self.list_tabs_for_reload_maintenance().await?.tabs
-        } else {
-            Vec::new()
-        };
-        Ok(ChromeBridgeMaintenanceTabLease {
-            token,
-            marker_url,
-            marker_title,
-            tabs_before,
-        })
-    }
-
-    async fn cleanup_reload_maintenance_tab(
-        &self,
-        maintenance: &ChromeBridgeMaintenanceTabLease,
-    ) -> Result<Value, ChromeDebuggerBridgeError> {
-        let before_cleanup = self.list_tabs_for_reload_maintenance().await?;
-        let token_fragment = format!("synapse_maintenance_token={}", maintenance.token);
-        let token_matches = before_cleanup
-            .tabs
-            .iter()
-            .filter(|tab| {
-                tab.url.contains(&token_fragment) || tab.title == maintenance.marker_title
-            })
-            .collect::<Vec<_>>();
-
-        if token_matches.is_empty()
-            && !maintenance.tabs_before.is_empty()
-            && reload_preexisting_tabs_match(&maintenance.tabs_before, &before_cleanup.tabs)
-        {
-            return Ok(json!({
-                "attempted": true,
-                "closed": false,
-                "absent_verified": true,
-                "reason": "operation_owned_tab_already_absent_with_exact_preexisting_state",
-                "token_sha256": sha256_hex_lower(maintenance.token.as_bytes()),
-                "tab_count_before_operation": maintenance.tabs_before.len(),
-                "tab_count_after_cleanup": before_cleanup.tabs.len(),
-                "preexisting_tabs_preserved_exact": true,
-                "token_absent": true,
-            }));
-        }
-        if token_matches.len() != 1 {
-            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CREATED_TAB_NOT_UNIQUE token_sha256={} token_match_count={} tab_count={} remediation=the post-install bridge must find exactly one UI-created tab carrying either the exact daemon-generated marker title or the token-bearing extension URL before closing anything",
-                sha256_hex_lower(maintenance.token.as_bytes()),
-                token_matches.len(),
-                before_cleanup.tabs.len(),
-            )));
-        }
-        let owned = token_matches[0];
-        let owned_before = (*owned).clone();
-        let close_value = self
-            .send_reload_maintenance_command(
-                "closeTab",
-                json!({
-                    "targetIdHint": owned.target_id,
-                }),
-            )
-            .await?;
-        let close =
-            serde_json::from_value::<ChromeDebuggerCloseTabResult>(close_value).map_err(|error| {
-                ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_MAINTENANCE_TAB_CLOSE_DECODE_FAILED tab_id={} target_id={} error={} remediation=the replacement bridge must return the exact chrome.tabs.remove absence acknowledgement",
-                    owned.tab_id, owned.target_id, error
-                ))
-            })?;
-        if close.tab_id != owned.tab_id
-            || close.target_id != owned.target_id
-            || close.target_count_after != 0
-        {
-            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_TAB_CLOSE_ACK_MISMATCH expected_tab_id={} actual_tab_id={} expected_target_id={} actual_target_id={} target_count_after={} remediation=the replacement bridge acknowledged a different tab or did not read the exact target absent",
-                owned.tab_id,
-                close.tab_id,
-                owned.target_id,
-                close.target_id,
-                close.target_count_after,
-            )));
-        }
-
-        let mut prior_active_restore = json!({
-            "attempted": false,
-            "restored": false,
-            "reason": "no_preoperation_bridge_snapshot",
-        });
-        if !maintenance.tabs_before.is_empty() {
-            let prior_active = maintenance
-                .tabs_before
-                .iter()
-                .filter(|tab| tab.chrome_window_id == owned_before.chrome_window_id && tab.active)
-                .collect::<Vec<_>>();
-            if prior_active.len() != 1 {
-                return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_TAB_AMBIGUOUS chrome_window_id={:?} active_match_count={} remediation=cleanup closed the exact owned tab but cannot restore operator selection without one exact pre-operation active tab identity",
-                    owned_before.chrome_window_id,
-                    prior_active.len(),
-                )));
-            }
-            let active = prior_active[0];
-            let restore_value = self
-                .send_reload_maintenance_command(
-                    "activateTab",
-                    json!({
-                        "targetIdHint": active.target_id,
-                        "waitTimeoutMs": 10_000,
-                    }),
-                )
-                .await?;
-            let restored = serde_json::from_value::<ChromeDebuggerActivateTabResult>(
-                restore_value,
-            )
-            .map_err(|error| {
-                ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_RESTORE_DECODE_FAILED tab_id={} target_id={} error={} remediation=the replacement bridge must return exact chrome.tabs.update(active=true) readback for the pre-operation tab",
-                    active.tab_id, active.target_id, error
-                ))
-            })?;
-            if !restored.active
-                || restored.tab_id != active.tab_id
-                || restored.target_id != active.target_id
-                || restored.chrome_window_id != active.chrome_window_id
-            {
-                return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_MAINTENANCE_PRIOR_ACTIVE_RESTORE_MISMATCH expected_tab_id={} actual_tab_id={} expected_target_id={} actual_target_id={} expected_window_id={:?} actual_window_id={:?} active={} remediation=the exact pre-operation tab selection did not reconverge after maintenance cleanup",
-                    active.tab_id,
-                    restored.tab_id,
-                    active.target_id,
-                    restored.target_id,
-                    active.chrome_window_id,
-                    restored.chrome_window_id,
-                    restored.active,
-                )));
-            }
-            prior_active_restore = json!({
-                "attempted": true,
-                "restored": true,
-                "reason": "exact_chrome_tabs_update_active_readback",
-                "tab_id": active.tab_id,
-                "target_id": active.target_id,
-                "chrome_window_id": active.chrome_window_id,
-            });
-        }
-
-        let after_cleanup = self.list_tabs_for_reload_maintenance().await?;
-        let id_absent = !after_cleanup
-            .tabs
-            .iter()
-            .any(|tab| tab.tab_id == owned_before.tab_id);
-        let token_absent = !after_cleanup
-            .tabs
-            .iter()
-            .any(|tab| tab.url.contains(&token_fragment) || tab.title == maintenance.marker_title);
-        let preexisting_tabs_preserved_exact = maintenance.tabs_before.is_empty()
-            || reload_preexisting_tabs_match(&maintenance.tabs_before, &after_cleanup.tabs);
-        if !id_absent || !token_absent || !preexisting_tabs_preserved_exact {
-            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_TAB_CLEANUP_POSTCONDITION_FAILED tab_id={} target_id={} id_absent={} token_absent={} expected_preexisting_count={} actual_count={} preexisting_tabs_preserved_exact={} remediation=inspect chrome.tabs.query; cleanup is accepted only when the owned tab/token are absent and every pre-existing tab identity is unchanged",
-                owned_before.tab_id,
-                owned_before.target_id,
-                id_absent,
-                token_absent,
-                maintenance.tabs_before.len(),
-                after_cleanup.tabs.len(),
-                preexisting_tabs_preserved_exact,
-            )));
-        }
-        Ok(json!({
-            "attempted": true,
-            "closed": true,
-            "absent_verified": true,
-            "reason": "exact_chrome_tabs_remove_and_query_absence",
-            "tab_id": owned_before.tab_id,
-            "target_id": owned_before.target_id,
-            "chrome_window_id": owned_before.chrome_window_id,
-            "url_sha256_before_close": sha256_hex_lower(owned_before.url.as_bytes()),
-            "tab_count_before_operation": if maintenance.tabs_before.is_empty() {
-                Value::Null
-            } else {
-                json!(maintenance.tabs_before.len())
-            },
-            "tab_count_before_cleanup": before_cleanup.tabs.len(),
-            "tab_count_after_cleanup": after_cleanup.tabs.len(),
-            "preexisting_tabs_preserved_count": maintenance.tabs_before.len(),
-            "preexisting_tabs_preserved_exact": preexisting_tabs_preserved_exact,
-            "token_absent": token_absent,
-            "id_absent": id_absent,
-            "prior_active_restore": prior_active_restore,
-        }))
-    }
-
-    async fn cleanup_reload_maintenance_tab_with_ui_recovery(
-        &self,
-        maintenance: &ChromeBridgeMaintenanceTabLease,
-        ack: &ChromeBridgeReloadCommandAck,
-    ) -> Result<Value, ChromeDebuggerBridgeError> {
-        // The UIA lease is the sole mutation authority after the installer has
-        // returned an ACK. It alone owns both the exact runtime-id tab close and
-        // the OS foreground transaction. The replacement bridge is used only
-        // for an independent read after that transaction; it is never a mutating
-        // fallback that can bypass foreground restoration.
-        let mut ui_readback = run_chrome_bridge_host_ui_cleanup(maintenance, ack).await?;
-        let after_cleanup = self.list_tabs_for_reload_maintenance().await?;
-        let token_fragment = format!("synapse_maintenance_token={}", maintenance.token);
-        let token_absent = !after_cleanup
-            .tabs
-            .iter()
-            .any(|tab| tab.url.contains(&token_fragment));
-        let missing_preexisting = maintenance
-            .tabs_before
-            .iter()
-            .filter(|before| {
-                !after_cleanup.tabs.iter().any(|after| {
-                    before.target_id == after.target_id
-                        && before.tab_id == after.tab_id
-                        && before.chrome_window_id == after.chrome_window_id
-                        && before.index == after.index
-                        && before.target_type == after.target_type
-                        && before.url == after.url
-                        && before.pinned == after.pinned
-                })
-            })
-            .count();
-        let concurrent_count = after_cleanup
-            .tabs
-            .iter()
-            .filter(|after| {
-                !maintenance.tabs_before.iter().any(|before| {
-                    before.tab_id == after.tab_id && before.target_id == after.target_id
-                })
-            })
-            .count();
-        if !token_absent || missing_preexisting != 0 {
-            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_POST_UI_BRIDGE_READBACK_FAILED token_absent={} missing_preexisting_count={} preexisting_count={} after_count={} remediation=the exact UIA cleanup returned success, but the replacement bridge's independent chrome.tabs read did not prove token absence and preservation of every pre-operation tab",
-                token_absent,
-                missing_preexisting,
-                maintenance.tabs_before.len(),
-                after_cleanup.tabs.len(),
-            )));
-        }
-        let object = ui_readback.as_object_mut().ok_or_else(|| {
-            ChromeDebuggerBridgeError::host_reload_failed(
-                "SYNAPSE_CHROME_MAINTENANCE_UI_CLEANUP_EVIDENCE_INVALID expected=object remediation=the cleanup process must return structured UIA/foreground evidence",
-            )
-        })?;
-        object.insert(
-            "bridge_post_cleanup".to_owned(),
-            json!({
-                "source_of_truth": "replacement_bridge_chrome_tabs_query",
-                "token_absent": token_absent,
-                "preexisting_tab_count": maintenance.tabs_before.len(),
-                "missing_preexisting_count": missing_preexisting,
-                "concurrent_tab_count": concurrent_count,
-                "post_cleanup_tab_count": after_cleanup.tabs.len(),
-            }),
-        );
-        Ok(ui_readback)
-    }
-
-    async fn reload_via_host_ui(
+    async fn reload_in_background(
         &self,
         wait_timeout_ms: u64,
     ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
         let wait_timeout = Duration::from_millis(wait_timeout_ms);
-        invalidate_chrome_profile_scan_cache("host_ui_reload_before_snapshot");
-        let before = self.active_host_snapshot().ok();
-        let pre_reload_bridge_readback_usable = before.as_ref().is_some_and(|snapshot| {
-            !snapshot.extension_stale && snapshot.last_disconnect_detail.is_none()
-        });
-        if let Some(snapshot) = before
-            .as_ref()
-            .filter(|_| !pre_reload_bridge_readback_usable)
+        invalidate_chrome_profile_scan_cache("background_reload_before_snapshot");
+        let before = self.active_host_snapshot().map_err(|error| {
+            ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BACKGROUND_RELOAD_HOST_UNAVAILABLE error_code={} detail_sha256={} {}",
+                error.code(),
+                sha256_hex_lower(error.detail().as_bytes()),
+                NO_ACTIVE_HOST_REPAIR_GUIDANCE
+            ))
+        })?;
+        let loaded_build_id = before
+            .extension_build_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ChromeDebuggerBridgeError::host_reload_failed(format!(
+                    "SYNAPSE_CHROME_BACKGROUND_RELOAD_LOADED_BUILD_MISSING host_id={} remediation=restore a bridge build that advertises its executable identity and reloadSelf capability; Synapse failed before deploying files or touching any human window",
+                    before.host_id
+                ))
+            })?
+            .to_owned();
+        if before.extension_id.as_deref() != Some(EXTENSION_ID)
+            || !before
+                .extension_capabilities
+                .iter()
+                .any(|capability| capability == BACKGROUND_RUNTIME_RELOAD_COMMAND)
+            || before.last_disconnect_detail.is_some()
         {
-            tracing::warn!(
-                code = "CHROME_DEBUGGER_HOST_RELOAD_PRE_SNAPSHOT_SKIPPED",
-                host_id = %snapshot.host_id,
-                extension_stale = snapshot.extension_stale,
-                stale_reasons = %snapshot.extension_stale_reasons.join("|"),
-                last_disconnect_detail = snapshot.last_disconnect_detail.as_deref().unwrap_or("none"),
-                source_of_truth = "installer-owned UIA tab-strip lease",
-                "Chrome bridge repair refused to depend on an unhealthy worker for its pre-operation snapshot"
-            );
-        }
-        let maintenance = self
-            .prepare_reload_maintenance_tab(pre_reload_bridge_readback_usable)
-            .await?;
-        let attempt = match run_chrome_bridge_host_ui_reload(&maintenance).await {
-            Ok(attempt) => attempt,
-            Err(error) => {
-                let installer_verified_cleanup = error.detail().contains("cleanup=verified_absent");
-                let cleanup = self.cleanup_reload_maintenance_tab(&maintenance).await;
-                return match cleanup {
-                    Ok(cleanup) => Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                        "{} maintenance_cleanup={}",
-                        error.detail(),
-                        cleanup
-                    ))),
-                    Err(cleanup_error) if installer_verified_cleanup => {
-                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                            "{} maintenance_cleanup=installer_ui_verified_absent bridge_readback_error={} remediation=the installer separately proved exact token/address/tab-strip absence before returning its operation error; repair the named operation failure and retry",
-                            error.detail(),
-                            cleanup_error.detail(),
-                        )))
-                    }
-                    Err(cleanup_error) if before.is_none() => {
-                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                            "{} maintenance_cleanup_bridge_readback_unavailable={} remediation=the absent-host UI path performs exact token/address/tab-strip cleanup before returning this installer error; inspect the named SYNAPSE_CHROME_MAINTENANCE_* evidence",
-                            error.detail(),
-                            cleanup_error.detail(),
-                        )))
-                    }
-                    Err(cleanup_error) => {
-                        Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                            "SYNAPSE_CHROME_MAINTENANCE_OPERATION_AND_CLEANUP_FAILED operation_error={} cleanup_error={} remediation=inspect the exact tab/token/window identities; repair refuses to hide an operation-created maintenance surface",
-                            error.detail(),
-                            cleanup_error.detail(),
-                        )))
-                    }
-                };
-            }
-        };
-        let mut ack = attempt.ack;
-        if let Some(postcondition_error) = attempt.postcondition_error {
-            let maintenance_cleanup = self
-                .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
-                .await?;
-            ack.maintenance_cleanup = maintenance_cleanup;
             return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "{} maintenance_cleanup={} remediation=the installer mutated Chrome and returned its exact UIA/foreground lease; cleanup was completed and independently read before this postcondition error was propagated",
-                postcondition_error.detail(),
-                ack.maintenance_cleanup,
+                "SYNAPSE_CHROME_BACKGROUND_RELOAD_HOST_INELIGIBLE host_id={} extension_id={} expected_extension_id={} loaded_build_id={} reload_self_capability={} last_disconnect_detail={} remediation=restore an authenticated connected bridge that advertises reloadSelf; Synapse failed before deploying files or touching any human window",
+                before.host_id,
+                before.extension_id.as_deref().unwrap_or("<missing>"),
+                EXTENSION_ID,
+                loaded_build_id,
+                before
+                    .extension_capabilities
+                    .iter()
+                    .any(|capability| capability == BACKGROUND_RUNTIME_RELOAD_COMMAND),
+                before.last_disconnect_detail.as_deref().unwrap_or("<none>")
             )));
         }
-        invalidate_chrome_profile_scan_cache("host_ui_reload_after_control");
+
+        let deploy = run_chrome_bridge_background_deploy().await?;
+        invalidate_chrome_profile_scan_cache("background_reload_after_deploy");
+        let deployed_profile = synapse_chrome_profile_install_state();
+        let profile_worker_sha256 = deployed_profile
+            .active_profile_service_worker_sha256
+            .as_deref()
+            .unwrap_or("<missing>");
+        let deployed_profile_installed = deployed_profile.active_profile_extension_path.is_some();
+        if !deployed_profile_installed
+            || profile_worker_sha256 != deploy.extension_service_worker_sha256
+        {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BACKGROUND_DEPLOY_INDEPENDENT_READBACK_FAILED active_profile={} active_profile_installed={} deployed_worker_sha256={} profile_worker_sha256={} profile_error={} remediation=repair the stable extension directory or physical Chrome profile row; Synapse refuses to signal reload when a separate daemon read does not match the deployed bytes",
+                deploy.active_profile,
+                deployed_profile_installed,
+                deploy.extension_service_worker_sha256,
+                profile_worker_sha256,
+                deployed_profile
+                    .active_profile_service_worker_error
+                    .as_deref()
+                    .unwrap_or("<none>")
+            )));
+        }
+
+        let result = self
+            .send_command_with_timeout(
+                BACKGROUND_RUNTIME_RELOAD_COMMAND,
+                json!({
+                    "expectedExtensionId": EXTENSION_ID,
+                    "expectedLoadedBuildId": loaded_build_id,
+                    "expectedDeployedBuildId": EXPECTED_EXTENSION_BUILD_ID,
+                    "reloadDelayMs": 500,
+                }),
+                Duration::from_secs(5),
+            )
+            .await?;
+        let runtime_ack =
+            serde_json::from_value::<ChromeBridgeRuntimeReloadAck>(result).map_err(|error| {
+                ChromeDebuggerBridgeError::protocol(format!(
+                    "decode Chrome bridge reloadSelf acknowledgement: {error}"
+                ))
+            })?;
+        if !runtime_ack.ok
+            || runtime_ack.control_surface != "chrome.runtime.reload"
+            || runtime_ack.required_foreground
+            || runtime_ack.extension_id != EXTENSION_ID
+            || runtime_ack.loaded_build_id != loaded_build_id
+            || runtime_ack.deployed_build_id != EXPECTED_EXTENSION_BUILD_ID
+            || !(250..=5_000).contains(&runtime_ack.reload_delay_ms)
+            || runtime_ack.foreground_api_calls != 0
+            || runtime_ack.tab_mutations != 0
+            || runtime_ack.synthetic_input_events != 0
+        {
+            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                "SYNAPSE_CHROME_BACKGROUND_RELOAD_ACK_INVALID ok={} control_surface={} required_foreground={} extension_id={} expected_extension_id={} loaded_build_id={} expected_loaded_build_id={} deployed_build_id={} expected_deployed_build_id={} scheduled_at_unix_ms={} reload_delay_ms={} foreground_api_calls={} tab_mutations={} synthetic_input_events={} remediation=repair reloadSelf so it schedules only chrome.runtime.reload and reports exact zero human-window mutation evidence",
+                runtime_ack.ok,
+                runtime_ack.control_surface,
+                runtime_ack.required_foreground,
+                runtime_ack.extension_id,
+                EXTENSION_ID,
+                runtime_ack.loaded_build_id,
+                loaded_build_id,
+                runtime_ack.deployed_build_id,
+                EXPECTED_EXTENSION_BUILD_ID,
+                runtime_ack.scheduled_at_unix_ms,
+                runtime_ack.reload_delay_ms,
+                runtime_ack.foreground_api_calls,
+                runtime_ack.tab_mutations,
+                runtime_ack.synthetic_input_events
+            )));
+        }
+        let command_ack = ChromeBridgeReloadCommandAck {
+            ok: runtime_ack.ok,
+            control_surface: runtime_ack.control_surface.clone(),
+            required_foreground: runtime_ack.required_foreground,
+            installer_path: deploy.installer_path,
+            installer_sha256: deploy.installer_sha256,
+            installer_exit_code: deploy.installer_exit_code,
+            installer_stdout_sha256: deploy.installer_stdout_sha256,
+            installer_stderr_sha256: deploy.installer_stderr_sha256,
+            installer_duration_ms: deploy.installer_duration_ms,
+            extension_id: runtime_ack.extension_id.clone(),
+            extension_dir: deploy.extension_dir,
+            extension_service_worker_sha256: deploy.extension_service_worker_sha256.clone(),
+            active_profile: deploy.active_profile,
+            reason: "background_runtime_reload_scheduled_and_verified".to_owned(),
+            profile_before_installed: deploy.profile_before_installed,
+            profile_before_ready: deploy.profile_before_ready,
+            profile_after_installed: deploy.profile_after_installed,
+            profile_after_ready: deploy.profile_after_ready,
+            loaded_build_id: runtime_ack.loaded_build_id,
+            deployed_build_id: runtime_ack.deployed_build_id,
+            scheduled_at_unix_ms: runtime_ack.scheduled_at_unix_ms,
+            reload_delay_ms: runtime_ack.reload_delay_ms,
+            foreground_api_calls: runtime_ack.foreground_api_calls,
+            tab_mutations: runtime_ack.tab_mutations,
+            synthetic_input_events: runtime_ack.synthetic_input_events,
+        };
+
         let started = Instant::now();
-        let mut last_observed = "no_active_chrome_bridge_host".to_owned();
+        let mut last_observed = "no_replacement_chrome_bridge_host".to_owned();
         loop {
             if started.elapsed() >= wait_timeout {
-                let before_host = before
-                    .as_ref()
-                    .map_or("<none>", |snapshot| snapshot.host_id.as_str());
-                let cleanup = self
-                    .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
-                    .await;
                 return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                    "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_TIMEOUT control_surface={} before_host_id={} wait_timeout_ms={} last_observed={} installer_path={} installer_sha256={} maintenance_cleanup={} remediation=the exact Chrome extension management control completed, but the daemon did not observe a new clean authenticated bridge host within the bounded wait; the operation-owned maintenance tab was separately cleanup-attempted, inspect chrome://extensions for extension_id={}, the extension service-worker console, and daemon chrome_bridge health",
-                    ack.control_surface,
-                    before_host,
+                    "SYNAPSE_CHROME_BACKGROUND_RELOAD_TIMEOUT before_host_id={} loaded_build_id={} deployed_build_id={} deployed_worker_sha256={} wait_timeout_ms={} last_observed={} remediation=chrome.runtime.reload was acknowledged without foreground mutation, but the daemon did not independently observe the expected replacement host and physical bytes; inspect the extension service-worker console and daemon chrome_bridge health",
+                    before.host_id,
+                    loaded_build_id,
+                    EXPECTED_EXTENSION_BUILD_ID,
+                    deploy.extension_service_worker_sha256,
                     wait_timeout_ms,
-                    last_observed,
-                    ack.installer_path,
-                    ack.installer_sha256,
-                    cleanup.as_ref().map_or_else(
-                        |error| format!("failed:{}", error.detail()),
-                        Value::to_string
-                    ),
-                    EXTENSION_ID
+                    last_observed
                 )));
             }
             match self.active_host_snapshot() {
                 Ok(after) => {
-                    let replacement_host = before
-                        .as_ref()
-                        .is_none_or(|snapshot| after.host_id != snapshot.host_id);
-                    let clean = replacement_host
-                        && after.extension_id.as_deref() == Some(EXTENSION_ID)
+                    let replacement_host = after.host_id != before.host_id;
+                    let expected_identity = after.extension_id.as_deref() == Some(EXTENSION_ID)
                         && after.extension_build_id.as_deref() == Some(EXPECTED_EXTENSION_BUILD_ID)
-                        && after.last_disconnect_detail.is_none()
-                        && !after.extension_stale;
+                        && after.extension_declared_build_sha256.as_deref()
+                            == Some(EXPECTED_EXTENSION_DECLARED_BUILD_SHA256)
+                        && after.extension_service_worker_sha256.as_deref()
+                            == Some(deploy.extension_service_worker_sha256.as_str());
                     last_observed = format!(
-                        "host_id={} replacement_host={} extension_id={} build_id={} stale={} stale_reasons={}",
+                        "host_id={} replacement_host={} extension_id={} build_id={} declared_sha256={} worker_sha256={} stale={} stale_reasons={}",
                         after.host_id,
                         replacement_host,
                         after.extension_id.as_deref().unwrap_or("<missing>"),
                         after.extension_build_id.as_deref().unwrap_or("<missing>"),
+                        after
+                            .extension_declared_build_sha256
+                            .as_deref()
+                            .unwrap_or("<missing>"),
+                        after
+                            .extension_service_worker_sha256
+                            .as_deref()
+                            .unwrap_or("<missing>"),
                         after.extension_stale,
                         after.extension_stale_reasons.join("|")
                     );
-                    if replacement_host
-                        && after.extension_id.as_deref() == Some(EXTENSION_ID)
-                        && after.extension_build_id.as_deref() == Some(EXPECTED_EXTENSION_BUILD_ID)
-                        && after
-                            .extension_stale_reasons
-                            .iter()
-                            .any(|reason| reason.starts_with("durable_owner_state"))
-                    {
-                        let maintenance_cleanup = self
-                            .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
-                            .await?;
-                        ack.maintenance_cleanup = maintenance_cleanup;
+                    if replacement_host && expected_identity && after.extension_stale {
                         return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                            "SYNAPSE_CHROME_BRIDGE_HOST_RELOAD_MUTATION_GATE_UNHEALTHY host_id={} stale_reasons={} maintenance_cleanup={} remediation=inspect startupReadback.durable_owner_state and the extension service-worker console; repair the exact durable ledger field named there, then reload again; a connected read-only host is not accepted as a working bridge",
+                            "SYNAPSE_CHROME_BACKGROUND_RELOAD_REPLACEMENT_UNHEALTHY host_id={} stale_reasons={} startup_readback={} remediation=the replacement worker loaded the expected physical bytes but failed a durable startup gate; repair the exact named gate before retrying",
                             after.host_id,
                             after.extension_stale_reasons.join("|"),
-                            ack.maintenance_cleanup,
-                        )));
-                    }
-                    if clean {
-                        let waited_ms =
-                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-                        let maintenance_cleanup = self
-                            .cleanup_reload_maintenance_tab_with_ui_recovery(&maintenance, &ack)
-                            .await?;
-                        ack.maintenance_cleanup = maintenance_cleanup;
-                        tracing::info!(
-                            code = "CHROME_DEBUGGER_HOST_RELOAD_MUTATION_GATE_VERIFIED",
-                            host_id = %after.host_id,
-                            startup_readback = %after
+                            after
                                 .extension_startup_readback
                                 .as_ref()
-                                .map_or_else(|| "missing".to_owned(), ToString::to_string),
-                            "replacement Chrome bridge host published healthy durable mutation-gate startup evidence"
+                                .map_or_else(|| "<missing>".to_owned(), ToString::to_string)
+                        )));
+                    }
+                    if replacement_host
+                        && expected_identity
+                        && !after.extension_stale
+                        && after.last_disconnect_detail.is_none()
+                    {
+                        invalidate_chrome_profile_scan_cache(
+                            "background_reload_replacement_host_readback",
+                        );
+                        let final_profile = synapse_chrome_profile_install_state();
+                        let final_worker_sha256 = final_profile
+                            .active_profile_service_worker_sha256
+                            .as_deref()
+                            .unwrap_or("<missing>");
+                        let final_profile_installed =
+                            final_profile.active_profile_extension_path.is_some();
+                        if !final_profile_installed
+                            || final_worker_sha256 != deploy.extension_service_worker_sha256
+                        {
+                            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
+                                "SYNAPSE_CHROME_BACKGROUND_RELOAD_FINAL_PROFILE_READBACK_FAILED active_profile_installed={} expected_worker_sha256={} actual_worker_sha256={} profile_error={} remediation=the replacement host is healthy, but a separate final physical profile/filesystem read drifted; repair the stable extension row before accepting reload",
+                                final_profile_installed,
+                                deploy.extension_service_worker_sha256,
+                                final_worker_sha256,
+                                final_profile
+                                    .active_profile_service_worker_error
+                                    .as_deref()
+                                    .unwrap_or("<none>")
+                            )));
+                        }
+                        let waited_ms =
+                            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        tracing::info!(
+                            code = "CHROME_DEBUGGER_BACKGROUND_RUNTIME_RELOAD_VERIFIED",
+                            before_host_id = %before.host_id,
+                            after_host_id = %after.host_id,
+                            extension_build_id = EXPECTED_EXTENSION_BUILD_ID,
+                            extension_service_worker_sha256 = %deploy.extension_service_worker_sha256,
+                            required_foreground = false,
+                            foreground_api_calls = 0,
+                            tab_mutations = 0,
+                            synthetic_input_events = 0,
+                            "replacement Chrome bridge host and physical profile bytes verified after chrome.runtime.reload"
                         );
                         return Ok(ChromeBridgeReloadResult {
-                            before,
-                            command_ack: ack,
+                            before: Some(before),
+                            command_ack,
                             after,
                             reconnected: true,
                             waited_ms,
@@ -7763,7 +5658,7 @@ impl ChromeDebuggerBridge {
         kind: &str,
         params: Value,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
-        self.send_command_with_timeout_policy(kind, params, COMMAND_TIMEOUT, false)
+        self.send_command_with_timeout_policy(kind, params, COMMAND_TIMEOUT)
             .await
     }
 
@@ -7779,28 +5674,7 @@ impl ChromeDebuggerBridge {
         params: Value,
         command_timeout: Duration,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
-        self.send_command_with_timeout_policy(kind, params, command_timeout, false)
-            .await
-    }
-
-    /// The reload path may need read-only state before replacement and exact
-    /// cleanup through the replacement worker even when either worker is stale
-    /// by build identity. Public commands remain fail-closed. This private lane
-    /// bypasses only the daemon's pre-enqueue stale-build guard; the extension
-    /// still has to recognize the typed command and return exact chrome.tabs
-    /// readback. Maintenance creation itself stays on the independently owned
-    /// foreground UI path so repair never depends on the mutation lane it fixes.
-    async fn send_reload_maintenance_command(
-        &self,
-        kind: &str,
-        params: Value,
-    ) -> Result<Value, ChromeDebuggerBridgeError> {
-        if !matches!(kind, "activateTab" | "listTabs" | "closeTab") {
-            return Err(ChromeDebuggerBridgeError::host_reload_failed(format!(
-                "SYNAPSE_CHROME_MAINTENANCE_COMMAND_FORBIDDEN kind={kind} remediation=only the exact tab ownership primitives may cross the stale-worker repair boundary"
-            )));
-        }
-        self.send_command_with_timeout_policy(kind, params, COMMAND_TIMEOUT, true)
+        self.send_command_with_timeout_policy(kind, params, command_timeout)
             .await
     }
 
@@ -7809,7 +5683,6 @@ impl ChromeDebuggerBridge {
         kind: &str,
         params: Value,
         command_timeout: Duration,
-        allow_stale_for_reload_maintenance: bool,
     ) -> Result<Value, ChromeDebuggerBridgeError> {
         let id = format!(
             "chrome-cdp-{}-{}",
@@ -7840,9 +5713,7 @@ impl ChromeDebuggerBridge {
                 .hosts
                 .get(&host_id)
                 .ok_or_else(ChromeDebuggerBridgeError::unavailable)?;
-            if !allow_stale_for_reload_maintenance
-                && let Some(reason) = bridge_command_stale_reason(host, kind)
-            {
+            if let Some(reason) = bridge_command_stale_reason(host, kind) {
                 let error = ChromeDebuggerBridgeError::stale(kind, &host_id, host, &reason);
                 tracing::warn!(
                     code = error.code(),
@@ -8711,11 +6582,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         || "not_seen_yet".to_owned(),
         |value| quote_detail_value(&value.to_string()),
     );
-    let popup_risk_suppression_ok = popup_risk_suppression_covers_profile_risks(
-        host.extension_popup_risk_suppression.as_ref(),
-        popup_risks.len(),
-    );
-    let risk_warning = external_chrome_popup_risk_warning(popup_risks, popup_risk_suppression_ok);
+    let risk_warning = external_chrome_popup_risk_warning(popup_risks);
     let stale_reasons = bridge_identity_stale_reasons(host);
     let extension_stale = !stale_reasons.is_empty();
     let extension_stale_reasons = if stale_reasons.is_empty() {
@@ -8723,17 +6590,15 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     } else {
         stale_reasons.join("|")
     };
-    let popup_risk_blocking = !popup_risks.is_empty() && !popup_risk_suppression_ok;
     let tab_control_available = extension_id == EXTENSION_ID
         && host.last_disconnect_detail.is_none()
         && !extension_stale
-        && !self_permission_blocking
-        && !popup_risk_blocking;
+        && !self_permission_blocking;
     let status = if tab_control_available {
         "ok"
     } else if extension_stale {
         "stale"
-    } else if self_permission_blocking || popup_risk_blocking {
+    } else if self_permission_blocking {
         "unsafe_profile"
     } else if host.last_disconnect_detail.is_some() {
         "unavailable"
@@ -8746,7 +6611,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=true extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} extension_startup_readback={} {} {} {} {} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} extension_startup_readback={} {} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -9097,238 +6962,6 @@ pub async fn target_tab_state(
     })
 }
 
-pub struct ChromeDebuggerViewportEmulationRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub device_scale_factor: Option<f64>,
-    pub is_mobile: Option<bool>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn viewport_emulation(
-    request: ChromeDebuggerViewportEmulationRequest<'_>,
-) -> Result<ChromeDebuggerViewportEmulationResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "viewportEmulation")?;
-    let result = bridge()
-        .send_command(
-            "viewportEmulation",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "width": request.width,
-                "height": request.height,
-                "deviceScaleFactor": request.device_scale_factor,
-                "isMobile": request.is_mobile,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerViewportEmulationResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger viewportEmulation response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerDeviceEmulationRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub user_agent: Option<&'a str>,
-    pub width: Option<u32>,
-    pub height: Option<u32>,
-    pub device_scale_factor: Option<f64>,
-    pub is_mobile: Option<bool>,
-    pub has_touch: Option<bool>,
-    pub max_touch_points: Option<u32>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn device_emulation(
-    request: ChromeDebuggerDeviceEmulationRequest<'_>,
-) -> Result<ChromeDebuggerDeviceEmulationResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "deviceEmulation")?;
-    let result = bridge()
-        .send_command(
-            "deviceEmulation",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "userAgent": request.user_agent,
-                "width": request.width,
-                "height": request.height,
-                "deviceScaleFactor": request.device_scale_factor,
-                "isMobile": request.is_mobile,
-                "hasTouch": request.has_touch,
-                "maxTouchPoints": request.max_touch_points,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerDeviceEmulationResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger deviceEmulation response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerGeolocationEmulationRequest {
-    pub hwnd: i64,
-    pub target_id: String,
-    pub operation: String,
-    pub latitude: Option<f64>,
-    pub longitude: Option<f64>,
-    pub accuracy: Option<f64>,
-    pub altitude: Option<f64>,
-    pub altitude_accuracy: Option<f64>,
-    pub heading: Option<f64>,
-    pub speed: Option<f64>,
-    pub grant_permission: Option<bool>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn geolocation_emulation(
-    request: ChromeDebuggerGeolocationEmulationRequest,
-) -> Result<ChromeDebuggerGeolocationEmulationResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "geolocationEmulation")?;
-    let result = bridge()
-        .send_command(
-            "geolocationEmulation",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "latitude": request.latitude,
-                "longitude": request.longitude,
-                "accuracy": request.accuracy,
-                "altitude": request.altitude,
-                "altitudeAccuracy": request.altitude_accuracy,
-                "heading": request.heading,
-                "speed": request.speed,
-                "grantPermission": request.grant_permission,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerGeolocationEmulationResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger geolocationEmulation response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerLocaleEmulationRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub locale: Option<&'a str>,
-    pub timezone_id: Option<&'a str>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn locale_emulation(
-    request: ChromeDebuggerLocaleEmulationRequest<'_>,
-) -> Result<ChromeDebuggerLocaleEmulationResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "localeEmulation")?;
-    let result = bridge()
-        .send_command(
-            "localeEmulation",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "locale": request.locale,
-                "timezoneId": request.timezone_id,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerLocaleEmulationResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger localeEmulation response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerMediaEmulationRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub media: Option<&'a str>,
-    pub color_scheme: Option<&'a str>,
-    pub reduced_motion: Option<&'a str>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn media_emulation(
-    request: ChromeDebuggerMediaEmulationRequest<'_>,
-) -> Result<ChromeDebuggerMediaEmulationResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "mediaEmulation")?;
-    let result = bridge()
-        .send_command(
-            "mediaEmulation",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "media": request.media,
-                "colorScheme": request.color_scheme,
-                "reducedMotion": request.reduced_motion,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerMediaEmulationResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger mediaEmulation response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerNetworkConditionsRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub offline: Option<bool>,
-    pub latency_ms: Option<f64>,
-    pub download_throughput_bytes_per_sec: Option<f64>,
-    pub upload_throughput_bytes_per_sec: Option<f64>,
-    pub connection_type: Option<&'a str>,
-    pub wait_timeout_ms: u64,
-}
-
-pub async fn network_conditions(
-    request: ChromeDebuggerNetworkConditionsRequest<'_>,
-) -> Result<ChromeDebuggerNetworkConditionsResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "networkConditions")?;
-    let result = bridge()
-        .send_command(
-            "networkConditions",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "offline": request.offline,
-                "latencyMs": request.latency_ms,
-                "downloadThroughputBytesPerSec": request.download_throughput_bytes_per_sec,
-                "uploadThroughputBytesPerSec": request.upload_throughput_bytes_per_sec,
-                "connectionType": request.connection_type,
-                "waitTimeoutMs": request.wait_timeout_ms,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerNetworkConditionsResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger networkConditions response: {error}"
-        ))
-    })
-}
-
 pub async fn frames(
     hwnd: i64,
     target_id: &str,
@@ -9346,73 +6979,6 @@ pub async fn frames(
     serde_json::from_value::<ChromeDebuggerFramesResult>(result).map_err(|error| {
         ChromeDebuggerBridgeError::protocol(format!(
             "decode Chrome debugger frames response: {error}"
-        ))
-    })
-}
-
-pub async fn capture_visible_tab(
-    hwnd: i64,
-    _target_id: &str,
-    _expected_chrome_window_id: Option<i64>,
-) -> Result<ChromeDebuggerCaptureVisibleTabResult, ChromeDebuggerBridgeError> {
-    Err(ChromeDebuggerBridgeError::normal_bridge_attach_disabled(
-        hwnd,
-        "capturePageScreenshot",
-    ))
-}
-
-pub async fn page_screenshot(
-    hwnd: i64,
-    target_id: &str,
-    params: Value,
-) -> Result<ChromeDebuggerPageScreenshotResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "pageScreenshot")?;
-    let mut payload = if params.is_object() {
-        params
-    } else {
-        json!({})
-    };
-    payload["hwnd"] = json!(hwnd);
-    payload["targetIdHint"] = json!(target_id);
-    let command_timeout = page_screenshot_command_timeout(&payload);
-    let result = bridge()
-        .send_command_with_timeout("pageScreenshot", payload, command_timeout)
-        .await?;
-    serde_json::from_value::<ChromeDebuggerPageScreenshotResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger pageScreenshot response: {error}"
-        ))
-    })
-}
-
-fn page_screenshot_command_timeout(payload: &Value) -> Duration {
-    let caller_wait_ms = payload
-        .get("waitTimeoutMs")
-        .and_then(Value::as_u64)
-        .unwrap_or(PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS);
-    let extension_budget_ms = caller_wait_ms.min(PAGE_SCREENSHOT_EXTENSION_RESPONSE_BUDGET_MS);
-    Duration::from_millis(
-        extension_budget_ms.saturating_add(PAGE_SCREENSHOT_DAEMON_RESPONSE_HEADROOM_MS),
-    )
-}
-
-pub async fn page_pdf(
-    hwnd: i64,
-    target_id: &str,
-    params: Value,
-) -> Result<ChromeDebuggerPagePdfResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "pagePdf")?;
-    let mut payload = if params.is_object() {
-        params
-    } else {
-        json!({})
-    };
-    payload["hwnd"] = json!(hwnd);
-    payload["targetIdHint"] = json!(target_id);
-    let result = bridge().send_command("pagePdf", payload).await?;
-    serde_json::from_value::<ChromeDebuggerPagePdfResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger pagePdf response: {error}"
         ))
     })
 }
@@ -9938,42 +7504,6 @@ pub async fn wait_for_text(
     })
 }
 
-pub async fn wait_for_function(
-    hwnd: i64,
-    target_id: &str,
-    expression: &str,
-    args: Vec<Value>,
-    timeout_ms: u64,
-    polling_interval_ms: u64,
-) -> Result<ChromeDebuggerWaitForFunctionResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "waitForFunction")?;
-    // The daemon response envelope must outlive the caller's in-extension
-    // polling budget so a structured predicate/timeout outcome remains
-    // authoritative instead of being masked by a generic bridge timeout.
-    let command_timeout = COMMAND_TIMEOUT.max(Duration::from_millis(
-        timeout_ms.saturating_add(EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS),
-    ));
-    let result = bridge()
-        .send_command_with_timeout(
-            "waitForFunction",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-                "expression": expression,
-                "args": args,
-                "timeoutMs": timeout_ms,
-                "pollingIntervalMs": polling_interval_ms,
-            }),
-            command_timeout,
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerWaitForFunctionResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger waitForFunction response: {error}"
-        ))
-    })
-}
-
 pub async fn wait_for_load_state(
     hwnd: i64,
     target_id: &str,
@@ -10285,192 +7815,6 @@ pub async fn activate_tab(
     clippy::too_many_arguments,
     reason = "mirrors the MCP browser_evaluate parameters sent to the bridge, including the caller-configurable evaluate budget"
 )]
-pub async fn evaluate_script(
-    hwnd: i64,
-    target_id: &str,
-    expression: &str,
-    args: &[Value],
-    await_promise: bool,
-    return_by_value: bool,
-    timeout_ms: u64,
-) -> Result<ChromeDebuggerEvaluateScriptResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "evaluateScript")?;
-    // The daemon-side response budget must outlive the in-extension evaluate
-    // budget, otherwise the daemon kills the command first and surfaces a
-    // transport-looking A11Y_CDP_EXTENSION_TIMEOUT instead of the extension's
-    // clean structured BROWSER_EVALUATE_TIMEOUT (mirrors the downloads-wait
-    // pattern; see send_command_with_timeout). Add attach/round-trip headroom.
-    let command_timeout = COMMAND_TIMEOUT.max(Duration::from_millis(
-        timeout_ms.saturating_add(EVALUATE_DAEMON_TIMEOUT_HEADROOM_MS),
-    ));
-    let result = bridge()
-        .send_command_with_timeout(
-            "evaluateScript",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-                "expression": expression,
-                "args": args,
-                "awaitPromise": await_promise,
-                "returnByValue": return_by_value,
-                "timeoutMs": timeout_ms,
-            }),
-            command_timeout,
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerEvaluateScriptResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger evaluateScript response: {error}"
-        ))
-    })
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the MCP init-script parameters sent to the bridge"
-)]
-pub async fn init_script(
-    hwnd: i64,
-    target_id: &str,
-    operation: &str,
-    source: Option<&str>,
-    identifier: Option<&str>,
-    world_name: Option<&str>,
-    include_command_line_api: bool,
-    run_immediately: bool,
-) -> Result<ChromeDebuggerInitScriptResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "initScript")?;
-    let result = bridge()
-        .send_command(
-            "initScript",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-                "operation": operation,
-                "source": source,
-                "identifier": identifier,
-                "worldName": world_name,
-                "includeCommandLineAPI": include_command_line_api,
-                "runImmediately": run_immediately,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerInitScriptResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger initScript response: {error}"
-        ))
-    })
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the MCP binding parameters sent to the bridge"
-)]
-pub async fn expose_binding(
-    hwnd: i64,
-    target_id: &str,
-    operation: &str,
-    name: &str,
-    execution_context_name: Option<&str>,
-    since_seq: Option<u64>,
-    max_calls: usize,
-) -> Result<ChromeDebuggerExposeBindingResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "exposeBinding")?;
-    let result = bridge()
-        .send_command(
-            "exposeBinding",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-                "operation": operation,
-                "name": name,
-                "executionContextName": execution_context_name,
-                "sinceSeq": since_seq,
-                "maxCalls": max_calls,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerExposeBindingResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger exposeBinding response: {error}"
-        ))
-    })
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "mirrors the MCP dialog parameters sent to the bridge"
-)]
-pub async fn handle_dialog(
-    hwnd: i64,
-    target_id: &str,
-    operation: &str,
-    default_policy: Option<&str>,
-    prompt_text: Option<&str>,
-    since_seq: Option<u64>,
-    limit: usize,
-) -> Result<ChromeDebuggerHandleDialogResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(hwnd, "handleDialog")?;
-    let result = bridge()
-        .send_command(
-            "handleDialog",
-            json!({
-                "hwnd": hwnd,
-                "targetIdHint": target_id,
-                "operation": operation,
-                "defaultPolicy": default_policy,
-                "promptText": prompt_text,
-                "sinceSeq": since_seq,
-                "limit": limit,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerHandleDialogResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger handleDialog response: {error}"
-        ))
-    })
-}
-
-pub struct ChromeDebuggerFileUploadRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub operation: &'a str,
-    pub files: &'a [String],
-    pub selector: Option<&'a str>,
-    pub element_id: Option<&'a str>,
-    pub active_element: bool,
-    pub since_seq: Option<u64>,
-    pub limit: usize,
-}
-
-pub async fn file_upload(
-    request: ChromeDebuggerFileUploadRequest<'_>,
-) -> Result<ChromeDebuggerFileUploadResult, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "fileUpload")?;
-    let result = bridge()
-        .send_command(
-            "fileUpload",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "operation": request.operation,
-                "files": request.files,
-                "selector": request.selector,
-                "elementId": request.element_id,
-                "activeElement": request.active_element,
-                "sinceSeq": request.since_seq,
-                "limit": request.limit,
-            }),
-        )
-        .await?;
-    serde_json::from_value::<ChromeDebuggerFileUploadResult>(result).map_err(|error| {
-        ChromeDebuggerBridgeError::protocol(format!(
-            "decode Chrome debugger fileUpload response: {error}"
-        ))
-    })
-}
-
 /// Closes the extension mutation-admission gate immediately on receipt, ahead
 /// of its normal command FIFO, durably records the transition, and returns its
 /// monotonic disable generation. K2 must call this before draining daemon-side
@@ -10621,78 +7965,6 @@ pub async fn dom_action(
         .await
 }
 
-pub struct ChromeDebuggerCdpInputRequest<'a> {
-    pub hwnd: i64,
-    pub target_id: &'a str,
-    pub action: &'a str,
-    pub selector: Option<&'a str>,
-    pub element_id: Option<&'a str>,
-    pub active_element: bool,
-    pub role: Option<&'a str>,
-    pub name: Option<&'a str>,
-    pub value: Option<&'a str>,
-    pub text: Option<&'a str>,
-    pub x: Option<i32>,
-    pub y: Option<i32>,
-    pub coordinate_space: Option<&'a str>,
-    pub source_selector: Option<&'a str>,
-    pub target_selector: Option<&'a str>,
-    pub drag_steps: Option<u32>,
-    pub drag_duration_ms: Option<u64>,
-    pub drag_data_mime_type: Option<&'a str>,
-    pub drag_data_text: Option<&'a str>,
-    /// Mouse button for action=click/dblclick (left/middle/right). Ignored by
-    /// hover/tap/drag.
-    pub button: Option<&'a str>,
-    /// Modifier chord for action=click/dblclick. Ignored by hover/tap/drag.
-    pub modifiers: Option<&'a Value>,
-    /// Click count for action=click/dblclick (1 for click, 2 for dblclick).
-    pub clicks: Option<u8>,
-    pub wait_timeout_ms: u64,
-    pub auto_wait: bool,
-    pub auto_wait_timeout_ms: u32,
-    pub suppress_page_text: bool,
-}
-
-pub async fn cdp_input(
-    request: ChromeDebuggerCdpInputRequest<'_>,
-) -> Result<Value, ChromeDebuggerBridgeError> {
-    ensure_normal_bridge_external_popup_suppressed(request.hwnd, "cdpInput")?;
-    bridge()
-        .send_command(
-            "cdpInput",
-            json!({
-                "hwnd": request.hwnd,
-                "targetIdHint": request.target_id,
-                "action": request.action,
-                "selector": request.selector,
-                "elementId": request.element_id,
-                "activeElement": request.active_element,
-                "role": request.role,
-                "name": request.name,
-                "value": request.value,
-                "text": request.text,
-                "x": request.x,
-                "y": request.y,
-                "coordinateSpace": request.coordinate_space,
-                "sourceSelector": request.source_selector,
-                "targetSelector": request.target_selector,
-                "dragSteps": request.drag_steps,
-                "dragDurationMs": request.drag_duration_ms,
-                "dragDataMimeType": request.drag_data_mime_type,
-                "dragDataText": request.drag_data_text,
-                "button": request.button,
-                "modifiers": request.modifiers,
-                "clicks": request.clicks,
-                "waitTimeoutMs": request.wait_timeout_ms,
-                "autoWait": request.auto_wait,
-                "autoWaitTimeoutMs": request.auto_wait_timeout_ms,
-                "suppressPageText": request.suppress_page_text,
-            }),
-        )
-        .await
-}
-
 pub struct ChromeDebuggerCoordinateClickRequest<'a> {
     pub hwnd: i64,
     pub target_id: &'a str,
@@ -10780,7 +8052,7 @@ fn validate_maintenance_reconnect_pause_reason(
 pub async fn reload_bridge(
     wait_timeout_ms: u64,
 ) -> Result<ChromeBridgeReloadResult, ChromeDebuggerBridgeError> {
-    bridge().reload_via_host_ui(wait_timeout_ms).await
+    bridge().reload_in_background(wait_timeout_ms).await
 }
 
 pub async fn wait_for_active_bridge_host(
@@ -10923,9 +8195,6 @@ fn bridge_token_from_headers(headers: &HeaderMap) -> Option<&str> {
 }
 
 pub async fn http_register(Json(request): Json<NativeRegisterRequest>) -> Response {
-    if request.transport.as_deref() == Some("direct_http") {
-        note_normal_bridge_registration_external_popup_risk();
-    }
     with_direct_http_bridge_cors_headers(match bridge().register(request) {
         Ok(response) => Json(response).into_response(),
         Err(detail) => (
