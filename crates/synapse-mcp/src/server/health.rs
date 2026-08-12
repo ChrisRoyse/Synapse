@@ -1124,6 +1124,24 @@ impl SynapseService {
                 .last_search_state_after
                 .as_ref()
                 .and_then(|status| status.delta_changed_keys),
+            calyx_derived_state_last_weave_xterm_rows_written: Some(
+                readback.last_weave_xterm_rows_written,
+            ),
+            calyx_derived_state_last_weave_graph_rows_written: Some(
+                readback.last_weave_graph_rows_written,
+            ),
+            calyx_derived_state_last_weave_global_xterm_cf_rows_after: Some(
+                readback.last_weave_global_xterm_cf_rows_after,
+            ),
+            calyx_derived_state_last_weave_global_graph_cf_rows_after: Some(
+                readback.last_weave_global_graph_cf_rows_after,
+            ),
+            calyx_derived_state_last_weave_global_xterm_cf_rows_readback: Some(
+                readback.last_weave_global_xterm_cf_rows_readback,
+            ),
+            calyx_derived_state_last_weave_global_graph_cf_rows_readback: Some(
+                readback.last_weave_global_graph_cf_rows_readback,
+            ),
             ..SubsystemHealth::default()
         }
     }

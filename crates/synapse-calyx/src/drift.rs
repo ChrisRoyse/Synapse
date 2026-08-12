@@ -70,6 +70,9 @@ pub const SYNAPSE_DRIFT_MIN_WINDOW: usize = 4;
 pub const SYNAPSE_DRIFT_MAX_WINDOW: usize = 1_024;
 /// Default fraction of the most-recent records forming the recent window.
 pub const SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION: f32 = 0.3;
+/// Hard work bound for one MMD null-distribution estimate. The public request
+/// is rejected above this ceiling; it is never silently truncated.
+pub const SYNAPSE_DRIFT_MAX_PERMUTATIONS: usize = 10_000;
 const REACTIVE_DRIFT_PREFIX: &[u8; 8] = b"RDRIFT1\0";
 const REACTIVE_RECURRENCE_PREFIX: &[u8; 8] = b"RRECUR1\0";
 const REACTIVE_NOVELTY_PREFIX: &[u8; 8] = b"RNOVEL1\0";
@@ -903,16 +906,50 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxPanelDriftParams,
     ) -> Result<SynapseCalyxPanelDriftReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("mmd_panel_drift");
-        let max_records = params
-            .max_records
-            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
-        let recent_fraction = params.recent_fraction.clamp(0.05, 0.95);
-        let permutations = params.permutations.max(1);
-        let alpha = if params.alpha.is_finite() && params.alpha > 0.0 && params.alpha < 1.0 {
-            params.alpha
-        } else {
-            DEFAULT_MMD_ALPHA
-        };
+        if !(1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&params.max_records) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_MAX_RECORDS_INVALID",
+                format!(
+                    "MMD drift max_records={} is outside the supported range 1..={SYNAPSE_INTELLIGENCE_MAX_RECORDS}",
+                    params.max_records
+                ),
+                "set max_records to an integer inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !params.recent_fraction.is_finite() || !(0.05..=0.95).contains(&params.recent_fraction) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_RECENT_FRACTION_INVALID",
+                format!(
+                    "MMD drift recent_fraction={} must be finite and inside 0.05..=0.95",
+                    params.recent_fraction
+                ),
+                "set recent_fraction to a finite value inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !(1..=SYNAPSE_DRIFT_MAX_PERMUTATIONS).contains(&params.permutations) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_PERMUTATIONS_INVALID",
+                format!(
+                    "MMD drift permutations={} is outside the supported range 1..={SYNAPSE_DRIFT_MAX_PERMUTATIONS}",
+                    params.permutations
+                ),
+                "set permutations to an integer inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !params.alpha.is_finite() || !(0.0..1.0).contains(&params.alpha) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_ALPHA_INVALID",
+                format!(
+                    "MMD drift alpha={} must be finite and strictly inside 0..1",
+                    params.alpha
+                ),
+                "set alpha to a finite probability strictly between zero and one and retry; the request never substitutes a default",
+            ));
+        }
+        let max_records = params.max_records;
+        let recent_fraction = params.recent_fraction;
+        let permutations = params.permutations;
+        let alpha = params.alpha;
         let corpus = self.load_drift_corpus(params.panel_version, max_records)?;
 
         // Gather each lens's vectors in Base scan order (oldest first).
@@ -1107,6 +1144,15 @@ impl SynapseCalyxVault {
                     Ok(crate::SynapseCalyxWalkStep::Continue)
                 },
             )?;
+            if records_scanned == 0 {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_DRIFT_CORPUS_EMPTY",
+                    format!(
+                        "MMD drift panel {panel_version} has no Base CF constellation at the pinned snapshot"
+                    ),
+                    "confirm the exact panel_version against panel lifecycle/coverage state, ingest at least one real constellation, then retry",
+                ));
+            }
             let mut records = Vec::with_capacity(selected.len());
             for (_, cx_id) in selected {
                 // Slot vectors live in the per-slot CFs; Base carries their typed

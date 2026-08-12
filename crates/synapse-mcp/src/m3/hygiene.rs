@@ -1362,12 +1362,14 @@ pub fn run_blind_spot(
 /// hard-fails, or the `Reactive` CF write/readback fails.
 pub fn run_drift(db: &Db, params: &HygieneDriftParams) -> Result<HygieneDriftResponse, ErrorData> {
     let mut spec = synapse_calyx::SynapseCalyxPanelDriftParams::new(params.panel_version);
-    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    if let Some(max_records) = params.max_records {
+        spec.max_records = max_records as usize;
+    }
     if let Some(recent_fraction) = params.recent_fraction {
         spec.recent_fraction = recent_fraction;
     }
     if let Some(permutations) = params.permutations {
-        spec.permutations = permutations.max(1) as usize;
+        spec.permutations = permutations as usize;
     }
     let report = db
         .panel_drift_intelligence(&spec)

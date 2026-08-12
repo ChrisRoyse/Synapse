@@ -785,6 +785,29 @@ pub struct SubsystemHealth {
     /// The changed-key delta the maintainer measured on its last tick.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_delta_changed_keys: Option<u64>,
+    /// Per-panel `XTerm` rows submitted and durably flushed by the last
+    /// completed incremental-weave pass. This is an additive write count, not
+    /// a vault-global CF gauge and not a claim that every upsert grew the CF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_xterm_rows_written: Option<BTreeMap<u32, usize>>,
+    /// Per-panel Graph rows submitted and durably flushed by the last
+    /// completed incremental-weave pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_graph_rows_written: Option<BTreeMap<u32, usize>>,
+    /// Vault-global physical `XTerm` CF gauges observed after each panel's last
+    /// completed interval part. These are deliberately non-additive snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_global_xterm_cf_rows_after: Option<BTreeMap<u32, usize>>,
+    /// Vault-global physical Graph CF gauges observed after each panel's last
+    /// completed interval part. Completion order may differ across workers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_global_graph_cf_rows_after: Option<BTreeMap<u32, usize>>,
+    /// Physical-read provenance adjacent to each `XTerm` global gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_global_xterm_cf_rows_readback: Option<BTreeMap<u32, String>>,
+    /// Physical-read provenance adjacent to each Graph global gauge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_weave_global_graph_cf_rows_readback: Option<BTreeMap<u32, String>>,
 
     // --- coverage-backfill rotation and anchor-debt quarantine (#2061) ---
     /// Coverage targets owed a sweep, and how many the last tick swept. Equal on
