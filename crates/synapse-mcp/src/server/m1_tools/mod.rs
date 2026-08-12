@@ -21163,6 +21163,15 @@ fn chrome_bridge_reload_ack_readback(
                 "a bounded post-cleanup tab count",
             )
         })?;
+    let expected_before_cleanup = if maintenance_cleanup.closed {
+        expected_during_maintenance
+    } else {
+        // The decoder admits closed=false only for the separately proven
+        // already-absent terminal mode. In that mode the operation-owned tab
+        // disappeared before cleanup's first read, so both cleanup reads must
+        // already equal the post-cleanup conservation equation.
+        expected_post_cleanup
+    };
     let expected_bridge_post_cleanup = maintenance_tab
         .bridge_preexisting_tab_count
         .checked_add(maintenance_cleanup.bridge_post_cleanup.concurrent_tab_count)
@@ -21173,7 +21182,7 @@ fn chrome_bridge_reload_ack_readback(
             )
         })?;
     if maintenance_tab.tab_count_after_marker != expected_during_maintenance
-        || maintenance_cleanup.tab_count_before_cleanup != expected_during_maintenance
+        || maintenance_cleanup.tab_count_before_cleanup != expected_before_cleanup
         || maintenance_cleanup.tab_count_after_cleanup != expected_post_cleanup
         || maintenance_cleanup
             .bridge_post_cleanup
@@ -21710,13 +21719,29 @@ fn chrome_bridge_maintenance_cleanup_readback(
     value: &Value,
 ) -> Result<CdpBridgeMaintenanceCleanupReadback, ErrorData> {
     let attempted = reload_evidence_bool(value, "/attempted")?;
+    let close_attempted = reload_evidence_bool(value, "/close_attempted")?;
     let closed = reload_evidence_bool(value, "/closed")?;
+    let already_absent_before_cleanup =
+        reload_evidence_bool(value, "/already_absent_before_cleanup")?;
     let absent_verified = reload_evidence_bool(value, "/absent_verified")?;
+    let method = reload_evidence_string(value, "/method", 160)?;
     let missing_baseline_count = reload_evidence_array_len(value, "/missing_baseline_runtime_ids")?;
-    if !attempted || !closed || !absent_verified || missing_baseline_count != 0 {
+    let closed_by_operation = close_attempted
+        && closed
+        && !already_absent_before_cleanup
+        && method == "exact_uia_runtime_id_tab_close_button_invoke";
+    let already_absent = !close_attempted
+        && !closed
+        && already_absent_before_cleanup
+        && method == "exact_uia_runtime_id_already_absent_two_readback";
+    if !attempted
+        || !absent_verified
+        || missing_baseline_count != 0
+        || !(closed_by_operation || already_absent)
+    {
         return Err(chrome_bridge_reload_evidence_error(
             "/maintenance_cleanup",
-            "attempted exact close with absence proven and every baseline tab retained",
+            "exactly one terminal mode (closed_by_operation or already_absent_before_cleanup), absence proven, and every baseline tab retained",
         ));
     }
     let selection_pointer = "/prior_selection_restore";
@@ -21781,7 +21806,7 @@ fn chrome_bridge_maintenance_cleanup_readback(
         attempted,
         closed,
         absent_verified,
-        method: reload_evidence_string(value, "/method", 160)?,
+        method,
         tab_count_before_cleanup: reload_evidence_usize(value, "/tabs_before/count")?,
         tab_count_after_cleanup: reload_evidence_usize(value, "/tabs_after/count")?,
         missing_baseline_count,
