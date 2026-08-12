@@ -214,8 +214,14 @@ impl Registry {
     /// Measures a batch with a registered lens and validates every result.
     pub fn measure_batch(&self, lens_id: LensId, inputs: &[Input]) -> Result<Vec<SlotVector>> {
         let entry = self.lookup(lens_id)?;
-        for input in inputs {
-            ensure_input_modality(entry.lens.as_ref(), input)?;
+        for (item_index, input) in inputs.iter().enumerate() {
+            ensure_input_modality(entry.lens.as_ref(), input).map_err(|mut error| {
+                error.message = format!(
+                    "lens {lens_id} batch input item_index={item_index}: {}",
+                    error.message
+                );
+                error
+            })?;
         }
 
         let vectors = entry.lens.measure_batch(inputs)?;
@@ -226,8 +232,15 @@ impl Registry {
                 inputs.len()
             )));
         }
-        for vector in &vectors {
-            self.validate_entry(lens_id, entry, vector)?;
+        for (item_index, vector) in vectors.iter().enumerate() {
+            self.validate_entry(lens_id, entry, vector)
+                .map_err(|mut error| {
+                    error.message = format!(
+                        "lens {lens_id} batch output item_index={item_index}: {}",
+                        error.message
+                    );
+                    error
+                })?;
         }
         Ok(vectors)
     }

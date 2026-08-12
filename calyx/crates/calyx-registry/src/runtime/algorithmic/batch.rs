@@ -139,7 +139,16 @@ fn cpu_batch(
 ) -> Result<Vec<SlotVector>> {
     let output = inputs
         .iter()
-        .map(|input| lens.measure_cpu(input))
+        .enumerate()
+        .map(|(item_index, input)| {
+            lens.measure_cpu(input).map_err(|mut error| {
+                error.message = format!(
+                    "algorithmic batch item_index={item_index}: {}",
+                    error.message
+                );
+                error
+            })
+        })
         .collect::<Result<Vec<_>>>()?;
     lens.batch
         .record(cpu_stats(lens.encoder, inputs, work_items, reason));

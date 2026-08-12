@@ -410,6 +410,26 @@ impl AlgorithmicLens {
         }
     }
 
+    /// Validates the input-dependent bounds that must be known before this lens
+    /// can safely join a native batch.
+    ///
+    /// This deliberately does not measure the input. The Synapse page planner
+    /// uses it to remove a text item whose declared token ceiling would reject
+    /// the entire `measure_batch` call, preserving the existing pointwise
+    /// `Absent{Error}` policy without retrying a failed batch as singles.
+    pub fn preflight_batch_input(&self, input: &Input) -> Result<()> {
+        ensure_input_modality(self, input)?;
+        match self.encoder {
+            AlgorithmicEncoder::SynSparseText { .. } => {
+                syn::preflight_text_tokens(&input.bytes, "syn sparse text")
+            }
+            AlgorithmicEncoder::SynSparseTextTf { .. } => {
+                syn::preflight_text_tokens(&input.bytes, "syn sparse text tf")
+            }
+            _ => Ok(()),
+        }
+    }
+
     fn measure_cpu(&self, input: &Input) -> Result<SlotVector> {
         Ok(match self.encoder {
             AlgorithmicEncoder::SynCyclicTime { period } => syn::cyclic_time(&input.bytes, period)?,

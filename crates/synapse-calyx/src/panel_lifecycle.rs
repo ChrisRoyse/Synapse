@@ -13,7 +13,7 @@ use calyx_core::{
 use calyx_registry::{
     AlgorithmicLens, BackfillState, BackfillTask, BackfillTaskId, FrozenLensContract, LensRuntime,
     LensSpec, Registry, SlotSpec, SwapController, algorithmic_encoder, canonical_json_bytes,
-    derive_runtime_contract_from_spec,
+    derive_runtime_contract_from_spec, measure_registry_batch_with_runtime_limit,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +24,7 @@ const KEY_PREFIX: &[u8] = b"panel-lifecycle\0v1\0";
 const MAX_CAS_ATTEMPTS: usize = 64;
 const MAX_PANEL_NAME_BYTES: usize = 128;
 const OPERATION_ID_HEX_BYTES: usize = 64;
+const PANEL_LIFECYCLE_MEASURE_BATCH_LIMIT: usize = 256;
 
 pub const SYNAPSE_CALYX_PANEL_LIFECYCLE_INVALID: &str = "SYNAPSE_CALYX_PANEL_LIFECYCLE_INVALID";
 pub const SYNAPSE_CALYX_PANEL_LIFECYCLE_CONFLICT: &str = "SYNAPSE_CALYX_PANEL_LIFECYCLE_CONFLICT";
@@ -706,6 +707,35 @@ impl SynapseCalyxVault {
         lens_id: LensId,
         source_bytes: &[u8],
     ) -> Result<SynapseCalyxAddedLensMeasurement, SynapseCalyxError> {
+        let mut measured =
+            self.measure_added_panel_lens_batch(panel_name, lens_id, &[source_bytes])?;
+        if measured.len() != 1 {
+            return Err(invalid(format!(
+                "single added-lens measurement returned {} rows instead of 1",
+                measured.len()
+            )));
+        }
+        Ok(measured.remove(0))
+    }
+
+    /// Reconstructs one added frozen lens once and measures an ordered source
+    /// page through the registry's runtime-limited native batch path.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed for an empty batch, absent/retired lens state, projection or
+    /// runtime errors, reconstructed-id drift, or output cardinality mismatch.
+    pub fn measure_added_panel_lens_batch(
+        &self,
+        panel_name: &str,
+        lens_id: LensId,
+        source_rows: &[&[u8]],
+    ) -> Result<Vec<SynapseCalyxAddedLensMeasurement>, SynapseCalyxError> {
+        if source_rows.is_empty() {
+            return Err(invalid(
+                "added panel lens batch must contain at least one source row",
+            ));
+        }
         let state = self.read_panel_lifecycle(panel_name)?.ok_or_else(|| {
             conflict(format!("panel {panel_name:?} has no durable lifecycle row"))
         })?;
@@ -741,20 +771,39 @@ impl SynapseCalyxVault {
                 "reconstructed lens id {registered_id} differs from lifecycle id {lens_id}"
             )));
         }
-        let projected = project_source_bytes(&added.source_projection, source_bytes)?;
-        let vector = registry
-            .measure(
-                lens_id,
-                &Input::new(added.lens_spec.modality, projected.clone()),
-            )
-            .map_err(|error| SynapseCalyxError::from_calyx("measure added panel lens", &error))?;
-        Ok(SynapseCalyxAddedLensMeasurement {
-            panel_name: panel_name.to_owned(),
-            panel_version: state.controller.panel().version,
+        let projected = source_rows
+            .iter()
+            .map(|source_bytes| project_source_bytes(&added.source_projection, source_bytes))
+            .collect::<Result<Vec<_>, _>>()?;
+        let inputs = projected
+            .iter()
+            .map(|bytes| Input::new(added.lens_spec.modality, bytes.clone()))
+            .collect::<Vec<_>>();
+        let vectors = measure_registry_batch_with_runtime_limit(
+            &registry,
             lens_id,
-            input_sha256: hex_sha256(&projected),
-            vector,
-        })
+            &inputs,
+            Some(PANEL_LIFECYCLE_MEASURE_BATCH_LIMIT),
+        )
+        .map_err(|error| SynapseCalyxError::from_calyx("measure added panel lens", &error))?;
+        if vectors.len() != projected.len() {
+            return Err(invalid(format!(
+                "added panel lens batch returned {} vectors for {} projected inputs",
+                vectors.len(),
+                projected.len()
+            )));
+        }
+        Ok(projected
+            .into_iter()
+            .zip(vectors)
+            .map(|(projected, vector)| SynapseCalyxAddedLensMeasurement {
+                panel_name: panel_name.to_owned(),
+                panel_version: state.controller.panel().version,
+                lens_id,
+                input_sha256: hex_sha256(&projected),
+                vector,
+            })
+            .collect())
     }
 
     /// Re-measures one authoritative input into the latest durable lifecycle
@@ -775,44 +824,121 @@ impl SynapseCalyxVault {
         source_bytes: &[u8],
         base: &Constellation,
     ) -> Result<Option<Constellation>, SynapseCalyxError> {
-        let Some(state) = self.read_panel_lifecycle(panel_name)? else {
-            return Ok(None);
-        };
-        let panel = state.controller.panel();
-        if base.panel_version > panel.version {
-            return Err(conflict(format!(
-                "base constellation generation {} is newer than lifecycle generation {} for {panel_name:?}",
-                base.panel_version, panel.version
+        let mut materialized = self.materialize_panel_lifecycle_generation_batch(
+            panel_name,
+            &[(identity_input, source_bytes, base)],
+        )?;
+        if materialized.len() != 1 {
+            return Err(invalid(format!(
+                "single lifecycle materialization returned {} rows instead of 1",
+                materialized.len()
             )));
         }
-        if base.panel_version == panel.version {
-            return Ok(Some(base.clone()));
+        Ok(materialized.remove(0))
+    }
+
+    /// Re-measures an ordered source page into the latest durable lifecycle
+    /// generation, grouping every active added lens through one registry batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error for an empty page, generation inversion,
+    /// added-lens batch failure/cardinality drift, or invalid materialized schema.
+    pub fn materialize_panel_lifecycle_generation_batch(
+        &self,
+        panel_name: &str,
+        rows: &[(&[u8], &[u8], &Constellation)],
+    ) -> Result<Vec<Option<Constellation>>, SynapseCalyxError> {
+        if rows.is_empty() {
+            return Err(invalid(
+                "panel lifecycle materialization batch must contain at least one source row",
+            ));
         }
-        let mut materialized = base.clone();
-        materialized.cx_id = self.cx_id_for_input(identity_input, panel.version);
-        materialized.panel_version = panel.version;
+        let Some(state) = self.read_panel_lifecycle(panel_name)? else {
+            return Ok(vec![None; rows.len()]);
+        };
+        let panel = state.controller.panel();
+        let mut materialized = Vec::with_capacity(rows.len());
+        for (row_index, (identity_input, _source_bytes, base)) in rows.iter().enumerate() {
+            if base.panel_version > panel.version {
+                return Err(conflict(format!(
+                    "base constellation generation {} is newer than lifecycle generation {} for {panel_name:?} at row_index={row_index}",
+                    base.panel_version, panel.version
+                )));
+            }
+            let mut row = (*base).clone();
+            if row.panel_version < panel.version {
+                row.cx_id = self.cx_id_for_input(identity_input, panel.version);
+                row.panel_version = panel.version;
+            }
+            materialized.push(row);
+        }
         for slot in &panel.slots {
-            if materialized.slots.contains_key(&slot.slot_id) {
+            let missing = materialized
+                .iter()
+                .enumerate()
+                .filter_map(|(row_index, row)| {
+                    (!row.slots.contains_key(&slot.slot_id)).then_some(row_index)
+                })
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
                 continue;
             }
-            let vector = match slot.state {
+            match slot.state {
                 SlotState::Active => {
-                    self.measure_added_panel_lens(panel_name, slot.lens_id, source_bytes)?
-                        .vector
+                    let source_rows = missing
+                        .iter()
+                        .map(|row_index| rows[*row_index].1)
+                        .collect::<Vec<_>>();
+                    let measured = self.measure_added_panel_lens_batch(
+                        panel_name,
+                        slot.lens_id,
+                        &source_rows,
+                    )?;
+                    if measured.len() != missing.len() {
+                        return Err(invalid(format!(
+                            "lifecycle lens {} returned {} measurements for {} missing rows",
+                            slot.lens_id,
+                            measured.len(),
+                            missing.len()
+                        )));
+                    }
+                    for (row_index, measurement) in missing.into_iter().zip(measured) {
+                        materialized[row_index]
+                            .slots
+                            .insert(slot.slot_id, measurement.vector);
+                    }
                 }
-                SlotState::Parked | SlotState::Retired => SlotVector::Absent {
-                    reason: AbsentReason::LensInactive,
-                },
-            };
-            materialized.slots.insert(slot.slot_id, vector);
+                SlotState::Parked | SlotState::Retired => {
+                    let vector = SlotVector::Absent {
+                        reason: AbsentReason::LensInactive,
+                    };
+                    for row_index in missing {
+                        materialized[row_index]
+                            .slots
+                            .insert(slot.slot_id, vector.clone());
+                    }
+                }
+            }
         }
-        materialized.validate_schema().map_err(|error| {
-            SynapseCalyxError::from_calyx(
-                "validate materialized panel lifecycle generation",
-                &error,
-            )
-        })?;
-        Ok(Some(materialized))
+        let state_after = self.read_panel_lifecycle(panel_name)?;
+        if state_after.as_ref() != Some(&state) {
+            return Err(conflict(format!(
+                "panel {panel_name:?} lifecycle state changed while its {}-row measurement batch was in flight; refusing to publish vectors against a mixed contract",
+                rows.len()
+            )));
+        }
+        for (row_index, row) in materialized.iter().enumerate() {
+            row.validate_schema().map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!(
+                        "validate materialized panel lifecycle generation row_index={row_index}"
+                    ),
+                    &error,
+                )
+            })?;
+        }
+        Ok(materialized.into_iter().map(Some).collect())
     }
 
     /// Atomically recovers abandoned claims and claims a bounded next batch.

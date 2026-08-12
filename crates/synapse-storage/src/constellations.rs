@@ -1,10 +1,11 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::time::Duration;
 
 use calyx_core::{
-    AbsentReason, Anchor, AnchorKind, AnchorValue, Asymmetry, CalyxErrorCode, Constellation,
-    CxFlags, CxId, Input, InputRef, LedgerRef, Lens, METADATA_SOURCE_EVENT_TIME_RAW,
+    AbsentReason, Anchor, AnchorKind, AnchorValue, Asymmetry, CalyxError, CalyxErrorCode,
+    Constellation, CxFlags, CxId, Input, InputRef, LedgerRef, Lens, METADATA_SOURCE_EVENT_TIME_RAW,
     METADATA_SOURCE_EVENT_TIME_SECS, METADATA_SOURCE_SEQUENCE, METADATA_TEMPORAL_INACTIVE_REASON,
     METADATA_TEMPORAL_LANE_STATE, Modality, Panel, QuantPolicy, Slot, SlotId, SlotKey,
     SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE,
@@ -18,6 +19,7 @@ use calyx_mincut::{
 use calyx_registry::{
     AlgorithmicEncoder as RegistryAlgorithmicEncoder, AlgorithmicLens as RegistryAlgorithmicLens,
     LensRuntime, LensSpec, Registry, default_recall_delta,
+    measure_registry_batch_with_runtime_limit,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -6881,6 +6883,253 @@ fn activate_temporal_lane(
     metadata.insert(METADATA_SOURCE_SEQUENCE.to_owned(), hex_encode(source_key));
 }
 
+/// Bounds one runtime call while still amortizing setup across many source
+/// rows. The page itself is 1,000 rows; 256 keeps a future neural runtime's
+/// transient input/output allocations bounded without reducing the algorithmic
+/// runtime to batch-size one.
+const SYN_BACKFILL_MEASURE_BATCH_LIMIT: usize = 256;
+
+#[derive(Clone, Copy)]
+enum DeferredMeasurementPolicy {
+    Strict,
+    OverLimitAbsent { panel_name: &'static str },
+}
+
+struct DeferredMeasurement {
+    lens: AlgorithmicLens,
+    input: Input,
+    policy: DeferredMeasurementPolicy,
+}
+
+#[derive(Default)]
+pub(crate) struct DeferredMeasurementPlan {
+    jobs: Vec<DeferredMeasurement>,
+}
+
+thread_local! {
+    static DEFERRED_MEASUREMENTS: RefCell<Option<Vec<DeferredMeasurement>>> = const {
+        RefCell::new(None)
+    };
+}
+
+struct DeferredMeasurementCaptureGuard;
+
+impl Drop for DeferredMeasurementCaptureGuard {
+    fn drop(&mut self) {
+        DEFERRED_MEASUREMENTS.with(|measurements| {
+            measurements.borrow_mut().take();
+        });
+    }
+}
+
+/// Captures one constellation builder's lens calls without executing them.
+///
+/// # Errors
+///
+/// Returns a storage error when capture is nested on one worker thread or when
+/// the builder itself fails. The guard clears thread-local state during unwind.
+pub(crate) fn capture_deferred_measurements<T>(
+    build: impl FnOnce() -> StorageResult<T>,
+) -> StorageResult<(T, DeferredMeasurementPlan)> {
+    let installed = DEFERRED_MEASUREMENTS.with(|measurements| {
+        let mut measurements = measurements.borrow_mut();
+        if measurements.is_some() {
+            false
+        } else {
+            *measurements = Some(Vec::new());
+            true
+        }
+    });
+    if !installed {
+        return Err(measurement_error(
+            "nested Calyx measurement batch capture",
+            "a constellation builder attempted to open a second deferred measurement scope on one worker thread",
+        ));
+    }
+    let guard = DeferredMeasurementCaptureGuard;
+    let value = build()?;
+    let jobs = DEFERRED_MEASUREMENTS.with(|measurements| measurements.borrow_mut().take());
+    drop(guard);
+    let Some(jobs) = jobs else {
+        return Err(measurement_error(
+            "Calyx measurement batch capture state disappeared",
+            "the thread-local capture was cleared before its builder returned",
+        ));
+    };
+    Ok((value, DeferredMeasurementPlan { jobs }))
+}
+
+fn defer_measurement(
+    lens: AlgorithmicLens,
+    input: Input,
+    policy: DeferredMeasurementPolicy,
+) -> Result<(), (AlgorithmicLens, Input)> {
+    DEFERRED_MEASUREMENTS.with(|measurements| {
+        let mut measurements = measurements.borrow_mut();
+        let Some(jobs) = measurements.as_mut() else {
+            return Err((lens, input));
+        };
+        jobs.push(DeferredMeasurement {
+            lens,
+            input,
+            policy,
+        });
+        Ok(())
+    })
+}
+
+fn deferred_measurement_placeholder() -> SlotVector {
+    absent(AbsentReason::Deferred)
+}
+
+pub(crate) const fn is_deferred_measurement_placeholder(vector: &SlotVector) -> bool {
+    matches!(
+        vector,
+        SlotVector::Absent {
+            reason: AbsentReason::Deferred
+        }
+    )
+}
+
+/// Executes identical frozen lenses across all captured rows through the real
+/// registry batch API, returning ordered slot replacements per source row.
+///
+/// # Errors
+///
+/// Returns a storage error when the active panel/registry contract is missing,
+/// a planned lens is not uniquely mapped to a slot, preflight rejects a strict
+/// input, batch measurement fails, cardinality drifts, or a job is unresolved.
+#[allow(
+    clippy::too_many_lines,
+    reason = "contract lookup, pointwise preflight, grouped runtime calls, and cardinality validation form one fail-closed measurement transaction"
+)]
+pub(crate) fn resolve_deferred_measurement_plans(
+    panel_version: u32,
+    created_at_ms: u64,
+    plans: &[&DeferredMeasurementPlan],
+) -> StorageResult<Vec<Vec<(SlotId, SlotVector)>>> {
+    let contract = syn_active_panel_contract(panel_version, created_at_ms)?.ok_or_else(|| {
+        measurement_error(
+            "Calyx measurement batch panel is not registered",
+            panel_version,
+        )
+    })?;
+    let mut slot_by_lens = BTreeMap::new();
+    for slot in &contract.panel.slots {
+        if let Some(first_slot) = slot_by_lens.insert(slot.lens_id, slot.slot_id) {
+            return Err(measurement_error(
+                "Calyx measurement batch lens is mapped to multiple slots",
+                format!(
+                    "panel_version={panel_version} lens_id={} first_slot={} duplicate_slot={}",
+                    slot.lens_id, first_slot.0, slot.slot_id.0
+                ),
+            ));
+        }
+    }
+
+    let mut replacements = plans
+        .iter()
+        .map(|plan| Vec::with_capacity(plan.jobs.len()))
+        .collect::<Vec<_>>();
+    let mut groups = BTreeMap::<_, Vec<(usize, &DeferredMeasurement)>>::new();
+    for (row_index, plan) in plans.iter().enumerate() {
+        let mut seen = BTreeSet::new();
+        for job in &plan.jobs {
+            let lens_id = job.lens.id();
+            if !seen.insert(lens_id) {
+                return Err(measurement_error(
+                    "Calyx measurement batch row repeats a frozen lens",
+                    format!("row_index={row_index} lens_id={lens_id}"),
+                ));
+            }
+            let slot_id = slot_by_lens.get(&lens_id).copied().ok_or_else(|| {
+                measurement_error(
+                    "Calyx measurement batch lens is absent from the active panel",
+                    format!(
+                        "panel_version={panel_version} row_index={row_index} lens_id={lens_id}"
+                    ),
+                )
+            })?;
+            match job.lens.preflight_batch_input(&job.input) {
+                Ok(()) => groups.entry(lens_id).or_default().push((row_index, job)),
+                Err(source)
+                    if source.code == CalyxErrorCode::LensInputTooLarge.code()
+                        && matches!(
+                            job.policy,
+                            DeferredMeasurementPolicy::OverLimitAbsent { .. }
+                        ) =>
+                {
+                    let DeferredMeasurementPolicy::OverLimitAbsent { panel_name } = job.policy
+                    else {
+                        unreachable!("policy guarded by matches above")
+                    };
+                    replacements[row_index]
+                        .push((slot_id, refused_text_slot(panel_name, &job.lens, &source)));
+                }
+                Err(source) => {
+                    return Err(measurement_error(
+                        "Calyx Syn* lens batch preflight failed",
+                        format!(
+                            "panel_version={panel_version} row_index={row_index} lens_id={lens_id}: {source}"
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+
+    for (lens_id, jobs) in groups {
+        let slot_id = *slot_by_lens.get(&lens_id).ok_or_else(|| {
+            measurement_error("Calyx measurement batch lost its slot mapping", lens_id)
+        })?;
+        let inputs = jobs
+            .iter()
+            .map(|(_row_index, job)| job.input.clone())
+            .collect::<Vec<_>>();
+        let vectors = measure_registry_batch_with_runtime_limit(
+            &contract.registry,
+            lens_id,
+            &inputs,
+            Some(SYN_BACKFILL_MEASURE_BATCH_LIMIT),
+        )
+        .map_err(|source| {
+            measurement_error(
+                "Calyx Syn* registry batch measurement failed",
+                format!(
+                    "panel_version={panel_version} lens_id={lens_id} inputs={}: {source}",
+                    inputs.len()
+                ),
+            )
+        })?;
+        if vectors.len() != jobs.len() {
+            return Err(measurement_error(
+                "Calyx Syn* registry batch cardinality mismatch",
+                format!(
+                    "panel_version={panel_version} lens_id={lens_id} inputs={} vectors={}",
+                    jobs.len(),
+                    vectors.len()
+                ),
+            ));
+        }
+        for ((row_index, _job), vector) in jobs.into_iter().zip(vectors) {
+            replacements[row_index].push((slot_id, vector));
+        }
+    }
+    for (row_index, (plan, resolved)) in plans.iter().zip(&replacements).enumerate() {
+        if plan.jobs.len() != resolved.len() {
+            return Err(measurement_error(
+                "Calyx measurement batch left deferred jobs unresolved",
+                format!(
+                    "row_index={row_index} planned={} resolved={}",
+                    plan.jobs.len(),
+                    resolved.len()
+                ),
+            ));
+        }
+    }
+    Ok(replacements)
+}
+
 fn measure_text(
     panel_name: &'static str,
     lens: AlgorithmicLens,
@@ -7772,6 +8021,10 @@ fn measure_input(
     lens: AlgorithmicLens,
     input: Input,
 ) -> StorageResult<SlotVector> {
+    let (lens, input) = match defer_measurement(lens, input, DeferredMeasurementPolicy::Strict) {
+        Ok(()) => return Ok(deferred_measurement_placeholder()),
+        Err(unplanned) => unplanned,
+    };
     lens.measure(&input).map_err(|source| {
         measurement_error(
             "Calyx Syn* lens measurement failed",
@@ -7818,36 +8071,52 @@ fn measure_text_or_absent(
         return Ok(absent(AbsentReason::NotApplicable));
     }
     let input = Input::new(Modality::Structured, text.as_bytes());
+    let (lens, input) = match defer_measurement(
+        lens.clone(),
+        input,
+        DeferredMeasurementPolicy::OverLimitAbsent { panel_name },
+    ) {
+        Ok(()) => return Ok(deferred_measurement_placeholder()),
+        Err(unplanned) => unplanned,
+    };
     match lens.measure(&input) {
         Ok(vector) => Ok(vector),
         Err(source) if source.code == CalyxErrorCode::LensInputTooLarge.code() => {
-            let lens_id = lens.id().to_string();
-            synapse_telemetry::metrics::counter!(
-                CALYX_SLOT_LENS_REFUSED_TOTAL,
-                "panel" => panel_name,
-                "lens" => lens_id.clone(),
-            )
-            .increment(1);
-            tracing::warn!(
-                code = "CALYX_SLOT_LENS_REFUSED",
-                panel_name,
-                lens_id = %lens_id,
-                detail = %source.message,
-                remediation = "the record keeps every other lens; query the panel's \
-                               records_slot_refused coverage to see how often this fires",
-                "a lens refused an over-limit input; the slot is Absent{{Error}} and the rest of \
-                 the constellation is measured"
-            );
-            Ok(absent(AbsentReason::Error(format!(
-                "{SLOT_REFUSED_ABSENT_PREFIX}{lens_id}: {}",
-                source.message
-            ))))
+            Ok(refused_text_slot(panel_name, &lens, &source))
         }
         Err(source) => Err(measurement_error(
             "Calyx Syn* lens measurement failed",
             format!("{panel_name}: {}: {source}", lens.id()),
         )),
     }
+}
+
+fn refused_text_slot(
+    panel_name: &'static str,
+    lens: &AlgorithmicLens,
+    source: &CalyxError,
+) -> SlotVector {
+    let lens_id = lens.id().to_string();
+    synapse_telemetry::metrics::counter!(
+        CALYX_SLOT_LENS_REFUSED_TOTAL,
+        "panel" => panel_name,
+        "lens" => lens_id.clone(),
+    )
+    .increment(1);
+    tracing::warn!(
+        code = "CALYX_SLOT_LENS_REFUSED",
+        panel_name,
+        lens_id = %lens_id,
+        detail = %source.message,
+        remediation = "the record keeps every other lens; query the panel's \
+                       records_slot_refused coverage to see how often this fires",
+        "a lens refused an over-limit input; the slot is Absent{{Error}} and the rest of the \
+         constellation is measured"
+    );
+    absent(AbsentReason::Error(format!(
+        "{SLOT_REFUSED_ABSENT_PREFIX}{lens_id}: {}",
+        source.message
+    )))
 }
 
 #[allow(
