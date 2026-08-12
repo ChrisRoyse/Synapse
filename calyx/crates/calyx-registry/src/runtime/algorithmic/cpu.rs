@@ -206,8 +206,9 @@ pub(super) fn token_vectors_from_words(words: &[u32], token_dim: u32) -> Vec<Vec
 pub(super) fn token_vector(seed: &[u8], dim: u32) -> Vec<f32> {
     let mut out = Vec::with_capacity(dim as usize);
     let mut counter = 0_u32;
+    let mut hasher = blake3::Hasher::new();
     while out.len() < dim as usize {
-        let mut hasher = blake3::Hasher::new();
+        hasher.reset();
         hasher.update(b"calyx-algorithmic-token-hash-v1");
         hasher.update(seed);
         hasher.update(&counter.to_be_bytes());

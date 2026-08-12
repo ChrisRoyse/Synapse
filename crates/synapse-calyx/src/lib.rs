@@ -60,7 +60,7 @@ pub use calyx_aster::vault::{
 };
 use calyx_aster::vault::{
     AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook,
-    TemporalMetadataMigration, VaultOptions, encode as vault_encode,
+    TemporalMetadataBackfill, TemporalMetadataMigration, VaultOptions, encode as vault_encode,
 };
 pub use calyx_core::TemporalPolicy;
 use calyx_core::{
@@ -3494,6 +3494,36 @@ impl SynapseCalyxVault {
             )
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("backfill native Calyx temporal metadata", &error)
+            })
+    }
+
+    /// Atomically replaces only the temporal metadata fields on an ordered set
+    /// of legacy Base rows after exact panel and source-identity verification.
+    ///
+    /// Already-current rows remain read-only outcomes. Every changed row is
+    /// stamped by one declared batch ledger entry and becomes visible through
+    /// the same MVCC/WAL commit.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed Calyx error before mutation when any Base row is absent,
+    /// duplicated in the request, or differs from its authoritative panel or
+    /// identity. Durable commit and ledger-hook failures retain their exact
+    /// reconciliation-required error contract.
+    pub fn backfill_temporal_metadata_batch<I>(
+        &self,
+        requests: I,
+    ) -> Result<Vec<TemporalMetadataMigration>, SynapseCalyxError>
+    where
+        I: IntoIterator<Item = TemporalMetadataBackfill>,
+    {
+        self.vault
+            .backfill_temporal_metadata_batch(requests)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "backfill native Calyx temporal metadata batch",
+                    &error,
+                )
             })
     }
 

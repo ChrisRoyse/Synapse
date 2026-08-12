@@ -33,6 +33,21 @@ pub struct ConstellationHeader {
     pub input_hash: [u8; 32],
 }
 
+/// Allocation-light Base-row view for census and lineage scans.
+///
+/// It validates and skips input, slot, and scalar fields without materializing
+/// their maps, while decoding the header, anchors, and metadata those scans
+/// actually consume. This is read-only: callers that rewrite a Base row still
+/// need [`super::base_rewrite::BaseRowRewrite`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConstellationBaseProjection {
+    pub cx_id: CxId,
+    pub panel_version: u32,
+    pub created_at: u64,
+    pub anchors: Vec<calyx_core::Anchor>,
+    pub metadata: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WriteRow {
     pub cf: ColumnFamily,
@@ -275,6 +290,71 @@ pub fn decode_constellation_base_with_slot_hashes(
         },
         slot_hashes,
     ))
+}
+
+/// Decodes only the Base fields required by panel census and lineage walks.
+///
+/// The skipped variable-width fields are still bounds-checked and their UTF-8
+/// tags are validated, so malformed rows fail at the physical source of truth
+/// instead of becoming a partial projection.
+pub fn decode_constellation_base_projection(bytes: &[u8]) -> Result<ConstellationBaseProjection> {
+    let header = decode_header(bytes)?;
+    let mut cursor = Cursor::new(&bytes[HEADER_LEN..]);
+    let _identity = cursor.bytes(IDENTITY_HASH_LEN)?;
+    let _redacted = cursor.u8()?;
+    match cursor.u8()? {
+        0 => {}
+        1 => validate_utf8_field(cursor.bytes_prefixed()?, "input pointer")?,
+        tag => {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "unknown input pointer tag {tag}"
+            )));
+        }
+    }
+
+    let slot_count = cursor.u16()? as usize;
+    let slot_bytes = slot_count.checked_mul(2 + 32).ok_or_else(|| {
+        CalyxError::aster_corrupt_shard(format!(
+            "Base slot-map byte count overflow: slot_count={slot_count}"
+        ))
+    })?;
+    let _slots = cursor.bytes(slot_bytes)?;
+
+    let scalar_count = cursor.u32()? as usize;
+    for _ in 0..scalar_count {
+        validate_utf8_field(cursor.bytes_prefixed()?, "scalar key")?;
+        let _value_bits = cursor.u64()?;
+    }
+
+    let anchor_count = cursor.u32()? as usize;
+    let mut anchors = reserved_vec(anchor_count, "Base projection anchors")?;
+    for _ in 0..anchor_count {
+        anchors.push(decode_anchor(cursor.bytes_prefixed()?)?);
+    }
+    let _provenance_hash = cursor.bytes(32)?;
+    let metadata = if cursor.remaining() == 0 {
+        BTreeMap::new()
+    } else {
+        decode_string_metadata(&mut cursor)?
+    };
+    if cursor.remaining() != 0 {
+        return Err(CalyxError::aster_corrupt_shard(
+            "trailing bytes after constellation metadata",
+        ));
+    }
+    Ok(ConstellationBaseProjection {
+        cx_id: header.cx_id,
+        panel_version: header.panel_version,
+        created_at: header.created_at,
+        anchors,
+        metadata,
+    })
+}
+
+fn validate_utf8_field(bytes: &[u8], field: &str) -> Result<()> {
+    std::str::from_utf8(bytes)
+        .map(|_value| ())
+        .map_err(|error| CalyxError::aster_corrupt_shard(format!("{field} utf8 decode: {error}")))
 }
 
 /// Reads the stored identity hash out of an encoded Base row without decoding

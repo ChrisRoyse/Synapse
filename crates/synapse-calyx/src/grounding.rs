@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::cf::ColumnFamily;
-use calyx_aster::vault::encode::decode_constellation_base;
+use calyx_aster::vault::encode::{decode_constellation_base, decode_constellation_base_projection};
 use calyx_core::{AbsentReason, Anchor, AnchorKind, SlotVector};
 use serde::{Deserialize, Serialize};
 
@@ -565,7 +565,7 @@ impl SynapseCalyxVault {
             ColumnFamily::Base,
             crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
             |key, value| {
-                let base = match decode_constellation_base(value) {
+                let base = match decode_constellation_base_projection(value) {
                     Ok(base) => base,
                     Err(error) => {
                         decode_failures += 1;
@@ -658,7 +658,7 @@ impl SynapseCalyxVault {
             ColumnFamily::Base,
             crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
             |key, value| {
-                let base = match decode_constellation_base(value) {
+                let base = match decode_constellation_base_projection(value) {
                     Ok(base) => base,
                     Err(error) => {
                         decode_failures += 1;

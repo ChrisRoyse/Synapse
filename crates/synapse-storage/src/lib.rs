@@ -1545,8 +1545,86 @@ impl Db {
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
-        self.backend
-            .backfill_temporal_metadata(source_cf, source_key, after_physical, max_rows)
+        let exact_keys = source_key.map(|key| vec![key.to_vec()]);
+        self.backend.backfill_temporal_metadata(
+            source_cf,
+            exact_keys.as_deref(),
+            false,
+            after_physical,
+            max_rows,
+        )
+    }
+
+    /// Rebuilds an ordered set of exact source identities through one native
+    /// constellation/temporal/anchor batch while retaining one disposition per
+    /// requested key.
+    ///
+    /// # Errors
+    ///
+    /// Fails the whole call when the source CF or request shape is invalid, or
+    /// when the shared durable transaction/readback fails. Source-row-specific
+    /// preflight failures are returned in their ordered item result and are
+    /// never retried through a single-row fallback.
+    pub fn backfill_temporal_metadata_exact_batch(
+        &self,
+        source_cf: &str,
+        source_keys: &[Vec<u8>],
+    ) -> StorageResult<Vec<StorageResult<constellations::TemporalMetadataBackfillRowReport>>> {
+        if source_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let report = self.backend.backfill_temporal_metadata(
+            source_cf,
+            Some(source_keys),
+            true,
+            None,
+            source_keys.len(),
+        )?;
+        let mut by_key = std::collections::BTreeMap::new();
+        for row in report.row_reports {
+            let key = row.source_key.clone();
+            if by_key.insert(key.clone(), Ok(row)).is_some() {
+                return Err(StorageError::ReadFailed {
+                    cf_name: source_cf.to_owned(),
+                    detail: format!(
+                        "exact temporal backfill returned duplicate success disposition for key_hex={}",
+                        constellations::hex_encode(&key)
+                    ),
+                });
+            }
+        }
+        for failure in report.row_failures {
+            let key = failure.source_key;
+            let error = StorageError::ReadFailed {
+                cf_name: source_cf.to_owned(),
+                detail: format!(
+                    "exact temporal backfill pointwise preflight failed for key_hex={}: {}",
+                    constellations::hex_encode(&key),
+                    failure.error
+                ),
+            };
+            if by_key.insert(key.clone(), Err(error)).is_some() {
+                return Err(StorageError::ReadFailed {
+                    cf_name: source_cf.to_owned(),
+                    detail: format!(
+                        "exact temporal backfill returned conflicting dispositions for key_hex={}",
+                        constellations::hex_encode(&key)
+                    ),
+                });
+            }
+        }
+        source_keys
+            .iter()
+            .map(|key| {
+                by_key.remove(key).ok_or_else(|| StorageError::ReadFailed {
+                    cf_name: source_cf.to_owned(),
+                    detail: format!(
+                        "exact temporal backfill returned no disposition for requested key_hex={}",
+                        constellations::hex_encode(key)
+                    ),
+                })
+            })
+            .collect()
     }
 
     /// Returns the status of the exact process-local Calyx vault that owns
@@ -2250,6 +2328,21 @@ impl Db {
             .put_agent_event_constellation(source_key, raw_bytes, record)
     }
 
+    /// Measures and stores native Calyx constellations for persisted
+    /// `CF_AGENT_EVENTS` rows in one durable backend batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when any measurement, ordered batch commit, or
+    /// per-row readback contract fails.
+    #[tracing::instrument(skip_all, fields(row_count = rows.len(), backend = self.backend_name()))]
+    pub fn put_agent_event_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, synapse_core::types::AgentEventRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        self.backend.put_agent_event_constellations(rows)
+    }
+
     /// Measures and stores the native Calyx constellation for one persisted
     /// `CF_AGENT_TRANSCRIPTS` row.
     ///
@@ -2267,6 +2360,21 @@ impl Db {
     ) -> StorageResult<ConstellationPutReport> {
         self.backend
             .put_agent_transcript_constellation(source_key, raw_bytes, record)
+    }
+
+    /// Measures and stores native Calyx constellations for persisted
+    /// `CF_AGENT_TRANSCRIPTS` rows in one durable backend batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when any measurement, ordered batch commit, or
+    /// per-row readback contract fails.
+    #[tracing::instrument(skip_all, fields(row_count = rows.len(), backend = self.backend_name()))]
+    pub fn put_agent_transcript_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, synapse_core::types::AgentTranscriptRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        self.backend.put_agent_transcript_constellations(rows)
     }
 
     /// Measures and stores the native Calyx constellation for one persisted

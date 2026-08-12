@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use calyx_core::{CalyxError, Result, SlotVector, SparseEntry, content_address};
 use serde_json::Value;
 
@@ -180,16 +178,15 @@ pub(super) fn sparse_text(bytes: &[u8], dim: u32) -> Result<SlotVector> {
 pub(super) fn sparse_text_tf(bytes: &[u8], dim: u32) -> Result<SlotVector> {
     let dim = ensure_power_of_two("syn sparse text tf dim", dim)?;
     let tokens = lexical_tokens(bytes, MAX_TEXT_TOKENS, "syn sparse text tf")?;
-    let mut counts = BTreeMap::<u32, f32>::new();
+    let mut hasher = blake3::Hasher::new();
+    let mut counts = Vec::with_capacity(tokens.len());
     for token in &tokens {
-        let digest = content_address([b"syn-sparse-text-tf-v1".as_slice(), token.as_bytes()]);
+        let digest =
+            content_address_pair_reusing(&mut hasher, b"syn-sparse-text-tf-v1", token.as_bytes());
         let idx = hash_prefix(&digest) & (dim - 1);
-        *counts.entry(idx).or_default() += 1.0;
+        counts.push((idx, 1.0));
     }
-    let entries = counts
-        .into_iter()
-        .map(|(idx, val)| SparseEntry { idx, val })
-        .collect();
+    let entries = fold_sparse_entries(counts);
     Ok(SlotVector::Sparse { dim, entries })
 }
 
@@ -645,26 +642,25 @@ fn signed_sparse<'a>(
     namespace: &'static [u8],
 ) -> Result<SlotVector> {
     let dim = ensure_power_of_two("syn sparse dim", dim)?;
-    let mut counts = BTreeMap::<u32, f32>::new();
+    let mut hasher = blake3::Hasher::new();
+    let mut counts = Vec::new();
     let mut total = 0.0_f32;
     for token in tokens {
-        let digest = content_address([namespace, token.as_bytes()]);
+        let digest = content_address_pair_reusing(&mut hasher, namespace, token.as_bytes());
         let idx = hash_prefix(&digest) & (dim - 1);
         let val = signed_hash_value(&digest);
-        *counts.entry(idx).or_default() += val;
+        counts.push((idx, val));
         total += val.abs();
     }
-    let entries = if total == 0.0 {
-        Vec::new()
+    let mut entries = fold_sparse_entries(counts);
+    if total != 0.0 {
+        for entry in &mut entries {
+            entry.val /= total;
+        }
+        entries.retain(|entry| entry.val != 0.0);
     } else {
-        counts
-            .into_iter()
-            .filter_map(|(idx, val)| {
-                let val = val / total;
-                (val != 0.0).then_some(SparseEntry { idx, val })
-            })
-            .collect()
-    };
+        entries.clear();
+    }
     Ok(SlotVector::Sparse { dim, entries })
 }
 
@@ -899,6 +895,36 @@ fn hash_prefix(digest: &[u8; 16]) -> u32 {
 
 fn signed_hash_value(digest: &[u8; 16]) -> f32 {
     if digest[4] & 1 == 0 { 1.0 } else { -1.0 }
+}
+
+fn content_address_pair_reusing(
+    hasher: &mut blake3::Hasher,
+    first: &[u8],
+    second: &[u8],
+) -> [u8; 16] {
+    hasher.reset();
+    for part in [first, second] {
+        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let mut digest = [0_u8; 16];
+    digest.copy_from_slice(&hasher.finalize().as_bytes()[..16]);
+    digest
+}
+
+fn fold_sparse_entries(mut counts: Vec<(u32, f32)>) -> Vec<SparseEntry> {
+    counts.sort_unstable_by_key(|(idx, _)| *idx);
+    let mut entries: Vec<SparseEntry> = Vec::with_capacity(counts.len());
+    for (idx, val) in counts {
+        if let Some(last) = entries.last_mut()
+            && last.idx == idx
+        {
+            last.val += val;
+        } else {
+            entries.push(SparseEntry { idx, val });
+        }
+    }
+    entries
 }
 
 fn numerical(message: impl Into<String>) -> CalyxError {

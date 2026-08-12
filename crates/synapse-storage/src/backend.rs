@@ -15,7 +15,8 @@ use calyx_aster::{
     mvcc::{CfRead, Freshness, LATEST_CF_RANGE_PAGE_MAX_ROWS, tombstone_value},
     wal,
 };
-use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, TemporalPolicy};
+use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, TemporalPolicy, VaultId};
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -174,7 +175,7 @@ struct PendingConstellationReport {
     scalar_count: u64,
 }
 
-struct EpisodeConstellationBatch {
+struct ConstellationBatch {
     constellations: Vec<Constellation>,
     pending_reports: Vec<PendingConstellationReport>,
 }
@@ -358,6 +359,38 @@ struct PreparedGroundingAnchorSource {
 }
 
 type PreparedGroundingAnchorBatch = (Vec<PreparedGroundingAnchorSource>, Vec<(CxId, Vec<Anchor>)>);
+
+#[derive(Clone, Copy)]
+struct TemporalBackfillBuildContext<'a> {
+    source_cf: &'a str,
+    active_panel_version: u32,
+    vault_id: VaultId,
+    created_at_ms: u64,
+    next_ledger_seq: u64,
+}
+
+struct PreparedTranscriptBackfillOutcome {
+    anchor: Option<GroundingAnchor>,
+    unadjudicable: bool,
+}
+
+struct PreparedTemporalBackfillRow {
+    constellation: Constellation,
+    transcript_outcome: Option<PreparedTranscriptBackfillOutcome>,
+    action_outcome_present: Option<bool>,
+}
+
+struct TemporalBackfillRowSidecars {
+    transcript_outcome: Option<PreparedTranscriptBackfillOutcome>,
+    action_outcome_present: Option<bool>,
+}
+
+struct TemporalBackfillRowOutcome {
+    put: SynapseCalyxObservationPutReadback,
+    migration: Option<calyx_aster::vault::TemporalMetadataMigration>,
+    cx_id: CxId,
+    sidecars: TemporalBackfillRowSidecars,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CalyxAnchorBatchWriteReport {
@@ -883,7 +916,8 @@ pub trait StorageBackend: Send + Sync {
     fn backfill_temporal_metadata(
         &self,
         source_cf: &str,
-        source_key: Option<&[u8]>,
+        source_keys: Option<&[Vec<u8>]>,
+        pointwise_preflight: bool,
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport>;
@@ -909,12 +943,20 @@ pub trait StorageBackend: Send + Sync {
         raw_bytes: &[u8],
         record: &AgentEventRecord,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_agent_event_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, AgentEventRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>>;
     fn put_agent_transcript_constellation(
         &self,
         source_key: &[u8],
         raw_bytes: &[u8],
         record: &AgentTranscriptRecord,
     ) -> StorageResult<ConstellationPutReport>;
+    fn put_agent_transcript_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, AgentTranscriptRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>>;
     fn put_action_constellation(
         &self,
         source_key: &[u8],
@@ -2310,78 +2352,6 @@ impl CalyxBackend {
         self.with_vault(cf_name, "scan Calyx KV namespace", false, |vault| {
             read_all_rows_from_vault(vault, cf_name)
         })
-    }
-
-    /// Grounds one already-measured transcript row, reporting whether the row
-    /// carried an adjudicated outcome at all (#1926).
-    ///
-    /// `Ok(None)` means "this row has nothing to adjudicate", which is a real
-    /// answer for the ~74% of transcript rows that are not observed tool
-    /// results. It is never used to swallow a failed write.
-    fn put_agent_transcript_outcome_anchor_row(
-        &self,
-        source_key: &[u8],
-        source_value: &[u8],
-        record: &AgentTranscriptRecord,
-    ) -> StorageResult<Option<()>> {
-        let Some(anchor) = constellations::agent_transcript_outcome_anchor(record) else {
-            return Ok(None);
-        };
-        let panel =
-            constellations::anchor_panel_for_source_row(cf::CF_AGENT_TRANSCRIPTS, source_key)?;
-        let input_bytes = constellations::source_constellation_input_bytes(
-            panel.input_mode,
-            cf::CF_AGENT_TRANSCRIPTS,
-            source_key,
-            source_value,
-        );
-        let calyx_anchor = grounding_anchor_to_calyx(anchor.clone())?;
-        let existing = self.with_vault(
-            "calyx_agent_transcript_outcome_anchor",
-            "read exact current transcript outcome before anchoring",
-            false,
-            |vault| {
-                let cx_id = vault.cx_id_for_input(&input_bytes, panel.panel_version);
-                vault
-                    .read_anchor_exact(cx_id, &calyx_anchor.kind)
-                    .map_err(|error| {
-                        calyx_read_failed(
-                            "calyx_agent_transcript_outcome_anchor",
-                            "read exact current transcript outcome before anchoring",
-                            &error,
-                        )
-                    })
-            },
-        )?;
-        if let Some(existing) = existing {
-            if existing.anchor != calyx_anchor {
-                return Err(calyx_write_failed_detail(
-                    "calyx_agent_transcript_outcome_anchor",
-                    format!(
-                        "active transcript anchor kind already exists with conflicting evidence: source_key_hex={} panel_version={} kind={}; immutable grounded outcomes cannot be overwritten",
-                        constellations::hex_encode(source_key),
-                        panel.panel_version,
-                        synapse_calyx::anchor_kind_label(&calyx_anchor.kind),
-                    ),
-                ));
-            }
-            return Ok(Some(()));
-        }
-        let payload = constellations::grounding_anchor_ledger_payload(
-            cf::CF_AGENT_TRANSCRIPTS,
-            source_key,
-            source_value,
-            &anchor,
-        );
-        <Self as StorageBackend>::put_grounding_anchor_for_source(
-            self,
-            cf::CF_AGENT_TRANSCRIPTS,
-            source_key,
-            source_value,
-            anchor,
-            &payload,
-        )?;
-        Ok(Some(()))
     }
 }
 
@@ -6190,7 +6160,8 @@ impl StorageBackend for CalyxBackend {
     fn backfill_temporal_metadata(
         &self,
         source_cf: &str,
-        source_key: Option<&[u8]>,
+        source_keys: Option<&[Vec<u8>]>,
+        pointwise_preflight: bool,
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport> {
@@ -6218,53 +6189,111 @@ impl StorageBackend for CalyxBackend {
                     .to_owned(),
             });
         }
-        if source_key.is_some() && after_physical.is_some() {
+        if source_keys.is_some() && after_physical.is_some() {
             return Err(StorageError::BackendInvalidConfig {
                 value: source_cf.to_owned(),
                 detail: "exact source_key and physical page cursor are mutually exclusive"
                     .to_owned(),
             });
         }
+        let mut row_failures = Vec::new();
         let (rows, resume_after_physical, more, candidate_rows_examined, expired_rows_skipped) =
-            if let Some(key) = source_key {
-                if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE
-                    && !key.starts_with(SYN_MCP_USAGE_KEY_PREFIX)
-                {
+            if let Some(keys) = source_keys {
+                if keys.is_empty() {
                     return Err(StorageError::BackendInvalidConfig {
-                        value: constellations::hex_encode(key),
-                        detail: "exact MCP-usage backfill key is outside mcp-usage/v1/; remediation=pass a key from the declared prefix"
+                        value: source_cf.to_owned(),
+                        detail: "exact temporal metadata backfill batch must contain at least one source key"
                             .to_owned(),
                     });
                 }
-                // #1984: any DECLARED outcome family, not one of them. The
-                // single-prefix test here refused the panel's own repair queue —
-                // the census named a stranded identity under
-                // `approval/v1/audit/`, which is as much this panel's population
-                // as `escalation/v1/audit/` is, and the repair could not use the
-                // path the catalog gave it. See `SYN_OUTCOME_KEY_PREFIXES` for
-                // the writer-by-writer evidence that the declaration, not the
-                // identity, was the thing that was wrong.
-                if source_cf == SYN_OUTCOME_BACKFILL_SOURCE
-                    && constellations::outcome_backfill_prefix_for_key(key).is_none()
-                {
-                    return Err(StorageError::BackendInvalidConfig {
-                        value: constellations::hex_encode(key),
-                        detail: format!(
-                            "exact outcome backfill key is outside every declared outcome row family ({}); remediation=pass a key from one of the declared prefixes, or add this row family to SYN_OUTCOME_KEY_PREFIXES if a writer really measures it into syn-outcome-v1",
-                            constellations::outcome_backfill_prefixes_display()
-                        ),
-                    });
+                let mut seen = BTreeSet::new();
+                for key in keys {
+                    if !seen.insert(key.as_slice()) {
+                        return Err(StorageError::BackendInvalidConfig {
+                            value: constellations::hex_encode(key),
+                            detail: "exact temporal metadata backfill batch contains a duplicate source key"
+                                .to_owned(),
+                        });
+                    }
                 }
+                let mut exact_rows = Vec::with_capacity(keys.len());
                 let physical_source_cf = backfill_physical_source_cf(source_cf);
-                self.get_cf(physical_source_cf, key)?
-                    .map(|value| (vec![(key.to_vec(), value)], None, false, 1, 0))
-                    .ok_or_else(|| StorageError::ReadFailed {
-                        cf_name: source_cf.to_owned(),
-                        detail: format!(
-                            "temporal metadata backfill source row not found: key_hex={}",
-                            constellations::hex_encode(key)
-                        ),
-                    })?
+                for key in keys {
+                    if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE
+                        && !key.starts_with(SYN_MCP_USAGE_KEY_PREFIX)
+                    {
+                        let error = StorageError::BackendInvalidConfig {
+                        value: constellations::hex_encode(key),
+                        detail: "exact MCP-usage backfill key is outside mcp-usage/v1/; remediation=pass a key from the declared prefix"
+                            .to_owned(),
+                    };
+                        if pointwise_preflight {
+                            row_failures.push(constellations::TemporalMetadataBackfillRowFailure {
+                                source_key: key.clone(),
+                                error: error.to_string(),
+                            });
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    // #1984: any DECLARED outcome family, not one of them. The
+                    // single-prefix test here refused the panel's own repair queue —
+                    // the census named a stranded identity under
+                    // `approval/v1/audit/`, which is as much this panel's population
+                    // as `escalation/v1/audit/` is, and the repair could not use the
+                    // path the catalog gave it. See `SYN_OUTCOME_KEY_PREFIXES` for
+                    // the writer-by-writer evidence that the declaration, not the
+                    // identity, was the thing that was wrong.
+                    if source_cf == SYN_OUTCOME_BACKFILL_SOURCE
+                        && constellations::outcome_backfill_prefix_for_key(key).is_none()
+                    {
+                        let error = StorageError::BackendInvalidConfig {
+                            value: constellations::hex_encode(key),
+                            detail: format!(
+                                "exact outcome backfill key is outside every declared outcome row family ({}); remediation=pass a key from one of the declared prefixes, or add this row family to SYN_OUTCOME_KEY_PREFIXES if a writer really measures it into syn-outcome-v1",
+                                constellations::outcome_backfill_prefixes_display()
+                            ),
+                        };
+                        if pointwise_preflight {
+                            row_failures.push(constellations::TemporalMetadataBackfillRowFailure {
+                                source_key: key.clone(),
+                                error: error.to_string(),
+                            });
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    match self.get_cf(physical_source_cf, key) {
+                        Ok(Some(value)) => exact_rows.push((key.clone(), value)),
+                        Ok(None) => {
+                            let error = StorageError::ReadFailed {
+                                cf_name: source_cf.to_owned(),
+                                detail: format!(
+                                    "temporal metadata backfill source row not found: key_hex={}",
+                                    constellations::hex_encode(key)
+                                ),
+                            };
+                            if pointwise_preflight {
+                                row_failures.push(
+                                    constellations::TemporalMetadataBackfillRowFailure {
+                                        source_key: key.clone(),
+                                        error: error.to_string(),
+                                    },
+                                );
+                            } else {
+                                return Err(error);
+                            }
+                        }
+                        Err(error) if pointwise_preflight => {
+                            row_failures.push(constellations::TemporalMetadataBackfillRowFailure {
+                                source_key: key.clone(),
+                                error: error.to_string(),
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                (exact_rows, None, false, keys.len(), 0)
             } else {
                 let page = match source_cf {
                     // One contiguous declared prefix, so the physical range can
@@ -6316,18 +6345,55 @@ impl StorageBackend for CalyxBackend {
             for row in rows {
                 if constellations::observation_constellation_sample_permits(&row.0)? {
                     sampled.push(row);
-                } else if source_key.is_some() {
-                    return Err(StorageError::BackendInvalidConfig {
+                } else if source_keys.is_some() {
+                    let error = StorageError::BackendInvalidConfig {
                         value: constellations::hex_encode(&row.0),
                         detail: "exact CF_OBSERVATIONS row is outside the deterministic sampled panel population"
                             .to_owned(),
-                    });
+                    };
+                    if pointwise_preflight {
+                        row_failures.push(constellations::TemporalMetadataBackfillRowFailure {
+                            source_key: row.0,
+                            error: error.to_string(),
+                        });
+                    } else {
+                        return Err(error);
+                    }
                 }
             }
             sampled
         } else {
             rows
         };
+        if rows.is_empty() {
+            let latest_seq = self.with_vault(
+                "calyx_temporal_metadata_backfill",
+                "read empty Calyx temporal metadata backfill sequence",
+                false,
+                |vault| Ok(vault.latest_seq()),
+            )?;
+            return Ok(constellations::TemporalMetadataBackfillReport {
+                source_cf: source_cf.to_owned(),
+                examined_rows: 0,
+                inserted_rows: 0,
+                backfilled_rows: 0,
+                already_current_rows: 0,
+                temporal_ineligible_rows: 0,
+                outcome_anchored_rows: 0,
+                outcome_absent_rows: 0,
+                outcome_unadjudicable_rows: 0,
+                anchors_carried_forward: 0,
+                rows_anchor_carried: 0,
+                anchor_carry_source_generations_read: 0,
+                candidate_rows_examined: candidate_rows_examined as u64,
+                expired_rows_skipped: expired_rows_skipped as u64,
+                latest_seq,
+                resume_after_physical,
+                more,
+                row_reports: Vec::new(),
+                row_failures,
+            });
+        }
         let examined_rows = rows.len() as u64;
         let mut inserted_rows = 0_u64;
         let mut backfilled_rows = 0_u64;
@@ -6368,7 +6434,7 @@ impl StorageBackend for CalyxBackend {
             // (STORAGE_DERIVED_STATE_ANCHOR_DEBT_REPAIR_UNAMORTIZED). Exact-key
             // calls reuse the cache; the cache's cf/superseded-version match
             // still forces a rebuild whenever the panel contract changed.
-            self.anchor_carry_lineage(source_cf, source_key.is_none() && after_physical.is_none())?
+            self.anchor_carry_lineage(source_cf, source_keys.is_none() && after_physical.is_none())?
         } else {
             Arc::new(BTreeMap::new())
         };
@@ -6377,251 +6443,395 @@ impl StorageBackend for CalyxBackend {
         } else {
             0
         };
-        let mut carry_targets = Vec::with_capacity(rows.len());
-        for (key, raw) in rows {
-            let identity_input = if source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
-                constellations::mcp_usage_constellation_input_bytes(cf::CF_KV, &key, &raw)
-            } else if source_cf == SYN_OUTCOME_BACKFILL_SOURCE {
-                constellations::outcome_constellation_input_bytes(cf::CF_KV, &key, &raw)
-            } else {
-                raw.clone()
-            };
-            let disposition = self.with_vault(
-                "calyx_temporal_metadata_backfill",
-                "backfill Calyx temporal metadata",
-                true,
-                |vault| {
-                    let context = NativeConstellationContext {
-                        vault_id: vault.vault_id_value(),
-                        cx_id: vault.cx_id_for_input(&identity_input, active_panel_version),
-                        created_at_ms: calyx_clock_now_for_write(
-                            vault,
-                            backfill_physical_source_cf(source_cf),
-                        )?,
-                        next_ledger_seq: vault.latest_seq().saturating_add(1),
-                    };
-                    let decode_failed = |error: &serde_json::Error, label: &str| {
-                        StorageError::ReadFailed {
-                            cf_name: source_cf.to_owned(),
-                            detail: format!(
-                                "decode authoritative {label} row key_hex={}: {error}",
-                                constellations::hex_encode(&key)
+        // #2105/#2121: lens construction is independent by source row, while
+        // every durable write must remain ordered and serialized. Rayon indexed
+        // collection preserves physical page order. We collect `Vec<Result<_>>`
+        // first and resolve it sequentially so simultaneous failures still
+        // report the first physical row rather than Rayon's nondeterministic
+        // first completed error.
+        let (page_outcomes, committed_row_indexes, build_failures) = self.with_vault(
+            "calyx_temporal_metadata_backfill",
+            "parallel-build and batch-commit Calyx temporal metadata page",
+            true,
+            |vault| {
+                let build_context = TemporalBackfillBuildContext {
+                    source_cf,
+                    active_panel_version,
+                    vault_id: vault.vault_id_value(),
+                    created_at_ms: calyx_clock_now_for_write(
+                        vault,
+                        backfill_physical_source_cf(source_cf),
+                    )?,
+                    next_ledger_seq: vault.latest_seq().saturating_add(1),
+                };
+                let built = rows
+                    .par_iter()
+                    .map(|(key, raw)| {
+                        build_temporal_backfill_row(vault, build_context, key, raw)
+                    })
+                    .collect::<Vec<_>>();
+                let (mut prepared, mut committed_row_indexes, mut build_failures) = if pointwise_preflight {
+                    let mut prepared = Vec::with_capacity(built.len());
+                    let mut committed_row_indexes = Vec::with_capacity(built.len());
+                    let mut build_failures = Vec::new();
+                    for (row_index, result) in built.into_iter().enumerate() {
+                        match result {
+                            Ok(row) => {
+                                prepared.push(row);
+                                committed_row_indexes.push(row_index);
+                            }
+                            Err(error) => build_failures.push(
+                                constellations::TemporalMetadataBackfillRowFailure {
+                                    source_key: rows[row_index].0.clone(),
+                                    error: error.to_string(),
+                                },
                             ),
                         }
-                    };
-                    let expected = match source_cf {
-                        cf::CF_TIMELINE => {
-                            let record: TimelineRecord = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "timeline"))?;
-                            constellations::build_timeline_constellation(
-                                context, &key, &raw, &record,
-                            )?
+                    }
+                    (prepared, committed_row_indexes, build_failures)
+                } else {
+                    let prepared = built
+                        .into_iter()
+                        .collect::<StorageResult<Vec<PreparedTemporalBackfillRow>>>()?;
+                    let committed_row_indexes = (0..prepared.len()).collect::<Vec<_>>();
+                    (prepared, committed_row_indexes, Vec::new())
+                };
+                if pointwise_preflight {
+                    let mut eligible_prepared = Vec::with_capacity(prepared.len());
+                    let mut eligible_indexes = Vec::with_capacity(committed_row_indexes.len());
+                    for (row, source_row_index) in
+                        prepared.into_iter().zip(committed_row_indexes)
+                    {
+                        let (_identity, temporal) =
+                            constellations::temporal_migration_metadata(&row.constellation);
+                        match constellations::temporal_migration_eligible(&temporal) {
+                            Ok(_eligible) => {
+                                eligible_prepared.push(row);
+                                eligible_indexes.push(source_row_index);
+                            }
+                            Err(error) => build_failures.push(
+                                constellations::TemporalMetadataBackfillRowFailure {
+                                    source_key: rows[source_row_index].0.clone(),
+                                    error: error.to_string(),
+                                },
+                            ),
                         }
-                        cf::CF_EPISODES => {
-                            let record: EpisodeRecord = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "episode"))?;
-                            constellations::build_episode_constellation(context, &key, &raw, &record)?
-                        }
-                        // #1904 gave the agent-transcript panel its first
-                        // lexical lane, which needs the same re-measure path the
-                        // timeline panel used. The panel is spawn-keyed and by
-                        // far the largest on the vault, so it is only ever
-                        // reached through the paginated cursor.
-                        cf::CF_AGENT_TRANSCRIPTS => {
-                            let record: AgentTranscriptRecord = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "agent transcript"))?;
-                            constellations::build_agent_transcript_constellation(
-                                context, &key, &raw, &record,
-                            )?
-                        }
-                        cf::CF_AGENT_EVENTS => {
-                            let record: AgentEventRecord = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "agent event"))?;
-                            constellations::build_agent_event_constellation(
-                                context, &key, &raw, &record,
-                            )?
-                        }
-                        cf::CF_ACTION_LOG => {
-                            let record: Value = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "action"))?;
-                            constellations::build_action_constellation(context, &key, &raw, &record)?
-                        }
-                        cf::CF_REFLEX_AUDIT => {
-                            let record: StoredReflexAudit = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "reflex audit"))?;
-                            constellations::build_reflex_audit_constellation(
-                                context, &key, &raw, &record,
-                            )?
-                        }
-                        cf::CF_OBSERVATIONS => {
-                            let record: StoredObservation = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "observation"))?;
-                            constellations::build_observation_constellation(
-                                context, &key, &raw, &record,
-                            )?
-                        }
-                        SYN_MCP_USAGE_BACKFILL_SOURCE => {
-                            let record: Value = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "MCP usage"))?;
-                            constellations::build_mcp_usage_constellation(
-                                context,
-                                &key,
-                                &raw,
-                                &identity_input,
-                                &record,
-                            )?
-                        }
-                        SYN_OUTCOME_BACKFILL_SOURCE => {
-                            let record: Value = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "outcome"))?;
-                            constellations::build_outcome_constellation(
-                                context,
-                                cf::CF_KV,
-                                &key,
-                                &raw,
-                                &identity_input,
-                                &record,
-                            )?
-                        }
-                        // Exhaustive over the guard above, so a CF added there
-                        // without a builder here is a compile-visible omission
-                        // rather than a silent mis-measurement.
-                        _ => {
-                            let record: Value = serde_json::from_slice(&raw)
-                                .map_err(|error| decode_failed(&error, "process"))?;
-                            constellations::build_process_constellation(
-                                context, &key, &raw, &record,
-                            )?
-                        }
-                    };
-                    let put = vault
-                        .put_observation_constellation(expected.clone())
-                        .map_err(|error| {
-                            calyx_write_failed(
-                                "calyx_temporal_metadata_backfill",
-                                "materialize missing Calyx constellation before temporal metadata backfill",
-                                &error,
-                            )
-                        })?;
+                    }
+                    prepared = eligible_prepared;
+                    committed_row_indexes = eligible_indexes;
+                }
+                if prepared.is_empty() {
+                    return Ok((Vec::new(), committed_row_indexes, build_failures));
+                }
+
+                let expected_ids = prepared
+                    .iter()
+                    .map(|row| row.constellation.cx_id)
+                    .collect::<Vec<_>>();
+                let mut temporal_batches = Vec::<(
+                    Vec<usize>,
+                    calyx_aster::vault::TemporalMetadataBackfill,
+                )>::new();
+                let mut temporal_batch_by_id = BTreeMap::<CxId, usize>::new();
+                for (row_index, row) in prepared.iter().enumerate() {
                     let (identity, temporal) =
-                        constellations::temporal_migration_metadata(&expected);
-                    let migration = if constellations::temporal_migration_eligible(&temporal)? {
-                        Some(
-                            vault
-                                .backfill_temporal_metadata(
-                                    expected.cx_id,
-                                    expected.panel_version,
-                                    &identity,
-                                    &temporal,
-                                )
-                                .map_err(|error| {
-                                    calyx_write_failed(
-                                        "calyx_temporal_metadata_backfill",
-                                        "backfill Calyx temporal metadata",
-                                        &error,
-                                    )
-                                })?,
-                        )
-                    } else {
-                        None
+                        constellations::temporal_migration_metadata(&row.constellation);
+                    if !constellations::temporal_migration_eligible(&temporal)? {
+                        continue;
+                    }
+                    let request = calyx_aster::vault::TemporalMetadataBackfill {
+                        cx_id: row.constellation.cx_id,
+                        expected_panel_version: row.constellation.panel_version,
+                        expected_identity: identity,
+                        expected_temporal: temporal,
                     };
-                    Ok((put.disposition, migration, expected.cx_id))
-                },
-            )?;
-            if disposition.1.is_none() {
+                    if let Some(batch_index) = temporal_batch_by_id.get(&request.cx_id).copied() {
+                        if temporal_batches[batch_index].1 != request {
+                            return Err(calyx_write_failed_detail(
+                                "calyx_temporal_metadata_backfill",
+                                format!(
+                                    "duplicate content identity has conflicting authoritative temporal metadata in one page: cx_id={} first_row_index={} conflicting_row_index={row_index}",
+                                    request.cx_id, temporal_batches[batch_index].0[0]
+                                ),
+                            ));
+                        }
+                        temporal_batches[batch_index].0.push(row_index);
+                    } else {
+                        temporal_batch_by_id.insert(request.cx_id, temporal_batches.len());
+                        temporal_batches.push((vec![row_index], request));
+                    }
+                }
+
+                let mut sidecars = Vec::with_capacity(prepared.len());
+                let constellations = prepared
+                    .into_iter()
+                    .map(|row| {
+                        sidecars.push(TemporalBackfillRowSidecars {
+                            transcript_outcome: row.transcript_outcome,
+                            action_outcome_present: row.action_outcome_present,
+                        });
+                        row.constellation
+                    })
+                    .collect::<Vec<_>>();
+                let puts = vault
+                    .put_observation_constellation_batch(constellations)
+                    .map_err(|error| {
+                        calyx_write_failed(
+                            "calyx_temporal_metadata_backfill",
+                            &format!(
+                                "materialize ordered Calyx constellation page batch rows={} wal_max_record_bytes={}",
+                                expected_ids.len(),
+                                wal::MAX_RECORD_BYTES
+                            ),
+                            &error,
+                        )
+                    })?;
+                if puts.len() != expected_ids.len() {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_temporal_metadata_backfill",
+                        format!(
+                            "constellation page batch returned {} readbacks for {} ordered inputs",
+                            puts.len(),
+                            expected_ids.len()
+                        ),
+                    ));
+                }
+                for (row_index, (put, expected_id)) in
+                    puts.iter().zip(&expected_ids).enumerate()
+                {
+                    if put.cx_id != expected_id.to_string() {
+                        return Err(calyx_write_failed_detail(
+                            "calyx_temporal_metadata_backfill",
+                            format!(
+                                "constellation page batch readback identity mismatch at row_index={row_index}: expected_cx_id={expected_id} actual_cx_id={}",
+                                put.cx_id
+                            ),
+                        ));
+                    }
+                }
+
+                let migration_requests = temporal_batches
+                    .iter()
+                    .map(|(_row_indexes, request)| request.clone())
+                    .collect::<Vec<_>>();
+                let migration_results = vault
+                    .backfill_temporal_metadata_batch(migration_requests)
+                    .map_err(|error| {
+                        calyx_write_failed(
+                            "calyx_temporal_metadata_backfill",
+                            &format!(
+                                "batch temporal Base rewrites rows={} page_rows={}",
+                                temporal_batches.len(),
+                                expected_ids.len()
+                            ),
+                            &error,
+                        )
+                    })?;
+                if migration_results.len() != temporal_batches.len() {
+                    return Err(calyx_write_failed_detail(
+                        "calyx_temporal_metadata_backfill",
+                        format!(
+                            "temporal metadata batch returned {} outcomes for {} unique eligible identities",
+                            migration_results.len(),
+                            temporal_batches.len()
+                        ),
+                    ));
+                }
+                let mut migrations = vec![None; expected_ids.len()];
+                for ((row_indexes, _request), migration) in
+                    temporal_batches.into_iter().zip(migration_results)
+                {
+                    for row_index in row_indexes {
+                        migrations[row_index] = Some(migration.clone());
+                    }
+                }
+
+                let outcomes = puts
+                    .into_iter()
+                    .zip(expected_ids)
+                    .zip(sidecars)
+                    .enumerate()
+                    .map(|(row_index, ((put, cx_id), sidecars))| TemporalBackfillRowOutcome {
+                        put,
+                        migration: migrations[row_index].take(),
+                        cx_id,
+                        sidecars,
+                    })
+                    .collect::<Vec<_>>();
+                Ok((outcomes, committed_row_indexes, build_failures))
+            },
+        )?;
+        row_failures.extend(build_failures);
+        if page_outcomes.len() != committed_row_indexes.len() {
+            return Err(calyx_write_failed_detail(
+                "calyx_temporal_metadata_backfill",
+                format!(
+                    "backfill page produced {} ordered outcomes for {} committed source rows",
+                    page_outcomes.len(),
+                    committed_row_indexes.len()
+                ),
+            ));
+        }
+        let committed_row_indexes = committed_row_indexes.into_iter().collect::<BTreeSet<_>>();
+        let rows = rows
+            .into_iter()
+            .enumerate()
+            .filter_map(|(row_index, row)| {
+                committed_row_indexes.contains(&row_index).then_some(row)
+            })
+            .collect::<Vec<_>>();
+
+        let mut carry_targets = Vec::with_capacity(rows.len());
+        let mut transcript_anchor_sources = Vec::new();
+        let mut row_reports = Vec::with_capacity(rows.len());
+        for ((key, raw), outcome) in rows.into_iter().zip(page_outcomes) {
+            let row_index = row_reports.len();
+            let mut row_report = constellations::TemporalMetadataBackfillRowReport {
+                source_key: key.clone(),
+                inserted_rows: 0,
+                backfilled_rows: 0,
+                already_current_rows: 0,
+                temporal_ineligible_rows: 0,
+                outcome_anchored_rows: 0,
+                outcome_absent_rows: 0,
+                outcome_unadjudicable_rows: 0,
+                anchors_carried_forward: 0,
+                rows_anchor_carried: 0,
+                anchor_carry_source_generations_read: 0,
+                latest_seq: 0,
+            };
+            if outcome.migration.is_none() {
                 temporal_ineligible_rows = temporal_ineligible_rows.saturating_add(1);
+                row_report.temporal_ineligible_rows = 1;
             }
-            if disposition.0.inserted() {
+            if outcome.put.disposition.inserted() {
                 inserted_rows = inserted_rows.saturating_add(1);
-            } else if disposition
-                .1
+                row_report.inserted_rows = 1;
+            } else if outcome
+                .migration
                 .as_ref()
                 .is_some_and(calyx_aster::vault::TemporalMetadataMigration::changed)
             {
                 backfilled_rows = backfilled_rows.saturating_add(1);
-            } else if disposition.1.is_some() {
+                row_report.backfilled_rows = 1;
+            } else if outcome.migration.is_some() {
                 already_current_rows = already_current_rows.saturating_add(1);
+                row_report.already_current_rows = 1;
             }
 
-            // #1926: the constellation for this row now exists at the active
-            // panel version, which is the precondition an anchor write has. A
-            // re-measure sweep that left the row ungrounded would have to be
-            // followed by a second full sweep to ground it, against a corpus
-            // that moves between passes — so the outcome is written here, in the
-            // same pass, against the row that was just measured.
-            if source_cf == cf::CF_AGENT_TRANSCRIPTS {
-                let record: AgentTranscriptRecord =
-                    serde_json::from_slice(&raw).map_err(|error| StorageError::ReadFailed {
-                        cf_name: source_cf.to_owned(),
-                        detail: format!(
-                            "decode authoritative agent transcript row for outcome anchoring key_hex={}: {error}",
-                            constellations::hex_encode(&key)
-                        ),
-                    })?;
-                if matches!(
-                    constellations::agent_transcript_tool_outcome(&record),
-                    constellations::AgentTranscriptToolOutcome::Unadjudicable(_)
-                ) {
+            if let Some(transcript) = outcome.sidecars.transcript_outcome {
+                if transcript.unadjudicable {
                     outcome_unadjudicable_rows = outcome_unadjudicable_rows.saturating_add(1);
+                    row_report.outcome_unadjudicable_rows = 1;
                 }
-                match self.put_agent_transcript_outcome_anchor_row(&key, &raw, &record)? {
-                    Some(()) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
-                    None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
+                if let Some(anchor) = transcript.anchor {
+                    row_report.outcome_anchored_rows = 1;
+                    transcript_anchor_sources.push(GroundingAnchorSource {
+                        source_cf: cf::CF_AGENT_TRANSCRIPTS,
+                        source_key: key.clone(),
+                        raw_bytes: raw.clone(),
+                        anchor,
+                    });
+                } else {
+                    outcome_absent_rows = outcome_absent_rows.saturating_add(1);
+                    row_report.outcome_absent_rows = 1;
                 }
             }
-            if source_cf == cf::CF_ACTION_LOG {
-                let record: Value = serde_json::from_slice(&raw).map_err(|error| {
-                    StorageError::ReadFailed {
-                        cf_name: source_cf.to_owned(),
-                        detail: format!(
-                            "decode authoritative action audit row for outcome anchoring key_hex={}: {error}",
-                            constellations::hex_encode(&key)
-                        ),
-                    }
-                })?;
-                match constellations::action_outcome_anchor(&key, &record)? {
-                    Some(_) => outcome_anchored_rows = outcome_anchored_rows.saturating_add(1),
-                    None => outcome_absent_rows = outcome_absent_rows.saturating_add(1),
+            if let Some(action_outcome_present) = outcome.sidecars.action_outcome_present {
+                if action_outcome_present {
+                    outcome_anchored_rows = outcome_anchored_rows.saturating_add(1);
+                    row_report.outcome_anchored_rows = 1;
+                } else {
+                    outcome_absent_rows = outcome_absent_rows.saturating_add(1);
+                    row_report.outcome_absent_rows = 1;
                 }
             }
             if carry_superseded_anchors {
-                carry_targets.push((key, disposition.2));
+                row_report.anchor_carry_source_generations_read = superseded_generation_count;
+                carry_targets.push(AnchorCarryBatchTarget {
+                    row_index,
+                    source_key: key,
+                    active_cx_id: outcome.cx_id,
+                    prior_anchors: anchor_lineage
+                        .get(&constellations::hex_encode(&row_report.source_key))
+                        .cloned()
+                        .unwrap_or_default(),
+                });
             }
+            row_reports.push(row_report);
+        }
+
+        // #2121: transcript rows used to perform one pre-read and up to one
+        // ledger/WAL/fsync commit each. The native multi-Cx anchor API validates
+        // every target at one snapshot, commits the missing set atomically, and
+        // the storage wrapper independently reads every physical Anchors-CF row.
+        if !transcript_anchor_sources.is_empty() {
+            let requested = transcript_anchor_sources.len() as u64;
+            let source_evidence = transcript_anchor_sources
+                .iter()
+                .map(|source| {
+                    serde_json::json!({
+                        "source_key_sha256": constellations::sha256_hex(&source.source_key),
+                        "source_value_sha256": constellations::sha256_hex(&source.raw_bytes),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let payload = serde_json::json!({
+                "mode": "agent-transcript-outcome-backfill-batch",
+                "source_cf": cf::CF_AGENT_TRANSCRIPTS,
+                "source_row_count": requested,
+                "source_evidence": source_evidence,
+            });
+            let report = <Self as StorageBackend>::put_grounding_anchors_for_sources(
+                self,
+                transcript_anchor_sources,
+                &payload,
+            )?;
+            if report.requested_anchor_count != requested
+                || report.readback_exact_match_count != requested
+            {
+                return Err(calyx_write_failed_detail(
+                    "calyx_temporal_metadata_backfill",
+                    format!(
+                        "transcript outcome batch readback mismatch: expected={requested} requested={} physical_exact_matches={}",
+                        report.requested_anchor_count, report.readback_exact_match_count
+                    ),
+                ));
+            }
+            outcome_anchored_rows = outcome_anchored_rows.saturating_add(requested);
         }
 
         // Carry only after every active generation row and fresh outcome in the
-        // page is durable. The lineage index makes rows without historical
-        // evidence a zero-I/O case; only the small grounded subset needs an
-        // authoritative Anchors-CF range read (#1981).
-        for (key, active_cx_id) in carry_targets {
+        // page is durable. Every eligible target is prepared and independently
+        // read back, but the missing anchors share one ledger/WAL/fsync commit.
+        // There is no retry-to-single-row path: one invalid batch fails with the
+        // complete target set still attributable in the error.
+        if !carry_targets.is_empty() {
             anchor_carry_source_generations_read =
-                anchor_carry_source_generations_read.saturating_add(superseded_generation_count);
-            let source_key_hex = constellations::hex_encode(&key);
-            let prior_anchors = anchor_lineage
-                .get(&source_key_hex)
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            if prior_anchors.is_empty() {
-                continue;
-            }
+                superseded_generation_count.saturating_mul(carry_targets.len() as u64);
             let carried = self.with_vault(
                 "calyx_anchor_carry_forward",
-                "carry grounded anchors from indexed superseded Base rows",
+                "batch-carry grounded anchors from indexed superseded Base rows",
                 true,
-                |vault| {
-                    carry_forward_grounded_anchors(
-                        vault,
-                        source_cf,
-                        &key,
-                        active_cx_id,
-                        prior_anchors,
-                    )
-                },
+                |vault| carry_forward_grounded_anchors_batch(vault, source_cf, carry_targets),
             )?;
-            anchors_carried_forward =
-                anchors_carried_forward.saturating_add(carried.anchors_written);
-            if carried.anchors_written > 0 {
-                rows_anchor_carried = rows_anchor_carried.saturating_add(1);
+            for (row_index, outcome) in carried {
+                let source_row_count = row_reports.len();
+                let row_report = row_reports.get_mut(row_index).ok_or_else(|| {
+                    calyx_write_failed_detail(
+                        "calyx_anchor_carry_forward",
+                        format!(
+                            "anchor carry batch returned out-of-range row_index={row_index} for {source_row_count} source rows"
+                        ),
+                    )
+                })?;
+                row_report.anchors_carried_forward = outcome.anchors_written;
+                anchors_carried_forward =
+                    anchors_carried_forward.saturating_add(outcome.anchors_written);
+                if outcome.anchors_written > 0 {
+                    row_report.rows_anchor_carried = 1;
+                    rows_anchor_carried = rows_anchor_carried.saturating_add(1);
+                }
             }
         }
         let latest_seq = self.with_vault(
@@ -6630,6 +6840,9 @@ impl StorageBackend for CalyxBackend {
             false,
             |vault| Ok(vault.latest_seq()),
         )?;
+        for row_report in &mut row_reports {
+            row_report.latest_seq = latest_seq;
+        }
         Ok(constellations::TemporalMetadataBackfillReport {
             source_cf: source_cf.to_owned(),
             examined_rows,
@@ -6648,6 +6861,8 @@ impl StorageBackend for CalyxBackend {
             latest_seq,
             resume_after_physical,
             more,
+            row_reports,
+            row_failures,
         })
     }
 
@@ -6859,9 +7074,12 @@ impl StorageBackend for CalyxBackend {
                             &source,
                         )
                     })?;
-                episode_constellation_reports(
+                constellation_batch_reports(
                     batch.pending_reports,
                     readbacks,
+                    SYN_EPISODE_PANEL_NAME,
+                    SYN_EPISODE_PANEL_VERSION,
+                    cf::CF_EPISODES,
                     constellations::duration_us(started.elapsed()),
                 )
             },
@@ -6974,6 +7192,50 @@ impl StorageBackend for CalyxBackend {
         }
     }
 
+    fn put_agent_event_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, AgentEventRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put agent event Calyx constellation batch",
+            true,
+            |vault| {
+                let batch = build_agent_event_constellation_batch(vault, rows)?;
+                let readbacks = vault
+                    .put_observation_constellation_batch(batch.constellations)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_constellation",
+                            "put agent event observation constellation batch",
+                            &source,
+                        )
+                    })?;
+                constellation_batch_reports(
+                    batch.pending_reports,
+                    readbacks,
+                    SYN_AGENT_EVENT_PANEL_NAME,
+                    SYN_AGENT_EVENT_PANEL_VERSION,
+                    cf::CF_AGENT_EVENTS,
+                    constellations::duration_us(started.elapsed()),
+                )
+            },
+        );
+        emit_constellation_batch_result(
+            result,
+            rows.len(),
+            SYN_AGENT_EVENT_PANEL_NAME,
+            SYN_AGENT_EVENT_PANEL_VERSION,
+            cf::CF_AGENT_EVENTS,
+            "CALYX_AGENT_EVENT_CONSTELLATION_BATCH_PUT",
+            started,
+        )
+    }
+
     fn put_agent_transcript_constellation(
         &self,
         source_key: &[u8],
@@ -7048,6 +7310,50 @@ impl StorageBackend for CalyxBackend {
                 Err(error)
             }
         }
+    }
+
+    fn put_agent_transcript_constellations(
+        &self,
+        rows: &[(Vec<u8>, Vec<u8>, AgentTranscriptRecord)],
+    ) -> StorageResult<Vec<ConstellationPutReport>> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let started = Instant::now();
+        let result = self.with_vault(
+            "calyx_constellation",
+            "put agent transcript Calyx constellation batch",
+            true,
+            |vault| {
+                let batch = build_agent_transcript_constellation_batch(vault, rows)?;
+                let readbacks = vault
+                    .put_observation_constellation_batch(batch.constellations)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_constellation",
+                            "put agent transcript observation constellation batch",
+                            &source,
+                        )
+                    })?;
+                constellation_batch_reports(
+                    batch.pending_reports,
+                    readbacks,
+                    SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+                    SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+                    cf::CF_AGENT_TRANSCRIPTS,
+                    constellations::duration_us(started.elapsed()),
+                )
+            },
+        );
+        emit_constellation_batch_result(
+            result,
+            rows.len(),
+            SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+            cf::CF_AGENT_TRANSCRIPTS,
+            "CALYX_AGENT_TRANSCRIPT_CONSTELLATION_BATCH_PUT",
+            started,
+        )
     }
 
     fn put_action_constellation(
@@ -8465,6 +8771,122 @@ impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
     ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
         self.scan_cf_range_page_latest(ColumnFamily::Kv, range, after_key, limit)
     }
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "one exhaustive source-CF dispatch keeps the declared backfill population and its authoritative decoder/builder mapping reviewable in one place"
+)]
+fn build_temporal_backfill_row(
+    vault: &SynapseCalyxVault,
+    build: TemporalBackfillBuildContext<'_>,
+    key: &[u8],
+    raw: &[u8],
+) -> StorageResult<PreparedTemporalBackfillRow> {
+    let identity_input = if build.source_cf == SYN_MCP_USAGE_BACKFILL_SOURCE {
+        constellations::mcp_usage_constellation_input_bytes(cf::CF_KV, key, raw)
+    } else if build.source_cf == SYN_OUTCOME_BACKFILL_SOURCE {
+        constellations::outcome_constellation_input_bytes(cf::CF_KV, key, raw)
+    } else {
+        raw.to_vec()
+    };
+    let context = NativeConstellationContext {
+        vault_id: build.vault_id,
+        cx_id: vault.cx_id_for_input(&identity_input, build.active_panel_version),
+        created_at_ms: build.created_at_ms,
+        next_ledger_seq: build.next_ledger_seq,
+    };
+    let decode_failed = |error: &serde_json::Error, label: &str| StorageError::ReadFailed {
+        cf_name: build.source_cf.to_owned(),
+        detail: format!(
+            "decode authoritative {label} row key_hex={}: {error}",
+            constellations::hex_encode(key)
+        ),
+    };
+    let mut transcript_outcome = None;
+    let mut action_outcome_present = None;
+    let constellation = match build.source_cf {
+        cf::CF_TIMELINE => {
+            let record: TimelineRecord =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "timeline"))?;
+            constellations::build_timeline_constellation(context, key, raw, &record)?
+        }
+        cf::CF_EPISODES => {
+            let record: EpisodeRecord =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "episode"))?;
+            constellations::build_episode_constellation(context, key, raw, &record)?
+        }
+        cf::CF_AGENT_TRANSCRIPTS => {
+            let record: AgentTranscriptRecord = serde_json::from_slice(raw)
+                .map_err(|error| decode_failed(&error, "agent transcript"))?;
+            transcript_outcome = Some(PreparedTranscriptBackfillOutcome {
+                anchor: constellations::agent_transcript_outcome_anchor(&record),
+                unadjudicable: matches!(
+                    constellations::agent_transcript_tool_outcome(&record),
+                    constellations::AgentTranscriptToolOutcome::Unadjudicable(_)
+                ),
+            });
+            constellations::build_agent_transcript_constellation(context, key, raw, &record)?
+        }
+        cf::CF_AGENT_EVENTS => {
+            let record: AgentEventRecord = serde_json::from_slice(raw)
+                .map_err(|error| decode_failed(&error, "agent event"))?;
+            constellations::build_agent_event_constellation(context, key, raw, &record)?
+        }
+        cf::CF_ACTION_LOG => {
+            let record: Value =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "action"))?;
+            action_outcome_present =
+                Some(constellations::action_outcome_anchor(key, &record)?.is_some());
+            constellations::build_action_constellation(context, key, raw, &record)?
+        }
+        cf::CF_REFLEX_AUDIT => {
+            let record: StoredReflexAudit = serde_json::from_slice(raw)
+                .map_err(|error| decode_failed(&error, "reflex audit"))?;
+            constellations::build_reflex_audit_constellation(context, key, raw, &record)?
+        }
+        cf::CF_OBSERVATIONS => {
+            let record: StoredObservation = serde_json::from_slice(raw)
+                .map_err(|error| decode_failed(&error, "observation"))?;
+            constellations::build_observation_constellation(context, key, raw, &record)?
+        }
+        SYN_MCP_USAGE_BACKFILL_SOURCE => {
+            let record: Value =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "MCP usage"))?;
+            constellations::build_mcp_usage_constellation(
+                context,
+                key,
+                raw,
+                &identity_input,
+                &record,
+            )?
+        }
+        SYN_OUTCOME_BACKFILL_SOURCE => {
+            let record: Value =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "outcome"))?;
+            constellations::build_outcome_constellation(
+                context,
+                cf::CF_KV,
+                key,
+                raw,
+                &identity_input,
+                &record,
+            )?
+        }
+        // Exhaustive over `backfill_temporal_metadata`'s source guard. A CF
+        // added there without a builder here fails through the process decoder
+        // instead of silently emitting an empty constellation.
+        _ => {
+            let record: Value =
+                serde_json::from_slice(raw).map_err(|error| decode_failed(&error, "process"))?;
+            constellations::build_process_constellation(context, key, raw, &record)?
+        }
+    };
+    Ok(PreparedTemporalBackfillRow {
+        constellation,
+        transcript_outcome,
+        action_outcome_present,
+    })
 }
 
 fn inspect_calyx_vault(
@@ -11842,7 +12264,7 @@ fn hex_prefix_for_log(bytes: &[u8]) -> String {
 fn build_episode_constellation_batch(
     vault: &SynapseCalyxVault,
     rows: &[(Vec<u8>, Vec<u8>, EpisodeRecord)],
-) -> StorageResult<EpisodeConstellationBatch> {
+) -> StorageResult<ConstellationBatch> {
     let vault_id = vault.vault_id_value();
     let created_at_ms = calyx_clock_now_for_write(vault, cf::CF_EPISODES)?;
     let next_ledger_seq = vault.latest_seq().saturating_add(1);
@@ -11865,22 +12287,148 @@ fn build_episode_constellation_batch(
         });
         constellations.push(constellation);
     }
-    Ok(EpisodeConstellationBatch {
+    Ok(ConstellationBatch {
         constellations,
         pending_reports,
     })
 }
 
-fn episode_constellation_reports(
+fn build_agent_event_constellation_batch(
+    vault: &SynapseCalyxVault,
+    rows: &[(Vec<u8>, Vec<u8>, AgentEventRecord)],
+) -> StorageResult<ConstellationBatch> {
+    let vault_id = vault.vault_id_value();
+    let created_at_ms = calyx_clock_now_for_write(vault, cf::CF_AGENT_EVENTS)?;
+    let next_ledger_seq = vault.latest_seq().saturating_add(1);
+    let built = rows
+        .par_iter()
+        .map(|(source_key, raw_bytes, record)| {
+            let context = NativeConstellationContext {
+                vault_id,
+                cx_id: vault.cx_id_for_input(raw_bytes, SYN_AGENT_EVENT_PANEL_VERSION),
+                created_at_ms,
+                next_ledger_seq,
+            };
+            let constellation = constellations::build_agent_event_constellation(
+                context, source_key, raw_bytes, record,
+            )?;
+            let report = PendingConstellationReport {
+                source_key: source_key.clone(),
+                raw_bytes: raw_bytes.clone(),
+                slot_count: constellation.slots.len() as u64,
+                scalar_count: constellation.scalars.len() as u64,
+            };
+            Ok((constellation, report))
+        })
+        .collect::<Vec<StorageResult<_>>>();
+    collect_constellation_batch(built)
+}
+
+fn build_agent_transcript_constellation_batch(
+    vault: &SynapseCalyxVault,
+    rows: &[(Vec<u8>, Vec<u8>, AgentTranscriptRecord)],
+) -> StorageResult<ConstellationBatch> {
+    let vault_id = vault.vault_id_value();
+    let created_at_ms = calyx_clock_now_for_write(vault, cf::CF_AGENT_TRANSCRIPTS)?;
+    let next_ledger_seq = vault.latest_seq().saturating_add(1);
+    let built = rows
+        .par_iter()
+        .map(|(source_key, raw_bytes, record)| {
+            let context = NativeConstellationContext {
+                vault_id,
+                cx_id: vault.cx_id_for_input(raw_bytes, SYN_AGENT_TRANSCRIPT_PANEL_VERSION),
+                created_at_ms,
+                next_ledger_seq,
+            };
+            let constellation = constellations::build_agent_transcript_constellation(
+                context, source_key, raw_bytes, record,
+            )?;
+            let report = PendingConstellationReport {
+                source_key: source_key.clone(),
+                raw_bytes: raw_bytes.clone(),
+                slot_count: constellation.slots.len() as u64,
+                scalar_count: constellation.scalars.len() as u64,
+            };
+            Ok((constellation, report))
+        })
+        .collect::<Vec<StorageResult<_>>>();
+    collect_constellation_batch(built)
+}
+
+fn collect_constellation_batch(
+    built: Vec<StorageResult<(Constellation, PendingConstellationReport)>>,
+) -> StorageResult<ConstellationBatch> {
+    let built = built.into_iter().collect::<StorageResult<Vec<_>>>()?;
+    let mut constellations = Vec::with_capacity(built.len());
+    let mut pending_reports = Vec::with_capacity(built.len());
+    for (constellation, report) in built {
+        constellations.push(constellation);
+        pending_reports.push(report);
+    }
+    Ok(ConstellationBatch {
+        constellations,
+        pending_reports,
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the emitted batch evidence names the complete frozen panel identity and source surface"
+)]
+fn emit_constellation_batch_result(
+    result: StorageResult<Vec<ConstellationPutReport>>,
+    input_rows: usize,
+    panel_name: &'static str,
+    panel_version: u32,
+    source_cf: &'static str,
+    success_code: &'static str,
+    started: Instant,
+) -> StorageResult<Vec<ConstellationPutReport>> {
+    match result {
+        Ok(reports) => {
+            for report in &reports {
+                constellations::emit_success_metric(report);
+            }
+            let inserted = reports.iter().filter(|report| report.inserted()).count();
+            let deduped = reports.iter().filter(|report| report.deduped()).count();
+            tracing::debug!(
+                code = success_code,
+                panel_name,
+                panel_version,
+                source_cf,
+                input_rows,
+                inserted,
+                deduped,
+                duration_us = constellations::duration_us(started.elapsed()),
+                "rows measured into native Calyx constellations as one durable batch"
+            );
+            Ok(reports)
+        }
+        Err(error) => {
+            constellations::emit_error_metric(
+                panel_name,
+                source_cf,
+                error.code(),
+                started.elapsed(),
+            );
+            Err(error)
+        }
+    }
+}
+
+fn constellation_batch_reports(
     pending: Vec<PendingConstellationReport>,
     readbacks: Vec<SynapseCalyxObservationPutReadback>,
+    panel_name: &'static str,
+    panel_version: u32,
+    source_cf: &'static str,
     duration_us: u64,
 ) -> StorageResult<Vec<ConstellationPutReport>> {
     if readbacks.len() != pending.len() {
         return Err(calyx_write_failed_detail(
             "calyx_constellation",
             format!(
-                "episode constellation batch returned {} readbacks for {} inputs",
+                "{panel_name} constellation batch returned {} readbacks for {} inputs",
                 readbacks.len(),
                 pending.len()
             ),
@@ -11891,9 +12439,9 @@ fn episode_constellation_reports(
         .zip(readbacks)
         .map(|(input, readback)| {
             constellation_report(ConstellationReportInput {
-                panel_name: SYN_EPISODE_PANEL_NAME,
-                panel_version: SYN_EPISODE_PANEL_VERSION,
-                source_cf: cf::CF_EPISODES,
+                panel_name,
+                panel_version,
+                source_cf,
                 source_key: &input.source_key,
                 raw_bytes: &input.raw_bytes,
                 readback,
@@ -14453,6 +15001,13 @@ struct AnchorCarryForward {
     anchors_written: u64,
 }
 
+struct AnchorCarryBatchTarget {
+    row_index: usize,
+    source_key: Vec<u8>,
+    active_cx_id: CxId,
+    prior_anchors: Vec<Anchor>,
+}
+
 /// Carries a source row's already-observed grounded anchors across a panel bump.
 ///
 /// **#1980.** `cx_id = hash(input_bytes, panel_version, vault_salt)` and an
@@ -14485,63 +15040,93 @@ struct AnchorCarryForward {
 /// history, when a superseded generation cannot be read, or when the anchor
 /// write or its physical readback fails. It never degrades to "carried nothing":
 /// a carry that cannot prove it ran is the failure being fixed.
-fn carry_forward_grounded_anchors(
+#[allow(
+    clippy::too_many_lines,
+    reason = "batch preparation, one atomic write, and per-target physical readback are one integrity boundary whose order must remain locally reviewable"
+)]
+fn carry_forward_grounded_anchors_batch(
     vault: &SynapseCalyxVault,
     source_cf: &str,
-    source_key: &[u8],
-    active_cx_id: CxId,
-    prior_anchors: &[Anchor],
-) -> StorageResult<AnchorCarryForward> {
+    targets: Vec<AnchorCarryBatchTarget>,
+) -> StorageResult<Vec<(usize, AnchorCarryForward)>> {
+    if targets.is_empty() {
+        return Err(calyx_write_failed_detail(
+            "calyx_anchor_carry_forward",
+            "anchor carry batch must contain at least one source identity",
+        ));
+    }
     let superseded = constellations::superseded_panel_versions_for_source_cf(source_cf)?;
     if superseded.is_empty() {
-        return Ok(AnchorCarryForward::default());
+        return Ok(targets
+            .into_iter()
+            .map(|target| (target.row_index, AnchorCarryForward::default()))
+            .collect());
     }
     let panel = constellations::anchor_panel_for_source_cf(source_cf)?;
-
-    // Kinds the ACTIVE generation already carries are never overwritten. A
-    // freshly derived outcome is the better evidence: it was measured from the
-    // row as it stands now, where a carried one is a historical observation.
-    // The page-level lineage index already selected the newest superseded
-    // observation per kind from the physical historical Base rows. It joins on
-    // source identity because current bytes cannot reconstruct an old cx_id for
-    // a mutable row (#1981/#1982).
-    let mut carry: Vec<Anchor> = Vec::new();
-    for anchor in prior_anchors {
-        if !(anchor.confidence.is_finite() && anchor.confidence > 0.0) {
-            continue;
-        }
-        // Use the exact physical key that the ledger-stamped write will use.
-        // A prefix-range scan is unnecessary here and previously let an
-        // existing row reach the integrity writer as a duplicate batch.
-        if vault
-            .read_anchor_exact(active_cx_id, &anchor.kind)
-            .map_err(|error| {
-                calyx_read_failed(
-                    "calyx_anchor_carry_forward",
-                    "read the active generation's exact anchor before carrying",
-                    &error,
-                )
-            })?
-            .is_some()
+    let mut seen_cx_ids = BTreeMap::<CxId, Vec<u8>>::new();
+    let mut prepared = Vec::<(usize, Vec<u8>, CxId, Vec<Anchor>)>::new();
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for target in targets {
+        if let Some(first_source_key) =
+            seen_cx_ids.insert(target.active_cx_id, target.source_key.clone())
         {
-            continue;
+            return Err(calyx_write_failed_detail(
+                "calyx_anchor_carry_forward",
+                format!(
+                    "two source identities resolved to the same active cx_id in one carry batch: cx_id={} first_source_key_hex={} duplicate_source_key_hex={}; source identity would be ambiguous",
+                    target.active_cx_id,
+                    constellations::hex_encode(&first_source_key),
+                    constellations::hex_encode(&target.source_key)
+                ),
+            ));
         }
-        carry.push(anchor.clone());
+
+        // Kinds the ACTIVE generation already carries are never overwritten. A
+        // freshly derived outcome is the better evidence: it was measured from
+        // the row as it stands now, where a carried one is historical.
+        let mut carry = Vec::new();
+        for anchor in target.prior_anchors {
+            if !(anchor.confidence.is_finite() && anchor.confidence > 0.0) {
+                continue;
+            }
+            if vault
+                .read_anchor_exact(target.active_cx_id, &anchor.kind)
+                .map_err(|error| {
+                    calyx_read_failed(
+                        "calyx_anchor_carry_forward",
+                        "read the active generation's exact anchor before batch carrying",
+                        &error,
+                    )
+                })?
+                .is_some()
+            {
+                continue;
+            }
+            carry.push(anchor);
+        }
+        outcomes.push((target.row_index, AnchorCarryForward::default()));
+        if !carry.is_empty() {
+            prepared.push((
+                target.row_index,
+                target.source_key,
+                target.active_cx_id,
+                carry,
+            ));
+        }
     }
-    if carry.is_empty() {
-        return Ok(AnchorCarryForward { anchors_written: 0 });
+    if prepared.is_empty() {
+        return Ok(outcomes);
     }
 
-    let carried_count = carry.len() as u64;
+    let carried_count = prepared
+        .iter()
+        .map(|(_row_index, _source_key, _cx_id, anchors)| anchors.len() as u64)
+        .sum::<u64>();
     let payload = serde_json::to_vec(&serde_json::json!({
-        "schema": "synapse_anchor_carry_forward/v1",
+        "schema": "synapse_anchor_carry_forward/v2",
         "issue": 1980,
         "source_cf": source_cf,
-        // Source keys can contain provider/session identifiers; their raw,
-        // hex, and digest forms are all long tokens intentionally refused by
-        // the ledger secret scanner. The ledger subject already binds this
-        // entry to active_cx_id, so retain only non-secret source shape here.
-        "source_key_len_bytes": source_key.len(),
+        "source_row_count": prepared.len(),
         "panel_name": panel.panel_name,
         "to_panel_version": panel.panel_version,
         "from_panel_versions": superseded,
@@ -14551,61 +15136,83 @@ fn carry_forward_grounded_anchors(
         type_name: "synapse_anchor_carry_forward_ledger_payload",
         source,
     })?;
-    vault
-        .put_grounding_anchors(
-            active_cx_id,
-            carry.clone(),
+    let write = vault
+        .put_grounding_anchors_for_many(
+            prepared
+                .iter()
+                .map(|(_row_index, _source_key, cx_id, anchors)| (*cx_id, anchors.clone()))
+                .collect(),
             payload,
             "synapse-anchor-carry-forward",
         )
         .map_err(|error| {
             calyx_write_failed(
                 "calyx_anchor_carry_forward",
-                "carry grounded anchors forward across a panel-version bump",
+                "batch-carry grounded anchors forward across a panel-version bump",
                 &error,
             )
         })?;
-
-    // Physical readback of the Anchors CF, not the write's return value: the
-    // whole defect class here is a path that reports success while the corpus
-    // stays ungrounded.
-    let readback = vault.scan_anchors_for_cx(active_cx_id).map_err(|error| {
-        calyx_read_failed(
+    if write.anchor_count as u64 != carried_count
+        || write
+            .written_anchor_count
+            .saturating_add(write.existing_anchor_count)
+            != write.anchor_count
+    {
+        return Err(calyx_write_failed_detail(
             "calyx_anchor_carry_forward",
-            "read back the carried anchors",
-            &error,
-        )
-    })?;
-    for anchor in &carry {
-        if !readback.iter().any(|row| &row.anchor == anchor) {
-            return Err(calyx_write_failed_detail(
-                "calyx_anchor_carry_forward",
-                format!(
-                    "carried anchor is absent from the Anchors CF after the write: \
-                     cx_id={active_cx_id} kind={} source_cf={source_cf} source_key_hex={}; \
-                     the constellation would be reported re-measured while staying ungrounded",
-                    synapse_calyx::anchor_kind_label(&anchor.kind),
-                    constellations::hex_encode(source_key),
-                ),
-            ));
-        }
+            format!(
+                "anchor carry batch write readback is inconsistent: requested={carried_count} reported={} written={} existing={}",
+                write.anchor_count, write.written_anchor_count, write.existing_anchor_count
+            ),
+        ));
     }
-
-    tracing::info!(
-        code = "CALYX_ANCHOR_CARRIED_FORWARD",
-        source_cf,
-        source_key_hex = %constellations::hex_encode(source_key),
-        panel_name = panel.panel_name,
-        to_panel_version = panel.panel_version,
-        from_panel_versions = ?superseded,
-        cx_id = %active_cx_id,
-        anchors_carried = carried_count,
-        anchors_present_after = readback.len(),
-        "grounded anchors carried across a panel-version bump with physical Anchors CF readback"
-    );
-    Ok(AnchorCarryForward {
-        anchors_written: carried_count,
-    })
+    for (row_index, source_key, active_cx_id, carry) in prepared {
+        // Physical readback of the Anchors CF, not the write return value.
+        let readback = vault.scan_anchors_for_cx(active_cx_id).map_err(|error| {
+            calyx_read_failed(
+                "calyx_anchor_carry_forward",
+                "read back one target from the carried anchor batch",
+                &error,
+            )
+        })?;
+        for anchor in &carry {
+            if !readback.iter().any(|row| &row.anchor == anchor) {
+                return Err(calyx_write_failed_detail(
+                    "calyx_anchor_carry_forward",
+                    format!(
+                        "carried anchor is absent from the Anchors CF after the batch write: cx_id={active_cx_id} kind={} source_cf={source_cf} source_key_hex={}; the constellation would be reported re-measured while staying ungrounded",
+                        synapse_calyx::anchor_kind_label(&anchor.kind),
+                        constellations::hex_encode(&source_key),
+                    ),
+                ));
+            }
+        }
+        let row_carried = carry.len() as u64;
+        let outcome = outcomes
+            .iter_mut()
+            .find(|(candidate_index, _)| *candidate_index == row_index)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    "calyx_anchor_carry_forward",
+                    format!("carry batch lost prepared row_index={row_index}"),
+                )
+            })?;
+        outcome.1.anchors_written = row_carried;
+        tracing::info!(
+            code = "CALYX_ANCHOR_CARRIED_FORWARD",
+            source_cf,
+            source_key_hex = %constellations::hex_encode(&source_key),
+            panel_name = panel.panel_name,
+            to_panel_version = panel.panel_version,
+            from_panel_versions = ?superseded,
+            cx_id = %active_cx_id,
+            anchors_carried = row_carried,
+            anchors_present_after = readback.len(),
+            batch_anchor_count = carried_count,
+            "grounded anchors carried across a panel-version bump in one batch with physical Anchors CF readback"
+        );
+    }
+    Ok(outcomes)
 }
 
 fn backfill_panel_version(source_cf: &str) -> StorageResult<u32> {

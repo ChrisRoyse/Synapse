@@ -116,7 +116,7 @@ pub use slot_column::{
 };
 pub use store::{PutDisposition, PutOutcome};
 pub use temporal_metadata::{
-    CALYX_TEMPORAL_METADATA_MIGRATION_MISMATCH, TemporalMetadataMigration,
+    CALYX_TEMPORAL_METADATA_MIGRATION_MISMATCH, TemporalMetadataBackfill, TemporalMetadataMigration,
 };
 pub use {
     context::VaultContext,

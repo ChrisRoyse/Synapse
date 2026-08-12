@@ -4002,6 +4002,7 @@ dependencies = [
  "calyx-mincut",
  "calyx-registry",
  "fs2",
+ "rayon",
  "serde",
  "serde_json",
  "sha2 0.11.0",

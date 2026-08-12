@@ -970,6 +970,28 @@ pub struct ConstellationPutReport {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalMetadataBackfillRowReport {
+    pub source_key: Vec<u8>,
+    pub inserted_rows: u64,
+    pub backfilled_rows: u64,
+    pub already_current_rows: u64,
+    pub temporal_ineligible_rows: u64,
+    pub outcome_anchored_rows: u64,
+    pub outcome_absent_rows: u64,
+    pub outcome_unadjudicable_rows: u64,
+    pub anchors_carried_forward: u64,
+    pub rows_anchor_carried: u64,
+    pub anchor_carry_source_generations_read: u64,
+    pub latest_seq: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TemporalMetadataBackfillRowFailure {
+    pub source_key: Vec<u8>,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TemporalMetadataBackfillReport {
     pub source_cf: String,
     pub examined_rows: u64,
@@ -1019,6 +1041,15 @@ pub struct TemporalMetadataBackfillReport {
     pub latest_seq: u64,
     pub resume_after_physical: Option<Vec<u8>>,
     pub more: bool,
+    /// Ordered per-source dispositions from the same physical commit/readback.
+    /// Exact-key maintenance batches use these to preserve pointwise quarantine
+    /// semantics without returning to one durable transaction per identity.
+    pub row_reports: Vec<TemporalMetadataBackfillRowReport>,
+    /// Pointwise preflight failures from an exact-key maintenance batch. The
+    /// public exact-batch wrapper joins these back to request order by physical
+    /// source key. Paged sweeps and single-key calls fail the whole operation
+    /// and therefore always leave this empty.
+    pub row_failures: Vec<TemporalMetadataBackfillRowFailure>,
 }
 
 // ---------------------------------------------------------------------------
@@ -8717,9 +8748,11 @@ fn action_target_value(record: &Value) -> Option<&Value> {
 /// bytes `syn_record_vector_unit_fields` content-addresses — bounded regardless
 /// of how long a window title or URL is.
 fn action_target_feature_digest(value: &str) -> String {
-    let mut digest = sha256_hex(value.as_bytes());
-    digest.truncate(16);
-    digest
+    let digest = Sha256::digest(value.as_bytes());
+    // `sha256_hex(...).truncate(16)` encoded all 32 digest bytes only to drop
+    // the last 24. Encoding the first eight bytes produces the exact same
+    // lowercase 16-character frozen feature key without the oversized String.
+    hex_encode(&digest[..8])
 }
 
 /// Splits one field value into the identity components a partial match should

@@ -190,13 +190,6 @@ pub const PANEL_ANCHOR_DEBT_QUARANTINE_CAP: usize = 256;
 /// immediately.
 pub const PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS: u32 = 3;
 
-/// Identities repaired between durable cursor writes.
-///
-/// The cursor is what makes progress survive a restart, so it is written often
-/// enough that a crash costs at most this many repeated (idempotent) repairs,
-/// and rarely enough that it is not a write per row.
-const PANEL_ANCHOR_DEBT_CURSOR_PERSIST_EVERY: usize = 32;
-
 /// `CF_KV` key prefix for the durable anchor-debt repair state, one row per
 /// `(panel generation, backfill source)`.
 const PANEL_ANCHOR_DEBT_STATE_KEY_PREFIX: &str = "syn/anchor-debt/v1/";
@@ -3977,9 +3970,9 @@ fn drive_anchor_debt_repair(
         let mut carried_anchors = 0u64;
         let mut inserted = 0u64;
         let mut newly_quarantined = 0usize;
-        let mut since_persist = 0usize;
         let mut queue_exhausted = !pending.is_empty();
 
+        let mut decoded = Vec::with_capacity(budget);
         for identity in pending.iter().take(budget) {
             if started.elapsed() >= PANEL_ANCHOR_DEBT_TICK_BUDGET {
                 queue_exhausted = false;
@@ -4003,15 +3996,13 @@ fn drive_anchor_debt_repair(
             }
 
             attempted += 1;
-            since_persist += 1;
-            // The cursor advances past every identity the pass touches,
+            // The cursor advances past every identity the batch touches,
             // including one it refuses, so a pathological row can delay a pass
-            // but can never stop it.
+            // but can never stop it. It is persisted once after the atomic batch.
             state.after_source_cf = Some(identity.source_cf.clone());
             state.after_source_key_hex = Some(identity.source_key_hex.clone());
-
-            let source_key = match decode_key_hex(&identity.source_key_hex) {
-                Ok(key) => key,
+            match decode_key_hex(&identity.source_key_hex) {
+                Ok(source_key) => decoded.push((*identity, source_key)),
                 Err(detail) => {
                     record_failure(
                         "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_UNDECODABLE",
@@ -4036,132 +4027,124 @@ fn drive_anchor_debt_repair(
                         last_attempt_unix_ms: now_unix_ms(),
                     });
                     newly_quarantined += 1;
-                    continue;
                 }
-            };
+            }
+        }
 
+        if !decoded.is_empty() {
+            let source_keys = decoded
+                .iter()
+                .map(|(_identity, source_key)| source_key.clone())
+                .collect::<Vec<_>>();
             let repair_started = std::time::Instant::now();
-            let repair_outcome =
-                db.backfill_temporal_metadata(&source_cf, Some(&source_key), None, 1);
+            let repair_outcomes =
+                db.backfill_temporal_metadata_exact_batch(&source_cf, &source_keys);
             pass.repair_ms = pass.repair_ms.saturating_add(
                 u64::try_from(repair_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             );
-            match repair_outcome {
-                Ok(page) => {
-                    inserted = inserted.saturating_add(page.inserted_rows);
-                    carried_anchors = carried_anchors.saturating_add(page.anchors_carried_forward);
-                    // The attempt ran to completion, so whatever transient made
-                    // earlier attempts fail is not a property of this row.
-                    state.clear_failed_attempts(identity);
-                    if page.anchors_carried_forward > 0 {
-                        carried_rows = carried_rows.saturating_add(1);
-                    } else {
-                        // Proof, not suspicion: the exact row was re-measured at
-                        // the active generation and its declared lineage carried
-                        // nothing. Retrying the same bytes cannot change that,
-                        // so this identity is quarantined by name — and only it.
-                        // This is the #2061 population, held to three rows on
-                        // `syn-outcome-v1` instead of a whole maintainer.
+            let outcomes = match repair_outcomes {
+                Ok(outcomes) if outcomes.len() == decoded.len() => outcomes,
+                Ok(outcomes) => {
+                    let error = format!(
+                        "exact anchor-debt batch returned {} ordered dispositions for {} requested identities",
+                        outcomes.len(),
+                        decoded.len()
+                    );
+                    decoded
+                        .iter()
+                        .map(|_| {
+                            Err(crate::StorageError::ReadFailed {
+                                cf_name: source_cf.clone(),
+                                detail: error.clone(),
+                            })
+                        })
+                        .collect()
+                }
+                Err(error) => {
+                    let error = error.to_string();
+                    decoded
+                        .iter()
+                        .map(|_| {
+                            Err(crate::StorageError::WriteFailed {
+                                cf_name: source_cf.clone(),
+                                detail: format!("shared exact anchor-debt batch failed: {error}"),
+                            })
+                        })
+                        .collect()
+                }
+            };
+
+            for ((identity, _source_key), repair_outcome) in decoded.into_iter().zip(outcomes) {
+                match repair_outcome {
+                    Ok(row) => {
+                        inserted = inserted.saturating_add(row.inserted_rows);
+                        carried_anchors =
+                            carried_anchors.saturating_add(row.anchors_carried_forward);
+                        state.clear_failed_attempts(identity);
+                        if row.anchors_carried_forward > 0 {
+                            carried_rows = carried_rows.saturating_add(1);
+                        } else {
+                            record_failure(
+                                "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_UNREPAIRABLE",
+                                format!(
+                                    "panel {} stranded identity source_cf={} source_key_hex={} \
+                                     from_generation={} was re-measured at generation {} in the \
+                                     exact-key batch and its declared anchor lineage carried \
+                                     nothing; quarantining this one identity so the remaining \
+                                     debt continues; inspect that superseded Base row's anchors \
+                                     and their confidence",
+                                    target.panel_name,
+                                    identity.source_cf,
+                                    identity.source_key_hex,
+                                    identity.superseded_panel_version,
+                                    target.panel_version,
+                                ),
+                            );
+                            pass.failed = true;
+                            state.quarantined.push(QuarantinedAnchorIdentity {
+                                source_cf: identity.source_cf.clone(),
+                                source_key_hex: identity.source_key_hex.clone(),
+                                superseded_panel_version: identity.superseded_panel_version,
+                                reason: "carry_forward_yielded_no_anchor".to_owned(),
+                                attempts: 1,
+                                first_seen_unix_ms: now_unix_ms(),
+                                last_attempt_unix_ms: now_unix_ms(),
+                            });
+                            newly_quarantined += 1;
+                        }
+                    }
+                    Err(error) => {
+                        let attempts = state.record_failed_attempt(identity, &error.to_string());
                         record_failure(
-                            "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_UNREPAIRABLE",
+                            "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_FAILED",
                             format!(
-                                "panel {} stranded identity source_cf={} source_key_hex={} \
-                                 from_generation={} was re-measured at generation {} and its \
-                                 declared anchor lineage carried nothing; quarantining this one \
-                                 identity so the panel's remaining debt and every other panel keep \
-                                 being repaired; inspect that superseded Base row's anchors and \
-                                 their confidence",
+                                "panel {} exact batched anchor-debt repair for source_cf={} \
+                                 source_key_hex={} from_generation={} failed on attempt {attempts} \
+                                 of {PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS}: {error}",
                                 target.panel_name,
                                 identity.source_cf,
                                 identity.source_key_hex,
                                 identity.superseded_panel_version,
-                                target.panel_version,
                             ),
                         );
                         pass.failed = true;
-                        state.quarantined.push(QuarantinedAnchorIdentity {
-                            source_cf: identity.source_cf.clone(),
-                            source_key_hex: identity.source_key_hex.clone(),
-                            superseded_panel_version: identity.superseded_panel_version,
-                            reason: "carry_forward_yielded_no_anchor".to_owned(),
-                            attempts: 1,
-                            first_seen_unix_ms: now_unix_ms(),
-                            last_attempt_unix_ms: now_unix_ms(),
-                        });
-                        newly_quarantined += 1;
+                        if attempts >= PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS
+                            && !state.quarantines(identity)
+                        {
+                            state.quarantined.push(QuarantinedAnchorIdentity {
+                                source_cf: identity.source_cf.clone(),
+                                source_key_hex: identity.source_key_hex.clone(),
+                                superseded_panel_version: identity.superseded_panel_version,
+                                reason: format!(
+                                    "batched_repair_failed_after_{attempts}_attempts: {error}"
+                                ),
+                                attempts,
+                                first_seen_unix_ms: now_unix_ms(),
+                                last_attempt_unix_ms: now_unix_ms(),
+                            });
+                            newly_quarantined += 1;
+                        }
                     }
-                }
-                Err(error) => {
-                    // A failed attempt is not proof the row cannot be repaired —
-                    // a write shed under disk pressure is not a lineage fault —
-                    // so it accrues attempts in the DURABLE ledger and is
-                    // quarantined only once it has failed often enough to be a
-                    // property of the row. Reading the count out of
-                    // `quarantined` (which is only written at the threshold)
-                    // made every tick report "attempt 1 of 3" forever (#1984).
-                    let attempts = state.record_failed_attempt(identity, &error.to_string());
-                    record_failure(
-                        "STORAGE_DERIVED_STATE_ANCHOR_DEBT_IDENTITY_FAILED",
-                        format!(
-                            "panel {} exact anchor-debt repair for source_cf={} source_key_hex={} \
-                             from_generation={} failed on attempt {attempts} of \
-                             {PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS}: {error}",
-                            target.panel_name,
-                            identity.source_cf,
-                            identity.source_key_hex,
-                            identity.superseded_panel_version,
-                        ),
-                    );
-                    pass.failed = true;
-                    if attempts >= PANEL_ANCHOR_DEBT_IDENTITY_MAX_ATTEMPTS
-                        && !state.quarantines(identity)
-                    {
-                        state.quarantined.push(QuarantinedAnchorIdentity {
-                            source_cf: identity.source_cf.clone(),
-                            source_key_hex: identity.source_key_hex.clone(),
-                            superseded_panel_version: identity.superseded_panel_version,
-                            reason: format!("repair_failed_after_{attempts}_attempts: {error}"),
-                            attempts,
-                            first_seen_unix_ms: now_unix_ms(),
-                            last_attempt_unix_ms: now_unix_ms(),
-                        });
-                        newly_quarantined += 1;
-                    }
-                    // Continue to the next identity, and do not abandon the
-                    // panel's queue (#1984). One erroring identity is evidence
-                    // about ONE row: the deployed daemon enumerated 3 stranded
-                    // identities for `syn-outcome-v1`, attempted 1, broke, and
-                    // reported `enumerated=3 attempted=1` on every tick — so the
-                    // disposition of the other two was unknown for the life of
-                    // the process. That is the same head-of-queue denial of
-                    // service #2030 fixed for a record and #2061 fixed for a
-                    // panel, one level further in. Each failure is recorded
-                    // independently above and the budget still bounds the tick.
-                    continue;
-                }
-            }
-
-            if since_persist >= PANEL_ANCHOR_DEBT_CURSOR_PERSIST_EVERY {
-                since_persist = 0;
-                state.updated_at_unix_ms = now_unix_ms();
-                if let Err(detail) = write_durable_maintenance_row(
-                    db,
-                    state_key.clone(),
-                    &state,
-                    "anchor-debt repair state",
-                ) {
-                    record_failure(
-                        "STORAGE_DERIVED_STATE_ANCHOR_DEBT_CURSOR_UNWRITABLE",
-                        format!(
-                            "panel {} anchor-debt resume cursor could not be persisted: {detail}; \
-                             without it a restart repeats work already done and no pass can be \
-                             proven complete",
-                            target.panel_name
-                        ),
-                    );
-                    pass.failed = true;
-                    queue_exhausted = false;
-                    break;
                 }
             }
         }

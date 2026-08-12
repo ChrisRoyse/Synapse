@@ -335,14 +335,13 @@ impl SynapseCalyxVault {
             ColumnFamily::Base,
             crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
             |_key, value| {
-                let base = calyx_aster::vault::encode::decode_constellation_base(value).map_err(
-                    |error| {
+                let base = calyx_aster::vault::encode::decode_constellation_base_projection(value)
+                    .map_err(|error| {
                         SynapseCalyxError::from_calyx(
-                            "decode Base row for lifecycle candidate census",
+                            "decode Base row projection for lifecycle candidate census",
                             &error,
                         )
-                    },
-                )?;
+                    })?;
                 if base.panel_version == panel_version {
                     if ids.len() >= max_records {
                         return Err(invalid(format!(

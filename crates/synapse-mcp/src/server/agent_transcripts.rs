@@ -58,7 +58,8 @@ use synapse_core::{
     TranscriptParseStatus, TranscriptRole, TranscriptSource, TranscriptToolCall, TranscriptUsage,
 };
 use synapse_storage::{
-    CfRevisionGuard, Db, agent_transcripts::agent_transcript_key, cf, decode_json, encode_json,
+    CfRevisionGuard, Db, GroundingAnchorSource, agent_transcripts::agent_transcript_key, cf,
+    decode_json, encode_json,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -1152,35 +1153,91 @@ pub(super) fn commit_transcript_chunk(
                     .map_or_else(|| "absent".to_owned(), sha256_hex)
             ));
         }
+    }
 
-        db.put_agent_transcript_constellation(&row.source_key, &row.encoded, &row.record)
+    // #2121: raw rows already share one guarded commit; their native
+    // projections now keep that same chunk boundary instead of paying one
+    // durable lock/WAL/fsync per row. The storage batch validates ordered
+    // readback cardinality and emits one report per input.
+    let projection_rows = rows
+        .iter()
+        .map(|row| {
+            (
+                row.source_key.clone(),
+                row.encoded.clone(),
+                row.record.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let reports = db
+        .put_agent_transcript_constellations(&projection_rows)
+        .map_err(|error| {
+            format!(
+                "{code_prefix}_CONSTELLATION_BATCH_FAILED: source_id={source_id} path={} rows={} first_source_key_hex={}: {error}; remediation=repair native Calyx batch publication and retry from the unchanged cursor",
+                source_path.display(),
+                rows.len(),
+                synapse_storage::constellations::hex_encode(&rows[0].source_key)
+            )
+        })?;
+    if reports.len() != rows.len() {
+        return Err(format!(
+            "{code_prefix}_CONSTELLATION_BATCH_READBACK_MISMATCH: source_id={source_id} path={} expected_rows={} actual_reports={}; remediation=hold the cursor and repair the ordered native Calyx batch readback contract",
+            source_path.display(),
+            rows.len(),
+            reports.len()
+        ));
+    }
+
+    let anchor_sources = rows
+        .iter()
+        .filter_map(|row| {
+            synapse_storage::constellations::agent_transcript_outcome_anchor(&row.record).map(
+                |anchor| GroundingAnchorSource {
+                    source_cf: cf::CF_AGENT_TRANSCRIPTS,
+                    source_key: row.source_key.clone(),
+                    raw_bytes: row.encoded.clone(),
+                    anchor,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    if !anchor_sources.is_empty() {
+        let evidence = anchor_sources
+            .iter()
+            .map(|source| {
+                json!({
+                    "source_key_sha256": sha256_hex(&source.source_key),
+                    "source_value_sha256": sha256_hex(&source.raw_bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "mode": "agent-transcript-ingest-outcome-batch",
+            "source_id": source_id,
+            "source_cf": cf::CF_AGENT_TRANSCRIPTS,
+            "source_row_count": anchor_sources.len(),
+            "source_evidence": evidence,
+        });
+        let anchor_report = db
+            .put_grounding_anchors_for_sources(anchor_sources, &payload)
             .map_err(|error| {
                 format!(
-                    "{code_prefix}_CONSTELLATION_MEASUREMENT_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} source_key_hex={}: {error}; remediation=repair native Calyx constellation publication and retry from the unchanged cursor",
+                    "{code_prefix}_OUTCOME_ANCHOR_BATCH_FAILED: source_id={source_id} path={} requested_anchors={}: {error}; remediation=repair the declared tool-outcome adjudication or native Calyx anchor batch and retry from the unchanged cursor",
                     source_path.display(),
-                    row.record.line_no,
-                    row.source_offset_bytes,
-                    synapse_storage::constellations::hex_encode(&row.source_key)
+                    evidence.len()
                 )
             })?;
-
-        // #1926: the constellation exists now, so its adjudicated outcome can be
-        // grounded. This is deliberately here and not on a later sweep: the
-        // anchor targets the cx_id derived from the *active* panel version, and
-        // the row that was just measured is the only moment that identity is
-        // guaranteed to resolve. Failing here fails the chunk and holds the
-        // cursor, which is correct — a transcript row that is durable but
-        // silently ungrounded is exactly the state #1926 was filed about.
-        db.put_agent_transcript_outcome_anchor(&row.source_key, &row.encoded, &row.record)
-            .map_err(|error| {
-                format!(
-                    "{code_prefix}_OUTCOME_ANCHOR_FAILED: source_id={source_id} path={} line_no={} source_offset_bytes={} source_key_hex={}: {error}; remediation=repair the declared tool-outcome adjudication or the Calyx anchor write and retry from the unchanged cursor",
-                    source_path.display(),
-                    row.record.line_no,
-                    row.source_offset_bytes,
-                    synapse_storage::constellations::hex_encode(&row.source_key)
-                )
-            })?;
+        if anchor_report.requested_anchor_count != evidence.len() as u64
+            || anchor_report.readback_exact_match_count != evidence.len() as u64
+        {
+            return Err(format!(
+                "{code_prefix}_OUTCOME_ANCHOR_BATCH_READBACK_MISMATCH: source_id={source_id} path={} expected={} requested={} physical_exact_matches={}; remediation=hold the cursor and inspect the physical Anchors CF before retrying",
+                source_path.display(),
+                evidence.len(),
+                anchor_report.requested_anchor_count,
+                anchor_report.readback_exact_match_count
+            ));
+        }
     }
 
     // #2113: this is the single commit site for `CF_AGENT_TRANSCRIPTS` rows

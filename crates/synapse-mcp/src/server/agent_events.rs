@@ -39,9 +39,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use synapse_core::{AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord};
 use synapse_storage::{
-    CfRevisionGuard, Db, GroundingAnchor, GroundingAnchorSource, RevisionedRawValue, StorageError,
-    StorageResult, agent_events::agent_event_key, agent_transcripts::agent_transcript_spawn_prefix,
-    cf, decode_json, encode_json,
+    CfRevisionGuard, Db, GroundingAnchorSource, RevisionedRawValue, StorageError, StorageResult,
+    agent_events::agent_event_key, agent_transcripts::agent_transcript_spawn_prefix, cf,
+    decode_json, encode_json,
 };
 
 use crate::m3::grounding::{self, SOURCE_AGENT_EVENT};
@@ -824,14 +824,23 @@ pub(crate) fn project_committed_agent_event_artifacts(
     db: &Db,
     committed: &CommittedAgentEventBatch,
 ) {
-    for ((record, readback), (source_key, raw_bytes)) in committed
+    let projection_rows = committed
         .records
         .iter()
-        .zip(&committed.readbacks)
         .zip(&committed.source_rows)
-    {
-        match db.put_agent_event_constellation(source_key, raw_bytes, record) {
-            Ok(constellation) => {
+        .map(|(record, (source_key, raw_bytes))| {
+            (source_key.clone(), raw_bytes.clone(), record.clone())
+        })
+        .collect::<Vec<_>>();
+    match db.put_agent_event_constellations(&projection_rows) {
+        Ok(constellations) if constellations.len() == committed.records.len() => {
+            for (((record, readback), (_source_key, _raw_bytes)), constellation) in committed
+                .records
+                .iter()
+                .zip(&committed.readbacks)
+                .zip(&committed.source_rows)
+                .zip(constellations)
+            {
                 tracing::debug!(
                     code = "AGENT_EVENT_RECORDED",
                     kind = ?record.kind,
@@ -849,20 +858,21 @@ pub(crate) fn project_committed_agent_event_artifacts(
                     "readback=CF_AGENT_EVENTS edge=atomic_journal_projection_commit"
                 );
             }
-            Err(error) => {
-                tracing::error!(
-                    code = "CALYX_AGENT_EVENT_CONSTELLATION_MEASUREMENT_FAILED",
-                    kind = ?record.kind,
-                    journal_ts_ns = readback.ts_ns,
-                    seq = readback.seq,
-                    committed_seq = readback.committed_seq,
-                    operation_committed = true,
-                    source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
-                    detail = %error,
-                    "agent event and projection cursor are committed but native Calyx constellation measurement failed; inspect/reconcile the content-addressed projection"
-                );
-            }
         }
+        Ok(constellations) => tracing::error!(
+            code = "CALYX_AGENT_EVENT_CONSTELLATION_BATCH_READBACK_MISMATCH",
+            expected_rows = committed.records.len(),
+            actual_reports = constellations.len(),
+            operation_committed = true,
+            "agent event journal transaction committed but ordered constellation batch cardinality diverged"
+        ),
+        Err(error) => tracing::error!(
+            code = "CALYX_AGENT_EVENT_CONSTELLATION_BATCH_FAILED",
+            record_count = committed.records.len(),
+            operation_committed = true,
+            detail = %error,
+            "agent event journal transaction committed but native Calyx constellation batch failed; inspect/reconcile the content-addressed projection"
+        ),
     }
     if let Err(error) = anchor_agent_event_outcomes(db, &committed.records, &committed.source_rows)
     {
@@ -894,34 +904,65 @@ fn anchor_agent_event_outcomes(
         .map(ToOwned::to_owned)
         .collect::<BTreeSet<String>>();
     let terminal_rows = SpawnTerminalEventRows::materialize(db, &terminal_spawns)?;
-    for (record, (source_key, source_value)) in records.iter().zip(source_rows) {
-        if record.kind == AgentEventKind::ToolCallFinished {
-            let error_present = tool_call_error_present(record);
-            put_agent_grounding_anchor(
-                db,
-                cf::CF_AGENT_EVENTS,
-                source_key,
-                source_value,
-                grounding::bool_anchor(
+
+    let tool_anchor_sources = records
+        .iter()
+        .zip(source_rows)
+        .filter(|(record, _source)| record.kind == AgentEventKind::ToolCallFinished)
+        .map(
+            |(record, (source_key, source_value))| GroundingAnchorSource {
+                source_cf: cf::CF_AGENT_EVENTS,
+                source_key: source_key.clone(),
+                raw_bytes: source_value.clone(),
+                anchor: grounding::bool_anchor(
                     "synapse:agent_tool_call_success",
-                    !error_present,
+                    !tool_call_error_present(record),
                     SOURCE_AGENT_EVENT,
                     grounding::observed_at_ms_from_ns(record.ts_ns),
                 ),
-                "agent tool-call outcome anchor",
-            )?;
-            tracing::debug!(
-                code = "AGENT_TOOL_CALL_OUTCOME_ANCHORED",
-                ts_ns = record.ts_ns,
-                session_id = ?record.session_id,
-                spawn_id = ?record.spawn_id,
-                tool_name = ?record.attributes.tool_name,
-                error_present,
-                source_key_hex = %synapse_storage::constellations::hex_encode(source_key),
-                "tool-call error presence grounded on agent-event constellation"
-            );
+            },
+        )
+        .collect::<Vec<_>>();
+    if !tool_anchor_sources.is_empty() {
+        let expected = tool_anchor_sources.len() as u64;
+        let evidence = tool_anchor_sources
+            .iter()
+            .map(|source| {
+                json!({
+                    "source_key_sha256": synapse_storage::constellations::sha256_hex(&source.source_key),
+                    "source_value_sha256": synapse_storage::constellations::sha256_hex(&source.raw_bytes),
+                })
+            })
+            .collect::<Vec<_>>();
+        let payload = json!({
+            "mode": "agent-event-tool-outcome-batch",
+            "source_cf": cf::CF_AGENT_EVENTS,
+            "source_count": expected,
+            "source_evidence": evidence,
+        });
+        let report = db.put_grounding_anchors_for_sources(tool_anchor_sources, &payload)?;
+        if report.requested_anchor_count != expected
+            || report.readback_exact_match_count != expected
+        {
+            return Err(StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                detail: format!(
+                    "agent tool-call outcome anchor batch readback mismatch: expected={expected} requested={} physical_exact_matches={}",
+                    report.requested_anchor_count, report.readback_exact_match_count
+                ),
+            });
         }
+        tracing::debug!(
+            code = "AGENT_TOOL_CALL_OUTCOME_BATCH_ANCHORED",
+            requested = expected,
+            written = report.written_anchor_count,
+            existing = report.existing_anchor_count,
+            physical_exact_matches = report.readback_exact_match_count,
+            "tool-call error presence grounded in one native Calyx anchor batch"
+        );
+    }
 
+    for record in records {
         let Some(_outcome) = terminal_agent_outcome(record) else {
             continue;
         };
@@ -1127,28 +1168,61 @@ fn anchor_spawn_terminal_event_rows(
     terminal_rows: &SpawnTerminalEventRows,
     spawn_id: &str,
 ) -> StorageResult<()> {
-    let mut anchored = 0_usize;
-    for row in terminal_rows.rows_for(spawn_id) {
-        db.put_agent_event_constellation(&row.key, &row.value, &row.record)?;
-        put_agent_grounding_anchor(
-            db,
-            cf::CF_AGENT_EVENTS,
-            &row.key,
-            &row.value,
-            grounding::enum_anchor(
+    let rows = terminal_rows.rows_for(spawn_id).iter().collect::<Vec<_>>();
+    let projection_rows = rows
+        .iter()
+        .map(|row| (row.key.clone(), row.value.clone(), row.record.clone()))
+        .collect::<Vec<_>>();
+    let reports = db.put_agent_event_constellations(&projection_rows)?;
+    if reports.len() != rows.len() {
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+            detail: format!(
+                "terminal agent-event constellation batch readback mismatch: spawn_id={spawn_id} expected={} actual={}",
+                rows.len(),
+                reports.len()
+            ),
+        });
+    }
+    let anchor_sources = rows
+        .iter()
+        .map(|row| GroundingAnchorSource {
+            source_cf: cf::CF_AGENT_EVENTS,
+            source_key: row.key.clone(),
+            raw_bytes: row.value.clone(),
+            anchor: grounding::enum_anchor(
                 "synapse:agent_end_state",
                 row.outcome,
                 SOURCE_AGENT_EVENT,
                 grounding::observed_at_ms_from_ns(row.record.ts_ns),
             ),
-            "agent end-state event anchor",
-        )?;
-        anchored = anchored.saturating_add(1);
+        })
+        .collect::<Vec<_>>();
+    if !anchor_sources.is_empty() {
+        let expected = anchor_sources.len() as u64;
+        let payload = json!({
+            "mode": "agent-terminal-event-outcome-batch",
+            "source_cf": cf::CF_AGENT_EVENTS,
+            "spawn_id_sha256": synapse_storage::constellations::sha256_hex(spawn_id.as_bytes()),
+            "source_count": expected,
+        });
+        let report = db.put_grounding_anchors_for_sources(anchor_sources, &payload)?;
+        if report.requested_anchor_count != expected
+            || report.readback_exact_match_count != expected
+        {
+            return Err(StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_EVENTS.to_owned(),
+                detail: format!(
+                    "terminal agent-event anchor batch readback mismatch: spawn_id={spawn_id} expected={expected} requested={} physical_exact_matches={}",
+                    report.requested_anchor_count, report.readback_exact_match_count
+                ),
+            });
+        }
     }
     tracing::info!(
         code = "AGENT_END_STATE_EVENT_ROWS_ANCHORED",
         spawn_id,
-        event_rows = anchored,
+        event_rows = rows.len(),
         index_rows_scanned = terminal_rows.rows_scanned,
         "terminal agent outcomes grounded on terminal spawn event constellations"
     );
@@ -1162,10 +1236,11 @@ fn anchor_spawn_transcript_rows(
     observed_ts_ns: u64,
 ) -> StorageResult<()> {
     let mut anchor_sources = Vec::new();
+    let mut projection_rows = Vec::new();
     let prefix = agent_transcript_spawn_prefix(spawn_id);
     for (source_key, source_value) in db.scan_cf_prefix(cf::CF_AGENT_TRANSCRIPTS, &prefix)? {
         let record: AgentTranscriptRecord = decode_json(&source_value)?;
-        db.put_agent_transcript_constellation(&source_key, &source_value, &record)?;
+        projection_rows.push((source_key.clone(), source_value.clone(), record));
         anchor_sources.push(GroundingAnchorSource {
             source_cf: cf::CF_AGENT_TRANSCRIPTS,
             source_key,
@@ -1177,6 +1252,22 @@ fn anchor_spawn_transcript_rows(
                 grounding::observed_at_ms_from_ns(observed_ts_ns),
             ),
         });
+    }
+    for (chunk_index, chunk) in projection_rows
+        .chunks(super::agent_transcripts::MAX_AGENT_TRANSCRIPT_COMMIT_ROWS)
+        .enumerate()
+    {
+        let reports = db.put_agent_transcript_constellations(chunk)?;
+        if reports.len() != chunk.len() {
+            return Err(StorageError::WriteFailed {
+                cf_name: cf::CF_AGENT_TRANSCRIPTS.to_owned(),
+                detail: format!(
+                    "agent end-state transcript constellation batch readback mismatch: spawn_id={spawn_id} chunk_index={chunk_index} expected={} actual={}",
+                    chunk.len(),
+                    reports.len()
+                ),
+            });
+        }
     }
     let requested = anchor_sources.len();
     let report = if anchor_sources.is_empty() {
@@ -1303,23 +1394,6 @@ fn terminal_event_log_dir(record: &AgentEventRecord) -> Option<String> {
             Path::new(completion_path)
                 .parent()
                 .map(|path| path.display().to_string())
-        })
-}
-
-fn put_agent_grounding_anchor(
-    db: &Db,
-    source_cf: &'static str,
-    source_key: &[u8],
-    source_value: &[u8],
-    anchor: GroundingAnchor,
-    context: &'static str,
-) -> StorageResult<()> {
-    let payload = grounding::anchor_ledger_payload(source_cf, source_key, source_value, &anchor);
-    db.put_grounding_anchor_for_source(source_cf, source_key, source_value, anchor, &payload)
-        .map(|_report| ())
-        .map_err(|error| StorageError::WriteFailed {
-            cf_name: source_cf.to_owned(),
-            detail: format!("{context} failed: {error}"),
         })
 }
 
