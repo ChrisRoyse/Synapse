@@ -676,6 +676,18 @@ fn text_tokens(bytes: &[u8], max_tokens: usize, label: &str) -> Result<Vec<Strin
     Ok(tokens)
 }
 
+/// Allocation-free batch preflight for the two text encoders whose over-limit
+/// refusal may be handled at slot granularity by the caller.
+pub(super) fn preflight_text_tokens(bytes: &[u8], label: &str) -> Result<()> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|err| numerical(format!("{label} input is not valid UTF-8: {err}")))?;
+    let token_count = text
+        .split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '-'))
+        .filter(|token| !token.is_empty())
+        .count();
+    ensure_token_limit(label, token_count, MAX_TEXT_TOKENS)
+}
+
 fn tokens_from_json_or_text(bytes: &[u8], max_tokens: usize, label: &str) -> Result<Vec<String>> {
     let text = std::str::from_utf8(bytes)
         .map_err(|err| numerical(format!("{label} input is not valid UTF-8: {err}")))?;

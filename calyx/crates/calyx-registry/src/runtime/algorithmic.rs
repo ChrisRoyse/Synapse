@@ -871,6 +871,25 @@ impl AlgorithmicLens {
         self.encoder
     }
 
+    /// Validates the input-dependent bounds that must be known before this
+    /// lens can safely join a native batch.
+    ///
+    /// This does not measure the input. Page planners use it to preserve an
+    /// explicitly declared per-slot over-limit policy without retrying a
+    /// rejected native batch as single-item measurements.
+    pub fn preflight_batch_input(&self, input: &Input) -> Result<()> {
+        ensure_input_modality(self, input)?;
+        match self.encoder {
+            AlgorithmicEncoder::SynSparseText { .. } => {
+                syn::preflight_text_tokens(&input.bytes, "syn sparse text")
+            }
+            AlgorithmicEncoder::SynSparseTextTf { .. } => {
+                syn::preflight_text_tokens(&input.bytes, "syn sparse text tf")
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Returns the most recent serializable batch provider/transfer evidence.
     pub fn last_batch_stats(&self) -> Option<AlgorithmicBatchStats> {
         self.batch.last_stats()

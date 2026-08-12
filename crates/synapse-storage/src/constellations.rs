@@ -11,15 +11,13 @@ use calyx_core::{
     SlotResource, SlotState, SlotVector, TEMPORAL_LANE_ACTIVE, TEMPORAL_LANE_INACTIVE,
     TEMPORAL_MISSING_CREATED_AT, VaultId,
 };
-use calyx_lenses::AlgorithmicLens;
-use calyx_lenses::measure::{absent, input_hash};
 use calyx_mincut::{
     StructuralParams, TransitionEdge, build_transition_graph, structural_signatures,
 };
+use calyx_registry::measure::{absent, input_hash};
 use calyx_registry::{
-    AlgorithmicEncoder as RegistryAlgorithmicEncoder, AlgorithmicLens as RegistryAlgorithmicLens,
-    LensRuntime, LensSpec, Registry, default_recall_delta,
-    measure_registry_batch_with_runtime_limit,
+    AlgorithmicEncoder as RegistryAlgorithmicEncoder, AlgorithmicLens, LensRuntime, LensSpec,
+    Registry, default_recall_delta, measure_registry_batch_with_runtime_limit,
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -41,6 +39,12 @@ use synapse_telemetry::metrics::{
     CALYX_CONSTELLATION_MEASUREMENT_DURATION_US, CALYX_CONSTELLATION_MEASUREMENT_ERRORS_TOTAL,
     CALYX_CONSTELLATION_MEASUREMENTS_TOTAL, CALYX_SLOT_LENS_REFUSED_TOTAL,
 };
+
+// Ingest and active-panel publication must derive frozen lens identities through
+// the same implementation. Two independent AlgorithmicLens types previously
+// allowed their norm fingerprints to drift and made valid batched measurement
+// fail because one declared slot acquired two content addresses.
+type RegistryAlgorithmicLens = AlgorithmicLens;
 
 use crate::{GroundingAnchor, GroundingAnchorValue, StorageError, StorageResult, cf};
 
@@ -6963,11 +6967,11 @@ fn defer_measurement(
     lens: AlgorithmicLens,
     input: Input,
     policy: DeferredMeasurementPolicy,
-) -> Result<(), (AlgorithmicLens, Input)> {
+) -> Result<(), Box<(AlgorithmicLens, Input)>> {
     DEFERRED_MEASUREMENTS.with(|measurements| {
         let mut measurements = measurements.borrow_mut();
         let Some(jobs) = measurements.as_mut() else {
-            return Err((lens, input));
+            return Err(Box::new((lens, input)));
         };
         jobs.push(DeferredMeasurement {
             lens,
@@ -8023,7 +8027,7 @@ fn measure_input(
 ) -> StorageResult<SlotVector> {
     let (lens, input) = match defer_measurement(lens, input, DeferredMeasurementPolicy::Strict) {
         Ok(()) => return Ok(deferred_measurement_placeholder()),
-        Err(unplanned) => unplanned,
+        Err(unplanned) => *unplanned,
     };
     lens.measure(&input).map_err(|source| {
         measurement_error(
@@ -8077,7 +8081,7 @@ fn measure_text_or_absent(
         DeferredMeasurementPolicy::OverLimitAbsent { panel_name },
     ) {
         Ok(()) => return Ok(deferred_measurement_placeholder()),
-        Err(unplanned) => unplanned,
+        Err(unplanned) => *unplanned,
     };
     match lens.measure(&input) {
         Ok(vector) => Ok(vector),

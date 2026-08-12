@@ -500,16 +500,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "calyx-lenses"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "calyx-core",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "calyx-lodestar"
 version = "0.1.0"
 dependencies = [
@@ -3998,7 +3988,6 @@ dependencies = [
  "calyx-assay",
  "calyx-aster",
  "calyx-core",
- "calyx-lenses",
  "calyx-mincut",
  "calyx-registry",
  "fs2",

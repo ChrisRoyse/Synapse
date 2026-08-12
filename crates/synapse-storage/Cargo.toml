@@ -16,7 +16,6 @@ default = []
 calyx-assay = { workspace = true }
 calyx-aster = { workspace = true }
 calyx-core = { workspace = true }
-calyx-lenses = { workspace = true }
 calyx-mincut = { version = "0.1.0", path = "../../calyx/crates/calyx-mincut" }
 calyx-registry = { workspace = true }
 fs2.workspace = true

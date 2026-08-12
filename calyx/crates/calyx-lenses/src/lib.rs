@@ -543,6 +543,7 @@ fn norm_fingerprint(encoder: AlgorithmicEncoder) -> &'static str {
         // the norm fingerprint is part of the lens id, so a disagreement here
         // silently splits one declared lens into two.
         AlgorithmicEncoder::SynRecordVector { .. }
+        | AlgorithmicEncoder::SynRecordVectorUnitFields { .. }
         | AlgorithmicEncoder::SynScalarRankArc { .. } => "unit",
         _ => "finite",
     }
