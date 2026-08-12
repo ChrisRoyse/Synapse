@@ -9308,6 +9308,199 @@ function Write-SynapseCandidateFailureEvidence {
     }
 }
 
+function Get-SynapseCandidateArtifactDescriptor {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $pathFull)).TrimEnd('\')
+    $leaf = Split-Path -Leaf $pathFull
+    if (-not $parentFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $leaf -notmatch '^candidate-\d{8}T\d{9}Z-(\d+)$') {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_SCOPE_INVALID path=$pathFull expected_parent=$rootFull actual_parent=$parentFull leaf=$leaf remediation=do not delete the path; only exact setup-created candidate directories are eligible"
+    }
+    $ownerPid = [int]$Matches[1]
+    if (-not (Test-Path -LiteralPath $pathFull)) {
+        return [pscustomobject]@{ Path = $pathFull; Exists = $false; OwnerPid = $ownerPid }
+    }
+    $item = Get-Item -LiteralPath $pathFull -Force -ErrorAction Stop
+    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_TYPE_INVALID path=$pathFull is_container=$($item.PSIsContainer) attributes=$($item.Attributes) remediation=do not recurse into a file or reparse point; inspect the exact setup-candidates child"
+    }
+    return [pscustomobject]@{
+        Path = $pathFull
+        Exists = $true
+        OwnerPid = $ownerPid
+    }
+}
+
+function Assert-SynapseCandidateArtifactCleanupSafe {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [int]$CandidateProcessId = 0,
+        [AllowEmptyString()][string]$Bind = ''
+    )
+
+    $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    if (-not $descriptor.Exists) { return $descriptor }
+
+    if ($CandidateProcessId -gt 0) {
+        $candidateProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$CandidateProcessId" -ErrorAction SilentlyContinue
+        if ($candidateProcess) {
+            throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_LIVE path=$($descriptor.Path) candidate_pid=$CandidateProcessId actual_name=$($candidateProcess.Name) actual_path=$($candidateProcess.ExecutablePath) remediation=do not delete candidate storage while the recorded process identity is live"
+        }
+    }
+    $pathReferences = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+        $_.ProcessId -ne $PID -and
+        -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
+        ([string]$_.CommandLine).IndexOf($descriptor.Path, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
+    })
+    if ($pathReferences.Count -gt 0) {
+        $referenceText = ($pathReferences | ForEach-Object { "pid=$($_.ProcessId),name=$($_.Name)" }) -join ';'
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_REFERENCE_LIVE path=$($descriptor.Path) references=$referenceText remediation=inspect these exact processes; do not delete storage referenced by a live command line"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Bind)) {
+        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        if ($listeners.Count -gt 0) {
+            throw "SYNAPSE_CANDIDATE_ARTIFACT_BIND_LIVE path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=do not delete candidate storage until its exact listener is absent"
+        }
+    }
+    return $descriptor
+}
+
+function Get-SynapseCandidateCleanupNativeErrorCode {
+    param([Parameter(Mandatory=$true)][System.Exception]$Exception)
+
+    $cursor = $Exception
+    $lastCode = 0
+    while ($null -ne $cursor) {
+        $code = ([int64]$cursor.HResult) -band 0xFFFF
+        if ($code -in @(5, 32, 33)) { return [int]$code }
+        if ($code -ne 0) { $lastCode = [int]$code }
+        $cursor = $cursor.InnerException
+    }
+    return $lastCode
+}
+
+function Remove-SynapseCandidateArtifact {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [int]$CandidateProcessId = 0,
+        [AllowEmptyString()][string]$Bind = '',
+        [ValidateRange(1, 60)][int]$TimeoutSeconds = 20,
+        [Parameter(Mandatory=$true)][string]$Reason
+    )
+
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $attempt = 0
+    $lastNativeError = 0
+    $lastError = '<none>'
+    while ($true) {
+        $attempt++
+        $descriptor = Assert-SynapseCandidateArtifactCleanupSafe `
+            -Path $Path `
+            -ExpectedRoot $ExpectedRoot `
+            -CandidateProcessId $CandidateProcessId `
+            -Bind $Bind
+        if (-not $descriptor.Exists) {
+            Info "Candidate artifact absence verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false"
+            return $descriptor
+        }
+
+        try {
+            Remove-Item -LiteralPath $descriptor.Path -Recurse -Force -ErrorAction Stop
+            if (-not (Test-Path -LiteralPath $descriptor.Path)) {
+                Info "Candidate artifact cleanup verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false"
+                return $descriptor
+            }
+            $lastNativeError = 0
+            $lastError = 'Remove-Item returned but the directory remains present'
+        } catch {
+            $lastNativeError = Get-SynapseCandidateCleanupNativeErrorCode -Exception $_.Exception
+            $lastError = $_.Exception.Message
+            if ($lastNativeError -notin @(5, 32, 33)) {
+                throw "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_FAILED reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempt=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) native_error=$lastNativeError error=$lastError remediation=inspect the exact non-transient filesystem failure; setup refuses to ignore or broaden candidate cleanup"
+            }
+        }
+
+        if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+            throw "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_TIMEOUT reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt timeout_seconds=$TimeoutSeconds native_error=$lastNativeError error=$lastError remediation=identify the exact process holding this isolated candidate path, close only that owned handle, and rerun setup"
+        }
+        Info "Candidate artifact cleanup waiting reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempt=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) native_error=$lastNativeError error=$lastError"
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+function Remove-SynapseStaleSuccessfulCandidateArtifacts {
+    param([Parameter(Mandatory=$true)][string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        Info "Stale successful candidate sweep root=$Root eligible_count=0 removed_count=0 retained_count=0"
+        return
+    }
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $removed = 0
+    $retained = 0
+    $eligible = 0
+    foreach ($child in @(Get-ChildItem -LiteralPath $rootFull -Directory -Force -ErrorAction Stop | Sort-Object Name)) {
+        $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $child.FullName -ExpectedRoot $rootFull
+        $diagnosticPath = Join-Path $descriptor.Path 'candidate-diagnostic.json'
+        if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
+            $retained++
+            continue
+        }
+        $healthPath = Join-Path $descriptor.Path 'candidate-health-after-bootstrap.json'
+        if (-not (Test-Path -LiteralPath $healthPath -PathType Leaf)) {
+            $retained++
+            Info "WARN: SYNAPSE_CANDIDATE_STALE_STATE_AMBIGUOUS path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) reason=validated_health_evidence_missing remediation=preserve and inspect this exact candidate directory; setup will not infer success"
+            continue
+        }
+        try {
+            $health = Get-Content -LiteralPath $healthPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_CANDIDATE_STALE_HEALTH_UNREADABLE path=$healthPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory and inspect its post-bootstrap health evidence"
+        }
+        if ($health.ok -ne $true -or [int]$health.pid -le 0 -or [int]$health.tool_count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$health.build)) {
+            $retained++
+            Info "WARN: SYNAPSE_CANDIDATE_STALE_STATE_AMBIGUOUS path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) health_ok=$($health.ok) health_pid=$($health.pid) tool_count=$($health.tool_count) build=$($health.build) remediation=preserve and inspect this exact candidate directory; setup will not infer successful validation"
+            continue
+        }
+        $recordedPidPath = Join-Path $descriptor.Path 'db\daemon.pid'
+        $recordedPid = 0
+        try {
+            $recordedPidText = ([string](Get-Content -LiteralPath $recordedPidPath -Raw -Encoding UTF8 -ErrorAction Stop)).Trim()
+        } catch {
+            throw "SYNAPSE_CANDIDATE_STALE_PID_UNREADABLE path=$($descriptor.Path) pid_path=$recordedPidPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory; stale cleanup requires its physical PID record"
+        }
+        if (-not [int]::TryParse($recordedPidText, [ref]$recordedPid) -or $recordedPid -ne [int]$health.pid) {
+            throw "SYNAPSE_CANDIDATE_STALE_PID_MISMATCH path=$($descriptor.Path) health_pid=$($health.pid) recorded_pid=$recordedPid pid_path=$recordedPidPath remediation=preserve the directory; stale cleanup authority is inconsistent"
+        }
+        $recordedBind = [string]$health.subsystems.http.bind_addr
+        if ([string]::IsNullOrWhiteSpace($recordedBind)) {
+            throw "SYNAPSE_CANDIDATE_STALE_BIND_MISSING path=$($descriptor.Path) health_path=$healthPath candidate_pid=$recordedPid remediation=preserve the exact candidate directory; stale cleanup requires its validated HTTP bind"
+        }
+        if (Get-Process -Id $descriptor.OwnerPid -ErrorAction SilentlyContinue) {
+            $retained++
+            Info "Stale successful candidate retained path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) candidate_pid=$recordedPid reason=setup_owner_pid_still_live"
+            continue
+        }
+        $eligible++
+        [void](Remove-SynapseCandidateArtifact `
+            -Path $descriptor.Path `
+            -ExpectedRoot $rootFull `
+            -CandidateProcessId $recordedPid `
+            -Bind $recordedBind `
+            -Reason 'startup_stale_validated_candidate')
+        $removed++
+    }
+    Info "Stale successful candidate sweep root=$rootFull eligible_count=$eligible removed_count=$removed retained_count=$retained"
+}
+
 function Remove-SynapseExpiredCandidateFailureEvidence {
     param(
         [Parameter(Mandatory=$true)][string]$Root,
@@ -9840,20 +10033,12 @@ function Test-SynapseCandidateDaemon {
                 throw "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$candidateRoot error=$($_.Exception.Message) original_failure=[$candidateFailureMessage] remediation=preserve the exact candidate directory and repair log-directory permissions before rerunning setup"
             }
         } elseif (Test-Path -LiteralPath $candidateRoot) {
-            $candidateParent = [System.IO.Path]::GetFullPath((Split-Path -Parent $candidateRoot)).TrimEnd('\')
-            $expectedParent = [System.IO.Path]::GetFullPath((Join-Path $LogDir 'setup-candidates')).TrimEnd('\')
-            if (-not $candidateParent.Equals($expectedParent, [System.StringComparison]::OrdinalIgnoreCase)) {
-                Die "SYNAPSE_CANDIDATE_ARTIFACT_SCOPE_INVALID path=$candidateRoot expected_parent=$expectedParent actual_parent=$candidateParent remediation=do not delete the path; inspect setup run-directory construction"
-            }
-            try {
-                Remove-Item -LiteralPath $candidateRoot -Recurse -Force -ErrorAction Stop
-            } catch {
-                Die "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_FAILED path=$candidateRoot error=$($_.Exception.Message) remediation=close only handles owned by the stopped candidate PID, remove this exact isolated directory, and rerun setup"
-            }
-            if (Test-Path -LiteralPath $candidateRoot) {
-                Die "SYNAPSE_CANDIDATE_ARTIFACT_CLEANUP_UNVERIFIED path=$candidateRoot remediation=inspect filesystem permissions and remove this exact isolated candidate directory before rerunning setup"
-            }
-            Info "Candidate daemon isolated artifacts removed path=$candidateRoot"
+            [void](Remove-SynapseCandidateArtifact `
+                -Path $candidateRoot `
+                -ExpectedRoot (Join-Path $LogDir 'setup-candidates') `
+                -CandidateProcessId ([int]$candidate.Id) `
+                -Bind $candidateBind `
+                -Reason 'validated_candidate_success')
         }
     }
 }
@@ -14352,6 +14537,7 @@ if ($maintenanceReason -eq 'setup') {
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
 Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
+Remove-SynapseStaleSuccessfulCandidateArtifacts -Root (Join-Path $LogDir 'setup-candidates')
 
 if ($ResumeChromeBridgePending) {
     Invoke-SynapseChromeBridgePendingResume -CheckpointPath $ChromeBridgePendingPath
