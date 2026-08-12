@@ -1211,9 +1211,25 @@ pub(super) fn commit_transcript_chunk(
                 })
             })
             .collect::<Vec<_>>();
+        // `source_id` is committed as a SHA-256 binding, never raw, for the same
+        // reason every identifier in `transcript_end_state_anchor_batch_payload`
+        // is. The ledger is append-only, so a secret that reaches it can never be
+        // removed, and `calyx_ledger::redaction` fails the whole group commit on
+        // any whitespace-free token longer than `MAX_UNCLASSIFIED_TOKEN_LEN` (39)
+        // unless the value is itself a hash, base58, or a bare UUID.
+        //
+        // An ambient spawn id is none of those: `agent-spawn-ambient-claude-` plus
+        // a 36-char UUID is a 63-character composite, so it satisfies the field
+        // allowlist (`_id`) and then fails the value test. That rejected every
+        // ambient outcome-anchor batch and rolled back its group commit 32,796
+        // times on the deployed daemon, holding the ingest cursor unchanged.
+        //
+        // Hashing preserves the provenance the ledger exists for — a candidate id
+        // can be hashed and compared — without loosening redaction, which is the
+        // resolution #2018 already established for this failure.
         let payload = json!({
             "mode": "agent-transcript-ingest-outcome-batch",
-            "source_id": source_id,
+            "source_id_sha256": sha256_hex(source_id.as_bytes()),
             "source_cf": cf::CF_AGENT_TRANSCRIPTS,
             "source_row_count": anchor_sources.len(),
             "source_evidence": evidence,
