@@ -23931,6 +23931,16 @@ fn resume_suspended_shell_child(identity: &ActRunShellLocalProcessIdentity) -> R
             identity.pid
         ));
     }
+    tracing::info!(
+        code = "CONTAINED_CHILD_PRIMARY_THREAD_RESUMED",
+        pid = identity.pid,
+        primary_thread_id = thread_id,
+        process_start_time = identity.start_time,
+        process_start_time_source = identity.start_time_source,
+        previous_suspend_count,
+        resume_verdict,
+        "CREATE_SUSPENDED child primary thread restarted from the authoritative ResumeThread transition readback"
+    );
     Ok(())
 }
 
