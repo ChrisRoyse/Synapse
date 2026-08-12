@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-noninterference-v19";
-const BRIDGE_DECLARED_BUILD_SHA256 = "14a9a7dd28a5ad63015265fa0b161884cff3976dd48e003a143a64967629db9a";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-target-scroll-v20";
+const BRIDGE_DECLARED_BUILD_SHA256 = "870cda343d5fe91cc67a3ae68e25c6919bc5139d96035d5d408648bc0dcb860d";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -9270,6 +9270,8 @@ async function handleDomAction(params) {
     button: normalizeMouseButton(params.button, "domAction"),
     modifiers: normalizeClickModifiers(params.modifiers, "domAction"),
     position: normalizeClickPosition(params, "domAction"),
+    scrollDeltaX: action === "scroll" ? normalizeDomScrollDelta(params.scrollDeltaX, "scrollDeltaX") : 0,
+    scrollDeltaY: action === "scroll" ? normalizeDomScrollDelta(params.scrollDeltaY, "scrollDeltaY") : 0,
     autoWait,
     autoWaitTimeoutMs,
     force,
@@ -9279,6 +9281,18 @@ async function handleDomAction(params) {
   const resolveTarget = { tabId: selected.tabId };
   if (Number.isSafeInteger(bridgeElement.frameId)) {
     resolveTarget.frameIds = [bridgeElement.frameId];
+  } else if (
+    action === "scroll" &&
+    !request.selector &&
+    !request.elementId &&
+    !request.role &&
+    !request.name &&
+    !request.value
+  ) {
+    // A page-scoped scroll targets the top document's one authoritative
+    // scrollingElement. Querying all frames would manufacture ambiguity from
+    // unrelated iframe roots.
+    resolveTarget.frameIds = [0];
   } else {
     resolveTarget.allFrames = true;
   }
@@ -9350,10 +9364,13 @@ async function handleDomAction(params) {
     );
   }
   if (!actionResult.ok) {
+    const actionReadback = actionResult.action_readback
+      ? `; action_readback=${JSON.stringify(actionResult.action_readback)}`
+      : "";
     throw bridgeError(
       String(actionResult.error_code || ERROR_AXTREE_FAILED),
       `domAction ${action} failed in resolved frame ${first.frame_id}: ${String(actionResult.error_detail || "")}; ` +
-        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}`
+        `frame_results=${JSON.stringify(frameResults.map(summarizeFrameExecutionResult).slice(0, 8))}${actionReadback}`
     );
   }
 
@@ -23297,13 +23314,24 @@ function normalizeDomAction(action) {
   if (normalized === "selecttext" || normalized === "select-text") {
     return "select_text";
   }
-  if (["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck"].includes(normalized)) {
+  if (["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "scroll"].includes(normalized)) {
     return normalized;
   }
   throw bridgeError(
     ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
-    `domAction action must be one of click, dblclick, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck; got ${JSON.stringify(action)}`
+    `domAction action must be one of click, dblclick, press, select, submit, dispatch_event, clear, focus, blur, select_text, check, uncheck, scroll; got ${JSON.stringify(action)}`
   );
+}
+
+function normalizeDomScrollDelta(value, fieldName) {
+  const delta = Number(value);
+  if (!Number.isSafeInteger(delta) || Math.abs(delta) > 1000000) {
+    throw bridgeError(
+      ERROR_CHROME_DOM_ACTION_UNSUPPORTED,
+      `domAction scroll ${fieldName} must be a safe integer from -1000000 through 1000000; got ${JSON.stringify(value)}`
+    );
+  }
+  return delta;
 }
 
 function stringOrNull(value) {
@@ -23690,6 +23718,8 @@ async function performDomActionInPage(request) {
   };
   const eventType = stringOrEmpty(request?.eventType);
   const eventInit = plainObjectOrEmpty(request?.eventInit);
+  const scrollDeltaX = Number(request?.scrollDeltaX);
+  const scrollDeltaY = Number(request?.scrollDeltaY);
   const resolveOnly = Boolean(request?.resolveOnly);
   const resolveActionability = Boolean(request?.resolveActionability);
   const autoWait = Boolean(request?.autoWait);
@@ -23706,11 +23736,24 @@ async function performDomActionInPage(request) {
     : 4096;
   const suppressPageText = Boolean(request?.suppressPageText);
 
-  if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "hover", "tap", "drag", "html5_drag", "html5_real_drag"].includes(action)) {
+  if (!["click", "dblclick", "press", "select", "submit", "dispatch_event", "clear", "focus", "blur", "select_text", "check", "uncheck", "scroll", "hover", "tap", "drag", "html5_drag", "html5_real_drag"].includes(action)) {
     return fail(ERROR_ACTION_UNSUPPORTED, `unsupported DOM action ${JSON.stringify(action)}`);
   }
   if (action === "dispatch_event" && !eventType) {
     return fail(ERROR_ACTION_UNSUPPORTED, "dispatch_event requires a non-empty eventType");
+  }
+  if (
+    action === "scroll" &&
+    (!Number.isSafeInteger(scrollDeltaX) ||
+      !Number.isSafeInteger(scrollDeltaY) ||
+      Math.abs(scrollDeltaX) > 1000000 ||
+      Math.abs(scrollDeltaY) > 1000000 ||
+      (scrollDeltaX === 0 && scrollDeltaY === 0))
+  ) {
+    return fail(
+      ERROR_ACTION_UNSUPPORTED,
+      `scroll requires non-zero safe-integer scrollDeltaX/scrollDeltaY within +/-1000000; got x=${JSON.stringify(request?.scrollDeltaX)} y=${JSON.stringify(request?.scrollDeltaY)}`
+    );
   }
 
   const beforeUrl = String(location.href || "");
@@ -23724,7 +23767,7 @@ async function performDomActionInPage(request) {
   const element = resolved.element;
   const beforeElement = elementSummary(element);
 
-  const bypassActionability = ["dispatch_event", "focus", "blur", "select_text"].includes(action);
+  const bypassActionability = ["dispatch_event", "focus", "blur", "select_text", "scroll"].includes(action);
   // #1821: `force` defers every actionability judgement to the snapshot recorded
   // just before dispatch, exactly like `autoWait` defers it to the poll loop.
   const deferActionability = (autoWait || force) && !bypassActionability;
@@ -23772,6 +23815,27 @@ async function performDomActionInPage(request) {
       }
     }
     let actionPoint = null;
+    if (action === "scroll") {
+      return {
+        ok: true,
+        action,
+        matched_count: resolved.matchedCount,
+        resolved_by: resolved.resolvedBy,
+        before_element: beforeElement,
+        after_element: elementSummary(element),
+        action_point: null,
+        resolve_only: true,
+        auto_wait: false,
+        auto_wait_readback: null,
+        forced_actionability_bypass: false,
+        in_page_before_url: beforeUrl,
+        in_page_after_url: String(location.href || ""),
+        in_page_title: String(document.title || ""),
+        in_page_ready_state: String(document.readyState || ""),
+        in_page_before_text: beforePageText,
+        in_page_after_text: beforePageText
+      };
+    }
     try {
       const point = elementClickPoint(element, null);
       actionPoint = { x: point.client_x, y: point.client_y };
@@ -23881,6 +23945,8 @@ async function performDomActionInPage(request) {
       actionReadback = performCheckState(element, true, eventsDispatched);
     } else if (action === "uncheck") {
       actionReadback = performCheckState(element, false, eventsDispatched);
+    } else if (action === "scroll") {
+      actionReadback = await performScroll(element, scrollDeltaX, scrollDeltaY);
     } else if (action === "hover" || action === "tap" || action === "drag" || action === "html5_drag" || action === "html5_real_drag") {
       throw actionError(ERROR_ACTION_UNSUPPORTED, `DOM action ${action} is resolver-only; dispatch through cdpInput`);
     }
@@ -23891,7 +23957,8 @@ async function performDomActionInPage(request) {
       before_element: beforeElement,
       auto_wait: autoWait,
       auto_wait_readback: autoWaitReadback,
-      events_dispatched: eventsDispatched
+      events_dispatched: eventsDispatched,
+      action_readback: error?.readback || null
     });
   }
 
@@ -24381,6 +24448,10 @@ async function performDomActionInPage(request) {
       const id = loc.elementId.startsWith("#") ? loc.elementId.slice(1) : loc.elementId;
       const byId = id ? document.getElementById(id) : null;
       candidates = byId ? [byId] : [];
+    } else if (actionName === "scroll" && !loc.role && !loc.name && !loc.value) {
+      resolvedBy = "document_scrolling_element";
+      const scrollingElement = document.scrollingElement;
+      candidates = scrollingElement instanceof Element ? [scrollingElement] : [];
     } else {
       candidates = semanticCandidates(actionName);
     }
@@ -24952,6 +25023,84 @@ async function performDomActionInPage(request) {
       input_fired: true,
       change_fired: true
     };
+  }
+
+  async function performScroll(element, deltaX, deltaY) {
+    if (typeof element.scrollBy !== "function") {
+      throw actionError(
+        ERROR_ACTION_UNSUPPORTED,
+        `resolved ${tag(element)} element has no scrollBy() method`
+      );
+    }
+    const snapshot = () => ({
+      scroll_left: Number(element.scrollLeft || 0),
+      scroll_top: Number(element.scrollTop || 0),
+      scroll_width: Number(element.scrollWidth || 0),
+      scroll_height: Number(element.scrollHeight || 0),
+      client_width: Number(element.clientWidth || 0),
+      client_height: Number(element.clientHeight || 0),
+      max_scroll_left: Math.max(0, Number(element.scrollWidth || 0) - Number(element.clientWidth || 0)),
+      max_scroll_top: Math.max(0, Number(element.scrollHeight || 0) - Number(element.clientHeight || 0))
+    });
+    const before = snapshot();
+    const expectedLeft = before.scroll_left + deltaX;
+    const expectedTop = before.scroll_top + deltaY;
+    const preflight = {
+      requested_delta_x: deltaX,
+      requested_delta_y: deltaY,
+      expected_scroll_left: expectedLeft,
+      expected_scroll_top: expectedTop,
+      before
+    };
+    if (
+      expectedLeft < 0 ||
+      expectedLeft > before.max_scroll_left ||
+      expectedTop < 0 ||
+      expectedTop > before.max_scroll_top
+    ) {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `scroll delta exceeds the target's remaining range: requested=(${deltaX},${deltaY}) before=(${before.scroll_left},${before.scroll_top}) max=(${before.max_scroll_left},${before.max_scroll_top})`,
+        { ...preflight, after: before, dispatched: false, verified: false }
+      );
+    }
+
+    element.scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
+    await twoAnimationFramesLocal();
+    const after = snapshot();
+    const actualDeltaX = after.scroll_left - before.scroll_left;
+    const actualDeltaY = after.scroll_top - before.scroll_top;
+    const toleranceCssPx = 0.5;
+    const xMagnitudeVerified = Math.abs(actualDeltaX - deltaX) <= toleranceCssPx;
+    const yMagnitudeVerified = Math.abs(actualDeltaY - deltaY) <= toleranceCssPx;
+    const xDirectionVerified = deltaX === 0 || Math.sign(actualDeltaX) === Math.sign(deltaX);
+    const yDirectionVerified = deltaY === 0 || Math.sign(actualDeltaY) === Math.sign(deltaY);
+    const readback = {
+      ...preflight,
+      after,
+      actual_delta_x: actualDeltaX,
+      actual_delta_y: actualDeltaY,
+      x_direction_verified: xDirectionVerified,
+      y_direction_verified: yDirectionVerified,
+      x_magnitude_verified: xMagnitudeVerified,
+      y_magnitude_verified: yMagnitudeVerified,
+      tolerance_css_px: toleranceCssPx,
+      dispatched: true,
+      verified:
+        xDirectionVerified &&
+        yDirectionVerified &&
+        xMagnitudeVerified &&
+        yMagnitudeVerified,
+      source_of_truth: "same-target Element.scrollLeft/scrollTop read before and after Element.scrollBy"
+    };
+    if (!readback.verified) {
+      throw actionError(
+        ERROR_POSTCONDITION_FAILED,
+        `scroll postcondition failed: requested=(${deltaX},${deltaY}) actual=(${actualDeltaX},${actualDeltaY}) before=(${before.scroll_left},${before.scroll_top}) after=(${after.scroll_left},${after.scroll_top})`,
+        readback
+      );
+    }
+    return readback;
   }
 
   function performFocus(element, events) {
@@ -25754,9 +25903,10 @@ async function performDomActionInPage(request) {
     return String(value).replace(/["\\]/g, "\\$&");
   }
 
-  function actionError(code, detail) {
+  function actionError(code, detail, readback = null) {
     const error = new Error(detail);
     error.code = code;
+    error.readback = readback;
     return error;
   }
 

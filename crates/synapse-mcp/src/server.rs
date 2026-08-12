@@ -269,6 +269,8 @@ mod param_hints;
 mod permission_gate;
 pub(crate) mod permission_policy;
 mod plan_tools;
+#[cfg(not(windows))]
+mod portable_cdp;
 mod reality;
 mod routine_assist_facades;
 mod routine_feedback;

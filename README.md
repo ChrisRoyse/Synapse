@@ -218,8 +218,8 @@ The web isn't pixels to Synapse — it's **structured DOM data**, and it can wor
 - **`browser_tabs`** — open, select, and close **background tabs** that never become the
   active tab. The page you're reading stays exactly where it is.
 - **`browser_nav`** — navigate, reload, back, and forward, all in the background.
-- **`browser_dom`** — read page content, locate and inspect nodes, and pull ARIA
-  snapshots straight from the DevTools accessibility tree.
+- **`browser_dom`** — read page content, locate and inspect nodes, pull ARIA
+  snapshots, and run strict retry-bounded assertions on the owned tab.
 - **`browser_form`** — set values and fill forms through CDP (`insertText`, dispatched
   events) instead of the cursor, so web forms fill while the browser sits behind your work.
 - **`browser_wait` · `browser_capture` · `browser_storage`** — wait on conditions,
@@ -698,7 +698,7 @@ glance:
 | `process` | `list` · `launch` · `history` |
 | `browser_tabs` | `list` · `select` · `new` · `close` |
 | `browser_nav` | `navigate` · `reload` · `back` · `forward` |
-| `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` |
+| `browser_dom` | `content` · `locate` · `inspect` · `aria_snapshot` · `assert` |
 | `browser_form` | `set_value` · `fill` |
 | `browser_wait` | `for_condition` |
 | `browser_capture` | `screenshot` · `downloads` |

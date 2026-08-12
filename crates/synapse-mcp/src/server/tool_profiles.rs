@@ -1018,6 +1018,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::ACTION_TARGET_INVALID,
                 "bind the intended tab and keep root element ids target-scoped",
             ),
+            op(
+                "assert",
+                false,
+                true,
+                "strict target-scoped locator assertion with bounded retry",
+                None,
+                error_codes::ACTION_TARGET_INVALID,
+                "bind the intended tab and provide one strict locator assertion with the matcher-specific expected value",
+            ),
         ],
     ),
     facade_contract(

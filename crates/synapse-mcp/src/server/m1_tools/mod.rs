@@ -7945,21 +7945,127 @@ impl SynapseService {
     )]
     async fn browser_evaluate_impl(
         &self,
-        _session_id: &str,
-        _window_hwnd: i64,
-        _cdp_target_id: &str,
-        _expression: &str,
-        _element_id: Option<&str>,
-        _backend_node_id: Option<i64>,
-        _args: &[Value],
-        _await_promise: bool,
-        _return_by_value: bool,
-        _timeout_ms: u64,
+        session_id: &str,
+        window_hwnd: i64,
+        cdp_target_id: &str,
+        expression: &str,
+        element_id: Option<&str>,
+        backend_node_id: Option<i64>,
+        args: &[Value],
+        await_promise: bool,
+        return_by_value: bool,
+        timeout_ms: u64,
     ) -> Result<BrowserEvaluateResponse, ErrorData> {
-        Err(mcp_error(
-            error_codes::A11Y_NOT_AVAILABLE,
-            "browser_evaluate is only available on Windows in this build",
-        ))
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_evaluate_before_portable_runtime_dispatch",
+        )?;
+        let owner = self
+            .cdp_target_owner_for_readback("browser_evaluate", session_id, cdp_target_id)?
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    format!(
+                        "browser_evaluate exact raw-CDP target {cdp_target_id:?} has no session-owned endpoint record; refusing endpoint discovery from another window or process"
+                    ),
+                )
+            })?;
+        if owner.window_hwnd != window_hwnd {
+            return Err(mcp_error(
+                error_codes::ACTION_TARGET_INVALID,
+                format!(
+                    "browser_evaluate owner/window mismatch for target {cdp_target_id:?}: owner hwnd={:#x}, resolved hwnd={window_hwnd:#x}",
+                    owner.window_hwnd
+                ),
+            ));
+        }
+        let (evaluated, scope, readback_backend) = if let Some(backend_node_id) = backend_node_id {
+            let evaluated = super::portable_cdp::runtime_call_function_on(
+                &owner.endpoint,
+                cdp_target_id,
+                backend_node_id,
+                expression,
+                args,
+                await_promise,
+                return_by_value,
+                timeout_ms,
+            )
+            .await?;
+            (
+                evaluated,
+                "element",
+                "DOM.resolveNode + Runtime.callFunctionOn + separate same-target page-state Runtime.evaluate",
+            )
+        } else {
+            let invocation = if args.is_empty() {
+                expression.to_owned()
+            } else {
+                let arg_list = args
+                    .iter()
+                    .map(serde_json::to_string)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| {
+                        mcp_error(
+                            error_codes::TOOL_PARAMS_INVALID,
+                            format!("browser_evaluate could not serialize page-scope arg: {error}"),
+                        )
+                    })?
+                    .join(", ");
+                format!("({expression})({arg_list})")
+            };
+            let evaluated = super::portable_cdp::runtime_evaluate(
+                &owner.endpoint,
+                cdp_target_id,
+                &invocation,
+                await_promise,
+                return_by_value,
+                timeout_ms,
+            )
+            .await?;
+            (
+                evaluated,
+                "page",
+                "Runtime.evaluate + separate same-target page-state Runtime.evaluate",
+            )
+        };
+        super::operator_panic_boundary::ensure_mcp_mutation(
+            "browser_evaluate_after_portable_runtime_dispatch",
+        )?;
+        tracing::info!(
+            code = "CDP_BACKGROUND_EVALUATE_PORTABLE",
+            session_id,
+            hwnd = window_hwnd,
+            endpoint = %evaluated.endpoint,
+            cdp_target_id = %evaluated.target_id,
+            scope,
+            element_id = element_id.unwrap_or(""),
+            arg_count = args.len(),
+            result_type = %evaluated.result_type,
+            returned_by_value = return_by_value,
+            target_url = %evaluated.url,
+            readback_backend,
+            "readback=portable_raw_cdp outcome=evaluated"
+        );
+        Ok(BrowserEvaluateResponse {
+            session_id: session_id.to_owned(),
+            window_hwnd,
+            transport: "portable_raw_cdp".to_owned(),
+            endpoint: evaluated.endpoint,
+            cdp_target_id: evaluated.target_id,
+            scope: scope.to_owned(),
+            element_id: element_id.map(ToOwned::to_owned),
+            url: redact_url_for_public_readback(&evaluated.url),
+            title: evaluated.title,
+            ready_state: evaluated.ready_state,
+            result_type: evaluated.result_type,
+            result_subtype: evaluated.result_subtype,
+            returned_by_value: return_by_value,
+            value: evaluated.value,
+            description: evaluated.description,
+            unserializable_value: evaluated.unserializable_value,
+            readback_backend: readback_backend.to_owned(),
+            backend_tier_used: "cdp".to_owned(),
+            required_foreground: false,
+        })
     }
 
     #[cfg(windows)]

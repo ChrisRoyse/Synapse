@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-12-noninterference-v19";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-12-target-scroll-v20";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "14a9a7dd28a5ad63015265fa0b161884cff3976dd48e003a143a64967629db9a";
+    "870cda343d5fe91cc67a3ae68e25c6919bc5139d96035d5d408648bc0dcb860d";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;
@@ -7919,6 +7919,8 @@ pub struct ChromeDebuggerDomActionRequest<'a> {
     pub modifiers: Option<&'a Value>,
     pub position_x: Option<i32>,
     pub position_y: Option<i32>,
+    pub scroll_delta_x: Option<i32>,
+    pub scroll_delta_y: Option<i32>,
     pub wait_timeout_ms: u64,
     pub auto_wait: bool,
     pub auto_wait_timeout_ms: u32,
@@ -7955,6 +7957,8 @@ pub async fn dom_action(
                 "modifiers": request.modifiers,
                 "positionX": request.position_x,
                 "positionY": request.position_y,
+                "scrollDeltaX": request.scroll_delta_x,
+                "scrollDeltaY": request.scroll_delta_y,
                 "waitTimeoutMs": request.wait_timeout_ms,
                 "autoWait": request.auto_wait,
                 "autoWaitTimeoutMs": request.auto_wait_timeout_ms,

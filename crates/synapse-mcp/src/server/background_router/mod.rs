@@ -26,11 +26,11 @@ use super::{
 };
 use crate::daemon_lifecycle::consume_panic_payload;
 use crate::m1::{
-    CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction, CdpNavigateTabParams,
-    CdpTargetInfoParams, ObserveParams, mcp_error,
+    BrowserEvaluateParams, CaptureScreenshotParams, CdpActivateTabParams, CdpNavigateAction,
+    CdpNavigateTabParams, CdpTargetInfoParams, ObserveParams, mcp_error,
 };
 use crate::m2::{
-    ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollParams, ActScrollPoint,
+    ActClickParams, ActFocusWindowParams, ActPressParams, ActScrollElementTarget, ActScrollParams,
     ActSetFieldTextLocator, ActSetFieldTextParams, ActTypeParams, act_press_normalized_labels,
     default_auto_wait_timeout_ms, default_verify_timeout_ms,
 };
@@ -64,6 +64,7 @@ const TARGET_ACT_STATUS_OK: &str = "ok";
 const TARGET_ACT_STATUS_VERIFY_NEEDED: &str = "verify_needed";
 const TARGET_ACT_STATUS_REFUSED: &str = "refused";
 const TARGET_ACT_STATUS_ERROR: &str = "error";
+const MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX: i32 = 1_000_000;
 const TARGET_ACT_KNOWN_VERBS: &str = "read, screenshot, navigate, set_field, insert_text, append_text, set_selection, click, dblclick, hover, tap, scroll, dispatch_event, clear, focus, blur, select_text, check, uncheck, type, key, press, select, submit, save, cleanup_notepad_tabs, run_shell, focus_window, set_window_bounds";
 const ACT_FACADE_SOURCE_OF_TRUTH: &str = "act facade CF_ACTION_LOG command audit row + target/action audit row + post-action target readback + synapse_action input lease + daemon-tool-events.jsonl";
 const TARGET_ACT_SECRET_SAFE_REDACTION_POLICY: &str = "target_act_secret_safe_v1";
@@ -5831,6 +5832,9 @@ async fn target_act_browser_dom_action(
     let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
     let click_count = target_act_dom_click_count(action, params.clicks)?;
     let click_position = target_act_click_position(params)?;
+    let scroll_deltas = (action == "scroll")
+        .then(|| target_act_scroll_deltas(params))
+        .transpose()?;
     let click_modifiers = target_act_click_modifiers_bridge_value(&params.modifiers)?;
     let request_details = json!({
         "session_id": &session_id,
@@ -5850,6 +5854,8 @@ async fn target_act_browser_dom_action(
         "modifiers": &click_modifiers,
         "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
         "clicks": click_count,
+        "scroll_delta_x": scroll_deltas.map(|(dx, _)| dx),
+        "scroll_delta_y": scroll_deltas.map(|(_, dy)| dy),
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
@@ -5913,6 +5919,8 @@ async fn target_act_browser_dom_action(
         "modifiers": &click_modifiers,
         "position": click_position.map(|(x, y)| json!({ "x": x, "y": y })),
         "clicks": click_count,
+        "scroll_delta_x": scroll_deltas.map(|(dx, _)| dx),
+        "scroll_delta_y": scroll_deltas.map(|(_, dy)| dy),
         "wait_timeout_ms": wait_timeout_ms,
         "auto_wait": params.auto_wait,
         "auto_wait_timeout_ms": params.auto_wait_timeout_ms,
@@ -5956,6 +5964,8 @@ async fn target_act_browser_dom_action(
             modifiers: Some(&click_modifiers),
             position_x: click_position.map(|(x, _)| x),
             position_y: click_position.map(|(_, y)| y),
+            scroll_delta_x: scroll_deltas.map(|(dx, _)| dx),
+            scroll_delta_y: scroll_deltas.map(|(_, dy)| dy),
             wait_timeout_ms,
             auto_wait: params.auto_wait,
             auto_wait_timeout_ms: params.auto_wait_timeout_ms,
@@ -7507,75 +7517,441 @@ fn trimmed_non_empty_string(value: Option<&str>) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// #1353: `verb=scroll` routes to the real `act_scroll` wheel primitive (visible
-/// in break_glass), which the hidden-tool route guidance advertises. Wheel deltas
-/// come in `args` as `[dx, dy]` (e.g. `["0","120"]`); an optional screen-space
-/// `x`/`y` sets the wheel point, and omitting it scrolls the focused/claimed
-/// target window — the native egui/wgpu viewport case.
+/// #1353/#2232: `verb=scroll` routes exclusively through the exact session
+/// target. Browser targets use same-target DOM/CDP scroll with physical
+/// before/after offset readback. Native targets require an observed element and
+/// use the background UIA scroll lane. It never emits a process-global wheel or
+/// falls back to the human foreground.
 async fn target_act_scroll(
     service: &SynapseService,
     params: &TargetActParams,
     request_context: &RequestContext<RoleServer>,
 ) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
-    let parse_delta = |raw: &str| -> Result<i32, ErrorData> {
-        raw.trim().parse::<i32>().map_err(|_| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("target_act verb=scroll args must be integer deltas [dx, dy]; got {raw:?}"),
-            )
-        })
-    };
-    let dx = params
-        .args
-        .first()
-        .map(|s| parse_delta(s))
-        .transpose()?
-        .unwrap_or(0);
-    let dy = params
-        .args
-        .get(1)
-        .map(|s| parse_delta(s))
-        .transpose()?
-        .unwrap_or(0);
-    if dx == 0 && dy == 0 {
+    let (dx, dy) = target_act_scroll_deltas(params)?;
+    target_act_validate_dom_locator("scroll", params)?;
+    target_act_validate_scroll_only_fields(params)?;
+    if target_act_coordinate(params)?.is_some() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
-            "target_act verb=scroll requires wheel deltas in args as [dx, dy] (e.g. args=[\"0\",\"120\"] to scroll down)",
+            "target_act verb=scroll is target-scoped and does not accept screen/window/viewport coordinates; bind the exact session target and optionally pass an element_id or selector",
         ));
     }
-    let at = match target_act_coordinate(params)? {
-        Some(coordinate) => match coordinate.space {
-            TargetActCoordinateSpace::Screen => Some(ActScrollPoint {
-                x: coordinate.x,
-                y: coordinate.y,
-            }),
-            other => {
+    let session_id = target_act_session_id(request_context, "scroll")?;
+    let target = service.session_target(Some(&session_id))?.ok_or_else(|| {
+        mcp_error(
+            error_codes::TARGET_NOT_SET,
+            "target_act verb=scroll requires an exact session target; refusing process-global wheel input and human-foreground fallback",
+        )
+    })?;
+    match target {
+        SessionTarget::Cdp { cdp_target_id, .. }
+            if target_act_is_chrome_bridge_target_id(&cdp_target_id) =>
+        {
+            target_act_browser_dom_action(service, "scroll", params, request_context).await
+        }
+        SessionTarget::Cdp { .. } => {
+            let wait_timeout_ms = target_act_dom_wait_timeout(params.wait_timeout_ms)?;
+            target_act_raw_cdp_scroll(service, params, dx, dy, wait_timeout_ms, request_context)
+                .await
+        }
+        SessionTarget::Window { hwnd } => {
+            let verify_timeout_ms = target_act_verify_timeout(params.wait_timeout_ms, "scroll")?;
+            let raw_element_id = params.element_id.as_deref().ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    "target_act verb=scroll on a native window requires an observed element_id with a background UIA ScrollPattern/ScrollItemPattern; refusing untargeted wheel input",
+                )
+            })?;
+            if target_act_has_dom_locator(params) {
                 return Err(mcp_error(
                     error_codes::TOOL_PARAMS_INVALID,
+                    "target_act verb=scroll selector/role/name/value locators require a browser target; a native window requires only an observed element_id",
+                ));
+            }
+            let element_id = ElementId::parse(raw_element_id).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("target_act verb=scroll element_id is invalid: {error}"),
+                )
+            })?;
+            let element_hwnd = element_id
+                .parts()
+                .map_err(|error| {
+                    mcp_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        format!("target_act verb=scroll element_id is invalid: {error}"),
+                    )
+                })?
+                .hwnd;
+            if element_hwnd != hwnd {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
                     format!(
-                        "target_act verb=scroll supports coordinate_space=screen for the at-point (got {other:?}); omit x/y to scroll the focused target window"
+                        "target_act verb=scroll element_id belongs to hwnd={element_hwnd:#x}, but the session target is hwnd={hwnd:#x}"
                     ),
                 ));
             }
+            ensure_target_act_operator_panic_boundary("scroll_before_uia_delivery")?;
+            target_act_delegate_response(
+                "act_scroll",
+                service
+                    .act_scroll(
+                        Parameters(ActScrollParams {
+                            dx,
+                            dy,
+                            at: None,
+                            target: Some(ActScrollElementTarget { element_id }),
+                            smooth: false,
+                            verify_delta: true,
+                            verify_timeout_ms,
+                        }),
+                        request_context.clone(),
+                    )
+                    .await,
+            )
+        }
+    }
+}
+
+fn target_act_scroll_deltas(params: &TargetActParams) -> Result<(i32, i32), ErrorData> {
+    if params.args.len() != 2 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=scroll requires exactly two integer args [dx, dy]; received {}",
+                params.args.len()
+            ),
+        ));
+    }
+    let parse_delta = |axis: &str, raw: &str| -> Result<i32, ErrorData> {
+        let value = raw.trim().parse::<i32>().map_err(|_| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb=scroll {axis} must be an integer within +/-{MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX}; got {raw:?}"
+                ),
+            )
+        })?;
+        if value.unsigned_abs() > MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX.unsigned_abs() {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "target_act verb=scroll {axis} magnitude {} exceeds maximum {MAX_TARGET_ACT_SCROLL_DELTA_CSS_PX}",
+                    value.unsigned_abs()
+                ),
+            ));
+        }
+        Ok(value)
+    };
+    let dx = parse_delta("dx", &params.args[0])?;
+    let dy = parse_delta("dy", &params.args[1])?;
+    if dx == 0 && dy == 0 {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=scroll requires at least one non-zero delta",
+        ));
+    }
+    Ok((dx, dy))
+}
+
+fn target_act_validate_scroll_only_fields(params: &TargetActParams) -> Result<(), ErrorData> {
+    let supplied = [
+        ("url", params.url.is_some()),
+        ("path", params.path.is_some()),
+        ("text", params.text.is_some()),
+        ("key", params.key.is_some()),
+        ("keys", !params.keys.is_empty()),
+        ("selection_start", params.selection_start.is_some()),
+        ("selection_end", params.selection_end.is_some()),
+        ("automation_id", params.automation_id.is_some()),
+        ("option", params.option.is_some()),
+        ("option_label", params.option_label.is_some()),
+        ("option_index", params.option_index.is_some()),
+        ("options", !params.options.is_empty()),
+        ("event_type", params.event_type.is_some()),
+        ("event_init", params.event_init.is_some()),
+        ("width", params.width.is_some()),
+        ("height", params.height.is_some()),
+        ("command", params.command.is_some()),
+        ("working_dir", params.working_dir.is_some()),
+        ("timeout_ms", params.timeout_ms.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, present)| present.then_some(field))
+    .collect::<Vec<_>>();
+    if supplied.is_empty() {
+        Ok(())
+    } else {
+        Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "target_act verb=scroll does not accept unrelated fields {supplied:?}; use args=[dx,dy] plus at most one exact browser/native locator and wait_timeout_ms"
+            ),
+        ))
+    }
+}
+
+const RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX: &str = r#"async (locatorKind, locatorValue, deltaX, deltaY) => {
+  let target;
+  if (locatorKind === "document") {
+    target = document.scrollingElement;
+  } else if (locatorKind === "id") {
+    target = document.getElementById(locatorValue);
+  } else if (locatorKind === "selector") {
+    let matches;
+    try { matches = Array.from(document.querySelectorAll(locatorValue)); }
+    catch (error) { return { ok: false, error_code: "CHROME_DOM_SELECTOR_INVALID", error_detail: String(error) }; }
+    if (matches.length !== 1) {
+      return { ok: false, error_code: matches.length === 0 ? "CHROME_DOM_ELEMENT_NOT_FOUND" : "CHROME_DOM_ELEMENT_AMBIGUOUS", error_detail: `strict selector matched ${matches.length} elements`, matched_count: matches.length };
+    }
+    target = matches[0];
+  }
+"#;
+
+const RAW_CDP_SCROLL_ELEMENT_EXPRESSION_PREFIX: &str = "async (target, deltaX, deltaY) => {";
+
+const RAW_CDP_SCROLL_EXPRESSION_BODY: &str = r#"
+  if (!(target instanceof Element) || typeof target.scrollBy !== "function") {
+    return { ok: false, error_code: "CHROME_DOM_ELEMENT_NOT_ACTIONABLE", error_detail: "resolved target is absent or has no scrollBy() method" };
+  }
+  const snapshot = () => ({
+    scroll_left: Number(target.scrollLeft || 0),
+    scroll_top: Number(target.scrollTop || 0),
+    scroll_width: Number(target.scrollWidth || 0),
+    scroll_height: Number(target.scrollHeight || 0),
+    client_width: Number(target.clientWidth || 0),
+    client_height: Number(target.clientHeight || 0),
+    max_scroll_left: Math.max(0, Number(target.scrollWidth || 0) - Number(target.clientWidth || 0)),
+    max_scroll_top: Math.max(0, Number(target.scrollHeight || 0) - Number(target.clientHeight || 0))
+  });
+  const before = snapshot();
+  const expectedScrollLeft = before.scroll_left + deltaX;
+  const expectedScrollTop = before.scroll_top + deltaY;
+  const base = { requested_delta_x: deltaX, requested_delta_y: deltaY, expected_scroll_left: expectedScrollLeft, expected_scroll_top: expectedScrollTop, before };
+  if (expectedScrollLeft < 0 || expectedScrollLeft > before.max_scroll_left || expectedScrollTop < 0 || expectedScrollTop > before.max_scroll_top) {
+    return { ok: false, error_code: "CHROME_DOM_ACTION_POSTCONDITION_FAILED", error_detail: "requested scroll delta exceeds the exact target range", ...base, after: before, dispatched: false, verified: false };
+  }
+  target.scrollBy({ left: deltaX, top: deltaY, behavior: "instant" });
+  await new Promise((resolve) => {
+    if (typeof MessageChannel !== "function") { resolve(); return; }
+    const channel = new MessageChannel();
+    channel.port1.onmessage = () => resolve();
+    channel.port2.postMessage(0);
+  });
+  const after = snapshot();
+  const actualDeltaX = after.scroll_left - before.scroll_left;
+  const actualDeltaY = after.scroll_top - before.scroll_top;
+  const toleranceCssPx = 0.5;
+  const xDirectionVerified = deltaX === 0 || Math.sign(actualDeltaX) === Math.sign(deltaX);
+  const yDirectionVerified = deltaY === 0 || Math.sign(actualDeltaY) === Math.sign(deltaY);
+  const xMagnitudeVerified = Math.abs(actualDeltaX - deltaX) <= toleranceCssPx;
+  const yMagnitudeVerified = Math.abs(actualDeltaY - deltaY) <= toleranceCssPx;
+  const verified = xDirectionVerified && yDirectionVerified && xMagnitudeVerified && yMagnitudeVerified;
+  return {
+    ok: verified,
+    error_code: verified ? null : "CHROME_DOM_ACTION_POSTCONDITION_FAILED",
+    error_detail: verified ? null : `scroll postcondition failed: requested=(${deltaX},${deltaY}) actual=(${actualDeltaX},${actualDeltaY})`,
+    ...base,
+    after,
+    actual_delta_x: actualDeltaX,
+    actual_delta_y: actualDeltaY,
+    x_direction_verified: xDirectionVerified,
+    y_direction_verified: yDirectionVerified,
+    x_magnitude_verified: xMagnitudeVerified,
+    y_magnitude_verified: yMagnitudeVerified,
+    tolerance_css_px: toleranceCssPx,
+    dispatched: true,
+    verified,
+    source_of_truth: "same-target Element.scrollLeft/scrollTop read before and after Runtime.evaluate Element.scrollBy"
+  };
+}"#;
+
+async fn target_act_raw_cdp_scroll(
+    service: &SynapseService,
+    params: &TargetActParams,
+    dx: i32,
+    dy: i32,
+    wait_timeout_ms: u64,
+    request_context: &RequestContext<RoleServer>,
+) -> Result<(&'static str, bool, &'static str, Value), ErrorData> {
+    if params
+        .role
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .name
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || params
+            .value
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=scroll on a raw-CDP target accepts one exact selector, one raw-CDP element_id, one DOM id, or no locator for document.scrollingElement; semantic role/name/value scroll locators are unavailable and are never approximated",
+        ));
+    }
+    if params
+        .selector
+        .as_ref()
+        .is_some_and(|value| !value.trim().is_empty())
+        && params
+            .element_id
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "target_act verb=scroll raw-CDP target is ambiguous: pass selector or element_id, not both",
+        ));
+    }
+
+    let mut expression = String::new();
+    let mut element_id = None;
+    let args = if let Some(raw_element_id) = params
+        .element_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        match ElementId::parse(raw_element_id) {
+            Ok(parsed) if synapse_a11y::cdp_backend_from_element_id(&parsed).is_some() => {
+                expression.push_str(RAW_CDP_SCROLL_ELEMENT_EXPRESSION_PREFIX);
+                expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
+                element_id = Some(raw_element_id.to_owned());
+                vec![json!(dx), json!(dy)]
+            }
+            Ok(_) => {
+                return Err(mcp_error(
+                    error_codes::ACTION_TARGET_INVALID,
+                    "target_act verb=scroll raw-CDP element_id is not a CDP web element",
+                ));
+            }
+            Err(_) => {
+                expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
+                expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
+                vec![json!("id"), json!(raw_element_id), json!(dx), json!(dy)]
+            }
+        }
+    } else if let Some(selector) = params
+        .selector
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
+        expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
+        vec![json!("selector"), json!(selector), json!(dx), json!(dy)]
+    } else {
+        expression.push_str(RAW_CDP_SCROLL_PAGE_EXPRESSION_PREFIX);
+        expression.push_str(RAW_CDP_SCROLL_EXPRESSION_BODY);
+        vec![json!("document"), Value::Null, json!(dx), json!(dy)]
+    };
+
+    ensure_target_act_operator_panic_boundary("raw_cdp_scroll_before_runtime_evaluate")?;
+    let evaluate_timeout_ms = u32::try_from(wait_timeout_ms).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "target_act validated raw-CDP scroll wait_timeout_ms={wait_timeout_ms} does not fit browser_evaluate timeout: {error}"
+            ),
+        )
+    })?;
+    let response = service
+        .browser_evaluate(
+            Parameters(BrowserEvaluateParams {
+                expression,
+                cdp_target_id: None,
+                window_hwnd: None,
+                element_id,
+                args: Some(args),
+                await_promise: Some(true),
+                return_by_value: Some(true),
+                timeout_ms: Some(evaluate_timeout_ms),
+            }),
+            request_context.clone(),
+        )
+        .await;
+    let response = match response {
+        Ok(response) => response.0,
+        Err(error) => {
+            return Ok((
+                "browser_evaluate.raw_cdp_scroll",
+                false,
+                target_act_error_status(&error),
+                target_act_error_result("browser_evaluate.raw_cdp_scroll", error),
+            ));
+        }
+    };
+    let mut result = response.value.as_object().cloned().ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            "target_act raw-CDP scroll Runtime.evaluate returned a non-object readback",
+        )
+    })?;
+    let ok = result.get("ok").and_then(Value::as_bool).ok_or_else(|| {
+        mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            "target_act raw-CDP scroll readback omitted boolean ok",
+        )
+    })?;
+    let verified = result
+        .get("verified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if ok && !verified {
+        return Err(mcp_error(
+            error_codes::ACTION_POSTCONDITION_FAILED,
+            "target_act raw-CDP scroll contradicted itself: ok=true but verified was absent or false",
+        ));
+    }
+    result.insert("session_id".to_owned(), json!(response.session_id));
+    result.insert("window_hwnd".to_owned(), json!(response.window_hwnd));
+    result.insert("transport".to_owned(), json!(response.transport));
+    result.insert("endpoint".to_owned(), json!(response.endpoint));
+    result.insert("cdp_target_id".to_owned(), json!(response.cdp_target_id));
+    result.insert("url".to_owned(), json!(response.url));
+    result.insert("title".to_owned(), json!(response.title));
+    result.insert("ready_state".to_owned(), json!(response.ready_state));
+    result.insert(
+        "readback_backend".to_owned(),
+        json!(response.readback_backend),
+    );
+    result.insert(
+        "required_foreground".to_owned(),
+        json!(response.required_foreground),
+    );
+    Ok((
+        "browser_evaluate.raw_cdp_scroll",
+        ok,
+        if ok {
+            TARGET_ACT_STATUS_OK
+        } else if result
+            .get("error_code")
+            .and_then(Value::as_str)
+            .is_some_and(|code| {
+                matches!(
+                    code,
+                    "CHROME_DOM_SELECTOR_INVALID"
+                        | "CHROME_DOM_ELEMENT_NOT_FOUND"
+                        | "CHROME_DOM_ELEMENT_AMBIGUOUS"
+                        | "CHROME_DOM_ELEMENT_NOT_ACTIONABLE"
+                )
+            })
+        {
+            TARGET_ACT_STATUS_REFUSED
+        } else {
+            TARGET_ACT_STATUS_ERROR
         },
-        None => None,
-    };
-    let scroll_params = ActScrollParams {
-        dx,
-        dy,
-        at,
-        target: None,
-        smooth: false,
-        verify_delta: false,
-        verify_timeout_ms: default_verify_timeout_ms(),
-    };
-    ensure_target_act_operator_panic_boundary("scroll_before_input_delivery")?;
-    target_act_delegate_response(
-        "act_scroll",
-        service
-            .act_scroll(Parameters(scroll_params), request_context.clone())
-            .await,
-    )
+        Value::Object(result),
+    ))
+}
+
+fn target_act_is_chrome_bridge_target_id(target_id: &str) -> bool {
+    target_id
+        .strip_prefix("chrome-tab:")
+        .is_some_and(|suffix| suffix.parse::<u32>().is_ok())
 }
 
 fn target_act_coordinate(
@@ -7784,13 +8160,22 @@ fn target_act_validate_dom_locator(
             .value
             .as_ref()
             .is_some_and(|value| !value.trim().is_empty());
-    if !(has_element_id || has_selector || has_semantic) {
+    if action != "scroll" && !(has_element_id || has_selector || has_semantic) {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "target_act verb={action} requires element_id, selector, or a semantic locator (role/name/value)"
             ),
         ));
+    }
+    if action == "scroll" {
+        let _ = target_act_scroll_deltas(params)?;
+        if params.force || params.auto_wait {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "target_act verb=scroll does not accept force or auto_wait; exact target resolution and scroll-range/postcondition verification are mandatory",
+            ));
+        }
     }
     if action == "select" {
         target_act_validate_select_options(params)?;
@@ -8410,6 +8795,17 @@ fn target_act_input_provenance(
 
     match delegated_tool {
         "chrome_debugger_bridge.domAction" => target_act_dom_action_provenance(result, context),
+        "browser_evaluate.raw_cdp_scroll" => target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlElementMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+            "raw_cdp_runtime",
+            "raw_cdp_websocket",
+            "Runtime.evaluate+Element.scrollBy",
+            false,
+            false,
+        ),
         "chrome_debugger_bridge.coordinateClick" | "chrome_debugger_bridge.keyDispatch" => {
             target_act_one_provenance(
                 context,
@@ -8503,7 +8899,7 @@ fn target_act_dom_action_provenance(
                 Some(context.target()),
             )
         })?;
-    if events.is_empty() {
+    if events.is_empty() && action != "scroll" {
         return Ok(Vec::new());
     }
     let backend = "chrome.scripting.executeScript";
@@ -8621,6 +9017,17 @@ fn target_act_dom_action_provenance(
                 false,
             )?);
         }
+        "scroll" => records.extend(target_act_one_provenance(
+            context,
+            InputDeliveryOrigin::HtmlElementMethod,
+            Some(true),
+            BrowserDefaultActionSemantics::HtmlElementMethodEffects,
+            backend,
+            transport,
+            "Element.scrollBy",
+            false,
+            false,
+        )?),
         other => {
             return Err(input_provenance_error(
                 "bridge_dom_action",

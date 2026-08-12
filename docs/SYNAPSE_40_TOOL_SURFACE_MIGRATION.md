@@ -56,7 +56,7 @@ Removed status means removed from the normal public surface. It does not always 
 | `process` | `list`, `launch`, `history` |
 | `browser_tabs` | `list`, `select`, `new`, `close` |
 | `browser_nav` | `navigate`, `reload`, `back`, `forward` |
-| `browser_dom` | `content`, `locate`, `inspect`, `aria_snapshot` |
+| `browser_dom` | `content`, `locate`, `inspect`, `aria_snapshot`, `assert` |
 | `browser_form` | `set_value`, `fill` |
 | `browser_wait` | `for_condition` |
 | `browser_capture` | `screenshot`, `downloads` |
@@ -179,9 +179,9 @@ The historical audit saw 152 live visible tools. The historical exact-plus-prefi
 | `cdp_activate_tab` | `browser_tabs operation=select`; explicit foreground activation requires advanced routing | Removed as direct normal public route. |
 | `cdp_target_info` | `browser_tabs operation=list` and `target operation=status` | Condensed. |
 | `cdp_bridge_reload` | `setup operation=doctor/repair` or advanced browser maintenance profile | Removed from normal public surface. |
-| `browser_content`, `browser_locate`, `browser_inspect`, `browser_aria_snapshot` | `browser_dom operation=content/locate/inspect/aria_snapshot` | Condensed. |
+| `browser_content`, `browser_locate`, `browser_inspect`, `browser_aria_snapshot`, `browser_assert` | `browser_dom operation=content/locate/inspect/aria_snapshot/assert` | Condensed. |
 | `browser_frames`, `browser_scroll_into_view`, `browser_set_content` | `browser_dom`, `browser_wait`, or advanced browser-control profile route | Removed from normal public surface as direct implementation seams. |
-| `browser_wait_for`, `browser_assert` | `browser_wait operation=for_condition` | Condensed. |
+| `browser_wait_for` | `browser_wait operation=for_condition` | Condensed. |
 | `browser_batch` | Use ordered calls to `browser_tabs`, `browser_nav`, `browser_dom`, `browser_form`, `browser_wait`, `browser_capture` | Removed from normal public surface to avoid ambiguous multi-side-effect batches. |
 | `browser_clock`, `browser_page_events` | `browser_wait operation=for_condition`, `audit operation=command_query`, or advanced browser-control profile route | Removed from normal public surface. |
 | `browser_set_value`, `browser_fill_form` | `browser_form operation=set_value/fill` | Condensed. |

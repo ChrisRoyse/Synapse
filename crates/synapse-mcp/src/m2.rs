@@ -76,7 +76,7 @@ pub(crate) use press::{
 };
 pub use release_all::{ReleaseAllParams, ReleaseAllResponse, release_all_with_handles};
 pub(crate) use scroll::act_scroll_with_handle_and_boundary;
-pub use scroll::{ActScrollParams, ActScrollPoint, ActScrollResponse};
+pub use scroll::{ActScrollElementTarget, ActScrollParams, ActScrollResponse};
 #[cfg(windows)]
 pub(crate) use set_field_text::act_set_field_text_web;
 pub use set_field_text::{

@@ -104,6 +104,9 @@ uuid.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows.workspace = true
 
+[target.'cfg(not(windows))'.dependencies]
+tokio-tungstenite.workspace = true
+
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 x11rb.workspace = true
 

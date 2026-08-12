@@ -3895,6 +3895,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "tracing",
  "tracing-subscriber",

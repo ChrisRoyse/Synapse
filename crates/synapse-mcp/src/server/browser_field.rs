@@ -970,6 +970,8 @@ impl SynapseService {
                 modifiers: None,
                 position_x: None,
                 position_y: None,
+                scroll_delta_x: None,
+                scroll_delta_y: None,
                 wait_timeout_ms,
                 auto_wait: false,
                 auto_wait_timeout_ms: 0,
