@@ -4677,10 +4677,37 @@ function Get-SynapseInstalledDaemonIdentityReadback {
 
     $supervisorStatePath = Join-Path $LogDir 'daemon-supervisor-current.json'
     $supervisorState = $null
-    try {
-        $supervisorState = (Get-Content -Raw -LiteralPath $supervisorStatePath -ErrorAction Stop) | ConvertFrom-Json
-    } catch {
-        $failures.Add("supervisor_state_unreadable path=$supervisorStatePath error=$(($_.Exception.Message -replace '\s+', ' ').Trim())")
+    $supervisorStateReadError = $null
+    $supervisorSettleStartedAt = Get-Date
+    $supervisorSettleDeadline = $supervisorSettleStartedAt.AddSeconds(30)
+    $supervisorSettleReads = 0
+    # `/health` becomes reachable just before the supervisor publishes its
+    # final `running` readback. That small ordering window is not an identity
+    # mismatch: the listener, binary hash, arguments, and child PID already
+    # prove which daemon answered. Wait for the authoritative supervisor state
+    # to settle, but never wait through a foreign child PID or a terminal state.
+    while ($true) {
+        $supervisorSettleReads++
+        $supervisorState = $null
+        $supervisorStateReadError = $null
+        try {
+            $supervisorState = (Get-Content -Raw -LiteralPath $supervisorStatePath -ErrorAction Stop) | ConvertFrom-Json
+        } catch {
+            $supervisorStateReadError = (($_.Exception.Message -replace '\s+', ' ').Trim())
+        }
+        $observedSupervisorStatus = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.state }
+        $observedSupervisorChildPid = if ($null -eq $supervisorState -or $null -eq $supervisorState.child_pid) { 0 } else { [int]$supervisorState.child_pid }
+        $supervisorStillPublishing = (
+            ($null -eq $supervisorState -or $observedSupervisorStatus -eq 'starting') -and
+            $observedSupervisorChildPid -in @(0, $HealthPid) -and
+            (Get-Date) -lt $supervisorSettleDeadline)
+        if (-not $supervisorStillPublishing) {
+            break
+        }
+        Start-Sleep -Milliseconds 250
+    }
+    if ($null -eq $supervisorState) {
+        $failures.Add("supervisor_state_unreadable path=$supervisorStatePath error=$(if ($supervisorStateReadError) { $supervisorStateReadError } else { '<unknown>' })")
     }
     $supervisorStatus = if ($null -eq $supervisorState) { '<missing>' } else { [string]$supervisorState.state }
     $supervisorChildPid = if ($null -eq $supervisorState -or $null -eq $supervisorState.child_pid) { 0 } else { [int]$supervisorState.child_pid }
@@ -4702,6 +4729,8 @@ function Get-SynapseInstalledDaemonIdentityReadback {
         SupervisorStatePath = $supervisorStatePath
         SupervisorState = $supervisorStatus
         SupervisorChildPid = $supervisorChildPid
+        SupervisorSettleReads = $supervisorSettleReads
+        SupervisorSettleWaitMs = [int][Math]::Round(((Get-Date) - $supervisorSettleStartedAt).TotalMilliseconds)
     }
 }
 
@@ -15839,7 +15868,7 @@ while ($true) {
                 Info "ERROR: $lastHealthError"
                 break
             }
-            Info ("Daemon OK: pid={0} version={1} db={2} exe={3} sha256={4} supervisor_state={5} supervisor_child_pid={6}" -f $h.pid, $h.version, $h.subsystems.storage.db_path, $daemonIdentityReadback.ExecutablePath, $daemonIdentityReadback.ExecutableSha256, $daemonIdentityReadback.SupervisorState, $daemonIdentityReadback.SupervisorChildPid)
+            Info ("Daemon OK: pid={0} version={1} db={2} exe={3} sha256={4} supervisor_state={5} supervisor_child_pid={6} supervisor_settle_reads={7} supervisor_settle_wait_ms={8}" -f $h.pid, $h.version, $h.subsystems.storage.db_path, $daemonIdentityReadback.ExecutablePath, $daemonIdentityReadback.ExecutableSha256, $daemonIdentityReadback.SupervisorState, $daemonIdentityReadback.SupervisorChildPid, $daemonIdentityReadback.SupervisorSettleReads, $daemonIdentityReadback.SupervisorSettleWaitMs)
             if ($ManualInstallHealthRollbackProbe) {
                 if ($ManualInstallHealthRollbackPauseMode -eq 'require_active_ack') {
                     $candidateChromeBridge = $h.subsystems.chrome_bridge
