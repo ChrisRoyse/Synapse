@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-11-bounded-error-causality-v15";
-const BRIDGE_DECLARED_BUILD_SHA256 = "5815f03740a703b9dedd569badfcd94ce18bfd9b9c604524e73ef1541e817434";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-storage-authority-divergence-v16";
+const BRIDGE_DECLARED_BUILD_SHA256 = "da47ac28073a1531b3a21154b2dd5e288a79d59e039dca6739428f06363e1c25";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -245,6 +245,7 @@ let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
 let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
 const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV4";
 const DURABLE_OWNER_STORAGE_SCHEMA_VERSION = 6;
+const DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS = 5000;
 const LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY =
   "synapseOperatorPanicDurableOwnerLedgerSchema5ArchiveV1";
 const LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV2";
@@ -264,6 +265,10 @@ let DURABLE_OWNER_STATE_LOADED = false;
 let DURABLE_OWNER_STATE_LOAD_ERROR = null;
 const DURABLE_OWNER_FAILURE_DETAIL_MAX_CHARS = 4096;
 let DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC = null;
+let DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED = false;
+let DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = null;
+let DURABLE_OWNER_STORAGE_WRITE_TRANSITION = null;
+let DURABLE_OWNER_STORAGE_DIVERGENCE = null;
 let DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = null;
 let DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = false;
 let DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = null;
@@ -347,6 +352,118 @@ function recordDurableOwnerStateFailure(stage, error) {
   return DURABLE_OWNER_STATE_LOAD_ERROR;
 }
 
+function durableOwnerStorageValueJson(value) {
+  return value === undefined ? null : canonicalDurableOwnerJson(value);
+}
+
+function durableOwnerStorageJsonIdentity(json) {
+  let value;
+  try {
+    value = json === null ? undefined : JSON.parse(json);
+  } catch {
+    value = undefined;
+  }
+  return {
+    present: json !== null,
+    schema_version: Number.isSafeInteger(value?.version) ? value.version : null,
+    revision: Number.isSafeInteger(value?.revision) ? value.revision : null,
+    bytes: json === null ? 0 : new TextEncoder().encode(json).byteLength
+  };
+}
+
+function enterDurableOwnerStorageFailClosed(stage, error) {
+  DURABLE_MUTATION_OWNERS_ENABLED = false;
+  UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
+    1,
+    UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
+  );
+  recordDurableOwnerStateFailure(stage, error);
+  return error;
+}
+
+function recordDurableOwnerStorageDivergence(stage, oldJson, newJson) {
+  if (!DURABLE_OWNER_STORAGE_DIVERGENCE) {
+    DURABLE_OWNER_STORAGE_DIVERGENCE = {
+      schema_version: 1,
+      stage: String(stage),
+      observed_at_unix_ms: Date.now(),
+      worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID,
+      bridge_build_id: BRIDGE_BUILD_ID,
+      baseline_initialized: DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED,
+      expected: durableOwnerStorageJsonIdentity(
+        DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON
+      ),
+      observed_old: durableOwnerStorageJsonIdentity(oldJson),
+      observed_new: durableOwnerStorageJsonIdentity(newJson),
+      verified_write_in_flight: Boolean(DURABLE_OWNER_STORAGE_WRITE_TRANSITION)
+    };
+  }
+  const error = new Error(
+    "authoritative chrome.storage.local durable owner row changed outside the exact " +
+      "verified writer transition; refusing every subsequent mutation and persistence; " +
+      `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
+  );
+  enterDurableOwnerStorageFailClosed(stage, error);
+  const transition = DURABLE_OWNER_STORAGE_WRITE_TRANSITION;
+  if (transition && !transition.eventObserved) {
+    transition.eventObserved = true;
+    transition.resolveEvent();
+  }
+  return error;
+}
+
+function handleDurableOwnerStorageChanged(changes, areaName) {
+  if (areaName !== "local") return;
+  const change = changes?.[DURABLE_OWNER_STORAGE_KEY];
+  if (!change) return;
+  const oldJson = durableOwnerStorageValueJson(change.oldValue);
+  const newJson = durableOwnerStorageValueJson(change.newValue);
+  if (oldJson === newJson) return;
+
+  const transition = DURABLE_OWNER_STORAGE_WRITE_TRANSITION;
+  if (transition &&
+      oldJson === transition.beforeJson &&
+      newJson === transition.expectedJson) {
+    transition.eventObserved = true;
+    transition.resolveEvent();
+    return;
+  }
+  recordDurableOwnerStorageDivergence(
+    DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED
+      ? "authoritative_storage_changed_outside_verified_writer"
+      : "authoritative_storage_changed_before_baseline",
+    oldJson,
+    newJson
+  );
+}
+
+function initializeDurableOwnerStorageBaseline(value) {
+  if (DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
+    throw new Error("durable owner storage baseline initialization attempted more than once");
+  }
+  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
+    throw new Error(
+      "durable owner storage changed before its initial read completed; refusing to " +
+        `select a competing baseline; storage_divergence=${JSON.stringify(
+          DURABLE_OWNER_STORAGE_DIVERGENCE
+        )}`
+    );
+  }
+  DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = durableOwnerStorageValueJson(value);
+  DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED = true;
+}
+
+function durableOwnerStorageAuthoritySnapshot() {
+  return {
+    baseline_initialized: DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED,
+    last_verified: durableOwnerStorageJsonIdentity(
+      DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON
+    ),
+    verified_write_in_flight: Boolean(DURABLE_OWNER_STORAGE_WRITE_TRANSITION),
+    divergence: DURABLE_OWNER_STORAGE_DIVERGENCE
+  };
+}
+
 function recordDurableOwnerLifecycleEvent(kind, reason = null) {
   const event = {
     kind,
@@ -409,6 +526,9 @@ function handleSynapseRuntimeStartup() {
 
 chrome.runtime.onInstalled.addListener(handleSynapseRuntimeInstalled);
 chrome.runtime.onStartup.addListener(handleSynapseRuntimeStartup);
+if (chrome.storage?.onChanged) {
+  chrome.storage.onChanged.addListener(handleDurableOwnerStorageChanged);
+}
 const DURABLE_OWNER_STATE_READY = restoreDurableOwnerLedger();
 
 let hostId = null;
@@ -2053,6 +2173,18 @@ function durableOwnerLedgerTabIds(ledger = DURABLE_OWNER_LEDGER) {
 }
 
 function assertDurableOwnerPersistenceAuthority(context, duringRestore) {
+  if (!DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
+    throw new Error(
+      `${context} refused because the authoritative storage baseline is not initialized`
+    );
+  }
+  if (DURABLE_OWNER_STORAGE_DIVERGENCE || DURABLE_OWNER_STATE_LOAD_ERROR) {
+    throw new Error(
+      `${context} refused because durable owner storage authority is unhealthy; ` +
+        `restore_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "not_available")}; ` +
+        `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
+    );
+  }
   if (!DURABLE_OWNER_STATE_LOADED && duringRestore !== true) {
     throw new Error(
       `${context} refused because durable owner state did not load; ` +
@@ -2063,19 +2195,122 @@ function assertDurableOwnerPersistenceAuthority(context, duringRestore) {
 }
 
 async function writeAndVerifyDurableOwnerSnapshot(snapshot) {
-  await chrome.storage.local.set({ [DURABLE_OWNER_STORAGE_KEY]: snapshot });
-  const readback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
-  const stored = readback?.[DURABLE_OWNER_STORAGE_KEY];
   const expectedJson = canonicalDurableOwnerJson(snapshot);
-  const actualJson = canonicalDurableOwnerJson(stored);
-  if (actualJson !== expectedJson) {
-    throw new Error(
-      "chrome.storage.local durable owner write postcondition failed; " +
-        `expected_sha256=${await sha256HexText(expectedJson)} ` +
-        `actual_sha256=${await sha256HexText(actualJson || "missing")} ` +
-        `expected_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
-        `actual_bytes=${new TextEncoder().encode(actualJson || "").byteLength}`
+  if (!DURABLE_OWNER_STORAGE_BASELINE_INITIALIZED) {
+    throw enterDurableOwnerStorageFailClosed(
+      "durable_owner_write_without_storage_baseline",
+      new Error("durable owner snapshot write refused before the storage baseline was read")
     );
+  }
+  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
+    throw new Error(
+      "durable owner snapshot write refused after authoritative storage divergence; " +
+        `storage_divergence=${JSON.stringify(DURABLE_OWNER_STORAGE_DIVERGENCE)}`
+    );
+  }
+
+  const beforeReadback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
+  if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
+    throw new Error(
+      "durable owner snapshot write refused because storage diverged during the pre-write read"
+    );
+  }
+  const beforeJson = durableOwnerStorageValueJson(
+    beforeReadback?.[DURABLE_OWNER_STORAGE_KEY]
+  );
+  if (beforeJson !== DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON) {
+    const error = new Error(
+      "chrome.storage.local durable owner write precondition failed; " +
+        `expected_sha256=${await sha256HexText(
+          DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON || "missing"
+        )} ` +
+        `actual_sha256=${await sha256HexText(beforeJson || "missing")} ` +
+        `expected_bytes=${DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON === null
+          ? 0
+          : new TextEncoder().encode(DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON).byteLength} ` +
+        `actual_bytes=${beforeJson === null
+          ? 0
+          : new TextEncoder().encode(beforeJson).byteLength}`
+    );
+    recordDurableOwnerStorageDivergence(
+      "durable_owner_write_precondition_mismatch",
+      DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON,
+      beforeJson
+    );
+    throw error;
+  }
+
+  let resolveEvent;
+  const eventPromise = new Promise((resolve) => {
+    resolveEvent = resolve;
+  });
+  const transition = {
+    beforeJson,
+    expectedJson,
+    eventObserved: false,
+    resolveEvent
+  };
+  DURABLE_OWNER_STORAGE_WRITE_TRANSITION = transition;
+  let eventTimeoutId = null;
+  try {
+    await chrome.storage.local.set({ [DURABLE_OWNER_STORAGE_KEY]: snapshot });
+    const readback = await chrome.storage.local.get(DURABLE_OWNER_STORAGE_KEY);
+    const stored = readback?.[DURABLE_OWNER_STORAGE_KEY];
+    const actualJson = durableOwnerStorageValueJson(stored);
+    if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
+      throw new Error(
+        "durable owner snapshot write refused because storage diverged during its " +
+          "verified write transition"
+      );
+    }
+    if (actualJson !== expectedJson) {
+      const error = new Error(
+        "chrome.storage.local durable owner write postcondition failed; " +
+          `expected_sha256=${await sha256HexText(expectedJson)} ` +
+          `actual_sha256=${await sha256HexText(actualJson || "missing")} ` +
+          `expected_bytes=${new TextEncoder().encode(expectedJson).byteLength} ` +
+          `actual_bytes=${actualJson === null
+            ? 0
+            : new TextEncoder().encode(actualJson).byteLength}`
+      );
+      recordDurableOwnerStorageDivergence(
+        "durable_owner_write_postcondition_mismatch",
+        expectedJson,
+        actualJson
+      );
+      throw error;
+    }
+    const eventObserved = await Promise.race([
+      eventPromise.then(() => true),
+      new Promise((resolve) => {
+        eventTimeoutId = setTimeout(
+          () => resolve(false),
+          DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS
+        );
+      })
+    ]);
+    if (!eventObserved || !transition.eventObserved) {
+      throw enterDurableOwnerStorageFailClosed(
+        "durable_owner_storage_change_event_missing",
+        new Error(
+          "chrome.storage.onChanged did not confirm the exact durable owner write " +
+            `transition within ${DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS}ms; refusing ` +
+            "to treat the readback alone as writer authority"
+        )
+      );
+    }
+    if (DURABLE_OWNER_STORAGE_DIVERGENCE) {
+      throw new Error(
+        "durable owner snapshot write refused because storage diverged before the " +
+          "verified transition completed"
+      );
+    }
+    DURABLE_OWNER_LAST_VERIFIED_STORAGE_JSON = actualJson;
+  } finally {
+    if (eventTimeoutId !== null) clearTimeout(eventTimeoutId);
+    if (DURABLE_OWNER_STORAGE_WRITE_TRANSITION === transition) {
+      DURABLE_OWNER_STORAGE_WRITE_TRANSITION = null;
+    }
   }
 }
 
@@ -2600,6 +2835,7 @@ async function pruneAbsentTabsFromStaleBrowserSessionLedger() {
 
 function rebaseDurableOwnerLedgerAfterStaleOwnerDrain() {
   if (
+    DURABLE_OWNER_STORAGE_DIVERGENCE ||
     DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED ||
     !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID ||
     durableOwnerRowCount(DURABLE_OWNER_LEDGER) !== 0 ||
@@ -2652,8 +2888,10 @@ async function waitForDurableOwnerLifecycleEvent() {
 async function restoreDurableOwnerLedger() {
   let schemaMigrated = false;
   try {
-    if (!chrome.storage?.local || !chrome.storage?.session) {
-      throw new Error("chrome.storage.local/session are required for durable owner continuity");
+    if (!chrome.storage?.local || !chrome.storage?.session || !chrome.storage?.onChanged) {
+      throw new Error(
+        "chrome.storage.local/session/onChanged are required for durable owner continuity"
+      );
     }
     const [localStored, sessionStored] = await Promise.all([
       chrome.storage.local.get([
@@ -2666,6 +2904,7 @@ async function restoreDurableOwnerLedger() {
         LEGACY_DURABLE_OWNER_STORAGE_KEY
       ])
     ]);
+    initializeDurableOwnerStorageBaseline(localStored?.[DURABLE_OWNER_STORAGE_KEY]);
     const hasCurrentLocalLedger = Object.prototype.hasOwnProperty.call(
       localStored || {},
       DURABLE_OWNER_STORAGE_KEY
@@ -4308,6 +4547,7 @@ function bridgeIdentity() {
         storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
         storage_state_failure_diagnostic:
           DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
+        storage_authority: durableOwnerStorageAuthoritySnapshot(),
         mutation_admission_enabled: DURABLE_MUTATION_OWNERS_ENABLED,
         browser_session_id_present: Boolean(DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID),
         ledger_browser_session_id_present: Boolean(DURABLE_OWNER_LEDGER.browserSessionId),
@@ -15725,6 +15965,7 @@ function operatorPanicOwnerReadback() {
     storage_state_load_error: DURABLE_OWNER_STATE_LOAD_ERROR,
     storage_state_failure_diagnostic:
       DURABLE_OWNER_STATE_FAILURE_DIAGNOSTIC,
+    storage_authority: durableOwnerStorageAuthoritySnapshot(),
     interrupted_migration_reconciliation:
       RECONCILED_INTERRUPTED_DURABLE_OWNER_MIGRATION,
     schema_5_migration: DURABLE_OWNER_SCHEMA5_MIGRATION,
