@@ -177,16 +177,53 @@ fn check_text_tokens(text: &str, field: Option<&str>) -> Result<()> {
         return Ok(());
     }
     if text_has_no_space_printable_run(text) && !allowed_stable_identifier(text, field) {
-        return Err(secret_error(
-            "ledger payload contains a long non-whitespace token",
+        return Err(secret_token_error(
+            "long_non_whitespace_token",
+            field,
+            text.len(),
         ));
     }
     for token in token_candidates(text) {
         if token.len() >= SECRET_TOKEN_MIN && !allowed_stable_identifier(token, field) {
-            return Err(secret_error("ledger payload contains a token-like secret"));
+            return Err(secret_token_error("token_like_secret", field, token.len()));
         }
     }
     Ok(())
+}
+
+/// Describe a rejected token without echoing any part of the token or an
+/// attacker-controlled JSON field name. The field is normalized with the same
+/// classifier used by the allowlist and bounded before it enters an error/log.
+/// This keeps redaction failures actionable without turning the diagnostic
+/// itself into a secret or log-injection surface.
+fn secret_token_error(kind: &str, field: Option<&str>, token_len: usize) -> CalyxError {
+    let field = diagnostic_field(field);
+    secret_error(format!(
+        "ledger payload contains a rejected token: kind={kind} field={field} token_len={token_len} classification_threshold={SECRET_TOKEN_MIN}; remediation=store a SHA-256 binding under a *_sha256 field or use a supported stable identifier encoding"
+    ))
+}
+
+fn diagnostic_field(field: Option<&str>) -> String {
+    const MAX_DIAGNOSTIC_FIELD_CHARS: usize = 64;
+    let Some(field) = field else {
+        return "<root>".to_owned();
+    };
+    let mut normalized = String::with_capacity(field.len().min(MAX_DIAGNOSTIC_FIELD_CHARS));
+    let mut chars = field.chars();
+    for ch in chars.by_ref().take(MAX_DIAGNOSTIC_FIELD_CHARS) {
+        normalized.push(if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '_'
+        });
+    }
+    if normalized.is_empty() {
+        normalized.push_str("<empty>");
+    }
+    if chars.next().is_some() {
+        normalized.push_str("_truncated");
+    }
+    normalized
 }
 
 fn token_candidates(text: &str) -> Vec<&str> {
