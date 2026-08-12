@@ -9386,6 +9386,123 @@ function Get-SynapseCandidateCleanupNativeErrorCode {
     return $lastCode
 }
 
+function Get-SynapseCandidateCleanupIntentPath {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot
+    )
+
+    $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    $leaf = Split-Path -Leaf $descriptor.Path
+    $suffix = $leaf.Substring('candidate-'.Length)
+    return Join-Path ([System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')) "candidate-cleanup-$suffix.json"
+}
+
+function Read-SynapseCandidateCleanupIntent {
+    param(
+        [Parameter(Mandatory=$true)][string]$IntentPath,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $intentFull = [System.IO.Path]::GetFullPath($IntentPath)
+    $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $intentFull)).TrimEnd('\')
+    $leaf = Split-Path -Leaf $intentFull
+    if (-not $parentFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $leaf -notmatch '^candidate-cleanup-(\d{8}T\d{9}Z-\d+)\.json$') {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_SCOPE_INVALID path=$intentFull expected_parent=$rootFull actual_parent=$parentFull leaf=$leaf remediation=preserve and inspect the file; only exact setup-created cleanup intents are authoritative"
+    }
+    $candidatePath = Join-Path $rootFull "candidate-$($Matches[1])"
+    $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $candidatePath -ExpectedRoot $rootFull
+    $item = Get-Item -LiteralPath $intentFull -Force -ErrorAction Stop
+    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_TYPE_INVALID path=$intentFull attributes=$($item.Attributes) remediation=preserve and inspect the non-regular intent path; setup will not follow it"
+    }
+    try {
+        $intent = Get-Content -LiteralPath $intentFull -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_UNREADABLE path=$intentFull error=$($_.Exception.Message) remediation=preserve the intent and candidate directory; repair the exact transaction journal before retrying setup"
+    }
+    $recordedRoot = [System.IO.Path]::GetFullPath([string]$intent.expected_root).TrimEnd('\')
+    $recordedCandidate = [System.IO.Path]::GetFullPath([string]$intent.candidate_path).TrimEnd('\')
+    if ([string]$intent.schema -ne 'synapse_candidate_cleanup_intent/v1' -or
+        [string]$intent.state -ne 'pending' -or
+        -not $recordedRoot.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $recordedCandidate.Equals($descriptor.Path, [System.StringComparison]::OrdinalIgnoreCase) -or
+        [int]$intent.setup_owner_pid -ne $descriptor.OwnerPid -or
+        [int]$intent.candidate_pid -le 0 -or
+        [string]::IsNullOrWhiteSpace([string]$intent.bind) -or
+        [string]::IsNullOrWhiteSpace([string]$intent.reason)) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_INVALID path=$intentFull candidate=$($descriptor.Path) schema=$($intent.schema) state=$($intent.state) setup_owner_pid=$($intent.setup_owner_pid) expected_setup_owner_pid=$($descriptor.OwnerPid) candidate_pid=$($intent.candidate_pid) bind=$($intent.bind) reason=$($intent.reason) remediation=preserve both paths and repair the exact cleanup transaction identity; setup refuses ambiguous recursive deletion"
+    }
+    return [pscustomobject]@{
+        Path = $intentFull
+        CandidatePath = $descriptor.Path
+        SetupOwnerPid = [int]$intent.setup_owner_pid
+        CandidatePid = [int]$intent.candidate_pid
+        Bind = [string]$intent.bind
+        Reason = [string]$intent.reason
+    }
+}
+
+function Ensure-SynapseCandidateCleanupIntent {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][int]$CandidateProcessId,
+        [Parameter(Mandatory=$true)][string]$Bind,
+        [Parameter(Mandatory=$true)][string]$Reason
+    )
+
+    if ($CandidateProcessId -le 0 -or [string]::IsNullOrWhiteSpace($Bind)) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_IDENTITY_MISSING path=$Path candidate_pid=$CandidateProcessId bind=$Bind reason=$Reason remediation=cleanup requires the exact validated candidate PID and bind"
+    }
+    $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    $intentPath = Get-SynapseCandidateCleanupIntentPath -Path $descriptor.Path -ExpectedRoot $ExpectedRoot
+    if (-not (Test-Path -LiteralPath $intentPath)) {
+        $record = [ordered]@{
+            schema = 'synapse_candidate_cleanup_intent/v1'
+            state = 'pending'
+            expected_root = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+            candidate_path = $descriptor.Path
+            setup_owner_pid = $descriptor.OwnerPid
+            candidate_pid = $CandidateProcessId
+            bind = $Bind
+            reason = $Reason
+            created_at_utc = [DateTime]::UtcNow.ToString('o')
+        }
+        $tempPath = "$intentPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
+        try {
+            [System.IO.File]::WriteAllText($tempPath, (($record | ConvertTo-Json -Depth 8) + "`n"), [System.Text.UTF8Encoding]::new($false))
+            Move-Item -LiteralPath $tempPath -Destination $intentPath -ErrorAction Stop
+        } catch {
+            try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
+            throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_WRITE_FAILED path=$intentPath candidate=$($descriptor.Path) error=$($_.Exception.Message) remediation=repair the setup-candidates directory; setup will not begin a recursive delete without a durable recovery intent"
+        }
+    }
+    $intent = Read-SynapseCandidateCleanupIntent -IntentPath $intentPath -ExpectedRoot $ExpectedRoot
+    if ($intent.CandidatePid -ne $CandidateProcessId -or
+        $intent.Bind -ne $Bind -or
+        $intent.Reason -ne $Reason) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_CONFLICT path=$intentPath candidate=$($intent.CandidatePath) recorded_pid=$($intent.CandidatePid) expected_pid=$CandidateProcessId recorded_bind=$($intent.Bind) expected_bind=$Bind recorded_reason=$($intent.Reason) expected_reason=$Reason remediation=preserve both paths; a different cleanup transaction already owns this candidate"
+    }
+    Info "Candidate cleanup intent verified path=$($intent.Path) candidate=$($intent.CandidatePath) setup_owner_pid=$($intent.SetupOwnerPid) candidate_pid=$($intent.CandidatePid) bind=$($intent.Bind) reason=$($intent.Reason)"
+    return $intent
+}
+
+function Complete-SynapseCandidateCleanupIntent {
+    param([Parameter(Mandatory=$true)]$Intent)
+
+    if (Test-Path -LiteralPath $Intent.CandidatePath) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_EARLY_COMPLETE path=$($Intent.Path) candidate=$($Intent.CandidatePath) remediation=do not clear recovery authority while the candidate directory remains"
+    }
+    Remove-Item -LiteralPath $Intent.Path -Force -ErrorAction Stop
+    if ((Test-Path -LiteralPath $Intent.Path) -or (Test-Path -LiteralPath $Intent.CandidatePath)) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_COMPLETION_UNVERIFIED path=$($Intent.Path) candidate=$($Intent.CandidatePath) remediation=inspect the exact intent and candidate paths; cleanup is incomplete"
+    }
+    Info "Candidate cleanup intent completion verified path=$($Intent.Path) candidate=$($Intent.CandidatePath) intent_exists=false candidate_exists=false"
+}
+
 function Remove-SynapseCandidateArtifact {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
@@ -9396,6 +9513,27 @@ function Remove-SynapseCandidateArtifact {
         [Parameter(Mandatory=$true)][string]$Reason
     )
 
+    $initial = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    $intentPath = Get-SynapseCandidateCleanupIntentPath -Path $initial.Path -ExpectedRoot $ExpectedRoot
+    if (-not $initial.Exists -and -not (Test-Path -LiteralPath $intentPath)) {
+        Info "Candidate artifact absence verified reason=$Reason path=$($initial.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=0 elapsed_ms=0 readback_exists=false intent_exists=false"
+        return $initial
+    }
+    $intent = if ($initial.Exists) {
+        Ensure-SynapseCandidateCleanupIntent `
+            -Path $initial.Path `
+            -ExpectedRoot $ExpectedRoot `
+            -CandidateProcessId $CandidateProcessId `
+            -Bind $Bind `
+            -Reason $Reason
+    } else {
+        Read-SynapseCandidateCleanupIntent -IntentPath $intentPath -ExpectedRoot $ExpectedRoot
+    }
+    if ($intent.CandidatePid -ne $CandidateProcessId -or
+        $intent.Bind -ne $Bind -or
+        $intent.Reason -ne $Reason) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_RESUME_CONFLICT path=$($intent.Path) candidate=$($intent.CandidatePath) recorded_pid=$($intent.CandidatePid) expected_pid=$CandidateProcessId recorded_bind=$($intent.Bind) expected_bind=$Bind recorded_reason=$($intent.Reason) expected_reason=$Reason remediation=resume the exact recorded cleanup transaction; do not replace its process/socket identity"
+    }
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     $attempt = 0
     $lastNativeError = 0
@@ -9408,14 +9546,16 @@ function Remove-SynapseCandidateArtifact {
             -CandidateProcessId $CandidateProcessId `
             -Bind $Bind
         if (-not $descriptor.Exists) {
-            Info "Candidate artifact absence verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false"
+            Complete-SynapseCandidateCleanupIntent -Intent $intent
+            Info "Candidate artifact absence verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false intent_exists=false"
             return $descriptor
         }
 
         try {
             Remove-Item -LiteralPath $descriptor.Path -Recurse -Force -ErrorAction Stop
             if (-not (Test-Path -LiteralPath $descriptor.Path)) {
-                Info "Candidate artifact cleanup verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false"
+                Complete-SynapseCandidateCleanupIntent -Intent $intent
+                Info "Candidate artifact cleanup verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false intent_exists=false"
                 return $descriptor
             }
             $lastNativeError = 0
@@ -9434,6 +9574,35 @@ function Remove-SynapseCandidateArtifact {
         Info "Candidate artifact cleanup waiting reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempt=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) native_error=$lastNativeError error=$lastError"
         Start-Sleep -Milliseconds 250
     }
+}
+
+function Resume-SynapseCandidateCleanupIntents {
+    param([Parameter(Mandatory=$true)][string]$Root)
+
+    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
+        Info "Candidate cleanup intent recovery root=$Root intent_count=0 resumed_count=0 retained_count=0"
+        return
+    }
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $resumed = 0
+    $retained = 0
+    $intents = @(Get-ChildItem -LiteralPath $rootFull -File -Force -Filter 'candidate-cleanup-*.json' -ErrorAction Stop | Sort-Object Name)
+    foreach ($file in $intents) {
+        $intent = Read-SynapseCandidateCleanupIntent -IntentPath $file.FullName -ExpectedRoot $rootFull
+        if (Get-Process -Id $intent.SetupOwnerPid -ErrorAction SilentlyContinue) {
+            $retained++
+            Info "Candidate cleanup intent retained path=$($intent.Path) candidate=$($intent.CandidatePath) setup_owner_pid=$($intent.SetupOwnerPid) reason=setup_owner_pid_still_live"
+            continue
+        }
+        [void](Remove-SynapseCandidateArtifact `
+            -Path $intent.CandidatePath `
+            -ExpectedRoot $rootFull `
+            -CandidateProcessId $intent.CandidatePid `
+            -Bind $intent.Bind `
+            -Reason $intent.Reason)
+        $resumed++
+    }
+    Info "Candidate cleanup intent recovery root=$rootFull intent_count=$($intents.Count) resumed_count=$resumed retained_count=$retained"
 }
 
 function Remove-SynapseStaleSuccessfulCandidateArtifacts {
@@ -14537,6 +14706,7 @@ if ($maintenanceReason -eq 'setup') {
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
 Remove-SynapseStaleDaemonStagingArtifacts -LogDir $LogDir
+Resume-SynapseCandidateCleanupIntents -Root (Join-Path $LogDir 'setup-candidates')
 Remove-SynapseStaleSuccessfulCandidateArtifacts -Root (Join-Path $LogDir 'setup-candidates')
 
 if ($ResumeChromeBridgePending) {
