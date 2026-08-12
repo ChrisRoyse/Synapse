@@ -139,7 +139,7 @@ pub(super) fn rebuild_projection(
         clear_publication_rows(db)?;
         build_projection(db)?;
         let repaired = projection_status_locked(db)?;
-        if !projection_publication_complete(&repaired) {
+        if !projection_publication_complete(db, &repaired)? {
             return Err(format!(
                 "AGENT_TRANSCRIPT_ORDER_REPAIR_READBACK_MISMATCH: source_rows={} index_rows={} exact_match={} ready={} state_token_sha256={}; remediation=preserve the repair marker and resume only after inspecting the physical projection state",
                 repaired.source_rows,
@@ -185,12 +185,17 @@ pub(super) fn rebuild_projection(
     })
 }
 
-fn projection_publication_complete(status: &TranscriptOrderStatus) -> bool {
-    status.exact_match
-        && status.meta_schema_version == Some(SCHEMA_VERSION)
-        && status.meta_readable == Some(true)
-        && status.progress_complete == Some(true)
-        && status.progress_rows_indexed == Some(status.source_rows)
+fn projection_publication_complete(
+    db: &Db,
+    status: &TranscriptOrderStatus,
+) -> Result<bool, String> {
+    let Some(meta) = read_meta(db)? else {
+        return Ok(false);
+    };
+    let Some(progress) = read_progress(db)? else {
+        return Ok(false);
+    };
+    Ok(status.exact_match && validate_published_rows(&meta, &progress).is_ok())
 }
 
 pub(super) fn lock_projection() -> Result<MutexGuard<'static, ProjectionLockState>, String> {
@@ -215,7 +220,11 @@ pub(super) fn ensure_projection_locked(
     }
     match read_meta(db)? {
         Some(meta) => {
-            validate_meta(&meta)?;
+            let progress = read_progress(db)?.ok_or_else(|| {
+                "AGENT_TRANSCRIPT_ORDER_PROGRESS_MISSING: readable projection metadata exists without its publication progress row; remediation=preserve the metadata and run the revision-guarded projection repair"
+                    .to_owned()
+            })?;
+            validate_published_rows(&meta, &progress)?;
             reconcile_complete_sets(db)?;
         }
         None => build_projection(db)?,
@@ -545,31 +554,40 @@ fn projection_status_locked(db: &Db) -> Result<TranscriptOrderStatus, String> {
     let meta_bytes = db
         .get_cf(cf::CF_KV, META_KEY)
         .map_err(|error| format!("AGENT_TRANSCRIPT_ORDER_META_READ_FAILED: {error}"))?;
-    let (meta_schema_version, meta_readable, meta_decode_error) = match meta_bytes.as_deref() {
+    let (meta, meta_schema_version, meta_readable, meta_decode_error) = match meta_bytes.as_deref()
+    {
         Some(bytes) => match decode_json::<ProjectionMeta>(bytes) {
-            Ok(meta) => (Some(meta.schema_version), Some(meta.readable), None),
-            Err(error) => (None, None, Some(error.to_string())),
+            Ok(meta) => {
+                let schema_version = meta.schema_version;
+                let readable = meta.readable;
+                (Some(meta), Some(schema_version), Some(readable), None)
+            }
+            Err(error) => (None, None, None, Some(error.to_string())),
         },
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     let progress_bytes = db
         .get_cf(cf::CF_KV, PROGRESS_KEY)
         .map_err(|error| format!("AGENT_TRANSCRIPT_ORDER_PROGRESS_READ_FAILED: {error}"))?;
-    let (progress_complete, progress_rows_indexed, progress_decode_error) =
+    let (progress, progress_complete, progress_rows_indexed, progress_decode_error) =
         match progress_bytes.as_deref() {
             Some(bytes) => match decode_json::<ProjectionProgress>(bytes) {
-                Ok(progress) => (Some(progress.complete), Some(progress.rows_indexed), None),
-                Err(error) => (None, None, Some(error.to_string())),
+                Ok(progress) => {
+                    let complete = progress.complete;
+                    let rows_indexed = progress.rows_indexed;
+                    (Some(progress), Some(complete), Some(rows_indexed), None)
+                }
+                Err(error) => (None, None, None, Some(error.to_string())),
             },
-            None => (None, None, None),
+            None => (None, None, None, None),
         };
     let marker = read_repair_marker(db)?;
     let exact_match = expected == index_rows;
     let ready = exact_match
-        && meta_schema_version == Some(SCHEMA_VERSION)
-        && meta_readable == Some(true)
-        && progress_complete == Some(true)
-        && progress_rows_indexed == Some(source_rows.len() as u64)
+        && meta
+            .as_ref()
+            .zip(progress.as_ref())
+            .is_some_and(|(meta, progress)| validate_published_rows(meta, progress).is_ok())
         && marker.is_none();
     let source_digest_sha256 = rows_digest(&source_rows);
     let expected_index_digest_sha256 = rows_digest(&expected);
@@ -821,6 +839,34 @@ fn validate_progress(progress: &ProjectionProgress) -> Result<(), String> {
             "AGENT_TRANSCRIPT_ORDER_PROGRESS_SCHEMA_UNSUPPORTED: actual={} expected={SCHEMA_VERSION}; remediation=preserve the row and migrate it explicitly",
             progress.schema_version
         ));
+    }
+    Ok(())
+}
+
+fn validate_published_rows(
+    meta: &ProjectionMeta,
+    progress: &ProjectionProgress,
+) -> Result<(), String> {
+    validate_meta(meta)?;
+    validate_progress(progress)?;
+    if !progress.complete || progress.resume_after_physical_hex.is_some() {
+        return Err(format!(
+            "AGENT_TRANSCRIPT_ORDER_PUBLICATION_INCOMPLETE: complete={} resume_cursor_present={}; remediation=resume the revision-guarded projection repair before serving reads",
+            progress.complete,
+            progress.resume_after_physical_hex.is_some()
+        ));
+    }
+    if progress.rows_indexed != meta.source_rows_at_build {
+        return Err(format!(
+            "AGENT_TRANSCRIPT_ORDER_PUBLICATION_COUNT_MISMATCH: progress_rows_indexed={} meta_source_rows_at_build={}; remediation=preserve both CF_KV publication rows and run the revision-guarded projection repair",
+            progress.rows_indexed, meta.source_rows_at_build
+        ));
+    }
+    if !repair_token_is_valid(&meta.source_digest_at_build) {
+        return Err(
+            "AGENT_TRANSCRIPT_ORDER_PUBLICATION_DIGEST_INVALID: source_digest_at_build must be exactly 64 lowercase hexadecimal characters; remediation=preserve the metadata row and run the revision-guarded projection repair"
+                .to_owned(),
+        );
     }
     Ok(())
 }
