@@ -35,7 +35,9 @@ use crate::m3::{
         StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
         StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
         StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
-        StorageTemporalRerankResponse,
+        StorageTemporalRerankResponse, StorageTranscriptOrderRebuildParams,
+        StorageTranscriptOrderRebuildResponse, StorageTranscriptOrderStatusParams,
+        StorageTranscriptOrderStatusResponse,
     },
 };
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -52,6 +54,8 @@ pub enum StorageOperation {
     TemporalRerank,
     TemporalBackfill,
     SearchRebuild,
+    TranscriptOrderStatus,
+    TranscriptOrderRebuild,
     PanelLifecycle,
     FindSimilar,
     RetireOrphanSlotCfs,
@@ -76,6 +80,8 @@ impl StorageOperation {
             Self::TemporalRerank => "temporal_rerank",
             Self::TemporalBackfill => "temporal_backfill",
             Self::SearchRebuild => "search_rebuild",
+            Self::TranscriptOrderStatus => "transcript_order_status",
+            Self::TranscriptOrderRebuild => "transcript_order_rebuild",
             Self::PanelLifecycle => "panel_lifecycle",
             Self::FindSimilar => "find_similar",
             Self::RetireOrphanSlotCfs => "retire_orphan_slot_cfs",
@@ -114,6 +120,10 @@ pub struct StorageParams {
     pub temporal_backfill: Option<StorageTemporalBackfillParams>,
     #[serde(default)]
     pub search_rebuild: Option<StorageSearchRebuildParams>,
+    #[serde(default)]
+    pub transcript_order_status: Option<StorageTranscriptOrderStatusParams>,
+    #[serde(default)]
+    pub transcript_order_rebuild: Option<StorageTranscriptOrderRebuildParams>,
     #[serde(default)]
     pub panel_lifecycle: Option<StoragePanelLifecycleParams>,
     #[serde(default)]
@@ -164,6 +174,10 @@ pub struct StorageResponse {
     pub temporal_backfill: Option<StorageTemporalBackfillResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub search_rebuild: Option<StorageSearchRebuildResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_order_status: Option<Box<StorageTranscriptOrderStatusResponse>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_order_rebuild: Option<Box<StorageTranscriptOrderRebuildResponse>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub panel_lifecycle: Option<StoragePanelLifecycleResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

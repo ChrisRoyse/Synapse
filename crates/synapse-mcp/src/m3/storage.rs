@@ -77,6 +77,71 @@ const PROBE_WRITABLE_CFS: [&str; 14] = [
 #[serde(deny_unknown_fields)]
 pub struct StorageInspectParams {}
 
+/// Read-only exact census of the transcript timestamp-order projection.
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTranscriptOrderStatusParams {}
+
+/// Revision-guarded authorization for rebuilding the transcript timestamp-order
+/// projection. The token must come from a separate
+/// `storage operation=transcript_order_status` read.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTranscriptOrderRebuildParams {
+    pub expected_repair_token: String,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTranscriptOrderStatusResponse {
+    pub vault_id: String,
+    pub source_rows: u64,
+    pub index_rows: u64,
+    pub source_digest_sha256: String,
+    pub expected_index_digest_sha256: String,
+    pub actual_index_digest_sha256: String,
+    pub exact_match: bool,
+    /// True only when row sets match and both durable publication rows decode
+    /// as the supported, complete, readable schema.
+    pub ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_mismatch: Option<String>,
+    pub meta_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_schema_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_readable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta_decode_error: Option<String>,
+    pub progress_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_rows_indexed: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub progress_decode_error: Option<String>,
+    pub repair_in_progress: bool,
+    pub state_token_sha256: String,
+    /// Token accepted by `transcript_order_rebuild`. While a crash-recovery
+    /// marker exists this remains the original authorization token even though
+    /// cleanup/build progress changes the current state token.
+    pub repair_token_sha256: String,
+    pub source_of_truth: &'static str,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageTranscriptOrderRebuildResponse {
+    pub before: StorageTranscriptOrderStatusResponse,
+    pub after: StorageTranscriptOrderStatusResponse,
+    pub deleted_index_rows: u64,
+    pub rebuilt_index_rows: u64,
+    pub resumed_repair: bool,
+    pub finalized_only: bool,
+    pub authorization_token_sha256: String,
+    pub source_of_truth: &'static str,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageAnchorsParams {
@@ -2807,6 +2872,20 @@ pub fn required_permissions_gc(_params: &StorageGcOnceParams) -> RequiredPermiss
 #[must_use]
 pub fn required_permissions_search_rebuild(
     _params: &StorageSearchRebuildParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage, Permission::WriteStorage])
+}
+
+#[must_use]
+pub fn required_permissions_transcript_order_status(
+    _params: &StorageTranscriptOrderStatusParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_transcript_order_rebuild(
+    _params: &StorageTranscriptOrderRebuildParams,
 ) -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
 }

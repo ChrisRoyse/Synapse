@@ -25,6 +25,8 @@ pub(super) fn storage_response(
         temporal_rerank: None,
         temporal_backfill: None,
         search_rebuild: None,
+        transcript_order_status: None,
+        transcript_order_rebuild: None,
         panel_lifecycle: None,
         find_similar: None,
         retire_orphan_slot_cfs: None,

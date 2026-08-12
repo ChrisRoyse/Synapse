@@ -49,7 +49,7 @@ use synapse_calyx::{
 };
 use synapse_core::{
     error_codes,
-    retention::{DEFAULTS, RetentionDefault, RetentionTtl},
+    retention::{DEFAULTS, RetentionCapEviction, RetentionDefault, RetentionTtl},
     types::{
         AgentEventRecord, AgentTranscriptRecord, EpisodeRecord, StoredObservation,
         StoredReflexAudit, TimelineRecord,
@@ -13407,6 +13407,7 @@ fn calyx_process_private_bytes() -> StorageResult<u64> {
 }
 
 fn calyx_gc_default_budgets() -> StorageResult<Vec<CalyxGcBudget>> {
+    validate_calyx_retention_cap_coupling()?;
     DEFAULTS
         .iter()
         .copied()
@@ -14553,7 +14554,7 @@ fn confirm_calyx_gc_expired_evictions(
 }
 
 fn calyx_retention_default_for_write(cf_name: &str) -> StorageResult<RetentionDefault> {
-    DEFAULTS
+    let retention = DEFAULTS
         .iter()
         .copied()
         .find(|default| default.cf == cf_name)
@@ -14562,7 +14563,76 @@ fn calyx_retention_default_for_write(cf_name: &str) -> StorageResult<RetentionDe
                 cf_name,
                 format!("missing RetentionDefault mapping for Calyx column family {cf_name}"),
             )
-        })
+        })?;
+    validate_calyx_retention_cap_entry(retention)?;
+    Ok(retention)
+}
+
+fn validate_calyx_retention_cap_coupling() -> StorageResult<()> {
+    for retention in DEFAULTS {
+        let definitions = DEFAULTS
+            .iter()
+            .filter(|candidate| candidate.cf == retention.cf)
+            .count();
+        if definitions != 1 {
+            return Err(calyx_write_failed_detail(
+                retention.cf,
+                format!(
+                    "CALYX_RETENTION_DEFAULT_DUPLICATE: cf={} definitions={definitions}; remediation=retain exactly one authoritative policy per column family",
+                    retention.cf
+                ),
+            ));
+        }
+        validate_calyx_retention_cap_entry(retention)?;
+    }
+    Ok(())
+}
+
+fn validate_calyx_retention_cap_entry(retention: RetentionDefault) -> StorageResult<()> {
+    let RetentionCapEviction::LockstepWith(peer_cf) = retention.cap_eviction else {
+        return Ok(());
+    };
+    if peer_cf == retention.cf {
+        return Err(calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "CALYX_RETENTION_LOCKSTEP_SELF_REFERENCE: cf={} peer_cf={peer_cf}; remediation=declare the exact source/index peer",
+                retention.cf
+            ),
+        ));
+    }
+    let peer = DEFAULTS
+        .iter()
+        .copied()
+        .find(|candidate| candidate.cf == peer_cf)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                retention.cf,
+                format!(
+                    "CALYX_RETENTION_LOCKSTEP_PEER_MISSING: cf={} peer_cf={peer_cf}; remediation=add the peer RetentionDefault and its symmetric LockstepWith declaration",
+                    retention.cf
+                ),
+            )
+        })?;
+    if peer.cap_eviction != RetentionCapEviction::LockstepWith(retention.cf) {
+        return Err(calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "CALYX_RETENTION_LOCKSTEP_ASYMMETRIC: cf={} peer_cf={peer_cf} peer_policy={:?}; remediation=declare LockstepWith symmetrically on both source and index",
+                retention.cf, peer.cap_eviction
+            ),
+        ));
+    }
+    if peer.ttl != retention.ttl {
+        return Err(calyx_write_failed_detail(
+            retention.cf,
+            format!(
+                "CALYX_RETENTION_LOCKSTEP_TTL_MISMATCH: cf={} ttl={:?} peer_cf={peer_cf} peer_ttl={:?}; remediation=give the source and index one identical logical expiry boundary",
+                retention.cf, retention.ttl, peer.ttl
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn calyx_retention_cap_bytes_for_write(retention: RetentionDefault) -> StorageResult<(u64, u64)> {
@@ -14684,14 +14754,18 @@ fn calyx_cf_protected_from_auto_delete(cf_name: &str) -> bool {
     // secondary-index rows all live here today. A generic LRU cap cannot know
     // which keys are rebuildable, so automatic Calyx GC must preserve the whole
     // family until each high-volume prefix has an explicit typed store.
-    // The agent-event journal and its spawn index are one logical append. A
-    // generic per-CF LRU decision cannot delete both atomically, so cap
-    // eviction is forbidden for both. Their identical row TTLs remain the
+    // Every strict source/index pair declared `LockstepWith` is one logical
+    // relation. Generic per-CF LRU cannot know the peer key, so cap eviction is
+    // forbidden for both sides. Their validated identical row TTL remains the
     // logical expiry authority, and complete compaction reclaims expired bytes.
-    matches!(
-        cf_name,
-        cf::CF_KV | cf::CF_ROUTINE_STATE | cf::CF_AGENT_EVENTS | cf::CF_AGENT_EVENT_SPAWN_INDEX
-    )
+    matches!(cf_name, cf::CF_KV | cf::CF_ROUTINE_STATE)
+        || DEFAULTS.iter().any(|retention| {
+            retention.cf == cf_name
+                && matches!(
+                    retention.cap_eviction,
+                    RetentionCapEviction::LockstepWith(_)
+                )
+        })
 }
 
 fn calyx_put_row(

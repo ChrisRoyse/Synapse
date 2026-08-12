@@ -24,6 +24,13 @@ use super::{
 static SEARCH_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(1)));
 
+/// Transcript-order repair rewrites one durable secondary projection and its
+/// publication rows. The projection module also serializes source writers, but
+/// this non-waiting facade permit keeps a second operator call from occupying a
+/// blocking worker while the first repair owns that serialization boundary.
+static TRANSCRIPT_ORDER_REBUILD_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(1)));
+
 /// Panel generation allocation and Registry publication are one ordered
 /// mutation stream. Reject concurrent callers before either can reserve an id.
 static PANEL_LIFECYCLE_PERMITS: LazyLock<Arc<Semaphore>> =
@@ -600,6 +607,143 @@ pub(super) async fn handle(
                     response.raw_sidecars.len()
                 ),
                 |out| out.search_rebuild = Some(response),
+            )))
+        }
+        StorageOperation::TranscriptOrderStatus => {
+            let spec = params
+                .0
+                .transcript_order_status
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "transcript_order_status"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_transcript_order_status(&spec),
+            )?;
+            let db = service.m3_storage()?;
+            let response = tokio::task::spawn_blocking(move || {
+                crate::server::transcript_order::projection_status(&db)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "agent-transcript-order",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("transcript-order status task failed to join: {error}"),
+                    ),
+                    "inspect the daemon panic/error log before retrying the read-only projection census",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "agent-transcript-order",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(error_codes::STORAGE_CORRUPTED, error),
+                    "preserve the vault and inspect the named projection Source of Truth",
+                )
+            })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "transcript order source_rows={} index_rows={} exact_match={} ready={} state_token_sha256={}",
+                    response.source_rows,
+                    response.index_rows,
+                    response.exact_match,
+                    response.ready,
+                    response.state_token_sha256
+                ),
+                |out| out.transcript_order_status = Some(Box::new(response)),
+            )))
+        }
+        StorageOperation::TranscriptOrderRebuild => {
+            let spec = params
+                .0
+                .transcript_order_rebuild
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "transcript_order_rebuild"))?;
+            require_maintenance_profile(
+                service,
+                &request_context,
+                STORAGE_TOOL,
+                operation.as_str(),
+                "agent-transcript-order",
+                STORAGE_SOT,
+            )?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_transcript_order_rebuild(&spec),
+            )?;
+            let permit = Arc::clone(&TRANSCRIPT_ORDER_REBUILD_PERMITS)
+                .try_acquire_owned()
+                .map_err(|error| match error {
+                    TryAcquireError::NoPermits => facade_conflict_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "agent-transcript-order",
+                        STORAGE_SOT,
+                        error_codes::STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS,
+                        "a transcript timestamp-order projection rebuild is already in progress"
+                            .to_owned(),
+                        "wait for the in-flight transcript_order_rebuild call to finish, then read transcript_order_status again",
+                    ),
+                    TryAcquireError::Closed => facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "agent-transcript-order",
+                        STORAGE_SOT,
+                        crate::m1::mcp_error(
+                            error_codes::TOOL_INTERNAL_ERROR,
+                            "transcript-order rebuild admission semaphore was unexpectedly closed"
+                                .to_owned(),
+                        ),
+                        "restart the daemon; the transcript-order rebuild admission gate is unavailable",
+                    ),
+                })?;
+            let db = service.m3_storage()?;
+            let token = spec.expected_repair_token;
+            let response = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::server::transcript_order::rebuild_projection(&db, &token)
+            })
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "agent-transcript-order",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!("transcript-order rebuild task failed to join: {error}"),
+                    ),
+                    "inspect the daemon panic/error log and the durable repair marker before retrying",
+                )
+            })?
+            .map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "agent-transcript-order",
+                    STORAGE_SOT,
+                    crate::m1::mcp_error(error_codes::STORAGE_CORRUPTED, error),
+                    "re-read transcript_order_status and resume only with its exact repair_token_sha256",
+                )
+            })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "transcript order deleted={} rebuilt={} source_rows={} index_rows={} exact_match={} ready={}",
+                    response.deleted_index_rows,
+                    response.rebuilt_index_rows,
+                    response.after.source_rows,
+                    response.after.index_rows,
+                    response.after.exact_match,
+                    response.after.ready
+                ),
+                |out| out.transcript_order_rebuild = Some(Box::new(response)),
             )))
         }
         StorageOperation::PanelLifecycle => {

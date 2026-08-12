@@ -2255,6 +2255,26 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "hold an explicit maintenance profile, wait for any in-flight rebuild to publish its generation, then retry with the exact expected_panel_version",
             ),
             op(
+                "transcript_order_status",
+                false,
+                false,
+                "complete retained CF_AGENT_TRANSCRIPTS rows compared to CF_AGENT_TRANSCRIPT_ORDER pointers plus CF_KV publication/repair rows",
+                None,
+                error_codes::STORAGE_CORRUPTED,
+                "preserve the vault and inspect the returned row counts, digests, bounded first-mismatch evidence, and publication metadata",
+            ),
+            op(
+                "transcript_order_rebuild",
+                true,
+                false,
+                "CF_AGENT_TRANSCRIPT_ORDER rebuilt from CF_AGENT_TRANSCRIPTS under its one-writer lock plus crash-resumable CF_KV repair intent",
+                Some(
+                    "full before/after source and index row counts and digests, exact reconciliation, readable publication state, and absent repair marker",
+                ),
+                error_codes::STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS,
+                "read transcript_order_status first, hold an explicit maintenance profile, and pass its exact repair_token_sha256; after interruption, re-read status and resume with the retained repair token",
+            ),
+            op(
                 "panel_lifecycle",
                 true,
                 false,
