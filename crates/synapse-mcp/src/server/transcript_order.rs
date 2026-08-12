@@ -661,7 +661,14 @@ fn projection_status_locked(db: &Db) -> Result<TranscriptOrderStatus, String> {
     }
     let state_token_sha256 = hex_encode(&state_hasher.finalize());
     let repair_token_sha256 = marker.as_ref().map_or_else(
-        || state_token_sha256.clone(),
+        || {
+            repair_authorization_token(
+                &vault_identity.vault_id,
+                meta_bytes.as_deref(),
+                progress_bytes.as_deref(),
+                exact_match,
+            )
+        },
         |marker| marker.authorized_repair_token_sha256.clone(),
     );
 
@@ -693,6 +700,41 @@ fn projection_status_locked(db: &Db) -> Result<TranscriptOrderStatus, String> {
         repair_token_sha256,
         source_of_truth: PROJECTION_SOURCE_OF_TRUTH,
     })
+}
+
+/// Application-managed optimistic-concurrency token for the repair decision.
+///
+/// The full `state_token_sha256` deliberately changes with every physical
+/// source/index mutation and remains the audit/readback token. Repair does not
+/// mutate source rows, however, and re-censuses both row sets after it acquires
+/// their one-writer lock. Including the live row digests in its authorization
+/// token made the required MCP status -> rebuild sequence self-invalidating:
+/// ordinary transcript ingest for the status/tool calls atomically advanced
+/// both otherwise-correct row sets before rebuild could acquire that lock.
+///
+/// Scope this token to exactly the state the repair decision depends on. A
+/// different vault, changed publication row, or transition between exact and
+/// divergent row sets still conflicts. Mirrored source/index inserts and
+/// retention deletes do not, because rebuild verifies their latest complete
+/// sets under the lock before choosing finalize-only versus reconstruction.
+fn repair_authorization_token(
+    vault_id: &str,
+    meta_bytes: Option<&[u8]>,
+    progress_bytes: Option<&[u8]>,
+    exact_match: bool,
+) -> String {
+    let mut hasher = Sha256::new();
+    for component in [
+        b"agent-transcript-order-repair/v2".as_slice(),
+        vault_id.as_bytes(),
+        meta_bytes.unwrap_or_default(),
+        progress_bytes.unwrap_or_default(),
+    ] {
+        hasher.update((component.len() as u64).to_be_bytes());
+        hasher.update(component);
+    }
+    hasher.update([u8::from(exact_match)]);
+    hex_encode(&hasher.finalize())
 }
 
 fn read_repair_marker(db: &Db) -> Result<Option<ProjectionRepairMarker>, String> {
