@@ -50,16 +50,6 @@ struct PredecessorFileCandidate {
 }
 
 impl LevelFile {
-    fn without_lookup(path: PathBuf) -> Self {
-        Self {
-            path,
-            bounds: None,
-            bounds_retained: false,
-            lookup: None,
-            lookup_retained: false,
-        }
-    }
-
     fn with_lookup(path: PathBuf) -> Result<Self> {
         // Cold-open lookup retention owns exactly one decoded index. Going
         // through `shared_reader` here retained a second complete copy in the
@@ -77,6 +67,7 @@ impl LevelFile {
         let bounds = lookup.as_ref().map(|lookup| SstBounds {
             first_key: lookup.first_key.clone(),
             last_key: lookup.last_key.clone(),
+            sparse_index: Vec::new(),
         });
         Ok(Self {
             path,
@@ -108,10 +99,22 @@ impl LevelFile {
         })?;
         let bounds = match (&summary.first_key, &summary.last_key, entries) {
             (None, None, 0) => None,
-            (Some(first_key), Some(last_key), count) if count != 0 => Some(SstBounds {
-                first_key: first_key.clone(),
-                last_key: last_key.clone(),
-            }),
+            (Some(first_key), Some(last_key), count) if count != 0 => {
+                let bounds = read_sst_bounds(&summary.path)?.ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "new SST {} summary reports {} entries but its validated index is empty",
+                        summary.path.display(),
+                        summary.entries
+                    ))
+                })?;
+                if bounds.first_key != *first_key || bounds.last_key != *last_key {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "new SST {} validated bounds disagree with its writer summary",
+                        summary.path.display()
+                    )));
+                }
+                Some(bounds)
+            }
             _ => {
                 return Err(CalyxError::aster_corrupt_shard(format!(
                     "new SST {} summary has inconsistent entries/bounds: entries={} first_present={} last_present={}",
@@ -182,10 +185,16 @@ impl LevelFile {
     }
 
     pub(super) fn open_page_reader(&self) -> Result<Option<SstPageReader<'_>>> {
-        match (&self.lookup, self.lookup_retained) {
-            (Some(lookup), _) => SstPageReader::open(&self.path, lookup).map(Some),
-            (None, true) => Ok(None),
-            (None, false) => SstPageReader::open_streaming(&self.path).map(Some),
+        match (&self.lookup, self.bounds.as_ref(), self.lookup_retained) {
+            (Some(lookup), _, _) => SstPageReader::open(&self.path, lookup).map(Some),
+            (None, _, true) => Ok(None),
+            (None, Some(bounds), false) => {
+                SstPageReader::open_streaming(&self.path, bounds).map(Some)
+            }
+            (None, None, false) => Err(CalyxError::aster_corrupt_shard(format!(
+                "cold SST {} has no validated bounds/sparse index; reload the level from its immutable files before serving a read",
+                self.path.display()
+            ))),
         }
     }
 
@@ -196,7 +205,13 @@ impl LevelFile {
         let Some(lookup) = &self.lookup else {
             // A cold point read must not populate the mmap/decoded-index cache.
             // Stream to the candidate and CRC-validate that one record instead.
-            let mut reader = SstPageReader::open_streaming(&self.path)?;
+            let bounds = self.bounds.as_ref().ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "cold SST {} has no validated bounds/sparse index for point read",
+                    self.path.display()
+                ))
+            })?;
+            let mut reader = SstPageReader::open_streaming(&self.path, bounds)?;
             reader.seek_lower_bound(key, false)?;
             if reader.current_key() != Some(key) {
                 return Ok(None);
@@ -217,13 +232,13 @@ impl SstLevel {
         Self { files: Vec::new() }
     }
 
-    pub fn from_oldest_first(files: impl IntoIterator<Item = PathBuf>) -> Self {
+    pub fn from_oldest_first(files: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
         let mut files = files
             .into_iter()
-            .map(LevelFile::without_lookup)
-            .collect::<Vec<_>>();
+            .map(LevelFile::with_bounds)
+            .collect::<Result<Vec<_>>>()?;
         files.reverse();
-        Self { files }
+        Ok(Self { files })
     }
 
     pub fn from_oldest_first_with_bounds(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
@@ -291,8 +306,9 @@ impl SstLevel {
         Ok(Self { files })
     }
 
-    pub fn push(&mut self, path: PathBuf) {
-        self.files.insert(0, LevelFile::without_lookup(path));
+    pub fn push(&mut self, path: PathBuf) -> Result<()> {
+        self.files.insert(0, LevelFile::with_bounds(path)?);
+        Ok(())
     }
 
     pub fn push_with_lookup(&mut self, path: PathBuf) -> Result<()> {
@@ -500,8 +516,10 @@ impl SstLevel {
             }
             let file_index = candidate.source_index;
             let file = &self.files[file_index];
-            let Some(entry) = shared_reader(&file.path)?.predecessor(start, upper, inclusive)?
-            else {
+            let Some(mut reader) = file.open_page_reader()? else {
+                continue;
+            };
+            let Some(entry) = reader.predecessor(start, upper, inclusive)? else {
                 continue;
             };
             let replace = newest_at_greatest_key

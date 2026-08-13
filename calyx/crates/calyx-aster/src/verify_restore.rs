@@ -464,7 +464,7 @@ fn point_read_cf(
     {
         return Ok(Some(value.clone()));
     }
-    let level = SstLevel::from_oldest_first(cf_sst_paths(vault, cf)?);
+    let level = SstLevel::from_oldest_first(cf_sst_paths(vault, cf)?)?;
     let Some(value) = level.get(key)? else {
         return Ok(None);
     };

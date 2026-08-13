@@ -6,8 +6,8 @@ use calyx_core::{CalyxError, Result};
 
 use super::{
     HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN,
-    SstEntry, SstLookupMetadata, clone_scan_bytes, materialized_entry_bytes,
-    read_file_header_structure, record_crc, scan_reserve_failed,
+    SstBounds, SstEntry, SstLookupMetadata, SstSparseIndexEntry, clone_scan_bytes,
+    materialized_entry_bytes, read_file_header_structure, record_crc, scan_reserve_failed,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -80,7 +80,7 @@ pub(crate) enum SstPageReader<'a> {
         point_reader: SstPointReader,
         position: usize,
     },
-    Streaming(DiskIndexCursor),
+    Streaming(DiskIndexCursor<'a>),
 }
 
 impl<'a> SstPageReader<'a> {
@@ -93,8 +93,8 @@ impl<'a> SstPageReader<'a> {
         })
     }
 
-    pub(crate) fn open_streaming(path: &Path) -> Result<SstPageReader<'static>> {
-        DiskIndexCursor::open(path).map(SstPageReader::Streaming)
+    pub(crate) fn open_streaming(path: &'a Path, bounds: &'a SstBounds) -> Result<Self> {
+        DiskIndexCursor::open(path, &bounds.sparse_index).map(SstPageReader::Streaming)
     }
 
     pub(crate) fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
@@ -159,6 +159,30 @@ impl<'a> SstPageReader<'a> {
         }
         Ok(())
     }
+
+    pub(crate) fn predecessor(
+        &mut self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Result<Option<SstEntry>> {
+        match self {
+            Self::Retained {
+                lookup, position, ..
+            } => {
+                let end = lookup.lower_bound(upper, inclusive);
+                let Some(candidate) = end.checked_sub(1) else {
+                    return Ok(None);
+                };
+                *position = candidate;
+                if self.current_key().is_none_or(|key| key < start) {
+                    return Ok(None);
+                }
+                self.read_current().map(Some)
+            }
+            Self::Streaming(reader) => reader.predecessor(start, upper, inclusive),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,7 +193,7 @@ struct DiskIndexEntry {
 
 /// Allocation-constant cursor over the variable-length on-disk SST index.
 #[derive(Debug)]
-pub(crate) struct DiskIndexCursor {
+pub(crate) struct DiskIndexCursor<'a> {
     index_reader: BufReader<File>,
     point_reader: SstPointReader,
     path: PathBuf,
@@ -179,10 +203,11 @@ pub(crate) struct DiskIndexCursor {
     ordinal: usize,
     next_index_offset: u64,
     current: Option<DiskIndexEntry>,
+    sparse_index: &'a [SstSparseIndexEntry],
 }
 
-impl DiskIndexCursor {
-    fn open(path: &Path) -> Result<Self> {
+impl<'a> DiskIndexCursor<'a> {
+    fn open(path: &Path, sparse_index: &'a [SstSparseIndexEntry]) -> Result<Self> {
         let result = (|| {
             let point_reader = SstPointReader::open(path)?;
             let data_end = point_reader.data_end;
@@ -236,6 +261,7 @@ impl DiskIndexCursor {
                 ordinal: 0,
                 next_index_offset: data_end,
                 current: None,
+                sparse_index,
             };
             if entries == 0 {
                 if data_end != index_end {
@@ -307,6 +333,7 @@ impl DiskIndexCursor {
     }
 
     fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
+        self.seek_near(key, true)?;
         while self.current_key().is_some_and(|candidate| {
             if exclusive {
                 candidate <= key
@@ -316,6 +343,72 @@ impl DiskIndexCursor {
         }) {
             self.advance_one()?;
         }
+        Ok(())
+    }
+
+    fn predecessor(
+        &mut self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Result<Option<SstEntry>> {
+        self.seek_near(upper, inclusive)?;
+        let mut candidate = None;
+        while let Some(current) = self.current.as_ref() {
+            if current.key.as_slice() > upper || (!inclusive && current.key.as_slice() == upper) {
+                break;
+            }
+            if current.key.as_slice() >= start {
+                candidate = Some(current.clone());
+            }
+            self.advance_one()?;
+        }
+        let Some(candidate) = candidate else {
+            return Ok(None);
+        };
+        let value = self
+            .point_reader
+            .read_value(candidate.record_offset, &candidate.key)?;
+        Ok(Some(SstEntry {
+            key: candidate.key,
+            value,
+        }))
+    }
+
+    /// Repositions at the greatest retained seek point that cannot skip a
+    /// possible answer. The subsequent linear walk is bounded by one sparse
+    /// interval and still validates the selected record before serving it.
+    fn seek_near(&mut self, key: &[u8], inclusive: bool) -> Result<()> {
+        let anchor_end = self.sparse_index.partition_point(|anchor| {
+            if inclusive {
+                anchor.key.as_slice() <= key
+            } else {
+                anchor.key.as_slice() < key
+            }
+        });
+        let Some(anchor) = anchor_end
+            .checked_sub(1)
+            .and_then(|position| self.sparse_index.get(position))
+        else {
+            return Ok(());
+        };
+        if anchor.ordinal <= self.ordinal {
+            return Ok(());
+        }
+        self.index_reader
+            .seek(SeekFrom::Start(anchor.index_offset))
+            .map_err(|error| storage_error("seek sparse SST streaming index", &self.path, error))?;
+        self.ordinal = anchor.ordinal;
+        self.next_index_offset = anchor.index_offset;
+        let current = self.parse_next_entry(anchor.ordinal)?;
+        if current.key != anchor.key || current.record_offset != anchor.record_offset {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST sparse index anchor drift at ordinal {} in {}",
+                anchor.ordinal,
+                self.path.display()
+            )));
+        }
+        self.current = Some(current);
         Ok(())
     }
 

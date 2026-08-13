@@ -103,6 +103,22 @@ pub struct SstSummary {
 pub(crate) struct SstBounds {
     pub(crate) first_key: Vec<u8>,
     pub(crate) last_key: Vec<u8>,
+    /// Allocation-bounded seek points into the variable-length on-disk index.
+    ///
+    /// Cold readers use these to start within one bounded index interval of a
+    /// requested key. Retaining every decoded key made memory scale with the
+    /// lifetime corpus; retaining no seek points made a near-tail lookup replay
+    /// the complete historical index. The bounds scan already validates every
+    /// index entry, so recording a capped subset adds no extra disk pass.
+    pub(crate) sparse_index: Vec<SstSparseIndexEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SstSparseIndexEntry {
+    pub(crate) key: Vec<u8>,
+    pub(crate) index_offset: u64,
+    pub(crate) ordinal: usize,
+    pub(crate) record_offset: u64,
 }
 
 /// A key/value row read from an SSTable.
@@ -324,32 +340,6 @@ impl SstReader {
         Ok(())
     }
 
-    /// Reads at most one record: the greatest key in the requested bound.
-    pub(crate) fn predecessor(
-        &self,
-        start: &[u8],
-        upper: &[u8],
-        inclusive: bool,
-    ) -> Result<Option<SstEntry>> {
-        let position = self.index.partition_point(|entry| {
-            if inclusive {
-                entry.key.as_slice() <= upper
-            } else {
-                entry.key.as_slice() < upper
-            }
-        });
-        let Some(entry) = position
-            .checked_sub(1)
-            .and_then(|index| self.index.get(index))
-        else {
-            return Ok(None);
-        };
-        if entry.key.as_slice() < start {
-            return Ok(None);
-        }
-        read_record(self.column.as_bytes(), entry.offset).map(Some)
-    }
-
     pub fn range_key_states(&self, start: &[u8], end: &[u8]) -> Result<Vec<SstKeyState>> {
         self.range_key_states_until(start, Some(end))
     }
@@ -476,7 +466,22 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
     let mut previous = Vec::<u8>::new();
     let mut current = Vec::<u8>::new();
     let mut last_offset = None::<u64>;
+    let index_bytes = end.saturating_sub(header.index_offset);
+    let sparse_interval = index_bytes
+        .div_ceil((MAX_SST_SPARSE_INDEX_ENTRIES - 1) as u64)
+        .max(SST_SPARSE_INDEX_INTERVAL_BYTES);
+    let mut next_sparse_offset = header.index_offset;
+    let mut sparse_index = Vec::new();
+    let estimated_sparse_entries = usize::try_from(index_bytes.div_ceil(sparse_interval))
+        .unwrap_or(usize::MAX)
+        .saturating_add(1)
+        .min(MAX_SST_SPARSE_INDEX_ENTRIES)
+        .min(header.entries as usize);
+    sparse_index
+        .try_reserve_exact(estimated_sparse_entries)
+        .map_err(scan_reserve_failed)?;
     for ordinal in 0..header.entries {
+        let index_entry_offset = offset;
         let fixed_end = offset
             .checked_add(INDEX_ENTRY_FIXED_LEN as u64)
             .ok_or_else(|| {
@@ -522,6 +527,29 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
         if first.is_none() {
             first = Some((clone_scan_bytes(&current)?, record_offset));
         }
+        let is_last = ordinal.saturating_add(1) == header.entries;
+        if ordinal == 0 || index_entry_offset >= next_sparse_offset || is_last {
+            if sparse_index
+                .last()
+                .is_none_or(|entry: &SstSparseIndexEntry| entry.ordinal != ordinal as usize)
+            {
+                if sparse_index.len() >= MAX_SST_SPARSE_INDEX_ENTRIES {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "SST sparse index exceeded its per-file anchor bound of {MAX_SST_SPARSE_INDEX_ENTRIES}"
+                    )));
+                }
+                if sparse_index.len() == sparse_index.capacity() {
+                    sparse_index.try_reserve(1).map_err(scan_reserve_failed)?;
+                }
+                sparse_index.push(SstSparseIndexEntry {
+                    key: clone_scan_bytes(&current)?,
+                    index_offset: index_entry_offset,
+                    ordinal: ordinal as usize,
+                    record_offset,
+                });
+            }
+            next_sparse_offset = index_entry_offset.saturating_add(sparse_interval);
+        }
         std::mem::swap(&mut previous, &mut current);
         last_offset = Some(record_offset);
         offset = key_end;
@@ -551,6 +579,7 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
     Ok(Some(SstBounds {
         first_key,
         last_key,
+        sparse_index,
     }))
 }
 
@@ -558,6 +587,13 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
 /// sequential, so startup retains exactly one such buffer regardless of vault
 /// size or immutable-file count.
 const SST_BOUNDS_BUFFER_BYTES: usize = 64 * 1_024;
+
+/// Cold-index seek points are spaced by at least 256 KiB and capped per SST.
+/// A normal 64 MiB SST therefore retains at most 258 tiny anchors even if its
+/// data consists of millions of small rows, while a malformed/oversized SST
+/// can never contribute more than this absolute per-file count.
+const SST_SPARSE_INDEX_INTERVAL_BYTES: u64 = 256 * 1_024;
+const MAX_SST_SPARSE_INDEX_ENTRIES: usize = 1_024;
 
 fn read_exact_sst_stream(
     reader: &mut impl Read,
