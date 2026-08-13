@@ -101,6 +101,89 @@
 #[global_allocator]
 static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+unsafe extern "C" {
+    // Present in the mimalloc v3 library linked by `libmimalloc-sys`. The sys
+    // crate has not exposed this v3 entry point yet, so keep the declaration
+    // beside the process-global allocator that owns its use.
+    fn mi_thread_set_in_threadpool();
+}
+
+fn mark_mimalloc_threadpool_worker() {
+    // SAFETY: this is called by the worker itself at thread start, exactly as
+    // mimalloc requires. It has no arguments and mutates only that thread's
+    // allocator-local state.
+    unsafe { mi_thread_set_in_threadpool() };
+}
+
+// mimalloc v3 option indexes from the exact vendored v3 `mimalloc.h` linked by
+// libmimalloc-sys 0.1.49. The sys crate intentionally omits unstable option
+// constants, so startup version-gates these indexes and fails closed if a
+// future allocator changes the ABI instead of silently applying the wrong
+// policy.
+// The linked v3.3.2 reports 30302: major * 10_000 + minor * 100 + patch.
+const MIMALLOC_V3_MIN_VERSION: i32 = 30_000;
+const MIMALLOC_V4_MIN_VERSION: i32 = 40_000;
+const MI_OPTION_PURGE_DECOMMITS_V3: libmimalloc_sys::mi_option_t = 5;
+const MI_OPTION_PURGE_DELAY_V3: libmimalloc_sys::mi_option_t = 15;
+const MI_OPTION_ARENA_PURGE_MULT_V3: libmimalloc_sys::mi_option_t = 24;
+
+#[derive(Clone, Copy)]
+struct MimallocBackgroundPolicy {
+    version: i32,
+    purge_decommits: i32,
+    purge_delay_ms: i32,
+    arena_purge_mult: i32,
+}
+
+fn configure_mimalloc_for_background_daemon() -> anyhow::Result<MimallocBackgroundPolicy> {
+    // SAFETY: this runs as the first statement in `main`, before runtime or
+    // worker creation. mimalloc documents option mutation as non-thread-safe;
+    // no other application thread can allocate concurrently at this point.
+    let version = unsafe { libmimalloc_sys::mi_version() };
+    anyhow::ensure!(
+        (MIMALLOC_V3_MIN_VERSION..MIMALLOC_V4_MIN_VERSION).contains(&version),
+        "SYNAPSE_MIMALLOC_VERSION_UNSUPPORTED: linked mimalloc version {version} is outside the verified v3 option ABI; update the startup option indexes from the linked mimalloc.h before running the daemon"
+    );
+    // Immediate purge plus Windows decommit returns every newly empty page to
+    // physical-memory accounting at its real ownership boundary. An arena
+    // multiplier of one prevents abandoned short-lived worker arenas from
+    // extending that delay again. This changes retention policy, never
+    // admission or allocation limits.
+    unsafe {
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DECOMMITS_V3, 1);
+        libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY_V3, 0);
+        libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_PURGE_MULT_V3, 1);
+    }
+    let observed = unsafe {
+        (
+            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DECOMMITS_V3),
+            libmimalloc_sys::mi_option_get(MI_OPTION_PURGE_DELAY_V3),
+            libmimalloc_sys::mi_option_get(MI_OPTION_ARENA_PURGE_MULT_V3),
+        )
+    };
+    anyhow::ensure!(
+        observed == (1, 0, 1),
+        "SYNAPSE_MIMALLOC_BACKGROUND_POLICY_REJECTED: requested purge_decommits=1 purge_delay_ms=0 arena_purge_mult=1, read back purge_decommits={} purge_delay_ms={} arena_purge_mult={}; inspect allocator startup configuration before retrying",
+        observed.0,
+        observed.1,
+        observed.2
+    );
+    Ok(MimallocBackgroundPolicy {
+        version,
+        purge_decommits: observed.0,
+        purge_delay_ms: observed.1,
+        arena_purge_mult: observed.2,
+    })
+}
+
+fn reclaim_mimalloc_transient_pages() {
+    // SAFETY: `GLOBAL_ALLOCATOR` makes mimalloc the process allocator before
+    // `main` begins. `mi_collect(true)` takes no pointer; it eagerly collects
+    // abandoned pages and returns unused pages to the OS. The Calyx hook calls
+    // it only at bounded streaming boundaries.
+    unsafe { libmimalloc_sys::mi_collect(true) };
+}
+
 mod approval_protocol;
 mod bearer_token;
 mod chrome_debugger_bridge;
@@ -148,7 +231,90 @@ use crate::{
 
 const ALLOW_SHELL_ENV: &str = "SYNAPSE_ALLOW_SHELL";
 const ALLOW_LAUNCH_ENV: &str = "SYNAPSE_ALLOW_LAUNCH";
+const TOKIO_WORKER_THREADS_ENV: &str = "TOKIO_WORKER_THREADS";
+const TOKIO_MAX_BLOCKING_THREADS_ENV: &str = "SYNAPSE_TOKIO_MAX_BLOCKING_THREADS";
+const RAYON_WORKER_THREADS_ENV: &str = "RAYON_NUM_THREADS";
 const STDIO_SERVICE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_TOKIO_WORKER_THREADS: usize = 4;
+const MAX_TOKIO_BLOCKING_THREADS: usize = 16;
+const MAX_RAYON_WORKER_THREADS: usize = 4;
+const MAX_CONFIGURED_RUNTIME_THREADS: usize = 1024;
+
+#[derive(Clone, Copy, Debug)]
+struct RuntimePoolConfig {
+    logical_cpus: usize,
+    tokio_worker_threads: usize,
+    tokio_worker_threads_source: &'static str,
+    tokio_max_blocking_threads: usize,
+    tokio_max_blocking_threads_source: &'static str,
+    rayon_worker_threads: usize,
+    rayon_worker_threads_source: &'static str,
+}
+
+fn runtime_pool_config() -> anyhow::Result<RuntimePoolConfig> {
+    let logical_cpus = std::thread::available_parallelism()
+        .context("read host parallelism for bounded daemon worker pools")?
+        .get();
+    let (tokio_worker_threads, tokio_worker_threads_source) = configured_pool_threads(
+        TOKIO_WORKER_THREADS_ENV,
+        logical_cpus.min(MAX_TOKIO_WORKER_THREADS),
+    )?;
+    let (tokio_max_blocking_threads, tokio_max_blocking_threads_source) =
+        configured_pool_threads(TOKIO_MAX_BLOCKING_THREADS_ENV, MAX_TOKIO_BLOCKING_THREADS)?;
+    let (rayon_worker_threads, rayon_worker_threads_source) = configured_pool_threads(
+        RAYON_WORKER_THREADS_ENV,
+        logical_cpus.min(MAX_RAYON_WORKER_THREADS),
+    )?;
+    Ok(RuntimePoolConfig {
+        logical_cpus,
+        tokio_worker_threads,
+        tokio_worker_threads_source,
+        tokio_max_blocking_threads,
+        tokio_max_blocking_threads_source,
+        rayon_worker_threads,
+        rayon_worker_threads_source,
+    })
+}
+
+fn configured_pool_threads(name: &str, default: usize) -> anyhow::Result<(usize, &'static str)> {
+    let raw = match std::env::var(name) {
+        Ok(raw) => raw,
+        Err(std::env::VarError::NotPresent) => return Ok((default, "bounded_default")),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("{name} must be valid UTF-8 when set")
+        }
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{name} must not be empty when set");
+    }
+    let configured = trimmed
+        .parse::<usize>()
+        .with_context(|| format!("{name} must be a positive integer, got {raw:?}"))?;
+    if configured == 0 {
+        anyhow::bail!("{name} must be >= 1 when set");
+    }
+    if configured > MAX_CONFIGURED_RUNTIME_THREADS {
+        anyhow::bail!(
+            "{name} must be <= {MAX_CONFIGURED_RUNTIME_THREADS} when set, got {configured}"
+        );
+    }
+    Ok((configured, "environment"))
+}
+
+fn initialize_rayon_pool(config: RuntimePoolConfig) -> anyhow::Result<()> {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(config.rayon_worker_threads)
+        .thread_name(|index| format!("synapse-rayon-{index}"))
+        .start_handler(|_| mark_mimalloc_threadpool_worker())
+        .build_global()
+        .with_context(|| {
+            format!(
+                "initialize bounded global Rayon pool with {} workers",
+                config.rayon_worker_threads
+            )
+        })
+}
 
 type StdioServiceTask =
     ShutdownTaskOwner<Result<rmcp::service::QuitReason, tokio::task::JoinError>>;
@@ -409,6 +575,10 @@ fn parse_env_list(name: &str) -> Vec<String> {
 }
 
 fn main() -> ExitCode {
+    let mimalloc_policy = match configure_mimalloc_for_background_daemon() {
+        Ok(policy) => policy,
+        Err(error) => return top_level_error_exit(error),
+    };
     if let Some(result) = m1::run_detection_worker_from_process_args() {
         return match result {
             Ok(code) => code,
@@ -418,7 +588,20 @@ fn main() -> ExitCode {
             }
         };
     }
+    if let Err(error) =
+        synapse_calyx::install_process_memory_reclaimer(reclaim_mimalloc_transient_pages)
+    {
+        return top_level_error_exit(anyhow::Error::new(error));
+    }
+    let runtime_pools = match runtime_pool_config() {
+        Ok(config) => config,
+        Err(error) => return top_level_error_exit(error),
+    };
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(runtime_pools.tokio_worker_threads)
+        .max_blocking_threads(runtime_pools.tokio_max_blocking_threads)
+        .thread_name("synapse-tokio")
+        .on_thread_start(mark_mimalloc_threadpool_worker)
         .enable_all()
         .build()
     {
@@ -427,7 +610,7 @@ fn main() -> ExitCode {
             return top_level_error_exit(anyhow::anyhow!("initialize tokio runtime: {error:#}"));
         }
     };
-    let result = runtime.block_on(run());
+    let result = runtime.block_on(run(runtime_pools, mimalloc_policy));
     runtime.shutdown_timeout(Duration::from_secs(5));
     match result {
         Ok(code) => code,
@@ -449,7 +632,10 @@ fn top_level_error_exit(err: anyhow::Error) -> ExitCode {
     ExitCode::from(1)
 }
 
-async fn run() -> anyhow::Result<ExitCode> {
+async fn run(
+    runtime_pools: RuntimePoolConfig,
+    mimalloc_policy: MimallocBackgroundPolicy,
+) -> anyhow::Result<ExitCode> {
     if let Some(invocation) =
         chrome_debugger_bridge::native_host_invocation_from_args(std::env::args_os().skip(1))
     {
@@ -596,6 +782,23 @@ async fn run() -> anyhow::Result<ExitCode> {
     // Declare the daemon's scheduling QoS before any subsystem starts, so every
     // thread this process later spawns inherits the asserted priority class
     // rather than the one the launcher happened to hand down (#1910).
+    initialize_rayon_pool(runtime_pools)?;
+    tracing::info!(
+        code = "SYNAPSE_RUNTIME_POOLS_CONFIGURED",
+        logical_cpus = runtime_pools.logical_cpus,
+        tokio_worker_threads = runtime_pools.tokio_worker_threads,
+        tokio_worker_threads_source = runtime_pools.tokio_worker_threads_source,
+        tokio_max_blocking_threads = runtime_pools.tokio_max_blocking_threads,
+        tokio_max_blocking_threads_source = runtime_pools.tokio_max_blocking_threads_source,
+        rayon_worker_threads = runtime_pools.rayon_worker_threads,
+        rayon_worker_threads_source = runtime_pools.rayon_worker_threads_source,
+        mimalloc_threadpool_workers = true,
+        mimalloc_version = mimalloc_policy.version,
+        mimalloc_purge_decommits = mimalloc_policy.purge_decommits,
+        mimalloc_purge_delay_ms = mimalloc_policy.purge_delay_ms,
+        mimalloc_arena_purge_mult = mimalloc_policy.arena_purge_mult,
+        "bounded background runtime worker pools configured"
+    );
     let process_qos = process_qos::assert_interactive_qos();
     crate::server::set_process_qos_report(process_qos);
 

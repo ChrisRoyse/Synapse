@@ -17,10 +17,9 @@ use super::super::{
 };
 use super::{SharedRebuildProgress, emit_shared_progress};
 
-// An encoded multi-vector row may approach the 64 MiB segment ceiling.  Keep
-// raw slot values at one row per read so the progress page setting cannot
-// multiply that hard memory bound.
-const SLOT_POINT_READ_ROWS: usize = 1;
+#[path = "rebuild_scan/slot_vector.rs"]
+mod slot_vector;
+use slot_vector::{abort_flat_dense_writer, abort_sparse_writer, push_slot_vector};
 
 pub(super) fn load_base_docs_at<C: Clock, F>(
     vault: &AsterVault<C>,
@@ -149,16 +148,23 @@ fn decode_base_row(key: Vec<u8>, bytes: Vec<u8>) -> calyx_core::Result<(CxId, Co
 
 pub(super) enum ScannedSlotRows {
     Dense(dense::DenseSlotRows),
-    Sparse(sparse::SparseSlotRows),
+    DenseEntry(SearchIndexEntry),
+    SparseEntry(SearchIndexEntry),
     MultiEntry(SearchIndexEntry),
     AbsentOnly,
+}
+
+pub(super) struct SlotScanOptions<'a> {
+    pub(super) page_rows: usize,
+    pub(super) dense_index_config: &'a super::super::PersistedDenseIndexConfig,
 }
 
 impl ScannedSlotRows {
     pub(super) fn len(&self) -> usize {
         match self {
             Self::Dense(rows) => rows.len(),
-            Self::Sparse(rows) => rows.len(),
+            Self::DenseEntry(entry) => entry.len,
+            Self::SparseEntry(entry) => entry.len,
             Self::MultiEntry(entry) => entry.len,
             Self::AbsentOnly => 0,
         }
@@ -178,93 +184,97 @@ pub(super) fn collect_or_build_slot_from_cf<C: Clock, F>(
     vault: &AsterVault<C>,
     snapshot: Snapshot,
     plan: &SlotBuildPlan,
-    page_rows: usize,
+    options: SlotScanOptions<'_>,
     progress: Option<&SharedRebuildProgress<'_, F>>,
 ) -> CliResult<ScannedSlotRows>
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
+    let SlotScanOptions {
+        page_rows,
+        dense_index_config,
+    } = options;
     let mut found = 0usize;
     let mut shape = None;
     let mut dense_dim = None;
     let mut sparse_dim = None;
     let mut multi_token_dim = None;
     let mut dense_rows = Vec::new();
-    let mut sparse_rows = Vec::new();
+    let mut flat_dense_writer = None;
+    let mut sparse_writer = None;
     let mut multi_writer = None;
     let scan_result: CliResult = (|| {
-        for ids in plan.expected_ids.chunks(SLOT_POINT_READ_ROWS) {
-            let rows = vault.read_slot_cf_batch_snapshot(snapshot, plan.slot, ids)?;
-            if rows.len() != ids.len() {
-                return Err(stale(format!(
-                    "slot {} batch point read returned {} rows for {} requested IDs",
-                    plan.slot,
-                    rows.len(),
-                    ids.len()
-                )));
-            }
-            for (cx_id, bytes) in ids.iter().copied().zip(rows) {
-                let bytes = bytes.ok_or_else(|| {
+        let slot_cf = ColumnFamily::slot(plan.slot);
+        for cx_id in plan.expected_ids.iter().copied() {
+            // A multi-vector row may approach the 64 MiB segment ceiling, so
+            // this remains a strict one-row live-set bound. Use the exact
+            // pinned point-read primitive directly: wrapping every single row
+            // in `read_batch` allocated request/result vectors and acquired an
+            // all-family guard hundreds of thousands of times per slot.
+            let bytes = vault
+                .read_cf_snapshot(snapshot, slot_cf, cx_id.as_bytes())?
+                .ok_or_else(|| {
                     CalyxError::aster_corrupt_shard(format!(
                         "slot CF row missing for slot {} cx_id {cx_id}",
                         plan.slot
                     ))
                 })?;
-                let encoded_shape = inspect_slot_vector(&bytes).map_err(|error| {
-                    CalyxError::aster_corrupt_shard(format!(
-                        "slot {} cx {cx_id} has malformed encoded payload: {}",
-                        plan.slot, error.message
-                    ))
-                })?;
-                let flushed = match encoded_shape {
-                    EncodedSlotVectorShape::Multi {
+            let encoded_shape = inspect_slot_vector(&bytes).map_err(|error| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "slot {} cx {cx_id} has malformed encoded payload: {}",
+                    plan.slot, error.message
+                ))
+            })?;
+            let flushed = match encoded_shape {
+                EncodedSlotVectorShape::Multi {
+                    token_dim,
+                    token_count,
+                } => {
+                    multi::ensure_streaming_row_bounded(
+                        plan.slot,
+                        cx_id,
                         token_dim,
                         token_count,
-                    } => {
-                        multi::ensure_streaming_row_bounded(
-                            plan.slot,
-                            cx_id,
-                            token_dim,
-                            token_count,
-                            bytes.len(),
-                        )?;
-                        push_encoded_multi(
-                            plan,
-                            cx_id,
-                            token_dim,
-                            token_count,
-                            bytes,
-                            &mut shape,
-                            &mut multi_token_dim,
-                            &mut multi_writer,
-                            vault_dir,
-                            root,
-                            snapshot.seq(),
-                        )?
-                    }
-                    EncodedSlotVectorShape::Dense { .. }
-                    | EncodedSlotVectorShape::Sparse { .. }
-                    | EncodedSlotVectorShape::Absent => push_slot_vector(
+                        bytes.len(),
+                    )?;
+                    push_encoded_multi(
                         plan,
                         cx_id,
-                        decode_slot_vector(&bytes)?,
+                        token_dim,
+                        token_count,
+                        bytes,
                         &mut shape,
-                        &mut dense_dim,
-                        &mut sparse_dim,
                         &mut multi_token_dim,
-                        &mut dense_rows,
-                        &mut sparse_rows,
                         &mut multi_writer,
                         vault_dir,
                         root,
                         snapshot.seq(),
-                    )?,
-                };
-                if let Some(flushed) = flushed {
-                    emit_segment_flush(progress, plan, snapshot.seq(), flushed)?;
+                    )?
                 }
-                found += 1;
+                EncodedSlotVectorShape::Dense { .. }
+                | EncodedSlotVectorShape::Sparse { .. }
+                | EncodedSlotVectorShape::Absent => push_slot_vector(
+                    plan,
+                    cx_id,
+                    decode_slot_vector(&bytes)?,
+                    &mut shape,
+                    &mut dense_dim,
+                    &mut sparse_dim,
+                    &mut multi_token_dim,
+                    &mut dense_rows,
+                    &mut flat_dense_writer,
+                    &mut sparse_writer,
+                    &mut multi_writer,
+                    vault_dir,
+                    root,
+                    snapshot.seq(),
+                    dense_index_config,
+                )?,
+            };
+            if let Some(flushed) = flushed {
+                emit_segment_flush(progress, plan, snapshot.seq(), flushed)?;
             }
+            found += 1;
             if let Some(progress) = progress
                 && (found.is_multiple_of(page_rows) || found == plan.expected_ids.len())
             {
@@ -283,18 +293,24 @@ where
         Ok(())
     })();
     if let Err(primary) = scan_result {
+        let primary = abort_sparse_writer(&mut sparse_writer, primary);
+        let primary = abort_flat_dense_writer(&mut flat_dense_writer, primary);
         return Err(abort_multi_writer(&mut multi_writer, primary));
     }
     debug_assert_eq!(found, plan.expected_ids.len());
     match shape {
-        Some(SlotRowShape::Dense) => Ok(ScannedSlotRows::Dense(dense::DenseSlotRows {
-            dim: dense_dim.expect("dense shape has dim"),
-            rows: dense_rows,
-        })),
-        Some(SlotRowShape::Sparse) => Ok(ScannedSlotRows::Sparse(sparse::SparseSlotRows {
-            dim: sparse_dim.expect("sparse shape has dim"),
-            rows: sparse_rows,
-        })),
+        Some(SlotRowShape::Dense) => match flat_dense_writer {
+            Some(writer) => Ok(ScannedSlotRows::DenseEntry(writer.finish()?)),
+            None => Ok(ScannedSlotRows::Dense(dense::DenseSlotRows {
+                dim: dense_dim.expect("dense shape has dim"),
+                rows: dense_rows,
+            })),
+        },
+        Some(SlotRowShape::Sparse) => Ok(ScannedSlotRows::SparseEntry(
+            sparse_writer
+                .ok_or_else(|| stale(format!("slot {} has sparse shape but no rows", plan.slot)))?
+                .finish()?,
+        )),
         Some(SlotRowShape::Multi) => {
             let writer = multi_writer
                 .ok_or_else(|| stale(format!("slot {} has multi shape but no rows", plan.slot)))?;
@@ -305,86 +321,6 @@ where
             Ok(ScannedSlotRows::MultiEntry(entry))
         }
         None => Ok(ScannedSlotRows::AbsentOnly),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn push_slot_vector(
-    plan: &SlotBuildPlan,
-    cx_id: CxId,
-    vector: SlotVector,
-    shape: &mut Option<SlotRowShape>,
-    dense_dim: &mut Option<u32>,
-    sparse_dim: &mut Option<u32>,
-    multi_token_dim: &mut Option<u32>,
-    dense_rows: &mut Vec<(CxId, Vec<f32>)>,
-    sparse_rows: &mut Vec<(CxId, Vec<calyx_core::SparseEntry>)>,
-    multi_writer: &mut Option<multi::StreamingSegmentsWriter>,
-    vault_dir: &Path,
-    root: &Path,
-    base_seq: u64,
-) -> CliResult<Option<multi::SegmentFlush>> {
-    vector.validate_schema().map_err(|err| {
-        stale(format!(
-            "slot {} cx {cx_id} has invalid payload: {}",
-            plan.slot, err.message
-        ))
-    })?;
-    match vector {
-        SlotVector::Dense { dim, data } => {
-            require_shape(shape, SlotRowShape::Dense, plan.slot, cx_id)?;
-            dense::validate_dense(plan.slot, cx_id, dim, &data)?;
-            match *dense_dim {
-                Some(expected_dim) if expected_dim != dim => {
-                    return Err(stale(format!(
-                        "slot {} has mixed dense dims: {expected_dim} and {dim}",
-                        plan.slot
-                    )));
-                }
-                None => *dense_dim = Some(dim),
-                _ => {}
-            }
-            dense_rows.push((cx_id, data));
-            Ok(None)
-        }
-        SlotVector::Sparse { dim, entries } => {
-            require_shape(shape, SlotRowShape::Sparse, plan.slot, cx_id)?;
-            match *sparse_dim {
-                Some(expected_dim) if expected_dim != dim => {
-                    return Err(stale(format!(
-                        "slot {} has mixed sparse dims: {expected_dim} and {dim}",
-                        plan.slot
-                    )));
-                }
-                None => *sparse_dim = Some(dim),
-                _ => {}
-            }
-            sparse_rows.push((cx_id, entries));
-            Ok(None)
-        }
-        SlotVector::Multi { token_dim, tokens } => {
-            require_shape(shape, SlotRowShape::Multi, plan.slot, cx_id)?;
-            match *multi_token_dim {
-                Some(expected_dim) if expected_dim != token_dim => {
-                    return Err(stale(format!(
-                        "slot {} has mixed multi token dims: {expected_dim} and {token_dim}",
-                        plan.slot
-                    )));
-                }
-                None => *multi_token_dim = Some(token_dim),
-                _ => {}
-            }
-            if multi_writer.is_none() {
-                *multi_writer = Some(multi::StreamingSegmentsWriter::new(
-                    vault_dir, root, plan.slot, token_dim, base_seq,
-                ));
-            }
-            multi_writer
-                .as_mut()
-                .expect("multi writer initialized")
-                .push(cx_id, tokens)
-        }
-        SlotVector::Absent { .. } => Ok(None),
     }
 }
 

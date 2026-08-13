@@ -1,63 +1,25 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::io::{Read, Write};
+use std::collections::BTreeSet;
+use std::fs::File;
+use std::io::{BufReader, Read, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
 
 use calyx_core::{CxId, SlotId, SlotVector};
 use calyx_sextant::index::{IndexSearchHit, ranked};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use super::{DenseSlotRows, cosine};
+use super::cosine;
 use crate::error::CliResult;
-use crate::persisted::pinned::{self, PinKey};
-use crate::persisted::{SearchIndexEntry, rel, sha256_hex, stale, write_atomic_hashed};
+use crate::persisted::{HashingReader, SearchIndexEntry, stale};
+
+#[path = "flat/writer.rs"]
+mod writer;
+pub(in crate::persisted) use writer::StreamingWriter;
+pub(super) use writer::write;
 
 const FORMAT: &str = "calyx-search-flat-dense-v1";
 const MAGIC: &[u8; 16] = b"CALYXFLATDENSE01";
-const DEFAULT_MAX_ROWS: usize = 32_768;
-// Exact search is both faster and recall-perfect for large low-dimensional
-// structured lanes. Row count alone sent 50k x 1/2/8/16 lanes with extensive
-// ties through graph ANN even though their complete scalar scan is cheaper
-// than a high-dimensional graph traversal.
-const DEFAULT_MAX_SCALAR_VALUES: usize = 1_000_000;
-const PIN_KIND: &str = "flat_dense";
-
-pub(super) fn should_use_index(row_count: usize, dim: u32) -> bool {
-    row_count <= DEFAULT_MAX_ROWS
-        || row_count.saturating_mul(dim as usize) <= DEFAULT_MAX_SCALAR_VALUES
-}
-
-pub(super) fn write(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    rows: DenseSlotRows,
-    base_seq: u64,
-) -> CliResult<SearchIndexEntry> {
-    let path = root.join(format!(
-        "slot_{:05}_seq_{base_seq:020}_n_{:010}.flatdense.bin",
-        slot.get(),
-        rows.rows.len()
-    ));
-    let header = Header {
-        format: FORMAT.to_string(),
-        slot: slot.get(),
-        dim: rows.dim,
-        base_seq,
-        len: rows.rows.len(),
-    };
-    let sha256 = write_atomic_hashed(&path, |writer| write_sidecar(writer, &header, &rows.rows))?;
-    Ok(SearchIndexEntry::flat_dense(
-        slot,
-        rows.dim,
-        rows.rows.len(),
-        base_seq,
-        rel(vault_dir, &path)?,
-        sha256,
-    ))
-}
+const SEARCH_BATCH_ROWS: usize = 8_192;
 
 pub(super) fn search(
     vault_dir: &Path,
@@ -75,40 +37,34 @@ pub(super) fn search(
             "persistent flat dense search slot {slot} received non-dense query"
         )));
     };
-    let index = pinned_index(vault_dir, entry, slot)?;
-    if index.header.dim != *dim {
-        return Err(stale(format!(
-            "persistent flat dense slot {slot} index dim {} != query dim {dim}; reingest/backfill the vault",
-            index.header.dim
-        )));
-    }
-    // Score every physical row independently through Sextant's dispatched
-    // cosine kernel. The indexed Option vector retains sidecar row order even
-    // when candidate filtering is active; selection below owns the final total
-    // order and tie break exactly as before.
-    let mut scored = index
-        .rows
-        .par_iter()
-        .map(|(cx_id, values)| {
-            candidates
-                .is_none_or(|allowed| allowed.contains(cx_id))
-                .then(|| (*cx_id, cosine(data, values)))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    let compare = |left: &(CxId, f32), right: &(CxId, f32)| {
-        right
-            .1
-            .total_cmp(&left.1)
-            .then_with(|| left.0.cmp(&right.0))
-    };
-    if scored.len() > k {
-        scored.select_nth_unstable_by(k, compare);
-        scored.truncate(k);
-    }
-    scored.sort_unstable_by(compare);
+    let mut scored = Vec::new();
+    with_verified_rows(vault_dir, entry, slot, |header, row_bytes, batch| {
+        if header.dim != *dim {
+            return Err(stale(format!(
+                "persistent flat dense slot {slot} index dim {} != query dim {dim}; reingest/backfill the vault",
+                header.dim
+            )));
+        }
+        let mut batch_scores = batch
+            .par_chunks_exact(row_bytes)
+            .map_init(
+                || vec![0.0_f32; data.len()],
+                |decoded, row| {
+                    let cx_id = decode_id(row);
+                    if candidates.is_some_and(|allowed| !allowed.contains(&cx_id)) {
+                        return None;
+                    }
+                    decode_values(&row[16..], decoded);
+                    Some((cx_id, cosine(data, decoded)))
+                },
+            )
+            .filter_map(|scored| scored)
+            .collect::<Vec<_>>();
+        scored.append(&mut batch_scores);
+        retain_best(&mut scored, k);
+        Ok(())
+    })?;
+    scored.sort_unstable_by(compare_scores);
     Ok(ranked(scored))
 }
 
@@ -117,11 +73,20 @@ pub(super) fn ids(
     entry: &SearchIndexEntry,
     slot: SlotId,
 ) -> CliResult<Vec<CxId>> {
-    Ok(pinned_index(vault_dir, entry, slot)?
-        .rows
-        .iter()
-        .map(|(cx_id, _)| *cx_id)
-        .collect())
+    let mut ids = Vec::with_capacity(entry.len);
+    with_verified_rows(vault_dir, entry, slot, |_header, row_bytes, batch| {
+        ids.extend(batch.chunks_exact(row_bytes).map(decode_id));
+        Ok(())
+    })?;
+    Ok(ids)
+}
+
+pub(super) fn validate_entry(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    slot: SlotId,
+) -> CliResult {
+    with_verified_rows(vault_dir, entry, slot, |_header, _row_bytes, _batch| Ok(()))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -133,122 +98,100 @@ struct Header {
     len: usize,
 }
 
-#[derive(Debug)]
-struct Index {
-    header: Header,
-    rows: Vec<(CxId, Vec<f32>)>,
-}
-
-type FlatPinCache = Mutex<BTreeMap<(String, u16), (String, Arc<Index>)>>;
-
-fn cache() -> &'static FlatPinCache {
-    static CACHE: OnceLock<FlatPinCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-/// Verify-once-then-pin: the flat dense sidecar is fully read, hashed, and
-/// validated on first use per manifest generation (keyed by the manifest
-/// entry sha256); cache hits still fail closed on seq drift between the
-/// pinned header and the manifest entry being served.
-fn pinned_index(vault_dir: &Path, entry: &SearchIndexEntry, slot: SlotId) -> CliResult<Arc<Index>> {
-    let entry_sha256 = entry.require_sha256(slot)?.to_string();
-    let cache_key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
-    {
-        let cache = cache().lock().expect("flat dense pin cache poisoned");
-        if let Some((pinned_sha, index)) = cache.get(&cache_key)
-            && *pinned_sha == entry_sha256
-        {
-            if index.header.base_seq != entry.built_at_seq {
-                return Err(stale(format!(
-                    "persistent flat dense sidecar seq {} != manifest seq {}; rebuild the vault search indexes",
-                    index.header.base_seq, entry.built_at_seq
-                )));
-            }
-            return Ok(Arc::clone(index));
-        }
-    }
-    let path = vault_dir.join(entry.require_index_rel(slot)?);
-    let sidecar_bytes = if path.is_file() {
-        fs::metadata(&path)?.len()
-    } else {
-        0
-    };
-    let index = Arc::new(read(vault_dir, entry, slot)?);
-    let pin_key = PinKey::new(vault_dir, slot.get(), PIN_KIND)?;
-    pinned::reserve(&pin_key, sidecar_bytes)?;
-    let mut cache = cache().lock().expect("flat dense pin cache poisoned");
-    cache.insert(cache_key, (entry_sha256, Arc::clone(&index)));
-    Ok(index)
-}
-
-fn write_sidecar(
-    writer: &mut impl Write,
-    header: &Header,
-    rows: &[(CxId, Vec<f32>)],
-) -> CliResult<()> {
+fn write_header(writer: &mut impl Write, header: &Header) -> CliResult {
     writer.write_all(MAGIC)?;
-    let header = bincode::serde::encode_to_vec(header, bincode::config::standard())
+    let encoded = bincode::serde::encode_to_vec(header, bincode::config::standard())
         .map_err(|error| stale(format!("encode flat dense header failed: {error}")))?;
-    writer.write_all(&(header.len() as u32).to_le_bytes())?;
-    writer.write_all(&header)?;
-    for (cx_id, values) in rows {
-        writer.write_all(cx_id.as_bytes())?;
-        for value in values {
-            writer.write_all(&value.to_le_bytes())?;
-        }
-    }
+    writer.write_all(&(encoded.len() as u32).to_le_bytes())?;
+    writer.write_all(&encoded)?;
     Ok(())
 }
 
-fn read(vault_dir: &Path, entry: &SearchIndexEntry, slot: SlotId) -> CliResult<Index> {
+fn with_verified_rows<F>(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    slot: SlotId,
+    mut visit: F,
+) -> CliResult
+where
+    F: FnMut(&Header, usize, &[u8]) -> CliResult,
+{
     entry.require_kind("flat_dense", slot)?;
     let path = vault_dir.join(entry.require_index_rel(slot)?);
-    let bytes = fs::read(&path)?;
-    let actual = sha256_hex(&bytes);
+    let file = File::open(&path)?;
+    let file_len = file.metadata()?.len();
+    let mut reader = HashingReader::new(BufReader::new(file));
+    let (header, header_len) = read_header(&mut reader, &path)?;
+    validate_header(&header, entry, slot)?;
+    let row_bytes = row_bytes(header.dim, slot)?;
+    validate_size(file_len, header_len, row_bytes, &header, slot, &path)?;
+    let batch_rows = SEARCH_BATCH_ROWS.min(header.len.max(1));
+    let batch_bytes = row_bytes.checked_mul(batch_rows).ok_or_else(|| {
+        stale(format!(
+            "persistent flat dense slot {slot} batch size overflow"
+        ))
+    })?;
+    let mut buffer = vec![0_u8; batch_bytes];
+    let mut remaining = header.len;
+    let mut last_cx_id = None;
+    while remaining > 0 {
+        let rows = remaining.min(batch_rows);
+        let bytes = row_bytes.checked_mul(rows).ok_or_else(|| {
+            stale(format!(
+                "persistent flat dense slot {slot} page size overflow"
+            ))
+        })?;
+        reader.read_exact(&mut buffer[..bytes])?;
+        validate_rows(
+            &buffer[..bytes],
+            row_bytes,
+            header.dim,
+            slot,
+            &path,
+            &mut last_cx_id,
+        )?;
+        visit(&header, row_bytes, &buffer[..bytes])?;
+        remaining -= rows;
+    }
+    let mut trailing = [0_u8; 1];
+    if reader.read(&mut trailing)? != 0 {
+        return Err(stale(format!(
+            "persistent flat dense sidecar {} has trailing bytes; rebuild the vault search indexes",
+            path.display()
+        )));
+    }
+    let actual = reader.into_sha256();
     let expected = entry.require_sha256(slot)?;
     if actual != expected {
         return Err(stale(format!(
             "persistent flat dense sidecar sha256 {actual} != manifest {expected}; rebuild the vault search indexes"
         )));
     }
-    let mut cursor = std::io::Cursor::new(bytes);
-    let mut magic = [0u8; 16];
-    cursor.read_exact(&mut magic)?;
+    Ok(())
+}
+
+fn read_header(reader: &mut impl Read, path: &Path) -> CliResult<(Header, usize)> {
+    let mut magic = [0_u8; 16];
+    reader.read_exact(&mut magic)?;
     if &magic != MAGIC {
         return Err(stale(format!(
             "persistent flat dense sidecar {} has invalid magic; rebuild the vault search indexes",
             path.display()
         )));
     }
-    let header = read_header(&mut cursor, &path)?;
-    validate_header(&header, entry, slot)?;
-    validate_size(&cursor, &path, &header, slot)?;
-    read_rows(cursor, header, slot, &path)
-}
-
-pub(super) fn validate_entry(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    slot: SlotId,
-) -> CliResult {
-    let _ = read(vault_dir, entry, slot)?;
-    Ok(())
-}
-
-fn read_header(cursor: &mut std::io::Cursor<Vec<u8>>, path: &Path) -> CliResult<Header> {
-    let mut header_len = [0u8; 4];
-    cursor.read_exact(&mut header_len)?;
-    let header_len = u32::from_le_bytes(header_len) as usize;
+    let mut raw_len = [0_u8; 4];
+    reader.read_exact(&mut raw_len)?;
+    let header_len = u32::from_le_bytes(raw_len) as usize;
     if header_len == 0 || header_len > 64 * 1024 {
         return Err(stale(format!(
             "persistent flat dense sidecar {} has invalid header length {header_len}; rebuild the vault search indexes",
             path.display()
         )));
     }
-    let mut header_bytes = vec![0u8; header_len];
-    cursor.read_exact(&mut header_bytes)?;
+    let mut encoded = vec![0_u8; header_len];
+    reader.read_exact(&mut encoded)?;
     let (header, consumed): (Header, usize) =
-        bincode::serde::decode_from_slice(&header_bytes, bincode::config::standard()).map_err(
+        bincode::serde::decode_from_slice(&encoded, bincode::config::standard()).map_err(
             |error| {
                 stale(format!(
                     "persistent flat dense sidecar {} header decode failed: {error}; rebuild the vault search indexes",
@@ -256,14 +199,14 @@ fn read_header(cursor: &mut std::io::Cursor<Vec<u8>>, path: &Path) -> CliResult<
                 ))
             },
         )?;
-    if consumed != header_bytes.len() {
+    if consumed != encoded.len() {
         return Err(stale(format!(
             "persistent flat dense sidecar {} header consumed {consumed} of {} bytes; rebuild the vault search indexes",
             path.display(),
-            header_bytes.len()
+            encoded.len()
         )));
     }
-    Ok(header)
+    Ok((header, header_len))
 }
 
 fn validate_header(header: &Header, entry: &SearchIndexEntry, slot: SlotId) -> CliResult {
@@ -303,20 +246,22 @@ fn validate_header(header: &Header, entry: &SearchIndexEntry, slot: SlotId) -> C
     Ok(())
 }
 
+fn row_bytes(dim: u32, slot: SlotId) -> CliResult<usize> {
+    16usize.checked_add(dim as usize * 4).ok_or_else(|| {
+        stale(format!(
+            "persistent flat dense slot {slot} row byte size overflow"
+        ))
+    })
+}
+
 fn validate_size(
-    cursor: &std::io::Cursor<Vec<u8>>,
-    path: &Path,
+    file_len: u64,
+    header_len: usize,
+    row_bytes: usize,
     header: &Header,
     slot: SlotId,
+    path: &Path,
 ) -> CliResult {
-    let header_len = cursor.position() as usize - MAGIC.len() - 4;
-    let row_bytes = 16usize
-        .checked_add(header.dim as usize * 4)
-        .ok_or_else(|| {
-            stale(format!(
-                "persistent flat dense slot {slot} row byte size overflow"
-            ))
-        })?;
     let expected_len = MAGIC
         .len()
         .checked_add(4)
@@ -327,40 +272,64 @@ fn validate_size(
                 "persistent flat dense slot {slot} file size overflow"
             ))
         })?;
-    if cursor.get_ref().len() != expected_len {
+    if file_len != expected_len as u64 {
         return Err(stale(format!(
-            "persistent flat dense sidecar {} has {} bytes, expected {expected_len}; rebuild the vault search indexes",
-            path.display(),
-            cursor.get_ref().len()
+            "persistent flat dense sidecar {} has {file_len} bytes, expected {expected_len}; rebuild the vault search indexes",
+            path.display()
         )));
     }
     Ok(())
 }
 
-fn read_rows(
-    mut cursor: std::io::Cursor<Vec<u8>>,
-    header: Header,
+fn validate_rows(
+    bytes: &[u8],
+    row_bytes: usize,
+    dim: u32,
     slot: SlotId,
     path: &Path,
-) -> CliResult<Index> {
-    let mut rows = Vec::with_capacity(header.len);
-    for _ in 0..header.len {
-        let mut id = [0u8; 16];
-        cursor.read_exact(&mut id)?;
-        let mut values = Vec::with_capacity(header.dim as usize);
-        for _ in 0..header.dim {
-            let mut raw = [0u8; 4];
-            cursor.read_exact(&mut raw)?;
-            let value = f32::from_le_bytes(raw);
-            if !value.is_finite() {
-                return Err(stale(format!(
-                    "persistent flat dense sidecar {} has non-finite value for slot {slot}; rebuild the vault search indexes",
-                    path.display()
-                )));
-            }
-            values.push(value);
+    last_cx_id: &mut Option<CxId>,
+) -> CliResult {
+    for row in bytes.chunks_exact(row_bytes) {
+        let cx_id = decode_id(row);
+        if last_cx_id.is_some_and(|previous| previous >= cx_id) {
+            return Err(stale(format!(
+                "persistent flat dense sidecar {} slot {slot} IDs are not strictly increasing: previous={last_cx_id:?}, current={cx_id}; rebuild the vault search indexes",
+                path.display()
+            )));
         }
-        rows.push((CxId::from_bytes(id), values));
+        if row[16..].chunks_exact(4).take(dim as usize).any(|raw| {
+            !f32::from_le_bytes(raw.try_into().expect("four-byte float chunk")).is_finite()
+        }) {
+            return Err(stale(format!(
+                "persistent flat dense sidecar {} has non-finite value for slot {slot}; rebuild the vault search indexes",
+                path.display()
+            )));
+        }
+        *last_cx_id = Some(cx_id);
     }
-    Ok(Index { header, rows })
+    Ok(())
+}
+
+fn decode_id(row: &[u8]) -> CxId {
+    CxId::from_bytes(row[..16].try_into().expect("validated flat dense ID width"))
+}
+
+fn decode_values(encoded: &[u8], destination: &mut [f32]) {
+    for (value, raw) in destination.iter_mut().zip(encoded.chunks_exact(4)) {
+        *value = f32::from_le_bytes(raw.try_into().expect("four-byte float chunk"));
+    }
+}
+
+fn compare_scores(left: &(CxId, f32), right: &(CxId, f32)) -> std::cmp::Ordering {
+    right
+        .1
+        .total_cmp(&left.1)
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+fn retain_best(scored: &mut Vec<(CxId, f32)>, k: usize) {
+    if scored.len() > k {
+        scored.select_nth_unstable_by(k, compare_scores);
+        scored.truncate(k);
+    }
 }

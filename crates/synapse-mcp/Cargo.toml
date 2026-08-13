@@ -64,6 +64,10 @@ metrics.workspace = true
 # `#[global_allocator]` (src/main.rs), so a silent minor bump would swap the
 # allocator under the daemon between builds. Version moves are a reviewable act.
 mimalloc = "0.1.52"
+# `mimalloc` intentionally does not expose `mi_collect`; this exact sys crate
+# owns that allocator's C API and enables the one narrow reclamation operation
+# used at Calyx streaming rebuild release boundaries.
+libmimalloc-sys = { version = "=0.1.49", features = ["extended"] }
 notify.workspace = true
 rmcp = { workspace = true, features = [
     "transport-streamable-http-server",
@@ -72,6 +76,7 @@ rmcp = { workspace = true, features = [
 ] }
 regex.workspace = true
 reqwest.workspace = true
+rayon.workspace = true
 calyx-oracle = { workspace = true }
 num-traits.workspace = true
 sse-stream.workspace = true

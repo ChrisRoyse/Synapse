@@ -39,6 +39,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -276,8 +277,14 @@ pub struct SynapseCalyxSearchRebuildReport {
     pub private_bytes_before: u64,
     /// Highest process-private byte count observed at rebuild progress boundaries.
     pub private_bytes_peak: u64,
+    /// Exact rebuild boundary at which `private_bytes_peak` was observed.
+    pub private_bytes_peak_phase: String,
     /// Process-private bytes after artifact reopen and independent validation.
     pub private_bytes_after: u64,
+    /// Number of explicit allocator reclamation passes run at rebuild release boundaries.
+    pub private_bytes_reclaim_calls: u64,
+    /// Sum of process-private bytes observed returned after those passes.
+    pub private_bytes_observed_reclaimed: u64,
     pub generation: PersistedSearchGeneration,
     pub manifest_path: PathBuf,
     pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
@@ -797,7 +804,10 @@ pub struct SearchGenerationMaintenanceReport {
     pub after: Option<SynapseCalyxSearchGenerationStatus>,
     pub rebuild_private_bytes_before: Option<u64>,
     pub rebuild_private_bytes_peak: Option<u64>,
+    pub rebuild_private_bytes_peak_phase: Option<String>,
     pub rebuild_private_bytes_after: Option<u64>,
+    pub rebuild_private_bytes_reclaim_calls: Option<u64>,
+    pub rebuild_private_bytes_observed_reclaimed: Option<u64>,
     pub elapsed_ms: u64,
 }
 
@@ -2738,6 +2748,129 @@ pub fn process_private_bytes() -> Result<u64, SynapseCalyxError> {
         .map_err(|error| SynapseCalyxError::from_calyx("read process private commit", &error))
 }
 
+/// Process allocator hook used to return dead transient rebuild pages to the OS.
+///
+/// Calyx is allocator-agnostic, so the executable that selects the global
+/// allocator owns this hook. `synapse-mcp` installs its mimalloc collector once
+/// before opening the vault. Keeping that ownership explicit prevents a library
+/// consumer that uses the system allocator from accidentally invoking a foreign
+/// allocator API.
+type ProcessMemoryReclaimer = fn();
+static PROCESS_MEMORY_RECLAIMER: OnceLock<ProcessMemoryReclaimer> = OnceLock::new();
+
+/// Installs the executable-owned process memory reclaimer exactly once.
+///
+/// # Errors
+///
+/// Fails closed when process initialization attempts to install more than one
+/// owner. Multiple allocator authorities would make reclamation unsound.
+pub fn install_process_memory_reclaimer(
+    reclaimer: ProcessMemoryReclaimer,
+) -> Result<(), SynapseCalyxError> {
+    PROCESS_MEMORY_RECLAIMER.set(reclaimer).map_err(|_| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MEMORY_RECLAIMER_ALREADY_INSTALLED",
+            "a process memory reclaimer was already installed",
+            "install the allocator-owned reclaimer once, before opening any Calyx vault",
+        )
+    })
+}
+
+struct SearchRebuildMemoryTracker {
+    private_bytes_peak: u64,
+    private_bytes_peak_phase: String,
+    reclaim_calls: u64,
+    observed_reclaimed: u64,
+    missing_reclaimer_reported: bool,
+}
+
+impl SearchRebuildMemoryTracker {
+    fn new(private_bytes_before: u64) -> Self {
+        Self {
+            private_bytes_peak: private_bytes_before,
+            private_bytes_peak_phase: "before_rebuild".to_owned(),
+            reclaim_calls: 0,
+            observed_reclaimed: 0,
+            missing_reclaimer_reported: false,
+        }
+    }
+
+    fn observe(&mut self, progress: &calyx_search::RebuildProgress<'_>) -> Result<(), CalyxError> {
+        let observed = calyx_aster::resource::process_private_bytes()?;
+        let phase = rebuild_progress_phase(progress);
+        self.record_peak(observed, &phase);
+
+        // Completed slots and filters are exact ownership-release boundaries:
+        // their transient row buffers and encoders have been dropped. The
+        // executable configures allocator-native immediate page purging at
+        // startup; collecting on every progress page merely rescanned live
+        // heaps, consumed CPU, and flooded logs without releasing ownership.
+        let release_boundary = matches!(
+            progress.phase,
+            "slot_index_write_ok"
+                | "slot_worker_quiesced"
+                | "dense_slot_ok"
+                | "sparse_slot_ok"
+                | "multi_slot_ok"
+                | "slot_build_ok"
+                | "filter_ok"
+                | "manifest_validate_ok"
+                | "done"
+        );
+        if !release_boundary {
+            return Ok(());
+        }
+
+        let Some(reclaim) = PROCESS_MEMORY_RECLAIMER.get().copied() else {
+            if !self.missing_reclaimer_reported {
+                self.missing_reclaimer_reported = true;
+                tracing::warn!(
+                    code = "SYNAPSE_CALYX_PROCESS_MEMORY_RECLAIMER_NOT_INSTALLED",
+                    phase,
+                    observed_private_bytes = observed,
+                    "the executable did not install an allocator-owned transient-memory reclaimer"
+                );
+            }
+            return Ok(());
+        };
+
+        let started = Instant::now();
+        reclaim();
+        let after = calyx_aster::resource::process_private_bytes()?;
+        self.reclaim_calls = self.reclaim_calls.saturating_add(1);
+        self.observed_reclaimed = self
+            .observed_reclaimed
+            .saturating_add(observed.saturating_sub(after));
+        self.record_peak(after, &format!("{phase} after_allocator_reclaim"));
+        tracing::info!(
+            code = "SYNAPSE_CALYX_TRANSIENT_MEMORY_RECLAIMED",
+            phase,
+            release_boundary,
+            private_bytes_before = observed,
+            private_bytes_after = after,
+            private_bytes_reclaimed = observed.saturating_sub(after),
+            reclaim_elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            reclaim_calls = self.reclaim_calls,
+            "returned allocator-owned transient rebuild pages to the operating system"
+        );
+        Ok(())
+    }
+
+    fn record_peak(&mut self, observed: u64, phase: &str) {
+        if observed > self.private_bytes_peak {
+            self.private_bytes_peak = observed;
+            phase.clone_into(&mut self.private_bytes_peak_phase);
+        }
+    }
+}
+
+fn rebuild_progress_phase(progress: &calyx_search::RebuildProgress<'_>) -> String {
+    progress.panel_slot.map_or_else(
+        || progress.phase.to_owned(),
+        |panel_slot| format!("{} panel_slot={panel_slot:?}", progress.phase),
+    )
+}
+
 impl SynapseCalyxVaultStatus {
     #[must_use]
     pub fn disabled() -> Self {
@@ -4573,7 +4706,10 @@ impl SynapseCalyxVault {
                 after: None,
                 rebuild_private_bytes_before: None,
                 rebuild_private_bytes_peak: None,
+                rebuild_private_bytes_peak_phase: None,
                 rebuild_private_bytes_after: None,
+                rebuild_private_bytes_reclaim_calls: None,
+                rebuild_private_bytes_observed_reclaimed: None,
                 elapsed_ms: elapsed(started),
             });
         }
@@ -4602,7 +4738,10 @@ impl SynapseCalyxVault {
                 after: None,
                 rebuild_private_bytes_before: None,
                 rebuild_private_bytes_peak: None,
+                rebuild_private_bytes_peak_phase: None,
                 rebuild_private_bytes_after: None,
+                rebuild_private_bytes_reclaim_calls: None,
+                rebuild_private_bytes_observed_reclaimed: None,
                 elapsed_ms: elapsed(started),
             });
         }
@@ -4649,7 +4788,10 @@ impl SynapseCalyxVault {
             after_sparse_lanes = after.sparse_slot_count,
             private_bytes_before = rebuild.private_bytes_before,
             private_bytes_peak = rebuild.private_bytes_peak,
+            private_bytes_peak_phase = %rebuild.private_bytes_peak_phase,
             private_bytes_after = rebuild.private_bytes_after,
+            private_bytes_reclaim_calls = rebuild.private_bytes_reclaim_calls,
+            private_bytes_observed_reclaimed = rebuild.private_bytes_observed_reclaimed,
             elapsed_ms = elapsed(started),
             "persisted search generation rebuilt unattended and re-read from disk"
         );
@@ -4660,7 +4802,12 @@ impl SynapseCalyxVault {
             after: Some(after),
             rebuild_private_bytes_before: Some(rebuild.private_bytes_before),
             rebuild_private_bytes_peak: Some(rebuild.private_bytes_peak),
+            rebuild_private_bytes_peak_phase: Some(rebuild.private_bytes_peak_phase),
             rebuild_private_bytes_after: Some(rebuild.private_bytes_after),
+            rebuild_private_bytes_reclaim_calls: Some(rebuild.private_bytes_reclaim_calls),
+            rebuild_private_bytes_observed_reclaimed: Some(
+                rebuild.private_bytes_observed_reclaimed,
+            ),
             elapsed_ms: elapsed(started),
         })
     }
@@ -4711,7 +4858,7 @@ impl SynapseCalyxVault {
         let manifest_path = panel_root.join("manifest.json");
         let before_manifest_sha256 = read_optional_sha256(&manifest_path)?;
         let private_bytes_before = process_private_bytes()?;
-        let mut private_bytes_peak = private_bytes_before;
+        let mut memory = SearchRebuildMemoryTracker::new(private_bytes_before);
         tracing::info!(
             code = "SYNAPSE_CALYX_SEARCH_REBUILD_STARTED",
             panel_version = expected_panel_version,
@@ -4719,7 +4866,7 @@ impl SynapseCalyxVault {
             before_manifest_sha256 = ?before_manifest_sha256,
             "rebuilding persisted Calyx search indexes"
         );
-        self.rebuild_search_artifacts_measured(&state, &mut private_bytes_peak)?;
+        self.rebuild_search_artifacts_measured(&state, &mut memory)?;
         let generation =
             calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, state.panel.version)
                 .and_then(|indexes| indexes.generation())
@@ -4738,7 +4885,10 @@ impl SynapseCalyxVault {
         }
         let raw_sidecars = inspect_search_raw_sidecars(&panel_root)?;
         let private_bytes_after = process_private_bytes()?;
-        private_bytes_peak = private_bytes_peak.max(private_bytes_after);
+        if private_bytes_after > memory.private_bytes_peak {
+            memory.private_bytes_peak = private_bytes_after;
+            "after_generation_reopen".clone_into(&mut memory.private_bytes_peak_phase);
+        }
         tracing::info!(
             code = "SYNAPSE_CALYX_SEARCH_REBUILD_COMMITTED",
             panel_version = expected_panel_version,
@@ -4746,16 +4896,22 @@ impl SynapseCalyxVault {
             manifest_sha256 = %generation.manifest_sha256,
             raw_sidecar_count = raw_sidecars.len(),
             private_bytes_before,
-            private_bytes_peak,
+            private_bytes_peak = memory.private_bytes_peak,
+            private_bytes_peak_phase = %memory.private_bytes_peak_phase,
             private_bytes_after,
+            private_bytes_reclaim_calls = memory.reclaim_calls,
+            private_bytes_observed_reclaimed = memory.observed_reclaimed,
             "persisted Calyx search generation reopened and verified"
         );
         Ok(SynapseCalyxSearchRebuildReport {
             expected_panel_version,
             before_manifest_sha256,
             private_bytes_before,
-            private_bytes_peak,
+            private_bytes_peak: memory.private_bytes_peak,
+            private_bytes_peak_phase: memory.private_bytes_peak_phase,
             private_bytes_after,
+            private_bytes_reclaim_calls: memory.reclaim_calls,
+            private_bytes_observed_reclaimed: memory.observed_reclaimed,
             generation,
             manifest_path,
             raw_sidecars,
@@ -4781,7 +4937,9 @@ impl SynapseCalyxVault {
                 )
             })?;
         lock.try_lock_exclusive().map_err(|error| {
-            let (code, remediation) = if error.kind() == io::ErrorKind::WouldBlock {
+            let contended = error.kind() == io::ErrorKind::WouldBlock
+                || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)));
+            let (code, remediation) = if contended {
                 (
                     "SYNAPSE_CALYX_SEARCH_REBUILD_IN_PROGRESS",
                     "wait for the in-flight persisted search rebuild to publish or fail, then retry; every manual and scheduled caller shares this lock",
@@ -4877,18 +5035,14 @@ impl SynapseCalyxVault {
     fn rebuild_search_artifacts_measured(
         &self,
         state: &VaultPanelState,
-        private_bytes_peak: &mut u64,
+        memory: &mut SearchRebuildMemoryTracker,
     ) -> Result<(), SynapseCalyxError> {
         calyx_search::rebuild_for_vault_with_panel_state_dense_config_progress(
             &self.config.vault_dir,
             &self.vault,
             state,
             self.effective_tuning()?.dense_index_config(),
-            |_progress| {
-                *private_bytes_peak =
-                    (*private_bytes_peak).max(calyx_aster::resource::process_private_bytes()?);
-                Ok(())
-            },
+            |progress| Ok(memory.observe(&progress)?),
         )
         .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))
     }

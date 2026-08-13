@@ -872,6 +872,6 @@ pub fn manifest_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
 #[path = "persisted/io.rs"]
 mod fs_io;
 use fs_io::{
-    rel, sha256_file, sha256_hex, stale, write_atomic_hashed, write_json_atomic,
+    HashingReader, rel, sha256_file, sha256_hex, stale, write_atomic_hashed, write_json_atomic,
     write_json_atomic_durable, write_json_atomic_hashed,
 };

@@ -18,6 +18,7 @@ use crate::error::CliResult;
 
 #[path = "dense/flat.rs"]
 mod flat;
+pub(in crate::persisted) use flat::StreamingWriter as StreamingFlatWriter;
 
 #[derive(Clone, Debug)]
 pub(super) struct DenseSlotRows {
@@ -64,7 +65,11 @@ where
     let slot = panel_slot.slot_id();
     let panel_version = panel_slot.panel_version();
     let quant_bits = config.quant_bits_for(slot);
-    if quant_bits == 32 && should_use_flat_dense_index(rows.rows.len(), rows.dim) {
+    // Full-precision persisted search is an exact, disk-first scan. Building
+    // an approximate in-memory graph is strictly more resident state, loses
+    // recall, and cannot be bounded when a future corpus or dimension grows.
+    // Quantized lanes remain an explicit, manifest-sealed index family below.
+    if quant_bits == 32 {
         return flat::write(vault_dir, root, slot, rows, base_seq);
     }
     let dir_name = format!(
@@ -435,10 +440,6 @@ fn exact_filtered_hits(
     });
     scored.truncate(k);
     Ok(ranked(scored))
-}
-
-pub(super) fn should_use_flat_dense_index(row_count: usize, dim: u32) -> bool {
-    flat::should_use_index(row_count, dim)
 }
 
 pub(super) fn score_replacements(

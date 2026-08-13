@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -12,8 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use super::fs_io::HashingReader;
 use super::pinned::{self, PinKey};
-use super::{SearchIndexEntry, rel, sha256_hex, stale, write_atomic_hashed};
+use super::{SearchIndexEntry, sha256_hex, stale};
 use crate::error::CliResult;
+
+#[path = "sparse/writer.rs"]
+mod writer;
+pub(in crate::persisted) use writer::StreamingWriter;
 
 const SPARSE_FORMAT_V2: &str = "calyx-search-sparse-index-v2";
 const SPARSE_FORMAT_V3: &str = "calyx-search-sparse-index-v3";
@@ -40,12 +44,6 @@ impl SparseScoring {
 
 const fn legacy_sparse_scoring() -> SparseScoring {
     SparseScoring::Bm25
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct SparseSlotRows {
-    pub(super) dim: u32,
-    pub(super) rows: Vec<(CxId, Vec<SparseEntry>)>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -102,85 +100,6 @@ struct SparseRow {
 struct SparsePosting {
     cx_id: CxId,
     tf: f32,
-}
-
-impl SparseSlotRows {
-    pub(super) fn len(&self) -> usize {
-        self.rows.len()
-    }
-}
-
-pub(super) fn write<F>(
-    vault_dir: &Path,
-    root: &Path,
-    slot: SlotId,
-    rows: SparseSlotRows,
-    base_seq: u64,
-    scoring: SparseScoring,
-    mut progress: F,
-) -> CliResult<SearchIndexEntry>
-where
-    F: FnMut(&'static str, usize) -> CliResult,
-{
-    let row_count = rows.rows.len();
-    let path = root.join(format!(
-        "slot_{:05}_seq_{base_seq:020}_n_{row_count:010}.sparse.jsonl",
-        slot.get(),
-    ));
-    let mut validated_rows = Vec::with_capacity(row_count);
-    let mut total_doc_len = 0.0_f32;
-    let mut field_docs = 0usize;
-    for (cx_id, entries) in rows.rows {
-        let doc_len = validate_sparse_weights(&entries, scoring, &format!("row {cx_id}"))?;
-        if !entries.is_empty() {
-            field_docs = field_docs
-                .checked_add(1)
-                .ok_or_else(|| stale("sparse field-document count overflow"))?;
-            total_doc_len += doc_len;
-            if !total_doc_len.is_finite() {
-                return Err(stale("persistent sparse corpus length overflowed"));
-            }
-        }
-        validated_rows.push(SparseRow {
-            cx_id,
-            doc_len,
-            entries,
-        });
-    }
-    let avg_doc_len = if field_docs == 0 {
-        0.0
-    } else {
-        total_doc_len / field_docs as f32
-    };
-    let header = StreamingSparseHeader {
-        format: SPARSE_FORMAT_V4.to_owned(),
-        scoring,
-        slot: slot.get(),
-        dim: rows.dim,
-        base_seq,
-        len: row_count,
-        field_docs,
-        avg_doc_len,
-    };
-    progress("slot.sparse.rows_validated", row_count)?;
-    let sha256 = write_atomic_hashed(&path, |writer| {
-        serde_json::to_writer(&mut *writer, &header)?;
-        writer.write_all(b"\n")?;
-        for row in &validated_rows {
-            serde_json::to_writer(&mut *writer, row)?;
-            writer.write_all(b"\n")?;
-        }
-        Ok(())
-    })?;
-    Ok(SearchIndexEntry::sparse(
-        slot,
-        header.dim,
-        row_count,
-        base_seq,
-        rel(vault_dir, &path)?,
-        sha256,
-        scoring.index_kind(),
-    ))
 }
 
 pub(super) fn search(
@@ -727,6 +646,7 @@ fn visit_stream<F>(
 where
     F: FnMut(&StreamingSparseHeader, &SparseRow) -> CliResult,
 {
+    retire_legacy_cache(vault_dir, slot)?;
     require_sparse_kind(entry, slot)?;
     let path = vault_dir.join(entry.require_index_rel(slot)?);
     if !path.is_file() {
@@ -916,6 +836,15 @@ type SparsePinCache = Mutex<BTreeMap<(String, u16), (String, Arc<SparseIndex>)>>
 fn cache() -> &'static SparsePinCache {
     static CACHE: OnceLock<SparsePinCache> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn retire_legacy_cache(vault_dir: &Path, slot: SlotId) -> CliResult {
+    let key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
+    cache()
+        .lock()
+        .expect("sparse pin cache poisoned")
+        .remove(&key);
+    Ok(())
 }
 
 /// Verify-once-then-pin: the sparse sidecar is fully read, hashed, and

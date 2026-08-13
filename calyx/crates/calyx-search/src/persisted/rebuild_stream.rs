@@ -11,7 +11,8 @@ use rayon::prelude::*;
 #[path = "rebuild_scan.rs"]
 mod rebuild_scan;
 use rebuild_scan::{
-    LoadedBaseDocs, ScannedSlotRows, collect_or_build_slot_from_cf, load_base_docs_at,
+    LoadedBaseDocs, ScannedSlotRows, SlotScanOptions, collect_or_build_slot_from_cf,
+    load_base_docs_at,
 };
 
 use super::rebuild::{RebuildProgress, previous_manifest, prune_stale_index_artifacts};
@@ -403,22 +404,108 @@ where
             ))?;
         }
         let progress_lock = Arc::new(Mutex::new(&mut *progress));
-        let mut built = chunk
-            .par_iter()
-            .map(|plan| {
-                build_slot_entry(
-                    vault_dir,
-                    &root,
-                    vault,
-                    snapshot,
-                    plan,
-                    page_rows,
-                    build_policy,
-                    dense_index_config.clone(),
-                    Some(&progress_lock),
-                )
-            })
-            .collect::<CliResult<Vec<_>>>()?;
+        let mut built = if chunk.len() == 1 {
+            // The always-on daemon deliberately builds one lane at a time. Give
+            // that lane a short-lived allocator heap: mimalloc can retire the
+            // complete thread heap when the lane finishes instead of mixing
+            // millions of transient decode buffers into a long-lived Tokio or
+            // Rayon worker heap and pinning partially occupied pages forever.
+            // The scoped thread borrows the pinned vault/snapshot and cannot
+            // outlive this exact lane.
+            let plan = &chunk[0];
+            let worker_progress = Arc::clone(&progress_lock);
+            let (worker_row_count, worker_ok_phase) = std::thread::scope(
+                |scope| -> CliResult<(usize, &'static str)> {
+                    let worker = std::thread::Builder::new()
+                        .name(format!("calyx-search-slot-{:05}", plan.slot.get()))
+                        .spawn_scoped(scope, || {
+                            let built = build_slot_entry(
+                                vault_dir,
+                                &root,
+                                vault,
+                                snapshot,
+                                plan,
+                                page_rows,
+                                build_policy,
+                                dense_index_config.clone(),
+                                Some(&worker_progress),
+                            )?;
+                            let row_count = built.row_count;
+                            let ok_phase = built.ok_phase();
+                            // Do not move heap ownership from this short-lived
+                            // allocator heap into the parent. The staged record is
+                            // the physical handoff; the parent rereads and fully
+                            // validates it after this worker exits.
+                            drop(built);
+                            // `build_slot_entry` has returned, so every transient
+                            // scan page, decode buffer, and writer local has been
+                            // dropped on this allocator-owning thread. Report the
+                            // boundary before this thread exits: the executable's
+                            // allocator callback can now purge this thread's empty
+                            // pages directly instead of trying to collect its
+                            // abandoned heap later from the parent worker.
+                            emit_shared_progress(
+                                &worker_progress,
+                                RebuildProgress::slot(
+                                    "slot_worker_quiesced",
+                                    panel_version,
+                                    plan.slot,
+                                    Some(row_count),
+                                    Some(base_seq),
+                                ),
+                            )?;
+                            Ok((row_count, ok_phase))
+                        })
+                        .map_err(|error| {
+                            CliError::io(format!(
+                                "spawn isolated search rebuild worker for slot {}: {error}",
+                                plan.slot
+                            ))
+                        })?;
+                    worker.join().map_err(|payload| {
+                    stale(format!(
+                        "isolated search rebuild worker for slot {} panicked: {}; preserve its staged artifacts and inspect the named slot before retrying",
+                        plan.slot,
+                        panic_payload_detail(payload.as_ref())
+                    ))
+                })?
+                },
+            )?;
+            let built = reuse_staged_slot_entry(vault_dir, &root, plan, base_seq)?.ok_or_else(
+                || {
+                    stale(format!(
+                        "isolated search rebuild worker for slot {} returned without its required staged artifact at seq {base_seq}",
+                        plan.slot
+                    ))
+                },
+            )?;
+            if built.row_count != worker_row_count || built.ok_phase() != worker_ok_phase {
+                return Err(stale(format!(
+                    "isolated search rebuild worker for slot {} disagrees with its staged readback: worker rows={worker_row_count} phase={worker_ok_phase}, staged rows={} phase={}",
+                    plan.slot,
+                    built.row_count,
+                    built.ok_phase()
+                )));
+            }
+            vec![built]
+        } else {
+            chunk
+                .par_iter()
+                .map(|plan| {
+                    build_slot_entry(
+                        vault_dir,
+                        &root,
+                        vault,
+                        snapshot,
+                        plan,
+                        page_rows,
+                        build_policy,
+                        dense_index_config.clone(),
+                        Some(&progress_lock),
+                    )
+                })
+                .collect::<CliResult<Vec<_>>>()?
+        };
         drop(progress_lock);
         built.sort_by_key(|built| built.entry.slot());
         for built in built {
@@ -538,6 +625,17 @@ where
     })
 }
 
+fn panic_payload_detail(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload.downcast_ref::<&str>().copied().map_or_else(
+        || {
+            payload
+                .downcast_ref::<String>()
+                .map_or("non-string panic payload", String::as_str)
+        },
+        |message| message,
+    )
+}
+
 pub(super) fn validate_staged_manifest_artifacts(
     vault_dir: &Path,
     manifest: &SearchIndexManifest,
@@ -584,15 +682,6 @@ where
 {
     let base_seq = snapshot.seq();
     if let Some(built) = reuse_staged_slot_entry(vault_dir, root, plan, base_seq)? {
-        if built.row_count != plan.expected_ids.len() {
-            return Err(stale(format!(
-                "staged slot artifact for panel {} slot {} at base seq {base_seq} contains {} rows, but the pinned Base membership contains {}; refusing to reuse incomplete recovery state",
-                plan.panel_version,
-                plan.slot,
-                built.row_count,
-                plan.expected_ids.len()
-            )));
-        }
         if let Some(progress) = progress {
             emit_shared_progress(
                 progress,
@@ -619,8 +708,18 @@ where
             ),
         )?;
     }
-    let rows =
-        collect_or_build_slot_from_cf(vault_dir, root, vault, snapshot, plan, page_rows, progress)?;
+    let rows = collect_or_build_slot_from_cf(
+        vault_dir,
+        root,
+        vault,
+        snapshot,
+        plan,
+        SlotScanOptions {
+            page_rows,
+            dense_index_config: &dense_index_config,
+        },
+        progress,
+    )?;
     let row_count = rows.len();
     if let Some(progress) = progress {
         emit_shared_progress(
@@ -650,35 +749,8 @@ where
                 None => Ok(()),
             },
         )?),
-        ScannedSlotRows::Sparse(rows) => {
-            let scoring = plan.sparse_scoring.ok_or_else(|| {
-                stale(format!(
-                    "slot {} contains sparse rows but the active panel/lens contract declares no sparse scoring mode",
-                    plan.slot
-                ))
-            })?;
-            OptionalSearchIndexEntry::Some(sparse::write(
-                vault_dir,
-                root,
-                plan.slot,
-                rows,
-                base_seq,
-                scoring,
-                |phase, rows| match progress {
-                    Some(progress) => emit_shared_progress(
-                        progress,
-                        RebuildProgress::slot(
-                            phase,
-                            plan.panel_version,
-                            plan.slot,
-                            Some(rows),
-                            Some(base_seq),
-                        ),
-                    ),
-                    None => Ok(()),
-                },
-            )?)
-        }
+        ScannedSlotRows::DenseEntry(entry) => OptionalSearchIndexEntry::Some(entry),
+        ScannedSlotRows::SparseEntry(entry) => OptionalSearchIndexEntry::Some(entry),
         ScannedSlotRows::MultiEntry(entry) => OptionalSearchIndexEntry::Some(entry),
         ScannedSlotRows::AbsentOnly => OptionalSearchIndexEntry::None {
             slot: plan.slot.get(),
