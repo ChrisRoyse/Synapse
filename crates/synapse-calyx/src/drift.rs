@@ -671,7 +671,7 @@ impl SynapseCalyxVault {
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let min_samples = params.min_samples.max(SYNAPSE_BLIND_SPOT_MIN_SAMPLES);
         let corpus = self.load_drift_corpus(params.panel_version, max_records)?;
-        let backend = self.math_runtime.backend();
+        let backend = self.math_runtime.backend()?;
 
         // Enumerate the distinct dense lenses present in the corpus.
         let mut lens_ids: Vec<SlotId> = Vec::new();

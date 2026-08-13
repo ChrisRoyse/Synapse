@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, sync::OnceLock};
 
 use calyx_forge::{
     Backend, CUDA_COMPILED, CpuBackend, DeviceInfo, ForgeError, HostGpuReservation,
@@ -198,34 +198,153 @@ pub struct SynapseCalyxMathProbeTopKEntry {
     pub score: f32,
 }
 
-pub struct SynapseCalyxMathRuntime {
+struct InitializedSynapseCalyxMathRuntime {
     backend: Box<dyn SynapseMathBackend>,
     status: SynapseCalyxMathBackendStatus,
     host_reservation: Option<HostGpuReservation>,
+}
+
+pub struct SynapseCalyxMathRuntime {
+    config: SynapseCalyxTuningConfig,
+    cpu_readback: CpuReadback,
+    dormant_status: SynapseCalyxMathBackendStatus,
+    initialized: OnceLock<Result<InitializedSynapseCalyxMathRuntime, SynapseCalyxError>>,
 }
 
 impl fmt::Debug for SynapseCalyxMathRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("SynapseCalyxMathRuntime")
-            .field("status", &self.status)
+            .field("status", &self.status_snapshot())
             .finish_non_exhaustive()
     }
 }
 
 impl SynapseCalyxMathRuntime {
-    #[must_use]
-    pub fn backend(&self) -> &dyn Backend {
-        self.backend.as_ref()
-    }
-
-    #[must_use]
-    pub const fn status(&self) -> &SynapseCalyxMathBackendStatus {
-        &self.status
+    /// Returns the selected backend, initializing a dormant CUDA runtime on the
+    /// first real math request. Initialization is performed exactly once across
+    /// concurrent callers. Its success or structured failure is retained for
+    /// the vault lifetime; a failed selected GPU is never replaced by CPU.
+    ///
+    /// # Errors
+    ///
+    /// Returns the retained structured CUDA initialization/probe failure.
+    pub fn backend(&self) -> Result<&dyn Backend, SynapseCalyxError> {
+        let initialized = self.initialized.get_or_init(|| {
+            tracing::info!(
+                code = "SYNAPSE_CALYX_MATH_LAZY_INIT_STARTED",
+                requested_backend = self.config.math_backend.as_str(),
+                selected_backend = self.dormant_status.selected_backend.as_str(),
+                device_name = self.dormant_status.device_name.as_str(),
+                "initializing the selected CUDA runtime for its first real math request"
+            );
+            let result = initialize_cuda_runtime(&self.config, self.cpu_readback.clone());
+            match &result {
+                Ok(runtime) => tracing::info!(
+                    code = "SYNAPSE_CALYX_MATH_LAZY_INIT_SUCCEEDED",
+                    selected_backend = runtime.status.selected_backend.as_str(),
+                    device_name = runtime.status.device_name.as_str(),
+                    probe_status = runtime.status.probe.status.as_str(),
+                    "initialized and proved the selected CUDA runtime exactly once"
+                ),
+                Err(error) => tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LAZY_INIT_FAILED",
+                    error_code = error.code,
+                    source_code = error.source_code.unwrap_or("none"),
+                    error = %error,
+                    remediation = error.remediation,
+                    "the selected CUDA runtime failed its one-time initialization; retaining the failure and refusing math requests"
+                ),
+            }
+            result
+        });
+        initialized
+            .as_ref()
+            .map(|runtime| runtime.backend.as_ref() as &dyn Backend)
+            .map_err(Clone::clone)
     }
 
     #[must_use]
     pub fn status_snapshot(&self) -> SynapseCalyxMathBackendStatus {
+        match self.initialized.get() {
+            Some(Ok(runtime)) => runtime.status_snapshot(),
+            Some(Err(error)) => {
+                let mut status = self.dormant_status.clone();
+                status.runtime_readback_code = Some(error.code.to_owned());
+                status.runtime_readback_error = Some(error.to_string());
+                "error".clone_into(&mut status.probe.status);
+                status.probe.detail = format!(
+                    "one-time CUDA initialization failed with {}: {}",
+                    error.code, error.message
+                );
+                status
+            }
+            None => self.dormant_status.clone(),
+        }
+    }
+
+    /// Drops an initialized CUDA backend/context first, then explicitly removes
+    /// and rereads its host reservation row before shutdown may release the
+    /// vault lifetime lock. A runtime that remained dormant owns neither.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Forge-derived error if an initialized runtime's
+    /// persisted reservation cannot be removed, reread, unlocked, or deleted.
+    pub fn close(self) -> Result<Option<HostGpuReservationSnapshot>, SynapseCalyxError> {
+        match self.initialized.into_inner() {
+            Some(Ok(runtime)) => runtime.close(),
+            Some(Err(error)) => {
+                tracing::warn!(
+                    code = "SYNAPSE_CALYX_MATH_FAILED_RUNTIME_CLOSED",
+                    error_code = error.code,
+                    source_code = error.source_code.unwrap_or("none"),
+                    error = %error,
+                    "closed a vault whose one-time CUDA initialization had failed; no backend or host reservation remained live"
+                );
+                Ok(None)
+            }
+            None => {
+                tracing::info!(
+                    code = "SYNAPSE_CALYX_MATH_DORMANT_RUNTIME_CLOSED",
+                    selected_backend = self.dormant_status.selected_backend.as_str(),
+                    device_name = self.dormant_status.device_name.as_str(),
+                    "closed the dormant CUDA selection without ever creating a context or host reservation"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    fn from_initialized(
+        config: &SynapseCalyxTuningConfig,
+        cpu_readback: CpuReadback,
+        runtime: InitializedSynapseCalyxMathRuntime,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            cpu_readback,
+            dormant_status: runtime.status.clone(),
+            initialized: OnceLock::from(Ok(runtime)),
+        }
+    }
+
+    fn deferred_cuda(
+        config: &SynapseCalyxTuningConfig,
+        cpu_readback: CpuReadback,
+        status: SynapseCalyxMathBackendStatus,
+    ) -> Self {
+        Self {
+            config: config.clone(),
+            cpu_readback,
+            dormant_status: status,
+            initialized: OnceLock::new(),
+        }
+    }
+}
+
+impl InitializedSynapseCalyxMathRuntime {
+    fn status_snapshot(&self) -> SynapseCalyxMathBackendStatus {
         let mut status = self.status.clone();
         match self.backend.strict_vram_status() {
             Ok(vram_dispatch) => status.vram_dispatch = vram_dispatch,
@@ -273,15 +392,7 @@ impl SynapseCalyxMathRuntime {
         status
     }
 
-    /// Drops the CUDA backend/context first, then explicitly removes and
-    /// rereads the host reservation row before shutdown may release the vault
-    /// lifetime lock.
-    ///
-    /// # Errors
-    ///
-    /// Returns a structured Forge-derived error if the persisted reservation
-    /// cannot be removed, reread, unlocked, or physically deleted.
-    pub fn close(self) -> Result<Option<HostGpuReservationSnapshot>, SynapseCalyxError> {
+    fn close(self) -> Result<Option<HostGpuReservationSnapshot>, SynapseCalyxError> {
         let Self {
             backend,
             status: _,
@@ -301,15 +412,17 @@ impl SynapseCalyxMathRuntime {
     }
 }
 
-/// Builds the single Calyx Forge math backend for this Synapse process.
+/// Selects the single Calyx Forge math backend for this Synapse process.
 ///
 /// # Errors
 ///
-/// Returns a structured error when config is invalid or the selected runtime
-/// cannot initialize, reserve its physical GPU capacity, or pass the startup
-/// probe. `auto` prefers CUDA and selects CPU only when the failure proves
-/// that no supported CUDA device/runtime exists. A present-but-broken GPU,
-/// admission failure, or CUDA execution failure remains a hard error.
+/// Returns a structured error when config is invalid or physical device
+/// discovery cannot prove the requested selection. CPU is initialized and
+/// proved immediately. CUDA remains dormant until the first real math request,
+/// when it initializes exactly once, reserves physical GPU capacity, and runs
+/// its probe. `auto` selects CPU only when NVML proves there is no CUDA device.
+/// A present-but-broken GPU, admission failure, or CUDA execution failure is
+/// retained as a hard error and never causes a runtime fallback.
 pub fn math_backend(
     config: &SynapseCalyxTuningConfig,
 ) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
@@ -317,33 +430,135 @@ pub fn math_backend(
     let cpu_reference = CpuBackend::new();
     let cpu_readback = CpuReadback::from_backend(&cpu_reference);
     match config.math_backend {
-        SynapseCalyxMathBackend::Cpu => {
-            runtime_from_backend(config, cpu_reference, cpu_readback, None, None)
-        }
-        SynapseCalyxMathBackend::Cuda => cuda_runtime_candidate(config, cpu_readback),
+        SynapseCalyxMathBackend::Cpu => runtime_from_backend(
+            config,
+            cpu_reference,
+            cpu_readback.clone(),
+            None,
+            None,
+            None,
+        )
+        .map(|runtime| SynapseCalyxMathRuntime::from_initialized(config, cpu_readback, runtime)),
+        SynapseCalyxMathBackend::Cuda => deferred_cuda_runtime_candidate(config, cpu_readback),
         SynapseCalyxMathBackend::Auto => {
-            match cuda_runtime_candidate(config, cpu_readback.clone()) {
+            match deferred_cuda_runtime_candidate(config, cpu_readback.clone()) {
                 Ok(runtime) => Ok(runtime),
                 Err(error) if error_proves_cuda_absent(&error) => {
-                    let mut runtime =
-                        runtime_from_backend(config, cpu_reference, cpu_readback, None, None)?;
-                    runtime.status.fallback_code =
+                    let mut initialized = runtime_from_backend(
+                        config,
+                        cpu_reference,
+                        cpu_readback.clone(),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    initialized.status.fallback_code =
                         Some("SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE".to_owned());
-                    runtime.status.fallback_source_code = Some(error.code.to_owned());
-                    runtime.status.fallback_error = Some(error.to_string());
+                    initialized.status.fallback_source_code = Some(error.code.to_owned());
+                    initialized.status.fallback_error = Some(error.to_string());
                     tracing::warn!(
                         code = "SYNAPSE_CALYX_MATH_AUTO_CPU_NO_CUDA_DEVICE",
                         source_code = error.code,
                         source_error = %error,
-                        cpu_simd_path = runtime.status.cpu_simd_path,
+                        cpu_simd_path = initialized.status.cpu_simd_path,
                         "auto selected the explicit CPU runtime because no supported CUDA device exists"
                     );
-                    Ok(runtime)
+                    Ok(SynapseCalyxMathRuntime::from_initialized(
+                        config,
+                        cpu_readback,
+                        initialized,
+                    ))
                 }
                 Err(error) => Err(error),
             }
         }
     }
+}
+
+fn deferred_cuda_runtime_candidate(
+    config: &SynapseCalyxTuningConfig,
+    cpu_readback: CpuReadback,
+) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
+    let host = crate::host_cuda::host_cuda_device_probe();
+    if host.device_absent_proven {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT",
+            format!("NVML proved this host has no CUDA device: {}", host.basis),
+            MATH_BACKEND_REMEDIATION,
+        ));
+    }
+    if !host.device_present {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_DEVICE_INDETERMINATE",
+            format!(
+                "NVML could not prove whether this host has CUDA device 0: {}",
+                host.basis
+            ),
+            MATH_BACKEND_REMEDIATION,
+        ));
+    }
+    if !CUDA_COMPILED {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED",
+            format!(
+                "{} but this synapse-calyx build has no CUDA kernels compiled in; rebuild with --features calyx-cuda (a CUDA 13.3 toolkit must be installed so calyx-forge can run nvcc), or select math_backend=\"cpu\" explicitly to accept CPU math on a GPU host",
+                host.basis
+            ),
+            MATH_BACKEND_REMEDIATION,
+        ));
+    }
+
+    let status = SynapseCalyxMathBackendStatus {
+        requested_backend: config.math_backend,
+        selected_backend: "cuda".to_owned(),
+        cuda_compiled: CUDA_COMPILED,
+        device_name: host
+            .device_name
+            .clone()
+            .unwrap_or_else(|| "CUDA device 0".to_owned()),
+        device_vram_mib: host.device_vram_mib,
+        cpu_simd_path: cpu_readback.simd_path.clone(),
+        vram_budget_bytes: config.vram_budget_bytes,
+        vram_dispatch: None,
+        dispatch_telemetry: None,
+        host_reservation_basis: None,
+        host_reservation_id: None,
+        host_reservation: None,
+        runtime_readback_code: None,
+        runtime_readback_error: None,
+        fallback_code: None,
+        fallback_source_code: None,
+        fallback_error: None,
+        probe: SynapseCalyxMathProbeReport {
+            status: "dormant".to_owned(),
+            detail: format!(
+                "{}; CUDA context, modules, host reservation, and fixed-vector proof are deferred until the first real math request",
+                host.basis
+            ),
+            tolerance: PROBE_TOLERANCE,
+            dot: Vec::new(),
+            cosine: Vec::new(),
+            l2_squared: Vec::new(),
+            topk: Vec::new(),
+        },
+    };
+    tracing::info!(
+        code = "SYNAPSE_CALYX_MATH_BACKEND_SELECTED_DORMANT",
+        requested_backend = status.requested_backend.as_str(),
+        selected_backend = status.selected_backend.as_str(),
+        cuda_compiled = status.cuda_compiled,
+        device_name = status.device_name.as_str(),
+        device_vram_mib = status.device_vram_mib,
+        vram_budget_bytes = status.vram_budget_bytes,
+        probe_status = status.probe.status.as_str(),
+        device_probe_basis = host.basis.as_str(),
+        "selected CUDA from physical device evidence without creating a context or reserving memory"
+    );
+    Ok(SynapseCalyxMathRuntime::deferred_cuda(
+        config,
+        cpu_readback,
+        status,
+    ))
 }
 
 /// Whether an error is positive proof that this host has no CUDA device — the
@@ -355,15 +570,7 @@ pub fn math_backend(
 /// `SYNAPSE_CALYX_MATH_CUDA_DEVICE_INDETERMINATE` instead and deliberately do
 /// NOT match here: uncertainty is not evidence.
 fn error_proves_cuda_absent(error: &SynapseCalyxError) -> bool {
-    if error.code == "SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT" {
-        return true;
-    }
-    let detail = error.message.to_ascii_lowercase();
-    detail.contains("cuda_error_no_device")
-        || detail.contains("no cuda-capable device is detected")
-        || detail.contains("nvml init failed loading nvml.dll")
-        || (detail.contains("nvml device_by_index(0) failed")
-            && (detail.contains("not found") || detail.contains("no device")))
+    error.code == "SYNAPSE_CALYX_MATH_CUDA_DEVICE_ABSENT"
 }
 
 #[derive(Clone, Debug)]
@@ -468,10 +675,10 @@ impl From<VramStats> for SynapseCalyxVramDispatchStatus {
 }
 
 #[cfg(feature = "calyx-cuda")]
-fn cuda_runtime_candidate(
+fn initialize_cuda_runtime(
     config: &SynapseCalyxTuningConfig,
     cpu_readback: CpuReadback,
-) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
+) -> Result<InitializedSynapseCalyxMathRuntime, SynapseCalyxError> {
     let reservation_store = HostGpuReservationStore::from_env(0).map_err(|error| {
         forge_error(
             "SYNAPSE_CALYX_MATH_HOST_RESERVATION_OPEN_FAILED",
@@ -525,7 +732,7 @@ fn cuda_runtime_candidate(
             ));
         }
     };
-    let baseline_basis = match warm_and_verify_cuda_startup_envelope(
+    let (baseline_basis, probe) = match warm_and_verify_cuda_startup_envelope(
         &backend,
         &reservation,
         startup_envelope_mib,
@@ -562,6 +769,7 @@ fn cuda_runtime_candidate(
         cpu_readback,
         Some(reservation),
         Some(baseline_basis),
+        Some(probe),
     )
 }
 
@@ -589,8 +797,8 @@ fn warm_and_verify_cuda_startup_envelope(
     reservation: &HostGpuReservation,
     startup_envelope_mib: u64,
     runtime_ceiling_mib: u64,
-) -> Result<String, SynapseCalyxError> {
-    run_startup_probe(backend)?;
+) -> Result<(String, SynapseCalyxMathProbeReport), SynapseCalyxError> {
+    let probe = run_startup_probe(backend)?;
     let free_before_cuda_mib = reservation.admitted_snapshot().last_physical_free_mib;
     let measured_snapshot = reservation.readback().map_err(|error| {
         forge_error(
@@ -619,7 +827,7 @@ fn warm_and_verify_cuda_startup_envelope(
         source_of_truth = measured_snapshot.state_path,
         "retained the pre-admitted CUDA context envelope because device-global NVML samples cannot isolate this process on WDDM"
     );
-    Ok(basis)
+    Ok((basis, probe))
 }
 
 fn cleanup_host_reservation_after_startup_failure(
@@ -672,10 +880,10 @@ fn cleanup_optional_host_reservation_after_startup_failure(
 ///     `math_backend="cuda"` still fails.
 ///   * probe malfunction -> hard failure. Uncertainty is never treated as absence.
 #[cfg(not(feature = "calyx-cuda"))]
-fn cuda_runtime_candidate(
+fn initialize_cuda_runtime(
     _config: &SynapseCalyxTuningConfig,
     _cpu_readback: CpuReadback,
-) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError> {
+) -> Result<InitializedSynapseCalyxMathRuntime, SynapseCalyxError> {
     match calyx_forge::probe_host_cuda_device(0) {
         calyx_forge::HostCudaDeviceVerdict::Present(device) => Err(SynapseCalyxError::new(
             "SYNAPSE_CALYX_MATH_CUDA_NOT_COMPILED",
@@ -708,12 +916,13 @@ fn runtime_from_backend<B>(
     cpu_readback: CpuReadback,
     host_reservation: Option<HostGpuReservation>,
     host_reservation_basis: Option<String>,
-) -> Result<SynapseCalyxMathRuntime, SynapseCalyxError>
+    validated_probe: Option<SynapseCalyxMathProbeReport>,
+) -> Result<InitializedSynapseCalyxMathRuntime, SynapseCalyxError>
 where
     B: SynapseMathBackend + 'static,
 {
     let device_info = backend.device_info();
-    let probe = match run_startup_probe(&backend) {
+    let probe = match validated_probe.map_or_else(|| run_startup_probe(&backend), Ok) {
         Ok(probe) => probe,
         Err(error) => {
             return Err(cleanup_optional_host_reservation_after_startup_failure(
@@ -797,7 +1006,7 @@ where
         probe_topk = ?status.probe.topk,
         "selected fail-closed Calyx Forge math backend"
     );
-    Ok(SynapseCalyxMathRuntime {
+    Ok(InitializedSynapseCalyxMathRuntime {
         backend: Box::new(backend),
         status,
         host_reservation,

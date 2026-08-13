@@ -3745,10 +3745,11 @@ impl SynapseCalyxVault {
             cf_count_memo: std::sync::Mutex::default(),
         };
         opened.initialize_anneal_tuning()?;
+        let math_status = opened.math_runtime.status_snapshot();
         let status = status_from_vault(
             &opened.config,
             &opened.vault,
-            opened.math_runtime.status(),
+            &math_status,
             opened.open_mode,
         );
         tracing::info!(

@@ -48,6 +48,8 @@ pub struct SynapseCalyxHostCudaProbe {
     pub device_present: bool,
     /// Device name when present.
     pub device_name: Option<String>,
+    /// Physical device memory reported by NVML when present.
+    pub device_vram_mib: Option<u64>,
     /// Verbatim NVML basis for this verdict, suitable for logging as evidence.
     pub basis: String,
 }
@@ -68,6 +70,7 @@ pub fn host_cuda_device_probe() -> &'static SynapseCalyxHostCudaProbe {
             device_absent_proven: false,
             device_present: true,
             device_name: Some(device.name.clone()),
+            device_vram_mib: Some(device.total_mib),
             basis: format!(
                 "NVML read CUDA device 0 (name={}, uuid={}, total_mib={})",
                 device.name, device.uuid, device.total_mib
@@ -78,6 +81,7 @@ pub fn host_cuda_device_probe() -> &'static SynapseCalyxHostCudaProbe {
             device_absent_proven: true,
             device_present: false,
             device_name: None,
+            device_vram_mib: None,
             basis,
         },
         calyx_forge::HostCudaDeviceVerdict::Indeterminate { basis } => SynapseCalyxHostCudaProbe {
@@ -85,6 +89,7 @@ pub fn host_cuda_device_probe() -> &'static SynapseCalyxHostCudaProbe {
             device_absent_proven: false,
             device_present: false,
             device_name: None,
+            device_vram_mib: None,
             basis,
         },
     })
