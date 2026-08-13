@@ -13534,6 +13534,10 @@ struct CalyxGcEvictionRevalidation {
 
 #[derive(Debug)]
 struct CalyxRetentionState {
+    /// Exact non-expired, non-derived-referenced row count observed by the
+    /// pinned sweep. This remains scalar for policy-protected families because
+    /// those families can never consume per-row eviction candidates.
+    before_live_rows: u64,
     live_entries: Vec<CalyxRetentionLiveEntry>,
     /// Expired rows the sweep proposed, before the pre-delete re-check.
     expired_candidates: Vec<CalyxGcEvictionCandidate>,
@@ -14278,11 +14282,26 @@ fn run_calyx_gc_budget(
             "Calyx storage GC retained source rows that live derived constellations still point at"
         );
     }
-    let before_live_rows = calyx_len_to_u64(
+    let materialized_eviction_candidate_rows = calyx_len_to_u64(
         budget.cf_name,
-        "Calyx GC live row count",
+        "Calyx GC materialized eviction candidate row count",
         state.live_entries.len(),
     )?;
+    let before_live_rows = state.before_live_rows;
+    let expected_materialized_eviction_candidate_rows = if budget.protected {
+        0
+    } else {
+        before_live_rows
+    };
+    if materialized_eviction_candidate_rows != expected_materialized_eviction_candidate_rows {
+        return Err(calyx_write_failed_detail(
+            budget.cf_name,
+            format!(
+                "Calyx retention materialization invariant violated: protected={} live_rows={before_live_rows} materialized_eviction_candidate_rows={materialized_eviction_candidate_rows} expected={expected_materialized_eviction_candidate_rows}",
+                budget.protected
+            ),
+        ));
+    }
     let before_estimated_num_keys = before_live_rows
         .checked_add(state.expired_rows)
         .ok_or_else(|| {
@@ -14313,7 +14332,15 @@ fn run_calyx_gc_budget(
             )
         })?;
     let after_estimated_num_keys = before_estimated_num_keys.saturating_sub(evicted_rows);
-    emit_calyx_gc_report(budget, &state, &cap_outcome, before_value, hard_cap_reached);
+    emit_calyx_gc_report(
+        budget,
+        &state,
+        &cap_outcome,
+        before_live_rows,
+        materialized_eviction_candidate_rows,
+        before_value,
+        hard_cap_reached,
+    );
     if cap_outcome.cap_evicted_rows > 0 {
         emit_calyx_gc_eviction_metric(
             budget,
@@ -14467,6 +14494,8 @@ fn emit_calyx_gc_report(
     budget: CalyxGcBudget,
     state: &CalyxRetentionState,
     cap_outcome: &CalyxGcCapOutcome,
+    before_live_rows: u64,
+    materialized_eviction_candidate_rows: u64,
     before_value: u64,
     hard_cap_reached: bool,
 ) {
@@ -14483,6 +14512,8 @@ fn emit_calyx_gc_report(
             unit = budget.unit.as_str(),
             expired_rows = state.expired_rows,
             cap_evicted_rows = cap_outcome.cap_evicted_rows,
+            before_live_rows,
+            materialized_eviction_candidate_rows,
             before_value,
             after_value = cap_outcome.after_value,
             soft_cap = budget.soft_cap,
@@ -14567,6 +14598,7 @@ fn collect_calyx_retention_state(
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let mut state = CalyxRetentionState {
+        before_live_rows: 0,
         live_entries: Vec::new(),
         expired_candidates: Vec::new(),
         tombstones: Vec::new(),
@@ -14632,13 +14664,25 @@ fn collect_calyx_retention_state(
                             format!("Calyx retention live-byte accounting overflow in {cf_name}"),
                         )
                     })?;
-            state.live_entries.push(CalyxRetentionLiveEntry {
-                full_key: full_key.to_vec(),
-                user_key,
-                live_bytes,
-                written_at_ms: envelope.written_at_ms,
-                value_digest: calyx_gc_row_digest(value),
-            });
+            state.before_live_rows = state.before_live_rows.checked_add(1).ok_or_else(|| {
+                calyx_write_failed_detail(
+                    cf_name,
+                    format!("Calyx retention live-row accounting overflow in {cf_name}"),
+                )
+            })?;
+            // A protected family cannot enter cap eviction, so retaining its
+            // full key, user key, digest and timestamps until the sweep ends is
+            // dead ownership. Keep the exact scalar count/bytes above and only
+            // allocate row candidates for the branch that can consume them.
+            if !protected {
+                state.live_entries.push(CalyxRetentionLiveEntry {
+                    full_key: full_key.to_vec(),
+                    user_key,
+                    live_bytes,
+                    written_at_ms: envelope.written_at_ms,
+                    value_digest: calyx_gc_row_digest(value),
+                });
+            }
             Ok(ControlFlow::Continue(()))
         },
     )?;
