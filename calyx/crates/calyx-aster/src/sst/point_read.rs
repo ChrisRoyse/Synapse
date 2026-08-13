@@ -5,9 +5,9 @@ use std::path::{Path, PathBuf};
 use calyx_core::{CalyxError, Result};
 
 use super::{
-    HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, LEGACY_VERSION, MAGIC, MAX_RANGE_SCAN_BYTES,
-    RECORD_HEADER_LEN, SstEntry, SstLookupMetadata, VERSION, clone_scan_bytes,
-    materialized_entry_bytes, record_crc, scan_reserve_failed,
+    HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN,
+    SstEntry, SstLookupMetadata, clone_scan_bytes, materialized_entry_bytes,
+    read_file_header_structure, record_crc, scan_reserve_failed,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -390,6 +390,15 @@ pub(crate) struct SstPointReader {
     entries: usize,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexedRecordLayout {
+    key_len: usize,
+    value_len: usize,
+    key_start: u64,
+    value_start: u64,
+    expected_crc: u32,
+}
+
 impl SstPointReader {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
@@ -418,57 +427,118 @@ impl SstPointReader {
                 },
             )?;
         }
-        let file_len = file
-            .metadata()
-            .map_err(|error| storage_error("stat SST for indexed row read", path, error))?
-            .len();
-        let mut header = [0_u8; HEADER_LEN];
-        read_exact_indexed(&mut file, &mut header, path, 0)?;
-        if &header[0..4] != MAGIC {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "SST {} magic mismatch during indexed row read",
-                path.display()
-            )));
-        }
-        let version = u32::from_le_bytes(header[4..8].try_into().expect("version"));
-        if version != VERSION && version != LEGACY_VERSION {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "unsupported SST version {version} in {}",
-                path.display()
-            )));
-        }
-        let entries = usize::try_from(u32::from_le_bytes(
-            header[8..12].try_into().expect("entries"),
-        ))
-        .map_err(|_| CalyxError::aster_corrupt_shard("SST entry count exceeds usize"))?;
-        let index_offset = u64::from_le_bytes(header[12..20].try_into().expect("index offset"));
-        let bloom_offset = u64::from_le_bytes(header[20..28].try_into().expect("bloom offset"));
-        if index_offset < HEADER_LEN as u64
-            || index_offset > file_len
-            || bloom_offset < index_offset
-            || bloom_offset > file_len
-        {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "SST {} header offsets are out of bounds for file length {file_len}",
-                path.display()
-            )));
-        }
+        let header = read_file_header_structure(&mut file, path)?;
+        let entries = usize::try_from(header.entries)
+            .map_err(|_| CalyxError::aster_corrupt_shard("SST entry count exceeds usize"))?;
         Ok(Self {
             file,
             path: path.to_path_buf(),
-            data_end: index_offset,
-            index_end: bloom_offset,
+            data_end: header.index_offset,
+            index_end: header.bloom_offset,
             entries,
         })
     }
 
-    /// Reads and CRC-validates one exact SST record. The caller separately
-    /// authenticates the value against the SHA-256 stored in the page index.
+    /// Reads and CRC-validates one exact SST record after matching its index key.
     pub(crate) fn read_value(
         &mut self,
         record_offset: u64,
         expected_key: &[u8],
     ) -> Result<Vec<u8>> {
+        let layout = self.read_record_layout(record_offset, expected_key)?;
+        let row_bytes = std::mem::size_of::<SstEntry>()
+            .saturating_add(layout.key_len)
+            .saturating_add(layout.value_len);
+        if row_bytes > MAX_RANGE_SCAN_BYTES {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+                message: format!(
+                    "SST indexed record at {}:{record_offset} requires {row_bytes} bytes, above the {MAX_RANGE_SCAN_BYTES}-byte materialization budget",
+                    self.path.display()
+                ),
+                remediation: "repair or split the oversized immutable row; indexed reads refuse an allocation that can abort the daemon",
+            });
+        }
+        let mut key = try_zeroed(layout.key_len)?;
+        read_exact_indexed(&mut self.file, &mut key, &self.path, layout.key_start)?;
+        if key != expected_key {
+            return Err(index_key_mismatch(
+                &self.path,
+                record_offset,
+                &key,
+                expected_key,
+            ));
+        }
+        let mut value = try_zeroed(layout.value_len)?;
+        read_exact_indexed(&mut self.file, &mut value, &self.path, layout.value_start)?;
+        let actual_crc = record_crc(&key, &value);
+        if actual_crc != layout.expected_crc {
+            return Err(record_crc_mismatch(
+                &self.path,
+                record_offset,
+                layout.expected_crc,
+                actual_crc,
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Validates one record without materializing its value.
+    ///
+    /// Cold-open bounds need integrity proof for the first and last keys of
+    /// every SST, but retaining either value would turn a metadata census into
+    /// a data-sized allocation. CRC input is therefore consumed through one
+    /// fixed buffer.
+    pub(crate) fn validate_record(
+        &mut self,
+        record_offset: u64,
+        expected_key: &[u8],
+    ) -> Result<()> {
+        let layout = self.read_record_layout(record_offset, expected_key)?;
+        let mut hasher = crc32fast::Hasher::new();
+        let mut buffer = [0_u8; RECORD_VALIDATION_BUFFER_BYTES];
+        let mut cursor = layout.key_start;
+        for expected in expected_key.chunks(RECORD_VALIDATION_BUFFER_BYTES) {
+            let actual = &mut buffer[..expected.len()];
+            read_exact_indexed(&mut self.file, actual, &self.path, cursor)?;
+            if actual != expected {
+                return Err(index_key_mismatch(
+                    &self.path,
+                    record_offset,
+                    actual,
+                    expected,
+                ));
+            }
+            hasher.update(actual);
+            cursor = cursor.saturating_add(expected.len() as u64);
+        }
+        let mut remaining = layout.value_len;
+        cursor = layout.value_start;
+        while remaining > 0 {
+            let chunk_len = remaining.min(buffer.len());
+            let chunk = &mut buffer[..chunk_len];
+            read_exact_indexed(&mut self.file, chunk, &self.path, cursor)?;
+            hasher.update(chunk);
+            remaining -= chunk_len;
+            cursor = cursor.saturating_add(chunk_len as u64);
+        }
+        let actual_crc = hasher.finalize();
+        if actual_crc != layout.expected_crc {
+            return Err(record_crc_mismatch(
+                &self.path,
+                record_offset,
+                layout.expected_crc,
+                actual_crc,
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_record_layout(
+        &mut self,
+        record_offset: u64,
+        expected_key: &[u8],
+    ) -> Result<IndexedRecordLayout> {
         if record_offset < HEADER_LEN as u64 || record_offset >= self.data_end {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "SST indexed record offset {record_offset} is outside data section {}..{} in {}",
@@ -508,40 +578,42 @@ impl SstPointReader {
                 expected_key.len()
             )));
         }
-        let row_bytes = std::mem::size_of::<SstEntry>()
-            .saturating_add(key_len)
-            .saturating_add(value_len);
-        if row_bytes > MAX_RANGE_SCAN_BYTES {
-            return Err(CalyxError {
-                code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
-                message: format!(
-                    "SST indexed record at {}:{record_offset} requires {row_bytes} bytes, above the {MAX_RANGE_SCAN_BYTES}-byte materialization budget",
-                    self.path.display()
-                ),
-                remediation: "repair or split the oversized immutable row; indexed reads refuse an allocation that can abort the daemon",
-            });
-        }
-        let mut key = try_zeroed(key_len)?;
-        read_exact_indexed(&mut self.file, &mut key, &self.path, key_start)?;
-        if key != expected_key {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "SST indexed record at {}:{record_offset} has key {} instead of {}",
-                self.path.display(),
-                hex_bytes(&key),
-                hex_bytes(expected_key)
-            )));
-        }
-        let mut value = try_zeroed(value_len)?;
-        read_exact_indexed(&mut self.file, &mut value, &self.path, value_start)?;
-        let actual_crc = record_crc(&key, &value);
-        if actual_crc != expected_crc {
-            return Err(CalyxError::aster_corrupt_shard(format!(
-                "SST indexed record CRC mismatch at {}:{record_offset}: expected {expected_crc:08x}, got {actual_crc:08x}",
-                self.path.display()
-            )));
-        }
-        Ok(value)
+        Ok(IndexedRecordLayout {
+            key_len,
+            value_len,
+            key_start,
+            value_start,
+            expected_crc,
+        })
     }
+}
+
+const RECORD_VALIDATION_BUFFER_BYTES: usize = 16 * 1_024;
+
+fn index_key_mismatch(
+    path: &Path,
+    record_offset: u64,
+    actual: &[u8],
+    expected: &[u8],
+) -> CalyxError {
+    CalyxError::aster_corrupt_shard(format!(
+        "SST indexed record at {}:{record_offset} has key {} instead of {}",
+        path.display(),
+        hex_bytes(actual),
+        hex_bytes(expected)
+    ))
+}
+
+fn record_crc_mismatch(
+    path: &Path,
+    record_offset: u64,
+    expected_crc: u32,
+    actual_crc: u32,
+) -> CalyxError {
+    CalyxError::aster_corrupt_shard(format!(
+        "SST indexed record CRC mismatch at {}:{record_offset}: expected {expected_crc:08x}, got {actual_crc:08x}",
+        path.display()
+    ))
 }
 
 fn try_zeroed(len: usize) -> Result<Vec<u8>> {

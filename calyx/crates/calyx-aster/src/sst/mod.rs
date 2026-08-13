@@ -66,6 +66,8 @@ pub(super) fn scan_reserve_failed(err: std::collections::TryReserveError) -> Cal
 use crate::mmap_col::MmapColumn;
 use bloom::BloomFilter;
 use calyx_core::{CalyxError, Result};
+use std::fs::File;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use io_helpers::{record_crc, section_crc};
@@ -436,12 +438,12 @@ impl SstReader {
 
 /// Reads and validates only the immutable file's ordered key bounds.
 ///
-/// The complete variable-length index is walked as borrowed mmap slices so a
-/// malformed count, offset, length, or key order fails closed without retaining
-/// an allocation per row. The first and last indexed data records are then read
-/// through the normal record CRC gate. A later candidate read still performs
-/// the SST-wide body checksum in [`SstReader::open`]; bounds are only a negative
-/// selection index and never authorize serving bytes.
+/// The complete variable-length index is walked through a single bounded file
+/// buffer so a malformed count, offset, length, or key order fails closed
+/// without mapping the cold SST into the process working set or retaining an
+/// allocation per row. The first and last indexed data records are then read
+/// through the normal record CRC gate. Bounds are only a negative selection
+/// index and never authorize serving bytes.
 pub(crate) fn read_sst_bounds(path: &Path) -> Result<Option<SstBounds>> {
     read_sst_bounds_inner(path).map_err(|mut error| {
         error.message = format!(
@@ -454,86 +456,119 @@ pub(crate) fn read_sst_bounds(path: &Path) -> Result<Option<SstBounds>> {
 }
 
 fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
-    let column = MmapColumn::open(path)?;
-    let bytes = column.as_bytes();
-    let header = read_header_structure(bytes)?;
-    let mut offset = usize::try_from(header.index_offset)
-        .map_err(|_| CalyxError::aster_corrupt_shard("SST index offset exceeds usize"))?;
-    let end = usize::try_from(header.bloom_offset)
-        .map_err(|_| CalyxError::aster_corrupt_shard("SST bloom offset exceeds usize"))?;
-    let mut first = None::<(&[u8], u64)>;
-    let mut previous = None::<&[u8]>;
-    let mut last = None::<(&[u8], u64)>;
-    for _ in 0..header.entries {
-        let fixed_end = offset.checked_add(INDEX_ENTRY_FIXED_LEN).ok_or_else(|| {
-            CalyxError::aster_corrupt_shard("SST index fixed-entry offset overflow")
-        })?;
-        let fixed = bytes
-            .get(offset..fixed_end)
-            .filter(|_| fixed_end <= end)
-            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index entry out of bounds"))?;
+    let mut file =
+        File::open(path).map_err(|error| sst_io_error("open SST bounds", path, error))?;
+    let header = read_file_header_structure(&mut file, path)?;
+    file.seek(SeekFrom::Start(header.index_offset))
+        .map_err(|error| sst_io_error("seek SST bounds index", path, error))?;
+    let mut reader = BufReader::with_capacity(SST_BOUNDS_BUFFER_BYTES, file);
+    let mut offset = header.index_offset;
+    let end = header.bloom_offset;
+    let mut first = None::<(Vec<u8>, u64)>;
+    let mut previous = Vec::<u8>::new();
+    let mut current = Vec::<u8>::new();
+    let mut last_offset = None::<u64>;
+    for ordinal in 0..header.entries {
+        let fixed_end = offset
+            .checked_add(INDEX_ENTRY_FIXED_LEN as u64)
+            .ok_or_else(|| {
+                CalyxError::aster_corrupt_shard("SST index fixed-entry offset overflow")
+            })?;
+        if fixed_end > end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST index entry {ordinal} is out of bounds"
+            )));
+        }
+        let mut fixed = [0_u8; INDEX_ENTRY_FIXED_LEN];
+        read_exact_sst_stream(&mut reader, &mut fixed, path, offset, "index entry")?;
         let key_len = u32::from_le_bytes(fixed[0..4].try_into().expect("index key len")) as usize;
         let record_offset = u64::from_le_bytes(fixed[4..12].try_into().expect("record offset"));
-        offset = fixed_end;
-        let key_end = offset
-            .checked_add(key_len)
-            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index key offset overflow"))?;
-        let key = bytes
-            .get(offset..key_end)
-            .filter(|_| key_end <= end)
-            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index key out of bounds"))?;
+        let key_end =
+            fixed_end
+                .checked_add(u64::try_from(key_len).map_err(|_| {
+                    CalyxError::aster_corrupt_shard("SST index key length exceeds u64")
+                })?)
+                .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index key offset overflow"))?;
+        if key_end > end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST index key {ordinal} is out of bounds"
+            )));
+        }
+        current.clear();
+        current
+            .try_reserve_exact(key_len)
+            .map_err(scan_reserve_failed)?;
+        current.resize(key_len, 0);
+        read_exact_sst_stream(&mut reader, &mut current, path, fixed_end, "index key")?;
         if record_offset < HEADER_LEN as u64 || record_offset >= header.index_offset {
             return Err(CalyxError::aster_corrupt_shard(format!(
                 "SST index record offset {record_offset} is outside the data section {}..{}",
                 HEADER_LEN, header.index_offset
             )));
         }
-        if previous.is_some_and(|prior| prior >= key) {
+        if ordinal != 0 && previous >= current {
             return Err(CalyxError::aster_corrupt_shard(
                 "SST index keys must be strictly sorted",
             ));
         }
         if first.is_none() {
-            first = Some((key, record_offset));
+            first = Some((clone_scan_bytes(&current)?, record_offset));
         }
-        previous = Some(key);
-        last = Some((key, record_offset));
+        std::mem::swap(&mut previous, &mut current);
+        last_offset = Some(record_offset);
         offset = key_end;
     }
     if offset != end {
         return Err(CalyxError::aster_corrupt_shard("SST index length mismatch"));
     }
     let Some((first_key, first_offset)) = first else {
-        if last.is_some() {
+        if last_offset.is_some() || !previous.is_empty() {
             return Err(CalyxError::aster_corrupt_shard(
                 "empty SST bounds walk produced a last key",
             ));
         }
         return Ok(None);
     };
-    let Some((last_key, last_offset)) = last else {
+    let Some(last_offset) = last_offset else {
         return Err(CalyxError::aster_corrupt_shard(
             "non-empty SST bounds walk produced no last key",
         ));
     };
-    let first_record = read_record_ref(bytes, first_offset)?;
-    if first_record.key != first_key {
-        return Err(CalyxError::aster_corrupt_shard(
-            "SST first index key does not match its CRC-validated data record",
-        ));
-    }
+    let last_key = previous;
+    let mut point_reader = SstPointReader::open(path)?;
+    point_reader.validate_record(first_offset, &first_key)?;
     if last_offset != first_offset {
-        let last_record = read_record_ref(bytes, last_offset)?;
-        if last_record.key != last_key {
-            return Err(CalyxError::aster_corrupt_shard(
-                "SST last index key does not match its CRC-validated data record",
-            ));
-        }
+        point_reader.validate_record(last_offset, &last_key)?;
     }
     Ok(Some(SstBounds {
-        first_key: first_key.to_vec(),
-        last_key: last_key.to_vec(),
+        first_key,
+        last_key,
     }))
+}
+
+/// Fixed file buffer used while deriving one cold SST's bounds. Router load is
+/// sequential, so startup retains exactly one such buffer regardless of vault
+/// size or immutable-file count.
+const SST_BOUNDS_BUFFER_BYTES: usize = 64 * 1_024;
+
+fn read_exact_sst_stream(
+    reader: &mut impl Read,
+    out: &mut [u8],
+    path: &Path,
+    offset: u64,
+    section: &'static str,
+) -> Result<()> {
+    reader.read_exact(out).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            CalyxError::aster_corrupt_shard(format!(
+                "SST {section} is truncated at {}:{offset} while reading {} bytes",
+                path.display(),
+                out.len()
+            ))
+        } else {
+            sst_io_error(&format!("read SST {section}"), path, error)
+        }
+    })
 }
 
 pub(super) fn materialized_entry_bytes<T>(key: &[u8], value: &[u8]) -> usize {
@@ -680,10 +715,10 @@ fn write_header(
     bytes[28..32].copy_from_slice(&body_crc.to_le_bytes());
 }
 
-fn read_header_structure(bytes: &[u8]) -> Result<Header> {
-    let header = bytes
-        .get(0..HEADER_LEN)
-        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing"))?;
+fn parse_header_structure(header: &[u8], len: u64) -> Result<Header> {
+    if header.len() != HEADER_LEN {
+        return Err(CalyxError::aster_corrupt_shard("SST header missing"));
+    }
     if &header[0..4] != MAGIC {
         return Err(CalyxError::aster_corrupt_shard("SST magic mismatch"));
     }
@@ -696,7 +731,6 @@ fn read_header_structure(bytes: &[u8]) -> Result<Header> {
     let entries = u32::from_le_bytes(header[8..12].try_into().expect("entries"));
     let index_offset = u64::from_le_bytes(header[12..20].try_into().expect("index offset"));
     let bloom_offset = u64::from_le_bytes(header[20..28].try_into().expect("bloom offset"));
-    let len = bytes.len() as u64;
     if index_offset < HEADER_LEN as u64
         || index_offset > len
         || bloom_offset < index_offset
@@ -711,6 +745,39 @@ fn read_header_structure(bytes: &[u8]) -> Result<Header> {
         index_offset,
         bloom_offset,
     })
+}
+
+fn read_header_structure(bytes: &[u8]) -> Result<Header> {
+    let header = bytes
+        .get(0..HEADER_LEN)
+        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing"))?;
+    let len = bytes.len() as u64;
+    parse_header_structure(header, len)
+}
+
+fn read_file_header_structure(file: &mut File, path: &Path) -> Result<Header> {
+    let len = file
+        .metadata()
+        .map_err(|error| sst_io_error("stat SST", path, error))?
+        .len();
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| sst_io_error("seek SST header", path, error))?;
+    let mut header = [0_u8; HEADER_LEN];
+    file.read_exact(&mut header).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::UnexpectedEof {
+            CalyxError::aster_corrupt_shard(format!(
+                "SST header is truncated in {}",
+                path.display()
+            ))
+        } else {
+            sst_io_error("read SST header", path, error)
+        }
+    })?;
+    parse_header_structure(&header, len)
+}
+
+fn sst_io_error(context: &str, path: &Path, error: std::io::Error) -> CalyxError {
+    CalyxError::disk_pressure(format!("{context} {}: {error}", path.display()))
 }
 
 fn read_header(bytes: &[u8]) -> Result<Header> {
