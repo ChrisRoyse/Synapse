@@ -1,8 +1,7 @@
 use super::page;
 use super::{
-    MAX_RANGE_SCAN_BYTES, SstBounds, SstEntry, SstKeyState, SstLookupMetadata, SstPageReader,
-    SstPointReader, SstReader, SstSummary, clone_scan_bytes, materialized_entry_bytes,
-    scan_reserve_failed,
+    MAX_RANGE_SCAN_BYTES, SstBounds, SstEntry, SstLookupMetadata, SstPageReader, SstPointReader,
+    SstReader, SstSummary, clone_scan_bytes, materialized_entry_bytes, scan_reserve_failed,
 };
 use super::{read_sst_bounds, shared_reader};
 use calyx_core::{CalyxError, Result};
@@ -36,12 +35,6 @@ pub struct PreparedLevelFile(LevelFile);
 struct RankedRangeEntry {
     source_index: usize,
     entry: SstEntry,
-}
-
-#[derive(Debug)]
-struct RankedKeyState {
-    source_index: usize,
-    state: SstKeyState,
 }
 
 #[derive(Debug)]
@@ -562,44 +555,26 @@ impl SstLevel {
 
     pub fn range_keys_until(&self, start: &[u8], end: Option<&[u8]>) -> Result<Vec<Vec<u8>>> {
         let mut retained_bytes = 0_usize;
-        let mut ranked = Vec::<RankedKeyState>::new();
-        for (source_index, file) in self.files.iter().enumerate() {
-            if !file.may_intersect(start, end) {
-                continue;
-            }
-            shared_reader(&file.path)?.visit_range_until(start, end, |key, value| {
-                let next_record = materialized_entry_bytes::<RankedKeyState>(key, &[]);
+        let mut rows = Vec::new();
+        // This API necessarily returns every live key, but the immutable input
+        // no longer needs whole-file mmap readers or a second vector containing
+        // every duplicate physical version. The key-state cursor validates
+        // records forward-only, merges newest-wins as it advances, and retains
+        // only one bounded page plus the result keys (#2239).
+        let mut stream =
+            self.open_key_state_page_stream_with_overlay(start, end, 4_096, Vec::new())?;
+        while let Some(states) = stream.next_page()? {
+            for state in states {
+                if state.is_tombstone {
+                    continue;
+                }
+                let next_record = materialized_entry_bytes::<Vec<u8>>(&state.key, &[]);
                 retained_bytes = retained_bytes.saturating_add(next_record);
                 if retained_bytes > MAX_RANGE_SCAN_BYTES {
                     return Err(level_scan_budget_exceeded(retained_bytes, next_record));
                 }
-                ranked.try_reserve(1).map_err(scan_reserve_failed)?;
-                ranked.push(RankedKeyState {
-                    source_index,
-                    state: SstKeyState {
-                        key: clone_scan_bytes(key)?,
-                        is_tombstone: crate::mvcc::is_tombstone_value(value),
-                    },
-                });
-                Ok(())
-            })?;
-        }
-
-        ranked.sort_unstable_by(|left, right| {
-            left.state
-                .key
-                .cmp(&right.state.key)
-                .then_with(|| left.source_index.cmp(&right.source_index))
-        });
-        ranked.dedup_by(|later, earlier| later.state.key == earlier.state.key);
-
-        let live_count = ranked.iter().filter(|row| !row.state.is_tombstone).count();
-        let mut rows = Vec::new();
-        rows.try_reserve_exact(live_count)
-            .map_err(scan_reserve_failed)?;
-        for row in ranked {
-            if !row.state.is_tombstone {
-                rows.push(row.state.key);
+                rows.try_reserve(1).map_err(scan_reserve_failed)?;
+                rows.push(state.key);
             }
         }
         Ok(rows)

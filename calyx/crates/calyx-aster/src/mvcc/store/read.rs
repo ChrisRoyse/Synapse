@@ -97,7 +97,7 @@ impl VersionedCfStore {
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<LatestCfRangePage> {
-        validate_latest_page_request(range, after_key, limit)?;
+        validate_range_page_request(range, after_key, limit)?;
         if limit == 0 {
             return Ok(LatestCfRangePage {
                 snapshot_seq: self.current_seq(),
@@ -596,80 +596,71 @@ impl VersionedCfStore {
         limit: usize,
         clock: &dyn Clock,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        validate_range_page_request(range, after_key, limit)?;
         self.ensure_snapshot_live(snapshot, clock)?;
         if limit == 0 {
             return Ok(Vec::new());
         }
-        if self.router_latest_readback.load(Ordering::Acquire) {
-            // Select visible keys first so table tombstones and inserts are
-            // merged correctly without cloning the complete value range.
-            let keys = self.scan_cf_range_keys_at(snapshot, cf, range, clock)?;
-            let keys = keys
-                .into_iter()
-                .filter(|key| after_key.is_none_or(|after| key.as_slice() > after))
-                .take(limit)
-                .collect::<Vec<_>>();
-            let reads = keys
-                .iter()
-                .cloned()
-                .map(|key| CfRead::new(cf, key))
-                .collect::<Vec<_>>();
-            let values = self.read_batch(snapshot, &reads, clock)?;
-            return keys
-                .into_iter()
-                .zip(values)
-                .map(|(key, value)| {
-                    value.map(|value| (key.clone(), value)).ok_or_else(|| {
-                        // Deliberately does NOT say the key "disappeared". Both
-                        // halves of this read run at one pinned sequence, so
-                        // nothing can vanish between them; the only way to be
-                        // here is that the key-selection view and the
-                        // value-resolution view disagree about visibility at
-                        // that same sequence. Naming a race sent an
-                        // investigation at a deterministic condition after the
-                        // wrong thing (#1954), so the message states the
-                        // disagreement and names both views instead.
-                        calyx_core::CalyxError::aster_corrupt_shard(format!(
-                            "{} key {} was selected as visible at pinned seq {} by the \
-                             key view (router range keys + MVCC table overlay) but the \
-                             value view (read_batch) resolved no live value at that same \
-                             sequence; the two latest views disagree about this key's \
-                             visibility, which is deterministic at a pinned sequence and \
-                             not a concurrent mutation",
-                            cf.name(),
-                            hex_prefix(&key),
-                            snapshot.seq()
-                        ))
-                    })
-                })
-                .collect();
-        }
-        let lower = if let Some(after_key) = after_key {
-            Bound::Excluded(after_key)
-        } else {
-            Bound::Included(range.start.as_slice())
-        };
-        let table = self.read_rows(RowGuardSite::ScanCfRangePageAt, cf);
+
+        // Page the ordered union of raw physical key states and the exact MVCC
+        // overlay. The former implementation called `scan_cf_range_keys_at`
+        // here, materialising the *entire* requested range before applying
+        // `take(limit)`. On a cold router that also opened the whole-file SST
+        // reader, whose integrity pass read every body byte. GC and derived
+        // maintenance therefore reread a 1.17 GiB KV SST once per nominally
+        // bounded page (#2239).
+        //
+        // Candidates retain tombstones. Advancing by the last examined
+        // candidate guarantees progress through a deletion-dense range while
+        // returning the same contract as before: up to `limit` live rows. A
+        // table key with no version visible at this historical snapshot is an
+        // explicit absence/tombstone override for newer router state.
         let mut rows = Vec::with_capacity(limit);
-        let Some(cf_rows) = table.get(&cf) else {
-            return Ok(rows);
-        };
-        for (key, versions) in cf_rows.range::<[u8], _>((lower, Bound::Unbounded)) {
-            if !range.contains(key) {
-                if range.end.as_ref().is_some_and(|end| key >= end) {
-                    break;
-                }
-                continue;
+        let mut candidate_after = after_key.map(<[u8]>::to_vec);
+        loop {
+            self.ensure_snapshot_live(snapshot, clock)?;
+            let table = self.read_rows(RowGuardSite::ScanCfRangePageAt, cf);
+            let router = if self.router_latest_readback.load(Ordering::Acquire) {
+                // The rows guard prevents a commit from advancing the serving
+                // view between this sequence check and the router shard read.
+                self.ensure_router_latest_snapshot(snapshot)?;
+                Some(self.router.as_deref().ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(
+                        "router-backed snapshot page requested without a CF router".to_owned(),
+                    )
+                })?)
+            } else {
+                None
+            };
+            let candidates = snapshot_range_candidate_page_from_view(
+                snapshot.seq(),
+                &table,
+                router,
+                cf,
+                range,
+                candidate_after.as_deref(),
+                limit,
+            )?;
+            drop(table);
+
+            if candidates.is_empty() {
+                return Ok(rows);
             }
-            if let Some(value) = visible_value(versions, snapshot.seq()) {
-                self.ensure_unbarriered(cf, key)?;
-                rows.push((key.clone(), value));
-                if rows.len() == limit {
-                    break;
+            let exhausted = candidates.len() < limit;
+            for (key, state) in candidates {
+                candidate_after = Some(key.clone());
+                if let VisibleValue::Live(value) = state {
+                    self.ensure_unbarriered(cf, &key)?;
+                    rows.push((key, value));
+                    if rows.len() == limit {
+                        return Ok(rows);
+                    }
                 }
+            }
+            if exhausted {
+                return Ok(rows);
             }
         }
-        Ok(rows)
     }
 
     /// Returns the greatest visible row in `[start, upper]` at one pinned snapshot.
@@ -1057,11 +1048,71 @@ fn latest_range_page_from_view(
         .unwrap_or_default();
     let table_rows =
         table_candidate_page_from_view(table, seq, cf, range, after_key, candidate_limit)?;
+    let candidates = merge_range_candidate_page(router_rows, table_rows, candidate_limit);
 
+    let examined_rows = candidates.len();
+    let more = examined_rows > limit;
+    // The lookahead candidate is part of the read. Validate its barrier before
+    // revealing `more=true`; otherwise paging would leak the existence of a
+    // blocked live row even though the row itself is not emitted yet.
+    for (key, state) in &candidates {
+        if matches!(state, VisibleValue::Live(_)) {
+            ensure_view_key_unbarriered(barriers, cf, key)?;
+        }
+    }
+    let mut resume_after = None;
+    let mut rows = Vec::with_capacity(limit);
+    for (key, state) in candidates.into_iter().take(limit) {
+        resume_after = Some(key.clone());
+        if let VisibleValue::Live(value) = state {
+            rows.push((key, value));
+        }
+    }
+
+    Ok(LatestCfRangePage {
+        snapshot_seq: seq,
+        rows,
+        resume_after,
+        more,
+        examined_rows,
+    })
+}
+
+fn snapshot_range_candidate_page_from_view(
+    seq: Seq,
+    table: &RowTable,
+    router: Option<&CfRouter>,
+    cf: ColumnFamily,
+    range: &KeyRange,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, VisibleValue)>> {
+    let router_rows = router
+        .map(|router| {
+            router.range_candidate_page_until(
+                cf,
+                &range.start,
+                range.end.as_deref(),
+                after_key,
+                limit,
+            )
+        })
+        .transpose()?
+        .unwrap_or_default();
+    let table_rows =
+        table_snapshot_candidate_page_from_view(table, seq, cf, range, after_key, limit)?;
+    Ok(merge_range_candidate_page(router_rows, table_rows, limit))
+}
+
+fn merge_range_candidate_page(
+    router_rows: Vec<crate::sst::SstEntry>,
+    table_rows: Vec<(Vec<u8>, VisibleValue)>,
+    limit: usize,
+) -> Vec<(Vec<u8>, VisibleValue)> {
     let mut router_index = 0;
     let mut table_index = 0;
-    let mut candidates = Vec::with_capacity(candidate_limit);
-    while candidates.len() < candidate_limit
+    let mut candidates = Vec::with_capacity(limit);
+    while candidates.len() < limit
         && (router_index < router_rows.len() || table_index < table_rows.len())
     {
         let (key, state) = match (router_rows.get(router_index), table_rows.get(table_index)) {
@@ -1098,33 +1149,7 @@ fn latest_range_page_from_view(
         };
         candidates.push((key, state));
     }
-
-    let examined_rows = candidates.len();
-    let more = examined_rows > limit;
-    // The lookahead candidate is part of the read. Validate its barrier before
-    // revealing `more=true`; otherwise paging would leak the existence of a
-    // blocked live row even though the row itself is not emitted yet.
-    for (key, state) in &candidates {
-        if matches!(state, VisibleValue::Live(_)) {
-            ensure_view_key_unbarriered(barriers, cf, key)?;
-        }
-    }
-    let mut resume_after = None;
-    let mut rows = Vec::with_capacity(limit);
-    for (key, state) in candidates.into_iter().take(limit) {
-        resume_after = Some(key.clone());
-        if let VisibleValue::Live(value) = state {
-            rows.push((key, value));
-        }
-    }
-
-    Ok(LatestCfRangePage {
-        snapshot_seq: seq,
-        rows,
-        resume_after,
-        more,
-        examined_rows,
-    })
+    candidates
 }
 
 fn table_candidate_page_from_view(
@@ -1163,6 +1188,32 @@ fn table_candidate_page_from_view(
         .collect()
 }
 
+fn table_snapshot_candidate_page_from_view(
+    table: &RowTable,
+    seq: Seq,
+    cf: ColumnFamily,
+    range: &KeyRange,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, VisibleValue)>> {
+    let Some(cf_rows) = table.get(&cf) else {
+        return Ok(Vec::new());
+    };
+    let rows = latest::overlay_page(cf_rows, cf, Some(range), after_key)?
+        .map(|(key, versions)| {
+            // Every post-recovery changed key remains in the MVCC table. A key
+            // whose first version is newer than `seq` must therefore suppress
+            // the router's newer state, exactly like an explicit tombstone.
+            (
+                key.clone(),
+                visible_value_state(versions, seq).unwrap_or(VisibleValue::Tombstone),
+            )
+        })
+        .take(limit)
+        .collect();
+    Ok(rows)
+}
+
 fn visible_state_from_router_value(value: &[u8]) -> VisibleValue {
     if is_tombstone_value(value) {
         VisibleValue::Tombstone
@@ -1171,14 +1222,14 @@ fn visible_state_from_router_value(value: &[u8]) -> VisibleValue {
     }
 }
 
-fn validate_latest_page_request(
+fn validate_range_page_request(
     range: &KeyRange,
     after_key: Option<&[u8]>,
     limit: usize,
 ) -> Result<()> {
     if limit > LATEST_CF_RANGE_PAGE_MAX_ROWS {
-        return Err(invalid_latest_page(format!(
-            "latest range page limit {limit} exceeds the hard maximum {LATEST_CF_RANGE_PAGE_MAX_ROWS}"
+        return Err(invalid_range_page(format!(
+            "range page limit {limit} exceeds the hard maximum {LATEST_CF_RANGE_PAGE_MAX_ROWS}"
         )));
     }
     if range
@@ -1186,8 +1237,8 @@ fn validate_latest_page_request(
         .as_ref()
         .is_some_and(|end| end.as_slice() <= range.start.as_slice())
     {
-        return Err(invalid_latest_page(format!(
-            "latest range page requires end > start; start={} end={}",
+        return Err(invalid_range_page(format!(
+            "range page requires end > start; start={} end={}",
             hex_prefix(&range.start),
             range
                 .end
@@ -1203,8 +1254,8 @@ fn validate_latest_page_request(
                 .as_ref()
                 .is_some_and(|end| after_key >= end.as_slice()))
     {
-        return Err(invalid_latest_page(format!(
-            "latest range page cursor {} is outside [{}, {})",
+        return Err(invalid_range_page(format!(
+            "range page cursor {} is outside [{}, {})",
             hex_prefix(after_key),
             hex_prefix(&range.start),
             range
@@ -1217,16 +1268,12 @@ fn validate_latest_page_request(
     Ok(())
 }
 
-fn invalid_latest_page(message: impl Into<String>) -> CalyxError {
+fn invalid_range_page(message: impl Into<String>) -> CalyxError {
     CalyxError {
         code: "CALYX_ASTER_RANGE_PAGE_INVALID",
         message: message.into(),
         remediation: "supply an ordered range, an exclusive cursor inside that range, and a page limit at or below LATEST_CF_RANGE_PAGE_MAX_ROWS",
     }
-}
-
-fn visible_value(versions: &VersionChain, seq: Seq) -> Option<Vec<u8>> {
-    visible_value_state(versions, seq).and_then(VisibleValue::into_option)
 }
 
 #[derive(Clone)]
