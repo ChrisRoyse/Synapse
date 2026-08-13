@@ -2771,7 +2771,7 @@ impl SynapseService {
                 // live-verified), the nested `perception_detection` field stays
                 // truthful, and the arm below names the absence in the rollup
                 // detail instead of folding it into a generic "initialized".
-                let (status, prefix) = match (&bundle, detection.status.as_str()) {
+                let (mut status, mut prefix) = match (&bundle, detection.status.as_str()) {
                     (Err(_), _) => ("error", "perception detector backend probe failed"),
                     (Ok(_), "misconfigured") => (
                         "misconfigured",
@@ -2783,6 +2783,12 @@ impl SynapseService {
                     ),
                     (Ok(_), _) => ("ok", "perception runtime initialized"),
                 };
+                let fs_watch = state.fs_recent_tracker.readback();
+                if fs_watch.queue_error.is_some() || fs_watch.watcher_errors > 0 {
+                    status = "error";
+                    prefix =
+                        "perception runtime filesystem watcher reported a native or queue failure";
+                }
                 SubsystemHealth {
                     status: status.to_owned(),
                     detail: Some(format!("{prefix}; {detection_detail}; {bundled_blob}")),
@@ -2790,6 +2796,7 @@ impl SynapseService {
                     capture_config: Some(state.active_capture_config.clone()),
                     capture_runtime: Some(state.capture_runtime_readback()),
                     perception_detection: Some(detection),
+                    perception_fs_watch: Some(fs_watch.into_health_value()),
                     ..SubsystemHealth::default()
                 }
             }

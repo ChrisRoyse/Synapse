@@ -75,6 +75,10 @@ pub struct MvccCommitTimings {
     pub router_lock_wait_us: u64,
     /// Search-panel attribution, which may read the router's latest view.
     pub panel_attribution_us: u64,
+    /// Capturing the durable router's prior value for keys first changed after
+    /// a disk-backed open. This is the bounded MVCC delta that preserves live
+    /// snapshot semantics without copying the checkpointed corpus into heap.
+    pub history_baseline_us: u64,
     /// Content-watermark advance and sequence allocation.
     pub watermark_us: u64,
     /// Row-table version-chain apply, including every key and value copy.
@@ -104,6 +108,7 @@ pub const MVCC_STAGE_NAMES: [&str; MVCC_STAGE_COUNT] = [
     "row_lock_wait",
     "router_lock_wait",
     "panel_attribution",
+    "history_baseline",
     "watermark",
     "row_apply",
     "router_apply",
@@ -111,7 +116,7 @@ pub const MVCC_STAGE_NAMES: [&str; MVCC_STAGE_COUNT] = [
     "unattributed",
 ];
 /// Number of sub-stages in [`MVCC_STAGE_NAMES`].
-pub const MVCC_STAGE_COUNT: usize = 9;
+pub const MVCC_STAGE_COUNT: usize = 10;
 
 impl MvccCommitTimings {
     /// This commit's MVCC sub-stages in [`MVCC_STAGE_NAMES`] order.
@@ -126,6 +131,7 @@ impl MvccCommitTimings {
             self.row_lock_wait_us,
             self.router_lock_wait_us,
             self.panel_attribution_us,
+            self.history_baseline_us,
             self.watermark_us,
             self.row_apply_us,
             self.router_apply_us,
@@ -142,6 +148,7 @@ impl MvccCommitTimings {
             .saturating_sub(self.row_lock_wait_us)
             .saturating_sub(self.router_lock_wait_us)
             .saturating_sub(self.panel_attribution_us)
+            .saturating_sub(self.history_baseline_us)
             .saturating_sub(self.watermark_us)
             .saturating_sub(self.row_apply_us)
             .saturating_sub(self.router_apply_us)
@@ -1892,6 +1899,9 @@ impl VersionedCfStore {
             PanelAttribution::Strict,
         )?;
         timings.panel_attribution_us = elapsed_us(&attribution_started);
+        let history_baseline_started = Instant::now();
+        self.ensure_router_history_baselines(&mut table, &rows)?;
+        timings.history_baseline_us = elapsed_us(&history_baseline_started);
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
         // this commit's seq must already observe its watermark (issue #1100).
@@ -1913,7 +1923,9 @@ impl VersionedCfStore {
         // released, so it can never observe a row whose family still reports a
         // sequence below this commit's.
         self.publish_cf_commit_seq(&rows, seq);
-        timings.watermark_us = elapsed_us(&attribution_started) - timings.panel_attribution_us;
+        timings.watermark_us = elapsed_us(&attribution_started)
+            .saturating_sub(timings.panel_attribution_us)
+            .saturating_sub(timings.history_baseline_us);
         let row_apply_started = Instant::now();
         for (cf, key, value) in &rows {
             table
@@ -2043,6 +2055,49 @@ impl VersionedCfStore {
         }
         timings.total_us = elapsed_us(&started);
         Ok(seq)
+    }
+
+    /// Captures the opening router view only for keys first changed during this
+    /// process. The immutable SST/router state is the baseline Source of Truth;
+    /// the row table is a delta journal above `changed_key_history_floor`.
+    ///
+    /// A baseline tombstone is just as important as a baseline value: without
+    /// it, a snapshot pinned before a key's first insertion would fall through
+    /// to the now-newer router and incorrectly observe that insertion. Values
+    /// are captured before any router publication and while every touched row
+    /// shard is held exclusively, so a reader sees either the old router or a
+    /// complete baseline+new-version chain, never the transition between them.
+    fn ensure_router_history_baselines(
+        &self,
+        table: &mut RowWriteSet<'_>,
+        rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+    ) -> Result<()> {
+        if !self.router_latest_readback.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let router = self.router.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "router-backed MVCC history requested without a CF router".to_owned(),
+            )
+        })?;
+        for (cf, key, _value) in rows {
+            let family = table.entry_mut(*cf)?;
+            let chain = family.entry(key.clone()).or_default();
+            if chain
+                .iter()
+                .any(|version| version.seq <= self.changed_key_history_floor)
+            {
+                continue;
+            }
+            let baseline = router
+                .get(*cf, key)?
+                .unwrap_or_else(|| TOMBSTONE_VALUE.to_vec());
+            chain.push_front(VersionedValue {
+                seq: self.changed_key_history_floor,
+                value: baseline,
+            });
+        }
+        Ok(())
     }
 
     /// Restores one durable write group at its original sequence before live writes begin.
@@ -2225,6 +2280,7 @@ impl VersionedCfStore {
                 &rows,
                 attribution,
             )?;
+            self.ensure_router_history_baselines(&mut table, &rows)?;
             if rows
                 .iter()
                 .any(|(cf, _, _)| cf.feeds_persistent_search_index())

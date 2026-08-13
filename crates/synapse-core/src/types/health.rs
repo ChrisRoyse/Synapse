@@ -1183,6 +1183,10 @@ pub struct SubsystemHealth {
     /// subsystem except `perception`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub perception_detection: Option<PerceptionDetectionHealth>,
+    /// Exact recursive filesystem-watcher ownership and bounded ingress state.
+    /// `None` for every subsystem except `perception`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perception_fs_watch: Option<serde_json::Value>,
     /// Structured `chrome_bridge` verdict. `None` for every subsystem except
     /// `chrome_bridge`; the MCP health builder populates it so the bridge
     /// readiness is machine-readable instead of a single concatenated

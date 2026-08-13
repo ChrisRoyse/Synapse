@@ -209,7 +209,22 @@ impl VersionedCfStore {
                 return Ok(value.into_option());
             }
         }
-        self.router_latest_value(snapshot, cf, key)
+        let router_value = self.router_latest_value(snapshot, cf, key)?;
+        // A commit may have landed between the first row-table miss and the
+        // router point read. Disk-backed mode publishes the prior-value
+        // baseline to the row table before it changes the router, so a second
+        // table read resolves that race exactly: if the router value came from
+        // the newer commit, its baseline is already visible here; if no row
+        // appeared, the router value still belongs to this snapshot.
+        let table = self.read_rows(RowGuardSite::ReadAt, cf);
+        if let Some(value) = table
+            .get(&cf)
+            .and_then(|rows| rows.get(key))
+            .and_then(|versions| visible_value_state(versions, snapshot.seq()))
+        {
+            return Ok(value.into_option());
+        }
+        Ok(router_value)
     }
 
     /// Returns the visible version sequence for one CF/key at the pinned sequence.
@@ -288,11 +303,26 @@ impl VersionedCfStore {
         let router = self.router.as_deref();
         self.ensure_router_latest_snapshot(snapshot)?;
         if let Some(router) = router.as_ref() {
-            for index in router_misses {
+            for &index in &router_misses {
                 let read = &reads[index];
                 values[index] = router
                     .get(read.cf, &read.key)?
                     .filter(|value| !is_tombstone_value(value));
+            }
+        }
+        // Same race closure as `read_at`, applied to the exact router-miss
+        // indexes. A concurrent commit records its baseline before router
+        // publication, so this second table view overrides only values that
+        // might otherwise have been read from a newer physical router view.
+        let table = self.read_rows_all(RowGuardSite::ReadBatch);
+        for index in router_misses {
+            let read = &reads[index];
+            if let Some(visible) = table
+                .cf(read.cf)
+                .and_then(|rows| rows.get(read.key.as_slice()))
+                .and_then(|versions| visible_value_state(versions, snapshot.seq()))
+            {
+                values[index] = visible.into_option();
             }
         }
         Ok(values)

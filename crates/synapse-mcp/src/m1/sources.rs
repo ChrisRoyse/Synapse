@@ -1,8 +1,8 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt, fs,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -252,16 +252,89 @@ fn hex_lower(bytes: &[u8]) -> String {
 
 pub struct FsRecentTracker {
     roots: Vec<PathBuf>,
-    rx: Option<mpsc::Receiver<notify::Result<notify::Event>>>,
+    queue: Option<Arc<Mutex<FsWatchQueue>>>,
     _watcher: Option<RecommendedWatcher>,
     disabled_reason: Option<String>,
+}
+
+#[derive(Debug)]
+struct FsQueuedEvent {
+    at: DateTime<Utc>,
+    path: PathBuf,
+    kind: FsEventKind,
+}
+
+#[derive(Debug, Default)]
+struct FsWatchQueue {
+    events: VecDeque<FsQueuedEvent>,
+    received_paths: u64,
+    coalesced_paths: u64,
+    evicted_paths: u64,
+    watcher_errors: u64,
+    high_water_paths: usize,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct FsWatchReadback {
+    pub enabled: bool,
+    pub roots: Vec<String>,
+    pub queue_capacity_paths: usize,
+    pub queued_paths: usize,
+    pub high_water_paths: usize,
+    pub received_paths: u64,
+    pub coalesced_paths: u64,
+    pub evicted_paths: u64,
+    pub watcher_errors: u64,
+    pub disabled_reason: Option<String>,
+    pub queue_error: Option<String>,
+}
+
+impl FsWatchReadback {
+    /// Builds the health payload without a fallible serialization step. Health
+    /// is the diagnostic surface for watcher failure, so it must never replace
+    /// an encoding error with fabricated "disabled" state.
+    #[must_use]
+    pub fn into_health_value(self) -> serde_json::Value {
+        serde_json::Value::Object(serde_json::Map::from_iter([
+            ("enabled".to_owned(), self.enabled.into()),
+            (
+                "roots".to_owned(),
+                serde_json::Value::Array(
+                    self.roots
+                        .into_iter()
+                        .map(serde_json::Value::String)
+                        .collect(),
+                ),
+            ),
+            (
+                "queue_capacity_paths".to_owned(),
+                self.queue_capacity_paths.into(),
+            ),
+            ("queued_paths".to_owned(), self.queued_paths.into()),
+            ("high_water_paths".to_owned(), self.high_water_paths.into()),
+            ("received_paths".to_owned(), self.received_paths.into()),
+            ("coalesced_paths".to_owned(), self.coalesced_paths.into()),
+            ("evicted_paths".to_owned(), self.evicted_paths.into()),
+            ("watcher_errors".to_owned(), self.watcher_errors.into()),
+            (
+                "disabled_reason".to_owned(),
+                self.disabled_reason
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            ),
+            (
+                "queue_error".to_owned(),
+                self.queue_error
+                    .map_or(serde_json::Value::Null, serde_json::Value::String),
+            ),
+        ]))
+    }
 }
 
 impl fmt::Debug for FsRecentTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("FsRecentTracker")
             .field("roots", &self.roots)
-            .field("enabled", &self.rx.is_some())
+            .field("enabled", &self.queue.is_some())
             .field("disabled_reason", &self.disabled_reason)
             .finish_non_exhaustive()
     }
@@ -311,16 +384,41 @@ impl FsRecentTracker {
         if roots.is_empty() {
             anyhow::bail!("no configured filesystem summary roots are available");
         }
-        let (tx, rx) = mpsc::channel();
+        let queue = Arc::new(Mutex::new(FsWatchQueue::default()));
+        let callback_queue = Arc::clone(&queue);
         let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = tx.send(event);
+            let mut queue = match callback_queue.lock() {
+                Ok(queue) => queue,
+                Err(error) => {
+                    tracing::error!(
+                        code = "OBSERVE_FS_WATCH_QUEUE_POISONED",
+                        error = %error,
+                        remediation = "restart the Synapse daemon and inspect the preceding panic; filesystem activity is not being accepted while the queue lock is poisoned",
+                        "filesystem watcher could not publish a native event"
+                    );
+                    return;
+                }
+            };
+            match event {
+                Ok(event) => queue.push_notify_event(event),
+                Err(error) => {
+                    queue.watcher_errors = queue.watcher_errors.saturating_add(1);
+                    tracing::error!(
+                        code = "OBSERVE_FS_WATCH_NATIVE_ERROR",
+                        watcher_errors = queue.watcher_errors,
+                        error = %error,
+                        remediation = "inspect the watched roots and native watcher resources; the failed event was not represented as a filesystem change",
+                        "native filesystem watcher reported an error"
+                    );
+                }
+            }
         })?;
         for root in &roots {
             watcher.watch(root, RecursiveMode::Recursive)?;
         }
         Ok(Self {
             roots,
-            rx: Some(rx),
+            queue: Some(queue),
             _watcher: Some(watcher),
             disabled_reason: None,
         })
@@ -333,7 +431,7 @@ impl FsRecentTracker {
     fn disabled(reason: Option<String>) -> Self {
         Self {
             roots: Vec::new(),
-            rx: None,
+            queue: None,
             _watcher: None,
             disabled_reason: reason,
         }
@@ -353,25 +451,121 @@ impl FsRecentTracker {
     }
 
     fn drain_events(&self) -> Vec<FsObservedEvent> {
-        let Some(rx) = self.rx.as_ref() else {
+        let Some(queue) = self.queue.as_ref() else {
             return Vec::new();
         };
-        let mut events = Vec::new();
-        while let Ok(result) = rx.try_recv() {
-            match result {
-                Ok(event) => events.extend(fs_events_from_notify(&self.roots, &event)),
-                Err(error) => tracing::debug!(
-                    code = "OBSERVE_FS_WATCH_EVENT_FAILED",
+        let queued = match queue.lock() {
+            Ok(mut queue) => queue.events.drain(..).collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::error!(
+                    code = "OBSERVE_FS_WATCH_QUEUE_POISONED",
                     error = %error,
-                    "filesystem watcher event failed"
-                ),
+                    remediation = "restart the Synapse daemon and inspect the preceding panic; filesystem activity cannot be read while the queue lock is poisoned",
+                    "filesystem watcher queue could not be drained"
+                );
+                return Vec::new();
             }
+        };
+        queued
+            .into_iter()
+            .filter_map(|event| fs_observed_event_from_queued(&self.roots, event))
+            .collect()
+    }
+
+    #[must_use]
+    pub fn readback(&self) -> FsWatchReadback {
+        let roots = self
+            .roots
+            .iter()
+            .map(|root| root.display().to_string())
+            .collect();
+        let Some(queue) = self.queue.as_ref() else {
+            return FsWatchReadback {
+                enabled: false,
+                roots,
+                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
+                queued_paths: 0,
+                high_water_paths: 0,
+                received_paths: 0,
+                coalesced_paths: 0,
+                evicted_paths: 0,
+                watcher_errors: 0,
+                disabled_reason: self.disabled_reason.clone(),
+                queue_error: None,
+            };
+        };
+        match queue.lock() {
+            Ok(queue) => FsWatchReadback {
+                enabled: true,
+                roots,
+                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
+                queued_paths: queue.events.len(),
+                high_water_paths: queue.high_water_paths,
+                received_paths: queue.received_paths,
+                coalesced_paths: queue.coalesced_paths,
+                evicted_paths: queue.evicted_paths,
+                watcher_errors: queue.watcher_errors,
+                disabled_reason: None,
+                queue_error: None,
+            },
+            Err(error) => FsWatchReadback {
+                enabled: true,
+                roots,
+                queue_capacity_paths: MAX_FS_RECENT_EVENTS,
+                queued_paths: 0,
+                high_water_paths: 0,
+                received_paths: 0,
+                coalesced_paths: 0,
+                evicted_paths: 0,
+                watcher_errors: 0,
+                disabled_reason: None,
+                queue_error: Some(format!("filesystem watcher queue lock poisoned: {error}")),
+            },
         }
-        let mut events = coalesce_fs_observed_events(events);
-        if events.len() > MAX_FS_RECENT_EVENTS {
-            events.drain(0..events.len() - MAX_FS_RECENT_EVENTS);
+    }
+}
+
+impl FsWatchQueue {
+    fn push_notify_event(&mut self, event: notify::Event) {
+        let Some(kind) = fs_event_kind(event.kind) else {
+            return;
+        };
+        let at = Utc::now();
+        for path in event.paths {
+            self.received_paths = self.received_paths.saturating_add(1);
+            if let Some(position) = self.events.iter().position(|queued| queued.path == path) {
+                let Some(mut queued) = self.events.remove(position) else {
+                    tracing::error!(
+                        code = "OBSERVE_FS_WATCH_QUEUE_INDEX_DRIFT",
+                        position,
+                        queue_len = self.events.len(),
+                        remediation = "inspect FsWatchQueue::push_notify_event; a position returned by VecDeque::position must remain removable under the same exclusive lock",
+                        "filesystem watcher queue index changed inside one exclusive operation"
+                    );
+                    continue;
+                };
+                queued.at = at;
+                queued.kind = coalesced_fs_kind(queued.kind, kind);
+                self.events.push_back(queued);
+                self.coalesced_paths = self.coalesced_paths.saturating_add(1);
+                continue;
+            }
+            if self.events.len() == MAX_FS_RECENT_EVENTS {
+                let _superseded = self.events.pop_front();
+                self.evicted_paths = self.evicted_paths.saturating_add(1);
+                if self.evicted_paths.is_power_of_two() {
+                    tracing::warn!(
+                        code = "OBSERVE_FS_WATCH_RECENT_WINDOW_ADVANCED",
+                        queue_capacity_paths = MAX_FS_RECENT_EVENTS,
+                        evicted_paths = self.evicted_paths,
+                        received_paths = self.received_paths,
+                        "filesystem activity exceeded the public recent-path window; the oldest path was retired while the newest exact path state was retained"
+                    );
+                }
+            }
+            self.events.push_back(FsQueuedEvent { at, path, kind });
+            self.high_water_paths = self.high_water_paths.max(self.events.len());
         }
-        events
     }
 }
 
@@ -388,56 +582,28 @@ struct FsObservedEvent {
     timeline: FsTimelineEvent,
 }
 
-fn fs_events_from_notify(roots: &[PathBuf], event: &notify::Event) -> Vec<FsObservedEvent> {
-    let Some(kind) = fs_event_kind(event.kind) else {
-        return Vec::new();
-    };
-    let at = Utc::now();
-    event
-        .paths
-        .iter()
-        .filter_map(|path| {
-            let root = event_root_for_path(roots, path)?;
-            let full_path = fs_event_full_path(path);
-            let full_path_text = fs_timeline_path_text(&full_path);
-            let size_bytes = fs_event_size(&full_path, kind);
-            Some(FsObservedEvent {
-                observation: FsEvent {
-                    at,
-                    path: redacted_fs_path_token(root, &full_path),
-                    kind,
-                    size_bytes,
-                },
-                timeline: FsTimelineEvent {
-                    at,
-                    path: full_path_text,
-                    kind,
-                    size_bytes,
-                },
-            })
-        })
-        .collect()
-}
-
-fn coalesce_fs_observed_events(events: Vec<FsObservedEvent>) -> Vec<FsObservedEvent> {
-    let mut by_path = BTreeMap::<String, FsObservedEvent>::new();
-    for event in events {
-        by_path
-            .entry(event.timeline.path.clone())
-            .and_modify(|existing| {
-                existing.observation.at = event.observation.at;
-                existing.timeline.at = event.timeline.at;
-                let kind = coalesced_fs_kind(existing.timeline.kind, event.timeline.kind);
-                existing.observation.kind = kind;
-                existing.timeline.kind = kind;
-                if event.timeline.size_bytes.is_some() || kind == FsEventKind::Deleted {
-                    existing.observation.size_bytes = event.observation.size_bytes;
-                    existing.timeline.size_bytes = event.timeline.size_bytes;
-                }
-            })
-            .or_insert(event);
-    }
-    by_path.into_values().collect()
+fn fs_observed_event_from_queued(
+    roots: &[PathBuf],
+    event: FsQueuedEvent,
+) -> Option<FsObservedEvent> {
+    let root = event_root_for_path(roots, &event.path)?;
+    let full_path = fs_event_full_path(&event.path);
+    let full_path_text = fs_timeline_path_text(&full_path);
+    let size_bytes = fs_event_size(&full_path, event.kind);
+    Some(FsObservedEvent {
+        observation: FsEvent {
+            at: event.at,
+            path: redacted_fs_path_token(root, &full_path),
+            kind: event.kind,
+            size_bytes,
+        },
+        timeline: FsTimelineEvent {
+            at: event.at,
+            path: full_path_text,
+            kind: event.kind,
+            size_bytes,
+        },
+    })
 }
 
 const fn coalesced_fs_kind(existing: FsEventKind, next: FsEventKind) -> FsEventKind {

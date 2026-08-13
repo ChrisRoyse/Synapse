@@ -384,6 +384,7 @@ impl CommitStageTimings {
             mvcc_row_lock_wait_us = self.mvcc.row_lock_wait_us,
             mvcc_router_lock_wait_us = self.mvcc.router_lock_wait_us,
             mvcc_panel_attribution_us = self.mvcc.panel_attribution_us,
+            mvcc_history_baseline_us = self.mvcc.history_baseline_us,
             mvcc_row_apply_us = self.mvcc.row_apply_us,
             mvcc_router_apply_us = self.mvcc.router_apply_us,
             mvcc_router_ensure_cf_us = self.mvcc.put.ensure_cf_us,

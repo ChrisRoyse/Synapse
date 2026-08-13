@@ -172,14 +172,24 @@ impl VersionedCfStore {
         snapshot: Snapshot,
     ) -> Result<()> {
         let latest = self.current_seq();
-        if snapshot.seq() == latest {
+        if snapshot.seq() >= self.changed_key_history_floor && snapshot.seq() <= latest {
             return Ok(());
         }
-        Err(latest_only_error(format!(
-            "historical snapshot {} requested from latest-only recovered vault at seq {}",
-            snapshot.seq(),
-            latest
-        )))
+        if snapshot.seq() > latest {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "snapshot {} is ahead of the latest committed sequence {latest}",
+                snapshot.seq()
+            )));
+        }
+        Err(CalyxError {
+            code: "CALYX_ASTER_ROUTER_HISTORY_BEFORE_RECOVERY_FLOOR",
+            message: format!(
+                "snapshot {} predates the disk-backed MVCC recovery floor {}; latest committed sequence is {latest}",
+                snapshot.seq(),
+                self.changed_key_history_floor
+            ),
+            remediation: "rebase the reader at or after the reported recovery floor; this process preserves every later change as an exact in-memory delta over the durable router baseline",
+        })
     }
 
     pub(in crate::mvcc::store) fn ensure_snapshot_live(
