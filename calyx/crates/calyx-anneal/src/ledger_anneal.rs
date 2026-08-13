@@ -235,15 +235,20 @@ where
 
 /// Process-local delta index for exact kind-selective Anneal ledger reads.
 ///
-/// The first read establishes a checked baseline from every physical Ledger
-/// row. Later reads page only the ordered suffix after `indexed_through`, so an
-/// absent Anneal kind remains an exact result without rescanning the mixed
-/// ledger on every status request.
+/// The first finite recent-history read establishes a checked, newest-first
+/// baseline and stops as soon as its requested result is complete. Later reads
+/// page only the ordered suffix after `indexed_through`. This is deliberately
+/// limit-aware: daemon health asks for 16 recent Anneal entries and must not
+/// decode a million-row mixed ledger merely to answer that bounded query.
+/// Requests larger than the retained baseline rebuild it exactly; an explicit
+/// unbounded request still validates the complete ledger.
 #[derive(Debug, Default)]
 pub struct AsterAnnealLedgerIndex {
     initialized: bool,
     indexed_through: Option<u64>,
     anneal_sequences: Vec<u64>,
+    retained_limit: usize,
+    all_anneal_retained: bool,
 }
 
 const ANNEAL_LEDGER_INDEX_PAGE_ROWS: usize = 4_096;
@@ -268,20 +273,11 @@ where
 }
 
 impl AsterAnnealLedgerIndex {
-    fn refresh<C>(&mut self, vault: &AsterVault<C>) -> Result<u64>
+    fn refresh_recent<C>(&mut self, vault: &AsterVault<C>, requested: usize) -> Result<u64>
     where
         C: Clock,
     {
         let snapshot = vault.latest_seq();
-        if !self.initialized {
-            let (anneal_sequences, indexed_through) =
-                scan_anneal_sequence_range(vault, snapshot, &KeyRange::all(), 0)?;
-            self.anneal_sequences = anneal_sequences;
-            self.indexed_through = indexed_through;
-            self.initialized = true;
-            return Ok(snapshot);
-        }
-
         let greatest = vault.predecessor_cf_at(
             snapshot,
             ColumnFamily::Ledger,
@@ -294,9 +290,36 @@ impl AsterAnnealLedgerIndex {
                     "Anneal ledger delta index previously observed rows but the Ledger is now empty",
                 ));
             }
+            self.initialized = true;
+            self.retained_limit = self.retained_limit.max(requested);
+            self.all_anneal_retained = true;
             return Ok(snapshot);
         };
         let greatest_seq = parse_aster_ledger_seq(&greatest_key)?;
+
+        let needs_larger_baseline =
+            self.initialized && requested > self.retained_limit && !self.all_anneal_retained;
+        if !self.initialized || needs_larger_baseline {
+            let (anneal_sequences, all_anneal_retained) = if requested == usize::MAX {
+                let (sequences, indexed_through) =
+                    scan_anneal_sequence_range(vault, snapshot, &KeyRange::all(), 0)?;
+                if indexed_through != Some(greatest_seq) {
+                    return Err(CalyxError::ledger_chain_broken(format!(
+                        "Anneal ledger full baseline stopped before the physical head: expected_greatest={greatest_seq} indexed_through={indexed_through:?}"
+                    )));
+                }
+                (sequences, true)
+            } else {
+                scan_recent_anneal_sequences(vault, snapshot, greatest_seq, requested)?
+            };
+            self.anneal_sequences = anneal_sequences;
+            self.indexed_through = Some(greatest_seq);
+            self.retained_limit = requested;
+            self.all_anneal_retained = all_anneal_retained;
+            self.initialized = true;
+            return Ok(snapshot);
+        }
+
         if self
             .indexed_through
             .is_some_and(|indexed| greatest_seq < indexed)
@@ -305,6 +328,12 @@ impl AsterAnnealLedgerIndex {
                 "Anneal ledger delta index regressed: indexed_through={} physical_greatest={greatest_seq}",
                 self.indexed_through.expect("checked as some")
             )));
+        }
+        if requested > self.retained_limit {
+            // Every historical Anneal row is already resident, so raising the
+            // retention ceiling before applying the delta remains exact and
+            // avoids rescanning history.
+            self.retained_limit = requested;
         }
         let first = match self.indexed_through {
             Some(indexed) => match indexed.checked_add(1) {
@@ -336,6 +365,11 @@ impl AsterAnnealLedgerIndex {
             self.anneal_sequences.extend(new_anneal);
             self.indexed_through = indexed_through;
         }
+        if self.anneal_sequences.len() > self.retained_limit {
+            let excess = self.anneal_sequences.len() - self.retained_limit;
+            self.anneal_sequences.drain(0..excess);
+            self.all_anneal_retained = false;
+        }
         Ok(snapshot)
     }
 
@@ -345,6 +379,101 @@ impl AsterAnnealLedgerIndex {
         }
         &self.anneal_sequences[self.anneal_sequences.len() - n..]
     }
+}
+
+/// Finds the exact newest `requested` Anneal ledger rows without materialising
+/// the older mixed-ledger prefix.
+///
+/// Ledger sequence keys are contiguous by the authenticated chain contract.
+/// Each bounded page is therefore checked for its exact expected key count,
+/// key sequence, encoded sequence, and decodability before its matching rows
+/// are admitted. The scan walks page ranges from the physical head toward
+/// zero and stops only after the requested newest matches are known.
+fn scan_recent_anneal_sequences<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    greatest_seq: u64,
+    requested: usize,
+) -> Result<(Vec<u64>, bool)>
+where
+    C: Clock,
+{
+    let page_span = u64::try_from(ANNEAL_LEDGER_INDEX_PAGE_ROWS)
+        .expect("Anneal ledger page bound always fits u64");
+    let mut newest_first = Vec::with_capacity(requested.min(ANNEAL_LEDGER_INDEX_PAGE_ROWS));
+    let mut page_last = greatest_seq;
+    let mut reached_sequence_zero = false;
+
+    loop {
+        let page_first = page_last.saturating_sub(page_span - 1);
+        let range = page_last.checked_add(1).map_or_else(
+            || KeyRange {
+                start: ledger_key(page_first),
+                end: None,
+            },
+            |end| ledger_range(page_first, end),
+        );
+        let page = vault.scan_cf_range_page_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            &range,
+            None,
+            ANNEAL_LEDGER_INDEX_PAGE_ROWS,
+        )?;
+        let expected_len = usize::try_from(page_last - page_first + 1)
+            .expect("one bounded Anneal ledger page always fits usize");
+        if page.len() != expected_len {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "Anneal ledger recent baseline found a sequence gap: expected_rows={expected_len} found_rows={} range_start={page_first} range_end_inclusive={page_last}",
+                page.len()
+            )));
+        }
+
+        let mut decoded = Vec::with_capacity(page.len());
+        for (offset, (key, bytes)) in page.iter().enumerate() {
+            let seq = parse_aster_ledger_seq(key)?;
+            let expected = page_first
+                .checked_add(u64::try_from(offset).expect("page offset always fits u64"))
+                .ok_or_else(|| {
+                    CalyxError::ledger_chain_broken(
+                        "Anneal ledger recent baseline sequence arithmetic overflowed",
+                    )
+                })?;
+            if seq != expected {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "Anneal ledger recent baseline found a sequence gap: expected={expected} found={seq}"
+                )));
+            }
+            let entry = decode(bytes)?;
+            if entry.seq != seq {
+                return Err(CalyxError::ledger_chain_broken(format!(
+                    "Anneal ledger recent baseline physical key {seq} does not match encoded seq {}",
+                    entry.seq
+                )));
+            }
+            decoded.push((seq, entry.kind));
+        }
+        newest_first.extend(
+            decoded
+                .into_iter()
+                .rev()
+                .filter_map(|(seq, kind)| (kind == EntryKind::Anneal).then_some(seq)),
+        );
+
+        if page_first == 0 {
+            reached_sequence_zero = true;
+            break;
+        }
+        if newest_first.len() >= requested {
+            break;
+        }
+        page_last = page_first - 1;
+    }
+
+    let all_anneal_retained = reached_sequence_zero && newest_first.len() <= requested;
+    newest_first.truncate(requested);
+    newest_first.reverse();
+    Ok((newest_first, all_anneal_retained))
 }
 
 fn scan_anneal_sequence_range<C>(
@@ -486,7 +615,7 @@ where
                     "Anneal ledger delta index lock is poisoned; restart the process and inspect the preceding panic",
                 )
             })?;
-            let snapshot = index.refresh(self.vault)?;
+            let snapshot = index.refresh_recent(self.vault, n)?;
             (snapshot, index.recent_sequences(n).to_vec())
         };
         sequences
