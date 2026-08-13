@@ -4441,8 +4441,35 @@ impl SynapseCalyxVault {
         supplied: Option<&VaultPanelState>,
     ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
         let started = std::time::Instant::now();
-        let before = self.search_generation_status_for_panel(panel_version, true)?;
-        self.decide_and_maintain(panel_version, before, supplied, started)
+        match self.search_generation_status_for_panel(panel_version, true) {
+            Ok(before) => self.decide_and_maintain(panel_version, before, supplied, started, None),
+            Err(error)
+                if error.code == "SYNAPSE_CALYX_STALE_DERIVED"
+                    && error.source_code == Some("CALYX_STALE_DERIVED") =>
+            {
+                // A restart reconstructs the latest durable rows, but it does
+                // not invent the older per-key change history an already-
+                // published generation may name as its base. This exact error
+                // is positive proof that incremental reconciliation is no
+                // longer possible. Read the artifact facts without pretending
+                // to measure that missing interval, then perform the full
+                // authoritative rebuild this unattended maintainer owns.
+                let before = self.search_generation_status_for_panel(panel_version, false)?;
+                tracing::warn!(
+                    code = "SYNAPSE_CALYX_SEARCH_GENERATION_HISTORY_GAP_REBASE_REQUIRED",
+                    panel_version,
+                    error_code = error.code,
+                    source_code = error.source_code.unwrap_or("none"),
+                    detail = %error.message,
+                    before_state = %before.state,
+                    before_built_at_seq = ?before.built_at_seq,
+                    vault_latest_seq = before.vault_latest_seq,
+                    "the persisted generation predates the recovered change-history floor; a full rebuild from authoritative rows is required"
+                );
+                self.decide_and_maintain(panel_version, before, supplied, started, Some(&error))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     #[allow(
@@ -4455,6 +4482,7 @@ impl SynapseCalyxVault {
         before: SynapseCalyxSearchGenerationStatus,
         supplied: Option<&VaultPanelState>,
         started: std::time::Instant,
+        delta_history_gap: Option<&SynapseCalyxError>,
     ) -> Result<SearchGenerationMaintenanceReport, SynapseCalyxError> {
         let elapsed = |started: std::time::Instant| {
             u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
@@ -4477,6 +4505,16 @@ impl SynapseCalyxVault {
                 format!(
                     "a mutation staked a rebuild-required intent: {}",
                     before.rebuild_required.as_deref().unwrap_or("unknown")
+                ),
+            )
+        } else if let Some(error) = delta_history_gap.as_ref() {
+            (
+                SearchGenerationMaintenanceAction::RefreshOverExisting,
+                format!(
+                    "the generation's incremental change interval is unavailable after vault recovery (code={} source_code={}): {}; full rebase from authoritative Base and slot rows is required",
+                    error.code,
+                    error.source_code.unwrap_or("none"),
+                    error.message
                 ),
             )
         } else if delta_keys > SEARCH_GENERATION_REFRESH_DELTA_KEYS {
@@ -4534,7 +4572,8 @@ impl SynapseCalyxVault {
         // every query is already failing closed, so waiting protects nothing and
         // costs recall. Two exemptions therefore apply — an absent generation
         // (no live artifact to protect) and an already-unusable one.
-        let already_unusable = delta_keys > before.max_reconciled_delta_keys;
+        let already_unusable =
+            delta_history_gap.is_some() || delta_keys > before.max_reconciled_delta_keys;
         if action == SearchGenerationMaintenanceAction::RefreshOverExisting
             && !already_unusable
             && before
@@ -4564,6 +4603,10 @@ impl SynapseCalyxVault {
             vault_latest_seq = before.vault_latest_seq,
             seq_lag = ?before.seq_lag,
             delta_changed_keys = ?before.delta_changed_keys,
+            delta_history_gap_code = delta_history_gap.as_ref().map(|error| error.code),
+            delta_history_gap_source_code = delta_history_gap
+                .as_ref()
+                .and_then(|error| error.source_code),
             refresh_threshold = SEARCH_GENERATION_REFRESH_DELTA_KEYS,
             max_reconciled_delta_keys = before.max_reconciled_delta_keys,
             already_unusable,
