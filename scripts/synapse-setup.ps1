@@ -2453,33 +2453,19 @@ while ($true) {
         Write-SupervisorState -State 'running' -Generation $generation -ChildPid $process.Id -ExitCode $null -Message 'Daemon exact PID/creation/image/arguments own the listener and authenticated health returned 200.'
     }
 
-    while ($true) {
-        $handleReportedTerminal = $process.WaitForExit($daemonStartupPollMilliseconds)
-        $identity = Get-ExactChildIdentityState -ChildPid $process.Id -CreationDate $childCreationDate
-        if ($handleReportedTerminal -eq $true -and $identity.Live -eq $true) {
-            $daemonLockOwner = '<missing>'
-            $daemonPidPath = Join-Path $DbPath 'daemon.pid'
-            if (Test-Path -LiteralPath $daemonPidPath -PathType Leaf) {
-                try { $daemonLockOwner = (Get-Content -Raw -LiteralPath $daemonPidPath).Trim() }
-                catch { $daemonLockOwner = "<read_failed:$($_.Exception.Message)>" }
-            }
-            $progressTail = '<none>'
-            if (Test-Path -LiteralPath $stderrLog -PathType Leaf) {
-                try { $progressTail = ((Get-Content -LiteralPath $stderrLog -Tail 5 -ErrorAction Stop) -join ' | ').Trim() }
-                catch { $progressTail = "<read_failed:$($_.Exception.Message)>" }
-            }
-            throw "SYNAPSE_DAEMON_CHILD_TERMINALITY_CONTRADICTION generation=$generation pid=$($process.Id) creation_date=$childCreationDate retained_handle_wait=terminal exact_identity=live daemon_lock_owner=$daemonLockOwner stderr_tail=[$progressTail] remediation=the supervisor refuses to launch a replacement while the exact PID/creation/image/arguments remain live; inspect the retained native handle and Win32_Process state"
-        }
-        if ($identity.Terminal -eq $true) {
-            Write-LogLine "SYNAPSE_DAEMON_TERMINAL_IDENTITY_PROVED generation=$generation pid=$($process.Id) creation_date=$childCreationDate reason=$($identity.Reason)"
-            Write-SupervisorEvent 'terminal_identity_proved' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; reason = $identity.Reason }
-            break
-        }
-        if ($identity.Live -ne $true) {
-            throw "SYNAPSE_DAEMON_CHILD_IDENTITY_DRIFT generation=$generation pid=$($process.Id) creation_date=$childCreationDate reason=$($identity.Reason) remediation=inspect Win32_Process executable and command line; the supervisor refuses to infer terminality or launch a duplicate"
-        }
-    }
+    # #2236: after launch identity has been verified, the retained native
+    # process handle is the authoritative identity and lifetime SoT. Windows
+    # keeps that exact process object alive while the handle is open and
+    # signals it at termination. A post-exit Win32_Process row can transiently
+    # remain enumerable with already-cleared image/command-line properties;
+    # allowing that teardown view to override WaitForExit(true) stranded the
+    # daemon with SYNAPSE_DAEMON_CHILD_IDENTITY_DRIFT after a graceful restart.
+    # The parameterless wait synchronizes redirected stream completion and
+    # makes ExitCode immediately observable from this same exact handle.
     $process.WaitForExit()
+    $terminalIdentity = Get-ExactChildIdentityState -ChildPid $process.Id -CreationDate $childCreationDate
+    Write-LogLine "SYNAPSE_DAEMON_EXACT_HANDLE_TERMINAL_PROVED generation=$generation pid=$($process.Id) creation_date=$childCreationDate post_exit_identity=$($terminalIdentity.Reason)"
+    Write-SupervisorEvent 'exact_handle_terminal_proved' @{ generation = $generation; child_pid = $process.Id; child_creation_date = $childCreationDate; post_exit_identity = $terminalIdentity.Reason }
     $endTime = Get-Date
     $exitCode = $process.ExitCode
     if ($null -eq $exitCode) {
