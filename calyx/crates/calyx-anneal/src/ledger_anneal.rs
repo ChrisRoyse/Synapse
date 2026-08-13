@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use calyx_aster::cf::{ColumnFamily, KeyRange, ledger_key, ledger_range};
+use calyx_aster::mvcc::LatestCfRangePage;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, LedgerRef, Result};
 use calyx_ledger::{
@@ -413,13 +414,20 @@ where
             },
             |end| ledger_range(page_first, end),
         );
-        let page = vault.scan_cf_range_page_at(
+        let page = scan_ledger_page_at_latest(
+            vault,
             snapshot,
-            ColumnFamily::Ledger,
             &range,
             None,
             ANNEAL_LEDGER_INDEX_PAGE_ROWS,
         )?;
+        if page.more {
+            return Err(CalyxError::ledger_chain_broken(format!(
+                "Anneal ledger recent baseline range contained more than its exact sequence span: range_start={page_first} range_end_inclusive={page_last} examined_rows={}",
+                page.examined_rows
+            )));
+        }
+        let page = page.rows;
         let expected_len = usize::try_from(page_last - page_first + 1)
             .expect("one bounded Anneal ledger page always fits usize");
         if page.len() != expected_len {
@@ -489,17 +497,17 @@ where
     let mut after_key = None;
     let mut last_seen = None;
     loop {
-        let page = vault.scan_cf_range_page_at(
+        let page = scan_ledger_page_at_latest(
+            vault,
             snapshot,
-            ColumnFamily::Ledger,
             range,
             after_key.as_deref(),
             ANNEAL_LEDGER_INDEX_PAGE_ROWS,
         )?;
-        if page.is_empty() {
+        if page.rows.is_empty() {
             break;
         }
-        for (key, bytes) in &page {
+        for (key, bytes) in &page.rows {
             let seq = parse_aster_ledger_seq(key)?;
             let expected =
                 last_seen.map_or(first_expected, |previous: u64| previous.saturating_add(1));
@@ -520,12 +528,64 @@ where
             }
             last_seen = Some(seq);
         }
-        after_key = page.last().map(|(key, _)| key.clone());
-        if page.len() < ANNEAL_LEDGER_INDEX_PAGE_ROWS {
+        after_key = page.resume_after;
+        if !page.more {
             break;
         }
     }
     Ok((anneal_sequences, last_seen))
+}
+
+/// Reads one bounded Ledger page from the disk-backed latest view and proves it
+/// still represents the caller's pinned sequence.
+///
+/// The older snapshot-page path first materialised every visible key in the
+/// requested range through `range_keys_until` and then point-read the selected
+/// values. Repeating that path while finding sparse Anneal entries reopened and
+/// rescanned immutable sources on every page. The latest page API merges only a
+/// bounded candidate set and exposes the physical candidate cursor. Ledger is
+/// append-only, so a filtered tombstone or a cursor that does not name the last
+/// live sequence is corruption rather than something this index may skip.
+fn scan_ledger_page_at_latest<C>(
+    vault: &AsterVault<C>,
+    snapshot: u64,
+    range: &KeyRange,
+    after_key: Option<&[u8]>,
+    limit: usize,
+) -> Result<LatestCfRangePage>
+where
+    C: Clock,
+{
+    let page = vault.scan_cf_range_page_latest(ColumnFamily::Ledger, range, after_key, limit)?;
+    if page.snapshot_seq != snapshot {
+        return Err(CalyxError::ledger_chain_broken(format!(
+            "Anneal ledger bounded scan changed committed sequence: expected_snapshot={snapshot} actual_snapshot={}",
+            page.snapshot_seq
+        )));
+    }
+    let expected_examined = page.rows.len().saturating_add(usize::from(page.more));
+    if page.examined_rows != expected_examined {
+        return Err(CalyxError::ledger_chain_broken(format!(
+            "Anneal ledger bounded scan encountered a non-live physical sequence: live_rows={} examined_rows={} more={}",
+            page.rows.len(),
+            page.examined_rows,
+            page.more
+        )));
+    }
+    let expected_resume = page.rows.last().map(|(key, _)| key.as_slice());
+    if page.resume_after.as_deref() != expected_resume {
+        return Err(CalyxError::ledger_chain_broken(format!(
+            "Anneal ledger bounded scan cursor does not match its last live sequence: resume_after={} last_live={}",
+            page.resume_after
+                .as_deref()
+                .map(|key| format!("{key:02x?}"))
+                .unwrap_or_else(|| "<none>".to_owned()),
+            expected_resume
+                .map(|key| format!("{key:02x?}"))
+                .unwrap_or_else(|| "<none>".to_owned())
+        )));
+    }
+    Ok(page)
 }
 
 impl<C> LedgerCfStore for AsterAnnealLedgerStore<'_, C>
