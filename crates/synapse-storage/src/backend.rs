@@ -4344,32 +4344,34 @@ impl StorageBackend for CalyxBackend {
         // deliberately does not derive a fraction from (a subset-fed panel has
         // no meaningful denominator), and this pass runs on a five-minute tick.
         let mut source_cf_rows = BTreeMap::new();
-        // #1940: the KEYS, not just the count. The orphan question — "does this
-        // record's own source row still exist" — is a membership test, and the
-        // rows are already in hand here, so keeping their keys costs one pass
-        // over an array that was going to be dropped anyway.
-        let mut source_cf_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        // #1940/#2243: retain only census-referenced keys proven absent, not
+        // every physical source key. The physical namespace and the compact
+        // census vectors are both strictly ordered, so a monotonic exact merge
+        // answers the same membership question with no second corpus-sized key
+        // tree. Presence of an empty set proves the CF was measured and every
+        // referenced key existed; absence of the map entry remains unknown.
+        let mut source_cf_absent_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for entry in constellations::builtin_panel_catalog() {
             let Some(cf_name) = entry.source.cf_name() else {
                 continue;
             };
-            if source_cf_keys.contains_key(cf_name) {
+            if source_cf_absent_keys.contains_key(cf_name) {
                 continue;
             }
             // The row COUNT is still only taken for a declared full-CF
             // denominator: a subset-fed panel has no meaningful coverage
             // fraction, and deriving one would read as a permanent outage.
-            // The KEY SET is taken for every source CF, including subset-fed
-            // ones (#1940). The orphan probe is a per-record membership test —
-            // "is this record's own source row still there" — and that question
-            // is exactly as meaningful for a sampled panel as for a full-CF
-            // one. Skipping them made the census silently under-report:
+            // The ordered physical pass is taken for every source CF, including
+            // subset-fed ones (#1940). The orphan probe is a per-record
+            // membership test — "is this record's own source row still there"
+            // — and that question is exactly as meaningful for a sampled panel
+            // as for a full-CF one. Skipping them made the census under-report:
             // measured 2026-08-01 it found 226 of the 227 orphans an
             // independent audit found, missing `syn-observation-v1`'s one
             // record purely because its panel is sampled.
             //
-            // The KEY SET is read with expired rows INCLUDED, and that is not
-            // the same question the row count answers (#1940).
+            // The membership merge treats expired rows as physically PRESENT,
+            // and that is not the same question the row count answers (#1940).
             //
             // `source_cf_rows` is a coverage denominator: "how many source rows
             // is this panel supposed to have measured". A row past its TTL is
@@ -4408,35 +4410,37 @@ impl StorageBackend for CalyxBackend {
             // delete window to close: nothing here proposes a mutation, so a row
             // rewritten between two pages simply contributes its newer value to
             // a census that is explicitly a five-minute sample.
-            let (live_rows, keys) = self.with_vault(
+            let mut referenced_keys: Vec<&str> = census
+                .entries
+                .iter()
+                .filter_map(|generation| generation.source_key_hexes.get(cf_name))
+                .flatten()
+                .map(String::as_str)
+                .collect();
+            referenced_keys.sort_unstable();
+            referenced_keys.dedup();
+            let referenced_key_count = referenced_keys.len();
+            let (live_rows, absent_keys) = self.with_vault(
                 cf_name,
-                "census one Calyx source CF's rows and keys in bounded pages",
+                "merge census-referenced keys against one Calyx source CF in bounded pages",
                 false,
-                |vault| {
-                    let mut live_rows = 0_u64;
-                    let mut keys: BTreeSet<String> = BTreeSet::new();
-                    sweep_calyx_namespace_rows(
-                        vault,
-                        cf_name,
-                        PANEL_COVERAGE_SOURCE_CENSUS_SITE,
-                        |key, _payload, expired| {
-                            keys.insert(constellations::hex_encode(key));
-                            if !expired {
-                                live_rows = live_rows.saturating_add(1);
-                            }
-                            Ok(())
-                        },
-                    )?;
-                    Ok((live_rows, keys))
-                },
+                |vault| merge_panel_coverage_source_cf(vault, cf_name, &referenced_keys),
             )?;
+            tracing::info!(
+                code = "SYNAPSE_PANEL_COVERAGE_SOURCE_MERGE_COMPLETE",
+                source_cf = cf_name,
+                referenced_key_count,
+                absent_key_count = absent_keys.len(),
+                live_rows,
+                "panel coverage completed an exact ordered source-key merge without retaining the physical key corpus"
+            );
             // The row COUNT is still only taken for a declared full-CF
             // denominator: a subset-fed panel has no meaningful coverage
             // fraction, and deriving one would read as a permanent outage.
             if entry.source.is_full_cf() {
                 source_cf_rows.insert(cf_name.to_owned(), live_rows);
             }
-            source_cf_keys.insert(cf_name.to_owned(), keys);
+            source_cf_absent_keys.insert(cf_name.to_owned(), absent_keys);
         }
 
         // #2062: the second authority. The catalog is a compile-time table and
@@ -4454,7 +4458,7 @@ impl StorageBackend for CalyxBackend {
         let report = crate::panel_coverage::build_panel_coverage_report(
             &census,
             &source_cf_rows,
-            &source_cf_keys,
+            &source_cf_absent_keys,
             &ownership,
         );
         if !report.accounting_holds() {
@@ -11181,6 +11185,55 @@ where
         visit(key, payload, expired)?;
         Ok(ControlFlow::Continue(()))
     })
+}
+
+/// Exact anti-join of the census-referenced source identities against one
+/// physical source CF. Both inputs are ordered; only unmatched census keys are
+/// retained, so physical rows unrelated to panel coverage never become heap
+/// state. Expired rows remain present for membership but not for the live-row
+/// coverage denominator.
+fn merge_panel_coverage_source_cf(
+    vault: &impl CalyxVaultKvRead,
+    cf_name: &str,
+    referenced_keys: &[&str],
+) -> StorageResult<(u64, Vec<String>)> {
+    let mut live_rows = 0_u64;
+    let mut next_referenced = 0_usize;
+    let mut absent_keys: Vec<String> = Vec::new();
+    sweep_calyx_namespace_rows(
+        vault,
+        cf_name,
+        PANEL_COVERAGE_SOURCE_CENSUS_SITE,
+        |key, _payload, expired| {
+            // Fixed-width lowercase hex preserves raw-byte lexicographic
+            // order, so both cursors advance once and a mismatch cannot be
+            // revisited by a later physical key.
+            let physical_key_hex = constellations::hex_encode(key);
+            while referenced_keys
+                .get(next_referenced)
+                .is_some_and(|referenced| *referenced < physical_key_hex.as_str())
+            {
+                absent_keys.push(referenced_keys[next_referenced].to_owned());
+                next_referenced += 1;
+            }
+            if referenced_keys
+                .get(next_referenced)
+                .is_some_and(|referenced| *referenced == physical_key_hex.as_str())
+            {
+                next_referenced += 1;
+            }
+            if !expired {
+                live_rows = live_rows.saturating_add(1);
+            }
+            Ok(())
+        },
+    )?;
+    absent_keys.extend(
+        referenced_keys[next_referenced..]
+            .iter()
+            .map(|key| (*key).to_owned()),
+    );
+    Ok((live_rows, absent_keys))
 }
 
 /// [`sweep_calyx_namespace_rows`] over an arbitrary ordered sub-range of one

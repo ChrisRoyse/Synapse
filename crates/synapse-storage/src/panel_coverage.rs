@@ -1010,13 +1010,13 @@ struct OrphanProbe {
 /// is orphaned iff *its own* declared source key is absent from the source CF —
 /// not iff the generation happens to hold more records than the CF holds rows.
 ///
-/// Absent source-CF key sets mean the CF was not read (a subset-fed or derived
-/// panel has no full-CF denominator, so its keys are not loaded). Those records
-/// are neither covered nor orphaned here; they are simply not probed, and
-/// counting them as orphans would invent 30,000 findings on `CF_KV` alone.
+/// An absent source-CF map entry means the CF was not read. A present empty set
+/// means it was read and every referenced key existed. Records from unmeasured
+/// CFs are neither covered nor orphaned here; counting them as orphans would
+/// invent findings from missing evidence.
 fn probe_orphans(
     active: Option<&synapse_calyx::SynapseCalyxPanelCensusEntry>,
-    source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
+    source_cf_absent_keys: &BTreeMap<String, Vec<String>>,
     source_ttl_managed: bool,
 ) -> OrphanProbe {
     let Some(active) = active else {
@@ -1027,10 +1027,13 @@ fn probe_orphans(
         ..OrphanProbe::default()
     };
     for (source_cf, keys) in &active.source_key_hexes {
-        let Some(present) = source_cf_keys.get(source_cf) else {
+        let Some(absent) = source_cf_absent_keys.get(source_cf) else {
             continue;
         };
-        let absent = keys.iter().filter(|key| !present.contains(*key)).count();
+        let absent = keys
+            .iter()
+            .filter(|key| absent.binary_search(key).is_ok())
+            .count();
         if source_ttl_managed {
             probe.evicted += absent;
         } else {
@@ -1061,7 +1064,7 @@ fn probe_orphans(
 pub fn build_panel_coverage_report(
     census: &SynapseCalyxPanelCensus,
     source_cf_rows: &BTreeMap<String, u64>,
-    source_cf_keys: &BTreeMap<String, BTreeSet<String>>,
+    source_cf_absent_keys: &BTreeMap<String, Vec<String>>,
     ownership: &PanelGenerationOwnership,
 ) -> PanelCoverageReport {
     let catalog = builtin_panel_catalog();
@@ -1140,20 +1143,20 @@ pub fn build_panel_coverage_report(
         // #1982. Compare source identities, not aggregate counts. The active
         // and superseded counts describe different populations; a large live
         // writer population can otherwise hide every stranded historical row.
-        let active_grounded_keys = active
-            .map(|row| &row.grounded_source_key_hexes)
-            .cloned()
-            .unwrap_or_default();
+        let active_grounded_keys = active.map(|row| &row.grounded_source_key_hexes);
         // #1984: the generation each key's anchors live on is retained, not just
         // the key. The historical `cx_id` cannot be recomputed from a mutable
         // row's current bytes (#1981/#1982), so a repair must be told which
         // declared generation to carry FROM. `superseded_versions` is ordered
-        // newest-superseded first and `or_insert` keeps that first writer, so a
-        // key present on two closed generations names the newest one — the same
-        // choice the carry-forward's lineage index makes per anchor kind.
-        let mut superseded_grounded_keys: BTreeMap<String, BTreeMap<String, u32>> = BTreeMap::new();
+        // newest-superseded first; sorting each borrowed-key vector by identity
+        // then generation priority makes the first duplicate the newest one.
+        // The scan below visits that first identity only — the same choice the
+        // carry-forward's lineage index makes per anchor kind — without cloning
+        // every key into an allocation-heavy tree.
+        let mut superseded_grounded_keys: BTreeMap<String, Vec<(&str, u32, usize)>> =
+            BTreeMap::new();
         let mut anchors_stranding_identity_unknown = 0usize;
-        for version in entry.superseded_versions {
+        for (generation_priority, version) in entry.superseded_versions.iter().enumerate() {
             let Some(row) = census.entry(*version) else {
                 continue;
             };
@@ -1164,9 +1167,14 @@ pub fn build_panel_coverage_report(
                     .entry(source_cf.clone())
                     .or_default();
                 for key in keys {
-                    by_key.entry(key.clone()).or_insert(*version);
+                    by_key.push((key.as_str(), *version, generation_priority));
                 }
             }
+        }
+        for keys in superseded_grounded_keys.values_mut() {
+            keys.sort_unstable_by(|left, right| {
+                left.0.cmp(right.0).then_with(|| left.2.cmp(&right.2))
+            });
         }
         // #2021: an anchor can be replayed only while its source event exists.
         // TTL-managed audit CFs deliberately expire source rows while Calyx
@@ -1189,19 +1197,31 @@ pub fn build_panel_coverage_report(
         let mut anchors_stranded_source_cf_unmeasured = 0usize;
         if entry.carry_superseded_anchors {
             for (source_cf, keys) in &superseded_grounded_keys {
-                let active_keys = active_grounded_keys.get(source_cf);
-                let present_source_keys = source_cf_keys.get(source_cf);
-                for (key, superseded_panel_version) in keys {
-                    if active_keys.is_some_and(|active| active.contains(key)) {
+                let active_keys = active_grounded_keys.and_then(|by_cf| by_cf.get(source_cf));
+                let absent_source_keys = source_cf_absent_keys.get(source_cf);
+                let mut previous_key: Option<&str> = None;
+                for &(key, superseded_panel_version, _generation_priority) in keys {
+                    if previous_key == Some(key) {
+                        continue;
+                    }
+                    previous_key = Some(key);
+                    if active_keys.is_some_and(|active| {
+                        active
+                            .binary_search_by(|candidate| candidate.as_str().cmp(key))
+                            .is_ok()
+                    }) {
                         // Already carried: the active generation holds this
                         // source identity grounded. Not debt.
                         continue;
                     }
-                    let Some(present_source_keys) = present_source_keys else {
+                    let Some(absent_source_keys) = absent_source_keys else {
                         anchors_stranded_source_cf_unmeasured += 1;
                         continue;
                     };
-                    if !present_source_keys.contains(key) {
+                    if absent_source_keys
+                        .binary_search_by(|candidate| candidate.as_str().cmp(key))
+                        .is_ok()
+                    {
                         anchors_stranded_source_absent += 1;
                         continue;
                     }
@@ -1209,8 +1229,8 @@ pub fn build_panel_coverage_report(
                     if anchors_stranded_identities.len() < SYN_ANCHOR_DEBT_IDENTITY_CAP {
                         anchors_stranded_identities.push(StrandedAnchorIdentity {
                             source_cf: source_cf.clone(),
-                            source_key_hex: key.clone(),
-                            superseded_panel_version: *superseded_panel_version,
+                            source_key_hex: key.to_owned(),
+                            superseded_panel_version,
                         });
                     }
                 }
@@ -1312,7 +1332,7 @@ pub fn build_panel_coverage_report(
         // question the counter exists to raise. "Was the source row evicted, or
         // did it never exist?" is a membership test on a specific key, and no
         // difference of two counts can perform one.
-        let probe = probe_orphans(active, source_cf_keys, entry.source_ttl_managed);
+        let probe = probe_orphans(active, source_cf_absent_keys, entry.source_ttl_managed);
         // The same probe over every superseded generation. Without it the
         // census would report zero orphans and be *right about the active
         // generation while hiding every real one*: measured 2026-08-01, all 227
@@ -1326,7 +1346,7 @@ pub fn build_panel_coverage_report(
             .map(|version| {
                 probe_orphans(
                     census.entry(*version),
-                    source_cf_keys,
+                    source_cf_absent_keys,
                     entry.source_ttl_managed,
                 )
             })

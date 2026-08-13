@@ -416,7 +416,7 @@ pub struct SynapseCalyxPanelCensusEntry {
     pub earliest_created_at_ms: Option<u64>,
     pub latest_created_at_ms: Option<u64>,
     /// Each record's declared provenance at this generation: source CF name →
-    /// the set of source row keys (lowercase hex) measured from it (#1940).
+    /// sorted, unique source row keys (lowercase hex) measured from it (#1940).
     ///
     /// This is what turns the orphan count from a subtraction into a probe. The
     /// old count was `active_version_records - source_cf_rows`, which is a
@@ -426,14 +426,16 @@ pub struct SynapseCalyxPanelCensusEntry {
     /// rows not yet measured at all. On the live vault 2026-08-01 that
     /// arithmetic reported 667 orphans where the probe finds 227.
     ///
-    /// A set rather than a count because the question is membership — "does
-    /// this record's own source row still exist" — and no count can answer it.
-    pub source_key_hexes: BTreeMap<String, BTreeSet<String>>,
+    /// Exact identities rather than a count are required because the question
+    /// is membership — "does this record's own source row still exist" — and
+    /// no count can answer it. A compact sorted vector preserves exact binary
+    /// search/merge semantics without one allocation-heavy tree node per row.
+    pub source_key_hexes: BTreeMap<String, Vec<String>>,
     /// Source identities for the subset of records carrying at least one
     /// grounded anchor. Kept separately because panel-version bumps change the
     /// constellation id while preserving the source identity; exact set
     /// difference is therefore the only sound stranded-anchor detector.
-    pub grounded_source_key_hexes: BTreeMap<String, BTreeSet<String>>,
+    pub grounded_source_key_hexes: BTreeMap<String, Vec<String>>,
     /// Grounded records whose source identity is absent. They cannot be joined
     /// across generations and must remain explicitly unknown.
     pub grounded_unattributed_records: usize,
@@ -697,7 +699,7 @@ impl SynapseCalyxVault {
                             .source_key_hexes
                             .entry(source_cf.clone())
                             .or_default()
-                            .insert(source_key_hex.clone());
+                            .push(source_key_hex.clone());
                     }
                     _ => entry.unattributed_records += 1,
                 }
@@ -728,7 +730,7 @@ impl SynapseCalyxVault {
                                 .grounded_source_key_hexes
                                 .entry(source_cf.clone())
                                 .or_default()
-                                .insert(source_key_hex.clone());
+                                .push(source_key_hex.clone());
                         }
                         _ => entry.grounded_unattributed_records += 1,
                     }
@@ -740,6 +742,21 @@ impl SynapseCalyxVault {
             },
         )?;
         let base_cf_rows = walk.rows_visited;
+
+        // Exact membership does not require a tree node per identity. The Base
+        // walk is already complete here, so canonicalize each identity stream
+        // once; downstream probes can binary-search it or merge it against an
+        // ordered physical CF scan without retaining another corpus-sized set.
+        for entry in by_version.values_mut() {
+            for keys in entry.source_key_hexes.values_mut() {
+                keys.sort_unstable();
+                keys.dedup();
+            }
+            for keys in entry.grounded_source_key_hexes.values_mut() {
+                keys.sort_unstable();
+                keys.dedup();
+            }
+        }
 
         if decode_failures > 0 {
             tracing::error!(
