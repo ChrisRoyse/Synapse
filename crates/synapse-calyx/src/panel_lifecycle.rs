@@ -334,7 +334,7 @@ impl SynapseCalyxVault {
         let mut ids = Vec::new();
         self.walk_cf_latest(
             ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
             |_key, value| {
                 let base = calyx_aster::vault::encode::decode_constellation_base_projection(value)
                     .map_err(|error| {

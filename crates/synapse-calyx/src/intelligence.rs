@@ -993,7 +993,7 @@ impl SynapseCalyxVault {
             self.walk_cf_snapshot(
                 snapshot,
                 ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
                 |_key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -1024,7 +1024,7 @@ impl SynapseCalyxVault {
                             }
                         }
                     }
-                    records.push(DenseRecord::from_constellation(&hydrated));
+                    records.push(DenseRecord::from_constellation(hydrated));
                     if records.len() >= max_records {
                         Ok(crate::SynapseCalyxWalkStep::Stop)
                     } else {
@@ -1254,33 +1254,37 @@ struct DenseRecord {
 }
 
 impl DenseRecord {
-    fn from_constellation(constellation: &Constellation) -> Self {
-        let slots = constellation
-            .slots
-            .iter()
-            .filter_map(|(slot, vector)| dense_vector(vector).map(|dense| (*slot, dense)))
-            .collect();
-        let sparse = constellation
-            .slots
-            .iter()
-            .filter_map(|(slot, vector)| match vector {
-                SlotVector::Sparse { entries, .. } => Some((
-                    *slot,
-                    entries
-                        .iter()
-                        .map(|entry| (entry.idx, entry.val))
-                        .collect::<Vec<_>>(),
-                )),
-                SlotVector::Dense { .. } | SlotVector::Multi { .. } | SlotVector::Absent { .. } => {
-                    None
+    fn from_constellation(constellation: Constellation) -> Self {
+        let Constellation {
+            cx_id,
+            slots: constellation_slots,
+            anchors,
+            ..
+        } = constellation;
+        let mut slots = BTreeMap::new();
+        let mut sparse = BTreeMap::new();
+        for (slot, vector) in constellation_slots {
+            match vector {
+                SlotVector::Dense { data, .. } => {
+                    slots.insert(slot, data);
                 }
-            })
-            .collect();
+                SlotVector::Sparse { entries, .. } => {
+                    sparse.insert(
+                        slot,
+                        entries
+                            .into_iter()
+                            .map(|entry| (entry.idx, entry.val))
+                            .collect(),
+                    );
+                }
+                SlotVector::Multi { .. } | SlotVector::Absent { .. } => {}
+            }
+        }
         Self {
-            cx_id: constellation.cx_id,
+            cx_id,
             slots,
             sparse,
-            anchors: constellation.anchors.clone(),
+            anchors,
         }
     }
 }
@@ -1496,13 +1500,6 @@ pub struct SynapseCalyxCorpusSlotState {
     /// Why this lens is not measurable; present exactly when `measurable` is
     /// false and the loader has a specific reason beyond its vector kind.
     pub unusable_reason: Option<String>,
-}
-
-fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
-    match vector {
-        SlotVector::Dense { data, .. } => Some(data.clone()),
-        SlotVector::Sparse { .. } | SlotVector::Multi { .. } | SlotVector::Absent { .. } => None,
-    }
 }
 
 /// What the kernel corpus loader saw on the requested content slot for records
@@ -5459,7 +5456,7 @@ impl SynapseCalyxVault {
         // the `Base` row-guard before it looked at the first row.
         self.walk_cf_latest(
             ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
             |_key, value| {
                 let constellation = decode_constellation_base(value).map_err(|error| {
                     SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -6460,7 +6457,7 @@ impl SynapseCalyxVault {
             self.walk_cf_snapshot(
                 snapshot,
                 ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
                 |_key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)

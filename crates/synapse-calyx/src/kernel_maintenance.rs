@@ -417,7 +417,7 @@ impl SynapseCalyxVault {
         // bounded sweep still reads only the pages it needs.
         self.walk_cf_latest(
             ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
             |_key, value| {
                 let constellation = decode_constellation_base(value).map_err(|error| {
                     SynapseCalyxError::from_calyx("decode Base constellation", &error)

@@ -200,7 +200,7 @@ impl SynapseCalyxVault {
                 self.walk_cf_snapshot(
                     snapshot,
                     ColumnFamily::Base,
-                    crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                    crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
                     |_key, value| {
                         let base = decode_constellation_base(value).map_err(|error| {
                             SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -567,7 +567,7 @@ impl SynapseCalyxVault {
         let mut first_failure = None::<String>;
         self.walk_cf_latest(
             ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
             |key, value| {
                 let base = match decode_constellation_base_projection(value) {
                     Ok(base) => base,
@@ -668,7 +668,7 @@ impl SynapseCalyxVault {
         let walk = self.walk_cf_snapshot(
             snapshot,
             ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
             |key, value| {
                 let base = match decode_constellation_base_projection(value) {
                     Ok(base) => base,

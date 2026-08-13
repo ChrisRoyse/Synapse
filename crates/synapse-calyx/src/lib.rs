@@ -1242,6 +1242,12 @@ impl From<calyx_aster::vault::ConditionalCfWriteOutcome> for SynapseCalyxConditi
 /// maintenance pass uses a little more CPU in total, and stops holding a lock
 /// that every constellation writer needs for a third of a second.
 pub const SYNAPSE_CALYX_CF_WALK_PAGE_ROWS: usize = 256;
+/// Base rows duplicate every slot payload and can therefore be orders of
+/// magnitude larger than key-oriented CF rows. Keep each physical Base page
+/// small enough that the page itself cannot become a multi-gigabyte transient;
+/// the persistent snapshot cursor preserves linear I/O despite the smaller
+/// handoff unit.
+pub(crate) const SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS: usize = 16;
 
 /// What a [`SynapseCalyxVault::walk_cf_latest`] visitor asks for next.
 ///
@@ -2786,6 +2792,56 @@ pub fn install_process_memory_reclaimer(
 }
 
 const BASE_PAGE_RECLAIM_GROWTH_BYTES: u64 = 32 * 1024 * 1024;
+
+struct BaseCfWalkMemoryTracker {
+    private_bytes_after_last_reclaim: u64,
+}
+
+impl BaseCfWalkMemoryTracker {
+    fn new(cf: ColumnFamily) -> Result<Option<Self>, SynapseCalyxError> {
+        if cf != ColumnFamily::Base || PROCESS_MEMORY_RECLAIMER.get().is_none() {
+            return Ok(None);
+        }
+        Ok(Some(Self {
+            private_bytes_after_last_reclaim: process_private_bytes()?,
+        }))
+    }
+
+    fn page_released(
+        &mut self,
+        page: usize,
+        rows_examined: usize,
+    ) -> Result<(), SynapseCalyxError> {
+        let before = process_private_bytes()?;
+        if before.saturating_sub(self.private_bytes_after_last_reclaim)
+            < BASE_PAGE_RECLAIM_GROWTH_BYTES
+        {
+            return Ok(());
+        }
+        let reclaim = PROCESS_MEMORY_RECLAIMER.get().copied().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_MEMORY_RECLAIMER_DISAPPEARED",
+                "the process memory reclaimer disappeared during a Base CF walk",
+                "repair process initialization; a once-installed allocator authority must remain available for the process lifetime",
+            )
+        })?;
+        let started = Instant::now();
+        reclaim();
+        let after = process_private_bytes()?;
+        self.private_bytes_after_last_reclaim = after;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_BASE_WALK_PAGE_MEMORY_RECLAIMED",
+            page,
+            rows_examined,
+            private_bytes_before = before,
+            private_bytes_after = after,
+            private_bytes_reclaimed = before.saturating_sub(after),
+            reclaim_elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "returned a released Base walk page to the operating system while preserving the pinned cursor and caller-owned corpus"
+        );
+        Ok(())
+    }
+}
 
 struct SearchRebuildMemoryTracker {
     private_bytes_peak: u64,
@@ -7287,23 +7343,39 @@ impl SynapseCalyxVault {
             snapshot_seq_first: snapshot.seq(),
             snapshot_seq_last: snapshot.seq(),
         };
+        let mut page_memory = BaseCfWalkMemoryTracker::new(cf)?;
         let result =
             self.vault
                 .scan_cf_range_pages_snapshot(snapshot, cf, range, page_rows, |page| {
                     walk.pages += 1;
                     walk.rows_examined += page.len();
+                    let mut control = None;
                     for (key, value) in &page {
                         walk.rows_visited += 1;
                         match visit(key, value) {
                             Ok(SynapseCalyxWalkStep::Continue) => {}
                             Ok(SynapseCalyxWalkStep::Stop) => {
                                 walk.stopped_early = true;
-                                return Err(SynapseCalyxSnapshotWalkControl::Stop);
+                                control = Some(SynapseCalyxSnapshotWalkControl::Stop);
+                                break;
                             }
                             Err(error) => {
-                                return Err(SynapseCalyxSnapshotWalkControl::Error(error));
+                                control = Some(SynapseCalyxSnapshotWalkControl::Error(error));
+                                break;
                             }
                         }
+                    }
+                    // The allocator collection must happen after the physical
+                    // page and every visitor-local decode have released
+                    // ownership. Calling it earlier only scans live memory.
+                    drop(page);
+                    if let Some(memory) = page_memory.as_mut() {
+                        memory
+                            .page_released(walk.pages, walk.rows_examined)
+                            .map_err(SynapseCalyxSnapshotWalkControl::Error)?;
+                    }
+                    if let Some(control) = control {
+                        return Err(control);
                     }
                     Ok(())
                 });
