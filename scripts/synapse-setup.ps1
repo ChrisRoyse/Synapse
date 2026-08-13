@@ -9820,23 +9820,24 @@ function Get-SynapseCandidateReplacementReservationId {
     if (-not $statePresent) {
         Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_MISSING path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon GPU reservation Source of Truth before candidate validation"
     }
-    # #2239 made CUDA ownership demand-driven: the final caller destroys the
-    # context, releases the host lease, and publishes `dormant_verified` only
-    # after a separate ledger read proves the live PID owns no reservation.
-    # A candidate therefore needs a replacement reservation only while the
-    # outgoing daemon has an active lease. Preserve every mixed-state refusal:
-    # the exact dormant verdict is accepted only when both health and the
-    # current physical ledger independently prove there is nothing to hand off.
-    if ($probeStatus -ieq 'dormant_verified') {
+    # #2239 made CUDA ownership demand-driven. `dormant` means no caller has
+    # created a context or reservation yet; after a caller, the final release
+    # destroys the context and publishes `dormant_verified` only after a
+    # separate ledger read. A candidate therefore needs a replacement
+    # reservation only while the outgoing daemon has an active lease. Preserve
+    # every mixed-state refusal: only those two explicit idle lifecycle states
+    # are accepted, and only when health plus the current physical ledger
+    # independently prove there is nothing to hand off.
+    if (@('dormant', 'dormant_verified') -icontains $probeStatus) {
         if (-not [string]::IsNullOrWhiteSpace($healthReservationId) -or $pidRows.Count -ne 0) {
-            Die "SYNAPSE_GPU_REPLACEMENT_DORMANT_STATE_CONFLICT path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) ledger_pid_row_count=$($pidRows.Count) remediation=dormant_verified requires an absent health reservation identity and zero physical ledger rows for the exact live daemon"
+            Die "SYNAPSE_GPU_REPLACEMENT_IDLE_STATE_CONFLICT path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) ledger_pid_row_count=$($pidRows.Count) remediation=dormant and dormant_verified require an absent health reservation identity and zero physical ledger rows for the exact live daemon"
         }
         try {
             $stateHash = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256 -ErrorAction Stop).Hash
         } catch {
             Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_HASH_FAILED path=$statePath live_pid=$($listener.OwningProcess) error=$($_.Exception.Message) remediation=repair physical read access to the host GPU reservation Source of Truth before candidate validation"
         }
-        Info "SYNAPSE_GPU_REPLACEMENT_DORMANT_VERIFIED bind=$Bind live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=<none> ledger_pid_row_count=0 ledger_reservation_count=$(@($state.reservations).Count) ledger_sha256=$stateHash state_path=$statePath note=no active CUDA context or host lease exists to hand off; candidate admission remains independently validated"
+        Info "SYNAPSE_GPU_REPLACEMENT_IDLE_VERIFIED bind=$Bind live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=<none> ledger_pid_row_count=0 ledger_reservation_count=$(@($state.reservations).Count) ledger_sha256=$stateHash state_path=$statePath note=no active CUDA context or host lease exists to hand off; candidate admission remains independently validated"
         return $null
     }
     if ($healthReservationId -notmatch '^[0-9a-fA-F]{32}$') {
