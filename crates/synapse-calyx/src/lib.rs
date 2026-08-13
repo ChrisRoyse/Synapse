@@ -6882,6 +6882,48 @@ impl SynapseCalyxVault {
         snapshot: Snapshot,
         cf: ColumnFamily,
         page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        self.walk_cf_range_snapshot(snapshot, cf, &KeyRange::all(), page_rows, visit)
+    }
+
+    /// Streams one range from one newly registered latest snapshot while
+    /// retaining the immutable merge cursor for the complete walk.
+    ///
+    /// This is the cross-crate primitive for logical filters such as retention
+    /// TTL: a caller can skip any number of physical candidates and stop after
+    /// collecting its bounded logical page without reopening and re-seeking
+    /// every SST for each all-filtered candidate page.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the page size is zero, snapshot
+    /// registration or lease validation fails, an immutable record is corrupt,
+    /// a read barrier blocks a row, or the visitor rejects a row.
+    pub fn walk_cf_range_latest_snapshot<V>(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        self.with_read_snapshot(INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            self.walk_cf_range_snapshot(snapshot, cf, range, page_rows, visit)
+        })
+    }
+
+    fn walk_cf_range_snapshot<V>(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        page_rows: usize,
         mut visit: V,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
     where
@@ -6907,30 +6949,26 @@ impl SynapseCalyxVault {
             snapshot_seq_first: snapshot.seq(),
             snapshot_seq_last: snapshot.seq(),
         };
-        let result = self.vault.scan_cf_range_pages_snapshot(
-            snapshot,
-            cf,
-            &KeyRange::all(),
-            page_rows,
-            |page| {
-                walk.pages += 1;
-                walk.rows_examined += page.len();
-                for (key, value) in &page {
-                    walk.rows_visited += 1;
-                    match visit(key, value) {
-                        Ok(SynapseCalyxWalkStep::Continue) => {}
-                        Ok(SynapseCalyxWalkStep::Stop) => {
-                            walk.stopped_early = true;
-                            return Err(SynapseCalyxSnapshotWalkControl::Stop);
-                        }
-                        Err(error) => {
-                            return Err(SynapseCalyxSnapshotWalkControl::Error(error));
+        let result =
+            self.vault
+                .scan_cf_range_pages_snapshot(snapshot, cf, range, page_rows, |page| {
+                    walk.pages += 1;
+                    walk.rows_examined += page.len();
+                    for (key, value) in &page {
+                        walk.rows_visited += 1;
+                        match visit(key, value) {
+                            Ok(SynapseCalyxWalkStep::Continue) => {}
+                            Ok(SynapseCalyxWalkStep::Stop) => {
+                                walk.stopped_early = true;
+                                return Err(SynapseCalyxSnapshotWalkControl::Stop);
+                            }
+                            Err(error) => {
+                                return Err(SynapseCalyxSnapshotWalkControl::Error(error));
+                            }
                         }
                     }
-                }
-                Ok(())
-            },
-        );
+                    Ok(())
+                });
         match result {
             Ok(()) => {
                 // The former page-at-a-time path performed and counted one

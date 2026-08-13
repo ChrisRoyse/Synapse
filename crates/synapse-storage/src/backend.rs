@@ -21,8 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    AsterOrphanSlotGcReport, SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback,
-    SynapseCalyxAnchorReadback, SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
+    AsterOrphanSlotGcReport, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, SynapseCalyxAbundanceReport,
+    SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
+    SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
     SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxBackupReport,
     SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
     SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
@@ -45,7 +46,8 @@ use synapse_calyx::{
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
     SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport,
-    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
+    SynapseCalyxWalkStep, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -11444,20 +11446,21 @@ const CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES: usize = 1_000_000;
 /// Reads one ordered logical page, stepping over runs of TTL-expired rows.
 ///
 /// The page is bounded by live rows, and it advances through dead candidates on
-/// the vault's **opaque physical cursor** rather than on a logical key. That
-/// distinction is the whole correctness argument. A logical cursor can only name
-/// a row the caller was handed, so a page whose every candidate was expired
-/// yields no key to resume from: the caller re-issues the identical request, gets
-/// the identical empty page, and the scan is wedged permanently. The physical
-/// cursor names a position in the keyspace whether or not the row at it is live,
-/// so forward progress no longer depends on finding something to return.
+/// one pinned physical stream rather than reopening the range from a logical
+/// key after each all-expired candidate page. That distinction is the whole
+/// correctness and complexity argument. A logical cursor can only name a row
+/// the caller was handed, while an expired row is intentionally not handed out.
+/// The persistent immutable merge cursor can advance across that row anyway,
+/// so forward progress no longer depends on finding something to return and a
+/// long expired run remains one linear pass over its physical sources.
 ///
-/// This previously failed with `CALYX_ORDERED_KEY_PAGE_NO_LOGICAL_PROGRESS`
-/// whenever one page of candidates was entirely expired, which is why the
-/// ambient transcript ingest and the agent cost rollup retried the same wedged
-/// scan every few seconds indefinitely.
+/// This first failed with `CALYX_ORDERED_KEY_PAGE_NO_LOGICAL_PROGRESS`. An
+/// opaque resume cursor fixed correctness but still reopened and re-sought the
+/// same KV SST hundreds of times for a 62,000-row expired run, sustaining more
+/// than 1.5 GiB/s of reads and a full CPU core. The retained stream fixes that
+/// physical amplification rather than hiding it behind a larger retry budget.
 fn read_ordered_rows_from_vault_page(
-    vault: &impl CalyxVaultKvRead,
+    vault: &SynapseCalyxVault,
     cf_name: &str,
     start_key: &[u8],
     max_rows: usize,
@@ -11473,66 +11476,68 @@ fn read_ordered_rows_from_vault_page(
         .map_err(|source| calyx_read_failed(cf_name, "read Calyx vault clock", &source))?;
 
     let mut decoded: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let mut after_physical: Option<Vec<u8>> = None;
     let mut candidates_examined = 0usize;
-    let mut skipped_pages = 0u64;
-
-    let (more, expired_skipped) = loop {
-        let page = vault
-            .scan_kv_range_page_latest(&range, after_physical.as_deref(), max_rows)
-            .map_err(|source| {
-                calyx_read_failed(
+    let mut expired_skipped = 0usize;
+    let candidate_page_rows = max_rows.max(SYNAPSE_CALYX_CF_WALK_PAGE_ROWS);
+    let walk = vault
+        .walk_cf_range_latest_snapshot(
+            ColumnFamily::Kv,
+            &range,
+            candidate_page_rows,
+            |physical_key, value| {
+                candidates_examined = candidates_examined.saturating_add(1);
+                if candidates_examined > CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES {
+                    return Err(SynapseCalyxError::new(
+                        "CALYX_ORDERED_KEY_PAGE_EXPIRED_RUN_EXCEEDS_BUDGET",
+                        format!(
+                            "walked more than {CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES} consecutive physical candidates without filling the {max_rows}-row logical {cf_name} page; current_physical_key_sha256={}",
+                            sha256_hex(physical_key)
+                        ),
+                        "run retention GC for the named CF to reclaim the expired run, then retry",
+                    ));
+                }
+                let user_key = decode_calyx_user_key_for_read(
                     cf_name,
-                    "scan candidate-bounded ordered Calyx logical page",
-                    &source,
+                    collection_id,
+                    physical_key,
                 )
-            })?;
-        let page_candidates = page.rows.len();
-        candidates_examined = candidates_examined.saturating_add(page_candidates);
-        decoded.reserve(page_candidates);
-        for (physical_key, value) in page.rows {
-            let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, &physical_key)?;
-            let envelope =
-                decode_calyx_value_raw(&value).map_err(|detail| StorageError::ReadFailed {
-                    cf_name: cf_name.to_owned(),
-                    detail: format!(
-                        "decode candidate-bounded ordered Calyx logical page value: key_sha256={} detail={detail}",
-                        sha256_hex(&user_key)
-                    ),
+                .map_err(|error| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_ORDERED_KEY_DECODE_FAILED",
+                        error.to_string(),
+                        "repair the named physical namespace key before retrying the ordered page",
+                    )
                 })?;
-            if !calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
-                decoded.push((user_key, envelope.payload.to_vec()));
-            }
-        }
-
-        if !decoded.is_empty() || !page.more {
-            break (page.more, candidates_examined.saturating_sub(decoded.len()));
-        }
-
-        // Every candidate on this page was expired and the range continues.
-        // Step the physical cursor past them; a logical key cannot express this
-        // position because no live row was decoded to name one.
-        let Some(resume_after) = page.resume_after else {
-            return Err(StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail: format!(
-                    "CALYX_ORDERED_KEY_PAGE_CURSOR_ABSENT: vault reported more candidates after {candidates_examined} fully expired rows but returned no physical resume cursor; remediation=inspect the Calyx range-page contract for {cf_name}, which must yield a resume cursor whenever more=true"
-                ),
-            });
-        };
-        skipped_pages = skipped_pages.saturating_add(1);
-
-        if candidates_examined >= CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES {
-            return Err(StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail: format!(
-                    "CALYX_ORDERED_KEY_PAGE_EXPIRED_RUN_EXCEEDS_BUDGET: walked {candidates_examined} consecutive TTL-expired physical candidates across {skipped_pages} pages without reaching a live row, exceeding the {CALYX_ORDERED_PAGE_MAX_SKIPPED_CANDIDATES} candidate ceiling; resume_after_physical_sha256={}; remediation=run retention GC for {cf_name} to reclaim the expired run, then retry",
-                    sha256_hex(&resume_after)
-                ),
-            });
-        }
-        after_physical = Some(resume_after);
-    };
+                let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_ORDERED_VALUE_DECODE_FAILED",
+                        format!(
+                            "decode candidate-bounded ordered Calyx logical page value: key_sha256={} detail={detail}",
+                            sha256_hex(&user_key)
+                        ),
+                        "repair the named retention envelope before retrying the ordered page",
+                    )
+                })?;
+                if calyx_value_is_expired(envelope.expires_at_ms, now_ms) {
+                    expired_skipped = expired_skipped.saturating_add(1);
+                } else {
+                    decoded.push((user_key, envelope.payload.to_vec()));
+                }
+                Ok(if decoded.len() >= max_rows {
+                    SynapseCalyxWalkStep::Stop
+                } else {
+                    SynapseCalyxWalkStep::Continue
+                })
+            },
+        )
+        .map_err(|source| {
+            calyx_read_failed(
+                cf_name,
+                "stream candidate-bounded ordered Calyx logical page",
+                &source,
+            )
+        })?;
+    let more = walk.stopped_early;
 
     if !decoded
         .windows(2)
@@ -11545,11 +11550,11 @@ fn read_ordered_rows_from_vault_page(
         });
     }
 
-    if skipped_pages > 0 {
+    if expired_skipped > 0 {
         tracing::warn!(
             code = "STORAGE_CALYX_ORDERED_PAGE_SKIPPED_EXPIRED_RUN",
             cf = cf_name,
-            skipped_pages,
+            physical_pages = walk.pages,
             candidates_examined,
             expired_skipped,
             live_rows = decoded.len(),
