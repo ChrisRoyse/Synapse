@@ -59,13 +59,15 @@ impl CfRouter {
         let output = self
             .cf_dir(cf)
             .join(flush_sst_file_name(commit_watermark, ordinal));
-        write_sst(
+        let summary = write_sst(
             &output,
             retained
                 .iter()
                 .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
         )?;
-        let replacement = SstLevel::from_oldest_first_with_lookup([output.clone()])?;
+        let prepared = SstLevel::prepare(&summary, self.config.retains_lookup(cf))?;
+        let mut replacement = SstLevel::new();
+        replacement.push_prepared(prepared);
         shard.levels.insert(cf, replacement);
 
         for input in input_paths {

@@ -23,16 +23,40 @@ use std::time::SystemTime;
 /// Bounds open mappings, file descriptors, decoded indexes, and bloom filters.
 const MAX_CACHED_READERS: usize = 256;
 
+/// Resident decoded-index budget for the shared immutable-reader cache.
+///
+/// A count-only limit retained 256 readers regardless of whether each decoded
+/// index was 4 KiB or 40 MiB. The production Ledger walk in #2239 therefore
+/// retained over a gigabyte while still appearing "within cap". This is an
+/// internal cache working-set budget, not a process memory limit: a caller can
+/// open any valid SST, but an oversized reader is not kept after that call.
+const MAX_CACHED_READER_HEAP_BYTES: usize = 64 * 1024 * 1024;
+
 struct Entry {
     reader: Arc<SstReader>,
     len: u64,
     modified: Option<SystemTime>,
     last_used: u64,
+    heap_bytes: usize,
 }
 
-fn cache() -> &'static Mutex<HashMap<PathBuf, Entry>> {
-    static CACHE: OnceLock<Mutex<HashMap<PathBuf, Entry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct ReaderCache {
+    entries: HashMap<PathBuf, Entry>,
+    retained_heap_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SstReaderCacheStatus {
+    pub entries: usize,
+    pub estimated_heap_bytes: usize,
+    pub max_entries: usize,
+    pub max_estimated_heap_bytes: usize,
+}
+
+fn cache() -> &'static Mutex<ReaderCache> {
+    static CACHE: OnceLock<Mutex<ReaderCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ReaderCache::default()))
 }
 
 fn next_tick() -> u64 {
@@ -40,7 +64,7 @@ fn next_tick() -> u64 {
     CLOCK.fetch_add(1, Ordering::Relaxed)
 }
 
-fn lock() -> MutexGuard<'static, HashMap<PathBuf, Entry>> {
+fn lock() -> MutexGuard<'static, ReaderCache> {
     cache()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -63,12 +87,12 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
 
     {
         let mut cache = lock();
-        if let Some(entry) = cache.get_mut(&key) {
+        if let Some(entry) = cache.entries.get_mut(&key) {
             if entry.len == len && entry.modified == modified {
                 entry.last_used = next_tick();
                 return Ok(Arc::clone(&entry.reader));
             }
-            cache.remove(&key);
+            remove_entry(&mut cache, &key);
         }
     }
 
@@ -76,16 +100,24 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
     // serialize behind a cold open. Concurrent cold opens are both valid
     // because SST files are immutable.
     let reader = Arc::new(SstReader::open(&key)?);
+    let heap_bytes = reader.estimated_heap_bytes();
     let mut cache = lock();
-    cache.insert(
-        key,
-        Entry {
-            reader: Arc::clone(&reader),
-            len,
-            modified,
-            last_used: next_tick(),
-        },
-    );
+    if heap_bytes <= MAX_CACHED_READER_HEAP_BYTES {
+        let prior = cache.entries.insert(
+            key,
+            Entry {
+                reader: Arc::clone(&reader),
+                len,
+                modified,
+                last_used: next_tick(),
+                heap_bytes,
+            },
+        );
+        if let Some(prior) = prior {
+            subtract_retained_heap(&mut cache, prior.heap_bytes);
+        }
+        cache.retained_heap_bytes = cache.retained_heap_bytes.saturating_add(heap_bytes);
+    }
     evict_over_cap(&mut cache);
     Ok(reader)
 }
@@ -98,7 +130,7 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
 /// no filesystem syscall runs inside the lock (issue #1806).
 pub fn invalidate_reader_canonical(canonical: &Path) {
     let mut cache = lock();
-    cache.remove(canonical);
+    remove_entry(&mut cache, canonical);
 }
 
 /// Drops the cache-owned mapping before a caller reclaims an SST file.
@@ -106,23 +138,51 @@ pub fn invalidate_reader(path: &Path) {
     let mut cache = lock();
     match fs::canonicalize(path) {
         Ok(key) => {
-            cache.remove(&key);
+            remove_entry(&mut cache, &key);
         }
         Err(_) => {
-            cache.remove(path);
+            remove_entry(&mut cache, path);
         }
     }
 }
 
-fn evict_over_cap(cache: &mut HashMap<PathBuf, Entry>) {
-    while cache.len() > MAX_CACHED_READERS {
+pub fn reader_cache_status() -> SstReaderCacheStatus {
+    let cache = lock();
+    SstReaderCacheStatus {
+        entries: cache.entries.len(),
+        estimated_heap_bytes: cache.retained_heap_bytes,
+        max_entries: MAX_CACHED_READERS,
+        max_estimated_heap_bytes: MAX_CACHED_READER_HEAP_BYTES,
+    }
+}
+
+fn remove_entry(cache: &mut ReaderCache, key: &Path) {
+    if let Some(entry) = cache.entries.remove(key) {
+        subtract_retained_heap(cache, entry.heap_bytes);
+    }
+}
+
+fn subtract_retained_heap(cache: &mut ReaderCache, removing: usize) {
+    assert!(
+        cache.retained_heap_bytes >= removing,
+        "CALYX_ASTER_SST_READER_CACHE_ACCOUNTING_UNDERFLOW retained_heap_bytes={} removing_heap_bytes={removing}",
+        cache.retained_heap_bytes
+    );
+    cache.retained_heap_bytes -= removing;
+}
+
+fn evict_over_cap(cache: &mut ReaderCache) {
+    while cache.entries.len() > MAX_CACHED_READERS
+        || cache.retained_heap_bytes > MAX_CACHED_READER_HEAP_BYTES
+    {
         let victim = cache
+            .entries
             .iter()
             .min_by_key(|(_, entry)| entry.last_used)
             .map(|(key, _)| key.clone());
         let Some(victim) = victim else {
             break;
         };
-        cache.remove(&victim);
+        remove_entry(cache, &victim);
     }
 }

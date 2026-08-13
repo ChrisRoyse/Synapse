@@ -1982,6 +1982,14 @@ where
         self.rows.memtable_status()
     }
 
+    /// Process-wide immutable-reader cache occupancy. Readers are shared across
+    /// vault instances, so this is intentionally reported as the physical
+    /// process Source of Truth rather than attributed to one logical vault.
+    #[must_use]
+    pub fn sst_reader_cache_status(&self) -> crate::sst::SstReaderCacheStatus {
+        crate::sst::reader_cache_status()
+    }
+
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {
         self.rows.install_read_barrier(barrier);
     }

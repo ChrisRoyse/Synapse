@@ -9,7 +9,10 @@ mod page;
 mod point_read;
 mod reader_cache;
 
-pub use reader_cache::{invalidate_reader, invalidate_reader_canonical, shared_reader};
+pub use reader_cache::{
+    SstReaderCacheStatus, invalidate_reader, invalidate_reader_canonical, reader_cache_status,
+    shared_reader,
+};
 
 /// Hard ceiling on immutable SST sources participating in one range page.
 ///
@@ -83,6 +86,21 @@ pub struct SstSummary {
     pub bytes: u64,
     pub index_offset: u64,
     pub bloom_offset: u64,
+    pub first_key: Option<Vec<u8>>,
+    pub last_key: Option<Vec<u8>>,
+}
+
+/// Small, allocation-bounded key range used to reject immutable files that
+/// cannot answer a point or range read.
+///
+/// Unlike [`SstLookupMetadata`], this never retains every key in the SST. A
+/// cold-open router can therefore prune thousands of immutable sources without
+/// recreating the multi-gigabyte decoded-index resident set that issue #2239
+/// exposed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SstBounds {
+    pub(crate) first_key: Vec<u8>,
+    pub(crate) last_key: Vec<u8>,
 }
 
 /// A key/value row read from an SSTable.
@@ -215,6 +233,8 @@ pub fn write_sst<'a>(
         bytes: bytes.len() as u64,
         index_offset,
         bloom_offset,
+        first_key: entries.first().map(|(key, _)| key.clone()),
+        last_key: entries.last().map(|(key, _)| key.clone()),
     })
 }
 
@@ -394,6 +414,16 @@ impl SstReader {
         })
     }
 
+    pub(crate) fn estimated_heap_bytes(&self) -> usize {
+        self.index
+            .capacity()
+            .saturating_mul(std::mem::size_of::<IndexEntry>())
+            .saturating_add(self.index.iter().fold(0_usize, |bytes, entry| {
+                bytes.saturating_add(entry.key.capacity())
+            }))
+            .saturating_add(self.bloom.estimated_heap_bytes())
+    }
+
     /// Clones the index from an already whole-file-validated reader.
     ///
     /// Unlike [`Self::lookup_metadata`], an empty vector is a valid result for
@@ -402,6 +432,108 @@ impl SstReader {
     fn validated_index(&self) -> Vec<IndexEntry> {
         self.index.clone()
     }
+}
+
+/// Reads and validates only the immutable file's ordered key bounds.
+///
+/// The complete variable-length index is walked as borrowed mmap slices so a
+/// malformed count, offset, length, or key order fails closed without retaining
+/// an allocation per row. The first and last indexed data records are then read
+/// through the normal record CRC gate. A later candidate read still performs
+/// the SST-wide body checksum in [`SstReader::open`]; bounds are only a negative
+/// selection index and never authorize serving bytes.
+pub(crate) fn read_sst_bounds(path: &Path) -> Result<Option<SstBounds>> {
+    read_sst_bounds_inner(path).map_err(|mut error| {
+        error.message = format!(
+            "read bounded SST key index {}: {}",
+            path.display(),
+            error.message
+        );
+        error
+    })
+}
+
+fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
+    let column = MmapColumn::open(path)?;
+    let bytes = column.as_bytes();
+    let header = read_header_structure(bytes)?;
+    let mut offset = usize::try_from(header.index_offset)
+        .map_err(|_| CalyxError::aster_corrupt_shard("SST index offset exceeds usize"))?;
+    let end = usize::try_from(header.bloom_offset)
+        .map_err(|_| CalyxError::aster_corrupt_shard("SST bloom offset exceeds usize"))?;
+    let mut first = None::<(&[u8], u64)>;
+    let mut previous = None::<&[u8]>;
+    let mut last = None::<(&[u8], u64)>;
+    for _ in 0..header.entries {
+        let fixed_end = offset.checked_add(INDEX_ENTRY_FIXED_LEN).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard("SST index fixed-entry offset overflow")
+        })?;
+        let fixed = bytes
+            .get(offset..fixed_end)
+            .filter(|_| fixed_end <= end)
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index entry out of bounds"))?;
+        let key_len = u32::from_le_bytes(fixed[0..4].try_into().expect("index key len")) as usize;
+        let record_offset = u64::from_le_bytes(fixed[4..12].try_into().expect("record offset"));
+        offset = fixed_end;
+        let key_end = offset
+            .checked_add(key_len)
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index key offset overflow"))?;
+        let key = bytes
+            .get(offset..key_end)
+            .filter(|_| key_end <= end)
+            .ok_or_else(|| CalyxError::aster_corrupt_shard("SST index key out of bounds"))?;
+        if record_offset < HEADER_LEN as u64 || record_offset >= header.index_offset {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST index record offset {record_offset} is outside the data section {}..{}",
+                HEADER_LEN, header.index_offset
+            )));
+        }
+        if previous.is_some_and(|prior| prior >= key) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "SST index keys must be strictly sorted",
+            ));
+        }
+        if first.is_none() {
+            first = Some((key, record_offset));
+        }
+        previous = Some(key);
+        last = Some((key, record_offset));
+        offset = key_end;
+    }
+    if offset != end {
+        return Err(CalyxError::aster_corrupt_shard("SST index length mismatch"));
+    }
+    let Some((first_key, first_offset)) = first else {
+        if last.is_some() {
+            return Err(CalyxError::aster_corrupt_shard(
+                "empty SST bounds walk produced a last key",
+            ));
+        }
+        return Ok(None);
+    };
+    let Some((last_key, last_offset)) = last else {
+        return Err(CalyxError::aster_corrupt_shard(
+            "non-empty SST bounds walk produced no last key",
+        ));
+    };
+    let first_record = read_record_ref(bytes, first_offset)?;
+    if first_record.key != first_key {
+        return Err(CalyxError::aster_corrupt_shard(
+            "SST first index key does not match its CRC-validated data record",
+        ));
+    }
+    if last_offset != first_offset {
+        let last_record = read_record_ref(bytes, last_offset)?;
+        if last_record.key != last_key {
+            return Err(CalyxError::aster_corrupt_shard(
+                "SST last index key does not match its CRC-validated data record",
+            ));
+        }
+    }
+    Ok(Some(SstBounds {
+        first_key: first_key.to_vec(),
+        last_key: last_key.to_vec(),
+    }))
 }
 
 pub(super) fn materialized_entry_bytes<T>(key: &[u8], value: &[u8]) -> usize {
@@ -548,7 +680,7 @@ fn write_header(
     bytes[28..32].copy_from_slice(&body_crc.to_le_bytes());
 }
 
-fn read_header(bytes: &[u8]) -> Result<Header> {
+fn read_header_structure(bytes: &[u8]) -> Result<Header> {
     let header = bytes
         .get(0..HEADER_LEN)
         .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing"))?;
@@ -574,6 +706,19 @@ fn read_header(bytes: &[u8]) -> Result<Header> {
             "SST header offsets out of bounds",
         ));
     }
+    Ok(Header {
+        entries,
+        index_offset,
+        bloom_offset,
+    })
+}
+
+fn read_header(bytes: &[u8]) -> Result<Header> {
+    let parsed = read_header_structure(bytes)?;
+    let header = bytes
+        .get(0..HEADER_LEN)
+        .ok_or_else(|| CalyxError::aster_corrupt_shard("SST header missing"))?;
+    let version = u32::from_le_bytes(header[4..8].try_into().expect("version"));
     if version >= VERSION {
         let expected_crc = u32::from_le_bytes(header[28..32].try_into().expect("body crc"));
         let actual_crc = section_crc(
@@ -587,9 +732,5 @@ fn read_header(bytes: &[u8]) -> Result<Header> {
             )));
         }
     }
-    Ok(Header {
-        entries,
-        index_offset,
-        bloom_offset,
-    })
+    Ok(parsed)
 }

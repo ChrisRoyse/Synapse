@@ -2531,6 +2531,10 @@ pub struct SynapseCalyxVaultStatus {
     pub memtable_used_bytes: Option<u64>,
     pub memtable_cap_bytes: Option<u64>,
     pub memtable_high_water_bytes: Option<u64>,
+    pub sst_reader_cache_entries: Option<u64>,
+    pub sst_reader_cache_estimated_heap_bytes: Option<u64>,
+    pub sst_reader_cache_max_entries: Option<u64>,
+    pub sst_reader_cache_max_estimated_heap_bytes: Option<u64>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
     pub anneal: Option<SynapseCalyxAnnealStatus>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
@@ -8220,6 +8224,7 @@ fn status_from_vault(
     let recovery_report = vault.recovery_report();
     let mvcc_resident = vault.mvcc_resident_status();
     let memtable = vault.memtable_status();
+    let reader_cache = vault.sst_reader_cache_status();
     let mut status = SynapseCalyxVaultStatus {
         enabled: true,
         phase: "open".to_owned(),
@@ -8247,6 +8252,12 @@ fn status_from_vault(
                 .iter()
                 .map(|entry| entry.high_water_bytes)
                 .sum(),
+        ),
+        sst_reader_cache_entries: Some(reader_cache.entries as u64),
+        sst_reader_cache_estimated_heap_bytes: Some(reader_cache.estimated_heap_bytes as u64),
+        sst_reader_cache_max_entries: Some(reader_cache.max_entries as u64),
+        sst_reader_cache_max_estimated_heap_bytes: Some(
+            reader_cache.max_estimated_heap_bytes as u64,
         ),
         ..SynapseCalyxVaultStatus::default()
     };

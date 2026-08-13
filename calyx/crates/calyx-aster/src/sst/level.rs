@@ -1,9 +1,10 @@
 use super::page;
-use super::shared_reader;
 use super::{
-    MAX_RANGE_SCAN_BYTES, SstEntry, SstKeyState, SstLookupMetadata, SstPageReader, SstPointReader,
-    clone_scan_bytes, materialized_entry_bytes, scan_reserve_failed,
+    MAX_RANGE_SCAN_BYTES, SstBounds, SstEntry, SstKeyState, SstLookupMetadata, SstPageReader,
+    SstPointReader, SstReader, SstSummary, clone_scan_bytes, materialized_entry_bytes,
+    scan_reserve_failed,
 };
+use super::{read_sst_bounds, shared_reader};
 use calyx_core::{CalyxError, Result};
 use std::path::PathBuf;
 
@@ -19,6 +20,8 @@ pub struct SstLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LevelFile {
     pub(super) path: PathBuf,
+    bounds: Option<SstBounds>,
+    bounds_retained: bool,
     lookup: Option<SstLookupMetadata>,
     lookup_retained: bool,
 }
@@ -40,42 +43,142 @@ struct RankedKeyState {
     state: SstKeyState,
 }
 
+#[derive(Debug)]
+struct PredecessorFileCandidate {
+    source_index: usize,
+    upper_bound: Vec<u8>,
+}
+
 impl LevelFile {
     fn without_lookup(path: PathBuf) -> Self {
         Self {
             path,
+            bounds: None,
+            bounds_retained: false,
             lookup: None,
             lookup_retained: false,
         }
     }
 
     fn with_lookup(path: PathBuf) -> Result<Self> {
-        let lookup = shared_reader(&path)?.lookup_metadata();
+        // Cold-open lookup retention owns exactly one decoded index. Going
+        // through `shared_reader` here retained a second complete copy in the
+        // process-wide cache before cloning it into the level (#2239).
+        let lookup = SstReader::open(&path)?.lookup_metadata();
+        if let Some(lookup) = &lookup {
+            u32::try_from(lookup.len()).map_err(|_| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "SST {} decoded index has {} entries, exceeding its on-disk u32 count",
+                    path.display(),
+                    lookup.len()
+                ))
+            })?;
+        }
+        let bounds = lookup.as_ref().map(|lookup| SstBounds {
+            first_key: lookup.first_key.clone(),
+            last_key: lookup.last_key.clone(),
+        });
         Ok(Self {
             path,
+            bounds,
+            bounds_retained: true,
             lookup,
             lookup_retained: true,
         })
     }
 
-    fn may_contain(&self, key: &[u8]) -> bool {
-        let Some(lookup) = &self.lookup else {
-            return !self.lookup_retained;
+    fn with_bounds(path: PathBuf) -> Result<Self> {
+        let bounds = read_sst_bounds(&path)?;
+        Ok(Self {
+            path,
+            bounds,
+            bounds_retained: true,
+            lookup: None,
+            lookup_retained: false,
+        })
+    }
+
+    fn from_summary(summary: &SstSummary) -> Result<Self> {
+        let entries = u32::try_from(summary.entries).map_err(|_| {
+            CalyxError::aster_corrupt_shard(format!(
+                "new SST {} has {} entries, exceeding the on-disk u32 count",
+                summary.path.display(),
+                summary.entries
+            ))
+        })?;
+        let bounds = match (&summary.first_key, &summary.last_key, entries) {
+            (None, None, 0) => None,
+            (Some(first_key), Some(last_key), count) if count != 0 => Some(SstBounds {
+                first_key: first_key.clone(),
+                last_key: last_key.clone(),
+            }),
+            _ => {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "new SST {} summary has inconsistent entries/bounds: entries={} first_present={} last_present={}",
+                    summary.path.display(),
+                    summary.entries,
+                    summary.first_key.is_some(),
+                    summary.last_key.is_some()
+                )));
+            }
         };
-        key >= lookup.first_key.as_slice()
-            && key <= lookup.last_key.as_slice()
-            && lookup.bloom.may_contain(key)
+        Ok(Self {
+            path: summary.path.clone(),
+            bounds,
+            bounds_retained: true,
+            lookup: None,
+            lookup_retained: false,
+        })
+    }
+
+    fn may_contain(&self, key: &[u8]) -> bool {
+        if let Some(lookup) = &self.lookup {
+            return key >= lookup.first_key.as_slice()
+                && key <= lookup.last_key.as_slice()
+                && lookup.bloom.may_contain(key);
+        }
+        if let Some(bounds) = &self.bounds {
+            return key >= bounds.first_key.as_slice() && key <= bounds.last_key.as_slice();
+        }
+        !self.bounds_retained && !self.lookup_retained
     }
 
     pub(super) fn may_intersect(&self, start: &[u8], end: Option<&[u8]>) -> bool {
         if end.is_some_and(|end| start >= end) {
             return false;
         }
-        let Some(lookup) = &self.lookup else {
-            return !self.lookup_retained;
+        let bounds = self.bounds.as_ref();
+        let Some(bounds) = bounds else {
+            return !self.bounds_retained;
         };
-        lookup.last_key.as_slice() >= start
-            && end.is_none_or(|end| lookup.first_key.as_slice() < end)
+        bounds.last_key.as_slice() >= start
+            && end.is_none_or(|end| bounds.first_key.as_slice() < end)
+    }
+
+    fn predecessor_upper_bound(
+        &self,
+        start: &[u8],
+        upper: &[u8],
+        inclusive: bool,
+    ) -> Option<Vec<u8>> {
+        if (inclusive && start > upper) || (!inclusive && start >= upper) {
+            return None;
+        }
+        let Some(bounds) = &self.bounds else {
+            return (!self.bounds_retained).then(|| upper.to_vec());
+        };
+        if bounds.last_key.as_slice() < start
+            || (inclusive && bounds.first_key.as_slice() > upper)
+            || (!inclusive && bounds.first_key.as_slice() >= upper)
+        {
+            return None;
+        }
+        if bounds.last_key.as_slice() < upper || (inclusive && bounds.last_key.as_slice() == upper)
+        {
+            Some(bounds.last_key.clone())
+        } else {
+            Some(upper.to_vec())
+        }
     }
 
     pub(super) fn open_page_reader(&self) -> Result<Option<SstPageReader<'_>>> {
@@ -121,6 +224,15 @@ impl SstLevel {
             .collect::<Vec<_>>();
         files.reverse();
         Self { files }
+    }
+
+    pub fn from_oldest_first_with_bounds(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
+        let mut files = paths
+            .into_iter()
+            .map(LevelFile::with_bounds)
+            .collect::<Result<Vec<_>>>()?;
+        files.reverse();
+        Ok(Self { files })
     }
 
     pub fn from_oldest_first_with_lookup(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self> {
@@ -198,6 +310,17 @@ impl SstLevel {
     /// insert lets the caller pay it unlocked.
     pub fn prepare_with_lookup(path: PathBuf) -> Result<PreparedLevelFile> {
         Ok(PreparedLevelFile(LevelFile::with_lookup(path)?))
+    }
+
+    /// Prepares a new immutable file according to the router's retained-index
+    /// policy. Non-pageable files reuse the writer's already-known bounds and
+    /// retain no decoded per-row index.
+    pub fn prepare(summary: &SstSummary, retain_lookup: bool) -> Result<PreparedLevelFile> {
+        if retain_lookup {
+            Self::prepare_with_lookup(summary.path.clone())
+        } else {
+            Ok(PreparedLevelFile(LevelFile::from_summary(summary)?))
+        }
     }
 
     /// Inserts an entry prepared by [`Self::prepare_with_lookup`]. Pointer move
@@ -349,8 +472,34 @@ impl SstLevel {
         upper: &[u8],
         inclusive: bool,
     ) -> Result<Option<SstEntry>> {
+        let mut candidates = self
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(source_index, file)| {
+                file.predecessor_upper_bound(start, upper, inclusive)
+                    .map(|upper_bound| PredecessorFileCandidate {
+                        source_index,
+                        upper_bound,
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .upper_bound
+                .cmp(&left.upper_bound)
+                .then_with(|| left.source_index.cmp(&right.source_index))
+        });
         let mut newest_at_greatest_key = None::<(usize, SstEntry)>;
-        for (file_index, file) in self.files.iter().enumerate() {
+        for candidate in candidates {
+            if newest_at_greatest_key
+                .as_ref()
+                .is_some_and(|(_, best)| candidate.upper_bound < best.key)
+            {
+                break;
+            }
+            let file_index = candidate.source_index;
+            let file = &self.files[file_index];
             let Some(entry) = shared_reader(&file.path)?.predecessor(start, upper, inclusive)?
             else {
                 continue;

@@ -267,7 +267,7 @@ impl CfRouter {
         let level = if retain_lookup {
             SstLevel::from_oldest_first_with_lookup(files)?
         } else {
-            SstLevel::from_oldest_first(files)
+            SstLevel::from_oldest_first_with_bounds(files)?
         };
         shard.ensure_cf(&self.config, cf)?;
         shard.levels.insert(cf, level);

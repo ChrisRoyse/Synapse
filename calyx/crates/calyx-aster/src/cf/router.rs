@@ -158,6 +158,7 @@ pub struct SealedFlush {
     path: PathBuf,
     table: Arc<Memtable>,
     value_crypto: Option<SharedVaultContext>,
+    retain_lookup: bool,
 }
 
 impl SealedFlush {
@@ -201,7 +202,7 @@ impl SealedFlush {
             }
             None => self.table.flush_to_sst(&self.path)?,
         };
-        let prepared = SstLevel::prepare_with_lookup(summary.path.clone())?;
+        let prepared = SstLevel::prepare(&summary, self.retain_lookup)?;
         Ok(WrittenFlush { summary, prepared })
     }
 }
@@ -225,6 +226,8 @@ pub(super) struct RouterConfig {
     tiering_policy: Option<TieringPolicy>,
     memtable_byte_cap: usize,
     value_crypto: Option<SharedVaultContext>,
+    eager_lookup_on_open: bool,
+    selected_lookup_is_universal: bool,
 }
 
 /// The per-column-family serving state routed to **one shard**.
@@ -307,6 +310,12 @@ impl RouterConfig {
         let stagger = (cf_name_hash(&cf.name()) as usize) % (MEMTABLE_CAP_STAGGER_PCT + 1);
         let reduction = self.memtable_byte_cap / 100 * stagger;
         self.memtable_byte_cap.saturating_sub(reduction).max(1)
+    }
+
+    pub(super) fn retains_lookup(&self, cf: ColumnFamily) -> bool {
+        cf == ColumnFamily::Kv
+            || (self.eager_lookup_on_open
+                && (self.selected_lookup_is_universal || cf.supports_paged_scan()))
     }
 
     pub(super) fn cf_dir(&self, cf: ColumnFamily) -> PathBuf {
@@ -657,7 +666,14 @@ impl CfRouter {
                 "selected CF router open requires at least one column family",
             ));
         }
-        let router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy, value_crypto)?;
+        let router = Self::new_empty(
+            vault_dir,
+            memtable_byte_cap,
+            tiering_policy,
+            value_crypto,
+            eager_lookup_on_open,
+            true,
+        )?;
         for cf in &selected {
             router.ensure_cf(*cf)?;
         }
@@ -698,7 +714,14 @@ impl CfRouter {
         value_crypto: Option<SharedVaultContext>,
         eager_lookup_on_open: bool,
     ) -> Result<Self> {
-        let router = Self::new_empty(vault_dir, memtable_byte_cap, tiering_policy, value_crypto)?;
+        let router = Self::new_empty(
+            vault_dir,
+            memtable_byte_cap,
+            tiering_policy,
+            value_crypto,
+            eager_lookup_on_open,
+            false,
+        )?;
         for cf in ColumnFamily::STATIC {
             router.ensure_cf(cf)?;
         }
@@ -711,6 +734,8 @@ impl CfRouter {
         memtable_byte_cap: usize,
         tiering_policy: Option<TieringPolicy>,
         value_crypto: Option<SharedVaultContext>,
+        eager_lookup_on_open: bool,
+        selected_lookup_is_universal: bool,
     ) -> Result<Self> {
         let vault_dir = vault_dir.as_ref().to_path_buf();
         let memtable_byte_cap = if memtable_byte_cap == 0 {
@@ -733,6 +758,8 @@ impl CfRouter {
                 tiering_policy,
                 memtable_byte_cap,
                 value_crypto,
+                eager_lookup_on_open,
+                selected_lookup_is_universal,
             }),
             resource_counters: Arc::new(ResourceCounters::default()),
             shards: (0..ColumnFamily::SHARDS)
@@ -1041,6 +1068,7 @@ impl CfRouter {
             path,
             table,
             value_crypto: self.config.value_crypto.clone(),
+            retain_lookup: self.config.retains_lookup(cf),
         })
     }
 
