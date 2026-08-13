@@ -415,7 +415,8 @@ impl SynapseCalyxVault {
         let mut agreement_zero_norm_records = 0usize;
         let mut lens_ids: BTreeSet<SlotId> = BTreeSet::new();
         let mut measured_slot_instances = 0usize;
-        let backend = self.math_runtime.backend()?;
+        let backend_lease = self.math_runtime.backend()?;
+        let backend = &*backend_lease;
         for record in &corpus.records {
             for slot in record.slots.keys() {
                 lens_ids.insert(*slot);
@@ -1048,7 +1049,8 @@ impl SynapseCalyxVault {
         SynapseCalyxError,
     > {
         let knn_k = knn_k.clamp(1, 64);
-        let backend = self.math_runtime.backend()?;
+        let backend_lease = self.math_runtime.backend()?;
+        let backend = &*backend_lease;
         let mut by_slot: BTreeMap<SlotId, Vec<(CxId, &Vec<f32>)>> = BTreeMap::new();
         for record in &corpus.records {
             for (slot, vector) in &record.slots {
@@ -6758,7 +6760,8 @@ impl SynapseCalyxVault {
         for (index, row) in rows.iter().enumerate() {
             by_dim.entry(row.vector.len()).or_default().push(index);
         }
-        let backend = self.math_runtime.backend()?;
+        let backend_lease = self.math_runtime.backend()?;
+        let backend = &*backend_lease;
         for (dim, group) in by_dim {
             if dim == 0 || group.len() < 2 {
                 continue;

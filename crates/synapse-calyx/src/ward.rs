@@ -533,7 +533,8 @@ impl SynapseCalyxVault {
         }
 
         let clock = FixedGuardClock(self.clock_now_ms()?);
-        let backend = self.math_runtime.backend()?;
+        let backend_lease = self.math_runtime.backend()?;
+        let backend = &*backend_lease;
         let scoring_backend = backend.device_info().kind.to_string();
         let mut inputs = Vec::with_capacity(params.slots.len());
         let mut evidence = Vec::with_capacity(params.slots.len());

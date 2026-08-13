@@ -1,4 +1,9 @@
-use std::{fmt, sync::OnceLock};
+use std::{
+    fmt,
+    marker::PhantomData,
+    ops::Deref,
+    sync::{Arc, Condvar, Mutex, MutexGuard},
+};
 
 use calyx_forge::{
     Backend, CUDA_COMPILED, CpuBackend, DeviceInfo, ForgeError, HostGpuReservation,
@@ -199,16 +204,42 @@ pub struct SynapseCalyxMathProbeTopKEntry {
 }
 
 struct InitializedSynapseCalyxMathRuntime {
-    backend: Box<dyn SynapseMathBackend>,
+    backend: Arc<dyn SynapseMathBackend>,
     status: SynapseCalyxMathBackendStatus,
     host_reservation: Option<HostGpuReservation>,
 }
 
 pub struct SynapseCalyxMathRuntime {
+    shared: Arc<MathRuntimeShared>,
+}
+
+struct MathRuntimeShared {
     config: SynapseCalyxTuningConfig,
     cpu_readback: CpuReadback,
-    dormant_status: SynapseCalyxMathBackendStatus,
-    initialized: OnceLock<Result<InitializedSynapseCalyxMathRuntime, SynapseCalyxError>>,
+    release_when_idle: bool,
+    lifecycle: Mutex<MathRuntimeLifecycle>,
+    lifecycle_changed: Condvar,
+}
+
+enum MathRuntimeLifecycle {
+    Dormant(SynapseCalyxMathBackendStatus),
+    Initializing(SynapseCalyxMathBackendStatus),
+    Ready {
+        runtime: Box<InitializedSynapseCalyxMathRuntime>,
+        active_leases: usize,
+    },
+    Releasing(SynapseCalyxMathBackendStatus),
+    Failed {
+        status: SynapseCalyxMathBackendStatus,
+        error: SynapseCalyxError,
+    },
+    Closed(SynapseCalyxMathBackendStatus),
+}
+
+pub struct SynapseCalyxMathLease<'runtime> {
+    shared: Arc<MathRuntimeShared>,
+    backend: Option<Arc<dyn SynapseMathBackend>>,
+    _runtime: PhantomData<&'runtime SynapseCalyxMathRuntime>,
 }
 
 impl fmt::Debug for SynapseCalyxMathRuntime {
@@ -221,97 +252,189 @@ impl fmt::Debug for SynapseCalyxMathRuntime {
 }
 
 impl SynapseCalyxMathRuntime {
-    /// Returns the selected backend, initializing a dormant CUDA runtime on the
-    /// first real math request. Initialization is performed exactly once across
-    /// concurrent callers. Its success or structured failure is retained for
-    /// the vault lifetime; a failed selected GPU is never replaced by CPU.
+    /// Leases the selected backend, activating a dormant CUDA runtime on the
+    /// first concurrent math request and releasing it after the final caller.
+    /// A failed selected GPU or failed release is retained as a hard error and
+    /// is never replaced by CPU.
     ///
     /// # Errors
     ///
-    /// Returns the retained structured CUDA initialization/probe failure.
-    pub fn backend(&self) -> Result<&dyn Backend, SynapseCalyxError> {
-        let initialized = self.initialized.get_or_init(|| {
-            tracing::info!(
-                code = "SYNAPSE_CALYX_MATH_LAZY_INIT_STARTED",
-                requested_backend = self.config.math_backend.as_str(),
-                selected_backend = self.dormant_status.selected_backend.as_str(),
-                device_name = self.dormant_status.device_name.as_str(),
-                "initializing the selected CUDA runtime for its first real math request"
-            );
-            let result = initialize_cuda_runtime(&self.config, self.cpu_readback.clone());
-            match &result {
-                Ok(runtime) => tracing::info!(
-                    code = "SYNAPSE_CALYX_MATH_LAZY_INIT_SUCCEEDED",
-                    selected_backend = runtime.status.selected_backend.as_str(),
-                    device_name = runtime.status.device_name.as_str(),
-                    probe_status = runtime.status.probe.status.as_str(),
-                    "initialized and proved the selected CUDA runtime exactly once"
-                ),
-                Err(error) => tracing::error!(
-                    code = "SYNAPSE_CALYX_MATH_LAZY_INIT_FAILED",
-                    error_code = error.code,
-                    source_code = error.source_code.unwrap_or("none"),
-                    error = %error,
-                    remediation = error.remediation,
-                    "the selected CUDA runtime failed its one-time initialization; retaining the failure and refusing math requests"
-                ),
+    /// Returns the retained structured CUDA initialization/probe/release
+    /// failure, or a lifecycle synchronization failure.
+    pub(crate) fn backend(&self) -> Result<SynapseCalyxMathLease<'_>, SynapseCalyxError> {
+        loop {
+            let mut lifecycle = self.shared.lock_lifecycle()?;
+            match &mut *lifecycle {
+                MathRuntimeLifecycle::Dormant(status) => {
+                    let dormant_status = status.clone();
+                    tracing::info!(
+                        code = "SYNAPSE_CALYX_MATH_LAZY_INIT_STARTED",
+                        requested_backend = self.shared.config.math_backend.as_str(),
+                        selected_backend = dormant_status.selected_backend.as_str(),
+                        device_name = dormant_status.device_name.as_str(),
+                        "activating the selected CUDA runtime for a real math request"
+                    );
+                    *lifecycle = MathRuntimeLifecycle::Initializing(dormant_status.clone());
+                    drop(lifecycle);
+
+                    let result = initialize_cuda_runtime(
+                        &self.shared.config,
+                        self.shared.cpu_readback.clone(),
+                    );
+                    let mut lifecycle = self.shared.lock_lifecycle()?;
+                    match result {
+                        Ok(runtime) => {
+                            tracing::info!(
+                                code = "SYNAPSE_CALYX_MATH_LAZY_INIT_SUCCEEDED",
+                                selected_backend = runtime.status.selected_backend.as_str(),
+                                device_name = runtime.status.device_name.as_str(),
+                                probe_status = runtime.status.probe.status.as_str(),
+                                "activated and proved the selected CUDA runtime"
+                            );
+                            *lifecycle = MathRuntimeLifecycle::Ready {
+                                runtime: Box::new(runtime),
+                                active_leases: 0,
+                            };
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                code = "SYNAPSE_CALYX_MATH_LAZY_INIT_FAILED",
+                                error_code = error.code,
+                                source_code = error.source_code.unwrap_or("none"),
+                                error = %error,
+                                remediation = error.remediation,
+                                "the selected CUDA runtime failed activation; retaining the failure and refusing math requests"
+                            );
+                            *lifecycle = MathRuntimeLifecycle::Failed {
+                                status: failed_math_status(dormant_status, &error),
+                                error,
+                            };
+                        }
+                    }
+                    drop(lifecycle);
+                    self.shared.lifecycle_changed.notify_all();
+                }
+                MathRuntimeLifecycle::Initializing(_) | MathRuntimeLifecycle::Releasing(_) => {
+                    drop(self.shared.wait_for_lifecycle_change(lifecycle)?);
+                }
+                MathRuntimeLifecycle::Ready {
+                    runtime,
+                    active_leases,
+                } => {
+                    *active_leases = active_leases.checked_add(1).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_MATH_LEASE_OVERFLOW",
+                            "the concurrent math lease count overflowed usize",
+                            MATH_BACKEND_REMEDIATION,
+                        )
+                    })?;
+                    return Ok(SynapseCalyxMathLease {
+                        shared: Arc::clone(&self.shared),
+                        backend: Some(Arc::clone(&runtime.backend)),
+                        _runtime: PhantomData,
+                    });
+                }
+                MathRuntimeLifecycle::Failed { error, .. } => return Err(error.clone()),
+                MathRuntimeLifecycle::Closed(_) => {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_MATH_RUNTIME_CLOSED",
+                        "the Calyx math runtime is already closed",
+                        MATH_BACKEND_REMEDIATION,
+                    ));
+                }
             }
-            result
-        });
-        initialized
-            .as_ref()
-            .map(|runtime| runtime.backend.as_ref() as &dyn Backend)
-            .map_err(Clone::clone)
+        }
     }
 
     #[must_use]
     pub fn status_snapshot(&self) -> SynapseCalyxMathBackendStatus {
-        match self.initialized.get() {
-            Some(Ok(runtime)) => runtime.status_snapshot(),
-            Some(Err(error)) => {
-                let mut status = self.dormant_status.clone();
-                status.runtime_readback_code = Some(error.code.to_owned());
-                status.runtime_readback_error = Some(error.to_string());
-                "error".clone_into(&mut status.probe.status);
-                status.probe.detail = format!(
-                    "one-time CUDA initialization failed with {}: {}",
-                    error.code, error.message
+        let lifecycle = match self.shared.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED",
+                    remediation = MATH_BACKEND_REMEDIATION,
+                    "math lifecycle state was poisoned while producing health readback"
                 );
-                status
+                let mut status = poisoned.into_inner().status_snapshot();
+                status.runtime_readback_code =
+                    Some("SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED".to_owned());
+                status.runtime_readback_error = Some(
+                    "math lifecycle state was poisoned; requests fail closed and daemon replacement is required"
+                        .to_owned(),
+                );
+                return status;
             }
-            None => self.dormant_status.clone(),
-        }
+        };
+        lifecycle.status_snapshot()
     }
 
-    /// Drops an initialized CUDA backend/context first, then explicitly removes
-    /// and rereads its host reservation row before shutdown may release the
-    /// vault lifetime lock. A runtime that remained dormant owns neither.
+    /// Closes a CPU runtime or a CUDA runtime that has not already returned to
+    /// dormancy. The lifetime on every lease prevents close while a caller is
+    /// using the backend.
     ///
     /// # Errors
     ///
-    /// Returns a structured Forge-derived error if an initialized runtime's
-    /// persisted reservation cannot be removed, reread, unlocked, or deleted.
+    /// Returns a structured Forge-derived error if a live runtime's persisted
+    /// reservation cannot be removed, reread, unlocked, or deleted.
     pub fn close(self) -> Result<Option<HostGpuReservationSnapshot>, SynapseCalyxError> {
-        match self.initialized.into_inner() {
-            Some(Ok(runtime)) => runtime.close(),
-            Some(Err(error)) => {
-                tracing::warn!(
-                    code = "SYNAPSE_CALYX_MATH_FAILED_RUNTIME_CLOSED",
-                    error_code = error.code,
-                    source_code = error.source_code.unwrap_or("none"),
-                    error = %error,
-                    "closed a vault whose one-time CUDA initialization had failed; no backend or host reservation remained live"
-                );
-                Ok(None)
-            }
-            None => {
-                tracing::info!(
-                    code = "SYNAPSE_CALYX_MATH_DORMANT_RUNTIME_CLOSED",
-                    selected_backend = self.dormant_status.selected_backend.as_str(),
-                    device_name = self.dormant_status.device_name.as_str(),
-                    "closed the dormant CUDA selection without ever creating a context or host reservation"
-                );
-                Ok(None)
+        loop {
+            let mut lifecycle = self.shared.lock_lifecycle()?;
+            match &*lifecycle {
+                MathRuntimeLifecycle::Initializing(_) | MathRuntimeLifecycle::Releasing(_) => {
+                    drop(self.shared.wait_for_lifecycle_change(lifecycle)?);
+                }
+                MathRuntimeLifecycle::Ready { active_leases, .. } if *active_leases != 0 => {
+                    let error = SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_MATH_CLOSE_WITH_ACTIVE_LEASES",
+                        format!(
+                            "refused to close the Calyx math runtime with {active_leases} active lease(s)"
+                        ),
+                        MATH_BACKEND_REMEDIATION,
+                    );
+                    drop(lifecycle);
+                    return Err(error);
+                }
+                MathRuntimeLifecycle::Ready { .. } => {
+                    let prior = std::mem::replace(
+                        &mut *lifecycle,
+                        MathRuntimeLifecycle::Closed(closed_placeholder_status()),
+                    );
+                    let MathRuntimeLifecycle::Ready { runtime, .. } = prior else {
+                        unreachable!("ready lifecycle was matched before replacement");
+                    };
+                    drop(lifecycle);
+                    return (*runtime).close();
+                }
+                MathRuntimeLifecycle::Dormant(status) => {
+                    let status = status.clone();
+                    tracing::info!(
+                        code = "SYNAPSE_CALYX_MATH_DORMANT_RUNTIME_CLOSED",
+                        selected_backend = status.selected_backend.as_str(),
+                        device_name = status.device_name.as_str(),
+                        "closed the dormant CUDA selection without a live context or host reservation"
+                    );
+                    *lifecycle = MathRuntimeLifecycle::Closed(status);
+                    drop(lifecycle);
+                    return Ok(None);
+                }
+                MathRuntimeLifecycle::Failed { status, error } => {
+                    let status = status.clone();
+                    tracing::warn!(
+                        code = "SYNAPSE_CALYX_MATH_FAILED_RUNTIME_CLOSED",
+                        error_code = error.code,
+                        source_code = error.source_code.unwrap_or("none"),
+                        error = %error,
+                        "closed a vault whose CUDA activation or release had failed"
+                    );
+                    *lifecycle = MathRuntimeLifecycle::Closed(status);
+                    drop(lifecycle);
+                    return Ok(None);
+                }
+                MathRuntimeLifecycle::Closed(_) => {
+                    drop(lifecycle);
+                    return Ok(None);
+                }
             }
         }
     }
@@ -322,10 +445,16 @@ impl SynapseCalyxMathRuntime {
         runtime: InitializedSynapseCalyxMathRuntime,
     ) -> Self {
         Self {
-            config: config.clone(),
-            cpu_readback,
-            dormant_status: runtime.status.clone(),
-            initialized: OnceLock::from(Ok(runtime)),
+            shared: Arc::new(MathRuntimeShared {
+                config: config.clone(),
+                cpu_readback,
+                release_when_idle: false,
+                lifecycle: Mutex::new(MathRuntimeLifecycle::Ready {
+                    runtime: Box::new(runtime),
+                    active_leases: 0,
+                }),
+                lifecycle_changed: Condvar::new(),
+            }),
         }
     }
 
@@ -335,11 +464,307 @@ impl SynapseCalyxMathRuntime {
         status: SynapseCalyxMathBackendStatus,
     ) -> Self {
         Self {
-            config: config.clone(),
-            cpu_readback,
-            dormant_status: status,
-            initialized: OnceLock::new(),
+            shared: Arc::new(MathRuntimeShared {
+                config: config.clone(),
+                cpu_readback,
+                release_when_idle: true,
+                lifecycle: Mutex::new(MathRuntimeLifecycle::Dormant(status)),
+                lifecycle_changed: Condvar::new(),
+            }),
         }
+    }
+}
+
+impl MathRuntimeShared {
+    fn lock_lifecycle(&self) -> Result<MutexGuard<'_, MathRuntimeLifecycle>, SynapseCalyxError> {
+        self.lifecycle.lock().map_err(|_| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED",
+                "math lifecycle state was poisoned; refusing to use an unprovable backend state",
+                MATH_BACKEND_REMEDIATION,
+            )
+        })
+    }
+
+    fn wait_for_lifecycle_change<'a>(
+        &self,
+        lifecycle: MutexGuard<'a, MathRuntimeLifecycle>,
+    ) -> Result<MutexGuard<'a, MathRuntimeLifecycle>, SynapseCalyxError> {
+        self.lifecycle_changed.wait(lifecycle).map_err(|_| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED",
+                "math lifecycle state was poisoned while waiting for activation or release",
+                MATH_BACKEND_REMEDIATION,
+            )
+        })
+    }
+}
+
+impl MathRuntimeLifecycle {
+    fn status_snapshot(&self) -> SynapseCalyxMathBackendStatus {
+        match self {
+            Self::Dormant(status) | Self::Failed { status, .. } | Self::Closed(status) => {
+                status.clone()
+            }
+            Self::Initializing(status) => transitional_math_status(
+                status.clone(),
+                "initializing",
+                "a real math caller is activating and proving the selected CUDA runtime",
+            ),
+            Self::Ready { runtime, .. } => runtime.status_snapshot(),
+            Self::Releasing(status) => transitional_math_status(
+                status.clone(),
+                "releasing",
+                "the final math lease is destroying the CUDA context and rereading the host reservation Source of Truth",
+            ),
+        }
+    }
+}
+
+impl Deref for SynapseCalyxMathLease<'_> {
+    type Target = dyn Backend;
+
+    fn deref(&self) -> &Self::Target {
+        self.backend.as_deref().unwrap_or_else(|| {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_MATH_LEASE_BACKEND_MISSING",
+                remediation = MATH_BACKEND_REMEDIATION,
+                "a live math lease lost its backend ownership invariant"
+            );
+            std::process::abort();
+        })
+    }
+}
+
+impl SynapseCalyxMathLease<'_> {
+    fn release(&mut self) {
+        let mut lifecycle = match self.shared.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED",
+                    remediation = MATH_BACKEND_REMEDIATION,
+                    "math lifecycle state was poisoned while dropping a lease; attempting exact resource cleanup before retaining failure"
+                );
+                poisoned.into_inner()
+            }
+        };
+        let poisoned = self.shared.lifecycle.is_poisoned();
+        let mut lifecycle_failure = poisoned.then(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_MATH_LIFECYCLE_POISONED",
+                "CUDA resources were released, but poisoned lifecycle state prevents proving safe reactivation",
+                MATH_BACKEND_REMEDIATION,
+            )
+        });
+        let should_release = match &mut *lifecycle {
+            MathRuntimeLifecycle::Ready { active_leases, .. } if *active_leases > 0 => {
+                *active_leases -= 1;
+                *active_leases == 0 && self.shared.release_when_idle
+            }
+            MathRuntimeLifecycle::Ready { .. } => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LEASE_UNDERFLOW",
+                    remediation = MATH_BACKEND_REMEDIATION,
+                    "math lease dropped while the lifecycle recorded zero active leases"
+                );
+                lifecycle_failure = Some(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_MATH_LEASE_UNDERFLOW",
+                    "a math lease dropped while the lifecycle recorded zero active leases; resources were cleaned and reactivation is refused",
+                    MATH_BACKEND_REMEDIATION,
+                ));
+                self.shared.release_when_idle
+            }
+            _ => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LEASE_STATE_INVALID",
+                    lifecycle = lifecycle.label(),
+                    remediation = MATH_BACKEND_REMEDIATION,
+                    "math lease dropped outside the ready lifecycle"
+                );
+                false
+            }
+        };
+        if !should_release {
+            drop(lifecycle);
+            drop(self.backend.take());
+            return;
+        }
+
+        let prior = std::mem::replace(
+            &mut *lifecycle,
+            MathRuntimeLifecycle::Closed(closed_placeholder_status()),
+        );
+        let MathRuntimeLifecycle::Ready { runtime, .. } = prior else {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_MATH_LEASE_STATE_INVALID",
+                remediation = MATH_BACKEND_REMEDIATION,
+                "the ready CUDA runtime disappeared before final-lease release"
+            );
+            drop(lifecycle);
+            drop(self.backend.take());
+            return;
+        };
+        let live_status = runtime.status_snapshot();
+        *lifecycle = MathRuntimeLifecycle::Releasing(live_status.clone());
+        tracing::info!(
+            code = "SYNAPSE_CALYX_MATH_IDLE_RELEASE_STARTED",
+            selected_backend = live_status.selected_backend.as_str(),
+            device_name = live_status.device_name.as_str(),
+            host_reservation_id = live_status.host_reservation_id.as_deref().unwrap_or("none"),
+            "the final math lease ended; destroying the CUDA runtime before releasing its host reservation"
+        );
+        drop(lifecycle);
+
+        drop(self.backend.take());
+        self.finish_idle_release(runtime, live_status, lifecycle_failure);
+    }
+
+    fn finish_idle_release(
+        &self,
+        runtime: Box<InitializedSynapseCalyxMathRuntime>,
+        live_status: SynapseCalyxMathBackendStatus,
+        lifecycle_failure: Option<SynapseCalyxError>,
+    ) {
+        let release = (*runtime).close();
+        let mut lifecycle = match self.shared.lifecycle.lock() {
+            Ok(lifecycle) => lifecycle,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match (release, lifecycle_failure) {
+            (Ok(snapshot), None) => {
+                let dormant = dormant_status_after_release(live_status);
+                if let Some(snapshot) = snapshot.as_ref() {
+                    tracing::info!(
+                        code = "SYNAPSE_CALYX_MATH_IDLE_RELEASE_SUCCEEDED",
+                        state_path = snapshot.state_path.as_str(),
+                        state_sha256 = snapshot.state_sha256.as_str(),
+                        reserved_mib = snapshot.reserved_mib,
+                        reservation_count = snapshot.reservations.len(),
+                        "destroyed the idle CUDA context and separately read back the host reservation Source of Truth"
+                    );
+                } else {
+                    tracing::info!(
+                        code = "SYNAPSE_CALYX_MATH_IDLE_RELEASE_SUCCEEDED",
+                        "released an idle math runtime that owned no host GPU reservation"
+                    );
+                }
+                *lifecycle = MathRuntimeLifecycle::Dormant(dormant);
+            }
+            (Ok(_), Some(error)) => {
+                tracing::error!(
+                    code = error.code,
+                    error = %error,
+                    remediation = error.remediation,
+                    "released idle CUDA resources but retained a fail-closed lifecycle error"
+                );
+                *lifecycle = MathRuntimeLifecycle::Failed {
+                    status: failed_math_status(live_status, &error),
+                    error,
+                };
+            }
+            (Err(error), _) => {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_IDLE_RELEASE_FAILED",
+                    error_code = error.code,
+                    source_code = error.source_code.unwrap_or("none"),
+                    error = %error,
+                    remediation = error.remediation,
+                    "failed to prove idle CUDA runtime release; retaining a hard math error"
+                );
+                *lifecycle = MathRuntimeLifecycle::Failed {
+                    status: failed_math_status(live_status, &error),
+                    error,
+                };
+            }
+        }
+        drop(lifecycle);
+        self.shared.lifecycle_changed.notify_all();
+    }
+}
+
+impl Drop for SynapseCalyxMathLease<'_> {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+impl MathRuntimeLifecycle {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::Dormant(_) => "dormant",
+            Self::Initializing(_) => "initializing",
+            Self::Ready { .. } => "ready",
+            Self::Releasing(_) => "releasing",
+            Self::Failed { .. } => "failed",
+            Self::Closed(_) => "closed",
+        }
+    }
+}
+
+fn transitional_math_status(
+    mut status: SynapseCalyxMathBackendStatus,
+    state: &str,
+    detail: &str,
+) -> SynapseCalyxMathBackendStatus {
+    state.clone_into(&mut status.probe.status);
+    detail.clone_into(&mut status.probe.detail);
+    status
+}
+
+fn failed_math_status(
+    mut status: SynapseCalyxMathBackendStatus,
+    error: &SynapseCalyxError,
+) -> SynapseCalyxMathBackendStatus {
+    status.runtime_readback_code = Some(error.code.to_owned());
+    status.runtime_readback_error = Some(error.to_string());
+    "error".clone_into(&mut status.probe.status);
+    status.probe.detail = format!("math runtime failed with {}: {}", error.code, error.message);
+    status
+}
+
+fn dormant_status_after_release(
+    mut status: SynapseCalyxMathBackendStatus,
+) -> SynapseCalyxMathBackendStatus {
+    status.vram_dispatch = None;
+    status.host_reservation_basis = None;
+    status.host_reservation_id = None;
+    status.host_reservation = None;
+    status.runtime_readback_code = None;
+    status.runtime_readback_error = None;
+    "dormant_verified".clone_into(&mut status.probe.status);
+    "the selected CUDA backend passed its real operation probe; the final caller then destroyed the context and reread the host reservation Source of Truth, so no CUDA runtime or reservation is live while idle".clone_into(&mut status.probe.detail);
+    status
+}
+
+fn closed_placeholder_status() -> SynapseCalyxMathBackendStatus {
+    SynapseCalyxMathBackendStatus {
+        requested_backend: SynapseCalyxMathBackend::Cpu,
+        selected_backend: "closed".to_owned(),
+        cuda_compiled: CUDA_COMPILED,
+        device_name: "closed".to_owned(),
+        device_vram_mib: None,
+        cpu_simd_path: "closed".to_owned(),
+        vram_budget_bytes: 0,
+        vram_dispatch: None,
+        dispatch_telemetry: None,
+        host_reservation_basis: None,
+        host_reservation_id: None,
+        host_reservation: None,
+        runtime_readback_code: None,
+        runtime_readback_error: None,
+        fallback_code: None,
+        fallback_source_code: None,
+        fallback_error: None,
+        probe: SynapseCalyxMathProbeReport {
+            status: "closed".to_owned(),
+            detail: "the Calyx math runtime is closed and exposes no backend".to_owned(),
+            tolerance: PROBE_TOLERANCE,
+            dot: Vec::new(),
+            cosine: Vec::new(),
+            l2_squared: Vec::new(),
+            topk: Vec::new(),
+        },
     }
 }
 
@@ -1007,7 +1432,7 @@ where
         "selected fail-closed Calyx Forge math backend"
     );
     Ok(InitializedSynapseCalyxMathRuntime {
-        backend: Box::new(backend),
+        backend: Arc::new(backend),
         status,
         host_reservation,
     })
