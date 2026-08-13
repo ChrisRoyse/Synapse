@@ -14125,6 +14125,12 @@ fn run_calyx_gc_budgets_owned(
             &mut tombstones,
         )?);
     }
+    // No phase after retention adjudication consults the derived-source
+    // protection index. Destroy its 1.5M-key corpus before tombstone I/O and
+    // native fan-out compaction can acquire their own bounded working sets.
+    // Keeping it until the outer function returned made independent, bounded
+    // phases overlap and was the remaining >1 GiB GC peak in #2243.
+    drop(referenced);
 
     if !tombstones.is_empty() {
         let tombstone_rows =
@@ -14170,6 +14176,28 @@ fn run_calyx_gc_budgets_owned(
             );
         }
     }
+
+    // `referenced`, every per-CF retention vector, and any committed tombstone
+    // payloads are now dead. Return their allocator pages before compaction;
+    // the compactor must start from the steady-state daemon, not from the prior
+    // phase's dead heap. The executable allocator hook is mandatory and this
+    // operation fails closed if the OS readback or release itself fails.
+    let retention_release = synapse_calyx::release_process_memory("storage_gc_retention_complete")
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "release dead retention-census memory before native fan-out compaction",
+                &source,
+            )
+        })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_GC_RETENTION_MEMORY_RELEASED",
+        private_bytes_before = retention_release.private_bytes_before,
+        private_bytes_after = retention_release.private_bytes_after,
+        private_bytes_reclaimed = retention_release.private_bytes_reclaimed,
+        release_elapsed_us = retention_release.elapsed_us,
+        "released the completed retention phase before native fan-out compaction acquired its working set"
+    );
 
     let native_fanout = vault.compact_native_fanout_once().map_err(|source| {
         calyx_write_failed(
