@@ -426,6 +426,14 @@ impl SstReader {
             .saturating_add(self.bloom.estimated_heap_bytes())
     }
 
+    /// File-backed virtual address span owned by this reader's mmap.
+    ///
+    /// Faulted pages from this span contribute to physical working set even
+    /// though they are not heap allocations, so caches must account for both.
+    pub(crate) fn mapped_bytes(&self) -> usize {
+        self.column.file_len()
+    }
+
     /// Clones the index from an already whole-file-validated reader.
     ///
     /// Unlike [`Self::lookup_metadata`], an empty vector is a valid result for

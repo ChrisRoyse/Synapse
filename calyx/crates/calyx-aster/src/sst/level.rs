@@ -194,7 +194,14 @@ impl LevelFile {
             return Ok(None);
         }
         let Some(lookup) = &self.lookup else {
-            return shared_reader(&self.path)?.get(key);
+            // A cold point read must not populate the mmap/decoded-index cache.
+            // Stream to the candidate and CRC-validate that one record instead.
+            let mut reader = SstPageReader::open_streaming(&self.path)?;
+            reader.seek_lower_bound(key, false)?;
+            if reader.current_key() != Some(key) {
+                return Ok(None);
+            }
+            return reader.read_current().map(|entry| Some(entry.value));
         };
         let Some(offset) = lookup.record_offset(key) else {
             return Ok(None);

@@ -32,26 +32,39 @@ const MAX_CACHED_READERS: usize = 256;
 /// open any valid SST, but an oversized reader is not kept after that call.
 const MAX_CACHED_READER_HEAP_BYTES: usize = 64 * 1024 * 1024;
 
+/// File-backed mmap span retained by the cache.
+///
+/// This is separate from decoded heap because mapped files do not appear in
+/// allocator accounting yet their faulted pages are charged to process working
+/// set. The production cache in #2239 reported only 66 MiB of heap while 50
+/// retained 64 MiB mappings drove physical working set above 4 GiB. A cache is
+/// useful only when it accounts for every resource it retains.
+const MAX_CACHED_READER_MAPPED_BYTES: usize = 64 * 1024 * 1024;
+
 struct Entry {
     reader: Arc<SstReader>,
     len: u64,
     modified: Option<SystemTime>,
     last_used: u64,
     heap_bytes: usize,
+    mapped_bytes: usize,
 }
 
 #[derive(Default)]
 struct ReaderCache {
     entries: HashMap<PathBuf, Entry>,
     retained_heap_bytes: usize,
+    retained_mapped_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SstReaderCacheStatus {
     pub entries: usize,
     pub estimated_heap_bytes: usize,
+    pub mapped_bytes: usize,
     pub max_entries: usize,
     pub max_estimated_heap_bytes: usize,
+    pub max_mapped_bytes: usize,
 }
 
 fn cache() -> &'static Mutex<ReaderCache> {
@@ -101,8 +114,10 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
     // because SST files are immutable.
     let reader = Arc::new(SstReader::open(&key)?);
     let heap_bytes = reader.estimated_heap_bytes();
+    let mapped_bytes = reader.mapped_bytes();
     let mut cache = lock();
-    if heap_bytes <= MAX_CACHED_READER_HEAP_BYTES {
+    if heap_bytes <= MAX_CACHED_READER_HEAP_BYTES && mapped_bytes <= MAX_CACHED_READER_MAPPED_BYTES
+    {
         let prior = cache.entries.insert(
             key,
             Entry {
@@ -111,12 +126,14 @@ pub fn shared_reader(path: &Path) -> Result<Arc<SstReader>> {
                 modified,
                 last_used: next_tick(),
                 heap_bytes,
+                mapped_bytes,
             },
         );
         if let Some(prior) = prior {
-            subtract_retained_heap(&mut cache, prior.heap_bytes);
+            subtract_retained_bytes(&mut cache, prior.heap_bytes, prior.mapped_bytes);
         }
         cache.retained_heap_bytes = cache.retained_heap_bytes.saturating_add(heap_bytes);
+        cache.retained_mapped_bytes = cache.retained_mapped_bytes.saturating_add(mapped_bytes);
     }
     evict_over_cap(&mut cache);
     Ok(reader)
@@ -151,29 +168,34 @@ pub fn reader_cache_status() -> SstReaderCacheStatus {
     SstReaderCacheStatus {
         entries: cache.entries.len(),
         estimated_heap_bytes: cache.retained_heap_bytes,
+        mapped_bytes: cache.retained_mapped_bytes,
         max_entries: MAX_CACHED_READERS,
         max_estimated_heap_bytes: MAX_CACHED_READER_HEAP_BYTES,
+        max_mapped_bytes: MAX_CACHED_READER_MAPPED_BYTES,
     }
 }
 
 fn remove_entry(cache: &mut ReaderCache, key: &Path) {
     if let Some(entry) = cache.entries.remove(key) {
-        subtract_retained_heap(cache, entry.heap_bytes);
+        subtract_retained_bytes(cache, entry.heap_bytes, entry.mapped_bytes);
     }
 }
 
-fn subtract_retained_heap(cache: &mut ReaderCache, removing: usize) {
+fn subtract_retained_bytes(cache: &mut ReaderCache, heap_bytes: usize, mapped_bytes: usize) {
     assert!(
-        cache.retained_heap_bytes >= removing,
-        "CALYX_ASTER_SST_READER_CACHE_ACCOUNTING_UNDERFLOW retained_heap_bytes={} removing_heap_bytes={removing}",
-        cache.retained_heap_bytes
+        cache.retained_heap_bytes >= heap_bytes && cache.retained_mapped_bytes >= mapped_bytes,
+        "CALYX_ASTER_SST_READER_CACHE_ACCOUNTING_UNDERFLOW retained_heap_bytes={} removing_heap_bytes={heap_bytes} retained_mapped_bytes={} removing_mapped_bytes={mapped_bytes}",
+        cache.retained_heap_bytes,
+        cache.retained_mapped_bytes
     );
-    cache.retained_heap_bytes -= removing;
+    cache.retained_heap_bytes -= heap_bytes;
+    cache.retained_mapped_bytes -= mapped_bytes;
 }
 
 fn evict_over_cap(cache: &mut ReaderCache) {
     while cache.entries.len() > MAX_CACHED_READERS
         || cache.retained_heap_bytes > MAX_CACHED_READER_HEAP_BYTES
+        || cache.retained_mapped_bytes > MAX_CACHED_READER_MAPPED_BYTES
     {
         let victim = cache
             .entries

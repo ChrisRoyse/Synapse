@@ -553,9 +553,13 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_sst_reader_cache_estimated_heap_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_sst_reader_cache_mapped_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_sst_reader_cache_max_entries: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_sst_reader_cache_max_estimated_heap_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_sst_reader_cache_max_mapped_bytes: Option<u64>,
     /// #1883: every configurable Calyx tuning knob, each reported WITH whether
     /// anything actually reads it. The nine `calyx_*` knobs that used to be
     /// printed here as bare numbers were validated, lowered and echoed, and read

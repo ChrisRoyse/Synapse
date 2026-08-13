@@ -27,7 +27,10 @@ impl SstStreamingReader {
     /// remains for compaction, whose one-pass input open is the boundary.
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
-        let index = super::shared_reader(path)?.validated_index();
+        // Compaction owns this decoded index for the duration of its stream.
+        // Caching the source reader retained a second index plus the complete
+        // mmap after this clone, long after compaction stopped reading it.
+        let index = super::SstReader::open(path)?.validated_index();
         let path = path.to_path_buf();
         let point_reader = SstPointReader::open(&path)?;
         Ok(Self {

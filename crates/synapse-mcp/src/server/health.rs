@@ -1559,7 +1559,7 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} open_mode={} restore_mvcc_rows={:?} eager_router_lookup_on_open={:?} mvcc_resident_keys={:?} mvcc_resident_versions={:?} mvcc_resident_payload_bytes={:?} memtable_used_bytes={:?} memtable_cap_bytes={:?} memtable_high_water_bytes={:?} sst_reader_cache_entries={:?} sst_reader_cache_estimated_heap_bytes={:?} sst_reader_cache_max_entries={:?} sst_reader_cache_max_estimated_heap_bytes={:?} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
+                "enabled={} phase={} open={} open_mode={} restore_mvcc_rows={:?} eager_router_lookup_on_open={:?} mvcc_resident_keys={:?} mvcc_resident_versions={:?} mvcc_resident_payload_bytes={:?} memtable_used_bytes={:?} memtable_cap_bytes={:?} memtable_high_water_bytes={:?} sst_reader_cache_entries={:?} sst_reader_cache_estimated_heap_bytes={:?} sst_reader_cache_mapped_bytes={:?} sst_reader_cache_max_entries={:?} sst_reader_cache_max_estimated_heap_bytes={:?} sst_reader_cache_max_mapped_bytes={:?} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
@@ -1574,8 +1574,10 @@ impl SynapseService {
                 status.memtable_high_water_bytes,
                 status.sst_reader_cache_entries,
                 status.sst_reader_cache_estimated_heap_bytes,
+                status.sst_reader_cache_mapped_bytes,
                 status.sst_reader_cache_max_entries,
                 status.sst_reader_cache_max_estimated_heap_bytes,
+                status.sst_reader_cache_max_mapped_bytes,
                 status
                     .vault_dir
                     .as_ref()
@@ -1635,9 +1637,11 @@ impl SynapseService {
             calyx_sst_reader_cache_entries: status.sst_reader_cache_entries,
             calyx_sst_reader_cache_estimated_heap_bytes: status
                 .sst_reader_cache_estimated_heap_bytes,
+            calyx_sst_reader_cache_mapped_bytes: status.sst_reader_cache_mapped_bytes,
             calyx_sst_reader_cache_max_entries: status.sst_reader_cache_max_entries,
             calyx_sst_reader_cache_max_estimated_heap_bytes: status
                 .sst_reader_cache_max_estimated_heap_bytes,
+            calyx_sst_reader_cache_max_mapped_bytes: status.sst_reader_cache_max_mapped_bytes,
             calyx_tuning_knobs: tuning_knobs,
             calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
             calyx_row_guard_sites: row_guard_sites,
