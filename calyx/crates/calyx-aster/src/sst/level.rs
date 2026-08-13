@@ -185,14 +185,7 @@ impl LevelFile {
         match (&self.lookup, self.lookup_retained) {
             (Some(lookup), _) => SstPageReader::open(&self.path, lookup).map(Some),
             (None, true) => Ok(None),
-            (None, false) => Err(calyx_core::CalyxError {
-                code: "CALYX_ASTER_SST_PAGE_INDEX_MISSING",
-                message: format!(
-                    "candidate-bounded SST paging requires a retained validated lookup index for {}",
-                    self.path.display()
-                ),
-                remediation: "reopen the vault with the required paged-CF lookup policy; do not fall back to a whole-file scan",
-            }),
+            (None, false) => SstPageReader::open_streaming(&self.path).map(Some),
         }
     }
 

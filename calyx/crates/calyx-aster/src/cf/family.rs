@@ -285,41 +285,23 @@ impl ColumnFamily {
         matches!(self, Self::Slot { .. })
     }
 
-    /// Whether candidate-bounded SST paging is supported for this family
-    /// (#1973).
+    /// Whether full opens retain this family's decoded SST lookup indexes.
     ///
-    /// **This is the single declaration of that fact.** Paging an SST needs a
-    /// retained, validated key/offset lookup index, and retaining one costs
-    /// open time proportional to the family's SST footprint. So which families
-    /// may be paged and which families retain a lookup are the *same question*,
-    /// and they must be answered in one place.
-    ///
-    /// They were not. `should_build_eager_lookup_on_open` retained a lookup for
-    /// `Kv`, `Base` and the slot CFs, while `scan_cf_range_page_latest` accepted
-    /// any family — so the paging API's contract silently held for three
-    /// families and failed closed on the rest with
-    /// `CALYX_ASTER_SST_PAGE_INDEX_MISSING`. #1968 bounded walks over `Base`
-    /// only and never met it; the moment #1973 bounded the `XTerm` and `Graph`
-    /// readbacks, the abundance report broke on a 1.8 MB column family.
+    /// This is a latency policy, never a capability declaration. Every column
+    /// family can page through the allocation-constant on-disk cursor. Retaining
+    /// decoded indexes only avoids sequential index traversal for the hottest
+    /// paged families, at a resident-memory and startup cost proportional to
+    /// their complete immutable footprint.
     ///
     /// The set is deliberately not "every family". That was measured on a real
     /// 1.25 GB vault and rejected: retaining every lookup took vault open from
-    /// **5.0 s to 36.6 s**, and the cost sat almost entirely in large families
-    /// that nothing pages (`scalars` 111 MB, `ledger` 68 MB, `time_index`
-    /// 17 MB, `raw_commitment` 15 MB). Paying 31 s of startup to make those
-    /// pageable would buy nothing.
-    ///
-    /// # Adding a family
-    ///
-    /// If a bounded walk needs a family that is not here, add it here — the
-    /// retention policy reads this predicate, so one edit does both. The paged
-    /// read path names this method in its refusal, so the error points at the
-    /// declaration to change rather than at an SST path.
-    pub const fn supports_paged_scan(&self) -> bool {
+    /// 5.0 s to 36.6 s and later grew into the multi-gigabyte resident set in
+    /// #2239. Large cold families must remain pageable without being retained.
+    pub const fn retains_eager_lookup(&self) -> bool {
         matches!(
             self,
-            // The shared Synapse KV namespace: paging is a hard contract here
-            // and is retained even when eager lookup is off.
+            // The shared Synapse KV namespace is retained unconditionally by
+            // RouterConfig; naming it here keeps the hot-family policy total.
             Self::Kv
             // Every constellation write lands in Base, and the slot CFs are the
             // high-volume point-read surfaces (#1968).

@@ -95,14 +95,8 @@ struct PageCursor<'a> {
 }
 
 enum PageSource<'a> {
-    Overlay {
-        rows: Vec<SstEntry>,
-        pos: usize,
-    },
-    Sst {
-        reader: SstPageReader<'a>,
-        pos: usize,
-    },
+    Overlay { rows: Vec<SstEntry>, pos: usize },
+    Sst { reader: SstPageReader<'a> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,7 +124,7 @@ impl PageSource<'_> {
     fn current_key(&self, end: Option<&[u8]>) -> Option<&[u8]> {
         let key = match self {
             Self::Overlay { rows, pos } => rows.get(*pos).map(|row| row.key.as_slice()),
-            Self::Sst { reader, pos } => reader.key_at(*pos),
+            Self::Sst { reader } => reader.current_key(),
         }?;
         if end.is_some_and(|end| key >= end) {
             None
@@ -142,25 +136,19 @@ impl PageSource<'_> {
     fn read_current(&mut self) -> Result<SstEntry> {
         match self {
             Self::Overlay { rows, pos } => Ok(rows[*pos].clone()),
-            Self::Sst { reader, pos } => reader.entry_at(*pos),
+            Self::Sst { reader } => reader.read_current(),
         }
     }
 
-    fn advance_past(&mut self, key: &[u8]) {
+    fn advance_past(&mut self, key: &[u8]) -> Result<()> {
         match self {
             Self::Overlay { rows, pos } => {
                 while rows.get(*pos).is_some_and(|row| row.key.as_slice() == key) {
                     *pos += 1;
                 }
+                Ok(())
             }
-            Self::Sst { reader, pos } => {
-                while reader
-                    .key_at(*pos)
-                    .is_some_and(|candidate| candidate == key)
-                {
-                    *pos += 1;
-                }
-            }
+            Self::Sst { reader } => reader.advance_past(key),
         }
     }
 }
@@ -210,18 +198,18 @@ fn open_page_cursor<'a>(
         .par_iter()
         .filter(|file| file.may_intersect(lower, end))
         .map(|file| {
-            let Some(reader) = file.open_page_reader()? else {
+            let Some(mut reader) = file.open_page_reader()? else {
                 return Ok(None);
             };
-            let mut pos = reader.lower_bound(lower, exclusive);
-            while reader.key_at(pos).is_some_and(|key| key < start) {
-                pos += 1;
+            reader.seek_lower_bound(lower, exclusive)?;
+            while reader.current_key().is_some_and(|key| key < start) {
+                reader.advance_one()?;
             }
             if reader
-                .key_at(pos)
+                .current_key()
                 .is_some_and(|key| end.is_none_or(|end| key < end))
             {
-                Ok(Some(PageSource::Sst { reader, pos }))
+                Ok(Some(PageSource::Sst { reader }))
             } else {
                 Ok(None)
             }
@@ -285,7 +273,7 @@ fn next_latest_entry(cursor: &mut PageCursor<'_>) -> Result<Option<SstEntry>> {
         );
     }
     for source in duplicate_sources {
-        cursor.sources[source].advance_past(&next_key);
+        cursor.sources[source].advance_past(&next_key)?;
         cursor.push_current(source);
     }
     Ok(Some(entry))

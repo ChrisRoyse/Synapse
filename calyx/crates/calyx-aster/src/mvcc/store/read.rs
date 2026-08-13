@@ -98,26 +98,6 @@ impl VersionedCfStore {
         limit: usize,
     ) -> Result<LatestCfRangePage> {
         validate_latest_page_request(range, after_key, limit)?;
-        // Refuse up front, naming the declaration (#1973).
-        //
-        // Without this the request proceeds to the SST layer and fails with
-        // `CALYX_ASTER_SST_PAGE_INDEX_MISSING` naming a *file path*, which
-        // describes a symptom: the caller learns some SST lacks an index, not
-        // that this whole family was never declared pageable. That refusal also
-        // only fires once a family has SSTs on disk, so paging a
-        // not-yet-flushed family appears to work and starts failing later —
-        // which is precisely how a bounded readback over `XTerm` reached
-        // production before anyone noticed.
-        if !cf.supports_paged_scan() {
-            return Err(CalyxError {
-                code: "CALYX_ASTER_CF_NOT_PAGEABLE",
-                message: format!(
-                    "candidate-bounded paging was requested for {}, which is not declared pageable; only families for which a validated SST lookup index is retained at open can be paged",
-                    cf.name()
-                ),
-                remediation: "add this family to ColumnFamily::supports_paged_scan (which the open-time lookup-retention policy reads), or use an unpaged scan; do not fall back to a whole-file scan",
-            });
-        }
         if limit == 0 {
             return Ok(LatestCfRangePage {
                 snapshot_seq: self.current_seq(),

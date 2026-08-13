@@ -936,10 +936,9 @@ where
     /// (issue #1969).
     ///
     /// Without this, such a read resolves to zero rows, which a caller cannot
-    /// distinguish from an empty family. The paging path already gets this right
-    /// — it fails closed with `CALYX_ASTER_SST_PAGE_INDEX_MISSING` naming the
-    /// file rather than answering zero — and this is the same discipline applied
-    /// to the family selection itself.
+    /// distinguish from an empty family. Paging now works for every selected
+    /// family regardless of lookup-retention policy, so this selection check is
+    /// the one authoritative refusal boundary.
     ///
     /// Costs one `BTreeSet` lookup, and only on handles that were opened
     /// partially: a fully-opened vault holds `None` here and returns

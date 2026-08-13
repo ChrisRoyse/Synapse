@@ -315,7 +315,7 @@ impl RouterConfig {
     pub(super) fn retains_lookup(&self, cf: ColumnFamily) -> bool {
         cf == ColumnFamily::Kv
             || (self.eager_lookup_on_open
-                && (self.selected_lookup_is_universal || cf.supports_paged_scan()))
+                && (self.selected_lookup_is_universal || cf.retains_eager_lookup()))
     }
 
     pub(super) fn cf_dir(&self, cf: ColumnFamily) -> PathBuf {

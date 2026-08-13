@@ -40,18 +40,9 @@ where
     C: Clock,
 {
     let mut targets = EraseTargets::default();
-    // Every static family, including the ones `supports_paged_scan` refuses.
-    //
-    // #1977 asked whether this loop could be migrated at all, because
-    // `Scalars`, `TimeIndex` and `RawCommitment` are deliberately *not*
-    // declared pageable — retaining their lookup indexes at open costs 31 s of
-    // vault-open time to buy paging nothing uses (#1976). It can, and without
-    // reopening that trade: `scan_cf_pages_at` pins a snapshot and pages
-    // through `scan_cf_range_page_at` / `read_batch`, neither of which needs an
-    // SST lookup index. The `supports_paged_scan` declaration gates
-    // `scan_cf_range_page_latest` — the *latest*-view candidate pager — not
-    // this one. So the loop is bounded per family with no per-family split and
-    // no change to the open-time policy.
+    // Every static family through the pinned, bounded physical pager. Paging is
+    // independent of decoded-index retention, so cold families such as
+    // Scalars, TimeIndex and RawCommitment need no special unbounded path.
     for cf in ColumnFamily::STATIC {
         if cf == ColumnFamily::Ledger {
             continue;

@@ -1,12 +1,13 @@
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use calyx_core::{CalyxError, Result};
 
 use super::{
-    HEADER_LEN, IndexEntry, LEGACY_VERSION, MAGIC, RECORD_HEADER_LEN, SstEntry, SstLookupMetadata,
-    VERSION, record_crc,
+    HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, LEGACY_VERSION, MAGIC, MAX_RANGE_SCAN_BYTES,
+    RECORD_HEADER_LEN, SstEntry, SstLookupMetadata, VERSION, clone_scan_bytes,
+    materialized_entry_bytes, record_crc, scan_reserve_failed,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -56,55 +57,337 @@ impl SstStreamingReader {
     }
 }
 
-/// Candidate-page reader borrowing a retained, whole-file-validated lookup.
+/// Candidate-page reader over either a retained lookup or the immutable on-disk
+/// index.
 ///
-/// Opening performs only bounded header/file-handle work. It never clones the
-/// full index and never rechecks the full SST body.
+/// Cold files stream their variable-length index through a bounded buffered file
+/// reader: the cursor retains one current key, never a `Vec` per key or a mapping
+/// of the complete SST. This keeps paging available for every column family
+/// without recreating the multi-gigabyte decoded-index resident set from #2239
+/// or charging faulted cold pages to the daemon's working set. Each index entry
+/// is checked against the CRC-validated record it selects before that row can be
+/// served. Validation is deliberately incremental: checksumming every byte in
+/// every intersecting 64 MiB SST at cursor open faults the complete cold corpus
+/// into memory before a row is requested.
 #[derive(Debug)]
-pub(crate) struct SstPageReader<'a> {
-    path: &'a Path,
-    lookup: &'a SstLookupMetadata,
-    point_reader: SstPointReader,
+pub(crate) enum SstPageReader<'a> {
+    Retained {
+        path: &'a Path,
+        lookup: &'a SstLookupMetadata,
+        point_reader: SstPointReader,
+        position: usize,
+    },
+    Streaming(DiskIndexCursor),
 }
 
 impl<'a> SstPageReader<'a> {
     pub(crate) fn open(path: &'a Path, lookup: &'a SstLookupMetadata) -> Result<Self> {
-        Ok(Self {
+        Ok(Self::Retained {
             path,
             lookup,
             point_reader: SstPointReader::open(path)?,
+            position: 0,
         })
     }
 
-    pub(crate) fn lower_bound(&self, key: &[u8], exclusive: bool) -> usize {
-        self.lookup.lower_bound(key, exclusive)
+    pub(crate) fn open_streaming(path: &Path) -> Result<SstPageReader<'static>> {
+        DiskIndexCursor::open(path).map(SstPageReader::Streaming)
     }
 
-    pub(crate) fn key_at(&self, position: usize) -> Option<&[u8]> {
-        self.lookup.key_at(position)
+    pub(crate) fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
+        match self {
+            Self::Retained {
+                lookup, position, ..
+            } => {
+                *position = lookup.lower_bound(key, exclusive);
+                Ok(())
+            }
+            Self::Streaming(reader) => reader.seek_lower_bound(key, exclusive),
+        }
     }
 
-    pub(crate) fn entry_at(&mut self, position: usize) -> Result<SstEntry> {
-        let (key, offset) = self.lookup.entry_at(position).ok_or_else(|| {
+    pub(crate) fn current_key(&self) -> Option<&[u8]> {
+        match self {
+            Self::Retained {
+                lookup, position, ..
+            } => lookup.key_at(*position),
+            Self::Streaming(reader) => reader.current_key(),
+        }
+    }
+
+    pub(crate) fn read_current(&mut self) -> Result<SstEntry> {
+        match self {
+            Self::Retained {
+                path,
+                lookup,
+                point_reader,
+                position,
+            } => {
+                let (key, offset) = lookup.entry_at(*position).ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "SST page row position {position} is outside retained index length {} in {}",
+                        lookup.len(),
+                        path.display()
+                    ))
+                })?;
+                let value = point_reader.read_value(offset, key)?;
+                Ok(SstEntry {
+                    key: key.to_vec(),
+                    value,
+                })
+            }
+            Self::Streaming(reader) => reader.read_current(),
+        }
+    }
+
+    pub(crate) fn advance_one(&mut self) -> Result<()> {
+        match self {
+            Self::Retained { position, .. } => {
+                *position = position.saturating_add(1);
+                Ok(())
+            }
+            Self::Streaming(reader) => reader.advance_one(),
+        }
+    }
+
+    pub(crate) fn advance_past(&mut self, key: &[u8]) -> Result<()> {
+        while self.current_key().is_some_and(|candidate| candidate == key) {
+            self.advance_one()?;
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DiskIndexEntry {
+    key: Vec<u8>,
+    record_offset: u64,
+}
+
+/// Allocation-constant cursor over the variable-length on-disk SST index.
+#[derive(Debug)]
+pub(crate) struct DiskIndexCursor {
+    index_reader: BufReader<File>,
+    point_reader: SstPointReader,
+    path: PathBuf,
+    data_end: u64,
+    index_end: u64,
+    entries: usize,
+    ordinal: usize,
+    next_index_offset: u64,
+    current: Option<DiskIndexEntry>,
+}
+
+impl DiskIndexCursor {
+    fn open(path: &Path) -> Result<Self> {
+        let result = (|| {
+            let point_reader = SstPointReader::open(path)?;
+            let data_end = point_reader.data_end;
+            let index_end = point_reader.index_end;
+            let entries = point_reader.entries;
+            let mut index_file = OpenOptions::new()
+                .read(true)
+                .open(path)
+                .map_err(|error| storage_error("open SST streaming index", path, error))?;
+            #[cfg(target_os = "linux")]
+            {
+                use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
+
+                posix_fadvise(
+                    &index_file,
+                    data_end as i64,
+                    index_end.saturating_sub(data_end) as i64,
+                    PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+                )
+                .map_err(|error| {
+                    storage_error(
+                        "declare sequential SST index access",
+                        path,
+                        io::Error::from(error),
+                    )
+                })?;
+                posix_fadvise(
+                    &index_file,
+                    data_end as i64,
+                    index_end.saturating_sub(data_end) as i64,
+                    PosixFadviseAdvice::POSIX_FADV_NOREUSE,
+                )
+                .map_err(|error| {
+                    storage_error(
+                        "declare one-pass SST index access",
+                        path,
+                        io::Error::from(error),
+                    )
+                })?;
+            }
+            index_file
+                .seek(SeekFrom::Start(data_end))
+                .map_err(|error| storage_error("seek SST streaming index", path, error))?;
+            let mut cursor = Self {
+                index_reader: BufReader::with_capacity(STREAMING_INDEX_BUFFER_BYTES, index_file),
+                point_reader,
+                path: path.to_path_buf(),
+                data_end,
+                index_end,
+                entries,
+                ordinal: 0,
+                next_index_offset: data_end,
+                current: None,
+            };
+            if entries == 0 {
+                if data_end != index_end {
+                    return Err(CalyxError::aster_corrupt_shard(
+                        "empty SST index has non-empty bytes",
+                    ));
+                }
+            } else {
+                cursor.current = Some(cursor.parse_next_entry(0)?);
+            }
+            Ok(cursor)
+        })();
+        result.map_err(|mut error| {
+            error.message = format!(
+                "open streaming SST page index {}: {}",
+                path.display(),
+                error.message
+            );
+            error
+        })
+    }
+
+    fn parse_next_entry(&mut self, ordinal: usize) -> Result<DiskIndexEntry> {
+        let offset = self.next_index_offset;
+        let fixed_end = offset
+            .checked_add(INDEX_ENTRY_FIXED_LEN as u64)
+            .ok_or_else(|| {
+                CalyxError::aster_corrupt_shard("SST streaming index fixed offset overflow")
+            })?;
+        if fixed_end > self.index_end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST streaming index entry {ordinal} at {offset} is out of bounds"
+            )));
+        }
+        let mut fixed = [0_u8; INDEX_ENTRY_FIXED_LEN];
+        read_exact_indexed(&mut self.index_reader, &mut fixed, &self.path, offset)?;
+        let key_len = u32::from_le_bytes(fixed[0..4].try_into().expect("index key len")) as usize;
+        let record_offset = u64::from_le_bytes(fixed[4..12].try_into().expect("record offset"));
+        let key_len_u64 = u64::try_from(key_len)
+            .map_err(|_| CalyxError::aster_corrupt_shard("SST index key length exceeds u64"))?;
+        let key_end = fixed_end.checked_add(key_len_u64).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard("SST streaming index key offset overflow")
+        })?;
+        if key_end > self.index_end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST streaming index key {ordinal} ending at {key_end} is out of bounds"
+            )));
+        }
+        let mut key = try_zeroed(key_len)?;
+        read_exact_indexed(&mut self.index_reader, &mut key, &self.path, fixed_end)?;
+        if record_offset < HEADER_LEN as u64 || record_offset >= self.data_end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST streaming index record offset {record_offset} is outside the data section {}..{}",
+                HEADER_LEN, self.data_end
+            )));
+        }
+        if ordinal + 1 == self.entries && key_end != self.index_end {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST streaming index length mismatch after final entry {ordinal}: next_offset={key_end} index_end={}",
+                self.index_end
+            )));
+        }
+        self.next_index_offset = key_end;
+        Ok(DiskIndexEntry { key, record_offset })
+    }
+
+    fn current_key(&self) -> Option<&[u8]> {
+        self.current.as_ref().map(|current| current.key.as_slice())
+    }
+
+    fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
+        while self.current_key().is_some_and(|candidate| {
+            if exclusive {
+                candidate <= key
+            } else {
+                candidate < key
+            }
+        }) {
+            self.advance_one()?;
+        }
+        Ok(())
+    }
+
+    fn read_current(&mut self) -> Result<SstEntry> {
+        let current = self.current.as_ref().ok_or_else(|| {
             CalyxError::aster_corrupt_shard(format!(
-                "SST page row position {position} is outside retained index length {} in {}",
-                self.lookup.len(),
+                "SST streaming page cursor is exhausted in {}",
                 self.path.display()
             ))
         })?;
-        let value = self.point_reader.read_value(offset, key)?;
+        let indexed_key = current.key.as_slice();
+        let value = self
+            .point_reader
+            .read_value(current.record_offset, indexed_key)?;
+        let row_bytes = materialized_entry_bytes::<SstEntry>(indexed_key, &value);
+        if row_bytes > MAX_RANGE_SCAN_BYTES {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+                message: format!(
+                    "SST streaming page row at ordinal {} in {} requires {row_bytes} bytes, above the {MAX_RANGE_SCAN_BYTES}-byte materialization budget",
+                    self.ordinal,
+                    self.path.display()
+                ),
+                remediation: "repair or split the oversized immutable row; paging refuses an allocation that can abort the daemon",
+            });
+        }
         Ok(SstEntry {
-            key: key.to_vec(),
+            key: clone_scan_bytes(indexed_key)?,
             value,
         })
     }
+
+    fn advance_one(&mut self) -> Result<()> {
+        let Some(current) = self.current.take() else {
+            return Ok(());
+        };
+        let next_ordinal = self.ordinal.saturating_add(1);
+        if next_ordinal >= self.entries {
+            if self.next_index_offset != self.index_end {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "SST streaming index ended at {} instead of {} in {}",
+                    self.next_index_offset,
+                    self.index_end,
+                    self.path.display()
+                )));
+            }
+            self.ordinal = self.entries;
+            self.current = None;
+            return Ok(());
+        }
+        let next = self.parse_next_entry(next_ordinal)?;
+        if current.key >= next.key {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST streaming index keys are not strictly sorted at ordinals {} and {next_ordinal} in {}",
+                self.ordinal,
+                self.path.display()
+            )));
+        }
+        self.ordinal = next_ordinal;
+        self.current = Some(next);
+        Ok(())
+    }
 }
+
+/// Buffer retained by each cold SST cursor. Even at the hard 512-source fan-in
+/// ceiling this accounts for at most 8 MiB of index buffers per page operation.
+const STREAMING_INDEX_BUFFER_BYTES: usize = 16 * 1_024;
 
 #[derive(Debug)]
 pub(crate) struct SstPointReader {
     file: File,
     path: PathBuf,
     data_end: u64,
+    index_end: u64,
+    entries: usize,
 }
 
 impl SstPointReader {
@@ -154,6 +437,10 @@ impl SstPointReader {
                 path.display()
             )));
         }
+        let entries = usize::try_from(u32::from_le_bytes(
+            header[8..12].try_into().expect("entries"),
+        ))
+        .map_err(|_| CalyxError::aster_corrupt_shard("SST entry count exceeds usize"))?;
         let index_offset = u64::from_le_bytes(header[12..20].try_into().expect("index offset"));
         let bloom_offset = u64::from_le_bytes(header[20..28].try_into().expect("bloom offset"));
         if index_offset < HEADER_LEN as u64
@@ -170,6 +457,8 @@ impl SstPointReader {
             file,
             path: path.to_path_buf(),
             data_end: index_offset,
+            index_end: bloom_offset,
+            entries,
         })
     }
 
@@ -212,7 +501,27 @@ impl SstPointReader {
                 self.path.display()
             )));
         }
-        let mut key = vec![0_u8; key_len];
+        if key_len != expected_key.len() {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "SST indexed record at {}:{record_offset} declares a {key_len}-byte key but its index key is {} bytes",
+                self.path.display(),
+                expected_key.len()
+            )));
+        }
+        let row_bytes = std::mem::size_of::<SstEntry>()
+            .saturating_add(key_len)
+            .saturating_add(value_len);
+        if row_bytes > MAX_RANGE_SCAN_BYTES {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
+                message: format!(
+                    "SST indexed record at {}:{record_offset} requires {row_bytes} bytes, above the {MAX_RANGE_SCAN_BYTES}-byte materialization budget",
+                    self.path.display()
+                ),
+                remediation: "repair or split the oversized immutable row; indexed reads refuse an allocation that can abort the daemon",
+            });
+        }
+        let mut key = try_zeroed(key_len)?;
         read_exact_indexed(&mut self.file, &mut key, &self.path, key_start)?;
         if key != expected_key {
             return Err(CalyxError::aster_corrupt_shard(format!(
@@ -222,7 +531,7 @@ impl SstPointReader {
                 hex_bytes(expected_key)
             )));
         }
-        let mut value = vec![0_u8; value_len];
+        let mut value = try_zeroed(value_len)?;
         read_exact_indexed(&mut self.file, &mut value, &self.path, value_start)?;
         let actual_crc = record_crc(&key, &value);
         if actual_crc != expected_crc {
@@ -235,8 +544,20 @@ impl SstPointReader {
     }
 }
 
-fn read_exact_indexed(file: &mut File, out: &mut [u8], path: &Path, offset: u64) -> Result<()> {
-    file.read_exact(out).map_err(|error| {
+fn try_zeroed(len: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(scan_reserve_failed)?;
+    bytes.resize(len, 0);
+    Ok(bytes)
+}
+
+fn read_exact_indexed(
+    reader: &mut impl Read,
+    out: &mut [u8],
+    path: &Path,
+    offset: u64,
+) -> Result<()> {
+    reader.read_exact(out).map_err(|error| {
         if error.kind() == io::ErrorKind::UnexpectedEof {
             CalyxError::aster_corrupt_shard(format!(
                 "SST indexed row is truncated at {}:{offset} while reading {} bytes",

@@ -53,9 +53,9 @@ const OPTIONAL_REBUILDABLE_DIRS: [&str; 3] = ["ann", "kernel", "guard"];
 /// Rows materialized per bounded verification page.
 ///
 /// Peak retention of a scan is this many decoded rows, not the column family.
-/// The page cursor is re-opened per page against retained lookup indexes, which
-/// costs one file handle plus a binary search per intersecting SST — cheap at a
-/// scheduled cadence, and the price of never refusing to verify.
+/// The page cursor is re-opened per page. Hot families use retained lookup
+/// indexes; cold families use the bounded on-disk index cursor. Neither path
+/// materializes the immutable corpus.
 const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
 
 /// Scan refusals that mean "this check could not run to completion", never
@@ -64,11 +64,10 @@ const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
 /// Each of these is a defensive ceiling failing closed before an allocator abort
 /// or an unbounded read. None of them is evidence about vault integrity, so none
 /// of them may reach an operator wearing the corruption remediation.
-const RESOURCE_REFUSAL_CODES: [&str; 4] = [
+const RESOURCE_REFUSAL_CODES: [&str; 3] = [
     "CALYX_ASTER_SCAN_MEMORY_BUDGET",
     "CALYX_ASTER_SCAN_ALLOC",
     "CALYX_ASTER_SST_PAGE_SOURCE_LIMIT_EXCEEDED",
-    "CALYX_ASTER_SST_PAGE_INDEX_MISSING",
 ];
 
 type WalOverlay = HashMap<ColumnFamily, Vec<(Vec<u8>, Vec<u8>)>>;

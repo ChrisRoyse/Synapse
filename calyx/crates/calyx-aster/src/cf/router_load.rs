@@ -286,10 +286,9 @@ fn should_build_eager_lookup_on_open(cf: ColumnFamily, eager_lookup_on_open: boo
     if !eager_lookup_on_open {
         return false;
     }
-    // The single declaration of "which families may be paged" (#1973). Retaining
-    // a lookup is exactly what makes paging possible, so this policy must not
-    // hold an independent opinion about the set — it reads it.
-    cf.supports_paged_scan()
+    // Retention is a latency policy only. Every family remains pageable through
+    // the allocation-constant on-disk cursor when this returns false.
+    cf.retains_eager_lookup()
 }
 
 /// Lists SST files in a CF directory, failing closed on any `*.sst` file

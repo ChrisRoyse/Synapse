@@ -6841,21 +6841,12 @@ impl SynapseCalyxVault {
     ///
     /// # Which column families this works on
     ///
-    /// Candidate-bounded paging needs a **retained, validated SST lookup
-    /// index**, and the router's open policy retains one only for `Kv`
-    /// (always), and for `Base` and the slot CFs when the vault was opened with
-    /// `eager_router_lookup_on_open`. `SynapseCalyxVault::open` sets that, so
-    /// the daemon's live handle can page `Base`; `open_latest_readback` does
-    /// not, and is only ever used as a transient adoption step that closes and
-    /// reopens through `open` before any backend is published.
-    ///
-    /// A walk over a CF without a retained index **fails closed** with
-    /// `CALYX_ASTER_SST_PAGE_INDEX_MISSING` rather than returning a partial or
-    /// empty result — which is the correct outcome and is verified manually,
-    /// because an empty answer for a populated CF is exactly the class of silent
-    /// wrong answer this issue exists to remove.
-    /// It does mean this is not a drop-in replacement for `scan_cf_latest` on
-    /// an arbitrary CF: check the open policy before migrating a new caller.
+    /// Every selected column family supports candidate-bounded paging. Hot
+    /// families may use a retained, validated lookup index; cold families use
+    /// Aster's allocation-constant on-disk cursor, which retains one buffered
+    /// index window and validates the selected record's key and CRC before
+    /// returning it. Open mode therefore changes latency, never correctness or
+    /// whether a populated family can be walked.
     ///
     /// # The window this trades away, and why it is reported
     ///

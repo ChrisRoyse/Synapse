@@ -226,208 +226,18 @@ pub const KERNEL_REBUILD_MAX_RECORDS: usize = 2_000;
 const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
 
 // ---------------------------------------------------------------------------
-// Bounded sub-pass parallelism (#2116)
+// Derived pass resident-memory contract (#2239)
 // ---------------------------------------------------------------------------
 //
-// The tick was 100% serial on one blocking thread: 26.8% duty cycle, 1.4 of 32
-// cores busy, 73 s average against a 60 s budget. The fix is *not* "make the
-// tick wide" — the daemon shares 32 cores with perception, action and every MCP
-// request, and the goal is wall clock inside the budget, not thread count.
-//
-// Two sub-pass groups are parallelised, and only two. The rule applied to every
-// candidate was: **a group may run concurrently only if its members write to
-// disjoint keys and take no shared serialising lock for the bulk of their
-// work.** The proof for each group is stated at its spawn site. Everything that
-// failed that test stayed serial, and the reason is recorded there too, so the
-// next reader does not have to re-derive it:
-//
-// * **Graph-lane publishes** share the vault-global panel-generation allocator
-//   and the Registry CF. Only the read-only *scan* halves run concurrently; the
-//   publishes stay serial on the driver thread, in exactly today's order.
-// * **Coverage backfill and anchor-debt repair** take the durable commit lock
-//   once per row (`put_observation_constellation`, `backend.rs`), so N target
-//   threads would queue on the one lock that serialises every vault write —
-//   including the foreground MCP commits this tick must never starve (#1806 /
-//   #1832 lock topology). Their CPU-parallel fix is #2105's intra-page
-//   mechanism, which is a different change to a different function.
-// * **Snapshot-version GC** (#2122) is not on this tick at all; it runs at the
-//   end of `storage_gc` behind that tick's row-cap eviction so it can reclaim
-//   the versions those tombstones create. The global maintenance semaphore may
-//   admit this tick alongside GC even at its current width of two; it is a load
-//   bound, not an ordering primitive (#2150). Concurrent commits and
-//   reclamation synchronize at the MVCC row-shard write guards. Any future
-//   cross-operation dependency needs one admitted closure or its own lock.
-
-/// Worker threads one parallel sub-pass group may occupy.
-///
-/// Three, because three is the width of the widest independent group (the three
-/// graph scan lanes; the three weave panels) and a fourth thread would idle. A
-/// pool is used rather than "one thread per unit" so that adding a fourth panel
-/// later widens the work without widening the daemon's footprint.
-pub const DERIVED_STATE_SUBPASS_WORKERS: usize = 3;
-
-/// Hard ceiling on the env override, whatever an operator asks for.
-///
-/// The tick runs on Tokio's blocking pool under a maintenance admission permit
-/// while perception, action and MCP share the same 32 cores. A maintenance pass
-/// that can be told to occupy an arbitrary number of them is a foot-gun, not a
-/// tuning knob.
-const DERIVED_STATE_SUBPASS_WORKERS_MAX: usize = 8;
-
-/// Operator override for [`DERIVED_STATE_SUBPASS_WORKERS`].
-///
-/// `1` — or `0`, which fails **closed** to it — restores the exactly-serial
-/// pre-#2116 tick, which is the escape hatch an operator needs if concurrency
-/// is ever suspected in an incident. An unparseable value is refused with a
-/// warning and the documented default is used: silently reading a typo as
-/// "serial" would hide a knob that is not doing what its setter believes.
-const DERIVED_STATE_SUBPASS_WORKERS_ENV: &str = "SYNAPSE_DERIVED_STATE_SUBPASS_WORKERS";
-
-/// Resolves this tick's sub-pass pool width.
-fn subpass_workers() -> usize {
-    let Ok(raw) = std::env::var(DERIVED_STATE_SUBPASS_WORKERS_ENV) else {
-        return DERIVED_STATE_SUBPASS_WORKERS;
-    };
-    match raw.trim().parse::<usize>() {
-        // Fail closed: zero workers cannot mean "unbounded", and it cannot mean
-        // "run nothing" either, so it means the serial tick.
-        Ok(0) => 1,
-        Ok(requested) => requested.min(DERIVED_STATE_SUBPASS_WORKERS_MAX),
-        Err(error) => {
-            tracing::warn!(
-                code = "STORAGE_DERIVED_STATE_SUBPASS_WORKERS_UNPARSEABLE",
-                env = DERIVED_STATE_SUBPASS_WORKERS_ENV,
-                value = %raw,
-                error = %error,
-                default_workers = DERIVED_STATE_SUBPASS_WORKERS,
-                "the sub-pass worker override is not a non-negative integer; running this tick at \
-                 the documented default width"
-            );
-            DERIVED_STATE_SUBPASS_WORKERS
-        }
-    }
-}
-
-/// Runs one group of independent sub-passes across a bounded worker pool.
-///
-/// # The contract every caller must satisfy
-///
-/// Each unit must be independent of every other unit **in this group**: disjoint
-/// written keys, no shared serialising lock held for the bulk of its work, and
-/// no ordering dependency between them. Cross-unit ordering that does exist —
-/// a publish that consumes two lanes' output, a failure that must be attributed
-/// in a fixed order — belongs on the driver thread, after this returns.
-///
-/// # What it deliberately does not do
-///
-/// It does not collect results, because the units that need to publish anything
-/// write into their own caller-owned slot. It does not catch panics: a panicking
-/// sub-pass is a defect that must reach the maintenance task exactly as loudly as
-/// it does today, and `std::thread::scope` re-raises it on join after the other
-/// units of the group have finished.
-///
-/// A pool width of 1 (or a group of one unit) runs the units inline on the
-/// calling thread, spawning nothing at all.
-type SubpassUnit<'units> = Box<dyn FnOnce() + Send + 'units>;
-type SubpassQueue<'units> = Vec<Mutex<Option<SubpassUnit<'units>>>>;
-
-fn run_subpass_group<'units>(group: &'static str, units: Vec<SubpassUnit<'units>>) {
-    if units.is_empty() {
-        return;
-    }
-    let workers = subpass_workers().min(units.len());
-    let unit_count = units.len();
-    let started = std::time::Instant::now();
-    if workers <= 1 {
-        for unit in units {
-            unit();
-        }
-        tracing::debug!(
-            code = "STORAGE_DERIVED_STATE_SUBPASS_GROUP",
-            group,
-            units = unit_count,
-            workers = 1_usize,
-            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "ran a sub-pass group inline; the bounded pool is configured serial"
-        );
-        return;
-    }
-    let claimed = std::sync::atomic::AtomicUsize::new(0);
-    let queue: SubpassQueue<'units> = units
-        .into_iter()
-        .map(|unit| Mutex::new(Some(unit)))
-        .collect();
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let claimed = &claimed;
-            let queue = &queue;
-            scope.spawn(move || {
-                loop {
-                    let index = claimed.fetch_add(1, Ordering::Relaxed);
-                    let Some(slot) = queue.get(index) else {
-                        break;
-                    };
-                    // Each slot is claimed by exactly one worker (the atomic
-                    // cursor hands out each index once), so this lock is never
-                    // contended; it exists only to move the `FnOnce` out of a
-                    // shared borrow.
-                    let unit = match slot.lock() {
-                        Ok(mut guard) => guard.take(),
-                        Err(poisoned) => poisoned.into_inner().take(),
-                    };
-                    if let Some(unit) = unit {
-                        unit();
-                    }
-                }
-            });
-        }
-    });
-    tracing::debug!(
-        code = "STORAGE_DERIVED_STATE_SUBPASS_GROUP",
-        group,
-        units = unit_count,
-        workers,
-        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "ran a sub-pass group across the bounded maintenance worker pool"
-    );
-}
-
-/// Hands one parallel sub-pass's outcome back to the driver.
-///
-/// The slot is the whole result-passing mechanism: a unit owns its slot for the
-/// duration of the group and nothing else touches it, so this can never lose or
-/// interleave an outcome.
-fn set_subpass_slot<T>(slot: &Mutex<&mut Option<T>>, outcome: T) {
-    let mut guard = match slot.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    **guard = Some(outcome);
-}
-
-/// Reads one parallel sub-pass's outcome, refusing an empty slot.
-///
-/// An empty slot means the pool returned without running a unit it was given.
-/// That cannot happen — the atomic cursor hands out every index exactly once and
-/// `run_subpass_group` joins before returning — so it is reported as the driver
-/// defect it would be rather than silently treated as "this sub-pass found
-/// nothing". The tick's accounting invariant (#2080) depends on every unit
-/// producing exactly one outcome: a missing one has to fail the tick, not vanish
-/// from it.
-fn subpass_outcome<T>(
-    unit: &'static str,
-    slot: Option<crate::StorageResult<T>>,
-) -> Result<T, String> {
-    match slot {
-        Some(Ok(value)) => Ok(value),
-        Some(Err(error)) => Err(error.to_string()),
-        None => Err(format!(
-            "parallel sub-pass `{unit}` produced no outcome; the bounded worker pool returned \
-             without running a unit it was handed, which is a defect in \
-             synapse_storage::derived_state::run_subpass_group rather than a state of the vault"
-        )),
-    }
-}
+// Corpus scans are deliberately sequential. A bounded page limits transient IO
+// but does not bound the owned maps accumulated from all pages. Running several
+// scans or weaves concurrently therefore multiplies live heap by the number of
+// lanes, even when their keys and locks are independent. The deployed daemon
+// proved that distinction physically: its storage caches remained below their
+// bounds while parallel derived passes drove the process above 4 GiB working
+// set. Each complete outcome is now published or consumed before the next
+// independent corpus pass starts. There is no concurrency override: permitting
+// one would reintroduce the same architectural failure behind configuration.
 
 /// Ticks started, ticks that ended with every sub-pass clean, ticks that ended
 /// with at least one sub-pass failure, and ticks that never ran (#2080 ask 1).
@@ -1085,56 +895,14 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     let mut any_failed = false;
     let mut current_panel_coverage = None;
 
-    // --- Graph lanes: three concurrent scans, then the same serial publishes
-    //     (#2116) ---
+    // --- Graph lanes: consume each whole-corpus result at the earliest safe
+    //     boundary (#2239) ---
     //
-    // **Independence proof, at the spawn site as required.** The three units
-    // below are read-only coherent scans, one column family each:
-    //
-    // * `CF_TIMELINE`  (app focus + path hierarchy)
-    // * `CF_AGENT_EVENTS` (agent spawn edges)
-    // * `CF_PROCESS_HISTORY` (process parent edges)
-    //
-    // 1. **No writes.** None of the three commits anything. The only mutation a
-    //    lane performs is to its own stack-local `BTreeMap`, returned by value.
-    //    Every write of this phase — the path-hierarchy publish, the two
-    //    graph-position publishes, and the generation supersession each performs
-    //    — happens after this group joins, on this thread, in exactly the order
-    //    it happens today. That matters because those publishes share the
-    //    vault-global panel-generation allocator and the Registry CF, i.e. a
-    //    shared CF write path, and are therefore *not* independent.
-    // 2. **Disjoint row-table shards.** Aster routes row-table guards by
-    //    `ColumnFamily::shard_index`, so these three column families take three
-    //    different `RwLock`s. The lanes take no wide guard: each pages its lease
-    //    1,000 rows at a time and holds a read guard only for the page (#2060).
-    // 3. **Own snapshot each.** Every lane pins its own bounded coherent scan
-    //    lease, so each still reads exactly the snapshot it reads today.
-    //    Concurrency changes the order the leases are taken, not the rows any
-    //    lane sees. Running them together also *shortens* the union of the three
-    //    lease lifetimes, which is what pins the snapshot-version GC floor
-    //    (#2122) — so this reduces reclamation debt rather than adding to it.
-    // 4. **Failure attribution unchanged.** A process-lane failure still fails
-    //    the agent-graph sub-pass, because it is still the agent-graph publish
-    //    that cannot be taken without it; a lane's failure is recorded once,
-    //    here, in the same fixed order as before.
-    let mut app_lane: Option<crate::StorageResult<AppFocusLaneScan>> = None;
-    let mut agent_lane: Option<crate::StorageResult<GraphLaneScan>> = None;
-    let mut process_lane: Option<crate::StorageResult<GraphLaneScan>> = None;
-    {
-        let app_slot = Mutex::new(&mut app_lane);
-        let agent_slot = Mutex::new(&mut agent_lane);
-        let process_slot = Mutex::new(&mut process_lane);
-        let db = &db;
-        run_subpass_group(
-            "graph_lanes",
-            vec![
-                Box::new(|| set_subpass_slot(&app_slot, scan_app_focus_lane(db))),
-                Box::new(|| set_subpass_slot(&agent_slot, scan_agent_spawn_lane(db))),
-                Box::new(|| set_subpass_slot(&process_slot, scan_process_parent_lane(db))),
-            ],
-        );
-    }
-    match subpass_outcome("app_focus", app_lane) {
+    // `scan_app_focus_lane` owns both an edge map and a unique-path corpus.
+    // Publish it immediately so those allocations are gone before either agent
+    // lane is built. The agent and process maps must coexist because their
+    // publisher joins the two sources; no unrelated third corpus overlaps them.
+    match scan_app_focus_lane(&db) {
         Ok(lane) => {
             lane.scan.lane_yield.report(lane.scan.source_seq);
             if let Err(error) = publish_app_transition_graph(&db, lane) {
@@ -1144,13 +912,10 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
         }
         Err(error) => {
             any_failed = true;
-            record_failure("STORAGE_DERIVED_STATE_APP_GRAPH_FAILED", error);
+            record_failure("STORAGE_DERIVED_STATE_APP_GRAPH_FAILED", error.to_string());
         }
     }
-    match (
-        subpass_outcome("agent_spawn", agent_lane),
-        subpass_outcome("process_parent", process_lane),
-    ) {
+    match (scan_agent_spawn_lane(&db), scan_process_parent_lane(&db)) {
         (Ok(agent), Ok(process)) => {
             agent.lane_yield.report(agent.source_seq);
             process.lane_yield.report(process.source_seq);
@@ -1164,7 +929,10 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
         }
         (Err(error), _) | (Ok(_), Err(error)) => {
             any_failed = true;
-            record_failure("STORAGE_DERIVED_STATE_AGENT_GRAPH_FAILED", error);
+            record_failure(
+                "STORAGE_DERIVED_STATE_AGENT_GRAPH_FAILED",
+                error.to_string(),
+            );
         }
     }
 
@@ -1488,75 +1256,18 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     // watermark; one failed panel cannot advance itself or suppress the other
     // two panels' work.
     //
-    // **Independence proof, at the spawn site as required (#2116).** One unit
-    // per panel version, and a panel version is the scope of every identifier
-    // this phase writes:
-    //
-    // 1. **Disjoint written keys.** `weave_panel` persists `XTerm` rows keyed by
-    //    `(panel_version, cx_id, slot pair)` and `Graph` rows keyed by
-    //    `agreement_edge_key(panel_version, …)` / `between_record_edge_key(…)`
-    //    over that panel's own `cx_id`s. Two panels can therefore never write
-    //    the same key, and the union of the three panels' rows after a parallel
-    //    tick is the same set as after a serial one. Slot ids are panel-scoped
-    //    by construction, which is the property that makes this true.
-    // 2. **Disjoint read windows.** Each panel loads only its own dense corpus,
-    //    from its own watermark, under its own 20 s budget
-    //    ([`WEAVE_PANEL_TICK_BUDGET`]). Serially that is up to 60 s of wall
-    //    clock on one core for work that shares nothing.
-    // 3. **Disjoint durable state.** [`WEAVE_WATERMARK_NS`] and
-    //    [`WEAVE_BACKLOG_TREND`] are `Mutex<BTreeMap<panel_version, _>>` — one
-    //    entry per unit, and `commit_weave_frontier` already refuses to write an
-    //    entry another owner moved. The per-panel readback fields are the same
-    //    shape, so the published state after the group is independent of the
-    //    order the units finished in.
-    // 4. **No lock held for the bulk of the work.** The expensive half —
-    //    within-record cross terms and the between-record kNN — is pure CPU with
-    //    no vault lock held; only the single `write_cf_batch` + `flush` at the
-    //    end takes the durable commit lock, and it is the same one batch per
-    //    panel that a serial tick takes. Concurrency therefore does not increase
-    //    how long any commit waits, only how soon the three batches arrive.
-    // 5. **Ordering that does exist stays on the driver.** The tick's outcome
-    //    ledger and the "last advisory" field are single-valued and
-    //    order-sensitive, so no unit touches them: each returns its advisory and
-    //    its verdict, and both are applied below in fixed panel order. That is
-    //    what keeps `success + failure + skipped == attempts` and the per-
-    //    sub-pass attribution byte-identical to a serial tick (#2080).
+    // Each panel owns disjoint keys, but that does not make its resident set
+    // free: a weave retains its dense corpus and graph products until its batch
+    // is committed. Run and account for one panel completely before loading the
+    // next. Fixed panel order also preserves the outcome-ledger and advisory
+    // semantics without result slots that keep completed products alive.
     let weave_panels = [
         crate::constellations::SYN_TIMELINE_PANEL_VERSION,
         crate::constellations::SYN_EPISODE_PANEL_VERSION,
         crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
     ];
-    let mut weave_outcomes: [Option<WeaveSubpass>; 3] = [None, None, None];
-    {
-        let mut slots: Vec<Mutex<&mut Option<WeaveSubpass>>> =
-            weave_outcomes.iter_mut().map(Mutex::new).collect();
-        let db = &db;
-        let units: Vec<Box<dyn FnOnce() + Send>> = slots
-            .iter_mut()
-            .zip(weave_panels)
-            .map(|(slot, panel_version)| {
-                let slot: &Mutex<&mut Option<WeaveSubpass>> = slot;
-                Box::new(move || set_subpass_slot(slot, weave_panel_subpass(db, panel_version)))
-                    as Box<dyn FnOnce() + Send>
-            })
-            .collect();
-        run_subpass_group("weave_panels", units);
-    }
-    for (panel_version, outcome) in weave_panels.into_iter().zip(weave_outcomes) {
-        let Some(outcome) = outcome else {
-            any_failed = true;
-            record_failure(
-                "STORAGE_DERIVED_STATE_WEAVE_FAILED",
-                format!(
-                    "parallel weave sub-pass for panel {panel_version} produced no outcome; the \
-                     bounded worker pool returned without running a unit it was handed"
-                ),
-            );
-            continue;
-        };
-        // Advisories are published here, in panel order, so the single-valued
-        // `last_advisory_*` fields land in the same order a serial tick would
-        // have left them in.
+    for panel_version in weave_panels {
+        let outcome = weave_panel_subpass(&db, panel_version);
         if let Some((code, detail)) = outcome.advisory {
             record_advisory(code, detail);
         }
