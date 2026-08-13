@@ -89,6 +89,39 @@ pub fn open_value(
     context.decrypt_value(sealed, &aad)
 }
 
+/// Opens one owned encrypted row value in its existing allocation.
+///
+/// Point reads that start from a borrowed value keep using [`open_value`]. SST
+/// page readers, however, already own a freshly materialized ciphertext `Vec`;
+/// decrypting that allocation in place prevents a full-value allocation pair
+/// from being created and abandoned for every row of a long scan.
+pub fn open_value_owned(
+    context: &SharedVaultContext,
+    cf: ColumnFamily,
+    key: &[u8],
+    mut value: Vec<u8>,
+) -> Result<Vec<u8>> {
+    if is_tombstone_value(&value) {
+        return Ok(value);
+    }
+    if !value.starts_with(ENVELOPE_MAGIC) {
+        return Err(CalyxError {
+            code: CALYX_VAULT_VALUE_NOT_ENCRYPTED,
+            message: format!(
+                "encrypted vault encountered plaintext {} value for key {}",
+                cf.name(),
+                hex_prefix(key)
+            ),
+            remediation: "recreate or migrate the vault with value encryption enabled before opening it with this key",
+        });
+    }
+    value.copy_within(ENVELOPE_MAGIC.len().., 0);
+    value.truncate(value.len() - ENVELOPE_MAGIC.len());
+    let context = read_context(context)?;
+    let aad = row_aad(context.vault_id(), cf, key);
+    context.decrypt_value_owned(value, &aad)
+}
+
 fn row_aad(vault_id: VaultId, cf: ColumnFamily, key: &[u8]) -> Vec<u8> {
     let mut aad = Vec::with_capacity(AAD_DOMAIN.len() + 1 + 16 + cf.name().len() + 8 + key.len());
     aad.extend_from_slice(AAD_DOMAIN);

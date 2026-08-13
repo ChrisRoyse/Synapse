@@ -11,7 +11,7 @@
 //! from memory on drop and are never cloned into a static. `Clone` is
 //! intentionally **not** derived: a secret should have exactly one owner.
 
-use aes_gcm::aead::{Aead, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, Payload};
 use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
 use calyx_core::{CalyxError, Result, VaultId};
 use hkdf::Hkdf;
@@ -145,6 +145,30 @@ impl VaultKey {
                     aad,
                 },
             )
+            .map_err(|_| decryption_failed("AES-256-GCM tag verification failed"))
+    }
+
+    /// AES-256-GCM decrypts an owned `ciphertext || tag` buffer in place.
+    ///
+    /// This is the allocation-stable counterpart to [`Self::decrypt`]. Durable
+    /// SST reads already own their ciphertext allocation, so replacing its
+    /// contents with plaintext avoids allocating and then abandoning a second
+    /// value-sized buffer for every row in a long sequential scan.
+    pub(crate) fn decrypt_in_place(
+        &self,
+        nonce: &[u8; NONCE_LEN],
+        ciphertext_and_tag: &mut Vec<u8>,
+        aad: &[u8],
+    ) -> Result<()> {
+        if ciphertext_and_tag.len() < TAG_LEN {
+            return Err(decryption_failed(format!(
+                "ciphertext is {} bytes, shorter than the {TAG_LEN}-byte GCM tag",
+                ciphertext_and_tag.len()
+            )));
+        }
+        let cipher = Aes256Gcm::new(self.aes_gcm_key());
+        cipher
+            .decrypt_in_place(Nonce::from_slice(nonce), aad, ciphertext_and_tag)
             .map_err(|_| decryption_failed("AES-256-GCM tag verification failed"))
     }
 }

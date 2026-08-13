@@ -2794,7 +2794,11 @@ pub fn install_process_memory_reclaimer(
 const BASE_PAGE_RECLAIM_GROWTH_BYTES: u64 = 32 * 1024 * 1024;
 
 struct BaseCfWalkMemoryTracker {
+    private_bytes_before: u64,
+    private_bytes_peak: u64,
     private_bytes_after_last_reclaim: u64,
+    page_reclaim_calls: u64,
+    page_reclaimed_bytes: u64,
 }
 
 impl BaseCfWalkMemoryTracker {
@@ -2802,8 +2806,13 @@ impl BaseCfWalkMemoryTracker {
         if cf != ColumnFamily::Base || PROCESS_MEMORY_RECLAIMER.get().is_none() {
             return Ok(None);
         }
+        let private_bytes_before = process_private_bytes()?;
         Ok(Some(Self {
-            private_bytes_after_last_reclaim: process_private_bytes()?,
+            private_bytes_before,
+            private_bytes_peak: private_bytes_before,
+            private_bytes_after_last_reclaim: private_bytes_before,
+            page_reclaim_calls: 0,
+            page_reclaimed_bytes: 0,
         }))
     }
 
@@ -2813,6 +2822,7 @@ impl BaseCfWalkMemoryTracker {
         rows_examined: usize,
     ) -> Result<(), SynapseCalyxError> {
         let before = process_private_bytes()?;
+        self.private_bytes_peak = self.private_bytes_peak.max(before);
         if before.saturating_sub(self.private_bytes_after_last_reclaim)
             < BASE_PAGE_RECLAIM_GROWTH_BYTES
         {
@@ -2828,17 +2838,65 @@ impl BaseCfWalkMemoryTracker {
         let started = Instant::now();
         reclaim();
         let after = process_private_bytes()?;
+        let reclaimed = before.saturating_sub(after);
+        self.private_bytes_peak = self.private_bytes_peak.max(after);
         self.private_bytes_after_last_reclaim = after;
+        self.page_reclaim_calls = self.page_reclaim_calls.saturating_add(1);
+        self.page_reclaimed_bytes = self.page_reclaimed_bytes.saturating_add(reclaimed);
         tracing::info!(
             code = "SYNAPSE_CALYX_BASE_WALK_PAGE_MEMORY_RECLAIMED",
             page,
             rows_examined,
             private_bytes_before = before,
             private_bytes_after = after,
-            private_bytes_reclaimed = before.saturating_sub(after),
+            private_bytes_reclaimed = reclaimed,
             reclaim_elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
             "returned a released Base walk page to the operating system while preserving the pinned cursor and caller-owned corpus"
         );
+        Ok(())
+    }
+
+    /// Reclaims after the streaming cursor and all of its file readers/frontier
+    /// values have been destroyed.
+    ///
+    /// Page callbacks cannot release cursor-owned allocations because the
+    /// stream necessarily remains live between pages. A long-lived daemon that
+    /// repeats a whole-Base scan once per panel therefore compounds those
+    /// abandoned allocator pages unless collection also happens at this outer
+    /// ownership boundary.
+    fn walk_released(
+        &mut self,
+        pages: usize,
+        rows_examined: usize,
+    ) -> Result<(), SynapseCalyxError> {
+        let before = process_private_bytes()?;
+        self.private_bytes_peak = self.private_bytes_peak.max(before);
+        let reclaim = PROCESS_MEMORY_RECLAIMER.get().copied().ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_MEMORY_RECLAIMER_DISAPPEARED",
+                "the process memory reclaimer disappeared after a Base CF walk",
+                "repair process initialization; a once-installed allocator authority must remain available for the process lifetime",
+            )
+        })?;
+        let started = Instant::now();
+        reclaim();
+        let after = process_private_bytes()?;
+        let reclaimed = before.saturating_sub(after);
+        tracing::info!(
+            code = "SYNAPSE_CALYX_BASE_WALK_MEMORY_RELEASED",
+            pages,
+            rows_examined,
+            private_bytes_start = self.private_bytes_before,
+            private_bytes_peak = self.private_bytes_peak,
+            private_bytes_before = before,
+            private_bytes_after = after,
+            private_bytes_reclaimed = reclaimed,
+            page_reclaim_calls = self.page_reclaim_calls,
+            page_reclaimed_bytes = self.page_reclaimed_bytes,
+            reclaim_elapsed_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            "returned cursor-owned and page-owned Base scan memory after the complete streaming owner was destroyed"
+        );
+        self.private_bytes_after_last_reclaim = after;
         Ok(())
     }
 }
@@ -7379,6 +7437,26 @@ impl SynapseCalyxVault {
                     }
                     Ok(())
                 });
+        // `scan_cf_range_pages_snapshot` owns the streaming cursor. It has
+        // returned here, so the cursor, open readers, merge frontier, and last
+        // output page are all physically destroyed before allocator collection.
+        let release_result = page_memory.as_mut().map_or(Ok(()), |memory| {
+            memory.walk_released(walk.pages, walk.rows_examined)
+        });
+        if let Err(release_error) = release_result {
+            return match result {
+                Err(SynapseCalyxSnapshotWalkControl::Error(scan_error)) => {
+                    Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_BASE_WALK_AND_MEMORY_RELEASE_FAILED",
+                        format!(
+                            "the Base CF walk failed with {scan_error}; after destroying its streaming cursor, allocator release also failed with {release_error}"
+                        ),
+                        "repair the named scan failure and the process-memory read/reclaimer failure before retrying; both independent failures are preserved here",
+                    ))
+                }
+                Ok(()) | Err(SynapseCalyxSnapshotWalkControl::Stop) => Err(release_error),
+            };
+        }
         match result {
             Ok(()) => {
                 // The former page-at-a-time path performed and counted one

@@ -180,6 +180,33 @@ impl VaultContext {
         self.key.decrypt(&nonce, ciphertext, aad)
     }
 
+    /// AES-256-GCM decrypts an owned `nonce || ciphertext || tag` value in its
+    /// existing allocation.
+    ///
+    /// Sequential SST scans already paid for and exclusively own this buffer.
+    /// Moving the ciphertext down over the nonce and decrypting in place keeps
+    /// one value allocation live instead of churning two value-sized buffers
+    /// per row. Authentication and failure behavior are identical to
+    /// [`Self::decrypt_value`].
+    pub fn decrypt_value_owned(&self, mut sealed_value: Vec<u8>, aad: &[u8]) -> Result<Vec<u8>> {
+        if sealed_value.len() < VALUE_NONCE_LEN + VALUE_TAG_LEN {
+            return Err(CalyxError {
+                code: CALYX_DECRYPTION_FAILED,
+                message: format!(
+                    "encrypted value is {} bytes, shorter than nonce plus GCM tag",
+                    sealed_value.len()
+                ),
+                remediation: "read the complete encrypted value envelope before decrypting",
+            });
+        }
+        let mut nonce = [0_u8; VALUE_NONCE_LEN];
+        nonce.copy_from_slice(&sealed_value[..VALUE_NONCE_LEN]);
+        sealed_value.copy_within(VALUE_NONCE_LEN.., 0);
+        sealed_value.truncate(sealed_value.len() - VALUE_NONCE_LEN);
+        self.key.decrypt_in_place(&nonce, &mut sealed_value, aad)?;
+        Ok(sealed_value)
+    }
+
     /// Crypto-shreds the live vault key for lawful/user-requested erasure.
     pub fn shred_key_for_erasure(&mut self) {
         self.key.shred_for_erasure();

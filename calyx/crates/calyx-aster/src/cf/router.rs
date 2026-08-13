@@ -3,7 +3,7 @@ use crate::compaction::TieringPolicy;
 use crate::memtable::{Memtable, MemtableUsage};
 use crate::resource::ResourceCounters;
 use crate::security::value_crypto::{
-    SharedVaultContext, open_value as open_encrypted_value, seal_value,
+    SharedVaultContext, open_value_owned as open_encrypted_value_owned, seal_value,
 };
 use crate::sst::level::{PreparedLevelFile, SstLevel};
 use crate::sst::{SstEntry, SstSummary};
@@ -345,7 +345,7 @@ impl RouterConfig {
         value: Vec<u8>,
     ) -> Result<Vec<u8>> {
         match &self.value_crypto {
-            Some(context) => open_encrypted_value(context, cf, key, &value),
+            Some(context) => open_encrypted_value_owned(context, cf, key, value),
             None => Ok(value),
         }
     }
