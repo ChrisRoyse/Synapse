@@ -4700,6 +4700,7 @@ impl SynapseCalyxVault {
         expected_panel_version: u32,
         supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
+        let _rebuild_lock = self.acquire_search_rebuild_lock(expected_panel_version)?;
         let state = self.resolve_search_rebuild_panel_state(expected_panel_version, supplied)?;
         let panel_root = self
             .config
@@ -4759,6 +4760,66 @@ impl SynapseCalyxVault {
             manifest_path,
             raw_sidecars,
         })
+    }
+
+    fn acquire_search_rebuild_lock(
+        &self,
+        expected_panel_version: u32,
+    ) -> Result<File, SynapseCalyxError> {
+        let lock_path = self.config.vault_dir.join("search-rebuild.lock");
+        let mut lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_SEARCH_REBUILD_LOCK_IO",
+                    format!("open search rebuild lock {}: {error}", lock_path.display()),
+                    "repair the exact lock-file path permissions or filesystem error, then retry; do not bypass single-writer admission",
+                )
+            })?;
+        lock.try_lock_exclusive().map_err(|error| {
+            let (code, remediation) = if error.kind() == io::ErrorKind::WouldBlock {
+                (
+                    "SYNAPSE_CALYX_SEARCH_REBUILD_IN_PROGRESS",
+                    "wait for the in-flight persisted search rebuild to publish or fail, then retry; every manual and scheduled caller shares this lock",
+                )
+            } else {
+                (
+                    "SYNAPSE_CALYX_SEARCH_REBUILD_LOCK_IO",
+                    "repair the exact lock-file path or filesystem error, then retry; do not bypass single-writer admission",
+                )
+            };
+            SynapseCalyxError::new(
+                code,
+                format!(
+                    "acquire exclusive search rebuild lock {} for panel {expected_panel_version}: {error}",
+                    lock_path.display()
+                ),
+                remediation,
+            )
+        })?;
+        lock.set_len(0).and_then(|()| {
+            writeln!(
+                lock,
+                "pid={} panel_version={expected_panel_version}",
+                std::process::id()
+            )
+        })
+        .and_then(|()| lock.sync_data())
+        .map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_REBUILD_LOCK_IO",
+                format!(
+                    "persist search rebuild lock owner {} for panel {expected_panel_version}: {error}",
+                    lock_path.display()
+                ),
+                "repair the exact lock-file path or filesystem error, then retry; no index artifacts were written",
+            )
+        })?;
+        Ok(lock)
     }
 
     fn resolve_search_rebuild_panel_state(

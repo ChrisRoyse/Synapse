@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -9,12 +10,15 @@ use calyx_sextant::index::bm25::Bm25;
 use calyx_sextant::index::{IndexSearchHit, ranked};
 use serde::{Deserialize, Serialize};
 
+use super::fs_io::HashingReader;
 use super::pinned::{self, PinKey};
-use super::{SearchIndexEntry, rel, sha256_hex, stale, write_json_atomic_hashed};
+use super::{SearchIndexEntry, rel, sha256_hex, stale, write_atomic_hashed};
 use crate::error::CliResult;
 
 const SPARSE_FORMAT_V2: &str = "calyx-search-sparse-index-v2";
 const SPARSE_FORMAT_V3: &str = "calyx-search-sparse-index-v3";
+const SPARSE_FORMAT_V4: &str = "calyx-search-sparse-index-v4-jsonl";
+const MAX_SPARSE_LINE_BYTES: u64 = 64 * 1024 * 1024;
 const LEGACY_BM25_KIND: &str = "sparse_inverted";
 const PIN_KIND: &str = "sparse";
 
@@ -75,6 +79,18 @@ struct SparseIndex {
     field_docs: usize,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StreamingSparseHeader {
+    format: String,
+    scoring: SparseScoring,
+    slot: u16,
+    dim: u32,
+    base_seq: u64,
+    len: usize,
+    field_docs: usize,
+    avg_doc_len: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 struct SparseRow {
     cx_id: CxId,
@@ -106,18 +122,60 @@ pub(super) fn write<F>(
 where
     F: FnMut(&'static str, usize) -> CliResult,
 {
+    let row_count = rows.rows.len();
     let path = root.join(format!(
-        "slot_{:05}_seq_{base_seq:020}_n_{:010}.sparse.json",
+        "slot_{:05}_seq_{base_seq:020}_n_{row_count:010}.sparse.jsonl",
         slot.get(),
-        rows.rows.len()
     ));
-    let index = build_index(slot, rows.dim, rows.rows, base_seq, scoring)?;
-    progress("slot.sparse.index_built", index.rows.len())?;
-    let sha256 = write_json_atomic_hashed(&path, &index)?;
+    let mut validated_rows = Vec::with_capacity(row_count);
+    let mut total_doc_len = 0.0_f32;
+    let mut field_docs = 0usize;
+    for (cx_id, entries) in rows.rows {
+        let doc_len = validate_sparse_weights(&entries, scoring, &format!("row {cx_id}"))?;
+        if !entries.is_empty() {
+            field_docs = field_docs
+                .checked_add(1)
+                .ok_or_else(|| stale("sparse field-document count overflow"))?;
+            total_doc_len += doc_len;
+            if !total_doc_len.is_finite() {
+                return Err(stale("persistent sparse corpus length overflowed"));
+            }
+        }
+        validated_rows.push(SparseRow {
+            cx_id,
+            doc_len,
+            entries,
+        });
+    }
+    let avg_doc_len = if field_docs == 0 {
+        0.0
+    } else {
+        total_doc_len / field_docs as f32
+    };
+    let header = StreamingSparseHeader {
+        format: SPARSE_FORMAT_V4.to_owned(),
+        scoring,
+        slot: slot.get(),
+        dim: rows.dim,
+        base_seq,
+        len: row_count,
+        field_docs,
+        avg_doc_len,
+    };
+    progress("slot.sparse.rows_validated", row_count)?;
+    let sha256 = write_atomic_hashed(&path, |writer| {
+        serde_json::to_writer(&mut *writer, &header)?;
+        writer.write_all(b"\n")?;
+        for row in &validated_rows {
+            serde_json::to_writer(&mut *writer, row)?;
+            writer.write_all(b"\n")?;
+        }
+        Ok(())
+    })?;
     Ok(SearchIndexEntry::sparse(
         slot,
-        index.dim,
-        index.rows.len(),
+        header.dim,
+        row_count,
         base_seq,
         rel(vault_dir, &path)?,
         sha256,
@@ -152,6 +210,18 @@ pub(super) fn search(
             err.message
         ))
     })?;
+    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
+        let scored = score_streaming(
+            vault_dir,
+            entry,
+            manifest_base_seq,
+            slot,
+            *query_dim,
+            entries,
+            candidates,
+        )?;
+        return Ok(ranked(top_k(scored, k)));
+    }
     let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
     validate_sparse_query_weights(entries, index.scoring, "query")?;
     if index.dim != *query_dim {
@@ -196,6 +266,20 @@ pub(super) fn search_reconciled(
             error.message
         ))
     })?;
+    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
+        let scored = score_streaming_reconciled(
+            vault_dir,
+            entry,
+            manifest_base_seq,
+            slot,
+            *query_dim,
+            query_entries,
+            candidates,
+            changed,
+            replacements,
+        )?;
+        return Ok(ranked(top_k(scored, k)));
+    }
     let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
     if index.dim != *query_dim {
         return Err(stale(format!(
@@ -390,6 +474,443 @@ fn score_bm25_reconciled(
     Ok(scores.into_iter().collect())
 }
 
+fn score_streaming(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    manifest_base_seq: u64,
+    slot: SlotId,
+    query_dim: u32,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let mut scoring = None;
+    let mut dot_scores = BTreeMap::new();
+    let mut document_frequencies = BTreeMap::<u32, usize>::new();
+    let header = visit_stream(vault_dir, entry, manifest_base_seq, slot, |header, row| {
+        if scoring.is_none() {
+            validate_sparse_query_weights(query, header.scoring, "query")?;
+            scoring = Some(header.scoring);
+        }
+        if header.scoring == SparseScoring::DotProduct {
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+        } else {
+            count_query_terms(row, query, &mut document_frequencies);
+        }
+        Ok(())
+    })?;
+    if header.dim != query_dim {
+        return Err(stale(format!(
+            "persistent streaming sparse slot {slot} index dim {} != query dim {query_dim}; reingest/backfill the vault",
+            header.dim
+        )));
+    }
+    validate_sparse_query_weights(query, header.scoring, "query")?;
+    if header.scoring == SparseScoring::DotProduct {
+        return Ok(dot_scores.into_iter().collect());
+    }
+    let mut scores = BTreeMap::new();
+    visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, row| {
+        score_streaming_bm25_row(
+            row,
+            query,
+            candidates,
+            header.field_docs,
+            header.avg_doc_len,
+            &document_frequencies,
+            &mut scores,
+        )
+    })?;
+    Ok(scores.into_iter().collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_streaming_reconciled(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    manifest_base_seq: u64,
+    slot: SlotId,
+    query_dim: u32,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+    changed: &BTreeSet<CxId>,
+    replacements: &BTreeMap<CxId, SlotVector>,
+) -> CliResult<Vec<(CxId, f32)>> {
+    let mut scoring = None;
+    let mut dot_scores = BTreeMap::new();
+    let mut document_frequencies = BTreeMap::<u32, usize>::new();
+    let mut unchanged_field_docs = 0usize;
+    let mut unchanged_total_doc_len = 0.0_f32;
+    let header = visit_stream(vault_dir, entry, manifest_base_seq, slot, |header, row| {
+        if scoring.is_none() {
+            validate_sparse_query_weights(query, header.scoring, "delta query")?;
+            scoring = Some(header.scoring);
+        }
+        if changed.contains(&row.cx_id) {
+            return Ok(());
+        }
+        if header.scoring == SparseScoring::DotProduct {
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+        } else if !row.entries.is_empty() {
+            unchanged_field_docs = unchanged_field_docs
+                .checked_add(1)
+                .ok_or_else(|| stale("reconciled sparse field-document count overflow"))?;
+            unchanged_total_doc_len += row.doc_len;
+            if !unchanged_total_doc_len.is_finite() {
+                return Err(stale("reconciled sparse corpus length overflowed"));
+            }
+            count_query_terms(row, query, &mut document_frequencies);
+        }
+        Ok(())
+    })?;
+    if header.dim != query_dim {
+        return Err(stale(format!(
+            "persistent streaming sparse slot {slot} index dim {} != delta query dim {query_dim}",
+            header.dim
+        )));
+    }
+    validate_sparse_query_weights(query, header.scoring, "delta query")?;
+    let replacement_rows = sparse_replacement_rows(slot, header.dim, header.scoring, replacements)?;
+    if header.scoring == SparseScoring::DotProduct {
+        for row in replacement_rows.values() {
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+        }
+        return Ok(dot_scores.into_iter().collect());
+    }
+    let mut total_docs = unchanged_field_docs;
+    let mut total_doc_len = unchanged_total_doc_len;
+    for row in replacement_rows
+        .values()
+        .filter(|row| !row.entries.is_empty())
+    {
+        total_docs = total_docs
+            .checked_add(1)
+            .ok_or_else(|| stale("reconciled sparse field-document count overflow"))?;
+        total_doc_len += row.doc_len;
+        if !total_doc_len.is_finite() {
+            return Err(stale("reconciled sparse corpus length overflowed"));
+        }
+        count_query_terms(row, query, &mut document_frequencies);
+    }
+    let avg_doc_len = if total_docs == 0 {
+        0.0
+    } else {
+        total_doc_len / total_docs as f32
+    };
+    let mut scores = BTreeMap::new();
+    visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, row| {
+        if changed.contains(&row.cx_id) {
+            return Ok(());
+        }
+        score_streaming_bm25_row(
+            row,
+            query,
+            candidates,
+            total_docs,
+            avg_doc_len,
+            &document_frequencies,
+            &mut scores,
+        )
+    })?;
+    for row in replacement_rows.values() {
+        score_streaming_bm25_row(
+            row,
+            query,
+            candidates,
+            total_docs,
+            avg_doc_len,
+            &document_frequencies,
+            &mut scores,
+        )?;
+    }
+    Ok(scores.into_iter().collect())
+}
+
+fn count_query_terms(
+    row: &SparseRow,
+    query: &[SparseEntry],
+    document_frequencies: &mut BTreeMap<u32, usize>,
+) {
+    for query_entry in query {
+        if row
+            .entries
+            .binary_search_by_key(&query_entry.idx, |entry| entry.idx)
+            .is_ok()
+        {
+            *document_frequencies.entry(query_entry.idx).or_default() += 1;
+        }
+    }
+}
+
+fn score_streaming_dot_row(
+    row: &SparseRow,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+    scores: &mut BTreeMap<CxId, f32>,
+) -> CliResult {
+    if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
+        return Ok(());
+    }
+    let mut score = 0.0_f32;
+    for query_entry in query {
+        if let Ok(index) = row
+            .entries
+            .binary_search_by_key(&query_entry.idx, |entry| entry.idx)
+        {
+            score += row.entries[index].val * query_entry.val;
+        }
+    }
+    if !score.is_finite() {
+        return Err(stale(format!(
+            "persistent streaming sparse dot-product score overflowed for {}",
+            row.cx_id
+        )));
+    }
+    if score != 0.0 {
+        scores.insert(row.cx_id, score);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_streaming_bm25_row(
+    row: &SparseRow,
+    query: &[SparseEntry],
+    candidates: Option<&BTreeSet<CxId>>,
+    total_docs: usize,
+    avg_doc_len: f32,
+    document_frequencies: &BTreeMap<u32, usize>,
+    scores: &mut BTreeMap<CxId, f32>,
+) -> CliResult {
+    if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
+        return Ok(());
+    }
+    let scorer = Bm25::default();
+    let mut score = 0.0_f32;
+    for query_entry in query {
+        let Ok(index) = row
+            .entries
+            .binary_search_by_key(&query_entry.idx, |entry| entry.idx)
+        else {
+            continue;
+        };
+        let df = document_frequencies
+            .get(&query_entry.idx)
+            .copied()
+            .unwrap_or(0);
+        score += scorer.score_term(
+            row.entries[index].val,
+            row.doc_len,
+            avg_doc_len,
+            total_docs,
+            df,
+        ) * query_entry.val;
+    }
+    if !score.is_finite() {
+        return Err(stale(format!(
+            "persistent streaming sparse BM25 score overflowed for {}",
+            row.cx_id
+        )));
+    }
+    if score != 0.0 {
+        scores.insert(row.cx_id, score);
+    }
+    Ok(())
+}
+
+fn visit_stream<F>(
+    vault_dir: &Path,
+    entry: &SearchIndexEntry,
+    manifest_base_seq: u64,
+    slot: SlotId,
+    mut visit: F,
+) -> CliResult<StreamingSparseHeader>
+where
+    F: FnMut(&StreamingSparseHeader, &SparseRow) -> CliResult,
+{
+    require_sparse_kind(entry, slot)?;
+    let path = vault_dir.join(entry.require_index_rel(slot)?);
+    if !path.is_file() {
+        return Err(stale(format!(
+            "persistent streaming sparse sidecar missing at {}; rebuild the vault search indexes",
+            path.display()
+        )));
+    }
+    let mut hashing_reader = HashingReader::new(File::open(&path)?);
+    let mut reader = BufReader::new(&mut hashing_reader);
+    let header_line = read_bounded_line(&mut reader, &path, "header")?.ok_or_else(|| {
+        stale(format!(
+            "persistent streaming sparse sidecar {} is empty",
+            path.display()
+        ))
+    })?;
+    let header: StreamingSparseHeader = serde_json::from_str(&header_line).map_err(|error| {
+        stale(format!(
+            "persistent streaming sparse header {} is invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    validate_streaming_header(&header, entry, manifest_base_seq, slot)?;
+    let mut count = 0usize;
+    let mut field_docs = 0usize;
+    let mut total_doc_len = 0.0_f32;
+    let mut last_cx_id = None;
+    while let Some(line) = read_bounded_line(&mut reader, &path, "row")? {
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            return Err(stale(format!(
+                "persistent streaming sparse sidecar {} contains an empty row line",
+                path.display()
+            )));
+        }
+        let row: SparseRow = serde_json::from_str(&line).map_err(|error| {
+            stale(format!(
+                "persistent streaming sparse row {} is invalid JSON: {error}",
+                path.display()
+            ))
+        })?;
+        if last_cx_id.is_some_and(|previous| previous >= row.cx_id) {
+            return Err(stale(format!(
+                "persistent streaming sparse rows are not strictly ordered: prior {last_cx_id:?}, current {}",
+                row.cx_id
+            )));
+        }
+        last_cx_id = Some(row.cx_id);
+        let expected_doc_len =
+            validate_sparse_weights(&row.entries, header.scoring, &format!("row {}", row.cx_id))?;
+        if row.doc_len.to_bits() != expected_doc_len.to_bits() {
+            return Err(stale(format!(
+                "persistent streaming sparse row {} doc_len {} != weight sum {expected_doc_len}",
+                row.cx_id, row.doc_len
+            )));
+        }
+        SlotVector::Sparse {
+            dim: header.dim,
+            entries: row.entries.clone(),
+        }
+        .validate_schema()
+        .map_err(|error| {
+            stale(format!(
+                "persistent streaming sparse row {} has invalid payload: {}",
+                row.cx_id, error.message
+            ))
+        })?;
+        if !row.entries.is_empty() {
+            field_docs = field_docs
+                .checked_add(1)
+                .ok_or_else(|| stale("streaming sparse field-document count overflow"))?;
+            total_doc_len += row.doc_len;
+            if !total_doc_len.is_finite() {
+                return Err(stale("streaming sparse corpus length overflowed"));
+            }
+        }
+        visit(&header, &row)?;
+        count = count
+            .checked_add(1)
+            .ok_or_else(|| stale("streaming sparse row count overflow"))?;
+    }
+    if count != header.len || count != entry.len {
+        return Err(stale(format!(
+            "persistent streaming sparse row len {count} != header len {} / manifest len {}",
+            header.len, entry.len
+        )));
+    }
+    let avg_doc_len = if field_docs == 0 {
+        0.0
+    } else {
+        total_doc_len / field_docs as f32
+    };
+    if field_docs != header.field_docs || (avg_doc_len - header.avg_doc_len).abs() > f32::EPSILON {
+        return Err(stale(format!(
+            "persistent streaming sparse corpus stats field_docs={field_docs} avg_doc_len={avg_doc_len} do not match header field_docs={} avg_doc_len={}",
+            header.field_docs, header.avg_doc_len
+        )));
+    }
+    drop(reader);
+    let actual = hashing_reader.into_sha256();
+    let expected = entry.require_sha256(slot)?;
+    if actual != expected {
+        return Err(stale(format!(
+            "persistent streaming sparse sidecar sha256 {actual} != manifest {expected}; rebuild the vault search indexes"
+        )));
+    }
+    Ok(header)
+}
+
+fn validate_streaming_header(
+    header: &StreamingSparseHeader,
+    entry: &SearchIndexEntry,
+    manifest_base_seq: u64,
+    slot: SlotId,
+) -> CliResult {
+    if header.format != SPARSE_FORMAT_V4 {
+        return Err(stale(format!(
+            "persistent streaming sparse format {} != {SPARSE_FORMAT_V4}",
+            header.format
+        )));
+    }
+    entry.require_kind(header.scoring.index_kind(), slot)?;
+    if header.slot != slot.get() || entry.slot != slot.get() {
+        return Err(stale(format!(
+            "persistent streaming sparse slot {} / entry slot {} != query slot {}",
+            header.slot,
+            entry.slot,
+            slot.get()
+        )));
+    }
+    let entry_dim = entry.require_dim(slot)?;
+    if header.dim != entry_dim {
+        return Err(stale(format!(
+            "persistent streaming sparse dim {} != manifest dim {entry_dim}",
+            header.dim
+        )));
+    }
+    if header.base_seq != manifest_base_seq || entry.built_at_seq != manifest_base_seq {
+        return Err(stale(format!(
+            "persistent streaming sparse seq {} / entry seq {} != manifest seq {manifest_base_seq}",
+            header.base_seq, entry.built_at_seq
+        )));
+    }
+    if header.len != entry.len || !header.avg_doc_len.is_finite() || header.avg_doc_len < 0.0 {
+        return Err(stale(format!(
+            "persistent streaming sparse header len {} / avg_doc_len {} is inconsistent with manifest len {}",
+            header.len, header.avg_doc_len, entry.len
+        )));
+    }
+    Ok(())
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    path: &Path,
+    kind: &str,
+) -> CliResult<Option<String>> {
+    let mut line = String::new();
+    let read = reader
+        .take(MAX_SPARSE_LINE_BYTES + 1)
+        .read_line(&mut line)
+        .map_err(|error| {
+            stale(format!(
+                "persistent streaming sparse {kind} at {} could not be decoded as UTF-8: {error}",
+                path.display()
+            ))
+        })?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if read as u64 > MAX_SPARSE_LINE_BYTES {
+        return Err(stale(format!(
+            "persistent streaming sparse {kind} at {} exceeds the {MAX_SPARSE_LINE_BYTES}-byte structural bound",
+            path.display()
+        )));
+    }
+    if !line.ends_with('\n') {
+        return Err(stale(format!(
+            "persistent streaming sparse {kind} at {} is not newline-terminated",
+            path.display()
+        )));
+    }
+    Ok(Some(line))
+}
+
 type SparsePinCache = Mutex<BTreeMap<(String, u16), (String, Arc<SparseIndex>)>>;
 
 fn cache() -> &'static SparsePinCache {
@@ -437,41 +958,6 @@ fn pinned_index(
     Ok(index)
 }
 
-fn build_index(
-    slot: SlotId,
-    dim: u32,
-    source_rows: Vec<(CxId, Vec<SparseEntry>)>,
-    base_seq: u64,
-    scoring: SparseScoring,
-) -> CliResult<SparseIndex> {
-    let rows = source_rows
-        .into_iter()
-        .map(|(cx_id, entries)| {
-            let doc_len = validate_sparse_weights(&entries, scoring, &format!("row {cx_id}"))?;
-            Ok(SparseRow {
-                cx_id,
-                doc_len,
-                entries,
-            })
-        })
-        .collect::<CliResult<Vec<_>>>()?;
-    let postings = postings_from_rows(&rows);
-    let (doc_lengths, avg_doc_len) = sparse_stats(&rows)?;
-    let field_docs = field_doc_count(&rows);
-    Ok(SparseIndex {
-        format: SPARSE_FORMAT_V3.to_string(),
-        scoring,
-        slot: slot.get(),
-        dim,
-        base_seq,
-        rows,
-        postings,
-        doc_lengths,
-        avg_doc_len,
-        field_docs,
-    })
-}
-
 fn read(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
@@ -513,7 +999,11 @@ pub(super) fn validate_entry(
     manifest_base_seq: u64,
     slot: SlotId,
 ) -> CliResult {
-    let _ = read(vault_dir, entry, manifest_base_seq, slot)?;
+    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
+        visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, _| Ok(()))?;
+    } else {
+        let _ = read(vault_dir, entry, manifest_base_seq, slot)?;
+    }
     Ok(())
 }
 
