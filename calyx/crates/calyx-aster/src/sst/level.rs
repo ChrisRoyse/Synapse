@@ -203,6 +203,23 @@ impl LevelFile {
         }
     }
 
+    pub(super) fn open_key_state_reader(&self) -> Result<Option<SstPageReader>> {
+        match (&self.lookup, self.bounds.as_ref(), self.lookup_retained) {
+            (Some(lookup), _, _) => {
+                SstPageReader::open_sequential(self.path.clone(), Arc::clone(lookup)).map(Some)
+            }
+            (None, _, true) => Ok(None),
+            (None, Some(bounds), false) => {
+                SstPageReader::open_streaming_sequential(self.path.clone(), Arc::clone(bounds))
+                    .map(Some)
+            }
+            (None, None, false) => Err(CalyxError::aster_corrupt_shard(format!(
+                "cold SST {} has no validated bounds/sparse index; reload the level from its immutable files before serving an exact key-state count",
+                self.path.display()
+            ))),
+        }
+    }
+
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if !self.may_contain(key) {
             return Ok(None);
@@ -628,6 +645,16 @@ impl SstLevel {
         overlay: Vec<SstEntry>,
     ) -> Result<page::SstPageStream> {
         page::open_page_stream_with_overlay_origins(self, start, end, after_key, limit, overlay)
+    }
+
+    pub(crate) fn open_key_state_page_stream_with_overlay(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        overlay: Vec<SstEntry>,
+    ) -> Result<page::SstKeyStatePageStream> {
+        page::open_key_state_page_stream_with_overlay(self, start, end, limit, overlay)
     }
 
     pub fn iter(&self) -> Result<Vec<SstEntry>> {

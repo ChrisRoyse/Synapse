@@ -99,6 +99,20 @@ impl SstPageReader {
         DiskIndexCursor::open(path, bounds).map(SstPageReader::Streaming)
     }
 
+    pub(crate) fn open_sequential(path: PathBuf, lookup: Arc<SstLookupMetadata>) -> Result<Self> {
+        let point_reader = SstPointReader::open_sequential(&path)?;
+        Ok(Self::Retained {
+            path,
+            lookup,
+            point_reader,
+            position: 0,
+        })
+    }
+
+    pub(crate) fn open_streaming_sequential(path: PathBuf, bounds: Arc<SstBounds>) -> Result<Self> {
+        DiskIndexCursor::open_sequential(path, bounds).map(SstPageReader::Streaming)
+    }
+
     pub(crate) fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
         match self {
             Self::Retained {
@@ -142,6 +156,33 @@ impl SstPageReader {
                 })
             }
             Self::Streaming(reader) => reader.read_current(),
+        }
+    }
+
+    /// CRC-validates the current indexed record and returns only whether its
+    /// raw value is the Aster tombstone marker.
+    ///
+    /// Exact cardinality scans do not need an immutable row's payload. This
+    /// path still consumes every byte and verifies the index key plus record
+    /// CRC, but never allocates or returns the value.
+    pub(crate) fn read_current_tombstone_state(&mut self) -> Result<bool> {
+        match self {
+            Self::Retained {
+                path,
+                lookup,
+                point_reader,
+                position,
+            } => {
+                let (key, offset) = lookup.entry_at(*position).ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "SST key-state row position {position} is outside retained index length {} in {}",
+                        lookup.len(),
+                        path.display()
+                    ))
+                })?;
+                point_reader.read_tombstone_state(offset, key)
+            }
+            Self::Streaming(reader) => reader.read_current_tombstone_state(),
         }
     }
 
@@ -210,13 +251,32 @@ pub(crate) struct DiskIndexCursor {
 
 impl DiskIndexCursor {
     fn open(path: PathBuf, bounds: Arc<SstBounds>) -> Result<Self> {
+        Self::open_with_data_access(path, bounds, SstDataAccess::Random)
+    }
+
+    fn open_sequential(path: PathBuf, bounds: Arc<SstBounds>) -> Result<Self> {
+        Self::open_with_data_access(path, bounds, SstDataAccess::Sequential)
+    }
+
+    fn open_with_data_access(
+        path: PathBuf,
+        bounds: Arc<SstBounds>,
+        data_access: SstDataAccess,
+    ) -> Result<Self> {
         let result = (|| {
-            let point_reader = SstPointReader::open(&path)?;
+            let point_reader = SstPointReader::open_with_access(&path, data_access)?;
             let data_end = point_reader.data_end;
             let index_end = point_reader.index_end;
             let entries = point_reader.entries;
-            let mut index_file = OpenOptions::new()
-                .read(true)
+            let mut index_options = OpenOptions::new();
+            index_options.read(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                index_options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+            }
+            let mut index_file = index_options
                 .open(&path)
                 .map_err(|error| storage_error("open SST streaming index", &path, error))?;
             #[cfg(target_os = "linux")]
@@ -444,6 +504,17 @@ impl DiskIndexCursor {
         })
     }
 
+    fn read_current_tombstone_state(&mut self) -> Result<bool> {
+        let current = self.current.as_ref().ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "SST streaming key-state cursor is exhausted in {}",
+                self.path.display()
+            ))
+        })?;
+        self.point_reader
+            .read_tombstone_state(current.record_offset, &current.key)
+    }
+
     fn advance_one(&mut self) -> Result<()> {
         let Some(current) = self.current.take() else {
             return Ok(());
@@ -486,6 +557,15 @@ const STREAMING_INDEX_BUFFER_BYTES: usize = 16 * 1_024;
 /// ceiling this accounts for at most 32 MiB of data buffers per page operation.
 const STREAMING_DATA_BUFFER_BYTES: usize = 64 * 1_024;
 
+#[cfg(windows)]
+const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SstDataAccess {
+    Random,
+    Sequential,
+}
+
 #[derive(Debug)]
 pub(crate) struct SstPointReader {
     file: BufReader<File>,
@@ -507,22 +587,42 @@ struct IndexedRecordLayout {
 
 impl SstPointReader {
     pub(crate) fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_access(path, SstDataAccess::Random)
+    }
+
+    fn open_sequential(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_access(path, SstDataAccess::Sequential)
+    }
+
+    fn open_with_access(path: impl AsRef<Path>, access: SstDataAccess) -> Result<Self> {
         let path = path.as_ref();
-        let mut file = OpenOptions::new()
-            .read(true)
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(windows)]
+        if access == SstDataAccess::Sequential {
+            use std::os::windows::fs::OpenOptionsExt;
+
+            options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+        }
+        let mut file = options
             .open(path)
             .map_err(|error| storage_error("open SST for indexed row read", path, error))?;
         #[cfg(target_os = "linux")]
         {
             use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
 
-            posix_fadvise(&file, 0, 0, PosixFadviseAdvice::POSIX_FADV_RANDOM).map_err(|error| {
-                storage_error(
+            let (advice, action) = match access {
+                SstDataAccess::Random => (
+                    PosixFadviseAdvice::POSIX_FADV_RANDOM,
                     "declare random SST point-read access",
-                    path,
-                    io::Error::from(error),
-                )
-            })?;
+                ),
+                SstDataAccess::Sequential => (
+                    PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+                    "declare sequential SST key-state access",
+                ),
+            };
+            posix_fadvise(&file, 0, 0, advice)
+                .map_err(|error| storage_error(action, path, io::Error::from(error)))?;
             posix_fadvise(&file, 0, 0, PosixFadviseAdvice::POSIX_FADV_NOREUSE).map_err(
                 |error| {
                     storage_error(
@@ -601,6 +701,18 @@ impl SstPointReader {
         record_offset: u64,
         expected_key: &[u8],
     ) -> Result<()> {
+        self.read_tombstone_state(record_offset, expected_key)
+            .map(|_| ())
+    }
+
+    /// Validates one complete indexed record while retaining only its
+    /// tombstone state. The value is streamed through a fixed buffer, so this
+    /// has constant memory even for large rows.
+    pub(crate) fn read_tombstone_state(
+        &mut self,
+        record_offset: u64,
+        expected_key: &[u8],
+    ) -> Result<bool> {
         let layout = self.read_record_layout(record_offset, expected_key)?;
         let mut hasher = crc32fast::Hasher::new();
         let mut buffer = [0_u8; RECORD_VALIDATION_BUFFER_BYTES];
@@ -620,13 +732,23 @@ impl SstPointReader {
             cursor = cursor.saturating_add(expected.len() as u64);
         }
         let mut remaining = layout.value_len;
+        let mut value_position = 0_usize;
+        let mut is_tombstone = layout.value_len == crate::mvcc::TOMBSTONE_VALUE.len();
         cursor = layout.value_start;
         while remaining > 0 {
             let chunk_len = remaining.min(buffer.len());
             let chunk = &mut buffer[..chunk_len];
             self.read_exact_at(chunk, cursor)?;
             hasher.update(chunk);
+            if is_tombstone
+                && chunk
+                    != &crate::mvcc::TOMBSTONE_VALUE
+                        [value_position..value_position.saturating_add(chunk_len)]
+            {
+                is_tombstone = false;
+            }
             remaining -= chunk_len;
+            value_position = value_position.saturating_add(chunk_len);
             cursor = cursor.saturating_add(chunk_len as u64);
         }
         let actual_crc = hasher.finalize();
@@ -638,7 +760,7 @@ impl SstPointReader {
                 actual_crc,
             ));
         }
-        Ok(())
+        Ok(is_tombstone)
     }
 
     fn read_record_layout(

@@ -6,6 +6,7 @@ mod store;
 
 pub use lease::{Freshness, ReaderLease, SeqAllocator, Snapshot};
 pub use read_barrier::{CALYX_ASTER_BASE_CORRUPT, ReadBarrier};
+pub(crate) use store::TOMBSTONE_VALUE;
 pub use store::{
     CfChangeSignal, CfRead, DEFAULT_SNAPSHOT_VERSION_GC_MAX_CHAINS,
     DEFAULT_SNAPSHOT_VERSION_GC_MAX_PASS_US, DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US,

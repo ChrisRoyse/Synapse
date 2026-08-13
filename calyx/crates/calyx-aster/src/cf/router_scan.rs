@@ -138,6 +138,48 @@ impl CfRouter {
         Ok(())
     }
 
+    /// Streams exact newest-wins key/tombstone state without opening values.
+    ///
+    /// The lock hand-off is identical to `range_immutable_pages_until`, but
+    /// every immutable record is CRC-validated sequentially and only its key
+    /// state crosses the router boundary. This is the physical primitive for
+    /// exact counts; it must never decrypt or materialize payloads.
+    pub(crate) fn range_immutable_key_state_pages_until<F, E, R>(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        limit: usize,
+        overlay: Vec<SstEntry>,
+        release_row_guard: R,
+        mut on_page: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(Vec<crate::sst::page::SstKeyState>) -> std::result::Result<(), E>,
+        E: From<CalyxError>,
+        R: FnOnce(),
+    {
+        if limit == 0 {
+            release_row_guard();
+            return Ok(());
+        }
+        let shard = self.read_shard(cf).map_err(E::from)?;
+        release_row_guard();
+        let level = shard.levels.get(&cf).cloned().unwrap_or_default();
+        let mut stream = level
+            .open_key_state_page_stream_with_overlay(
+                &range.start,
+                range.end.as_deref(),
+                limit,
+                overlay,
+            )
+            .map_err(E::from)?;
+        drop(shard);
+        while let Some(states) = stream.next_page().map_err(E::from)? {
+            on_page(states)?;
+        }
+        Ok(())
+    }
+
     fn open_page_winners(
         &self,
         cf: ColumnFamily,

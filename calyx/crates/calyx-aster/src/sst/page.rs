@@ -94,6 +94,25 @@ pub(super) fn open_page_stream_with_overlay_origins(
     })
 }
 
+/// Opens a newest-wins stream that retains only key plus tombstone state.
+///
+/// Unlike the value page stream, this cursor validates every physical record
+/// as it enters the merge heap, including older duplicate versions that cannot
+/// win. That makes each SST data section a forward-only integrity-checked read
+/// and prevents sparse winning-value reads from multiplying physical I/O.
+pub(super) fn open_key_state_page_stream_with_overlay(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    limit: usize,
+    overlay: Vec<SstEntry>,
+) -> Result<SstKeyStatePageStream> {
+    Ok(SstKeyStatePageStream {
+        cursor: open_key_state_cursor(level, start, end, overlay)?,
+        limit,
+    })
+}
+
 /// An owning set of already-open immutable file handles plus its bounded
 /// newest-wins merge state.
 ///
@@ -118,6 +137,31 @@ impl SstPageStream {
     }
 }
 
+/// One visible raw key state after newest-wins merging.
+pub(crate) struct SstKeyState {
+    pub(crate) key: Vec<u8>,
+    pub(crate) is_tombstone: bool,
+}
+
+/// Allocation-bounded owning stream for exact key cardinality reads.
+pub(crate) struct SstKeyStatePageStream {
+    cursor: KeyStateCursor,
+    limit: usize,
+}
+
+impl SstKeyStatePageStream {
+    pub(crate) fn next_page(&mut self) -> Result<Option<Vec<SstKeyState>>> {
+        let mut page = Vec::with_capacity(self.limit);
+        while page.len() < self.limit {
+            let Some(state) = next_latest_key_state(&mut self.cursor)? else {
+                break;
+            };
+            page.push(state);
+        }
+        Ok((!page.is_empty()).then_some(page))
+    }
+}
+
 struct PageCursor {
     sources: Vec<PageSource>,
     heap: BinaryHeap<HeapItem>,
@@ -127,6 +171,47 @@ struct PageCursor {
 enum PageSource {
     Overlay { rows: Vec<SstEntry>, pos: usize },
     Sst { reader: Box<SstPageReader> },
+}
+
+struct KeyStateCursor {
+    sources: Vec<KeyStateSource>,
+    heap: BinaryHeap<KeyStateHeapItem>,
+    end: Option<Vec<u8>>,
+}
+
+enum KeyStateSource {
+    Overlay { rows: Vec<SstEntry>, pos: usize },
+    Sst { reader: Box<SstPageReader> },
+}
+
+#[derive(Debug)]
+struct KeyStateHeapItem {
+    key: Vec<u8>,
+    source: usize,
+    is_tombstone: bool,
+}
+
+impl PartialEq for KeyStateHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key && self.source == other.source
+    }
+}
+
+impl Eq for KeyStateHeapItem {}
+
+impl Ord for KeyStateHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .key
+            .cmp(&self.key)
+            .then_with(|| other.source.cmp(&self.source))
+    }
+}
+
+impl PartialOrd for KeyStateHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +252,46 @@ impl PageSource {
         match self {
             Self::Overlay { rows, pos } => Ok(rows[*pos].clone()),
             Self::Sst { reader } => reader.read_current(),
+        }
+    }
+
+    fn advance_past(&mut self, key: &[u8]) -> Result<()> {
+        match self {
+            Self::Overlay { rows, pos } => {
+                while rows.get(*pos).is_some_and(|row| row.key.as_slice() == key) {
+                    *pos += 1;
+                }
+                Ok(())
+            }
+            Self::Sst { reader } => reader.advance_past(key),
+        }
+    }
+}
+
+impl KeyStateSource {
+    fn current_key(&self, end: Option<&[u8]>) -> Option<&[u8]> {
+        let key = match self {
+            Self::Overlay { rows, pos } => rows.get(*pos).map(|row| row.key.as_slice()),
+            Self::Sst { reader } => reader.current_key(),
+        }?;
+        if end.is_some_and(|end| key >= end) {
+            None
+        } else {
+            Some(key)
+        }
+    }
+
+    fn read_current_tombstone_state(&mut self) -> Result<bool> {
+        match self {
+            Self::Overlay { rows, pos } => rows.get(*pos).map_or_else(
+                || {
+                    Err(CalyxError::aster_corrupt_shard(
+                        "key-state overlay cursor is exhausted".to_owned(),
+                    ))
+                },
+                |row| Ok(is_tombstone_value(&row.value)),
+            ),
+            Self::Sst { reader } => reader.read_current_tombstone_state(),
         }
     }
 
@@ -259,6 +384,75 @@ fn open_page_cursor(
     Ok(cursor)
 }
 
+fn open_key_state_cursor(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    overlay: Vec<SstEntry>,
+) -> Result<KeyStateCursor> {
+    let intersecting_sources = level
+        .files
+        .iter()
+        .filter(|file| file.may_intersect(start, end))
+        .count();
+    if intersecting_sources > MAX_INTERSECTING_SST_PAGE_SOURCES {
+        tracing::error!(
+            code = "CALYX_ASTER_SST_KEY_STATE_SOURCE_LIMIT_EXCEEDED",
+            intersecting_sources,
+            max_sources = MAX_INTERSECTING_SST_PAGE_SOURCES,
+            "key-state stream rejected excessive immutable source fan-in"
+        );
+        return Err(CalyxError {
+            code: "CALYX_ASTER_SST_KEY_STATE_SOURCE_LIMIT_EXCEEDED",
+            message: format!(
+                "key-state stream intersects {intersecting_sources} immutable sources, above the hard maximum {MAX_INTERSECTING_SST_PAGE_SOURCES}"
+            ),
+            remediation: "compact the affected column family below the key-state source ceiling, verify the retained lookup state, and retry; exact counts fail closed rather than opening unbounded cursor state",
+        });
+    }
+
+    let mut sources = Vec::new();
+    let overlay = overlay_page_rows(overlay, start, end, start, false);
+    if !overlay.is_empty() {
+        sources.push(KeyStateSource::Overlay {
+            rows: overlay,
+            pos: 0,
+        });
+    }
+    let file_sources = level
+        .files
+        .par_iter()
+        .filter(|file| file.may_intersect(start, end))
+        .map(|file| {
+            let Some(mut reader) = file.open_key_state_reader()? else {
+                return Ok(None);
+            };
+            reader.seek_lower_bound(start, false)?;
+            if reader
+                .current_key()
+                .is_some_and(|key| end.is_none_or(|end| key < end))
+            {
+                Ok(Some(KeyStateSource::Sst {
+                    reader: Box::new(reader),
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sources.extend(file_sources.into_iter().flatten());
+
+    let mut cursor = KeyStateCursor {
+        sources,
+        heap: BinaryHeap::new(),
+        end: end.map(<[u8]>::to_vec),
+    };
+    for source in 0..cursor.sources.len() {
+        cursor.push_current(source)?;
+    }
+    Ok(cursor)
+}
+
 impl PageCursor {
     fn push_current(&mut self, source: usize) {
         if let Some(key) = self.sources[source].current_key(self.end.as_deref()) {
@@ -267,6 +461,24 @@ impl PageCursor {
                 source,
             });
         }
+    }
+}
+
+impl KeyStateCursor {
+    fn push_current(&mut self, source: usize) -> Result<()> {
+        let Some(key) = self.sources[source]
+            .current_key(self.end.as_deref())
+            .map(<[u8]>::to_vec)
+        else {
+            return Ok(());
+        };
+        let is_tombstone = self.sources[source].read_current_tombstone_state()?;
+        self.heap.push(KeyStateHeapItem {
+            key,
+            source,
+            is_tombstone,
+        });
+        Ok(())
     }
 }
 
@@ -312,6 +524,36 @@ fn next_latest_entry(cursor: &mut PageCursor) -> Result<Option<SstPageWinner>> {
     Ok(Some(SstPageWinner {
         entry,
         from_overlay,
+    }))
+}
+
+fn next_latest_key_state(cursor: &mut KeyStateCursor) -> Result<Option<SstKeyState>> {
+    let Some(first) = cursor.heap.pop() else {
+        return Ok(None);
+    };
+    let next_key = first.key;
+    let is_tombstone = first.is_tombstone;
+    let mut duplicate_sources = vec![first.source];
+    while cursor
+        .heap
+        .peek()
+        .is_some_and(|item| item.key.as_slice() == next_key.as_slice())
+    {
+        duplicate_sources.push(
+            cursor
+                .heap
+                .pop()
+                .expect("peek confirmed duplicate key-state heap item")
+                .source,
+        );
+    }
+    for source in duplicate_sources {
+        cursor.sources[source].advance_past(&next_key)?;
+        cursor.push_current(source)?;
+    }
+    Ok(Some(SstKeyState {
+        key: next_key,
+        is_tombstone,
     }))
 }
 

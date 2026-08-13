@@ -6947,7 +6947,8 @@ impl SynapseCalyxVault {
     }
 
     /// Counts the visible rows of one column family from one pinned physical
-    /// snapshot, using one persistent immutable cursor (#1973, #2239).
+    /// snapshot, using one persistent immutable key-state cursor (#1973,
+    /// #2239).
     ///
     /// [`Self::count_cf_latest`] reads as `O(1)` and is not: it is identical to
     /// `scan_cf_latest().len()` in time, walking every row of the family under a
@@ -6962,10 +6963,14 @@ impl SynapseCalyxVault {
     /// constructions over 233 immutable files and more than a terabyte of
     /// physical reads. The snapshot path captures the MVCC delta once, opens
     /// the immutable sources once, and carries their merge cursor across every
-    /// page. It therefore preserves the short row-guard hold while making the
-    /// physical work linear in the sources and rows rather than pages times
-    /// sources. The returned walk is always atomic because every page belongs
-    /// to the same registered snapshot.
+    /// page. A later deployment proved that reading only winning *values* was
+    /// still pathological for exact cardinality: 14.4 million overwritten
+    /// records made sparse 64 KiB buffered seeks turn a 5.7 GiB corpus into 64
+    /// GiB of physical reads. The count cursor now consumes and CRC-validates
+    /// every record sequentially, retains only key plus tombstone state, and
+    /// never decrypts or materializes payloads. Physical work is linear in SST
+    /// bytes with bounded state per source. The returned walk is always atomic
+    /// because every page belongs to the same registered snapshot.
     ///
     /// # Errors
     ///
@@ -6977,12 +6982,22 @@ impl SynapseCalyxVault {
         cf: ColumnFamily,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError> {
         self.with_read_snapshot(INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-            self.walk_cf_snapshot(
-                snapshot,
-                cf,
-                SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
-                |_key, _value| Ok(SynapseCalyxWalkStep::Continue),
-            )
+            let (rows, pages) = self
+                .vault
+                .count_cf_snapshot(snapshot, cf, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS)
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx("count pinned Calyx CF key states", &error)
+                })?;
+            Ok(SynapseCalyxCfWalk {
+                column_family: cf.name(),
+                page_rows: SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                pages,
+                rows_examined: rows,
+                rows_visited: rows,
+                stopped_early: false,
+                snapshot_seq_first: snapshot.seq(),
+                snapshot_seq_last: snapshot.seq(),
+            })
         })
     }
 

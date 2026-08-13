@@ -156,6 +156,18 @@ where
             .scan_cf_pages_at(snapshot, cf, limit, &self.clock, on_page)
     }
 
+    /// Counts visible raw rows at an already-pinned snapshot without opening
+    /// immutable payloads. Returns `(rows, candidate_pages)`.
+    pub fn count_cf_snapshot(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        limit: usize,
+    ) -> Result<(usize, usize)> {
+        self.assert_cf_selected(cf, "count_cf_snapshot")?;
+        self.rows.count_cf_at(snapshot, cf, limit, &self.clock)
+    }
+
     /// Scans at most `limit` visible raw CF rows using an already-pinned snapshot lease.
     pub fn scan_cf_range_page_snapshot(
         &self,
