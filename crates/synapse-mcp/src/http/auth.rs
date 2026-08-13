@@ -40,6 +40,11 @@ pub(super) enum OriginFailure {
     OriginRefused,
 }
 
+pub(super) enum HttpSecurityDecision {
+    Authorized,
+    Respond(Response),
+}
+
 impl HttpAuth {
     pub(super) fn load(bind_addr: SocketAddr) -> anyhow::Result<Self> {
         let resolution = load_token()?;
@@ -105,6 +110,16 @@ pub(super) async fn require_http_security(
     request: Request<Body>,
     next: Next,
 ) -> Response {
+    match evaluate_http_security(&auth, &request) {
+        HttpSecurityDecision::Authorized => next.run(request).await,
+        HttpSecurityDecision::Respond(response) => response,
+    }
+}
+
+pub(super) fn evaluate_http_security(
+    auth: &HttpAuth,
+    request: &Request<Body>,
+) -> HttpSecurityDecision {
     if auth.bind_addr.ip().is_loopback() && validate_host(request.headers()).is_ok() {
         if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_cors_preflight_request(
             request.method(),
@@ -127,30 +142,40 @@ pub(super) async fn require_http_security(
                     .contains_key(header::ACCESS_CONTROL_REQUEST_HEADERS),
                 "accepted direct Chrome bridge CORS preflight"
             );
-            return crate::chrome_debugger_bridge::direct_http_bridge_cors_preflight_response();
+            return HttpSecurityDecision::Respond(
+                crate::chrome_debugger_bridge::direct_http_bridge_cors_preflight_response(),
+            );
         }
         if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_request(
             request.headers(),
             request.uri(),
         ) {
-            return next.run(request).await;
+            return HttpSecurityDecision::Authorized;
         }
         if crate::chrome_debugger_bridge::is_direct_http_extension_bridge_register_or_probe_request(
             request.headers(),
             request.uri(),
         ) {
             return match auth.authorize_bridge_register(request.headers()) {
-                Ok(()) => next.run(request).await,
-                Err(failure) => unauthorized_request(failure, &request, auth.source_label()),
+                Ok(()) => HttpSecurityDecision::Authorized,
+                Err(failure) => HttpSecurityDecision::Respond(unauthorized_request(
+                    failure,
+                    request,
+                    auth.source_label(),
+                )),
             };
         }
     }
     if let Err(failure) = auth.validate_origin_and_host(request.headers()) {
-        return forbidden(failure);
+        return HttpSecurityDecision::Respond(forbidden(failure));
     }
     match auth.authorize(request.headers()) {
-        Ok(()) => next.run(request).await,
-        Err(failure) => unauthorized_request(failure, &request, auth.source_label()),
+        Ok(()) => HttpSecurityDecision::Authorized,
+        Err(failure) => HttpSecurityDecision::Respond(unauthorized_request(
+            failure,
+            request,
+            auth.source_label(),
+        )),
     }
 }
 

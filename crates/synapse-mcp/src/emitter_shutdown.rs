@@ -265,6 +265,16 @@ impl<T: Send + 'static> ShutdownTaskOwner<T> {
         task.abort();
     }
 
+    /// Scheduling hint used only to detect that a task stopped before its
+    /// owner expected it to. The terminal outcome must still be consumed by
+    /// polling this owner and acknowledged into the caller's verdict.
+    pub(crate) fn task_finished_hint(&self) -> bool {
+        let Some(task) = self.task.as_ref() else {
+            unreachable!("shutdown task owner must contain its exact JoinHandle");
+        };
+        task.is_finished()
+    }
+
     /// Returns true only after this wrapper has consumed the exact
     /// `JoinHandle` result. `JoinHandle::is_finished()` is deliberately not a
     /// substitute: a finished-but-unpolled handle can still carry a panic or

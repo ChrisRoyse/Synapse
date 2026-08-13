@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    convert::Infallible,
     fmt::Write as _,
     fs,
     io::{self, Read as _},
@@ -8,8 +9,8 @@ use std::{
     pin::Pin,
     process::ExitCode,
     sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     task::{Context as TaskContext, Poll},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -48,6 +49,7 @@ use tokio::{
     time,
 };
 use tokio_util::sync::CancellationToken;
+use tower::ServiceExt as _;
 #[cfg(windows)]
 use windows::Win32::Foundation::{
     GetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, HANDLE_FLAGS, SetHandleInformation,
@@ -125,6 +127,7 @@ const HTTP_ESCALATION_WORKER_STOP_TIMEOUT: Duration = Duration::from_secs(35);
 const HTTP_BACKGROUND_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 const HTTP_SERVER_TASK_ABORT_TIMEOUT: Duration = Duration::from_secs(2);
+const HTTP_STARTUP_RETRY_AFTER_SECONDS: u8 = 1;
 const HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV: &str = "SYNAPSE_HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_SECS";
 /// How long the shutdown may produce **no evidence of progress at all** before
 /// the watchdog forces a nonzero exit (#2131).
@@ -363,6 +366,100 @@ struct HttpRouterRuntime {
     session_lifecycle: crate::server::session_lifecycle::SessionLifecycleState,
     drain_state: crate::server::drain::DaemonDrainState,
     background_tasks: Vec<HttpBackgroundTaskOwner>,
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupHttpPhase {
+    StorageCalyxOpen = 1,
+    ActivityRecorder = 2,
+    RuntimeStart = 3,
+    StorageMaintenance = 4,
+    Ready = 5,
+}
+
+impl StartupHttpPhase {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::StorageCalyxOpen => "storage_calyx_open",
+            Self::ActivityRecorder => "activity_recorder",
+            Self::RuntimeStart => "runtime_start",
+            Self::StorageMaintenance => "storage_maintenance",
+            Self::Ready => "ready",
+        }
+    }
+
+    fn from_stored(value: u8) -> Result<Self, u8> {
+        match value {
+            1 => Ok(Self::StorageCalyxOpen),
+            2 => Ok(Self::ActivityRecorder),
+            3 => Ok(Self::RuntimeStart),
+            4 => Ok(Self::StorageMaintenance),
+            5 => Ok(Self::Ready),
+            invalid => Err(invalid),
+        }
+    }
+}
+
+/// One-way startup dispatch gate. The listener serves only the authenticated
+/// 503 surface until the fully initialized production router is published.
+/// `OnceLock` makes a second or partial publication impossible.
+#[derive(Clone)]
+struct StartupHttpDispatch {
+    ready_app: Arc<OnceLock<Router>>,
+    phase: Arc<AtomicU8>,
+    auth: Arc<HttpAuth>,
+    bind_addr: SocketAddr,
+    started_wall_ms: u64,
+}
+
+impl StartupHttpDispatch {
+    fn new(bind_addr: SocketAddr, started_wall_ms: u64, auth: Arc<HttpAuth>) -> Self {
+        Self {
+            ready_app: Arc::new(OnceLock::new()),
+            phase: Arc::new(AtomicU8::new(StartupHttpPhase::StorageCalyxOpen as u8)),
+            auth,
+            bind_addr,
+            started_wall_ms,
+        }
+    }
+
+    fn set_phase(&self, phase: StartupHttpPhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+        tracing::info!(
+            code = "MCP_HTTP_STARTUP_PHASE_PUBLISHED",
+            bind = %self.bind_addr,
+            phase = phase.label(),
+            startup_elapsed_ms = wall_clock_millis_now().saturating_sub(self.started_wall_ms),
+            "HTTP startup listener phase advanced"
+        );
+    }
+
+    fn phase(&self) -> Result<StartupHttpPhase, u8> {
+        StartupHttpPhase::from_stored(self.phase.load(Ordering::Acquire))
+    }
+
+    fn publish_ready(&self, app: Router) -> anyhow::Result<()> {
+        self.ready_app.set(app).map_err(|_app| {
+            anyhow::anyhow!(
+                "HTTP production router publication was attempted more than once for {}",
+                self.bind_addr
+            )
+        })?;
+        self.set_phase(StartupHttpPhase::Ready);
+        Ok(())
+    }
+}
+
+struct StartupHttpServer {
+    task: ShutdownTaskOwner<io::Result<()>>,
+    active_http_sockets: ActiveHttpSockets,
+}
+
+impl StartupHttpServer {
+    fn task_finished_hint(&self) -> bool {
+        self.task.task_finished_hint()
+    }
 }
 
 struct HttpShutdownWatchdog {
@@ -1158,6 +1255,132 @@ fn own_http_background_task(name: &'static str, task: JoinHandle<()>) -> HttpBac
     (name, ShutdownTaskOwner::new_unit(name, task))
 }
 
+fn startup_http_router(dispatch: StartupHttpDispatch) -> Router {
+    Router::new()
+        .fallback(startup_http_dispatch)
+        .with_state(dispatch)
+        .layer(middleware::map_response(force_connection_close))
+}
+
+async fn startup_http_dispatch(
+    State(dispatch): State<StartupHttpDispatch>,
+    request: Request<Body>,
+) -> Response {
+    if let Some(app) = dispatch.ready_app.get().cloned() {
+        return app
+            .oneshot(request)
+            .await
+            .unwrap_or_else(|error: Infallible| match error {});
+    }
+
+    if let auth::HttpSecurityDecision::Respond(response) =
+        auth::evaluate_http_security(&dispatch.auth, &request)
+    {
+        return response;
+    }
+
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    let phase = match dispatch.phase() {
+        Ok(StartupHttpPhase::Ready) => {
+            tracing::error!(
+                code = "MCP_HTTP_STARTUP_DISPATCH_INCONSISTENT",
+                bind = %dispatch.bind_addr,
+                method = %method,
+                path,
+                "startup dispatch reported ready without a published production router"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                    (header::CONNECTION, HeaderValue::from_static("close")),
+                ],
+                Json(serde_json::json!({
+                    "ok": false,
+                    "status": "error",
+                    "code": "MCP_HTTP_STARTUP_DISPATCH_INCONSISTENT",
+                    "message": "startup dispatch reported ready without a published production router",
+                    "pid": std::process::id(),
+                    "bind": dispatch.bind_addr.to_string(),
+                })),
+            )
+                .into_response();
+        }
+        Ok(phase) => phase,
+        Err(stored_phase) => {
+            tracing::error!(
+                code = "MCP_HTTP_STARTUP_PHASE_CORRUPTED",
+                bind = %dispatch.bind_addr,
+                method = %method,
+                path,
+                stored_phase,
+                "startup dispatch phase contained an unrecognized value"
+            );
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                [
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                    (header::CONNECTION, HeaderValue::from_static("close")),
+                ],
+                Json(serde_json::json!({
+                    "ok": false,
+                    "status": "error",
+                    "code": "MCP_HTTP_STARTUP_PHASE_CORRUPTED",
+                    "message": "startup dispatch phase contained an unrecognized value",
+                    "pid": std::process::id(),
+                    "bind": dispatch.bind_addr.to_string(),
+                    "stored_phase": stored_phase,
+                })),
+            )
+                .into_response();
+        }
+    };
+    let startup_elapsed_ms = wall_clock_millis_now().saturating_sub(dispatch.started_wall_ms);
+    tracing::debug!(
+        code = "MCP_HTTP_STARTUP_REQUEST_REFUSED",
+        bind = %dispatch.bind_addr,
+        method = %method,
+        path,
+        phase = phase.label(),
+        startup_elapsed_ms,
+        retry_after_seconds = HTTP_STARTUP_RETRY_AFTER_SECONDS,
+        "authenticated HTTP request refused while daemon readiness prerequisites are incomplete"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::RETRY_AFTER, HeaderValue::from_static("1")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+            (header::CONNECTION, HeaderValue::from_static("close")),
+        ],
+        Json(serde_json::json!({
+            "ok": false,
+            "status": "starting",
+            "code": "MCP_HTTP_STARTING",
+            "message": "daemon readiness prerequisites are still initializing",
+            "phase": phase.label(),
+            "pid": std::process::id(),
+            "bind": dispatch.bind_addr.to_string(),
+            "startup_elapsed_ms": startup_elapsed_ms,
+            "retry_after_seconds": HTTP_STARTUP_RETRY_AFTER_SECONDS,
+        })),
+    )
+        .into_response()
+}
+
+fn ensure_startup_http_server_running(
+    server: &StartupHttpServer,
+    phase: &'static str,
+) -> anyhow::Result<()> {
+    if server.task_finished_hint() {
+        anyhow::bail!(
+            "HTTP startup listener task reached a terminal scheduling state during phase {phase}; its exact terminal result must be consumed by startup cleanup"
+        );
+    }
+    Ok(())
+}
+
 fn configured_http_shutdown_watchdog_timeout() -> anyhow::Result<Duration> {
     configured_positive_seconds(
         HTTP_SHUTDOWN_WATCHDOG_TIMEOUT_ENV,
@@ -1514,6 +1737,7 @@ fn start_http_runtime(
     shutdown_cancel: &CancellationToken,
     local_addr: SocketAddr,
     sse_state: SseState,
+    auth: Arc<HttpAuth>,
     active_http_sockets: ActiveHttpSockets,
 ) -> Result<HttpRuntimeStartup, HttpRuntimeStartupFailure> {
     let mut background_tasks = Vec::new();
@@ -1682,6 +1906,7 @@ fn start_http_runtime(
         local_addr,
         sse_state,
         service.clone(),
+        auth,
         active_http_sockets,
     )
     .context("build HTTP MCP router")
@@ -1712,6 +1937,7 @@ async fn fail_http_startup_after_service(
     a11y_expected: bool,
     shutdown_cancel: CancellationToken,
     connection_closed_cancel: CancellationToken,
+    startup_server: Option<StartupHttpServer>,
     shell_job_store_lock_guard: crate::single_instance::ShellJobStoreLockGuard,
     single_instance_guard: crate::single_instance::SingleInstanceGuard,
 ) -> anyhow::Result<ExitCode> {
@@ -1733,6 +1959,42 @@ async fn fail_http_startup_after_service(
 
     let mut failures = HttpShutdownFailures::default();
     failures.push(phase, primary_detail.clone());
+
+    let (active_socket_owners_quiescent, server_dispatch_quiescent) = if let Some(
+        mut startup_server,
+    ) = startup_server
+    {
+        let shutdown_on_drop = startup_server
+            .active_http_sockets
+            .begin_shutdown_on_drop("http_startup_failure");
+        let socket_shutdown = startup_server
+            .active_http_sockets
+            .shutdown_all("http_startup_failure");
+        failures.inspect_socket_shutdown(&socket_shutdown);
+        let server_stop =
+            wait_for_server_stop(&mut startup_server.task, "http_startup_failure").await;
+        failures.inspect_result("startup_server_stop", server_stop);
+        let final_socket_count = startup_server.active_http_sockets.final_tracked_count();
+        let active_socket_owners_quiescent = matches!(&final_socket_count, Ok(0));
+        failures.inspect_final_socket_count(final_socket_count);
+        let server_dispatch_quiescent = startup_server.task.terminal_join_observed();
+        if server_dispatch_quiescent {
+            startup_server.task.acknowledge_terminal_outcome();
+        }
+        tracing::info!(
+            code = "MCP_HTTP_STARTUP_SERVER_CLEANUP_READBACK",
+            phase,
+            shutdown_on_drop = ?shutdown_on_drop,
+            socket_shutdown = ?socket_shutdown,
+            active_socket_owners_quiescent,
+            server_dispatch_quiescent,
+            "startup-failure cleanup read back the exact HTTP listener and accepted-socket owners"
+        );
+        drop(startup_server);
+        (active_socket_owners_quiescent, server_dispatch_quiescent)
+    } else {
+        (true, true)
+    };
 
     let operator_panic_k2_owners_before = crate::safety::operator_panic_k2_task_owner_readback();
     let hotkey_report =
@@ -1848,8 +2110,8 @@ async fn fail_http_startup_after_service(
         authority_finalizers_quiescent,
         session_input_owners_quiescent,
         session_manager_quiescent,
-        active_socket_owners_quiescent: true,
-        server_dispatch_quiescent: true,
+        active_socket_owners_quiescent,
+        server_dispatch_quiescent,
         background_tasks_quiescent,
         m2_emitter_safe,
         activity_owners_quiescent,
@@ -1882,6 +2144,8 @@ async fn fail_http_startup_after_service(
                 "authority_finalizers_quiescent": authority_finalizers_quiescent,
                 "session_input_owners_quiescent": session_input_owners_quiescent,
                 "session_manager_quiescent": session_manager_quiescent,
+                "active_socket_owners_quiescent": active_socket_owners_quiescent,
+                "server_dispatch_quiescent": server_dispatch_quiescent,
                 "background_tasks_quiescent": background_tasks_quiescent,
                 "storage_service_owners": storage_owner_readback,
                 "m2_emitter": format!("{m2_emitter_drain:?}"),
@@ -2283,7 +2547,7 @@ impl StartupPhaseTimer {
                 total_ms = total_ms as u64,
                 threshold_ms = STARTUP_SLOW_PHASE_THRESHOLD_MS as u64,
                 listener_bound = self.listener_bound,
-                "startup phase exceeded the slow threshold; a client handshake overlapping this window can time out"
+                "startup phase exceeded the slow threshold; clients overlapping a bound phase receive authenticated not-ready responses until production routing is published"
             );
         }
         phase_ms as u64
@@ -2518,10 +2782,120 @@ pub(super) async fn serve(
     });
     let startup_service_init_ms = startup_timer.mark("service_init");
 
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
+            bind = %addr,
+            "non-loopback HTTP bind allowed by explicit operator flag"
+        );
+    }
+    let auth = match HttpAuth::load(addr).context("load HTTP bearer token") {
+        Ok(auth) => Arc::new(auth),
+        Err(error) => {
+            return fail_http_startup_after_service(
+                HttpRuntimeStartupFailure::new("http_auth", error, Vec::new(), None),
+                service,
+                m3_state_for_recorder,
+                m2_emitter_owner,
+                false,
+                false,
+                shutdown_cancel,
+                connection_closed_cancel,
+                None,
+                shell_job_store_lock_guard,
+                single_instance_guard,
+            )
+            .await;
+        }
+    };
+    tracing::info!(
+        code = "MCP_HTTP_AUTH_CONFIGURED",
+        source = auth.source_label(),
+        "HTTP bearer token configured before startup listener bind"
+    );
+    tracing::info!(
+        code = "MCP_HTTP_PRE_BIND",
+        bind = %addr,
+        startup_elapsed_ms = startup_timer.total_ms(),
+        listener_bound = false,
+        "about to bind the authenticated HTTP startup listener; no listener is bound at this point in startup"
+    );
+    let listener = match bind_http_listener(addr).await {
+        Ok(listener) => listener,
+        Err(error) => {
+            return fail_http_startup_after_service(
+                HttpRuntimeStartupFailure::new("listener_bind", error, Vec::new(), None),
+                service,
+                m3_state_for_recorder,
+                m2_emitter_owner,
+                false,
+                false,
+                shutdown_cancel,
+                connection_closed_cancel,
+                None,
+                shell_job_store_lock_guard,
+                single_instance_guard,
+            )
+            .await;
+        }
+    };
+    startup_timer.listener_bound = true;
+    let startup_listener_bind_ms = startup_timer.mark("listener_bind");
+    let listener_bind_at_wall_ms = wall_clock_millis_now();
+    let local_addr = match listener.local_addr().context("read HTTP listener address") {
+        Ok(local_addr) => local_addr,
+        Err(error) => {
+            drop(listener);
+            return fail_http_startup_after_service(
+                HttpRuntimeStartupFailure::new(
+                    "listener_address_readback",
+                    error,
+                    Vec::new(),
+                    None,
+                ),
+                service,
+                m3_state_for_recorder,
+                m2_emitter_owner,
+                false,
+                false,
+                shutdown_cancel,
+                connection_closed_cancel,
+                None,
+                shell_job_store_lock_guard,
+                single_instance_guard,
+            )
+            .await;
+        }
+    };
+    let active_http_sockets = ActiveHttpSockets::default();
+    let startup_dispatch =
+        StartupHttpDispatch::new(local_addr, startup_timer.started_wall_ms, Arc::clone(&auth));
+    let startup_app = startup_http_router(startup_dispatch.clone());
+    let startup_server = StartupHttpServer {
+        task: ShutdownTaskOwner::new(
+            "http_server_dispatch",
+            spawn_server(
+                listener,
+                startup_app,
+                shutdown_cancel.clone(),
+                active_http_sockets.clone(),
+            ),
+        ),
+        active_http_sockets: active_http_sockets.clone(),
+    };
+    tracing::info!(
+        code = "MCP_HTTP_STARTUP_LISTENER_STARTED",
+        bind = %local_addr,
+        phase = StartupHttpPhase::StorageCalyxOpen.label(),
+        startup_elapsed_ms = startup_timer.total_ms(),
+        retry_after_seconds = HTTP_STARTUP_RETRY_AFTER_SECONDS,
+        "authenticated startup listener is serving truthful not-ready responses"
+    );
+
     // Eager storage and Calyx vault open: validate lock/schema/vault state
-    // before the production TCP listener is bound. A bound listener before
-    // request-serving state exists makes setup health probes hang against a
-    // process that is not yet able to answer `/health`.
+    // while the authenticated startup listener returns a bounded, truthful 503.
+    // The production router remains unpublished, so no request can reach
+    // partially initialized service state.
     //
     // Periodic maintenance is started after the recorder/router startup
     // preflights below, otherwise its first Calyx GC tick can hold the vault and
@@ -2562,6 +2936,7 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2598,6 +2973,7 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2612,6 +2988,28 @@ pub(super) async fn serve(
     // Vault open dominates cold start (#1798): capture its isolated cost so a
     // handshake that overlaps a slow cold open is attributable to this phase.
     let startup_storage_calyx_open_ms = startup_timer.mark("storage_calyx_open");
+    if let Err(error) = ensure_startup_http_server_running(&startup_server, "storage_calyx_open") {
+        return fail_http_startup_after_service(
+            HttpRuntimeStartupFailure::new(
+                "startup_listener_storage_calyx_open",
+                error,
+                Vec::new(),
+                None,
+            ),
+            service,
+            m3_state_for_recorder,
+            m2_emitter_owner,
+            false,
+            false,
+            shutdown_cancel,
+            connection_closed_cancel,
+            Some(startup_server),
+            shell_job_store_lock_guard,
+            single_instance_guard,
+        )
+        .await;
+    }
+    startup_dispatch.set_phase(StartupHttpPhase::ActivityRecorder);
 
     // Always-on activity recorder (#837): started eagerly so the operator
     // timeline records whenever the daemon runs, before any tool call can
@@ -2642,6 +3040,7 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2669,6 +3068,7 @@ pub(super) async fn serve(
                 false,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2680,33 +3080,28 @@ pub(super) async fn serve(
         );
     }
     let startup_activity_recorder_ms = startup_timer.mark("activity_recorder");
-
-    if !addr.ip().is_loopback() {
-        tracing::warn!(
-            code = "MCP_HTTP_NON_LOOPBACK_BIND_ALLOWED",
-            bind = %addr,
-            "non-loopback HTTP bind allowed by explicit operator flag"
-        );
+    if let Err(error) = ensure_startup_http_server_running(&startup_server, "activity_recorder") {
+        return fail_http_startup_after_service(
+            HttpRuntimeStartupFailure::new(
+                "startup_listener_activity_recorder",
+                error,
+                Vec::new(),
+                None,
+            ),
+            service,
+            m3_state_for_recorder,
+            m2_emitter_owner,
+            true,
+            true,
+            shutdown_cancel,
+            connection_closed_cancel,
+            Some(startup_server),
+            shell_job_store_lock_guard,
+            single_instance_guard,
+        )
+        .await;
     }
-    // Pre-bind marker (#1773): everything above ran with NO listener bound. If
-    // this edge is present in the log but MCP_HTTP_BIND_NORMAL is not, the port
-    // was never bound (matches the issue's `NO_TCP_7700_ENDPOINT` readback) —
-    // the process either stalled in, or died before completing, the bind below.
-    tracing::info!(
-        code = "MCP_HTTP_PRE_BIND",
-        bind = %addr,
-        startup_elapsed_ms = startup_timer.total_ms(),
-        listener_bound = false,
-        "about to bind the production HTTP listener; no listener is bound at this point in startup"
-    );
-    let listener = bind_http_listener(addr).await?;
-    startup_timer.listener_bound = true;
-    let startup_listener_bind_ms = startup_timer.mark("listener_bind");
-    let local_addr = listener
-        .local_addr()
-        .context("read HTTP listener address")?;
-
-    let active_http_sockets = ActiveHttpSockets::default();
+    startup_dispatch.set_phase(StartupHttpPhase::RuntimeStart);
     let HttpRuntimeStartup {
         mut background_tasks,
         mut operator_hotkey_guard,
@@ -2716,11 +3111,11 @@ pub(super) async fn serve(
         &shutdown_cancel,
         local_addr,
         sse_state,
+        Arc::clone(&auth),
         active_http_sockets.clone(),
     ) {
         Ok(startup) => startup,
         Err(failure) => {
-            drop(listener);
             return fail_http_startup_after_service(
                 failure,
                 service,
@@ -2730,6 +3125,7 @@ pub(super) async fn serve(
                 true,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2737,6 +3133,29 @@ pub(super) async fn serve(
         }
     };
     let startup_runtime_start_ms = startup_timer.mark("runtime_start");
+    background_tasks.append(&mut runtime.background_tasks);
+    if let Err(error) = ensure_startup_http_server_running(&startup_server, "runtime_start") {
+        return fail_http_startup_after_service(
+            HttpRuntimeStartupFailure::new(
+                "startup_listener_runtime_start",
+                error,
+                background_tasks,
+                operator_hotkey_guard,
+            ),
+            service,
+            m3_state_for_recorder,
+            m2_emitter_owner,
+            true,
+            true,
+            shutdown_cancel,
+            connection_closed_cancel,
+            Some(startup_server),
+            shell_job_store_lock_guard,
+            single_instance_guard,
+        )
+        .await;
+    }
+    startup_dispatch.set_phase(StartupHttpPhase::StorageMaintenance);
 
     {
         let maintenance_result = match m3_state_for_recorder.lock() {
@@ -2751,7 +3170,6 @@ pub(super) async fn serve(
             }
         };
         let Some(maintenance_result) = maintenance_result else {
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_maintenance_state_lock",
@@ -2768,6 +3186,7 @@ pub(super) async fn serve(
                 true,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2781,7 +3200,6 @@ pub(super) async fn serve(
                 detail = %detail,
                 "refusing to start: storage maintenance failed after HTTP readiness prerequisites completed"
             );
-            drop(listener);
             return fail_http_startup_after_service(
                 HttpRuntimeStartupFailure::new(
                     "storage_maintenance_start_after_http_ready_prereqs",
@@ -2796,6 +3214,7 @@ pub(super) async fn serve(
                 true,
                 shutdown_cancel,
                 connection_closed_cancel,
+                Some(startup_server),
                 shell_job_store_lock_guard,
                 single_instance_guard,
             )
@@ -2809,6 +3228,53 @@ pub(super) async fn serve(
     }
     let startup_maintenance_start_ms = startup_timer.mark("maintenance_start");
     let m2_emitter_done = m2_emitter_owner.done_receiver();
+    if let Err(error) = ensure_startup_http_server_running(&startup_server, "maintenance_start") {
+        return fail_http_startup_after_service(
+            HttpRuntimeStartupFailure::new(
+                "startup_listener_maintenance_start",
+                error,
+                background_tasks,
+                operator_hotkey_guard,
+            ),
+            service,
+            m3_state_for_recorder,
+            m2_emitter_owner,
+            true,
+            true,
+            shutdown_cancel,
+            connection_closed_cancel,
+            Some(startup_server),
+            shell_job_store_lock_guard,
+            single_instance_guard,
+        )
+        .await;
+    }
+    if let Err(error) = startup_dispatch.publish_ready(runtime.app.clone()) {
+        return fail_http_startup_after_service(
+            HttpRuntimeStartupFailure::new(
+                "production_router_publish",
+                error,
+                background_tasks,
+                operator_hotkey_guard,
+            ),
+            service,
+            m3_state_for_recorder,
+            m2_emitter_owner,
+            true,
+            true,
+            shutdown_cancel,
+            connection_closed_cancel,
+            Some(startup_server),
+            shell_job_store_lock_guard,
+            single_instance_guard,
+        )
+        .await;
+    }
+    // The server router owns the only dispatch gate needed after publication.
+    // Do not retain a second production Router clone in this startup frame;
+    // shutdown owner-count readbacks must be able to observe it disappear when
+    // the exact server task joins.
+    drop(startup_dispatch);
 
     // #1773: single structured readiness record attributing where startup time
     // went, phase by phase, in one line. Vault open (`storage_calyx_open_ms`)
@@ -2821,7 +3287,7 @@ pub(super) async fn serve(
         listener_bound = true,
         total_ms = startup_timer.total_ms(),
         startup_began_at_wall_ms = startup_timer.started_wall_ms,
-        listener_bind_at_wall_ms = wall_clock_millis_now(),
+        listener_bind_at_wall_ms,
         single_instance_lock_ms = startup_single_instance_ms,
         shell_job_store_lock_ms = startup_shell_job_lock_ms,
         lifecycle_ledger_ms = startup_lifecycle_ledger_ms,
@@ -2843,15 +3309,11 @@ pub(super) async fn serve(
     );
 
     let shutdown_cancel_for_http_endpoint = shutdown_cancel.clone();
-    let mut server_task = ShutdownTaskOwner::new(
-        "http_server_dispatch",
-        spawn_server(
-            listener,
-            runtime.app.clone(),
-            shutdown_cancel.clone(),
-            active_http_sockets.clone(),
-        ),
-    );
+    let StartupHttpServer {
+        task: mut server_task,
+        active_http_sockets: startup_server_sockets,
+    } = startup_server;
+    drop(startup_server_sockets);
     let m2_done_after_server_stop = m2_emitter_done.clone();
     let m2_done_after_signal = m2_emitter_done.clone();
     let m2_done_after_parent = m2_emitter_done.clone();
@@ -3297,7 +3759,6 @@ pub(super) async fn serve(
     // recorder to commit the final session_end boundary. The recorder itself
     // stops its WinEvent/idle/cadence producers before that write, preserving
     // the invariant that session_end is the last timeline row.
-    background_tasks.append(&mut runtime.background_tasks);
     let background_task_drain = drain_http_background_tasks(background_tasks).await;
     let background_tasks_quiescent = background_task_drain.owners_quiescent();
     tracing::info!(
@@ -3524,14 +3985,9 @@ fn router(
     bind_addr: SocketAddr,
     sse_state: SseState,
     service: SynapseService,
+    auth: Arc<HttpAuth>,
     active_http_sockets: ActiveHttpSockets,
 ) -> anyhow::Result<HttpRouterRuntime> {
-    let auth = Arc::new(HttpAuth::load(bind_addr).context("load HTTP bearer token")?);
-    tracing::info!(
-        code = "MCP_HTTP_AUTH_CONFIGURED",
-        source = auth.source_label(),
-        "HTTP bearer token configured"
-    );
     let health_service = Arc::new(service.clone());
     let drain_state = service.drain_state_handle();
     let session_registry = service.session_registry_handle();

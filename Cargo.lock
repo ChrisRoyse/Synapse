@@ -3897,6 +3897,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "uuid",
