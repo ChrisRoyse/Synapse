@@ -845,8 +845,9 @@ impl SynapseCalyxVault {
             }))
     }
 
-    /// Scans the `Base` CF once and returns the dense-slot corpus for a panel,
-    /// restricted to the requested `created_at` window.
+    /// Reads at most `max_records` matching `Base` rows and returns their
+    /// dense-slot corpus for a panel, restricted to the requested `created_at`
+    /// window.
     fn load_panel_dense_corpus(
         &self,
         panel_version: u32,
@@ -855,7 +856,7 @@ impl SynapseCalyxVault {
         self.load_panel_dense_corpus_in_window(panel_version, max_records, TimeWindowNs::default())
     }
 
-    /// Scans the `Base` CF once and returns the panel corpus.
+    /// Reads a bounded `Base` prefix and returns the panel corpus.
     ///
     /// `panel_slots` records **every** lens the corpus carries with the kind of
     /// vector it actually stores, so the lens count equals the panel contract
@@ -892,6 +893,15 @@ impl SynapseCalyxVault {
         max_records: usize,
         window: TimeWindowNs,
     ) -> Result<DenseCorpus, SynapseCalyxError> {
+        if max_records == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_INTELLIGENCE_MAX_RECORDS_ZERO",
+                format!(
+                    "panel {panel_version} corpus loading requires at least one record; max_records=0 cannot produce a measurable corpus"
+                ),
+                "pass max_records in 1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS",
+            ));
+        }
         // A Base row carries only `(slot_id, slot_hash)` pairs: every slot it
         // decodes to is `SlotVector::Absent`, by design, because the vectors live
         // in the per-slot CFs. Building the corpus straight from the decoded Base
@@ -904,10 +914,14 @@ impl SynapseCalyxVault {
         let mut records_outside_window = 0usize;
         let mut panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind> = BTreeMap::new();
         let mut sparse_support: BTreeMap<SlotId, BTreeSet<u32>> = BTreeMap::new();
-        // #1968: paged rather than materialized. This fold never needed the whole
-        // `Base` CF resident — it walks each row once — and holding the `Base`
-        // row-guard across a 106k-row materialization stalled every constellation
-        // writer behind it for ~204 ms.
+        // #1968: paged rather than materialized. #2239: `max_records` is also a
+        // traversal bound, not merely a retained-vector bound. The previous
+        // implementation continued through the entire Base CF after filling
+        // the requested sample solely to report a population denominator. On
+        // the deployed vault max_records=1 therefore read ~64 GiB and expired
+        // its lease before returning one row. Exact whole-vault population
+        // questions belong to the explicit panel census; intelligence work is
+        // measured over the bounded corpus it actually hydrates.
         self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
             self.walk_cf_snapshot(
                 snapshot,
@@ -925,14 +939,6 @@ impl SynapseCalyxVault {
                         return Ok(crate::SynapseCalyxWalkStep::Continue);
                     }
                     records_scanned += 1;
-                    if records.len() >= max_records {
-                        // Deliberately `Continue`, matching the pre-paging `continue`:
-                        // `records_scanned` is a count over the whole panel-and-window
-                        // population and `max_records` bounds only the *loaded*
-                        // subset, so the walk must reach the end of the CF for that
-                        // denominator to mean what it says.
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
                     let hydrated = self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
                     for (slot, vector) in &hydrated.slots {
                         let kind = SynapseCalyxSlotKind::of(vector);
@@ -952,7 +958,11 @@ impl SynapseCalyxVault {
                         }
                     }
                     records.push(DenseRecord::from_constellation(&hydrated));
-                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                    if records.len() >= max_records {
+                        Ok(crate::SynapseCalyxWalkStep::Stop)
+                    } else {
+                        Ok(crate::SynapseCalyxWalkStep::Continue)
+                    }
                 },
             )
         })?;

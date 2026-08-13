@@ -657,6 +657,16 @@ impl SstLevel {
         page::open_key_state_page_stream_with_overlay(self, start, end, limit, overlay)
     }
 
+    pub(crate) fn open_sequential_page_stream_with_overlay_origins(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        limit: usize,
+        overlay: Vec<SstEntry>,
+    ) -> Result<page::SstSequentialPageStream> {
+        page::open_sequential_page_stream_with_overlay_origins(self, start, end, limit, overlay)
+    }
+
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
         self.collect_range(&[], None)
     }

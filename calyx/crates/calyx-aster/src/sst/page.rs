@@ -1,5 +1,5 @@
 use super::level::SstLevel;
-use super::{MAX_INTERSECTING_SST_PAGE_SOURCES, SstEntry, SstPageReader};
+use super::{MAX_INTERSECTING_SST_PAGE_SOURCES, SstEntry, SstPageReader, materialized_entry_bytes};
 use crate::mvcc::is_tombstone_value;
 use calyx_core::{CalyxError, Result};
 use rayon::prelude::*;
@@ -113,6 +113,27 @@ pub(super) fn open_key_state_page_stream_with_overlay(
     })
 }
 
+/// Opens a snapshot value stream that reads every source forward only.
+///
+/// The ordinary page cursor delays value reads until it knows the winner,
+/// which is ideal for a short random range but pathological for a whole-CF
+/// merge with many overlapping SSTs: winning offsets become sparse point
+/// reads. This stream validates and retains one current raw value per source,
+/// so every source data section advances sequentially while newest-wins still
+/// decides which values cross the router's decryption boundary.
+pub(super) fn open_sequential_page_stream_with_overlay_origins(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    limit: usize,
+    overlay: Vec<SstEntry>,
+) -> Result<SstSequentialPageStream> {
+    Ok(SstSequentialPageStream {
+        cursor: open_sequential_page_cursor(level, start, end, overlay)?,
+        limit,
+    })
+}
+
 /// An owning set of already-open immutable file handles plus its bounded
 /// newest-wins merge state.
 ///
@@ -162,6 +183,40 @@ impl SstKeyStatePageStream {
     }
 }
 
+/// Memory ceiling for the one-current-value-per-source merge and each output
+/// page. Exceeding it is explicit compaction/data-shape debt, never permission
+/// to materialize until the daemon exhausts host memory.
+const SEQUENTIAL_SNAPSHOT_PAGE_MAX_BYTES: usize = 64 << 20;
+
+pub(crate) struct SstSequentialPageStream {
+    cursor: SequentialPageCursor,
+    limit: usize,
+}
+
+impl SstSequentialPageStream {
+    pub(crate) fn next_page(&mut self) -> Result<Option<Vec<SstPageWinner>>> {
+        let mut page = Vec::with_capacity(self.limit);
+        let mut page_bytes = 0_usize;
+        while page.len() < self.limit {
+            let Some(winner) = next_latest_sequential_entry(&mut self.cursor)? else {
+                break;
+            };
+            let row_bytes =
+                materialized_entry_bytes::<SstEntry>(&winner.entry.key, &winner.entry.value);
+            page_bytes = page_bytes.saturating_add(row_bytes);
+            if page_bytes > SEQUENTIAL_SNAPSHOT_PAGE_MAX_BYTES {
+                return Err(sequential_snapshot_memory_budget(
+                    "output page",
+                    page_bytes,
+                    row_bytes,
+                ));
+            }
+            page.push(winner);
+        }
+        Ok((!page.is_empty()).then_some(page))
+    }
+}
+
 struct PageCursor {
     sources: Vec<PageSource>,
     heap: BinaryHeap<HeapItem>,
@@ -179,6 +234,13 @@ struct KeyStateCursor {
     end: Option<Vec<u8>>,
 }
 
+struct SequentialPageCursor {
+    sources: Vec<PageSource>,
+    heap: BinaryHeap<SequentialHeapItem>,
+    heap_bytes: usize,
+    end: Option<Vec<u8>>,
+}
+
 enum KeyStateSource {
     Overlay { rows: Vec<SstEntry>, pos: usize },
     Sst { reader: Box<SstPageReader> },
@@ -189,6 +251,36 @@ struct KeyStateHeapItem {
     key: Vec<u8>,
     source: usize,
     is_tombstone: bool,
+}
+
+#[derive(Debug)]
+struct SequentialHeapItem {
+    entry: SstEntry,
+    source: usize,
+}
+
+impl PartialEq for SequentialHeapItem {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry.key == other.entry.key && self.source == other.source
+    }
+}
+
+impl Eq for SequentialHeapItem {}
+
+impl Ord for SequentialHeapItem {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .entry
+            .key
+            .cmp(&self.entry.key)
+            .then_with(|| other.source.cmp(&self.source))
+    }
+}
+
+impl PartialOrd for SequentialHeapItem {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl PartialEq for KeyStateHeapItem {
@@ -453,6 +545,76 @@ fn open_key_state_cursor(
     Ok(cursor)
 }
 
+fn open_sequential_page_cursor(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    overlay: Vec<SstEntry>,
+) -> Result<SequentialPageCursor> {
+    let intersecting_sources = level
+        .files
+        .iter()
+        .filter(|file| file.may_intersect(start, end))
+        .count();
+    if intersecting_sources > MAX_INTERSECTING_SST_PAGE_SOURCES {
+        tracing::error!(
+            code = "CALYX_ASTER_SST_SEQUENTIAL_SOURCE_LIMIT_EXCEEDED",
+            intersecting_sources,
+            max_sources = MAX_INTERSECTING_SST_PAGE_SOURCES,
+            "sequential snapshot stream rejected excessive immutable source fan-in"
+        );
+        return Err(CalyxError {
+            code: "CALYX_ASTER_SST_SEQUENTIAL_SOURCE_LIMIT_EXCEEDED",
+            message: format!(
+                "sequential snapshot stream intersects {intersecting_sources} immutable sources, above the hard maximum {MAX_INTERSECTING_SST_PAGE_SOURCES}"
+            ),
+            remediation: "compact the affected column family below the snapshot source ceiling and retry; the scan fails closed instead of opening unbounded cursor state",
+        });
+    }
+
+    let mut sources = Vec::new();
+    let overlay = overlay_page_rows(overlay, start, end, start, false);
+    if !overlay.is_empty() {
+        sources.push(PageSource::Overlay {
+            rows: overlay,
+            pos: 0,
+        });
+    }
+    let file_sources = level
+        .files
+        .par_iter()
+        .filter(|file| file.may_intersect(start, end))
+        .map(|file| {
+            let Some(mut reader) = file.open_key_state_reader()? else {
+                return Ok(None);
+            };
+            reader.seek_lower_bound(start, false)?;
+            if reader
+                .current_key()
+                .is_some_and(|key| end.is_none_or(|end| key < end))
+            {
+                Ok(Some(PageSource::Sst {
+                    reader: Box::new(reader),
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    sources.extend(file_sources.into_iter().flatten());
+
+    let mut cursor = SequentialPageCursor {
+        sources,
+        heap: BinaryHeap::new(),
+        heap_bytes: 0,
+        end: end.map(<[u8]>::to_vec),
+    };
+    for source in 0..cursor.sources.len() {
+        cursor.push_current(source)?;
+    }
+    Ok(cursor)
+}
+
 impl PageCursor {
     fn push_current(&mut self, source: usize) {
         if let Some(key) = self.sources[source].current_key(self.end.as_deref()) {
@@ -479,6 +641,37 @@ impl KeyStateCursor {
             is_tombstone,
         });
         Ok(())
+    }
+}
+
+impl SequentialPageCursor {
+    fn push_current(&mut self, source: usize) -> Result<()> {
+        if self.sources[source]
+            .current_key(self.end.as_deref())
+            .is_none()
+        {
+            return Ok(());
+        }
+        let entry = self.sources[source].read_current()?;
+        let row_bytes = materialized_entry_bytes::<SstEntry>(&entry.key, &entry.value);
+        let next_bytes = self.heap_bytes.saturating_add(row_bytes);
+        if next_bytes > SEQUENTIAL_SNAPSHOT_PAGE_MAX_BYTES {
+            return Err(sequential_snapshot_memory_budget(
+                "merge frontier",
+                next_bytes,
+                row_bytes,
+            ));
+        }
+        self.heap_bytes = next_bytes;
+        self.heap.push(SequentialHeapItem { entry, source });
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Option<SequentialHeapItem> {
+        let item = self.heap.pop()?;
+        let row_bytes = materialized_entry_bytes::<SstEntry>(&item.entry.key, &item.entry.value);
+        self.heap_bytes = self.heap_bytes.saturating_sub(row_bytes);
+        Some(item)
     }
 }
 
@@ -555,6 +748,53 @@ fn next_latest_key_state(cursor: &mut KeyStateCursor) -> Result<Option<SstKeySta
         key: next_key,
         is_tombstone,
     }))
+}
+
+fn next_latest_sequential_entry(
+    cursor: &mut SequentialPageCursor,
+) -> Result<Option<SstPageWinner>> {
+    let Some(first) = cursor.pop() else {
+        return Ok(None);
+    };
+    let next_key = first.entry.key.clone();
+    let winner_source = first.source;
+    let from_overlay = matches!(&cursor.sources[winner_source], PageSource::Overlay { .. });
+    let entry = first.entry;
+    let mut duplicate_sources = vec![winner_source];
+    while cursor
+        .heap
+        .peek()
+        .is_some_and(|item| item.entry.key.as_slice() == next_key.as_slice())
+    {
+        duplicate_sources.push(
+            cursor
+                .pop()
+                .expect("peek confirmed duplicate sequential heap item")
+                .source,
+        );
+    }
+    for source in duplicate_sources {
+        cursor.sources[source].advance_past(&next_key)?;
+        cursor.push_current(source)?;
+    }
+    Ok(Some(SstPageWinner {
+        entry,
+        from_overlay,
+    }))
+}
+
+fn sequential_snapshot_memory_budget(
+    scope: &'static str,
+    retained: usize,
+    next_record: usize,
+) -> CalyxError {
+    CalyxError {
+        code: "CALYX_ASTER_SEQUENTIAL_SNAPSHOT_MEMORY_BUDGET",
+        message: format!(
+            "sequential snapshot {scope} requires {retained} bytes after a {next_record}-byte record, above the {SEQUENTIAL_SNAPSHOT_PAGE_MAX_BYTES}-byte transient budget"
+        ),
+        remediation: "repair or split oversized immutable rows and compact excessive overlapping SSTs; snapshot paging fails closed instead of exhausting daemon memory",
+    }
 }
 
 fn overlay_page_rows(

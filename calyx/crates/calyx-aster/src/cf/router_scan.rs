@@ -123,10 +123,9 @@ impl CfRouter {
         release_row_guard();
         let level = shard.levels.get(&cf).cloned().unwrap_or_default();
         let mut stream = level
-            .open_page_stream_with_overlay_origins(
+            .open_sequential_page_stream_with_overlay_origins(
                 &range.start,
                 range.end.as_deref(),
-                None,
                 limit,
                 overlay,
             )
