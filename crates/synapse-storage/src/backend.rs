@@ -1,5 +1,7 @@
 use std::{
+    cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
+    mem::size_of,
     ops::ControlFlow,
     path::{Path, PathBuf},
     str::FromStr,
@@ -4324,124 +4326,87 @@ impl StorageBackend for CalyxBackend {
     }
 
     fn measure_panel_coverage(&self) -> StorageResult<crate::panel_coverage::PanelCoverageReport> {
-        let census = self.vault.with_vault(
-            "calyx_panel_census",
-            "census every Calyx panel generation in the Base CF",
+        // #2243: index each declared physical source namespace BEFORE decoding
+        // Base. The old order retained ~1.9 million hex Strings from Base and
+        // then joined them against source rows, duplicating the corpus and
+        // pushing a background-only census above 1 GiB. This index stores each
+        // physical key once as contiguous raw bytes plus one u32 end offset;
+        // Base can therefore perform exact membership as each row passes and
+        // retain only the rare keys proven absent.
+        let declared_source_cfs = panel_coverage_declared_source_cfs();
+        let (census, source_indices, source_cf_rows) = self.vault.with_vault(
+            "calyx_panel_coverage",
+            "measure source membership and every Base generation at one pinned Calyx sequence",
             true,
             |vault| {
-                vault.panel_census().map_err(|source| {
-                    calyx_write_failed(
-                        "calyx_panel_census",
-                        "census every Calyx panel generation in the Base CF",
+                let reader = CalyxPinnedReader::pin(
+                    vault,
+                    "calyx_panel_coverage",
+                    PANEL_COVERAGE_SOURCE_CENSUS_SITE,
+                    CALYX_GC_SOURCE_CENSUS_LEASE_MS,
+                )?;
+                let pinned_seq = reader.pinned_seq();
+                let read_at_unix_ms = vault.clock_now_ms().map_err(|source| {
+                    calyx_read_failed(
+                        "calyx_panel_coverage",
+                        "read the vault clock for the pinned panel-coverage census",
                         &source,
                     )
-                })
+                })?;
+                let mut source_indices: BTreeMap<String, PackedSortedKeys> = BTreeMap::new();
+                let mut source_cf_rows = BTreeMap::new();
+                for (cf_name, source_is_full_cf) in declared_source_cfs {
+                    // Membership is measured for sampled and full-CF panels:
+                    // both can have orphans. Expired rows remain physically
+                    // present in the index, but only live rows contribute to a
+                    // full-CF coverage denominator (#1882/#1940). The shared pin
+                    // excludes later commits from every source and Base page.
+                    let (live_rows, index) = build_panel_coverage_source_index(
+                        &reader,
+                        &cf_name,
+                        read_at_unix_ms,
+                    )?;
+                    tracing::info!(
+                        code = "SYNAPSE_PANEL_COVERAGE_SOURCE_INDEX_COMPLETE",
+                        source_cf = %cf_name,
+                        pinned_seq,
+                        physical_key_count = index.len(),
+                        packed_key_bytes = index.packed_bytes(),
+                        offset_bytes = index.offset_bytes(),
+                        live_rows,
+                        "panel coverage built an exact allocation-compact physical source-key index"
+                    );
+                    // A subset-fed panel has no meaningful coverage ratio.
+                    if source_is_full_cf {
+                        source_cf_rows.insert(cf_name.clone(), live_rows);
+                    }
+                    source_indices.insert(cf_name, index);
+                }
+
+                let census = vault
+                    .panel_census_snapshot(reader.snapshot(), |source_cf, source_key_hex| {
+                        source_indices
+                            .get(source_cf)
+                            .map(|index| index.contains_lower_hex(source_key_hex))
+                    })
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_panel_coverage",
+                            "census every Calyx panel generation with exact source membership at the pinned sequence",
+                            &source,
+                        )
+                    })?;
+                tracing::info!(
+                    code = "SYNAPSE_PANEL_COVERAGE_PINNED_CENSUS_COMPLETE",
+                    pinned_seq,
+                    source_cf_count = source_indices.len(),
+                    base_cf_rows = census.base_cf_rows,
+                    decode_failures = census.decode_failures,
+                    "panel coverage completed source and Base membership at one committed Calyx sequence"
+                );
+                Ok((census, source_indices, source_cf_rows))
             },
         )?;
-
-        // Count ONLY the CFs that are a declared full-CF denominator. Counting
-        // every CF would read ~28k unrelated CF_KV rows for a number the report
-        // deliberately does not derive a fraction from (a subset-fed panel has
-        // no meaningful denominator), and this pass runs on a five-minute tick.
-        let mut source_cf_rows = BTreeMap::new();
-        // #1940/#2243: retain only census-referenced keys proven absent, not
-        // every physical source key. The physical namespace and the compact
-        // census vectors are both strictly ordered, so a monotonic exact merge
-        // answers the same membership question with no second corpus-sized key
-        // tree. Presence of an empty set proves the CF was measured and every
-        // referenced key existed; absence of the map entry remains unknown.
-        let mut source_cf_absent_keys: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for entry in constellations::builtin_panel_catalog() {
-            let Some(cf_name) = entry.source.cf_name() else {
-                continue;
-            };
-            if source_cf_absent_keys.contains_key(cf_name) {
-                continue;
-            }
-            // The row COUNT is still only taken for a declared full-CF
-            // denominator: a subset-fed panel has no meaningful coverage
-            // fraction, and deriving one would read as a permanent outage.
-            // The ordered physical pass is taken for every source CF, including
-            // subset-fed ones (#1940). The orphan probe is a per-record
-            // membership test — "is this record's own source row still there"
-            // — and that question is exactly as meaningful for a sampled panel
-            // as for a full-CF one. Skipping them made the census under-report:
-            // measured 2026-08-01 it found 226 of the 227 orphans an
-            // independent audit found, missing `syn-observation-v1`'s one
-            // record purely because its panel is sampled.
-            //
-            // The membership merge treats expired rows as physically PRESENT,
-            // and that is not the same question the row count answers (#1940).
-            //
-            // `source_cf_rows` is a coverage denominator: "how many source rows
-            // is this panel supposed to have measured". A row past its TTL is
-            // on its way out and measuring it is pointless, so it is excluded.
-            //
-            // The orphan probe asks something else: "can this record's own
-            // source row still be read". A row past its TTL but still
-            // physically in the vault CAN be read and re-measured until the GC
-            // actually removes it, so counting it as gone would overstate the
-            // loss — the same call `--audit-source-coverage` makes for the same
-            // reason (#1882). Measured on the live vault 2026-08-01, the two
-            // readings of CF_ACTION_LOG differ by a factor of nine (82 unexpired
-            // vs 747 physically present), so this is the difference between
-            // reporting 665 orphans and the true 224.
-            //
-            // **#2060.** Both readings come from ONE bounded-hold paged fold,
-            // where they used to be two whole-CF `scan_cf_range_latest` holds.
-            // That site was the one whole-CF fold left on the maintainer's path
-            // after 682e6fdb, and it cost exactly five wide holds of 188-348 ms
-            // per census — ~1.2 s of cumulative commit-blocking every five
-            // minutes, measured on the deployed daemon at 16:08:48-16:08:49Z
-            // (188105/190442/249255/244189/198859 µs), with `health` round-trips
-            // inside the tick window reaching 3.9 s against a 686 ms median.
-            //
-            // The correctness argument is 682e6fdb's, unchanged, and it applies
-            // here more simply than it did to eviction because this fold only
-            // READS: row-table entries are only ever created, so a cursor cannot
-            // skip or double-visit a key; a commit concurrent with the fold
-            // allocates a sequence above the pinned one and is excluded from
-            // every page's answer; and a concurrent reclaim keeps each chain's
-            // newest version at or below the safe point, which is clamped to the
-            // oldest pinned sequence, so the version this fold reads is never
-            // the one dropped. The lease is re-checked per page, so a fold that
-            // outlived its pin fails closed rather than reading a partially
-            // reclaimed view. Unlike the eviction sweep there is no observe-to-
-            // delete window to close: nothing here proposes a mutation, so a row
-            // rewritten between two pages simply contributes its newer value to
-            // a census that is explicitly a five-minute sample.
-            let mut referenced_keys: Vec<&str> = census
-                .entries
-                .iter()
-                .filter_map(|generation| generation.source_key_hexes.get(cf_name))
-                .flatten()
-                .map(String::as_str)
-                .collect();
-            referenced_keys.sort_unstable();
-            referenced_keys.dedup();
-            let referenced_key_count = referenced_keys.len();
-            let (live_rows, absent_keys) = self.with_vault(
-                cf_name,
-                "merge census-referenced keys against one Calyx source CF in bounded pages",
-                false,
-                |vault| merge_panel_coverage_source_cf(vault, cf_name, &referenced_keys),
-            )?;
-            tracing::info!(
-                code = "SYNAPSE_PANEL_COVERAGE_SOURCE_MERGE_COMPLETE",
-                source_cf = cf_name,
-                referenced_key_count,
-                absent_key_count = absent_keys.len(),
-                live_rows,
-                "panel coverage completed an exact ordered source-key merge without retaining the physical key corpus"
-            );
-            // The row COUNT is still only taken for a declared full-CF
-            // denominator: a subset-fed panel has no meaningful coverage
-            // fraction, and deriving one would read as a permanent outage.
-            if entry.source.is_full_cf() {
-                source_cf_rows.insert(cf_name.to_owned(), live_rows);
-            }
-            source_cf_absent_keys.insert(cf_name.to_owned(), absent_keys);
-        }
 
         // #2062: the second authority. The catalog is a compile-time table and
         // structurally cannot claim a generation minted at runtime, so a census
@@ -4458,7 +4423,11 @@ impl StorageBackend for CalyxBackend {
         let report = crate::panel_coverage::build_panel_coverage_report(
             &census,
             &source_cf_rows,
-            &source_cf_absent_keys,
+            &|source_cf, source_key_hex| {
+                source_indices
+                    .get(source_cf)
+                    .map(|index| index.contains_lower_hex(source_key_hex))
+            },
             &ownership,
         );
         if !report.accounting_holds() {
@@ -11187,53 +11156,204 @@ where
     })
 }
 
-/// Exact anti-join of the census-referenced source identities against one
-/// physical source CF. Both inputs are ordered; only unmatched census keys are
-/// retained, so physical rows unrelated to panel coverage never become heap
-/// state. Expired rows remain present for membership but not for the live-row
-/// coverage denominator.
-fn merge_panel_coverage_source_cf(
-    vault: &impl CalyxVaultKvRead,
+/// Exact ordered source-key membership with one allocation for all key bytes and
+/// one fixed-width offset per key.
+///
+/// The logical source namespace is strictly ordered by
+/// [`sweep_calyx_namespace_rows`]. Keeping raw bytes preserves that ordering and
+/// avoids materialising two lowercase hex bytes plus a `String` allocation for
+/// every physical row. Candidate Base metadata is compared to the lowercase hex
+/// representation byte by byte, without decoding or allocating it; malformed or
+/// uppercase metadata therefore remains absent exactly as it was under the old
+/// lowercase-String merge.
+#[derive(Default)]
+struct PackedSortedKeys {
+    bytes: Vec<u8>,
+    ends: Vec<u32>,
+}
+
+impl PackedSortedKeys {
+    fn push(&mut self, cf_name: &str, key: &[u8]) -> StorageResult<()> {
+        if let Some(previous) = self.last()
+            && previous >= key
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "SYNAPSE_PANEL_COVERAGE_SOURCE_INDEX_ORDER_INVALID: source keys must be strictly increasing; previous={} current={}",
+                    constellations::hex_encode(previous),
+                    constellations::hex_encode(key),
+                ),
+            });
+        }
+        let end = self.bytes.len().checked_add(key.len()).ok_or_else(|| {
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "SYNAPSE_PANEL_COVERAGE_SOURCE_INDEX_SIZE_OVERFLOW: packed key byte length overflowed usize while appending a {}-byte key",
+                    key.len()
+                ),
+            }
+        })?;
+        let end = u32::try_from(end).map_err(|_| StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "SYNAPSE_PANEL_COVERAGE_SOURCE_INDEX_TOO_LARGE: exact packed source keys require {end} bytes, exceeding the u32 offset representation; reduce the physical source corpus itself or widen the persisted index representation before retrying"
+            ),
+        })?;
+        self.bytes.extend_from_slice(key);
+        self.ends.push(end);
+        Ok(())
+    }
+
+    const fn len(&self) -> usize {
+        self.ends.len()
+    }
+
+    const fn packed_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    const fn offset_bytes(&self) -> usize {
+        self.ends.len() * size_of::<u32>()
+    }
+
+    fn key(&self, index: usize) -> &[u8] {
+        let start = index
+            .checked_sub(1)
+            .map_or(0, |previous| self.ends[previous] as usize);
+        let end = self.ends[index] as usize;
+        &self.bytes[start..end]
+    }
+
+    fn last(&self) -> Option<&[u8]> {
+        (!self.ends.is_empty()).then(|| self.key(self.ends.len() - 1))
+    }
+
+    fn contains_lower_hex(&self, candidate: &str) -> bool {
+        let mut left = 0_usize;
+        let mut right = self.ends.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            match cmp_raw_key_to_lower_hex(self.key(middle), candidate.as_bytes()) {
+                CmpOrdering::Less => left = middle + 1,
+                CmpOrdering::Greater => right = middle,
+                CmpOrdering::Equal => return true,
+            }
+        }
+        false
+    }
+}
+
+fn panel_coverage_declared_source_cfs() -> BTreeMap<String, bool> {
+    let mut declared = BTreeMap::new();
+    for entry in constellations::builtin_panel_catalog() {
+        if let Some(cf_name) = entry.source.cf_name() {
+            declared
+                .entry(cf_name.to_owned())
+                .and_modify(|full_cf| *full_cf |= entry.source.is_full_cf())
+                .or_insert_with(|| entry.source.is_full_cf());
+        }
+    }
+    declared
+}
+
+fn cmp_raw_key_to_lower_hex(raw: &[u8], candidate: &[u8]) -> CmpOrdering {
+    const LOWER_HEX: &[u8; 16] = b"0123456789abcdef";
+    let encoded_len = raw.len().saturating_mul(2);
+    let shared_len = encoded_len.min(candidate.len());
+    for index in 0..shared_len {
+        let byte = raw[index / 2];
+        let encoded = if index % 2 == 0 {
+            LOWER_HEX[usize::from(byte >> 4)]
+        } else {
+            LOWER_HEX[usize::from(byte & 0x0f)]
+        };
+        match encoded.cmp(&candidate[index]) {
+            CmpOrdering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    encoded_len.cmp(&candidate.len())
+}
+
+/// Builds one [`PackedSortedKeys`] from the exact physical source namespace.
+/// Expired rows remain present for membership but not for the live-row coverage
+/// denominator.
+fn build_panel_coverage_source_index(
+    reader: &CalyxPinnedReader<'_>,
     cf_name: &str,
-    referenced_keys: &[&str],
-) -> StorageResult<(u64, Vec<String>)> {
+    read_at_unix_ms: u64,
+) -> StorageResult<(u64, PackedSortedKeys)> {
     let mut live_rows = 0_u64;
-    let mut next_referenced = 0_usize;
-    let mut absent_keys: Vec<String> = Vec::new();
-    sweep_calyx_namespace_rows(
-        vault,
+    let mut index = PackedSortedKeys::default();
+    sweep_calyx_namespace_rows_pinned(
+        reader,
         cf_name,
-        PANEL_COVERAGE_SOURCE_CENSUS_SITE,
+        read_at_unix_ms,
         |key, _payload, expired| {
-            // Fixed-width lowercase hex preserves raw-byte lexicographic
-            // order, so both cursors advance once and a mismatch cannot be
-            // revisited by a later physical key.
-            let physical_key_hex = constellations::hex_encode(key);
-            while referenced_keys
-                .get(next_referenced)
-                .is_some_and(|referenced| *referenced < physical_key_hex.as_str())
-            {
-                absent_keys.push(referenced_keys[next_referenced].to_owned());
-                next_referenced += 1;
-            }
-            if referenced_keys
-                .get(next_referenced)
-                .is_some_and(|referenced| *referenced == physical_key_hex.as_str())
-            {
-                next_referenced += 1;
-            }
+            index.push(cf_name, key)?;
             if !expired {
                 live_rows = live_rows.saturating_add(1);
             }
             Ok(())
         },
     )?;
-    absent_keys.extend(
-        referenced_keys[next_referenced..]
-            .iter()
-            .map(|key| (*key).to_owned()),
-    );
-    Ok((live_rows, absent_keys))
+    Ok((live_rows, index))
+}
+
+/// Pinned-sequence counterpart of [`sweep_calyx_namespace_rows`]. It preserves
+/// the same key/value decoding, TTL rule, and strict logical-order assertion,
+/// while every source namespace and the later Base census share one committed
+/// sequence.
+fn sweep_calyx_namespace_rows_pinned<V>(
+    reader: &CalyxPinnedReader<'_>,
+    cf_name: &str,
+    read_at_unix_ms: u64,
+    mut visit: V,
+) -> StorageResult<CalyxPinnedCfWalk>
+where
+    V: FnMut(&[u8], &[u8], bool) -> StorageResult<()>,
+{
+    let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+    let range = prefix_range(&calyx_namespace_prefix(collection_id));
+    let mut previous: Option<Vec<u8>> = None;
+    walk_cf_range_pages_pinned(reader, ColumnFamily::Kv, &range, |key, value| {
+        let user_key = decode_calyx_user_key_for_read(cf_name, collection_id, key)?;
+        let envelope = decode_calyx_value_raw(value).map_err(|detail| {
+            tracing::error!(
+                code = error_codes::STORAGE_READ_FAILED,
+                cf = cf_name,
+                detail,
+                pinned_seq = reader.pinned_seq(),
+                "pinned panel-coverage census rejected a malformed KV retention envelope"
+            );
+            StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail,
+            }
+        })?;
+        if previous
+            .as_deref()
+            .is_some_and(|earlier| user_key.as_slice() <= earlier)
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "CALYX_ORDERED_KEY_RANGE_OUT_OF_ORDER: pinned sequence {} did not decode into strictly increasing logical keys; previous={} current={}; remediation=inspect duplicate/corrupt namespace-one keys before retrying",
+                    reader.pinned_seq(),
+                    previous
+                        .as_deref()
+                        .map_or_else(String::new, constellations::hex_encode),
+                    constellations::hex_encode(&user_key),
+                ),
+            });
+        }
+        let expired = calyx_value_is_expired(envelope.expires_at_ms, read_at_unix_ms);
+        visit(&user_key, envelope.payload, expired)?;
+        previous = Some(user_key);
+        Ok(())
+    })
 }
 
 /// [`sweep_calyx_namespace_rows`] over an arbitrary ordered sub-range of one
@@ -13702,20 +13822,34 @@ struct CalyxPinnedCfWalk {
 /// resolves a sequence other than the pinned one, when a page reports more rows
 /// without a resume cursor, or when a cursor fails to advance. The visitor's own
 /// error is propagated verbatim.
+fn walk_cf_pages_pinned<V>(
+    reader: &CalyxPinnedReader<'_>,
+    cf: ColumnFamily,
+    visit: V,
+) -> StorageResult<CalyxPinnedCfWalk>
+where
+    V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
+{
+    walk_cf_range_pages_pinned(reader, cf, &KeyRange::all(), visit)
+}
+
+/// Range-scoped form of [`walk_cf_pages_pinned`], used when multiple logical
+/// Synapse namespaces in the physical KV family must share the same pinned
+/// sequence with a later non-KV census.
 #[expect(
     clippy::too_many_lines,
     reason = "one pinned paged walk must retain cursor progress, sequence proof, and complete accounting across page boundaries"
 )]
-fn walk_cf_pages_pinned<V>(
+fn walk_cf_range_pages_pinned<V>(
     reader: &CalyxPinnedReader<'_>,
     cf: ColumnFamily,
+    range: &KeyRange,
     mut visit: V,
 ) -> StorageResult<CalyxPinnedCfWalk>
 where
     V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
 {
     let started = Instant::now();
-    let range = KeyRange::all();
     let mut cursor: Option<Vec<u8>> = None;
     let mut walk = CalyxPinnedCfWalk {
         pinned_seq: reader.pinned_seq(),
@@ -13727,7 +13861,7 @@ where
             .scan_cf_range_page_snapshot(
                 reader.snapshot(),
                 cf,
-                &range,
+                range,
                 cursor.as_deref(),
                 CALYX_INSPECT_SWEEP_PAGE_ROWS,
             )

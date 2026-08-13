@@ -415,8 +415,9 @@ pub struct SynapseCalyxPanelCensusEntry {
     /// still landing on two versions at once, which is a defect.
     pub earliest_created_at_ms: Option<u64>,
     pub latest_created_at_ms: Option<u64>,
-    /// Each record's declared provenance at this generation: source CF name →
-    /// sorted, unique source row keys (lowercase hex) measured from it (#1940).
+    /// Each record's declared provenance that was proven absent from its physical
+    /// source CF at census time: source CF name → unique source row keys
+    /// (lowercase hex) measured from it (#1940/#2243).
     ///
     /// This is what turns the orphan count from a subtraction into a probe. The
     /// old count was `active_version_records - source_cf_rows`, which is a
@@ -426,11 +427,12 @@ pub struct SynapseCalyxPanelCensusEntry {
     /// rows not yet measured at all. On the live vault 2026-08-01 that
     /// arithmetic reported 667 orphans where the probe finds 227.
     ///
-    /// Exact identities rather than a count are required because the question
-    /// is membership — "does this record's own source row still exist" — and
-    /// no count can answer it. A compact sorted vector preserves exact binary
-    /// search/merge semantics without one allocation-heavy tree node per row.
-    pub source_key_hexes: BTreeMap<String, Vec<String>>,
+    /// Exact identities rather than a count are required so duplicate Base rows
+    /// declaring the same source identity still count as one orphan, as they did
+    /// before the source-membership pass was made streaming. Present identities
+    /// are deliberately not retained: the caller's exact physical-key index has
+    /// already proved their presence while this row was decoded.
+    pub absent_source_key_hexes: BTreeMap<String, BTreeSet<String>>,
     /// Source identities for the subset of records carrying at least one
     /// grounded anchor. Kept separately because panel-version bumps change the
     /// constellation id while preserving the source identity; exact set
@@ -642,7 +644,14 @@ impl SynapseCalyxVault {
         clippy::too_many_lines,
         reason = "one paged physical scan must retain all generation counters and first-failure evidence in a single pass"
     )]
-    pub fn panel_census(&self) -> Result<SynapseCalyxPanelCensus, SynapseCalyxError> {
+    pub fn panel_census_snapshot<F>(
+        &self,
+        snapshot: calyx_aster::mvcc::Snapshot,
+        mut source_key_present: F,
+    ) -> Result<SynapseCalyxPanelCensus, SynapseCalyxError>
+    where
+        F: FnMut(&str, &str) -> Option<bool>,
+    {
         // Hot-path boundary (#1686): a whole-Base scan is off-runtime
         // maintenance work and must never be driven from a tagged reflex tick.
         crate::lowering::hot_context::assert_cold_calyx("panel_census");
@@ -656,7 +665,8 @@ impl SynapseCalyxVault {
         // 106k dense-slot rows to walk them once held the `Base` row-guard for
         // 290 ms on average and 2.65 s at worst, stalling the constellation
         // writers that land in the same family.
-        let walk = self.walk_cf_latest(
+        let walk = self.walk_cf_snapshot(
+            snapshot,
             ColumnFamily::Base,
             crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
             |key, value| {
@@ -679,27 +689,35 @@ impl SynapseCalyxVault {
                         anchor_kind_records: BTreeMap::new(),
                         earliest_created_at_ms: None,
                         latest_created_at_ms: None,
-                        source_key_hexes: BTreeMap::new(),
+                        absent_source_key_hexes: BTreeMap::new(),
                         grounded_source_key_hexes: BTreeMap::new(),
                         grounded_unattributed_records: 0,
                         unattributed_records: 0,
                     }
                 });
                 entry.records += 1;
-                // #1940: the declared provenance of each record, kept so the
-                // orphan count can be a per-record probe against the source CF
-                // rather than a subtraction of two counts taken over different
+                // #1940: probe each record's declared provenance against its
+                // source CF rather than subtracting counts from different
                 // populations.
                 match (
                     base.metadata.get(METADATA_SOURCE_CF),
                     base.metadata.get(METADATA_SOURCE_KEY_HEX),
                 ) {
                     (Some(source_cf), Some(source_key_hex)) => {
-                        entry
-                            .source_key_hexes
-                            .entry(source_cf.clone())
-                            .or_default()
-                            .push(source_key_hex.clone());
+                        // #2243: perform the exact physical membership test as
+                        // each Base row passes through the bounded fold. The old
+                        // implementation retained all ~1.9 million identities
+                        // and only joined them after the scan, which duplicated
+                        // the corpus and pushed an idle daemon above 1 GiB. None
+                        // means the caller did not measure this CF, so absence is
+                        // unknown and must not be invented.
+                        if source_key_present(source_cf, source_key_hex) == Some(false) {
+                            entry
+                                .absent_source_key_hexes
+                                .entry(source_cf.clone())
+                                .or_default()
+                                .insert(source_key_hex.clone());
+                        }
                     }
                     _ => entry.unattributed_records += 1,
                 }
@@ -743,15 +761,11 @@ impl SynapseCalyxVault {
         )?;
         let base_cf_rows = walk.rows_visited;
 
-        // Exact membership does not require a tree node per identity. The Base
-        // walk is already complete here, so canonicalize each identity stream
-        // once; downstream probes can binary-search it or merge it against an
-        // ordered physical CF scan without retaining another corpus-sized set.
+        // Grounded identities are the smaller population whose exact keys are
+        // required later to detect and repair stranded anchors. Canonicalize
+        // those vectors once; ordinary source identities were tested during the
+        // fold and only proven absences remain in the per-generation sets.
         for entry in by_version.values_mut() {
-            for keys in entry.source_key_hexes.values_mut() {
-                keys.sort_unstable();
-                keys.dedup();
-            }
             for keys in entry.grounded_source_key_hexes.values_mut() {
                 keys.sort_unstable();
                 keys.dedup();

@@ -26,7 +26,7 @@
 //!
 //! Both questions are answered by two numbers per panel generation — how many
 //! `Base` constellations carry it, and how many of those are grounded — and both
-//! numbers live on the `Base` row itself. [`SynapseCalyxVault::panel_census`]
+//! numbers live on the `Base` row itself. [`SynapseCalyxVault::panel_census_snapshot`]
 //! gets them from ONE decode-only scan with no per-slot hydration, which is the
 //! whole reason this is affordable on a five-minute tick when
 //! `grounding_gap_report` is not.
@@ -1003,20 +1003,15 @@ struct OrphanProbe {
     unattributed: usize,
 }
 
-/// Probes each of a generation's records against the physical keys its source
-/// CF holds right now.
+/// Counts the source identities already proven absent while the generation's
+/// Base rows were decoded.
 ///
 /// This is the membership test the old subtraction could not perform. A record
 /// is orphaned iff *its own* declared source key is absent from the source CF —
 /// not iff the generation happens to hold more records than the CF holds rows.
 ///
-/// An absent source-CF map entry means the CF was not read. A present empty set
-/// means it was read and every referenced key existed. Records from unmeasured
-/// CFs are neither covered nor orphaned here; counting them as orphans would
-/// invent findings from missing evidence.
 fn probe_orphans(
     active: Option<&synapse_calyx::SynapseCalyxPanelCensusEntry>,
-    source_cf_absent_keys: &BTreeMap<String, Vec<String>>,
     source_ttl_managed: bool,
 ) -> OrphanProbe {
     let Some(active) = active else {
@@ -1026,14 +1021,8 @@ fn probe_orphans(
         unattributed: active.unattributed_records,
         ..OrphanProbe::default()
     };
-    for (source_cf, keys) in &active.source_key_hexes {
-        let Some(absent) = source_cf_absent_keys.get(source_cf) else {
-            continue;
-        };
-        let absent = keys
-            .iter()
-            .filter(|key| absent.binary_search(key).is_ok())
-            .count();
+    for keys in active.absent_source_key_hexes.values() {
+        let absent = keys.len();
         if source_ttl_managed {
             probe.evicted += absent;
         } else {
@@ -1061,12 +1050,15 @@ fn probe_orphans(
     clippy::too_many_lines,
     reason = "one catalog/census join must retain all generation ownership, grounding, denominator, and reclaim accounting in one report"
 )]
-pub fn build_panel_coverage_report(
+pub fn build_panel_coverage_report<F>(
     census: &SynapseCalyxPanelCensus,
     source_cf_rows: &BTreeMap<String, u64>,
-    source_cf_absent_keys: &BTreeMap<String, Vec<String>>,
+    source_key_present: &F,
     ownership: &PanelGenerationOwnership,
-) -> PanelCoverageReport {
+) -> PanelCoverageReport
+where
+    F: Fn(&str, &str) -> Option<bool>,
+{
     let catalog = builtin_panel_catalog();
     let mut panels = Vec::with_capacity(catalog.len());
     let mut claimed_versions: Vec<u32> = Vec::new();
@@ -1198,7 +1190,6 @@ pub fn build_panel_coverage_report(
         if entry.carry_superseded_anchors {
             for (source_cf, keys) in &superseded_grounded_keys {
                 let active_keys = active_grounded_keys.and_then(|by_cf| by_cf.get(source_cf));
-                let absent_source_keys = source_cf_absent_keys.get(source_cf);
                 let mut previous_key: Option<&str> = None;
                 for &(key, superseded_panel_version, _generation_priority) in keys {
                     if previous_key == Some(key) {
@@ -1214,16 +1205,16 @@ pub fn build_panel_coverage_report(
                         // source identity grounded. Not debt.
                         continue;
                     }
-                    let Some(absent_source_keys) = absent_source_keys else {
-                        anchors_stranded_source_cf_unmeasured += 1;
-                        continue;
-                    };
-                    if absent_source_keys
-                        .binary_search_by(|candidate| candidate.as_str().cmp(key))
-                        .is_ok()
-                    {
-                        anchors_stranded_source_absent += 1;
-                        continue;
+                    match source_key_present(source_cf, key) {
+                        Some(true) => {}
+                        Some(false) => {
+                            anchors_stranded_source_absent += 1;
+                            continue;
+                        }
+                        None => {
+                            anchors_stranded_source_cf_unmeasured += 1;
+                            continue;
+                        }
                     }
                     anchors_stranded_on_superseded += 1;
                     if anchors_stranded_identities.len() < SYN_ANCHOR_DEBT_IDENTITY_CAP {
@@ -1332,7 +1323,7 @@ pub fn build_panel_coverage_report(
         // question the counter exists to raise. "Was the source row evicted, or
         // did it never exist?" is a membership test on a specific key, and no
         // difference of two counts can perform one.
-        let probe = probe_orphans(active, source_cf_absent_keys, entry.source_ttl_managed);
+        let probe = probe_orphans(active, entry.source_ttl_managed);
         // The same probe over every superseded generation. Without it the
         // census would report zero orphans and be *right about the active
         // generation while hiding every real one*: measured 2026-08-01, all 227
@@ -1343,13 +1334,7 @@ pub fn build_panel_coverage_report(
         let superseded_probe = entry
             .superseded_versions
             .iter()
-            .map(|version| {
-                probe_orphans(
-                    census.entry(*version),
-                    source_cf_absent_keys,
-                    entry.source_ttl_managed,
-                )
-            })
+            .map(|version| probe_orphans(census.entry(*version), entry.source_ttl_managed))
             .fold(OrphanProbe::default(), |mut total, part| {
                 total.evicted += part.evicted;
                 total.missing += part.missing;
