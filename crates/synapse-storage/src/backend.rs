@@ -13668,9 +13668,90 @@ fn calyx_gc_budget(
 /// Built once per GC tick and shared across every CF budget, so the Base scan
 /// is paid once rather than per column family.
 ///
-/// Source column family -> the source row keys a live derived constellation
-/// still points at. The GC tick's protection set (#1882).
-type DerivedSourceReferences = BTreeMap<String, BTreeSet<Vec<u8>>>;
+/// One source key's exact byte range in [`PackedSourceReferenceKeys::bytes`].
+///
+/// Two fixed-width offsets replace a `Vec` allocation and a B-tree node per
+/// reference. The production corpus has more than 1.5 million references, so
+/// the ownership shape matters more than lookup's constant factor.
+#[derive(Clone, Copy, Debug)]
+struct PackedSourceReferenceRange {
+    start: u32,
+    end: u32,
+}
+
+/// Exact source-key membership backed by one byte arena plus compact ranges.
+///
+/// Base is ordered by constellation identity rather than source key, so keys
+/// are appended to the arena during the pinned stream and only the fixed-width
+/// ranges are sorted/deduplicated afterward. Membership remains an exact binary
+/// search; there is no probabilistic filter and no false-positive deletion
+/// risk.
+#[derive(Default)]
+struct PackedSourceReferenceKeys {
+    bytes: Vec<u8>,
+    ranges: Vec<PackedSourceReferenceRange>,
+}
+
+impl PackedSourceReferenceKeys {
+    fn push(&mut self, cf_name: &str, key: &[u8]) -> Result<(), String> {
+        let start = u32::try_from(self.bytes.len()).map_err(|_| {
+            format!(
+                "source-reference byte arena for {cf_name} already exceeds the u32 offset representation"
+            )
+        })?;
+        let end = self.bytes.len().checked_add(key.len()).ok_or_else(|| {
+            format!(
+                "source-reference byte arena length overflowed usize while appending a {}-byte key for {cf_name}",
+                key.len()
+            )
+        })?;
+        let end = u32::try_from(end).map_err(|_| {
+            format!(
+                "source-reference byte arena for {cf_name} requires {end} bytes, exceeding the u32 offset representation"
+            )
+        })?;
+        self.bytes.extend_from_slice(key);
+        self.ranges.push(PackedSourceReferenceRange { start, end });
+        Ok(())
+    }
+
+    fn sort_and_dedup(&mut self) {
+        let bytes = self.bytes.as_slice();
+        self.ranges.sort_unstable_by(|left, right| {
+            packed_source_reference_key(bytes, *left)
+                .cmp(packed_source_reference_key(bytes, *right))
+        });
+        self.ranges.dedup_by(|left, right| {
+            packed_source_reference_key(bytes, *left) == packed_source_reference_key(bytes, *right)
+        });
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.ranges
+            .binary_search_by(|range| packed_source_reference_key(&self.bytes, *range).cmp(key))
+            .is_ok()
+    }
+
+    const fn len(&self) -> usize {
+        self.ranges.len()
+    }
+
+    const fn packed_bytes(&self) -> usize {
+        self.bytes.len()
+    }
+
+    const fn range_bytes(&self) -> usize {
+        self.ranges.len() * size_of::<PackedSourceReferenceRange>()
+    }
+}
+
+fn packed_source_reference_key(bytes: &[u8], range: PackedSourceReferenceRange) -> &[u8] {
+    &bytes[range.start as usize..range.end as usize]
+}
+
+/// Source column family -> exact source row keys a live derived constellation
+/// still points at. The GC tick's allocation-compact protection set (#1882).
+type DerivedSourceReferences = BTreeMap<String, PackedSourceReferenceKeys>;
 
 /// Lease lifetime for the pinned `Base` census snapshot (#2058).
 ///
@@ -13967,13 +14048,45 @@ fn collect_derived_source_references(
             )
         })
     })?;
+    for keys in referenced.values_mut() {
+        keys.sort_and_dedup();
+    }
     let mut referenced_rows = 0_u64;
+    let mut packed_key_bytes = 0_u64;
+    let mut range_index_bytes = 0_u64;
     for keys in referenced.values() {
-        referenced_rows = referenced_rows.saturating_add(calyx_len_to_u64(
-            CALYX_GC_CF,
-            "Calyx GC protected source rows",
-            keys.len(),
-        )?);
+        let key_count =
+            calyx_len_to_u64(CALYX_GC_CF, "Calyx GC protected source rows", keys.len())?;
+        referenced_rows = referenced_rows.checked_add(key_count).ok_or_else(|| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "Calyx GC protected source-row count overflowed u64".to_owned(),
+            )
+        })?;
+        packed_key_bytes = packed_key_bytes
+            .checked_add(calyx_len_to_u64(
+                CALYX_GC_CF,
+                "Calyx GC packed source-reference key bytes",
+                keys.packed_bytes(),
+            )?)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "Calyx GC packed source-reference key bytes overflowed u64".to_owned(),
+                )
+            })?;
+        range_index_bytes = range_index_bytes
+            .checked_add(calyx_len_to_u64(
+                CALYX_GC_CF,
+                "Calyx GC packed source-reference range bytes",
+                keys.range_bytes(),
+            )?)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "Calyx GC packed source-reference range bytes overflowed u64".to_owned(),
+                )
+            })?;
     }
     let census = gc::DerivedSourceCensus {
         pinned_seq: walk.pinned_seq,
@@ -13997,7 +14110,9 @@ fn collect_derived_source_references(
         base_rows_visited = census.base_rows_visited,
         referenced_column_families = census.referenced_column_families,
         referenced_rows = census.referenced_rows,
-        "indexed every derived constellation's source reference from one pinned committed sequence"
+        packed_key_bytes,
+        range_index_bytes,
+        "indexed every derived constellation's source reference from one pinned committed sequence into exact packed key arenas"
     );
     Ok((referenced, census))
 }
@@ -14045,7 +14160,8 @@ fn collect_derived_source_reference(
         referenced
             .entry(source_cf.clone())
             .or_default()
-            .insert(source_key);
+            .push(source_cf, &source_key)
+            .map_err(to_error)?;
     }
     Ok(())
 }
@@ -14262,7 +14378,7 @@ fn run_calyx_gc_budget(
     vault: &SynapseCalyxVault,
     budget: CalyxGcBudget,
     now_ms: u64,
-    referenced: Option<&BTreeSet<Vec<u8>>>,
+    referenced: Option<&PackedSourceReferenceKeys>,
     pending_tombstones: &mut Vec<SynapseCalyxCfWrite>,
 ) -> StorageResult<gc::GcCfReport> {
     let collection_id = calyx_collection_id_for_cf_write(budget.cf_name)?;
@@ -14594,7 +14710,7 @@ fn collect_calyx_retention_state(
     collection_id: u64,
     now_ms: u64,
     protected: bool,
-    referenced: Option<&BTreeSet<Vec<u8>>>,
+    referenced: Option<&PackedSourceReferenceKeys>,
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let mut state = CalyxRetentionState {
