@@ -1215,7 +1215,7 @@ fn invalid_latest_page(message: impl Into<String>) -> CalyxError {
     }
 }
 
-fn visible_value(versions: &[VersionedValue], seq: Seq) -> Option<Vec<u8>> {
+fn visible_value(versions: &VersionChain, seq: Seq) -> Option<Vec<u8>> {
     visible_value_state(versions, seq).and_then(VisibleValue::into_option)
 }
 
@@ -1234,7 +1234,7 @@ impl VisibleValue {
     }
 }
 
-fn visible_value_state(versions: &[VersionedValue], seq: Seq) -> Option<VisibleValue> {
+fn visible_value_state(versions: &VersionChain, seq: Seq) -> Option<VisibleValue> {
     visible_version(versions, seq).map(|version| {
         if is_tombstone_value(&version.value) {
             VisibleValue::Tombstone
@@ -1244,7 +1244,7 @@ fn visible_value_state(versions: &[VersionedValue], seq: Seq) -> Option<VisibleV
     })
 }
 
-fn visible_version(versions: &[VersionedValue], seq: Seq) -> Option<&VersionedValue> {
+fn visible_version(versions: &VersionChain, seq: Seq) -> Option<&VersionedValue> {
     versions.iter().rev().find(|version| version.seq <= seq)
 }
 

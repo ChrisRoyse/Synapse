@@ -1,4 +1,4 @@
-use super::{RowGuardSite, RowTable, VersionChain, VersionedCfStore};
+use super::{RowGuardSite, RowTable, VersionChain, VersionedCfStore, VersionedValue};
 use crate::cf::ColumnFamily;
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotVersionGc};
 use calyx_core::{CalyxError, Clock, Result, Seq, Ts};
@@ -37,15 +37,15 @@ pub const DEFAULT_SNAPSHOT_VERSION_GC_MAX_PASS_US: u64 = 2_000_000;
 /// the budget the read guards are judged against would be trading a memory leak
 /// for the commit stall #1950 and #2060 spent two issues removing.
 ///
-/// It is a cooperative budget, not a hard ceiling: a version chain is the
-/// smallest resumable unit because the durable cursor names a row key, not a
-/// position inside its version vector. The clock is checked at the next key
-/// boundary after every chain that actually reclaims work or scans multiple
-/// versions, and after at most [`CLOCK_CHECK_CLEAN_CHAINS`] single-version
-/// no-op chains. Production measured **28.7 ms** with the former 32-chain
-/// cadence against this 15 ms budget; the work-aware cadence bounds ordinary
-/// overshoot to one dirty/multi-version chain (or eight single-version no-ops)
-/// instead of assuming every corpus gives a chain the same cost.
+/// It is a cooperative budget, not a scheduler guarantee. The clock is checked
+/// at the next key boundary after every dirty/multi-version chain and after at
+/// most [`CLOCK_CHECK_CLEAN_CHAINS`] single-version no-op chains. A hot chain is
+/// itself resumable: one acquisition moves at most
+/// [`RETIRED_VALUES_PER_SHARD_HOLD`] old values and returns the same inclusive
+/// key when debt remains. Reclaimed payloads are destroyed only after the guard
+/// is released. Production measured **28.7 ms** with the former 32-chain cadence
+/// and later 27.4 ms from allocator/destructor work still inside one guard;
+/// neither corpus-dependent unit remains in the critical section.
 pub const DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US: u64 = 15_000;
 
 const MAX_VERSIONS_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_VERSIONS";
@@ -67,6 +67,14 @@ const MAX_SHARD_HOLD_US_ENV: &str = "CALYX_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US
 /// ~3.4 ms rather than consuming the 10 ms margin between the 15 ms write-hold
 /// target and the 25 ms row-guard warning threshold.
 const CLOCK_CHECK_CLEAN_CHAINS: usize = 8;
+
+/// Maximum reclaimed values moved out of a shard during one write-guard hold.
+///
+/// The destination is allocated before the guard is acquired, so this is both
+/// an ownership-transfer work bound and an allocation bound inside the critical
+/// section. Reclaimed `Vec<u8>` payloads stay owned by that destination until
+/// after the guard has been released and its hold has been recorded.
+const RETIRED_VALUES_PER_SHARD_HOLD: usize = 4_096;
 
 /// Bounds on one snapshot-version GC pass.
 ///
@@ -380,6 +388,13 @@ impl VersionedCfStore {
             if walk.pass_budget_spent(&started) {
                 break;
             }
+            // Allocate the retirement destination before taking the shard
+            // guard. Moving a `VersionedValue` transfers its `Vec<u8>` buffer
+            // without freeing it; dropping this vector below, after the guard
+            // is measured and released, performs the potentially expensive
+            // payload destruction outside the critical section (#2146).
+            let retire_limit = walk.versions_remaining.min(RETIRED_VALUES_PER_SHARD_HOLD);
+            let mut retired = Vec::with_capacity(retire_limit);
             let acquired_cpu_us = super::thread_cpu_us();
             let acquired = Instant::now();
             let stopped_at = {
@@ -388,7 +403,14 @@ impl VersionedCfStore {
                         "MVCC row-table shard {shard} lock was poisoned during snapshot version GC"
                     ))
                 })?;
-                walk.reclaim_shard(&mut table, resume.as_ref(), floor, &acquired)
+                walk.reclaim_shard(
+                    &mut table,
+                    resume.as_ref(),
+                    floor,
+                    &acquired,
+                    &mut retired,
+                    retire_limit,
+                )
             };
             let held_us = super::elapsed_us(&acquired);
             walk.max_shard_hold_us = walk.max_shard_hold_us.max(held_us);
@@ -399,6 +421,7 @@ impl VersionedCfStore {
                 acquired,
                 acquired_cpu_us,
             );
+            drop(retired);
             let Some(key_cursor) = stopped_at else {
                 // Shard walked to its end.
                 shards_visited += 1;
@@ -495,25 +518,29 @@ impl PassWalk {
     /// `resume`.
     ///
     /// Returns `None` when it reached the end of the shard, and `Some((cf,
-    /// key))` when it stopped early — naming the key it was about to process,
-    /// which the next acquisition resumes *at*, not after.
+    /// key))` when it stopped early. The key is either untouched or has a
+    /// partially retired old prefix; the next acquisition always resumes *at*
+    /// it, never after it.
     ///
-    /// The inclusive cursor is load-bearing. Every early return happens before
-    /// the current chain is touched, so an exclusive cursor would skip it:
-    /// manual FSV caught precisely that as 196 paged passes reclaiming 18,872
-    /// of 18,944 reclaimable versions.
+    /// The inclusive cursor is load-bearing. Work-budget returns happen before
+    /// the current chain is touched, while an acquisition-local retirement
+    /// return happens only after a bounded prefix was removed and debt remains
+    /// on that same chain. An exclusive cursor would skip either case: manual
+    /// FSV caught precisely that class of bug as 196 paged passes reclaiming
+    /// 18,872 of 18,944 reclaimable versions.
     ///
-    /// Forward progress is guaranteed for the hold-budget return because a
-    /// clock read becomes due only after at least one prior chain in this
-    /// acquisition was processed. If that was the shard's final chain, the walk
-    /// ends and releases the guard directly. Work-budget returns can still fire
-    /// immediately because they end the pass rather than re-acquiring.
+    /// Forward progress is guaranteed for a hold-budget return because a clock
+    /// read becomes due only after prior work in this acquisition. A partial
+    /// hot-chain return moved at least one version. Work-budget returns can still
+    /// fire immediately because they end the pass rather than re-acquiring.
     fn reclaim_shard(
         &mut self,
         table: &mut RowTable,
         resume: Option<&(ColumnFamily, Vec<u8>)>,
         floor: Seq,
         acquired: &Instant,
+        retired: &mut Vec<VersionedValue>,
+        retire_limit: usize,
     ) -> Option<(ColumnFamily, Vec<u8>)> {
         let resume_cf = resume.map(|(cf, _)| *cf);
         let mut clean_chains_since_clock_check = 0usize;
@@ -542,6 +569,12 @@ impl PassWalk {
                     self.stopped_on = SnapshotVersionGcStop::VersionBudget;
                     return Some((*cf, key.clone()));
                 }
+                if retired.len() == retire_limit {
+                    // The current chain is untouched. Release the guard, drop
+                    // the extracted payloads outside it, and resume inclusively
+                    // at this exact key with a fresh preallocated destination.
+                    return Some((*cf, key.clone()));
+                }
                 if clock_due {
                     clock_due = false;
                     if super::elapsed_us(acquired) >= self.budget.max_shard_hold_us {
@@ -554,12 +587,28 @@ impl PassWalk {
                 self.chains_remaining -= 1;
                 self.chains_scanned += 1;
                 let versions_examined = versions.len();
-                let (reclaimed, bytes) =
-                    reclaim_chain(versions, floor, &mut self.versions_remaining);
+                let (reclaimed, bytes, chain_complete) = reclaim_chain(
+                    versions,
+                    floor,
+                    &mut self.versions_remaining,
+                    retired,
+                    retire_limit,
+                );
                 if reclaimed > 0 {
                     self.chains_compacted += 1;
                     self.versions_reclaimed += reclaimed as u64;
                     self.bytes_reclaimed += bytes as u64;
+                }
+                if !chain_complete {
+                    if self.versions_remaining == 0 {
+                        self.stopped_on = SnapshotVersionGcStop::VersionBudget;
+                    }
+                    // The old prefix was larger than this acquisition's
+                    // bounded retirement destination. Resume this same key:
+                    // every visit pops at least one old version, so this cannot
+                    // livelock, and no residual debt is skipped until a later
+                    // whole-vault sweep.
+                    return Some((*cf, key.clone()));
                 }
                 let clock_after_chain = reclaimed > 0 || versions_examined > 1;
                 if clock_after_chain {
@@ -617,45 +666,41 @@ impl SnapshotVersionGc for VersionedCfStore {
     }
 }
 
-/// Trims one chain in place, keeping the newest version at or below `safe_point`.
+/// Retires a bounded old prefix, keeping the newest version at or below
+/// `safe_point` and every version above it.
 ///
-/// In place is the point. This used to `drain(..)` into a freshly allocated
-/// `Vec::with_capacity(versions.len())` and assign it back, which allocated a
-/// second full-size chain *during* the pass and then kept its oversized capacity
-/// afterwards — a reclaimer whose peak footprint rose with the debt it was
-/// clearing. `retain` drops each removed `VersionedValue` (and therefore its
-/// value buffer) as it goes and allocates nothing, and the chain's own backing
-/// buffer is returned when it has become mostly empty.
+/// Version chains are append ordered. The reclaimable set is consequently one
+/// prefix, found with two O(log n) indexed bounds rather than a full scan. Each
+/// `pop_front` is amortized O(1), and the removed value is moved into the
+/// caller's preallocated retirement vector. The caller owns that vector beyond
+/// the shard guard, so neither value-buffer destruction nor destination growth
+/// occurs inside the critical section.
+///
+/// The boolean is false when the acquisition-local retirement bound left part
+/// of the same reclaimable prefix in place. The inclusive durable key cursor
+/// must then revisit this chain before advancing.
 fn reclaim_chain(
     versions: &mut VersionChain,
     safe_point: Seq,
     remaining: &mut usize,
-) -> (usize, usize) {
-    let keep_boundary = retained_boundary_index(versions, safe_point);
-    let mut index = 0usize;
+    retired: &mut Vec<VersionedValue>,
+    retire_limit: usize,
+) -> (usize, usize, bool) {
+    let reclaimable = reclaimable_prefix_len(versions, safe_point);
+    let retirement_room = retire_limit.saturating_sub(retired.len());
+    let to_reclaim = reclaimable.min(*remaining).min(retirement_room);
     let mut reclaimed = 0usize;
     let mut bytes_freed = 0usize;
-    versions.retain(|version| {
-        let position = index;
-        index += 1;
-        let can_reclaim =
-            version.seq < safe_point && Some(position) != keep_boundary && *remaining > 0;
-        if can_reclaim {
-            *remaining -= 1;
-            reclaimed += 1;
-            bytes_freed += version.value.len();
-        }
-        !can_reclaim
-    });
-    // Returning the chain `Vec`'s own buffer matters at this scale: a vault with
-    // millions of keys holds millions of these, and a chain trimmed from 40
-    // versions to 1 otherwise keeps room for 40 forever. Only when the slack is
-    // worth a reallocation, so a hot key that regrows its chain does not pay a
-    // realloc per pass.
-    if reclaimed > 0 && versions.capacity() >= versions.len().saturating_mul(2).max(4) {
-        versions.shrink_to_fit();
+    for _ in 0..to_reclaim {
+        let Some(version) = versions.pop_front() else {
+            break;
+        };
+        bytes_freed = bytes_freed.saturating_add(version.value.len());
+        retired.push(version);
+        reclaimed += 1;
     }
-    (reclaimed, bytes_freed)
+    *remaining -= reclaimed;
+    (reclaimed, bytes_freed, reclaimed == reclaimable)
 }
 
 /// Reclaimable versions across whatever set of column families the caller
@@ -671,20 +716,41 @@ fn snapshot_gc_debt_for_rows<'a>(
 }
 
 fn reclaimable_versions(versions: &VersionChain, safe_point: Seq) -> usize {
-    let keep_boundary = retained_boundary_index(versions, safe_point);
-    versions
-        .iter()
-        .enumerate()
-        .filter(|(index, version)| version.seq < safe_point && Some(*index) != keep_boundary)
-        .count()
+    reclaimable_prefix_len(versions, safe_point)
 }
 
-fn retained_boundary_index(versions: &VersionChain, safe_point: Seq) -> Option<usize> {
-    versions
-        .iter()
-        .enumerate()
-        .rev()
-        .find_map(|(index, version)| (version.seq <= safe_point).then_some(index))
+fn reclaimable_prefix_len(versions: &VersionChain, safe_point: Seq) -> usize {
+    // Live commits allocate increasing sequences under the row write guard;
+    // recovery rejects non-increasing batches before rebuilding these chains.
+    // Equal sequences can occur when one batch repeats a key, so the strict and
+    // inclusive bounds are intentionally distinct.
+    let strictly_older = partition_point(versions, |version| version.seq < safe_point);
+    if strictly_older == 0 {
+        return 0;
+    }
+    let at_or_below = partition_point(versions, |version| version.seq <= safe_point);
+    if at_or_below > strictly_older {
+        strictly_older
+    } else {
+        strictly_older - 1
+    }
+}
+
+fn partition_point(
+    versions: &VersionChain,
+    mut predicate: impl FnMut(&VersionedValue) -> bool,
+) -> usize {
+    let mut left = 0usize;
+    let mut right = versions.len();
+    while left < right {
+        let middle = left + (right - left) / 2;
+        if predicate(&versions[middle]) {
+            left = middle + 1;
+        } else {
+            right = middle;
+        }
+    }
+    left
 }
 
 fn positive_env_usize(name: &str, default: usize) -> Result<usize> {

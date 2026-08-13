@@ -21,7 +21,7 @@ pub use gc::{
     DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US, DEFAULT_SNAPSHOT_VERSION_GC_MAX_VERSIONS,
     SnapshotVersionGcBudget, SnapshotVersionGcPass, SnapshotVersionGcStop,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -233,7 +233,13 @@ struct VersionedValue {
     value: Vec<u8>,
 }
 
-type VersionChain = Vec<VersionedValue>;
+/// One key's append-ordered MVCC history.
+///
+/// Commits append at the back while snapshot-version GC retires an old prefix.
+/// `VecDeque` makes both physical operations amortized O(1); a `Vec` made every
+/// prefix reclaim compact the retained tail and destroy value buffers while the
+/// row-shard write guard was held (#2146).
+type VersionChain = VecDeque<VersionedValue>;
 /// The rows of every column family routed to **one shard** of the row table.
 ///
 /// Before #1950 this was the whole table under one vault-wide lock. It keeps
@@ -1914,7 +1920,7 @@ impl VersionedCfStore {
                 .entry_mut(*cf)?
                 .entry(key.clone())
                 .or_default()
-                .push(VersionedValue {
+                .push_back(VersionedValue {
                     seq,
                     value: value.clone(),
                 });
@@ -2123,7 +2129,7 @@ impl VersionedCfStore {
                 .entry_mut(cf)?
                 .entry(key)
                 .or_default()
-                .push(VersionedValue { seq, value });
+                .push_back(VersionedValue { seq, value });
         }
         Ok(())
     }
@@ -2232,7 +2238,7 @@ impl VersionedCfStore {
                     .entry_mut(cf)?
                     .entry(key)
                     .or_default()
-                    .push(VersionedValue { seq, value });
+                    .push_back(VersionedValue { seq, value });
             }
         }
         self.seqs.advance_to_at_least(final_seq);
@@ -2578,14 +2584,14 @@ fn visible_base_panels_in_chain(table: &RowTable, key: &[u8], seq: Seq) -> Resul
     let mut panels = BTreeSet::new();
     let versions = table
         .get(&ColumnFamily::Base)
-        .and_then(|base| base.get(key))
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    for version in versions.iter().filter(|version| version.seq <= seq) {
-        if is_tombstone_value(&version.value) {
-            continue;
+        .and_then(|base| base.get(key));
+    if let Some(versions) = versions {
+        for version in versions.iter().filter(|version| version.seq <= seq) {
+            if is_tombstone_value(&version.value) {
+                continue;
+            }
+            panels.insert(panel_from_base_value(key, &version.value)?);
         }
-        panels.insert(panel_from_base_value(key, &version.value)?);
     }
     if panels.is_empty() {
         return Ok(ChainPanels::Unattributable);
