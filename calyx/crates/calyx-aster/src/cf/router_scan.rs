@@ -1,8 +1,9 @@
-use super::ColumnFamily;
 use super::router::{CfRouter, RouterShard};
+use super::{ColumnFamily, KeyRange};
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
 use calyx_core::CalyxError;
+use std::collections::BTreeMap;
 
 impl CfRouter {
     /// The immutable level and the mutable overlay for one CF's range page.
@@ -22,18 +23,31 @@ impl CfRouter {
         cf: ColumnFamily,
         start: &[u8],
         end: Option<&[u8]>,
-        mut overlay: Vec<SstEntry>,
+        overlay: Vec<SstEntry>,
     ) -> (SstLevel, Vec<SstEntry>) {
+        let mut merged = BTreeMap::new();
         for table in shard.read_tables_oldest_first(cf) {
-            overlay.extend(
-                table
-                    .iter()
-                    .filter(|(key, _)| key.as_slice() >= start)
-                    .filter(|(key, _)| end.is_none_or(|end| key.as_slice() < end))
-                    .map(|(key, value)| SstEntry { key, value }),
-            );
+            for (key, value) in table
+                .iter()
+                .filter(|(key, _)| key.as_slice() >= start)
+                .filter(|(key, _)| end.is_none_or(|end| key.as_slice() < end))
+            {
+                merged.insert(key, value);
+            }
         }
-        (shard.levels.get(&cf).cloned().unwrap_or_default(), overlay)
+        // A caller-supplied overlay is the newest logical source. Folding it
+        // through the map also makes duplicate precedence deterministic before
+        // the SST cursor sees the rows.
+        for entry in overlay {
+            merged.insert(entry.key, entry.value);
+        }
+        (
+            shard.levels.get(&cf).cloned().unwrap_or_default(),
+            merged
+                .into_iter()
+                .map(|(key, value)| SstEntry { key, value })
+                .collect(),
+        )
     }
 
     /// # Errors
@@ -56,21 +70,96 @@ impl CfRouter {
         if limit == 0 {
             return Ok(());
         }
-        // The shard read guard is held across the whole page walk, not just
-        // the level clone. `retire_then_purge_cf_inputs` unlinks retired SSTs
-        // only after taking this CF's shard for write, and its safety argument
-        // is precisely that "readers hold the read lock across their SST reads,
-        // so taking the write lock drains every in-flight mapping". Paging a
-        // cloned level outside the guard would break that: the clone still
-        // names files the purge is free to delete.
-        //
-        // The hold is now scoped to one column family instead of the whole
-        // vault, which is the improvement; making it shorter than the reads it
-        // protects would not be one (#1806, #1950).
         let shard = self.read_shard(cf).map_err(E::from)?;
         let (level, overlay) = Self::range_page_sources(&shard, cf, start, end, overlay);
-        level.range_pages_with_overlay(start, end, None, limit, overlay, |entries| {
-            on_page(self.open_entries(cf, entries).map_err(E::from)?)
-        })
+        // Open every immutable handle while retirement is excluded, then let
+        // the owning stream carry those handles and Arc-backed lookup metadata
+        // beyond the guard. A retired path may be unlinked afterwards, but an
+        // already-open handle remains the same immutable file on both Unix and
+        // Windows. Callbacks therefore run without a router lock and may safely
+        // hydrate or write related rows (#1806, #1950).
+        let mut stream = level
+            .open_page_stream_with_overlay_origins(start, end, None, limit, overlay)
+            .map_err(E::from)?;
+        drop(shard);
+        while let Some(winners) = stream.next_page().map_err(E::from)? {
+            on_page(self.open_page_winners(cf, winners).map_err(E::from)?)?;
+        }
+        Ok(())
+    }
+
+    /// Streams one immutable CF view merged with an exact plaintext MVCC
+    /// overlay, preserving one SST cursor for the whole walk.
+    ///
+    /// `release_row_guard` is invoked only after the CF shard read guard has
+    /// been acquired. The caller uses that hand-off to preserve the global
+    /// rows -> router lock order while closing the race between collecting the
+    /// snapshot overlay and pinning the immutable file set. Mutable router
+    /// tables are deliberately excluded: every key changed since recovery is
+    /// represented by the MVCC overlay at the pinned sequence, so consulting a
+    /// latest-only memtable would reintroduce post-snapshot state.
+    pub(crate) fn range_immutable_pages_until<F, E, R>(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        limit: usize,
+        overlay: Vec<SstEntry>,
+        release_row_guard: R,
+        mut on_page: F,
+    ) -> std::result::Result<(), E>
+    where
+        F: FnMut(Vec<SstEntry>) -> std::result::Result<(), E>,
+        E: From<CalyxError>,
+        R: FnOnce(),
+    {
+        if limit == 0 {
+            release_row_guard();
+            return Ok(());
+        }
+        let shard = self.read_shard(cf).map_err(E::from)?;
+        // The caller still holds the row-table guard here. Acquiring the
+        // router first and releasing the row guard only now makes this one
+        // atomic lock hand-off, in the same order every commit uses.
+        release_row_guard();
+        let level = shard.levels.get(&cf).cloned().unwrap_or_default();
+        let mut stream = level
+            .open_page_stream_with_overlay_origins(
+                &range.start,
+                range.end.as_deref(),
+                None,
+                limit,
+                overlay,
+            )
+            .map_err(E::from)?;
+        drop(shard);
+        while let Some(winners) = stream.next_page().map_err(E::from)? {
+            on_page(self.open_page_winners(cf, winners).map_err(E::from)?)?;
+        }
+        Ok(())
+    }
+
+    fn open_page_winners(
+        &self,
+        cf: ColumnFamily,
+        winners: Vec<crate::sst::page::SstPageWinner>,
+    ) -> Result<Vec<SstEntry>, CalyxError> {
+        let mut entries = Vec::with_capacity(winners.len());
+        for winner in winners {
+            let entry = if winner.from_overlay {
+                winner.entry
+            } else {
+                let mut opened = self.open_entries(cf, [winner.entry])?;
+                opened.pop().ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(format!(
+                        "opening one immutable {} page row returned no row",
+                        cf.name()
+                    ))
+                })?
+            };
+            if !crate::mvcc::is_tombstone_value(&entry.value) {
+                entries.push(entry);
+            }
+        }
+        Ok(entries)
     }
 }

@@ -7,6 +7,7 @@ use super::{
 use super::{read_sst_bounds, shared_reader};
 use calyx_core::{CalyxError, Result};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::storage_names::{SstName, classify_sst};
 
@@ -20,9 +21,9 @@ pub struct SstLevel {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LevelFile {
     pub(super) path: PathBuf,
-    bounds: Option<SstBounds>,
+    bounds: Option<Arc<SstBounds>>,
     bounds_retained: bool,
-    lookup: Option<SstLookupMetadata>,
+    lookup: Option<Arc<SstLookupMetadata>>,
     lookup_retained: bool,
 }
 
@@ -54,7 +55,7 @@ impl LevelFile {
         // Cold-open lookup retention owns exactly one decoded index. Going
         // through `shared_reader` here retained a second complete copy in the
         // process-wide cache before cloning it into the level (#2239).
-        let lookup = SstReader::open(&path)?.lookup_metadata();
+        let lookup = SstReader::open(&path)?.lookup_metadata().map(Arc::new);
         if let Some(lookup) = &lookup {
             u32::try_from(lookup.len()).map_err(|_| {
                 CalyxError::aster_corrupt_shard(format!(
@@ -64,10 +65,12 @@ impl LevelFile {
                 ))
             })?;
         }
-        let bounds = lookup.as_ref().map(|lookup| SstBounds {
-            first_key: lookup.first_key.clone(),
-            last_key: lookup.last_key.clone(),
-            sparse_index: Vec::new(),
+        let bounds = lookup.as_ref().map(|lookup| {
+            Arc::new(SstBounds {
+                first_key: lookup.first_key.clone(),
+                last_key: lookup.last_key.clone(),
+                sparse_index: Vec::new(),
+            })
         });
         Ok(Self {
             path,
@@ -79,7 +82,7 @@ impl LevelFile {
     }
 
     fn with_bounds(path: PathBuf) -> Result<Self> {
-        let bounds = read_sst_bounds(&path)?;
+        let bounds = read_sst_bounds(&path)?.map(Arc::new);
         Ok(Self {
             path,
             bounds,
@@ -113,7 +116,7 @@ impl LevelFile {
                         summary.path.display()
                     )));
                 }
-                Some(bounds)
+                Some(Arc::new(bounds))
             }
             _ => {
                 return Err(CalyxError::aster_corrupt_shard(format!(
@@ -184,12 +187,14 @@ impl LevelFile {
         }
     }
 
-    pub(super) fn open_page_reader(&self) -> Result<Option<SstPageReader<'_>>> {
+    pub(super) fn open_page_reader(&self) -> Result<Option<SstPageReader>> {
         match (&self.lookup, self.bounds.as_ref(), self.lookup_retained) {
-            (Some(lookup), _, _) => SstPageReader::open(&self.path, lookup).map(Some),
+            (Some(lookup), _, _) => {
+                SstPageReader::open(self.path.clone(), Arc::clone(lookup)).map(Some)
+            }
             (None, _, true) => Ok(None),
             (None, Some(bounds), false) => {
-                SstPageReader::open_streaming(&self.path, bounds).map(Some)
+                SstPageReader::open_streaming(self.path.clone(), Arc::clone(bounds)).map(Some)
             }
             (None, None, false) => Err(CalyxError::aster_corrupt_shard(format!(
                 "cold SST {} has no validated bounds/sparse index; reload the level from its immutable files before serving a read",
@@ -211,7 +216,7 @@ impl LevelFile {
                     self.path.display()
                 ))
             })?;
-            let mut reader = SstPageReader::open_streaming(&self.path, bounds)?;
+            let mut reader = SstPageReader::open_streaming(self.path.clone(), Arc::clone(bounds))?;
             reader.seek_lower_bound(key, false)?;
             if reader.current_key() != Some(key) {
                 return Ok(None);
@@ -614,20 +619,15 @@ impl SstLevel {
         page::range_page(self, start, end, after_key, limit, overlay)
     }
 
-    pub(crate) fn range_pages_with_overlay<F, E>(
+    pub(crate) fn open_page_stream_with_overlay_origins(
         &self,
         start: &[u8],
         end: Option<&[u8]>,
         after_key: Option<&[u8]>,
         limit: usize,
         overlay: Vec<SstEntry>,
-        on_page: F,
-    ) -> std::result::Result<(), E>
-    where
-        F: FnMut(Vec<SstEntry>) -> std::result::Result<(), E>,
-        E: From<calyx_core::CalyxError>,
-    {
-        page::range_pages(self, start, end, after_key, limit, overlay, on_page)
+    ) -> Result<page::SstPageStream> {
+        page::open_page_stream_with_overlay_origins(self, start, end, after_key, limit, overlay)
     }
 
     pub fn iter(&self) -> Result<Vec<SstEntry>> {

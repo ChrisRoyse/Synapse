@@ -1,13 +1,14 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use calyx_core::{CalyxError, Result};
 
 use super::{
     HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN,
-    SstBounds, SstEntry, SstLookupMetadata, SstSparseIndexEntry, clone_scan_bytes,
-    materialized_entry_bytes, read_file_header_structure, record_crc, scan_reserve_failed,
+    SstBounds, SstEntry, SstLookupMetadata, clone_scan_bytes, materialized_entry_bytes,
+    read_file_header_structure, record_crc, scan_reserve_failed,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -73,28 +74,29 @@ impl SstStreamingReader {
 /// every intersecting 64 MiB SST at cursor open faults the complete cold corpus
 /// into memory before a row is requested.
 #[derive(Debug)]
-pub(crate) enum SstPageReader<'a> {
+pub(crate) enum SstPageReader {
     Retained {
-        path: &'a Path,
-        lookup: &'a SstLookupMetadata,
+        path: PathBuf,
+        lookup: Arc<SstLookupMetadata>,
         point_reader: SstPointReader,
         position: usize,
     },
-    Streaming(DiskIndexCursor<'a>),
+    Streaming(DiskIndexCursor),
 }
 
-impl<'a> SstPageReader<'a> {
-    pub(crate) fn open(path: &'a Path, lookup: &'a SstLookupMetadata) -> Result<Self> {
+impl SstPageReader {
+    pub(crate) fn open(path: PathBuf, lookup: Arc<SstLookupMetadata>) -> Result<Self> {
+        let point_reader = SstPointReader::open(&path)?;
         Ok(Self::Retained {
             path,
             lookup,
-            point_reader: SstPointReader::open(path)?,
+            point_reader,
             position: 0,
         })
     }
 
-    pub(crate) fn open_streaming(path: &'a Path, bounds: &'a SstBounds) -> Result<Self> {
-        DiskIndexCursor::open(path, &bounds.sparse_index).map(SstPageReader::Streaming)
+    pub(crate) fn open_streaming(path: PathBuf, bounds: Arc<SstBounds>) -> Result<Self> {
+        DiskIndexCursor::open(path, bounds).map(SstPageReader::Streaming)
     }
 
     pub(crate) fn seek_lower_bound(&mut self, key: &[u8], exclusive: bool) -> Result<()> {
@@ -193,7 +195,7 @@ struct DiskIndexEntry {
 
 /// Allocation-constant cursor over the variable-length on-disk SST index.
 #[derive(Debug)]
-pub(crate) struct DiskIndexCursor<'a> {
+pub(crate) struct DiskIndexCursor {
     index_reader: BufReader<File>,
     point_reader: SstPointReader,
     path: PathBuf,
@@ -203,20 +205,20 @@ pub(crate) struct DiskIndexCursor<'a> {
     ordinal: usize,
     next_index_offset: u64,
     current: Option<DiskIndexEntry>,
-    sparse_index: &'a [SstSparseIndexEntry],
+    bounds: Arc<SstBounds>,
 }
 
-impl<'a> DiskIndexCursor<'a> {
-    fn open(path: &Path, sparse_index: &'a [SstSparseIndexEntry]) -> Result<Self> {
+impl DiskIndexCursor {
+    fn open(path: PathBuf, bounds: Arc<SstBounds>) -> Result<Self> {
         let result = (|| {
-            let point_reader = SstPointReader::open(path)?;
+            let point_reader = SstPointReader::open(&path)?;
             let data_end = point_reader.data_end;
             let index_end = point_reader.index_end;
             let entries = point_reader.entries;
             let mut index_file = OpenOptions::new()
                 .read(true)
-                .open(path)
-                .map_err(|error| storage_error("open SST streaming index", path, error))?;
+                .open(&path)
+                .map_err(|error| storage_error("open SST streaming index", &path, error))?;
             #[cfg(target_os = "linux")]
             {
                 use nix::fcntl::{PosixFadviseAdvice, posix_fadvise};
@@ -230,7 +232,7 @@ impl<'a> DiskIndexCursor<'a> {
                 .map_err(|error| {
                     storage_error(
                         "declare sequential SST index access",
-                        path,
+                        &path,
                         io::Error::from(error),
                     )
                 })?;
@@ -243,25 +245,25 @@ impl<'a> DiskIndexCursor<'a> {
                 .map_err(|error| {
                     storage_error(
                         "declare one-pass SST index access",
-                        path,
+                        &path,
                         io::Error::from(error),
                     )
                 })?;
             }
             index_file
                 .seek(SeekFrom::Start(data_end))
-                .map_err(|error| storage_error("seek SST streaming index", path, error))?;
+                .map_err(|error| storage_error("seek SST streaming index", &path, error))?;
             let mut cursor = Self {
                 index_reader: BufReader::with_capacity(STREAMING_INDEX_BUFFER_BYTES, index_file),
                 point_reader,
-                path: path.to_path_buf(),
+                path: path.clone(),
                 data_end,
                 index_end,
                 entries,
                 ordinal: 0,
                 next_index_offset: data_end,
                 current: None,
-                sparse_index,
+                bounds,
             };
             if entries == 0 {
                 if data_end != index_end {
@@ -379,7 +381,7 @@ impl<'a> DiskIndexCursor<'a> {
     /// possible answer. The subsequent linear walk is bounded by one sparse
     /// interval and still validates the selected record before serving it.
     fn seek_near(&mut self, key: &[u8], inclusive: bool) -> Result<()> {
-        let anchor_end = self.sparse_index.partition_point(|anchor| {
+        let anchor_end = self.bounds.sparse_index.partition_point(|anchor| {
             if inclusive {
                 anchor.key.as_slice() <= key
             } else {
@@ -388,7 +390,8 @@ impl<'a> DiskIndexCursor<'a> {
         });
         let Some(anchor) = anchor_end
             .checked_sub(1)
-            .and_then(|position| self.sparse_index.get(position))
+            .and_then(|position| self.bounds.sparse_index.get(position))
+            .cloned()
         else {
             return Ok(());
         };

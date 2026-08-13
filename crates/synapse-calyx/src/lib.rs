@@ -1230,6 +1230,20 @@ pub enum SynapseCalyxWalkStep {
     Stop,
 }
 
+enum SynapseCalyxSnapshotWalkControl {
+    Stop,
+    Error(SynapseCalyxError),
+}
+
+impl From<calyx_core::CalyxError> for SynapseCalyxSnapshotWalkControl {
+    fn from(error: calyx_core::CalyxError) -> Self {
+        Self::Error(SynapseCalyxError::from_calyx(
+            "stream pinned Calyx CF snapshot",
+            &error,
+        ))
+    }
+}
+
 /// Provenance of one bounded-hold walk over a column family (#1968).
 ///
 /// A walk trades one long atomic view for many short ones, so the window it
@@ -6740,84 +6754,6 @@ impl SynapseCalyxVault {
         self.vault.router_latest_readback()
     }
 
-    fn walk_cf_with_page_reader<V, P>(
-        cf: ColumnFamily,
-        page_rows: usize,
-        mut read_page: P,
-        mut visit: V,
-    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
-    where
-        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
-        P: FnMut(Option<&[u8]>, usize) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError>,
-    {
-        if page_rows == 0 {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_CF_WALK_PAGE_ROWS_ZERO",
-                format!(
-                    "a bounded-hold walk over {} needs a positive page size; zero rows per page cannot make forward progress",
-                    cf.name()
-                ),
-                "pass SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, or another positive page size",
-            ));
-        }
-        let mut cursor: Option<Vec<u8>> = None;
-        let mut walk = SynapseCalyxCfWalk {
-            column_family: cf.name(),
-            page_rows,
-            pages: 0,
-            rows_examined: 0,
-            rows_visited: 0,
-            stopped_early: false,
-            snapshot_seq_first: 0,
-            snapshot_seq_last: 0,
-        };
-        loop {
-            let page = read_page(cursor.as_deref(), page_rows)?;
-            if walk.pages == 0 {
-                walk.snapshot_seq_first = page.snapshot_seq;
-            }
-            walk.snapshot_seq_last = page.snapshot_seq;
-            walk.pages += 1;
-            walk.rows_examined += page.examined_rows;
-            for (key, value) in &page.rows {
-                walk.rows_visited += 1;
-                if visit(key, value)? == SynapseCalyxWalkStep::Stop {
-                    walk.stopped_early = true;
-                    return Ok(walk);
-                }
-            }
-            if !page.more {
-                return Ok(walk);
-            }
-            let Some(resume) = page.resume_after else {
-                return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_CF_WALK_CURSOR_MISSING",
-                    format!(
-                        "page {} of the {} walk reported more rows but returned no resume cursor, so the walk cannot advance",
-                        walk.pages,
-                        cf.name()
-                    ),
-                    "repair the range pager so a page reporting `more` always carries `resume_after`",
-                ));
-            };
-            if cursor
-                .as_deref()
-                .is_some_and(|previous| resume.as_slice() <= previous)
-            {
-                return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_CF_WALK_CURSOR_STALLED",
-                    format!(
-                        "page {} of the {} walk returned a resume cursor that does not advance past the previous one, so the walk would re-read the same page forever",
-                        walk.pages,
-                        cf.name()
-                    ),
-                    "repair the range pager so `resume_after` is strictly greater than the exclusive `after_key` it was given",
-                ));
-            }
-            cursor = Some(resume);
-        }
-    }
-
     /// Folds over every visible row of one column family with a **bounded**
     /// row-table read-guard hold (#1968).
     ///
@@ -6958,20 +6894,68 @@ impl SynapseCalyxVault {
         snapshot: Snapshot,
         cf: ColumnFamily,
         page_rows: usize,
-        visit: V,
+        mut visit: V,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
     where
         V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
     {
-        let range = KeyRange::all();
-        Self::walk_cf_with_page_reader(
-            cf,
+        if page_rows == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_CF_WALK_PAGE_ROWS_ZERO",
+                format!(
+                    "a pinned walk over {} needs a positive page size; zero rows per page cannot make forward progress",
+                    cf.name()
+                ),
+                "pass SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, or another positive page size",
+            ));
+        }
+        let mut walk = SynapseCalyxCfWalk {
+            column_family: cf.name(),
             page_rows,
-            |after_key, limit| {
-                self.scan_cf_range_page_snapshot(snapshot, cf, &range, after_key, limit)
+            pages: 0,
+            rows_examined: 0,
+            rows_visited: 0,
+            stopped_early: false,
+            snapshot_seq_first: snapshot.seq(),
+            snapshot_seq_last: snapshot.seq(),
+        };
+        let result = self.vault.scan_cf_range_pages_snapshot(
+            snapshot,
+            cf,
+            &KeyRange::all(),
+            page_rows,
+            |page| {
+                walk.pages += 1;
+                walk.rows_examined += page.len();
+                for (key, value) in &page {
+                    walk.rows_visited += 1;
+                    match visit(key, value) {
+                        Ok(SynapseCalyxWalkStep::Continue) => {}
+                        Ok(SynapseCalyxWalkStep::Stop) => {
+                            walk.stopped_early = true;
+                            return Err(SynapseCalyxSnapshotWalkControl::Stop);
+                        }
+                        Err(error) => {
+                            return Err(SynapseCalyxSnapshotWalkControl::Error(error));
+                        }
+                    }
+                }
+                Ok(())
             },
-            visit,
-        )
+        );
+        match result {
+            Ok(()) => {
+                // The former page-at-a-time path performed and counted one
+                // empty read for an empty CF. Preserve that provenance even
+                // though the streaming cursor has no data page to callback.
+                if walk.pages == 0 {
+                    walk.pages = 1;
+                }
+                Ok(walk)
+            }
+            Err(SynapseCalyxSnapshotWalkControl::Stop) => Ok(walk),
+            Err(SynapseCalyxSnapshotWalkControl::Error(error)) => Err(error),
+        }
     }
 
     /// Counts the visible rows of one column family with a **bounded** row-guard

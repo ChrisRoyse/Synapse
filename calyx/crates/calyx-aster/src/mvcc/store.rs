@@ -464,6 +464,10 @@ pub enum RowGuardSite {
     ChangedKeysAfterAt,
     ChangedBaseKeysAfterAtForPanel,
     ScanCfRangePageAt,
+    /// One exact MVCC delta cloned before a persistent immutable SST walk.
+    /// The guard is handed directly to the router read guard so no same-CF
+    /// commit can enter between the two serving views.
+    SnapshotPagedOverlay,
     PredecessorCfAt,
     /// The overlay half of a whole-family `scan_cf_at`.
     ///
@@ -508,7 +512,7 @@ impl RowGuardSite {
     /// Every site, in declaration order. The census is indexed by position
     /// here, so this array is the contract that makes a zero-hold site
     /// reportable rather than invisible.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::ReadLatest,
         Self::ReadBatchLatest,
         Self::ScanCfLatest,
@@ -521,6 +525,7 @@ impl RowGuardSite {
         Self::ChangedKeysAfterAt,
         Self::ChangedBaseKeysAfterAtForPanel,
         Self::ScanCfRangePageAt,
+        Self::SnapshotPagedOverlay,
         Self::PredecessorCfAt,
         Self::ScanCfAtOverlay,
         Self::ScanCfRangeAtOverlay,
@@ -552,6 +557,7 @@ impl RowGuardSite {
             Self::ChangedKeysAfterAt => "changed_keys_after_at",
             Self::ChangedBaseKeysAfterAtForPanel => "changed_base_keys_after_at_for_panel",
             Self::ScanCfRangePageAt => "scan_cf_range_page_at",
+            Self::SnapshotPagedOverlay => "snapshot_paged_overlay",
             Self::PredecessorCfAt => "predecessor_cf_at",
             Self::ScanCfAtOverlay => "scan_cf_at_overlay",
             Self::ScanCfRangeAtOverlay => "scan_cf_range_at_overlay",
@@ -1295,20 +1301,20 @@ impl VersionedCfStore {
     /// then purge the now-unreferenced files with no lock held.
     ///
     /// Safety of the ordering rests on two facts:
-    /// 1. Readers hold the router **shard** read lock across their SST reads,
-    ///    so taking that shard for write drains every in-flight mapping. The
-    ///    router is sharded per column family now (#1950), and this argument
-    ///    survives it only because the refresh below takes the write guard for
-    ///    exactly the CFs being reclaimed, and because every read path holds
-    ///    its shard guard across the reads rather than snapshotting the level
-    ///    and releasing early.
+    /// 1. Point readers keep the router **shard** read lock across their SST
+    ///    read. Streaming readers open every immutable handle while holding
+    ///    that same guard, then retain the open handles plus Arc-backed lookup
+    ///    metadata after releasing it. An open Unix file description survives
+    ///    unlink, and Rust's Windows `OpenOptions` default includes
+    ///    `FILE_SHARE_DELETE`, so a delete-pending file remains readable
+    ///    through the already-open handle.
     /// 2. After the swap the retired paths are absent from every level, so no
     ///    reader can newly open them.
     ///
-    /// Together those mean no mapping can exist for a retired file once the
-    /// lock is released, which is exactly the precondition `remove_file` needs
-    /// on Windows. `doomed` must already be canonicalized and validated by the
-    /// caller — that work is filesystem I/O and stays outside the lock too.
+    /// Together those mean a reader has either finished its protected point
+    /// read or already owns the exact immutable handle before a retired path
+    /// can be purged. `doomed` must already be canonicalized and validated by
+    /// the caller — that work is filesystem I/O and stays outside the lock too.
     pub(crate) fn retire_then_purge_cf_inputs(
         &self,
         cfs: &[ColumnFamily],

@@ -192,8 +192,10 @@ impl CfRouter {
             }
         }
         // Exactly the named families' shards, held for the whole load. This
-        // is what `retire_then_purge_cf_inputs` needs in order to drain every
-        // in-flight SST mapping for the CFs whose files it is about to unlink;
+        // prevents a reader from opening the outgoing level while its
+        // replacement is installed. A streaming reader that entered earlier
+        // already owns its immutable file handles and Arc-backed metadata, so
+        // it remains valid without extending this guard across its callbacks;
         // readers of any other family are untouched (#1806, #1950).
         let mut guards = self.write_shards_for(cfs.iter().copied())?;
         let mut cfs_loaded = 0_usize;

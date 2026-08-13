@@ -1,6 +1,6 @@
 use super::*;
 
-mod latest;
+pub(super) mod latest;
 
 impl VersionedCfStore {
     /// Reads one CF/key from one atomic view of the latest committed state.

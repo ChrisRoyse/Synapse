@@ -5,7 +5,7 @@ mod bloom;
 #[path = "io.rs"]
 mod io_helpers;
 pub mod level;
-mod page;
+pub(crate) mod page;
 mod point_read;
 mod reader_cache;
 

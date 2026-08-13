@@ -6,6 +6,17 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+/// One newest-wins row together with the physical source that supplied it.
+///
+/// Router memtables and MVCC overlays are plaintext while immutable SST
+/// values may be sealed.  Keeping this bit beside the winner lets the router
+/// open only immutable values instead of trying to decrypt a plaintext
+/// overlay winner.
+pub(crate) struct SstPageWinner {
+    pub(crate) entry: SstEntry,
+    pub(crate) from_overlay: bool,
+}
+
 /// Hard ceiling on immutable SST sources participating in one candidate page.
 ///
 /// A flat newest-wins level must inspect one lower-bound key per intersecting
@@ -52,51 +63,70 @@ pub(super) fn range_candidate_page(
     )?;
     let mut rows = Vec::with_capacity(limit);
     while rows.len() < limit {
-        let Some(entry) = next_latest_entry(&mut cursor)? else {
+        let Some(winner) = next_latest_entry(&mut cursor)? else {
             break;
         };
-        rows.push(entry);
+        rows.push(winner.entry);
     }
     Ok(rows)
 }
 
-pub(super) fn range_pages<F, E>(
+/// Streams newest-wins pages while preserving whether each row came from the
+/// caller's overlay or an immutable SST.
+///
+/// Pages are candidate-bounded and retain tombstones. The router must open an
+/// immutable value before it can identify an encrypted tombstone, then filters
+/// it. Invoking the router once per candidate page also gives the MVCC layer a
+/// bounded place to re-check its reader lease even through a tombstone-only
+/// range. The origin is intentionally not a public storage concept; it exists
+/// only at the encryption boundary in the CF router.
+pub(super) fn open_page_stream_with_overlay_origins(
     level: &SstLevel,
     start: &[u8],
     end: Option<&[u8]>,
     after_key: Option<&[u8]>,
     limit: usize,
     overlay: Vec<SstEntry>,
-    mut on_page: F,
-) -> std::result::Result<(), E>
-where
-    F: FnMut(Vec<SstEntry>) -> std::result::Result<(), E>,
-    E: From<calyx_core::CalyxError>,
-{
-    if limit == 0 {
-        return Ok(());
-    }
-    let mut cursor =
-        open_page_cursor(level, start, end, after_key, overlay, None).map_err(E::from)?;
-    loop {
-        let page = next_page(&mut cursor, limit).map_err(E::from)?;
-        if page.is_empty() {
-            break;
-        }
-        on_page(page)?;
-    }
-    Ok(())
+) -> Result<SstPageStream> {
+    Ok(SstPageStream {
+        cursor: open_page_cursor(level, start, end, after_key, overlay, None)?,
+        limit,
+    })
 }
 
-struct PageCursor<'a> {
-    sources: Vec<PageSource<'a>>,
+/// An owning set of already-open immutable file handles plus its bounded
+/// newest-wins merge state.
+///
+/// Creation happens while the router shard is pinned. Once constructed, every
+/// file handle and the Arc-backed lookup/bounds metadata outlive a concurrent
+/// level retirement, so the router lock can be released before callbacks run.
+pub(crate) struct SstPageStream {
+    cursor: PageCursor,
+    limit: usize,
+}
+
+impl SstPageStream {
+    pub(crate) fn next_page(&mut self) -> Result<Option<Vec<SstPageWinner>>> {
+        let mut page = Vec::with_capacity(self.limit);
+        while page.len() < self.limit {
+            let Some(winner) = next_latest_entry(&mut self.cursor)? else {
+                break;
+            };
+            page.push(winner);
+        }
+        Ok((!page.is_empty()).then_some(page))
+    }
+}
+
+struct PageCursor {
+    sources: Vec<PageSource>,
     heap: BinaryHeap<HeapItem>,
     end: Option<Vec<u8>>,
 }
 
-enum PageSource<'a> {
+enum PageSource {
     Overlay { rows: Vec<SstEntry>, pos: usize },
-    Sst { reader: Box<SstPageReader<'a>> },
+    Sst { reader: Box<SstPageReader> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +150,7 @@ impl PartialOrd for HeapItem {
     }
 }
 
-impl PageSource<'_> {
+impl PageSource {
     fn current_key(&self, end: Option<&[u8]>) -> Option<&[u8]> {
         let key = match self {
             Self::Overlay { rows, pos } => rows.get(*pos).map(|row| row.key.as_slice()),
@@ -153,14 +183,14 @@ impl PageSource<'_> {
     }
 }
 
-fn open_page_cursor<'a>(
-    level: &'a SstLevel,
+fn open_page_cursor(
+    level: &SstLevel,
     start: &[u8],
     end: Option<&[u8]>,
     after_key: Option<&[u8]>,
     overlay: Vec<SstEntry>,
     max_intersecting_sst_sources: Option<usize>,
-) -> Result<PageCursor<'a>> {
+) -> Result<PageCursor> {
     let lower = after_key.unwrap_or(start);
     let exclusive = after_key.is_some();
     if let Some(max_sources) = max_intersecting_sst_sources {
@@ -229,7 +259,7 @@ fn open_page_cursor<'a>(
     Ok(cursor)
 }
 
-impl PageCursor<'_> {
+impl PageCursor {
     fn push_current(&mut self, source: usize) {
         if let Some(key) = self.sources[source].current_key(self.end.as_deref()) {
             self.heap.push(HeapItem {
@@ -240,25 +270,26 @@ impl PageCursor<'_> {
     }
 }
 
-fn next_page(cursor: &mut PageCursor<'_>, limit: usize) -> Result<Vec<SstEntry>> {
+fn next_page(cursor: &mut PageCursor, limit: usize) -> Result<Vec<SstEntry>> {
     let mut out = Vec::with_capacity(limit);
     while out.len() < limit {
-        let Some(entry) = next_latest_entry(cursor)? else {
+        let Some(winner) = next_latest_entry(cursor)? else {
             break;
         };
-        if !is_tombstone_value(&entry.value) {
-            out.push(entry);
+        if !is_tombstone_value(&winner.entry.value) {
+            out.push(winner.entry);
         }
     }
     Ok(out)
 }
 
-fn next_latest_entry(cursor: &mut PageCursor<'_>) -> Result<Option<SstEntry>> {
+fn next_latest_entry(cursor: &mut PageCursor) -> Result<Option<SstPageWinner>> {
     let Some(first) = cursor.heap.pop() else {
         return Ok(None);
     };
     let next_key = first.key;
     let winner_source = first.source;
+    let from_overlay = matches!(&cursor.sources[winner_source], PageSource::Overlay { .. });
     let entry = cursor.sources[winner_source].read_current()?;
     let mut duplicate_sources = vec![winner_source];
     while cursor
@@ -278,7 +309,10 @@ fn next_latest_entry(cursor: &mut PageCursor<'_>) -> Result<Option<SstEntry>> {
         cursor.sources[source].advance_past(&next_key)?;
         cursor.push_current(source);
     }
-    Ok(Some(entry))
+    Ok(Some(SstPageWinner {
+        entry,
+        from_overlay,
+    }))
 }
 
 fn overlay_page_rows(
