@@ -21,6 +21,7 @@ pub use gc::{
     DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US, DEFAULT_SNAPSHOT_VERSION_GC_MAX_VERSIONS,
     SnapshotVersionGcBudget, SnapshotVersionGcPass, SnapshotVersionGcStop,
 };
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
@@ -253,6 +254,73 @@ type VersionChain = VecDeque<VersionedValue>;
 /// the same shape so that a call site holding a single shard's guard reads
 /// `table.get(&cf)` exactly as it always did.
 type RowTable = BTreeMap<ColumnFamily, BTreeMap<Vec<u8>, VersionChain>>;
+
+/// O(1) readback of the logical payload resident in the MVCC delta table.
+///
+/// These are the bytes the table itself owns, not allocator guesses: key
+/// bytes are counted once per append-only key entry and value bytes once per
+/// retained version (including tombstones and router-history baselines).
+/// Container/node overhead remains visible in the independent OS process
+/// counters rather than being represented as a misleading estimate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MvccResidentStatus {
+    pub keys: u64,
+    pub versions: u64,
+    pub key_bytes: u64,
+    pub value_bytes: u64,
+}
+
+impl MvccResidentStatus {
+    #[must_use]
+    pub const fn payload_bytes(self) -> u64 {
+        self.key_bytes.saturating_add(self.value_bytes)
+    }
+}
+
+#[derive(Debug, Default)]
+struct MvccResidentCounters {
+    keys: AtomicU64,
+    versions: AtomicU64,
+    key_bytes: AtomicU64,
+    value_bytes: AtomicU64,
+}
+
+impl MvccResidentCounters {
+    fn record_insert(&self, new_key: bool, key_bytes: u64, value_bytes: u64) {
+        if new_key {
+            self.keys.fetch_add(1, Ordering::Relaxed);
+            self.key_bytes.fetch_add(key_bytes, Ordering::Relaxed);
+        }
+        self.versions.fetch_add(1, Ordering::Relaxed);
+        self.value_bytes.fetch_add(value_bytes, Ordering::Relaxed);
+    }
+
+    fn record_reclaim(&self, versions: u64, value_bytes: u64) -> Result<()> {
+        let current_versions = self.versions.load(Ordering::Acquire);
+        let current_value_bytes = self.value_bytes.load(Ordering::Acquire);
+        if current_versions < versions || current_value_bytes < value_bytes {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "MVCC resident counters cannot cover reclaim: versions={current_versions}/{versions} value_bytes={current_value_bytes}/{value_bytes}"
+            )));
+        }
+        // Snapshot-version reclaimers are serialized by `snapshot_gc_cursor`.
+        // Commits may only increment these counters concurrently, so after the
+        // paired validation neither subtraction can underflow and the two
+        // counters cannot be left half-updated by an error.
+        self.versions.fetch_sub(versions, Ordering::AcqRel);
+        self.value_bytes.fetch_sub(value_bytes, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> MvccResidentStatus {
+        MvccResidentStatus {
+            keys: self.keys.load(Ordering::Acquire),
+            versions: self.versions.load(Ordering::Acquire),
+            key_bytes: self.key_bytes.load(Ordering::Acquire),
+            value_bytes: self.value_bytes.load(Ordering::Acquire),
+        }
+    }
+}
 
 /// Sealed memtables that may be outstanding with the background flusher before
 /// a commit waits for capacity (#1951).
@@ -913,6 +981,8 @@ pub struct VersionedCfStore {
     ///
     /// Fixed length, allocated once, never resized.
     rows: Vec<RwLock<RowTable>>,
+    /// Exact logical bytes and row/version counts owned by `rows`.
+    mvcc_resident: MvccResidentCounters,
     /// Background SST writer for sealed memtables (#1951).
     ///
     /// Declared **before** `router` so it is dropped first: dropping it stops
@@ -1139,6 +1209,7 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
+            mvcc_resident: MvccResidentCounters::default(),
             flusher: OnceLock::new(),
             router: None,
             router_latest_readback: AtomicBool::new(false),
@@ -1172,6 +1243,7 @@ impl VersionedCfStore {
             panel_content_seqs: RwLock::new(BTreeMap::new()),
             next_lease_id: AtomicU64::new(0),
             rows: new_row_shards(),
+            mvcc_resident: MvccResidentCounters::default(),
             flusher: OnceLock::new(),
             router: Some(Arc::new(router)),
             router_latest_readback: AtomicBool::new(router_latest_readback),
@@ -1797,6 +1869,16 @@ impl VersionedCfStore {
         }
     }
 
+    /// Exact logical payload currently owned by the in-memory MVCC delta.
+    ///
+    /// This is an O(1) telemetry read. It deliberately excludes allocator and
+    /// container overhead, which remains authoritative only at the process
+    /// memory Source of Truth.
+    #[must_use]
+    pub fn mvcc_resident_status(&self) -> MvccResidentStatus {
+        self.mvcc_resident.snapshot()
+    }
+
     /// Admission check for rows that cannot fit even in an empty memtable.
     pub fn ensure_memtable_admission<I, K, V>(&self, rows: I) -> Result<()>
     where
@@ -1928,14 +2010,7 @@ impl VersionedCfStore {
             .saturating_sub(timings.history_baseline_us);
         let row_apply_started = Instant::now();
         for (cf, key, value) in &rows {
-            table
-                .entry_mut(*cf)?
-                .entry(key.clone())
-                .or_default()
-                .push_back(VersionedValue {
-                    seq,
-                    value: value.clone(),
-                });
+            self.append_mvcc_version(&mut table, *cf, key.clone(), seq, value.clone())?;
         }
         timings.row_apply_us = elapsed_us(&row_apply_started);
 
@@ -2081,22 +2156,69 @@ impl VersionedCfStore {
             )
         })?;
         for (cf, key, _value) in rows {
-            let family = table.entry_mut(*cf)?;
-            let chain = family.entry(key.clone()).or_default();
-            if chain
-                .iter()
-                .any(|version| version.seq <= self.changed_key_history_floor)
-            {
+            let has_baseline = table.entry_mut(*cf)?.get(key).is_some_and(|chain| {
+                chain
+                    .iter()
+                    .any(|version| version.seq <= self.changed_key_history_floor)
+            });
+            if has_baseline {
                 continue;
             }
             let baseline = router
                 .get(*cf, key)?
                 .unwrap_or_else(|| TOMBSTONE_VALUE.to_vec());
-            chain.push_front(VersionedValue {
-                seq: self.changed_key_history_floor,
-                value: baseline,
-            });
+            let key_bytes = u64::try_from(key.len()).unwrap_or(u64::MAX);
+            let value_bytes = u64::try_from(baseline.len()).unwrap_or(u64::MAX);
+            let family = table.entry_mut(*cf)?;
+            let new_key = match family.entry(key.clone()) {
+                Entry::Vacant(entry) => {
+                    let mut chain = VersionChain::new();
+                    chain.push_front(VersionedValue {
+                        seq: self.changed_key_history_floor,
+                        value: baseline,
+                    });
+                    entry.insert(chain);
+                    true
+                }
+                Entry::Occupied(mut entry) => {
+                    entry.get_mut().push_front(VersionedValue {
+                        seq: self.changed_key_history_floor,
+                        value: baseline,
+                    });
+                    false
+                }
+            };
+            self.mvcc_resident
+                .record_insert(new_key, key_bytes, value_bytes);
         }
+        Ok(())
+    }
+
+    fn append_mvcc_version(
+        &self,
+        table: &mut RowWriteSet<'_>,
+        cf: ColumnFamily,
+        key: Vec<u8>,
+        seq: Seq,
+        value: Vec<u8>,
+    ) -> Result<()> {
+        let key_bytes = u64::try_from(key.len()).unwrap_or(u64::MAX);
+        let value_bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        let family = table.entry_mut(cf)?;
+        let new_key = match family.entry(key) {
+            Entry::Vacant(entry) => {
+                let mut chain = VersionChain::new();
+                chain.push_back(VersionedValue { seq, value });
+                entry.insert(chain);
+                true
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().push_back(VersionedValue { seq, value });
+                false
+            }
+        };
+        self.mvcc_resident
+            .record_insert(new_key, key_bytes, value_bytes);
         Ok(())
     }
 
@@ -2180,11 +2302,7 @@ impl VersionedCfStore {
         // report `last_commit_seq = 0` while holding rows at much higher ones.
         self.publish_cf_commit_seq(&rows, seq);
         for (cf, key, value) in rows {
-            table
-                .entry_mut(cf)?
-                .entry(key)
-                .or_default()
-                .push_back(VersionedValue { seq, value });
+            self.append_mvcc_version(&mut table, cf, key, seq, value)?;
         }
         Ok(())
     }
@@ -2290,11 +2408,7 @@ impl VersionedCfStore {
             self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
             self.publish_cf_commit_seq(&rows, seq);
             for (cf, key, value) in rows {
-                table
-                    .entry_mut(cf)?
-                    .entry(key)
-                    .or_default()
-                    .push_back(VersionedValue { seq, value });
+                self.append_mvcc_version(&mut table, cf, key, seq, value)?;
             }
         }
         self.seqs.advance_to_at_least(final_seq);

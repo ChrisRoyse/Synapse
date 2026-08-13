@@ -526,6 +526,28 @@ pub struct SubsystemHealth {
     pub calyx_vault_last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_vault_remediation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_open_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_restore_mvcc_rows: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_vault_eager_router_lookup_on_open: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_mvcc_resident_keys: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_mvcc_resident_versions: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_mvcc_resident_key_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_mvcc_resident_value_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_mvcc_resident_payload_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_memtable_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_memtable_cap_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_memtable_high_water_bytes: Option<u64>,
     /// #1883: every configurable Calyx tuning knob, each reported WITH whether
     /// anything actually reads it. The nine `calyx_*` knobs that used to be
     /// printed here as bare numbers were validated, lowered and echoed, and read

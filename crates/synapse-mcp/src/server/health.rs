@@ -1559,10 +1559,19 @@ impl SynapseService {
         SubsystemHealth {
             status: health_status.to_owned(),
             detail: Some(format!(
-                "enabled={} phase={} open={} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
+                "enabled={} phase={} open={} open_mode={} restore_mvcc_rows={:?} eager_router_lookup_on_open={:?} mvcc_resident_keys={:?} mvcc_resident_versions={:?} mvcc_resident_payload_bytes={:?} memtable_used_bytes={:?} memtable_cap_bytes={:?} memtable_high_water_bytes={:?} vault_dir={} vault_id={} latest_seq={:?} last_recovered_seq={:?} torn_tail={} last_error_code={} last_calyx_error_code={} clock_mode={} math={} anneal_live_artifact={} anneal_artifact_bytes={} anneal_rollback_rows={} anneal_recent_changes={} anneal_budget_warning={} tuning_knobs_total={} tuning_knobs_inert={} inert_tuning_knobs=[{}] remediation={}",
                 status.enabled,
                 status.phase,
                 status.open,
+                status.open_mode.as_deref().unwrap_or("none"),
+                status.restore_mvcc_rows,
+                status.eager_router_lookup_on_open,
+                status.mvcc_resident_keys,
+                status.mvcc_resident_versions,
+                status.mvcc_resident_payload_bytes,
+                status.memtable_used_bytes,
+                status.memtable_cap_bytes,
+                status.memtable_high_water_bytes,
                 status
                     .vault_dir
                     .as_ref()
@@ -1608,6 +1617,17 @@ impl SynapseService {
             calyx_vault_last_calyx_error_code: status.last_calyx_error_code,
             calyx_vault_last_error: status.last_error,
             calyx_vault_remediation: status.remediation,
+            calyx_vault_open_mode: status.open_mode,
+            calyx_vault_restore_mvcc_rows: status.restore_mvcc_rows,
+            calyx_vault_eager_router_lookup_on_open: status.eager_router_lookup_on_open,
+            calyx_mvcc_resident_keys: status.mvcc_resident_keys,
+            calyx_mvcc_resident_versions: status.mvcc_resident_versions,
+            calyx_mvcc_resident_key_bytes: status.mvcc_resident_key_bytes,
+            calyx_mvcc_resident_value_bytes: status.mvcc_resident_value_bytes,
+            calyx_mvcc_resident_payload_bytes: status.mvcc_resident_payload_bytes,
+            calyx_memtable_used_bytes: status.memtable_used_bytes,
+            calyx_memtable_cap_bytes: status.memtable_cap_bytes,
+            calyx_memtable_high_water_bytes: status.memtable_high_water_bytes,
             calyx_tuning_knobs: tuning_knobs,
             calyx_inert_tuning_knob_count: Some(inert_tuning_knob_count),
             calyx_row_guard_sites: row_guard_sites,

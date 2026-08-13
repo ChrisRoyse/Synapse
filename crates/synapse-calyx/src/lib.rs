@@ -2523,6 +2523,14 @@ pub struct SynapseCalyxVaultStatus {
     pub last_calyx_error_code: Option<String>,
     pub last_error: Option<String>,
     pub remediation: Option<String>,
+    pub mvcc_resident_keys: Option<u64>,
+    pub mvcc_resident_versions: Option<u64>,
+    pub mvcc_resident_key_bytes: Option<u64>,
+    pub mvcc_resident_value_bytes: Option<u64>,
+    pub mvcc_resident_payload_bytes: Option<u64>,
+    pub memtable_used_bytes: Option<u64>,
+    pub memtable_cap_bytes: Option<u64>,
+    pub memtable_high_water_bytes: Option<u64>,
     pub tuning: Option<SynapseCalyxTuningConfig>,
     pub anneal: Option<SynapseCalyxAnnealStatus>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
@@ -8210,6 +8218,8 @@ fn status_from_vault(
     open_mode: SynapseCalyxVaultOpenMode,
 ) -> SynapseCalyxVaultStatus {
     let recovery_report = vault.recovery_report();
+    let mvcc_resident = vault.mvcc_resident_status();
+    let memtable = vault.memtable_status();
     let mut status = SynapseCalyxVaultStatus {
         enabled: true,
         phase: "open".to_owned(),
@@ -8224,6 +8234,20 @@ fn status_from_vault(
             .torn_tail
             .as_ref()
             .map(|tail| format!("{tail:?}")),
+        mvcc_resident_keys: Some(mvcc_resident.keys),
+        mvcc_resident_versions: Some(mvcc_resident.versions),
+        mvcc_resident_key_bytes: Some(mvcc_resident.key_bytes),
+        mvcc_resident_value_bytes: Some(mvcc_resident.value_bytes),
+        mvcc_resident_payload_bytes: Some(mvcc_resident.payload_bytes()),
+        memtable_used_bytes: Some(memtable.total_used_bytes),
+        memtable_cap_bytes: Some(memtable.total_cap_bytes),
+        memtable_high_water_bytes: Some(
+            memtable
+                .per_cf
+                .iter()
+                .map(|entry| entry.high_water_bytes)
+                .sum(),
+        ),
         ..SynapseCalyxVaultStatus::default()
     };
     status.apply_paths(config);

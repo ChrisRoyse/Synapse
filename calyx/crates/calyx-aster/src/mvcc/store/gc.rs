@@ -442,7 +442,6 @@ impl VersionedCfStore {
 
         cursor.shard = shard;
         cursor.resume = resume;
-        drop(cursor);
 
         let sweep_completed = !started_mid_shard
             && shards_visited == shards_total
@@ -464,6 +463,9 @@ impl VersionedCfStore {
             max_shard_hold_us: walk.max_shard_hold_us,
             resume_shard: shard,
         };
+        self.mvcc_resident
+            .record_reclaim(pass.versions_reclaimed, pass.bytes_reclaimed)?;
+        drop(cursor);
         self.snapshot_gc_counters.record_result(GcResult {
             safe_point_seq: floor,
             versions_reclaimed: usize::try_from(pass.versions_reclaimed).unwrap_or(usize::MAX),

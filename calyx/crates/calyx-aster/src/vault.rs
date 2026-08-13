@@ -51,8 +51,11 @@ mod temporal_metadata;
 mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange};
 use crate::dedup::DedupPolicy;
-use crate::mvcc::{CfRead, Freshness, ReadBarrier, Snapshot, VersionedCfStore, is_tombstone_value};
-use crate::resource::{ResourceStatus, VramBudgetStatus, collect_resource_status};
+use crate::mvcc::{
+    CfRead, Freshness, MvccResidentStatus, ReadBarrier, Snapshot, VersionedCfStore,
+    is_tombstone_value,
+};
+use crate::resource::{MemtableStatus, ResourceStatus, VramBudgetStatus, collect_resource_status};
 use crate::timetravel::RetentionHorizon;
 use crate::vault::durable::DurableVault;
 use crate::vault::ledger_hook::AsterLedgerHook;
@@ -1965,6 +1968,18 @@ where
         vram: VramBudgetStatus,
     ) -> Result<ResourceStatus> {
         collect_resource_status(vault_dir, vram, &self.rows, self.clock.now())
+    }
+
+    /// O(1) logical payload readback for the process-local MVCC delta.
+    #[must_use]
+    pub fn mvcc_resident_status(&self) -> MvccResidentStatus {
+        self.rows.mvcc_resident_status()
+    }
+
+    /// Current bounded router memtable usage and configured capacity.
+    #[must_use]
+    pub fn memtable_status(&self) -> MemtableStatus {
+        self.rows.memtable_status()
     }
 
     pub fn install_read_barrier(&self, barrier: ReadBarrier) {
