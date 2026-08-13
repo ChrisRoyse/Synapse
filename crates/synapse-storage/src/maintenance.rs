@@ -46,15 +46,16 @@ const STORAGE_HEAVY_MAINTENANCE_LANES: usize = 1;
 static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_HEAVY_MAINTENANCE_LANES)));
 
-/// In-flight admitted maintenance passes, published as queue-depth telemetry.
-static STORAGE_MAINTENANCE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
-
 /// Runs one blocking storage-maintenance pass off the async runtime workers.
 ///
 /// The closure executes on Tokio's blocking pool under a dedicated admission
 /// permit, so it can never park a runtime worker that is polling MCP requests.
-/// Structured telemetry records the admission queue depth, the time spent
-/// waiting for a permit, and the execution time of the pass itself.
+/// Structured telemetry records whether the lane was occupied when the request
+/// arrived, the time spent waiting for its permit, and the execution time of
+/// the pass itself. Occupancy is derived from the semaphore itself rather than
+/// a second counter: a waiter can acquire a just-released permit before the
+/// releasing task resumes to update a counter, which made the old telemetry
+/// falsely report `in_flight=2` beside `max_concurrent=1` during handoff.
 ///
 /// # Errors
 ///
@@ -66,10 +67,9 @@ where
     T: Send + 'static,
 {
     let semaphore = Arc::clone(&STORAGE_MAINTENANCE_PERMITS);
-    let waiters_before =
-        STORAGE_HEAVY_MAINTENANCE_LANES.saturating_sub(semaphore.available_permits());
+    let lane_occupied_at_request = semaphore.available_permits() == 0;
     let admission_started = Instant::now();
-    let permit = semaphore
+    let permit = Arc::clone(&semaphore)
         .acquire_owned()
         .await
         .map_err(|_closed| StorageError::WriteFailed {
@@ -80,15 +80,14 @@ where
         })?;
     let admission_wait_ms =
         u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let in_flight = STORAGE_MAINTENANCE_IN_FLIGHT
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
+    let active_after_admission =
+        STORAGE_HEAVY_MAINTENANCE_LANES.saturating_sub(semaphore.available_permits());
     tracing::info!(
         code = "STORAGE_MAINTENANCE_ADMITTED",
         operation,
         admission_wait_ms,
-        already_running = waiters_before as u64,
-        in_flight,
+        lane_occupied_at_request,
+        active_after_admission = active_after_admission as u64,
         max_concurrent = STORAGE_HEAVY_MAINTENANCE_LANES as u64,
         exclusive_whole_corpus_lane = true,
         "admitted storage maintenance onto the exclusive whole-corpus blocking lane off the async runtime workers"
@@ -108,9 +107,6 @@ where
     })
     .await;
     let exec_ms = u64::try_from(exec_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-    let remaining = STORAGE_MAINTENANCE_IN_FLIGHT
-        .fetch_sub(1, Ordering::AcqRel)
-        .saturating_sub(1);
     match joined {
         Ok(result) => {
             tracing::info!(
@@ -118,7 +114,6 @@ where
                 operation,
                 exec_ms,
                 admission_wait_ms,
-                in_flight = remaining,
                 is_ok = result.is_ok(),
                 "completed off-runtime storage maintenance pass"
             );
