@@ -2,7 +2,7 @@ use std::{
     fmt,
     marker::PhantomData,
     ops::Deref,
-    sync::{Arc, Condvar, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock},
 };
 
 use calyx_forge::{
@@ -48,6 +48,13 @@ const EXPECTED_COSINE: [f32; 3] = [1.0, 0.0, 1.0];
 const EXPECTED_L2_SQUARED: [f32; 3] = [0.0, 2.0, 1.0];
 const PROBE_TOPK_SCORES: [f32; 4] = [0.25, 1.5, -0.5, 1.5];
 const EXPECTED_TOPK: [(usize, f32); 3] = [(1, 1.5), (3, 1.5), (0, 0.25)];
+
+/// Process-lifetime CPU backend reserved for explicitly background intelligence
+/// work. It is separate from configured serving math: scheduled maintenance
+/// must not initialize a CUDA context, consume VRAM, or add driver host threads
+/// merely because a panel interval needs a small association pass.
+static VERIFIED_BACKGROUND_CPU_BACKEND: OnceLock<Result<Arc<dyn Backend>, SynapseCalyxError>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SynapseCalyxMathBackendStatus {
@@ -898,6 +905,30 @@ pub fn math_backend(
             }
         }
     }
+}
+
+/// Returns the process-owned, physically proved CPU backend used only by callers
+/// that explicitly declare background execution.
+///
+/// This is an execution class, not a failure fallback. The configured serving
+/// backend is neither attempted nor replaced. A CPU probe failure is retained
+/// and every later background request fails with the same structured cause.
+pub fn verified_background_cpu_backend() -> Result<Arc<dyn Backend>, SynapseCalyxError> {
+    VERIFIED_BACKGROUND_CPU_BACKEND
+        .get_or_init(|| {
+            let backend = Arc::new(CpuBackend::new());
+            let probe = run_startup_probe(backend.as_ref())?;
+            tracing::info!(
+                code = "SYNAPSE_CALYX_BACKGROUND_CPU_BACKEND_PROVED",
+                cpu_simd_path = backend.simd_path(),
+                probe_status = probe.status,
+                probe_detail = probe.detail,
+                "proved the explicit background CPU math execution class against real fixed-vector operations"
+            );
+            let backend: Arc<dyn Backend> = backend;
+            Ok(backend)
+        })
+        .clone()
 }
 
 fn deferred_cuda_runtime_candidate(

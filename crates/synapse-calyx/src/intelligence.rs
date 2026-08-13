@@ -95,6 +95,28 @@ pub const SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES: &str = "SYNAPSE_CALYX_ENSEMBLE_N
 const GRAPH_AGREEMENT_PREFIX: &[u8; 5] = b"GAGR1";
 const GRAPH_KNN_PREFIX: &[u8; 5] = b"GKNN1";
 
+/// Declares which physical math resource a weave is allowed to activate.
+///
+/// Scheduled maintenance is deliberately CPU-only so an idle background daemon
+/// never creates CUDA contexts, VRAM reservations, or driver threads that can
+/// interfere with foreground games. Interactive/explicit intelligence requests
+/// retain the operator-configured backend and its fail-closed behavior.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SynapseCalyxMathExecutionClass {
+    Configured,
+    BackgroundCpu,
+}
+
+impl SynapseCalyxMathExecutionClass {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Configured => "configured",
+            Self::BackgroundCpu => "background_cpu",
+        }
+    }
+}
+
 /// Bounded request describing one Loom weave pass over a panel.
 #[derive(Clone, Copy, Debug)]
 pub struct SynapseCalyxWeaveParams {
@@ -108,6 +130,7 @@ pub struct SynapseCalyxWeaveParams {
     /// Exclusive upper bound on a record's server-stamped `created_at`, in Unix
     /// nanoseconds. `None` leaves the window open at that end.
     pub until_ts_ns: Option<i64>,
+    pub math_execution_class: SynapseCalyxMathExecutionClass,
 }
 
 impl SynapseCalyxWeaveParams {
@@ -120,6 +143,7 @@ impl SynapseCalyxWeaveParams {
             cache_capacity: 4_096,
             since_ts_ns: None,
             until_ts_ns: None,
+            math_execution_class: SynapseCalyxMathExecutionClass::Configured,
         }
     }
 }
@@ -415,8 +439,39 @@ impl SynapseCalyxVault {
         let mut agreement_zero_norm_records = 0usize;
         let mut lens_ids: BTreeSet<SlotId> = BTreeSet::new();
         let mut measured_slot_instances = 0usize;
-        let backend_lease = self.math_runtime.backend()?;
-        let backend = &*backend_lease;
+        let configured_backend = if corpus.records.is_empty()
+            || params.math_execution_class != SynapseCalyxMathExecutionClass::Configured
+        {
+            None
+        } else {
+            Some(self.math_runtime.backend()?)
+        };
+        let background_backend = if corpus.records.is_empty()
+            || params.math_execution_class != SynapseCalyxMathExecutionClass::BackgroundCpu
+        {
+            None
+        } else {
+            Some(crate::math::verified_background_cpu_backend()?)
+        };
+        let backend = configured_backend
+            .as_ref()
+            .map(|lease| &**lease as &dyn Backend)
+            .or(background_backend.as_deref());
+        let backend_used = if corpus.records.is_empty() {
+            "none_empty_corpus"
+        } else {
+            params.math_execution_class.as_str()
+        };
+        tracing::info!(
+            code = "SYNAPSE_CALYX_WEAVE_MATH_EXECUTION_CLASS",
+            panel_version = params.panel_version,
+            requested_execution_class = params.math_execution_class.as_str(),
+            backend_used,
+            corpus_records = corpus.records.len(),
+            configured_runtime_activated = configured_backend.is_some(),
+            background_cpu_activated = background_backend.is_some(),
+            "selected the declared weave math execution class without runtime fallback"
+        );
         for record in &corpus.records {
             for slot in record.slots.keys() {
                 lens_ids.insert(*slot);
@@ -427,6 +482,17 @@ impl SynapseCalyxVault {
                 // the panel, but has no within-record cross-term to weave.
                 continue;
             }
+            let backend = backend.ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_WEAVE_MATH_BACKEND_MISSING",
+                    format!(
+                        "panel {} has a math-bearing record but execution class {} produced no backend",
+                        params.panel_version,
+                        params.math_execution_class.as_str()
+                    ),
+                    "repair the declared execution-class backend initialization; Synapse refuses to omit association math",
+                )
+            })?;
             let mut slot_ids: Vec<SlotId> = record.slots.keys().copied().collect();
             slot_ids.sort_unstable();
             let mut plan = plan_cross_terms(&slot_ids, &gate);
@@ -514,7 +580,7 @@ impl SynapseCalyxVault {
         }
 
         let (between_record_edges, knn_zero_norm_exclusions) =
-            self.build_between_record_edges(&corpus, params.knn_k)?;
+            Self::build_between_record_edges(backend, &corpus, params.knn_k)?;
         for edge in &between_record_edges {
             writes.push(SynapseCalyxCfWrite {
                 cf: ColumnFamily::Graph,
@@ -1038,7 +1104,7 @@ impl SynapseCalyxVault {
     /// with at least two records of a uniform dimension, a bounded cosine kNN
     /// graph over the records that carry that slot.
     fn build_between_record_edges(
-        &self,
+        backend: Option<&dyn Backend>,
         corpus: &DenseCorpus,
         knn_k: usize,
     ) -> Result<
@@ -1049,8 +1115,6 @@ impl SynapseCalyxVault {
         SynapseCalyxError,
     > {
         let knn_k = knn_k.clamp(1, 64);
-        let backend_lease = self.math_runtime.backend()?;
-        let backend = &*backend_lease;
         let mut by_slot: BTreeMap<SlotId, Vec<(CxId, &Vec<f32>)>> = BTreeMap::new();
         for record in &corpus.records {
             for (slot, vector) in &record.slots {
@@ -1108,6 +1172,17 @@ impl SynapseCalyxVault {
                 if geometric.len() < 2 {
                     continue;
                 }
+                let backend = backend.ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_WEAVE_MATH_BACKEND_MISSING",
+                        format!(
+                            "slot {} dimension {dim} has {} kNN candidates but the weave owns no math backend",
+                            slot.get(),
+                            geometric.len()
+                        ),
+                        "repair the declared execution-class backend initialization; Synapse refuses to omit between-record association math",
+                    )
+                })?;
                 append_slot_knn_edges(backend, slot, dim, &geometric, knn_k, &mut edges)?;
                 if edges.len() >= SYNAPSE_KNN_MAX_EDGES {
                     break;

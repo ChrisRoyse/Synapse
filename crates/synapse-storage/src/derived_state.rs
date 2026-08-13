@@ -2688,6 +2688,10 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
         params.since_ts_ns = Some(part_since);
         params.until_ts_ns = Some(part_until);
+        // Scheduled derived-state maintenance is an explicit background class.
+        // It must not initialize a CUDA context or reserve GPU resources while
+        // the operator is gaming; CPU probe failure remains a hard error.
+        params.math_execution_class = synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu;
         let report = match db.weave_panel_intelligence(params) {
             Ok(report) => report,
             Err(error) => {

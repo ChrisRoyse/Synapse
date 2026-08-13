@@ -164,12 +164,12 @@ pub use intelligence::{
     SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxExcludedLens,
     SynapseCalyxHazardReport, SynapseCalyxKernelAnswerHop, SynapseCalyxKernelAnswerReport,
     SynapseCalyxKernelParams, SynapseCalyxKernelReport, SynapseCalyxLensCoverageStatus,
-    SynapseCalyxLowSignalLens, SynapseCalyxNeffEstimate, SynapseCalyxPanelLensCoverage,
-    SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak, SynapseCalyxRedundancyPair,
-    SynapseCalyxRedundancyReport, SynapseCalyxRedundancySkip, SynapseCalyxSlotBits,
-    SynapseCalyxSlotKind, SynapseCalyxSufficiencyDeficit, SynapseCalyxSufficiencyReport,
-    SynapseCalyxSynergyReport, SynapseCalyxTemporalParams, SynapseCalyxWeaveBlindSpotPair,
-    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
+    SynapseCalyxLowSignalLens, SynapseCalyxMathExecutionClass, SynapseCalyxNeffEstimate,
+    SynapseCalyxPanelLensCoverage, SynapseCalyxPeriodicityReport, SynapseCalyxPeriodogramPeak,
+    SynapseCalyxRedundancyPair, SynapseCalyxRedundancyReport, SynapseCalyxRedundancySkip,
+    SynapseCalyxSlotBits, SynapseCalyxSlotKind, SynapseCalyxSufficiencyDeficit,
+    SynapseCalyxSufficiencyReport, SynapseCalyxSynergyReport, SynapseCalyxTemporalParams,
+    SynapseCalyxWeaveBlindSpotPair, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
 };
 pub use lowering::{
     LOWERED_ARTIFACT_MAGIC, LOWERED_ARTIFACT_SCHEMA_VERSION, LOWERED_DIR_NAME,
@@ -612,6 +612,15 @@ const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
 /// Reader-lease lifetime for bounded off-runtime corpus scans that enumerate
 /// Base rows and hydrate their slot rows from the same MVCC view.
 pub(crate) const INTELLIGENCE_CORPUS_READER_LEASE_MS: u64 = 30_000;
+/// Reader-lease lifetime for an exact physical whole-CF census.
+///
+/// Unlike a bounded intelligence corpus, this operation deliberately walks
+/// every live key state. The production Graph CF contains millions of rows, so
+/// applying the short corpus lease made a correct first census fail just before
+/// completion. The census still owns one pinned snapshot and still fails closed
+/// at a finite boundary; it simply has a lease sized for the operation it
+/// actually performs.
+const CF_COUNT_READER_LEASE_MS: u64 = 5 * 60_000;
 
 pub const SEARCH_GENERATION_REFRESH_DELTA_KEYS: u64 =
     (calyx_search::MAX_RECONCILED_DELTA_KEYS as u64) / 2;
@@ -2776,9 +2785,12 @@ pub fn install_process_memory_reclaimer(
     })
 }
 
+const BASE_PAGE_RECLAIM_GROWTH_BYTES: u64 = 32 * 1024 * 1024;
+
 struct SearchRebuildMemoryTracker {
     private_bytes_peak: u64,
     private_bytes_peak_phase: String,
+    private_bytes_after_last_reclaim: u64,
     reclaim_calls: u64,
     observed_reclaimed: u64,
     missing_reclaimer_reported: bool,
@@ -2789,6 +2801,7 @@ impl SearchRebuildMemoryTracker {
         Self {
             private_bytes_peak: private_bytes_before,
             private_bytes_peak_phase: "before_rebuild".to_owned(),
+            private_bytes_after_last_reclaim: private_bytes_before,
             reclaim_calls: 0,
             observed_reclaimed: 0,
             missing_reclaimer_reported: false,
@@ -2800,12 +2813,22 @@ impl SearchRebuildMemoryTracker {
         let phase = rebuild_progress_phase(progress);
         self.record_peak(observed, &phase);
 
-        // Completed slots and filters are exact ownership-release boundaries:
-        // their transient row buffers and encoders have been dropped. The
-        // executable configures allocator-native immediate page purging at
-        // startup; collecting on every progress page merely rescanned live
-        // heaps, consumed CPU, and flooded logs without releasing ownership.
-        let release_boundary = matches!(
+        // A completed Base page is also an exact ownership-release boundary:
+        // its encoded values and decoded constellation payloads have been
+        // consumed, while only compact CxId memberships remain live. Rayon can
+        // free those payloads from threads other than the scanning thread, so
+        // mimalloc may retain their now-unused pages until an explicit process
+        // collection. Reclaim only after meaningful growth, not on every page;
+        // this follows the allocator's guidance for long-running processes with
+        // cross-thread frees while keeping the scan's live memberships intact.
+        let base_page_growth_boundary = progress.phase == "base_scan_page"
+            && observed.saturating_sub(self.private_bytes_after_last_reclaim)
+                >= BASE_PAGE_RECLAIM_GROWTH_BYTES;
+        let final_base_release_boundary = progress.phase == "load_docs_ok";
+
+        // Completed slots and filters remain exact ownership-release boundaries:
+        // their transient row buffers and encoders have been dropped.
+        let structural_release_boundary = matches!(
             progress.phase,
             "slot_index_write_ok"
                 | "slot_worker_quiesced"
@@ -2817,6 +2840,8 @@ impl SearchRebuildMemoryTracker {
                 | "manifest_validate_ok"
                 | "done"
         );
+        let release_boundary =
+            base_page_growth_boundary || final_base_release_boundary || structural_release_boundary;
         if !release_boundary {
             return Ok(());
         }
@@ -2837,6 +2862,7 @@ impl SearchRebuildMemoryTracker {
         let started = Instant::now();
         reclaim();
         let after = calyx_aster::resource::process_private_bytes()?;
+        self.private_bytes_after_last_reclaim = after;
         self.reclaim_calls = self.reclaim_calls.saturating_add(1);
         self.observed_reclaimed = self
             .observed_reclaimed
@@ -2846,6 +2872,9 @@ impl SearchRebuildMemoryTracker {
             code = "SYNAPSE_CALYX_TRANSIENT_MEMORY_RECLAIMED",
             phase,
             release_boundary,
+            base_page_growth_boundary,
+            final_base_release_boundary,
+            structural_release_boundary,
             private_bytes_before = observed,
             private_bytes_after = after,
             private_bytes_reclaimed = observed.saturating_sub(after),
@@ -7328,7 +7357,7 @@ impl SynapseCalyxVault {
         &self,
         cf: ColumnFamily,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError> {
-        self.with_read_snapshot(INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+        self.with_read_snapshot(CF_COUNT_READER_LEASE_MS, |snapshot| {
             let (rows, pages) = self
                 .vault
                 .count_cf_snapshot(snapshot, cf, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS)
