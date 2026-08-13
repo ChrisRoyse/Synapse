@@ -216,19 +216,10 @@ where
         &mut progress,
     )?;
     let panel_version = base_docs.panel_version();
-    let retained_slot_payloads = base_docs.retained_slot_payloads();
-    if retained_slot_payloads != 0 {
-        return Err(stale(format!(
-            "search rebuild retained {retained_slot_payloads} duplicate Base slot payloads after planning"
-        )));
-    }
     progress(RebuildProgress {
         rows: Some(base_docs.len()),
         base_seq: Some(base_seq),
-        detail: Some(format!(
-            "slot_memberships={} retained_base_slot_payloads={retained_slot_payloads}",
-            base_docs.slot_memberships()
-        )),
+        detail: Some(format!("slot_memberships={}", base_docs.slot_memberships())),
         ..RebuildProgress::phase("load_docs_ok")
     })?;
     let build_policy = configured_diskann_build_policy()?;
@@ -236,7 +227,7 @@ where
         vault_dir,
         vault,
         snapshot,
-        &base_docs,
+        base_docs,
         RebuildOptions {
             page_rows,
             panel_version,
@@ -272,7 +263,7 @@ fn rebuild_from_base_with_progress<C: Clock, F>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
     snapshot: Snapshot,
-    base_docs: &LoadedBaseDocs,
+    base_docs: LoadedBaseDocs,
     options: RebuildOptions<'_>,
     progress: &mut F,
 ) -> CliResult<RebuildSummary>
@@ -342,9 +333,10 @@ where
     };
     progress(RebuildProgress::phase("previous_manifest_ok"))?;
 
+    let base_row_count = base_docs.len();
     let plans = slot_build_plans(
         panel_version,
-        &base_docs.ids_by_slot,
+        base_docs.ids_by_slot,
         previous_manifest.as_ref(),
         active_slots,
         sparse_scoring,
@@ -447,11 +439,10 @@ where
 
     let filter = match reuse_staged_filter_entry(vault_dir, &root, base_seq)? {
         Some(entry) => {
-            if entry.len != base_docs.len() {
+            if entry.len != base_row_count {
                 return Err(stale(format!(
                     "staged filter artifact at base seq {base_seq} contains {} rows, but the pinned Base snapshot contains {}; refusing to reuse incomplete recovery state",
-                    entry.len,
-                    base_docs.len()
+                    entry.len, base_row_count
                 )));
             }
             progress(RebuildProgress {
@@ -463,14 +454,22 @@ where
         }
         None => {
             progress(RebuildProgress {
-                rows: Some(base_docs.len()),
+                rows: Some(base_row_count),
                 base_seq: Some(base_seq),
                 ..RebuildProgress::phase("filter_start")
             })?;
-            let entry = filter::write(vault_dir, &root, &base_docs.docs, base_seq)?;
+            let entry = filter::write_from_vault_snapshot(
+                vault_dir,
+                &root,
+                vault,
+                snapshot,
+                panel_version,
+                page_rows,
+                base_row_count,
+            )?;
             write_staged_filter_artifact(&root, base_seq, &entry)?;
             progress(RebuildProgress {
-                rows: Some(base_docs.len()),
+                rows: Some(base_row_count),
                 base_seq: Some(base_seq),
                 ..RebuildProgress::phase("filter_ok")
             })?;
@@ -659,7 +658,25 @@ where
                 ))
             })?;
             OptionalSearchIndexEntry::Some(sparse::write(
-                vault_dir, root, plan.slot, rows, base_seq, scoring,
+                vault_dir,
+                root,
+                plan.slot,
+                rows,
+                base_seq,
+                scoring,
+                |phase, rows| match progress {
+                    Some(progress) => emit_shared_progress(
+                        progress,
+                        RebuildProgress::slot(
+                            phase,
+                            plan.panel_version,
+                            plan.slot,
+                            Some(rows),
+                            Some(base_seq),
+                        ),
+                    ),
+                    None => Ok(()),
+                },
             )?)
         }
         ScannedSlotRows::MultiEntry(entry) => OptionalSearchIndexEntry::Some(entry),

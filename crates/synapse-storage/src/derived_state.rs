@@ -989,7 +989,7 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     // --- Search generations (#1891 ask 2, extended to every published
     // generation by #1938) ---
     match db.maintain_calyx_search_generation() {
-        Ok(sweep) => {
+        Ok(mut sweep) => {
             // A generation nothing could maintain, and a generation whose
             // maintenance failed, both mean some corpus is heading for or
             // already past its reconciliation bound. Neither may be reported as
@@ -1029,6 +1029,12 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
+            if sweep.last_rebuild_memory.is_none() {
+                sweep.last_rebuild_memory = guard
+                    .last_search_sweep
+                    .as_ref()
+                    .and_then(|previous| previous.last_rebuild_memory.clone());
+            }
             // The single-generation fields keep reporting the **active** panel,
             // so the pre-#1938 health field means exactly what it always meant.
             // The sweep is published alongside it rather than folded into it: a

@@ -195,25 +195,24 @@ pub(super) fn manifest_backend(policy: DiskAnnBuildPolicy) -> (String, String, b
 
 pub(super) fn slot_build_plans(
     panel_version: u32,
-    ids_by_slot: &BTreeMap<SlotId, Vec<CxId>>,
+    ids_by_slot: BTreeMap<SlotId, Vec<CxId>>,
     previous_manifest: Option<&SearchIndexManifest>,
     active_slots: Option<&BTreeSet<SlotId>>,
     sparse_scoring_by_slot: &BTreeMap<SlotId, SparseScoring>,
 ) -> Vec<SlotBuildPlan> {
     ids_by_slot
-        .iter()
+        .into_iter()
         .filter(|(slot, _)| active_slots.is_none_or(|active| active.contains(slot)))
-        .map(|(slot, expected_ids)| {
-            let mut expected_ids = expected_ids.clone();
+        .map(|(slot, mut expected_ids)| {
             expected_ids.sort();
             expected_ids.dedup();
-            let estimated_bytes = estimate_slot_bytes(*slot, expected_ids.len(), previous_manifest);
+            let estimated_bytes = estimate_slot_bytes(slot, expected_ids.len(), previous_manifest);
             SlotBuildPlan {
                 panel_version,
-                slot: *slot,
+                slot,
                 expected_ids,
                 estimated_bytes,
-                sparse_scoring: sparse_scoring_by_slot.get(slot).copied(),
+                sparse_scoring: sparse_scoring_by_slot.get(&slot).copied(),
             }
         })
         .collect()
@@ -223,13 +222,13 @@ pub(super) fn bounded_parallel_slot_count(plans: &[SlotBuildPlan]) -> CliResult<
     if plans.is_empty() {
         return Ok(1);
     }
-    let thread_limit = configured_nonzero_usize("CALYX_SEARCH_REBUILD_MAX_PARALLEL_SLOTS")?
-        .or(configured_nonzero_usize("RAYON_NUM_THREADS")?)
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|threads| threads.get())
-                .unwrap_or(1)
-        });
+    // The daemon is an always-on background service, not an offline bulk
+    // indexer. A whole dense/sparse lane is materialized while its immutable
+    // artifact is built, so using every host thread here multiplies complete
+    // corpus working sets. Default to one lane at a time; an explicitly
+    // audited rebuild may opt into more through the dedicated setting.
+    let thread_limit =
+        configured_nonzero_usize("CALYX_SEARCH_REBUILD_MAX_PARALLEL_SLOTS")?.unwrap_or(1);
     let memory_budget = configured_nonzero_usize("CALYX_SEARCH_REBUILD_MEMORY_BUDGET_BYTES")?
         .unwrap_or(DEFAULT_REBUILD_SLOT_MEMORY_BUDGET_BYTES);
     let largest_slot = plans

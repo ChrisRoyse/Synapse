@@ -45,18 +45,31 @@ where
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);
-    let sha256 = {
+    let write_result: CliResult<String> = (|| {
         let file = File::create(&tmp)?;
         let mut writer = HashingWriter::new(BufWriter::new(file));
-        write_fn(&mut writer).inspect_err(|_| {
-            let _ = fs::remove_file(&tmp);
-        })?;
+        write_fn(&mut writer)?;
         let (buf_writer, sha256) = writer.into_parts();
         let file = buf_writer
             .into_inner()
             .map_err(|err| CliError::io(format!("flush index sidecar {}: {err}", tmp.display())))?;
         file.sync_all()?;
-        sha256
+        Ok(sha256)
+    })();
+    let sha256 = match write_result {
+        Ok(sha256) => sha256,
+        Err(primary) => {
+            return match fs::remove_file(&tmp) {
+                Ok(()) => Err(primary),
+                Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => Err(primary),
+                Err(cleanup) => Err(stale(format!(
+                    "streamed atomic sidecar write failed [{}] {}; temporary file cleanup at {} also failed: {cleanup}",
+                    primary.code(),
+                    primary.message(),
+                    tmp.display()
+                ))),
+            };
+        }
     };
     fs::rename(&tmp, path).inspect_err(|_| {
         let _ = fs::remove_file(&tmp);
@@ -100,6 +113,62 @@ impl<W: Write> Write for HashingWriter<W> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// `io::Read` adapter that hashes the exact bytes consumed by a streaming
+/// decoder. Validation and decoding therefore share one file handle and one
+/// byte stream; replacing an artifact between a hash pass and a parse pass
+/// cannot make unverified bytes visible to the caller.
+pub(super) struct HashingReader<R: Read> {
+    inner: R,
+    hasher: Sha256,
+}
+
+impl<R: Read> HashingReader<R> {
+    pub(super) fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+        }
+    }
+
+    pub(super) fn into_sha256(self) -> String {
+        let digest = self.hasher.finalize();
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            hex.push_str(&format!("{byte:02x}"));
+        }
+        hex
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        self.hasher.update(&buf[..read]);
+        Ok(read)
+    }
+}
+
+/// Hash a file with a fixed-size buffer. Artifact identity must never require a
+/// second allocation the size of the artifact being identified.
+pub(super) fn sha256_file(path: &Path) -> CliResult<String> {
+    let mut reader = BufReader::new(File::open(path)?);
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = hasher.finalize();
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        hex.push_str(&format!("{byte:02x}"));
+    }
+    Ok(hex)
 }
 
 /// Atomic JSON write followed by a parent-directory fsync, so the rename that

@@ -240,6 +240,20 @@ impl PanelGenerationMaintenance {
         self.is_declared_queryable && !self.manifest_present()
     }
 
+    /// Private-memory observations made by the real rebuild, when this pass
+    /// built rather than only inspected the generation.
+    #[must_use]
+    pub fn rebuild_private_bytes(&self) -> Option<(u64, u64, u64)> {
+        let GenerationDisposition::Maintained(report) = &self.disposition else {
+            return None;
+        };
+        Some((
+            report.rebuild_private_bytes_before?,
+            report.rebuild_private_bytes_peak?,
+            report.rebuild_private_bytes_after?,
+        ))
+    }
+
     /// One line of the health detail: everything an operator needs to decide
     /// whether to act, per generation.
     #[must_use]
@@ -267,13 +281,14 @@ impl PanelGenerationMaintenance {
                     .map_or(report.before.built_at_seq, |after| after.built_at_seq);
                 format!(
                     "panel {}{active}{queryable} {disposition} action={} state={state} built_at_seq={:?} \
-                     delta_changed_keys={:?} keys_to_bound={:?} limit={} elapsed_ms={}",
+                     delta_changed_keys={:?} keys_to_bound={:?} limit={} rebuild_private_bytes={:?} elapsed_ms={}",
                     self.panel_version,
                     report.action.as_str(),
                     built_at,
                     self.delta_changed_keys(),
                     self.keys_to_bound(),
                     report.before.max_reconciled_delta_keys,
+                    self.rebuild_private_bytes(),
                     report.elapsed_ms,
                 )
             }
@@ -325,7 +340,19 @@ pub struct SearchGenerationSweep {
     /// Entries under the index root that are not published generations, carried
     /// through so the sweep's scope is auditable rather than assumed complete.
     pub unrecognized_index_entries: Vec<String>,
+    /// Most recent real rebuild memory observation. The derived-state owner
+    /// carries this forward across inspection-only ticks so health does not
+    /// forget the last expensive operation five minutes later.
+    pub last_rebuild_memory: Option<SearchRebuildMemoryObservation>,
     pub elapsed_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct SearchRebuildMemoryObservation {
+    pub panel_version: u32,
+    pub private_bytes_before: u64,
+    pub private_bytes_peak: u64,
+    pub private_bytes_after: u64,
 }
 
 impl SearchGenerationSweep {
@@ -403,13 +430,14 @@ impl SearchGenerationSweep {
             .join("; ");
         format!(
             "index_root={} active_panel={:?} declared_queryable={:?} unbuilt_declared_queryable={:?} \
-             generations={} unrecognized={:?} elapsed_ms={} [{}]",
+             generations={} unrecognized={:?} last_rebuild_memory={:?} elapsed_ms={} [{}]",
             self.index_root,
             self.active_panel_version,
             self.declared_queryable_panel_versions,
             self.unbuilt_declared_queryable_panel_versions(),
             self.generations.len(),
             self.unrecognized_index_entries,
+            self.last_rebuild_memory,
             self.elapsed_ms,
             generations,
         )

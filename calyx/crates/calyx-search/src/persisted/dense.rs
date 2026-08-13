@@ -12,7 +12,7 @@ use super::rebuild::RebuildProgress;
 use super::rebuild_plan::DiskAnnBuildPolicy;
 use super::{
     DenseQuantizationEntry, PersistedDenseIndexConfig, SearchIndexEntry, SlotIdMap, rel,
-    sha256_hex, stale, write_json_atomic,
+    sha256_file, sha256_hex, stale, write_json_atomic,
 };
 use crate::error::CliResult;
 
@@ -130,16 +130,14 @@ where
         ))?;
         let pq_path = graph_path.with_extension("pq");
         let raw_path = graph_path.with_extension("raw");
-        let pq_bytes = fs::read(&pq_path)?;
-        let raw_bytes = fs::read(&raw_path)?;
         quantization = Some(DenseQuantizationEntry {
             bits: quant_bits,
             subvectors: params.subvectors,
             centroids: params.centroids.min(rows.rows.len()),
             pq_rel: rel(vault_dir, &pq_path)?,
-            pq_sha256: sha256_hex(&pq_bytes),
+            pq_sha256: sha256_file(&pq_path)?,
             raw_rel: rel(vault_dir, &raw_path)?,
-            raw_sha256: sha256_hex(&raw_bytes),
+            raw_sha256: sha256_file(&raw_path)?,
         });
     }
     let id_map_path = dir.join("ids.json");

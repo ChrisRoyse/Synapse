@@ -33,9 +33,10 @@ where
     F: FnMut(RebuildProgress<'_>) -> CliResult,
 {
     let range = all_rows();
-    let mut docs = BTreeMap::new();
+    let mut row_count = 0usize;
     let mut ids_by_slot = BTreeMap::<SlotId, Vec<CxId>>::new();
     let mut observed_panel_versions = BTreeSet::new();
+    let mut last_retained_cx_id = None;
     vault.scan_cf_range_pages_snapshot(
         snapshot,
         ColumnFamily::Base,
@@ -64,6 +65,13 @@ where
                 {
                     continue;
                 }
+                if last_retained_cx_id.is_some_and(|previous| previous >= cx_id) {
+                    return Err(stale(format!(
+                        "base CF search-rebuild scan is not strictly ordered: prior cx_id {last_retained_cx_id:?}, current {cx_id}"
+                    ))
+                    .into());
+                }
+                last_retained_cx_id = Some(cx_id);
                 // Base rows contain a second copy of every slot payload. The
                 // rebuild plan needs only slot membership, while the index
                 // writers deliberately reread authoritative payloads from
@@ -74,14 +82,12 @@ where
                     ids_by_slot.entry(*slot).or_default().push(cx_id);
                 }
                 cx.slots.clear();
-                if docs.insert(cx_id, cx).is_some() {
-                    return Err(
-                        stale(format!("base CF repeats row for cx_id {cx_id}")).into(),
-                    );
-                }
+                row_count = row_count
+                    .checked_add(1)
+                    .ok_or_else(|| stale("base CF row count overflow during search rebuild"))?;
             }
             progress(RebuildProgress {
-                rows: Some(docs.len()),
+                rows: Some(row_count),
                 base_seq: Some(snapshot.seq()),
                 ..RebuildProgress::phase("base_scan_page")
             })?;
@@ -104,14 +110,14 @@ where
     };
     Ok(LoadedBaseDocs {
         panel_version,
-        docs,
+        row_count,
         ids_by_slot,
     })
 }
 
 pub(super) struct LoadedBaseDocs {
     panel_version: u32,
-    pub(super) docs: BTreeMap<CxId, Constellation>,
+    row_count: usize,
     pub(super) ids_by_slot: BTreeMap<SlotId, Vec<CxId>>,
 }
 
@@ -121,15 +127,11 @@ impl LoadedBaseDocs {
     }
 
     pub(super) fn len(&self) -> usize {
-        self.docs.len()
+        self.row_count
     }
 
     pub(super) fn slot_memberships(&self) -> usize {
         self.ids_by_slot.values().map(Vec::len).sum()
-    }
-
-    pub(super) fn retained_slot_payloads(&self) -> usize {
-        self.docs.values().map(|cx| cx.slots.len()).sum()
     }
 }
 

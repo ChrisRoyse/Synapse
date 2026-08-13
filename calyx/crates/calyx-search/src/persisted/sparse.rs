@@ -94,20 +94,25 @@ impl SparseSlotRows {
     }
 }
 
-pub(super) fn write(
+pub(super) fn write<F>(
     vault_dir: &Path,
     root: &Path,
     slot: SlotId,
     rows: SparseSlotRows,
     base_seq: u64,
     scoring: SparseScoring,
-) -> CliResult<SearchIndexEntry> {
+    mut progress: F,
+) -> CliResult<SearchIndexEntry>
+where
+    F: FnMut(&'static str, usize) -> CliResult,
+{
     let path = root.join(format!(
         "slot_{:05}_seq_{base_seq:020}_n_{:010}.sparse.json",
         slot.get(),
         rows.rows.len()
     ));
     let index = build_index(slot, rows.dim, rows.rows, base_seq, scoring)?;
+    progress("slot.sparse.index_built", index.rows.len())?;
     let sha256 = write_json_atomic_hashed(&path, &index)?;
     Ok(SearchIndexEntry::sparse(
         slot,

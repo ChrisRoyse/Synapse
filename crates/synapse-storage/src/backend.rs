@@ -4239,12 +4239,23 @@ impl StorageBackend for CalyxBackend {
                     });
                 }
 
+                let last_rebuild_memory = generations.iter().rev().find_map(|entry| {
+                    entry.rebuild_private_bytes().map(|(before, peak, after)| {
+                        crate::search_sweep::SearchRebuildMemoryObservation {
+                            panel_version: entry.panel_version,
+                            private_bytes_before: before,
+                            private_bytes_peak: peak,
+                            private_bytes_after: after,
+                        }
+                    })
+                });
                 let sweep = SearchGenerationSweep {
                     index_root: published.index_root.display().to_string(),
                     active_panel_version,
                     declared_queryable_panel_versions: declared_queryable,
                     generations,
                     unrecognized_index_entries: published.unrecognized,
+                    last_rebuild_memory,
                     elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
                 };
                 // #2075: named loudly, at the pass that owns the condition. A

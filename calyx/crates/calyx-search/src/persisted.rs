@@ -23,7 +23,7 @@ mod sparse;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use calyx_aster::vault::AsterVault;
@@ -872,6 +872,6 @@ pub fn manifest_path(vault_dir: &Path, panel_version: u32) -> PathBuf {
 #[path = "persisted/io.rs"]
 mod fs_io;
 use fs_io::{
-    rel, sha256_hex, stale, write_atomic_hashed, write_json_atomic, write_json_atomic_durable,
-    write_json_atomic_hashed,
+    rel, sha256_file, sha256_hex, stale, write_atomic_hashed, write_json_atomic,
+    write_json_atomic_durable, write_json_atomic_hashed,
 };

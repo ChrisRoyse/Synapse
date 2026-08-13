@@ -272,6 +272,12 @@ pub struct SynapseCalyxSearchRawSidecar {
 pub struct SynapseCalyxSearchRebuildReport {
     pub expected_panel_version: u32,
     pub before_manifest_sha256: Option<String>,
+    /// Process-private bytes immediately before the pinned rebuild starts.
+    pub private_bytes_before: u64,
+    /// Highest process-private byte count observed at rebuild progress boundaries.
+    pub private_bytes_peak: u64,
+    /// Process-private bytes after artifact reopen and independent validation.
+    pub private_bytes_after: u64,
     pub generation: PersistedSearchGeneration,
     pub manifest_path: PathBuf,
     pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
@@ -789,6 +795,9 @@ pub struct SearchGenerationMaintenanceReport {
     pub before: SynapseCalyxSearchGenerationStatus,
     /// Generation state re-read from disk after the pass, when it built.
     pub after: Option<SynapseCalyxSearchGenerationStatus>,
+    pub rebuild_private_bytes_before: Option<u64>,
+    pub rebuild_private_bytes_peak: Option<u64>,
+    pub rebuild_private_bytes_after: Option<u64>,
     pub elapsed_ms: u64,
 }
 
@@ -4562,6 +4571,9 @@ impl SynapseCalyxVault {
                 reason,
                 before,
                 after: None,
+                rebuild_private_bytes_before: None,
+                rebuild_private_bytes_peak: None,
+                rebuild_private_bytes_after: None,
                 elapsed_ms: elapsed(started),
             });
         }
@@ -4588,6 +4600,9 @@ impl SynapseCalyxVault {
                 ),
                 before,
                 after: None,
+                rebuild_private_bytes_before: None,
+                rebuild_private_bytes_peak: None,
+                rebuild_private_bytes_after: None,
                 elapsed_ms: elapsed(started),
             });
         }
@@ -4612,7 +4627,7 @@ impl SynapseCalyxVault {
             already_unusable,
             "building the persisted search generation unattended"
         );
-        self.rebuild_search_indexes_for_panel(panel_version, supplied)?;
+        let rebuild = self.rebuild_search_indexes_for_panel(panel_version, supplied)?;
 
         // Source of truth is the manifest on disk, re-read independently of the
         // build that just claimed to write it. Scoped to the exact panel that
@@ -4632,6 +4647,9 @@ impl SynapseCalyxVault {
             after_rows_covered = ?after.rows_covered,
             after_dense_lanes = after.dense_slot_count,
             after_sparse_lanes = after.sparse_slot_count,
+            private_bytes_before = rebuild.private_bytes_before,
+            private_bytes_peak = rebuild.private_bytes_peak,
+            private_bytes_after = rebuild.private_bytes_after,
             elapsed_ms = elapsed(started),
             "persisted search generation rebuilt unattended and re-read from disk"
         );
@@ -4640,6 +4658,9 @@ impl SynapseCalyxVault {
             reason,
             before,
             after: Some(after),
+            rebuild_private_bytes_before: Some(rebuild.private_bytes_before),
+            rebuild_private_bytes_peak: Some(rebuild.private_bytes_peak),
+            rebuild_private_bytes_after: Some(rebuild.private_bytes_after),
             elapsed_ms: elapsed(started),
         })
     }
@@ -4679,9 +4700,72 @@ impl SynapseCalyxVault {
         expected_panel_version: u32,
         supplied: Option<&VaultPanelState>,
     ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
-        // A supplied contract must be for exactly the requested generation:
-        // rebuilding panel A's index from panel B's slot map would publish a
-        // manifest whose lanes do not describe the rows it indexed.
+        let state = self.resolve_search_rebuild_panel_state(expected_panel_version, supplied)?;
+        let panel_root = self
+            .config
+            .vault_dir
+            .join("idx")
+            .join("search")
+            .join(format!("panel_{expected_panel_version:010}"));
+        let manifest_path = panel_root.join("manifest.json");
+        let before_manifest_sha256 = read_optional_sha256(&manifest_path)?;
+        let private_bytes_before = process_private_bytes()?;
+        let mut private_bytes_peak = private_bytes_before;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_REBUILD_STARTED",
+            panel_version = expected_panel_version,
+            vault_dir = %self.config.vault_dir.display(),
+            before_manifest_sha256 = ?before_manifest_sha256,
+            "rebuilding persisted Calyx search indexes"
+        );
+        self.rebuild_search_artifacts_measured(&state, &mut private_bytes_peak)?;
+        let generation =
+            calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, state.panel.version)
+                .and_then(|indexes| indexes.generation())
+                .map_err(|error| {
+                    search_rebuild_error("reopen published search generation", error)
+                })?;
+        if generation.panel_version != expected_panel_version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
+                format!(
+                    "published search generation panel {} != requested panel {expected_panel_version}",
+                    generation.panel_version
+                ),
+                "remove no files; inspect the rebuild marker and durable panel state before retrying",
+            ));
+        }
+        let raw_sidecars = inspect_search_raw_sidecars(&panel_root)?;
+        let private_bytes_after = process_private_bytes()?;
+        private_bytes_peak = private_bytes_peak.max(private_bytes_after);
+        tracing::info!(
+            code = "SYNAPSE_CALYX_SEARCH_REBUILD_COMMITTED",
+            panel_version = expected_panel_version,
+            base_seq = generation.base_seq,
+            manifest_sha256 = %generation.manifest_sha256,
+            raw_sidecar_count = raw_sidecars.len(),
+            private_bytes_before,
+            private_bytes_peak,
+            private_bytes_after,
+            "persisted Calyx search generation reopened and verified"
+        );
+        Ok(SynapseCalyxSearchRebuildReport {
+            expected_panel_version,
+            before_manifest_sha256,
+            private_bytes_before,
+            private_bytes_peak,
+            private_bytes_after,
+            generation,
+            manifest_path,
+            raw_sidecars,
+        })
+    }
+
+    fn resolve_search_rebuild_panel_state(
+        &self,
+        expected_panel_version: u32,
+        supplied: Option<&VaultPanelState>,
+    ) -> Result<VaultPanelState, SynapseCalyxError> {
         if let Some(state) = supplied
             && state.panel.version != expected_panel_version
         {
@@ -4726,60 +4810,26 @@ impl SynapseCalyxVault {
             }
             active
         };
-        let panel_root = self
-            .config
-            .vault_dir
-            .join("idx")
-            .join("search")
-            .join(format!("panel_{expected_panel_version:010}"));
-        let manifest_path = panel_root.join("manifest.json");
-        let before_manifest_sha256 = read_optional_sha256(&manifest_path)?;
-        tracing::info!(
-            code = "SYNAPSE_CALYX_SEARCH_REBUILD_STARTED",
-            panel_version = expected_panel_version,
-            vault_dir = %self.config.vault_dir.display(),
-            before_manifest_sha256 = ?before_manifest_sha256,
-            "rebuilding persisted Calyx search indexes"
-        );
-        calyx_search::rebuild_for_vault_with_panel_state_and_dense_config(
+        Ok(state)
+    }
+
+    fn rebuild_search_artifacts_measured(
+        &self,
+        state: &VaultPanelState,
+        private_bytes_peak: &mut u64,
+    ) -> Result<(), SynapseCalyxError> {
+        calyx_search::rebuild_for_vault_with_panel_state_dense_config_progress(
             &self.config.vault_dir,
             &self.vault,
-            &state,
+            state,
             self.effective_tuning()?.dense_index_config(),
+            |_progress| {
+                *private_bytes_peak =
+                    (*private_bytes_peak).max(calyx_aster::resource::process_private_bytes()?);
+                Ok(())
+            },
         )
-        .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))?;
-        let generation =
-            calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, state.panel.version)
-                .and_then(|indexes| indexes.generation())
-                .map_err(|error| {
-                    search_rebuild_error("reopen published search generation", error)
-                })?;
-        if generation.panel_version != expected_panel_version {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_SEARCH_PANEL_MISMATCH",
-                format!(
-                    "published search generation panel {} != requested panel {expected_panel_version}",
-                    generation.panel_version
-                ),
-                "remove no files; inspect the rebuild marker and durable panel state before retrying",
-            ));
-        }
-        let raw_sidecars = inspect_search_raw_sidecars(&panel_root)?;
-        tracing::info!(
-            code = "SYNAPSE_CALYX_SEARCH_REBUILD_COMMITTED",
-            panel_version = expected_panel_version,
-            base_seq = generation.base_seq,
-            manifest_sha256 = %generation.manifest_sha256,
-            raw_sidecar_count = raw_sidecars.len(),
-            "persisted Calyx search generation reopened and verified"
-        );
-        Ok(SynapseCalyxSearchRebuildReport {
-            expected_panel_version,
-            before_manifest_sha256,
-            generation,
-            manifest_path,
-            raw_sidecars,
-        })
+        .map_err(|error| search_rebuild_error("rebuild persisted search indexes", error))
     }
 
     /// Publishes an active durable `Panel` snapshot into the Calyx manifest for
