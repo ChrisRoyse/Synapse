@@ -9771,6 +9771,7 @@ function Get-SynapseCandidateReplacementReservationId {
     }
     $calyxHealth = $health.subsystems.calyx_vault
     $selectedBackend = [string]$calyxHealth.calyx_math_backend
+    $probeStatus = [string]$calyxHealth.calyx_math_probe_status
     $healthReservationId = [string]$calyxHealth.calyx_gpu_reservation_id
     # Same split for the Calyx subsystem: the datum this function needs from it is the selected math
     # backend (which decides whether a GPU reservation has to be handed off at all). That datum being
@@ -9797,6 +9798,10 @@ function Get-SynapseCandidateReplacementReservationId {
         } catch {
             Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_UNREADABLE path=$statePath error=$($_.Exception.Message) remediation=repair the host GPU reservation Source of Truth before candidate validation"
         }
+        $stateProperties = @($state.PSObject.Properties.Name)
+        if ([int]$state.schema_version -ne 1 -or [int]$state.device_index -ne 0 -or $stateProperties -notcontains 'reservations') {
+            Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_SCHEMA_INVALID path=$statePath schema_version=$(if ($null -eq $state.schema_version) { '<absent>' } else { [string]$state.schema_version }) device_index=$(if ($null -eq $state.device_index) { '<absent>' } else { [string]$state.device_index }) reservations_present=$($stateProperties -contains 'reservations') remediation=repair the device-0 host GPU reservation ledger schema before candidate validation"
+        }
     }
 
     $pidRows = if ($null -eq $state) {
@@ -9815,8 +9820,27 @@ function Get-SynapseCandidateReplacementReservationId {
     if (-not $statePresent) {
         Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_MISSING path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon GPU reservation Source of Truth before candidate validation"
     }
+    # #2239 made CUDA ownership demand-driven: the final caller destroys the
+    # context, releases the host lease, and publishes `dormant_verified` only
+    # after a separate ledger read proves the live PID owns no reservation.
+    # A candidate therefore needs a replacement reservation only while the
+    # outgoing daemon has an active lease. Preserve every mixed-state refusal:
+    # the exact dormant verdict is accepted only when both health and the
+    # current physical ledger independently prove there is nothing to hand off.
+    if ($probeStatus -ieq 'dormant_verified') {
+        if (-not [string]::IsNullOrWhiteSpace($healthReservationId) -or $pidRows.Count -ne 0) {
+            Die "SYNAPSE_GPU_REPLACEMENT_DORMANT_STATE_CONFLICT path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) ledger_pid_row_count=$($pidRows.Count) remediation=dormant_verified requires an absent health reservation identity and zero physical ledger rows for the exact live daemon"
+        }
+        try {
+            $stateHash = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256 -ErrorAction Stop).Hash
+        } catch {
+            Die "SYNAPSE_GPU_REPLACEMENT_LEDGER_HASH_FAILED path=$statePath live_pid=$($listener.OwningProcess) error=$($_.Exception.Message) remediation=repair physical read access to the host GPU reservation Source of Truth before candidate validation"
+        }
+        Info "SYNAPSE_GPU_REPLACEMENT_DORMANT_VERIFIED bind=$Bind live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$probeStatus health_reservation_id=<none> ledger_pid_row_count=0 ledger_reservation_count=$(@($state.reservations).Count) ledger_sha256=$stateHash state_path=$statePath note=no active CUDA context or host lease exists to hand off; candidate admission remains independently validated"
+        return $null
+    }
     if ($healthReservationId -notmatch '^[0-9a-fA-F]{32}$') {
-        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_RESERVATION_INVALID path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon health reservation identity before candidate validation"
+        Die "SYNAPSE_GPU_REPLACEMENT_HEALTH_RESERVATION_INVALID path=$statePath live_pid=$($listener.OwningProcess) selected_backend=$selectedBackend probe_status=$(if ($probeStatus) { $probeStatus } else { '<absent>' }) health_reservation_id=$(if ($healthReservationId) { $healthReservationId } else { '<none>' }) remediation=repair the live CUDA daemon health reservation identity before candidate validation"
     }
     $matches = @($pidRows | Where-Object {
         [string]$_.owner -eq 'synapse-mcp' -and
