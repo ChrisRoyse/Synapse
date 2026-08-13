@@ -569,15 +569,20 @@ pub(super) async fn handle(
                         "restart the daemon; the search-rebuild admission gate is no longer available",
                     ),
                 })?;
-            // The rebuild is strictly blocking, CPU/IO-bound work that must not
-            // occupy a Tokio runtime worker serving MCP requests. Offload it to
-            // the blocking pool and hold the admission permit for the task's
-            // lifetime so a concurrent caller keeps failing closed until publish.
+            // The rebuild is strictly blocking, CPU/IO-bound whole-corpus work.
+            // Admit it through the same exclusive lane as GC, derived-state
+            // maintenance, and disk-pressure compaction so individually bounded
+            // working sets cannot multiply into an unbounded process total. The
+            // facade permit remains held while this call waits for and owns that
+            // lane, so a concurrent explicit rebuild still fails closed.
             let expected_panel_version = spec.expected_panel_version;
-            let report = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                db.rebuild_calyx_search_indexes(expected_panel_version)
-            })
+            let report = synapse_storage::maintenance::run_admitted_maintenance(
+                "storage_search_rebuild",
+                move || {
+                    let _permit = permit;
+                    db.rebuild_calyx_search_indexes(expected_panel_version)
+                },
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -585,21 +590,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("search-rebuild blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs for the SYNAPSE_CALYX_SEARCH_REBUILD phase records; the rebuild task terminated abnormally",
-                )
-            })?
-            .map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    &source_id,
-                    STORAGE_SOT,
                     crate::m1::mcp_error(error.code(), error.to_string()),
-                    "inspect the exact durable panel state, rebuild marker, and named physical artifact before retrying",
+                    "inspect daemon STORAGE_MAINTENANCE_* admission records and SYNAPSE_CALYX_SEARCH_REBUILD phase records; the exclusive rebuild pass failed",
                 )
             })?;
             let response = crate::m3::storage::StorageSearchRebuildResponse {

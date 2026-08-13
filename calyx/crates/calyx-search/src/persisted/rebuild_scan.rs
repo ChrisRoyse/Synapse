@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use calyx_aster::cf::{ColumnFamily, KeyRange};
+use calyx_aster::cf::{ColumnFamily, KeyRange, prefix_range};
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
 use calyx_aster::vault::encode::{
@@ -205,90 +205,147 @@ where
     let mut multi_writer = None;
     let scan_result: CliResult = (|| {
         let slot_cf = ColumnFamily::slot(plan.slot);
-        for cx_id in plan.expected_ids.iter().copied() {
-            // A multi-vector row may approach the 64 MiB segment ceiling, so
-            // this remains a strict one-row live-set bound. Use the exact
-            // pinned point-read primitive directly: wrapping every single row
-            // in `read_batch` allocated request/result vectors and acquired an
-            // all-family guard hundreds of thousands of times per slot.
-            let bytes = vault
-                .read_cf_snapshot(snapshot, slot_cf, cx_id.as_bytes())?
-                .ok_or_else(|| {
-                    CalyxError::aster_corrupt_shard(format!(
-                        "slot CF row missing for slot {} cx_id {cx_id}",
-                        plan.slot
-                    ))
-                })?;
-            let encoded_shape = inspect_slot_vector(&bytes).map_err(|error| {
-                CalyxError::aster_corrupt_shard(format!(
-                    "slot {} cx {cx_id} has malformed encoded payload: {}",
-                    plan.slot, error.message
-                ))
-            })?;
-            let flushed = match encoded_shape {
-                EncodedSlotVectorShape::Multi {
-                    token_dim,
-                    token_count,
-                } => {
-                    multi::ensure_streaming_row_bounded(
-                        plan.slot,
-                        cx_id,
-                        token_dim,
-                        token_count,
-                        bytes.len(),
-                    )?;
-                    push_encoded_multi(
-                        plan,
-                        cx_id,
-                        token_dim,
-                        token_count,
-                        bytes,
-                        &mut shape,
-                        &mut multi_token_dim,
-                        &mut multi_writer,
-                        vault_dir,
-                        root,
-                        snapshot.seq(),
-                    )?
+        let first_expected = plan.expected_ids.first().copied().ok_or_else(|| {
+            stale(format!(
+                "slot {} rebuild plan has no expected ids",
+                plan.slot
+            ))
+        })?;
+        let last_expected = plan
+            .expected_ids
+            .last()
+            .copied()
+            .expect("non-empty expected ids has a last id");
+        let range = KeyRange {
+            start: first_expected.as_bytes().to_vec(),
+            end: prefix_range(last_expected.as_bytes()).end,
+        };
+        let mut expected_index = 0usize;
+        let mut last_scanned = None;
+        vault.scan_cf_range_pages_snapshot(
+            snapshot,
+            slot_cf,
+            &range,
+            page_rows,
+            |page| -> CliResult {
+                for (key, bytes) in page {
+                    let cx_id = cx_id_from_cf_key(&key, "slot CF")?;
+                    if last_scanned.is_some_and(|previous| previous >= cx_id) {
+                        return Err(stale(format!(
+                            "slot {} CF scan is not strictly ordered: prior cx_id {last_scanned:?}, current {cx_id}",
+                            plan.slot
+                        )));
+                    }
+                    last_scanned = Some(cx_id);
+
+                    let Some(expected) = plan.expected_ids.get(expected_index).copied() else {
+                        return Err(stale(format!(
+                            "slot {} CF scan returned unexpected cx_id {cx_id} after all {} expected rows",
+                            plan.slot,
+                            plan.expected_ids.len()
+                        )));
+                    };
+                    match cx_id.cmp(&expected) {
+                        std::cmp::Ordering::Less => {
+                            // Slot CFs may contain rows from other panel versions.
+                            // They are part of the physical ordered stream but not
+                            // members of this panel's exact Base projection.
+                            continue;
+                        }
+                        std::cmp::Ordering::Greater => {
+                            return Err(CalyxError::aster_corrupt_shard(format!(
+                                "slot CF row missing for slot {} cx_id {expected}; next physical row is {cx_id}",
+                                plan.slot
+                            ))
+                            .into());
+                        }
+                        std::cmp::Ordering::Equal => {}
+                    }
+
+                    // A multi-vector row may approach the 64 MiB segment
+                    // ceiling, so processing remains a strict one-row live-set
+                    // bound even though the physical SST readers remain open for
+                    // the complete ordered range scan.
+                    let encoded_shape = inspect_slot_vector(&bytes).map_err(|error| {
+                        CalyxError::aster_corrupt_shard(format!(
+                            "slot {} cx {cx_id} has malformed encoded payload: {}",
+                            plan.slot, error.message
+                        ))
+                    })?;
+                    let flushed = match encoded_shape {
+                        EncodedSlotVectorShape::Multi {
+                            token_dim,
+                            token_count,
+                        } => {
+                            multi::ensure_streaming_row_bounded(
+                                plan.slot,
+                                cx_id,
+                                token_dim,
+                                token_count,
+                                bytes.len(),
+                            )?;
+                            push_encoded_multi(
+                                plan,
+                                cx_id,
+                                token_dim,
+                                token_count,
+                                bytes,
+                                &mut shape,
+                                &mut multi_token_dim,
+                                &mut multi_writer,
+                                vault_dir,
+                                root,
+                                snapshot.seq(),
+                            )?
+                        }
+                        EncodedSlotVectorShape::Dense { .. }
+                        | EncodedSlotVectorShape::Sparse { .. }
+                        | EncodedSlotVectorShape::Absent => push_slot_vector(
+                            plan,
+                            cx_id,
+                            decode_slot_vector(&bytes)?,
+                            &mut shape,
+                            &mut dense_dim,
+                            &mut sparse_dim,
+                            &mut multi_token_dim,
+                            &mut dense_rows,
+                            &mut flat_dense_writer,
+                            &mut sparse_writer,
+                            &mut multi_writer,
+                            vault_dir,
+                            root,
+                            snapshot.seq(),
+                            dense_index_config,
+                        )?,
+                    };
+                    if let Some(flushed) = flushed {
+                        emit_segment_flush(progress, plan, snapshot.seq(), flushed)?;
+                    }
+                    expected_index += 1;
+                    found += 1;
                 }
-                EncodedSlotVectorShape::Dense { .. }
-                | EncodedSlotVectorShape::Sparse { .. }
-                | EncodedSlotVectorShape::Absent => push_slot_vector(
-                    plan,
-                    cx_id,
-                    decode_slot_vector(&bytes)?,
-                    &mut shape,
-                    &mut dense_dim,
-                    &mut sparse_dim,
-                    &mut multi_token_dim,
-                    &mut dense_rows,
-                    &mut flat_dense_writer,
-                    &mut sparse_writer,
-                    &mut multi_writer,
-                    vault_dir,
-                    root,
-                    snapshot.seq(),
-                    dense_index_config,
-                )?,
-            };
-            if let Some(flushed) = flushed {
-                emit_segment_flush(progress, plan, snapshot.seq(), flushed)?;
-            }
-            found += 1;
-            if let Some(progress) = progress
-                && (found.is_multiple_of(page_rows) || found == plan.expected_ids.len())
-            {
-                emit_shared_progress(
-                    progress,
-                    RebuildProgress::slot(
-                        "slot_point_read_page",
-                        plan.panel_version,
-                        plan.slot,
-                        Some(found),
-                        Some(snapshot.seq()),
-                    ),
-                )?;
-            }
+                if let Some(progress) = progress {
+                    emit_shared_progress(
+                        progress,
+                        RebuildProgress::slot(
+                            "slot_range_scan_page",
+                            plan.panel_version,
+                            plan.slot,
+                            Some(found),
+                            Some(snapshot.seq()),
+                        ),
+                    )?;
+                }
+                Ok(())
+            },
+        )?;
+        if let Some(missing) = plan.expected_ids.get(expected_index) {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "slot CF row missing for slot {} cx_id {missing}; ordered physical scan ended after {found} of {} expected rows",
+                plan.slot,
+                plan.expected_ids.len()
+            ))
+            .into());
         }
         Ok(())
     })();

@@ -80,13 +80,17 @@
 /// page to the OS with `MEM_DECOMMIT` on Windows (`MIMALLOC_PURGE_DELAY`,
 /// default 1000 ms) rather than holding the commit forever.
 ///
-/// # Why the default configuration is left alone
+/// # Why the daemon overrides the default purge delay
 ///
-/// `MIMALLOC_PURGE_DELAY=0` would purge on every emptied page — lower commit,
-/// measurably worse throughput on a daemon that allocates in bursts. The 1000 ms
-/// default coalesces a burst's frees into one decommit, which is the behaviour
-/// this workload wants. It is an environment variable, so an operator can retune
-/// it on a host without a rebuild.
+/// The installed #2243 workload is an always-on background daemon whose
+/// short-lived rebuild workers release hundreds of thousands of decoded rows at
+/// explicit phase boundaries. Leaving the 1000 ms default in place let abandoned
+/// worker arenas remain charged long enough to overlap the next lane. Startup
+/// therefore applies and reads back `purge_decommits=1`, `purge_delay=0`, and
+/// `arena_purge_mult=1`: an empty page is decommitted at the ownership boundary,
+/// while the exclusive whole-corpus maintenance lane prevents repeated
+/// purge/reallocate churn from concurrent bulk passes. These are allocator
+/// retention semantics, not an allocation or process-memory cap.
 ///
 /// # Blast radius
 ///

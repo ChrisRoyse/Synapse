@@ -11,10 +11,10 @@
 //! This module routes every heavy maintenance pass through
 //! [`tokio::task::spawn_blocking`], which runs it on Tokio's dedicated blocking
 //! thread pool instead of a runtime worker, guarded by a small dedicated
-//! semaphore so overlapping periodic ticks queue instead of piling onto the
-//! blocking pool. This mirrors how mature LSM engines isolate background
-//! compaction onto a dedicated, lower-priority thread pool so foreground request
-//! latency is unaffected.
+//! exclusive lane so whole-corpus passes queue instead of multiplying their
+//! live row, SST-reader, and native-compaction working sets. This mirrors how
+//! mature LSM engines isolate and explicitly admit background compaction work so
+//! foreground request latency and host resources remain bounded.
 
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -31,25 +31,20 @@ use tokio::sync::Semaphore;
 
 use crate::{Db, StorageError, StorageResult};
 
-/// Maximum heavy storage-maintenance passes admitted concurrently onto the
-/// blocking pool.
+/// Number of exclusive whole-corpus storage-maintenance lanes.
 ///
-/// This is a throughput/back-pressure limit, never a correctness or ordering
-/// primitive (#2150). At two permits, *any* pair of operations can already run
-/// together. Dependent steps therefore belong in one admitted closure (for
-/// example row-cap eviction followed by snapshot-version reclamation in
-/// `CalyxGcRunner::run_full_once`) or behind their own data-level lock. Disk
-/// pressure is physical native-CF compaction only and performs no logical row
-/// mutation; the MVCC row-shard guards serialize reclamation with foreground
-/// commits. Changing this number requires a blocking-pool/load measurement, but
-/// must never be used to create or preserve an ordering guarantee.
-const MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS: usize = 2;
+/// This is resource ownership, not a memory cap and not a data-ordering
+/// primitive. Every caller traverses or compacts a substantial part of the same
+/// vault. Allowing GC, derived-state/search rebuild, and disk-pressure
+/// compaction to overlap multiplied independent bounded working sets into an
+/// unbounded process total (#2243). One exclusive lane preserves every
+/// capability while ensuring the daemon owns only one whole-corpus working set
+/// at a time. Data dependencies still belong inside one admitted closure or
+/// behind their own physical lock (#2150).
+const STORAGE_HEAVY_MAINTENANCE_LANES: usize = 1;
 
-static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> = LazyLock::new(|| {
-    Arc::new(Semaphore::new(
-        MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS,
-    ))
-});
+static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_HEAVY_MAINTENANCE_LANES)));
 
 /// In-flight admitted maintenance passes, published as queue-depth telemetry.
 static STORAGE_MAINTENANCE_IN_FLIGHT: AtomicU64 = AtomicU64::new(0);
@@ -72,7 +67,7 @@ where
 {
     let semaphore = Arc::clone(&STORAGE_MAINTENANCE_PERMITS);
     let waiters_before =
-        MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS.saturating_sub(semaphore.available_permits());
+        STORAGE_HEAVY_MAINTENANCE_LANES.saturating_sub(semaphore.available_permits());
     let admission_started = Instant::now();
     let permit = semaphore
         .acquire_owned()
@@ -94,8 +89,9 @@ where
         admission_wait_ms,
         already_running = waiters_before as u64,
         in_flight,
-        max_concurrent = MAX_CONCURRENT_STORAGE_MAINTENANCE_OPERATIONS as u64,
-        "admitted storage maintenance onto the dedicated blocking pool off the async runtime workers"
+        max_concurrent = STORAGE_HEAVY_MAINTENANCE_LANES as u64,
+        exclusive_whole_corpus_lane = true,
+        "admitted storage maintenance onto the exclusive whole-corpus blocking lane off the async runtime workers"
     );
     let exec_started = Instant::now();
     let joined = tokio::task::spawn_blocking(move || {
