@@ -23,20 +23,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use synapse_calyx::{
-    AsterOrphanSlotGcReport, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, SynapseCalyxAbundanceReport,
-    SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
+    AsterOrphanSlotGcReport, SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+    SynapseCalyxAbundanceReport, SynapseCalyxAnchorBatchWriteReadback, SynapseCalyxAnchorReadback,
     SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
     SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxBackupReport,
     SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
-    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWrite,
-    SynapseCalyxConditionalWriteError, SynapseCalyxConfig, SynapseCalyxDriftReport,
-    SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport, SynapseCalyxError,
-    SynapseCalyxFindParams, SynapseCalyxFindReport, SynapseCalyxGroundedObservationReadback,
-    SynapseCalyxGroundingGapReport, SynapseCalyxGuardCalibrateParams,
-    SynapseCalyxGuardCalibrateReport, SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport,
-    SynapseCalyxHazardReport, SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport,
-    SynapseCalyxKernelParams, SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport,
-    SynapseCalyxKernelReport, SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
+    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWalk,
+    SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
+    SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport,
+    SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
+    SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
+    SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
+    SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, SynapseCalyxHazardReport,
+    SynapseCalyxKernelAnswerReport, SynapseCalyxKernelHealthReport, SynapseCalyxKernelParams,
+    SynapseCalyxKernelRebuildParams, SynapseCalyxKernelRebuildReport, SynapseCalyxKernelReport,
+    SynapseCalyxLedgerEntryReadback, SynapseCalyxLedgerVerifyReport,
     SynapseCalyxMultiConditionalWriteOutcome, SynapseCalyxObservationPutReadback,
     SynapseCalyxPanelDriftParams, SynapseCalyxPanelDriftReport, SynapseCalyxPanelState,
     SynapseCalyxPeriodicityReport, SynapseCalyxPersistedNoveltyFinding,
@@ -8804,6 +8805,14 @@ trait CalyxVaultKvRead {
         after_key: Option<&[u8]>,
         limit: usize,
     ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError>;
+    fn walk_kv_range_latest_snapshot<V>(
+        &self,
+        range: &calyx_aster::cf::KeyRange,
+        page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>;
 }
 
 impl CalyxVaultKvRead for SynapseCalyxVault {
@@ -8842,6 +8851,18 @@ impl CalyxVaultKvRead for SynapseCalyxVault {
     ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
         self.scan_cf_range_page_latest(ColumnFamily::Kv, range, after_key, limit)
     }
+
+    fn walk_kv_range_latest_snapshot<V>(
+        &self,
+        range: &calyx_aster::cf::KeyRange,
+        page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        self.walk_cf_range_latest_snapshot(ColumnFamily::Kv, range, page_rows, visit)
+    }
 }
 
 impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
@@ -8879,6 +8900,18 @@ impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
         limit: usize,
     ) -> Result<SynapseCalyxCfRangePage, SynapseCalyxError> {
         self.scan_cf_range_page_latest(ColumnFamily::Kv, range, after_key, limit)
+    }
+
+    fn walk_kv_range_latest_snapshot<V>(
+        &self,
+        range: &calyx_aster::cf::KeyRange,
+        page_rows: usize,
+        visit: V,
+    ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        self.walk_cf_range_latest_snapshot(ColumnFamily::Kv, range, page_rows, visit)
     }
 }
 
@@ -9019,13 +9052,10 @@ fn inspect_calyx_vault_with_schema(
         .clock_now_ms()
         .map_err(|source| calyx_read_failed("<calyx-vault>", "read Calyx vault clock", &source))?;
     let mut census = CalyxVaultCensus::default();
-    // Paged rather than materialised (#2041). The whole-vault census is the
-    // single largest hold in `storage inspect`: one `scan_kv_range_latest` over
-    // every collection, 1,025,928 live rows on the production vault, folded
-    // under one acquisition of the MVCC row-table read guard that every vault
-    // write must take exclusively. Nothing about the fold needs a single atomic
-    // view — it is a sum — so the guard is released every page and the window
-    // the census actually observed is reported instead of assumed.
+    // Streamed rather than materialised (#2041/#2243). The whole-vault census
+    // used to be one wide guarded scan, then a page loop that reopened every
+    // immutable file thousands of times. One registered snapshot plus one
+    // sequential cursor now keeps the answer exact without either transient.
     let sweep = sweep_kv_range_pages(
         vault,
         "<calyx-vault>",
@@ -9058,21 +9088,6 @@ fn inspect_calyx_vault_with_schema(
         atomic = sweep.atomic(),
         "counted every physical Calyx KV collection with bounded row-table read-guard holds"
     );
-    if !sweep.atomic() {
-        // Never presented as an instant when it is not one. The unpaged census
-        // was one atomic view by construction; this one is only atomic when no
-        // commit landed mid-sweep, and the caller is told which it got rather
-        // than left to assume (#2041).
-        tracing::warn!(
-            code = "STORAGE_CALYX_INSPECT_CENSUS_INTERVAL",
-            site = "calyx_vault_inspect",
-            pages = sweep.pages,
-            rows_visited = sweep.rows_visited,
-            snapshot_seq_first = sweep.snapshot_seq_first,
-            snapshot_seq_last = sweep.snapshot_seq_last,
-            "the whole-vault census observed an interval rather than one instant; a commit landed between its first and last page"
-        );
-    }
     Ok(CalyxVaultInspect {
         schema_version,
         vault_id: vault.vault_id_string(),
@@ -10950,20 +10965,18 @@ const CALYX_INSPECT_SWEEP_PAGE_ROWS: usize = synapse_calyx::SYNAPSE_CALYX_CF_WAL
 ///
 /// A `site` label on `STORAGE_CALYX_BOUNDED_SWEEP`, not a new
 /// `calyx_row_guard_sites` entry, for the reason
-/// [`CALYX_GC_RETENTION_SWEEP_SITE`] documents: the guard this fold now takes is
-/// `scan_cf_range_page_latest`'s, and the claim to be judged is that
-/// `scan_cf_range_latest` loses the census's five wide holds per tick while the
-/// paged site gains them with `over_budget_holds` still zero. A private census
-/// name would hide exactly that number.
+/// [`CALYX_GC_RETENTION_SWEEP_SITE`] documents: the physical stream reports its
+/// existing snapshot-page guard site, while this label attributes the complete
+/// logical operation without minting a second low-level metric identity.
 const PANEL_COVERAGE_SOURCE_CENSUS_SITE: &str = "panel_coverage_source_census";
 
 /// Provenance of one bounded-hold sweep over an ordered Calyx KV range (#2041).
 ///
-/// A sweep trades one long atomic view for many short ones, so the window it
-/// observed is a property of the result and is reported rather than assumed.
-/// `snapshot_seq_first == snapshot_seq_last` ([`Self::atomic`]) means no commit
-/// landed between the first and last page, and only then is the fold's output
-/// an exact census of one instant; otherwise it is a census over an interval.
+/// Each individual sweep now owns one registered snapshot and therefore must
+/// report the same first and last sequence. The fields remain explicit because
+/// [`CalyxKvSweep::merge`] combines independently pinned per-family scans; that
+/// aggregate is an interval when the families were captured at different
+/// commits, and must never be presented as one instant.
 ///
 /// This mirrors [`synapse_calyx::SynapseCalyxCfWalk`] exactly, and exists
 /// separately only because these sweeps are *range*-scoped: all 17 Synapse
@@ -11012,19 +11025,20 @@ impl CalyxKvSweep {
 /// of them `site="scan_cf_range_latest"`, holds commonly 27-57 ms, against a
 /// 25 ms budget.
 ///
-/// Paging does not make the work smaller; it makes the *hold* bounded by a
-/// constant instead of by the size of the range. The cost is ~27% more total
-/// CPU re-merging each page's candidates, and a window that moves: the fold now
-/// describes an interval unless [`CalyxKvSweep::atomic`] holds, which is why
-/// that flag is returned rather than swallowed.
+/// The first paged implementation bounded the hold but reopened and re-sought
+/// every immutable file for every 256-row handoff. GC consequently accumulated
+/// those cursor transients and crossed 1 GiB. The current implementation keeps
+/// one sequential cursor and one registered snapshot for the whole range,
+/// releases each returned page promptly, then destroys and measures the cursor
+/// at the outer ownership boundary.
 ///
 /// # Errors
 ///
-/// Fails closed when a page that must be continued reports more candidates
-/// without a resume cursor, or returns a cursor that does not advance — both
-/// would re-read the same page forever. The visitor may return
-/// [`ControlFlow::Break`] after consuming a row to stop without reading another
-/// page; its own errors are propagated verbatim.
+/// Fails closed when snapshot registration, lease validation, immutable record
+/// validation, allocator accounting, or the visitor fails. The visitor may
+/// return [`ControlFlow::Break`] after consuming a row to stop without reading
+/// another page; its own error is preserved verbatim, including alongside an
+/// independent stream-release failure.
 fn sweep_kv_range_pages<V>(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
@@ -11036,57 +11050,54 @@ where
     V: FnMut(&[u8], &[u8]) -> StorageResult<ControlFlow<()>>,
 {
     let started = Instant::now();
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut sweep = CalyxKvSweep::default();
-    'pages: loop {
-        let page = vault
-            .scan_kv_range_page_latest(range, cursor.as_deref(), CALYX_INSPECT_SWEEP_PAGE_ROWS)
-            .map_err(|source| {
-                calyx_read_failed(
-                    cf_name,
-                    "scan bounded-hold Calyx KV inspection page",
-                    &source,
-                )
-            })?;
-        if sweep.pages == 0 {
-            sweep.snapshot_seq_first = page.snapshot_seq;
-        }
-        sweep.snapshot_seq_last = page.snapshot_seq;
-        sweep.pages = sweep.pages.saturating_add(1);
-        sweep.rows_examined = sweep.rows_examined.saturating_add(page.examined_rows);
-        for (key, value) in &page.rows {
-            sweep.rows_visited = sweep.rows_visited.saturating_add(1);
-            if visit(key, value)?.is_break() {
-                sweep.stopped_early = true;
-                break 'pages;
+    let mut visitor_error = None;
+    let walk_result =
+        vault.walk_kv_range_latest_snapshot(range, CALYX_INSPECT_SWEEP_PAGE_ROWS, |key, value| {
+            match visit(key, value) {
+                Ok(ControlFlow::Continue(())) => Ok(SynapseCalyxWalkStep::Continue),
+                Ok(ControlFlow::Break(())) => Ok(SynapseCalyxWalkStep::Stop),
+                Err(error) => {
+                    visitor_error = Some(error);
+                    Ok(SynapseCalyxWalkStep::Stop)
+                }
             }
-        }
-        if !page.more {
-            break;
-        }
-        let Some(resume) = page.resume_after else {
+        });
+    let walk = match (walk_result, visitor_error) {
+        (Ok(_), Some(error)) => return Err(error),
+        (Err(stream_error), Some(visitor_error)) => {
             return Err(StorageError::ReadFailed {
                 cf_name: cf_name.to_owned(),
                 detail: format!(
-                    "CALYX_INSPECT_SWEEP_CURSOR_MISSING: page {} of the {site} sweep reported more candidates but returned no resume cursor, so the sweep cannot advance; remediation=repair the range pager so a page reporting `more` always carries `resume_after`",
-                    sweep.pages
-                ),
-            });
-        };
-        if cursor
-            .as_deref()
-            .is_some_and(|previous| resume.as_slice() <= previous)
-        {
-            return Err(StorageError::ReadFailed {
-                cf_name: cf_name.to_owned(),
-                detail: format!(
-                    "CALYX_INSPECT_SWEEP_CURSOR_STALLED: page {} of the {site} sweep returned a resume cursor that does not advance past the previous one, so the sweep would re-read the same page forever; remediation=repair the range pager so `resume_after` is strictly greater than the exclusive `after_key` it was given",
-                    sweep.pages
+                    "CALYX_STREAM_AND_VISITOR_FAILED: the {site} visitor failed with {visitor_error}; after stopping it, the persistent KV stream also failed with {stream_error}; remediation=repair both independently reported failures before retrying"
                 ),
             });
         }
-        cursor = Some(resume);
+        (Err(source), None) => {
+            return Err(calyx_read_failed(
+                cf_name,
+                "stream one pinned Calyx KV inspection range",
+                &source,
+            ));
+        }
+        (Ok(walk), None) => walk,
+    };
+    if !walk.atomic() {
+        return Err(StorageError::ReadFailed {
+            cf_name: cf_name.to_owned(),
+            detail: format!(
+                "CALYX_PINNED_STREAM_SEQUENCE_DRIFTED: the {site} stream reported pages={} first_seq={} last_seq={}; one registered snapshot must serve the complete range; remediation=repair the persistent snapshot stream before trusting this census",
+                walk.pages, walk.snapshot_seq_first, walk.snapshot_seq_last
+            ),
+        });
     }
+    let sweep = CalyxKvSweep {
+        pages: walk.pages,
+        rows_examined: walk.rows_examined,
+        rows_visited: walk.rows_visited,
+        snapshot_seq_first: walk.snapshot_seq_first,
+        snapshot_seq_last: walk.snapshot_seq_last,
+        stopped_early: walk.stopped_early,
+    };
     tracing::debug!(
         code = "STORAGE_CALYX_BOUNDED_SWEEP",
         site,
@@ -11100,7 +11111,7 @@ where
         snapshot_seq_last = sweep.snapshot_seq_last,
         atomic = sweep.atomic(),
         stopped_early = sweep.stopped_early,
-        "folded an ordered Calyx KV range page by page, releasing the row-table read guard between pages"
+        "folded an ordered Calyx KV range through one pinned persistent stream, releasing each page and all cursor ownership at the exact operation boundary"
     );
     Ok(sweep)
 }
@@ -11503,11 +11514,10 @@ const CALYX_ORDERED_RANGE_READ_SITE: &str = "calyx_ordered_range_read";
 /// and 682e6fdb: 25-30 ms per hold at very high rate under ordinary MCP tool
 /// load, with a 224 ms worst hold, and every vault commit waits behind it.
 ///
-/// It now folds through [`sweep_calyx_range_rows`] — the same 256-row pager the
-/// GC retention sweep and the panel-coverage census already use — releasing the
-/// guard between pages. The decode, the TTL rule, the include-expired switch and
-/// the strictly-increasing logical-key assertion are unchanged; only the length
-/// of the critical section is.
+/// It now folds through [`sweep_calyx_range_rows`] — the same pinned persistent
+/// stream the GC retention sweep and the panel-coverage census use — releasing
+/// each 256-row handoff without reconstructing the immutable merge. The decode,
+/// TTL rule, include-expired switch and ordering assertion are unchanged.
 ///
 /// Three properties of the row table make the paged fold **equal** to the held
 /// one rather than an approximation of it (the argument established by #2058 and
@@ -11517,18 +11527,12 @@ const CALYX_ORDERED_RANGE_READ_SITE: &str = "calyx_ordered_range_read";
 ///    in place — so the key order a cursor walks is append-only and stable and a
 ///    cursor can neither skip nor double-visit a key.
 /// 2. A commit concurrent with the fold allocates a sequence strictly above the
-///    pinned one each page reads at, so it is excluded from that page's answer.
+///    one registered snapshot, so it is excluded from the complete answer.
 /// 3. A concurrent reclaim keeps each chain's newest version at or below the
 ///    safe point, and that point is clamped to the oldest pinned sequence across
 ///    live leases, so the version this fold reads is never the one dropped. The
-///    lease is re-checked per page, so a fold that outlived its pin fails closed.
-///
-/// The one property paging does **not** preserve is that the whole range is read
-/// at a single instant. That costs nothing here: this path only reads and
-/// proposes no mutation, so — unlike the GC eviction sweep, which needs a
-/// pre-delete re-check — a row rewritten between two pages simply contributes
-/// its newer value to a listing. When the window is not a single instant the
-/// sweep says so rather than implying atomicity it did not have.
+///    lease is re-checked while streaming, so a fold that outlived its pin fails
+///    closed. The returned first/last sequence is also rejected unless atomic.
 fn read_rows_from_vault_range_filtered(
     vault: &impl CalyxVaultKvRead,
     cf_name: &str,
@@ -11536,7 +11540,7 @@ fn read_rows_from_vault_range_filtered(
     include_expired: bool,
 ) -> StorageResult<Vec<RawRow>> {
     let mut decoded: Vec<RawRow> = Vec::new();
-    let sweep = sweep_calyx_range_rows(
+    sweep_calyx_range_rows(
         vault,
         cf_name,
         CALYX_ORDERED_RANGE_READ_SITE,
@@ -11548,20 +11552,6 @@ fn read_rows_from_vault_range_filtered(
             Ok(ControlFlow::Continue(()))
         },
     )?;
-    if !sweep.atomic() {
-        tracing::debug!(
-            code = "STORAGE_CALYX_ORDERED_RANGE_READ_INTERVAL",
-            cf = cf_name,
-            site = CALYX_ORDERED_RANGE_READ_SITE,
-            pages = sweep.pages,
-            rows_visited = sweep.rows_visited,
-            snapshot_seq_first = sweep.snapshot_seq_first,
-            snapshot_seq_last = sweep.snapshot_seq_last,
-            include_expired,
-            "ordered Calyx range read spanned more than one committed sequence; the rows are each \
-             individually current, the set is a bounded interval rather than one instant"
-        );
-    }
     Ok(decoded)
 }
 
@@ -13836,10 +13826,6 @@ where
 /// Range-scoped form of [`walk_cf_pages_pinned`], used when multiple logical
 /// Synapse namespaces in the physical KV family must share the same pinned
 /// sequence with a later non-KV census.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one pinned paged walk must retain cursor progress, sequence proof, and complete accounting across page boundaries"
-)]
 fn walk_cf_range_pages_pinned<V>(
     reader: &CalyxPinnedReader<'_>,
     cf: ColumnFamily,
@@ -13850,114 +13836,85 @@ where
     V: FnMut(&[u8], &[u8]) -> StorageResult<()>,
 {
     let started = Instant::now();
-    let mut cursor: Option<Vec<u8>> = None;
-    let mut walk = CalyxPinnedCfWalk {
-        pinned_seq: reader.pinned_seq(),
-        ..CalyxPinnedCfWalk::default()
+    let page_rows = if cf == ColumnFamily::Base {
+        SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS
+    } else {
+        CALYX_INSPECT_SWEEP_PAGE_ROWS
     };
-    loop {
-        let page = reader
-            .vault
-            .scan_cf_range_page_snapshot(
-                reader.snapshot(),
-                cf,
-                range,
-                cursor.as_deref(),
-                CALYX_INSPECT_SWEEP_PAGE_ROWS,
-            )
-            .map_err(|source| {
-                calyx_write_failed(
-                    reader.cf_name,
-                    &format!(
-                        "read page {} of the {} {} census at pinned committed sequence {} \
-                         ({} row(s) visited over {} ms so far)",
-                        walk.pages.saturating_add(1),
-                        cf.name(),
-                        reader.site,
-                        walk.pinned_seq,
-                        walk.rows_visited,
-                        started.elapsed().as_millis()
-                    ),
-                    &source,
-                )
-            })?;
-        if page.snapshot_seq != walk.pinned_seq {
+    let mut visitor_error = None;
+    let stream_result = reader.vault.walk_cf_range_snapshot(
+        reader.snapshot(),
+        cf,
+        range,
+        page_rows,
+        |key, value| match visit(key, value) {
+            Ok(()) => Ok(SynapseCalyxWalkStep::Continue),
+            Err(error) => {
+                visitor_error = Some(error);
+                Ok(SynapseCalyxWalkStep::Stop)
+            }
+        },
+    );
+    let streamed = match (stream_result, visitor_error) {
+        (Ok(_), Some(error)) => return Err(error),
+        (Err(stream_error), Some(visitor_error)) => {
             return Err(calyx_write_failed_detail(
                 reader.cf_name,
                 format!(
-                    "CALYX_PINNED_CENSUS_SEQUENCE_DRIFTED: page {} of the {} {} census was served \
-                     at committed sequence {} but the census pinned {}; a pinned walk that \
-                     silently changes sequence is a census over an interval, which is exactly the \
-                     moving window this pin exists to remove; remediation=repair the pinned pager \
-                     so every page is served at the sequence its lease pinned",
-                    walk.pages.saturating_add(1),
+                    "CALYX_PINNED_CENSUS_STREAM_AND_VISITOR_FAILED: the {} {} visitor failed with {visitor_error}; after stopping it, the persistent stream also failed with {stream_error}; remediation=repair both independently reported failures before retrying",
+                    cf.name(),
+                    reader.site
+                ),
+            ));
+        }
+        (Err(source), None) => {
+            return Err(calyx_write_failed(
+                reader.cf_name,
+                &format!(
+                    "stream the {} {} census at pinned committed sequence {}",
                     cf.name(),
                     reader.site,
-                    page.snapshot_seq,
-                    walk.pinned_seq
+                    reader.pinned_seq()
                 ),
+                &source,
             ));
         }
-        walk.pages = walk.pages.saturating_add(1);
-        walk.rows_examined = walk.rows_examined.saturating_add(page.examined_rows);
-        for (key, value) in &page.rows {
-            walk.rows_visited = walk.rows_visited.saturating_add(1);
-            visit(key, value)?;
-        }
-        if !page.more {
-            break;
-        }
-        // `more` without a cursor, or a cursor that does not advance, would
-        // re-read the same page forever. Both are impossible against the
-        // documented pager contract, which is exactly why they are worth
-        // failing closed on: an unbounded silent loop inside a GC census is a
-        // worse outcome than an error.
-        let Some(resume) = page.resume_after else {
-            return Err(calyx_write_failed_detail(
-                reader.cf_name,
-                format!(
-                    "CALYX_PINNED_CENSUS_CURSOR_MISSING: page {} of the {} {} census reported more \
-                     rows but returned no resume cursor, so the census cannot advance; \
-                     remediation=repair the range pager so a page reporting `more` always carries \
-                     `resume_after`",
-                    walk.pages,
-                    cf.name(),
-                    reader.site
-                ),
-            ));
-        };
-        if cursor
-            .as_deref()
-            .is_some_and(|previous| resume.as_slice() <= previous)
-        {
-            return Err(calyx_write_failed_detail(
-                reader.cf_name,
-                format!(
-                    "CALYX_PINNED_CENSUS_CURSOR_STALLED: page {} of the {} {} census returned a \
-                     resume cursor that does not advance past the previous one, so the census \
-                     would re-read the same page forever; remediation=repair the range pager so \
-                     `resume_after` is strictly greater than the exclusive `after_key` it was \
-                     given",
-                    walk.pages,
-                    cf.name(),
-                    reader.site
-                ),
-            ));
-        }
-        cursor = Some(resume);
+        (Ok(walk), None) => walk,
+    };
+    if !streamed.atomic()
+        || streamed.snapshot_seq_first != reader.pinned_seq()
+        || streamed.snapshot_seq_last != reader.pinned_seq()
+    {
+        return Err(calyx_write_failed_detail(
+            reader.cf_name,
+            format!(
+                "CALYX_PINNED_CENSUS_SEQUENCE_DRIFTED: the {} {} stream reported pages={} first_seq={} last_seq={} but the census pinned {}; remediation=repair the snapshot stream so every page is served by the exact registered lease",
+                cf.name(),
+                reader.site,
+                streamed.pages,
+                streamed.snapshot_seq_first,
+                streamed.snapshot_seq_last,
+                reader.pinned_seq()
+            ),
+        ));
     }
+    let walk = CalyxPinnedCfWalk {
+        pinned_seq: reader.pinned_seq(),
+        pages: streamed.pages,
+        rows_examined: streamed.rows_examined,
+        rows_visited: streamed.rows_visited,
+    };
     tracing::debug!(
         code = "STORAGE_CALYX_PINNED_CENSUS_WALK",
         site = reader.site,
         cf = cf.name(),
         pinned_seq = walk.pinned_seq,
         pages = walk.pages,
-        page_rows = CALYX_INSPECT_SWEEP_PAGE_ROWS,
+        page_rows,
         rows_visited = walk.rows_visited,
         rows_examined = walk.rows_examined,
         elapsed_ms = started.elapsed().as_millis(),
-        "folded a column family page by page at one pinned committed sequence, releasing the \
-         row-table read guard between pages"
+        "folded a column family at one pinned committed sequence through one persistent immutable cursor and released all cursor ownership at completion"
     );
     Ok(walk)
 }
@@ -14110,11 +14067,48 @@ fn decode_source_key_hex(value: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
+fn run_calyx_gc_budgets(
+    vault: &SynapseCalyxVault,
+    budgets: &[CalyxGcBudget],
+) -> StorageResult<gc::GcReport> {
+    // The inner scope owns every corpus-sized GC transient: the derived-source
+    // index, per-CF retention vectors, eviction proposals, and pending
+    // tombstones. Collection belongs after that scope returns on both success
+    // and failure; collecting inside a stream would only inspect live objects.
+    let gc_result = run_calyx_gc_budgets_owned(vault, budgets);
+    let release_result = synapse_calyx::release_process_memory("storage_gc_complete");
+    match (gc_result, release_result) {
+        (Ok(report), Ok(release)) => {
+            tracing::info!(
+                code = "STORAGE_CALYX_GC_TRANSIENT_MEMORY_RELEASED",
+                private_bytes_before = release.private_bytes_before,
+                private_bytes_after = release.private_bytes_after,
+                private_bytes_reclaimed = release.private_bytes_reclaimed,
+                release_elapsed_us = release.elapsed_us,
+                "released all dead corpus-sized GC transients after their owner scope ended"
+            );
+            Ok(report)
+        }
+        (Err(gc_error), Ok(_release)) => Err(gc_error),
+        (Ok(_report), Err(release_error)) => Err(calyx_write_failed(
+            CALYX_GC_CF,
+            "release dead transient memory after a completed Calyx GC pass",
+            &release_error,
+        )),
+        (Err(gc_error), Err(release_error)) => Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_AND_MEMORY_RELEASE_FAILED: GC failed with {gc_error}; after every GC transient owner was destroyed, allocator release also failed with {release_error}; remediation=repair both independently reported failures before retrying"
+            ),
+        )),
+    }
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "all per-CF budgets share one reference census and one atomic tombstone publication decision"
 )]
-fn run_calyx_gc_budgets(
+fn run_calyx_gc_budgets_owned(
     vault: &SynapseCalyxVault,
     budgets: &[CalyxGcBudget],
 ) -> StorageResult<gc::GcReport> {
@@ -14467,11 +14461,10 @@ fn emit_calyx_gc_report(
             hard_cap = budget.hard_cap,
             hard_cap_reached,
             eviction_skipped_reason = cap_outcome.eviction_skipped_reason.unwrap_or("none"),
-            // Provenance of the paged sweep the decisions were folded from, and
-            // what the pre-delete re-check changed about them (#2060). Reported
-            // rather than assumed: `sweep_atomic=false` means the retention
-            // census describes an interval, not an instant, and the re-check is
-            // what makes deleting from such a census safe.
+            // Provenance of the pinned stream the decisions were folded from,
+            // and what the pre-delete re-check changed about them (#2060).
+            // `sweep_atomic` is reported as an independently inspectable
+            // invariant rather than assumed.
             sweep_pages = state.sweep.pages,
             sweep_rows_visited = state.sweep.rows_visited,
             sweep_snapshot_seq_first = state.sweep.snapshot_seq_first,
@@ -14523,20 +14516,19 @@ fn emit_calyx_gc_eviction_metric(
 /// [`sweep_kv_range_pages`] answers the identical question at ~137 us mean per
 /// hold with zero over-budget holds.
 ///
-/// **What paging costs, and how eviction stays correct.** A paged fold observes
-/// a succession of committed sequences instead of one, so a row can be
-/// rewritten after the page that read it and before the tombstone that deletes
-/// it. The proposal is therefore separated from the delete: every candidate is
-/// re-checked against the row's *current* bytes under a short point-read guard
-/// immediately before its tombstone is written
+/// **How eviction stays correct.** The complete fold now observes one pinned
+/// committed sequence, but a row can still be rewritten after the stream reads
+/// it and before the later tombstone commit. The proposal is therefore
+/// separated from the delete: every candidate is re-checked against the row's
+/// *current* bytes under a short point-read guard immediately before its
+/// tombstone is written
 /// ([`confirm_calyx_gc_eviction`]), and a row whose bytes changed is retained
 /// for the next tick rather than deleted on stale evidence. Retention is the
 /// safe direction — a row kept one interval too long is recoverable, a row
 /// deleted on a stale view is not.
 ///
-/// The sweep's own window is returned in [`CalyxRetentionState::sweep`] rather
-/// than presented as an instant, exactly as #2041 required of the inspect
-/// census.
+/// The sweep's pinned sequence and atomicity proof are returned in
+/// [`CalyxRetentionState::sweep`] rather than inferred from a successful call.
 fn collect_calyx_retention_state(
     vault: &SynapseCalyxVault,
     cf_name: &str,
