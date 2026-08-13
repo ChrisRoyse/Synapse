@@ -2911,17 +2911,7 @@ struct MemoizedCfCount {
     /// that lands *while* the walk is paging must invalidate this entry, and it
     /// only does so if the recorded epoch predates it.
     out_of_band_epoch_before_walk: u64,
-    /// Reuses served since this walk, for the drift-check cadence.
-    reuses: u64,
 }
-
-/// After this many consecutive reuses of one CF's memoized count, the next
-/// request re-measures physically even though the sequence proof still holds,
-/// and asserts the two agree. The proof below is a construction, not a
-/// heuristic — but a construction whose premise ("nothing committed to this
-/// family") is supplied by another subsystem's counter is worth confronting
-/// with the disk on a bounded cadence rather than trusted forever.
-const CF_COUNT_MEMO_DRIFT_CHECK_REUSES: u64 = 32;
 
 /// A physical CF row count together with how it was obtained (#2114, #2139).
 ///
@@ -2944,8 +2934,6 @@ pub struct MemoizedCfCountReadback {
     /// `cf_last_commit_seq` because the gap between them is exactly the traffic
     /// the whole-vault gate used to be defeated by.
     pub vault_latest_seq: Seq,
-    /// Whether this measurement was forced by the reuse-cadence drift check.
-    pub drift_checked: bool,
 }
 
 impl MemoizedCfCountReadback {
@@ -2959,10 +2947,10 @@ impl MemoizedCfCountReadback {
     /// reports it.
     #[must_use]
     pub const fn provenance(&self) -> &'static str {
-        match (self.measured, self.drift_checked) {
-            (true, true) => "walked_drift_check",
-            (true, false) => "walked",
-            (false, _) => "unchanged_since_last_walk",
+        if self.measured {
+            "walked"
+        } else {
+            "unchanged_since_last_walk"
         }
     }
 }
@@ -6958,8 +6946,8 @@ impl SynapseCalyxVault {
         }
     }
 
-    /// Counts the visible rows of one column family with a **bounded** row-guard
-    /// hold, by folding [`Self::walk_cf_latest`] pages (#1973).
+    /// Counts the visible rows of one column family from one pinned physical
+    /// snapshot, using one persistent immutable cursor (#1973, #2239).
     ///
     /// [`Self::count_cf_latest`] reads as `O(1)` and is not: it is identical to
     /// `scan_cf_latest().len()` in time, walking every row of the family under a
@@ -6968,21 +6956,33 @@ impl SynapseCalyxVault {
     /// 25 ms budget, which is the same defect #1968 removed from `Base`, on a
     /// different column family.
     ///
-    /// The trade is the one #1968 already made and is stated rather than
-    /// hidden: many short holds instead of one long one, so the count describes
-    /// an *interval* unless [`SynapseCalyxCfWalk::atomic`] holds. Callers that
-    /// use the count as physical evidence a write landed get the walk back and
-    /// must report that flag rather than assume it.
+    /// The original bounded implementation reopened and re-sought every
+    /// intersecting SST for every 256-row page. On the deployed 6.1-million-row
+    /// Graph family that turned one logical count into roughly 24,000 cursor
+    /// constructions over 233 immutable files and more than a terabyte of
+    /// physical reads. The snapshot path captures the MVCC delta once, opens
+    /// the immutable sources once, and carries their merge cursor across every
+    /// page. It therefore preserves the short row-guard hold while making the
+    /// physical work linear in the sources and rows rather than pages times
+    /// sources. The returned walk is always atomic because every page belongs
+    /// to the same registered snapshot.
     ///
     /// # Errors
     ///
-    /// Propagates any page-read failure from [`Self::walk_cf_latest`].
+    /// Propagates snapshot registration, lease, or page-read failures. An
+    /// expired count fails explicitly; it never restarts from a moving latest
+    /// view or returns a partial count.
     pub fn count_cf_latest_bounded(
         &self,
         cf: ColumnFamily,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError> {
-        self.walk_cf_latest(cf, SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, |_key, _value| {
-            Ok(SynapseCalyxWalkStep::Continue)
+        self.with_read_snapshot(INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            self.walk_cf_snapshot(
+                snapshot,
+                cf,
+                SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                |_key, _value| Ok(SynapseCalyxWalkStep::Continue),
+            )
         })
     }
 
@@ -7035,11 +7035,14 @@ impl SynapseCalyxVault {
     /// walks continued. The per-family signal is the same proof against a
     /// condition that a busy vault can actually satisfy.
     ///
-    /// Anything weaker re-measures: a non-atomic walk is never memoized, a
-    /// commit to this family or any out-of-band change to it invalidates, and
-    /// every [`CF_COUNT_MEMO_DRIFT_CHECK_REUSES`] reuses the count is
-    /// re-measured against the disk anyway and any disagreement is reported at
-    /// error level with both numbers and the signals that produced them.
+    /// Anything weaker re-measures: a non-atomic walk is never memoized, and a
+    /// commit to this family or any out-of-band change to it invalidates. There
+    /// is deliberately no request-count-driven periodic full rescan. The two
+    /// monotone signals are the storage engine's publication invariant, not a
+    /// probabilistic cache hint; re-reading an unchanged multi-gigabyte family
+    /// after an arbitrary number of callers adds no evidence and recreated the
+    /// resource failure this memo exists to prevent. Explicit storage audits
+    /// remain able to call [`Self::count_cf_latest_bounded`] directly.
     ///
     /// # Errors
     ///
@@ -7061,28 +7064,15 @@ impl SynapseCalyxVault {
             entry.out_of_band_epoch_before_walk == signal.out_of_band_epoch
                 && signal.last_commit_seq <= entry.walk.snapshot_seq_last
         };
-        let due_drift_check = memoized
-            .as_ref()
-            .is_some_and(|entry| entry.reuses >= CF_COUNT_MEMO_DRIFT_CHECK_REUSES);
         if let Some(entry) = &memoized
-            && !due_drift_check
             && proof_holds(entry)
         {
-            let mut memo = match self.cf_count_memo.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            if let Some(stored) = memo.get_mut(&cf) {
-                stored.reuses = stored.reuses.saturating_add(1);
-            }
-            drop(memo);
             return Ok(MemoizedCfCountReadback {
                 walk: entry.walk.clone(),
                 measured: false,
                 unchanged_since_seq: Some(entry.walk.snapshot_seq_last),
                 cf_last_commit_seq: signal.last_commit_seq,
                 vault_latest_seq,
-                drift_checked: false,
             });
         }
 
@@ -7091,29 +7081,6 @@ impl SynapseCalyxVault {
         // this entry on the next call, rather than being memoized over.
         let out_of_band_epoch_before_walk = self.vault.cf_change_signal(cf).out_of_band_epoch;
         let walk = self.count_cf_latest_bounded(cf)?;
-        if due_drift_check
-            && let Some(entry) = &memoized
-            && proof_holds(entry)
-            && walk.atomic()
-            && walk.rows_visited != entry.walk.rows_visited
-        {
-            tracing::error!(
-                code = "SYNAPSE_CALYX_CF_COUNT_MEMO_DRIFT",
-                column_family = cf.name(),
-                memoized_rows = entry.walk.rows_visited,
-                measured_rows = walk.rows_visited,
-                memoized_seq = entry.walk.snapshot_seq_last,
-                measured_seq_first = walk.snapshot_seq_first,
-                measured_seq_last = walk.snapshot_seq_last,
-                cf_last_commit_seq = signal.last_commit_seq,
-                cf_out_of_band_epoch = signal.out_of_band_epoch,
-                memoized_out_of_band_epoch = entry.out_of_band_epoch_before_walk,
-                latest_seq = vault_latest_seq,
-                reuses = entry.reuses,
-                "a physical recount disagrees with a count the per-CF change signal proved unchanged; {} was mutated without publishing a commit sequence or an out-of-band epoch — the measured count is adopted and the memo re-anchored",
-                cf.name()
-            );
-        }
         let mut memo = match self.cf_count_memo.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -7124,7 +7091,6 @@ impl SynapseCalyxVault {
                 MemoizedCfCount {
                     walk: walk.clone(),
                     out_of_band_epoch_before_walk,
-                    reuses: 0,
                 },
             );
         } else {
@@ -7138,7 +7104,6 @@ impl SynapseCalyxVault {
             unchanged_since_seq: None,
             cf_last_commit_seq: signal.last_commit_seq,
             vault_latest_seq,
-            drift_checked: due_drift_check,
         })
     }
 
