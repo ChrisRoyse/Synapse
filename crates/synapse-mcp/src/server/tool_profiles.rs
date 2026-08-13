@@ -2179,6 +2179,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "repair storage initialization and read CF metadata again",
             ),
             op(
+                "snapshot_gc_status",
+                false,
+                false,
+                "live Calyx MVCC version table floor/current sequence plus process-lifetime cumulative reclamation counters",
+                None,
+                error_codes::STORAGE_READ_FAILED,
+                "repair storage initialization and read the live Calyx vault counters again",
+            ),
+            op(
                 "gc_once",
                 true,
                 false,

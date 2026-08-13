@@ -16,6 +16,7 @@ pub(super) fn storage_response(
         readback_source_of_truth: readback,
         inspect: None,
         summary: None,
+        snapshot_gc_status: None,
         gc_once: None,
         anchors: None,
         row_read: None,

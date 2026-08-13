@@ -2646,6 +2646,23 @@ pub struct SynapseCalyxSnapshotVersionGcPass {
     pub resume_shard: usize,
 }
 
+/// Independent point-in-time observation of the in-memory MVCC reclamation
+/// Source of Truth.
+///
+/// The totals are process-lifetime monotonic counters. Reading this separately
+/// from a GC trigger proves whether the vault's physical version table changed;
+/// it does not merely repeat the trigger's return value (#2146/#2150).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxSnapshotGcObservation {
+    pub floor_seq: u64,
+    pub current_seq: u64,
+    pub versions_reclaimed_total: u64,
+    pub bytes_reclaimed_total: u64,
+    pub soft_deletes_purged_total: u64,
+    /// Debt measured by the most recent GC metrics observation.
+    pub last_measured_compaction_debt: u64,
+}
+
 impl From<SnapshotVersionGcPass> for SynapseCalyxSnapshotVersionGcPass {
     fn from(pass: SnapshotVersionGcPass) -> Self {
         Self {
@@ -2929,6 +2946,20 @@ pub struct SynapseCalyxReadOnlyVault {
 }
 
 impl SynapseCalyxReadOnlyVault {
+    /// Reads physical snapshot-version GC state without mutating the vault.
+    #[must_use]
+    pub fn snapshot_gc_observation(&self) -> SynapseCalyxSnapshotGcObservation {
+        let metrics = self.vault.snapshot_gc_counters_only();
+        SynapseCalyxSnapshotGcObservation {
+            floor_seq: self.vault.snapshot_gc_floor_seq(),
+            current_seq: self.vault.latest_seq(),
+            versions_reclaimed_total: metrics.versions_reclaimed_total,
+            bytes_reclaimed_total: metrics.bytes_freed_total,
+            soft_deletes_purged_total: metrics.soft_deletes_purged_total,
+            last_measured_compaction_debt: metrics.compaction_debt,
+        }
+    }
+
     /// Reads native `TimeSeries` rows for physical analytics verification.
     ///
     /// # Errors
@@ -7396,6 +7427,20 @@ impl SynapseCalyxVault {
     #[must_use]
     pub fn snapshot_gc_floor(&self) -> (u64, u64) {
         (self.vault.snapshot_gc_floor_seq(), self.vault.latest_seq())
+    }
+
+    /// Reads physical snapshot-version GC state without mutating the vault.
+    #[must_use]
+    pub fn snapshot_gc_observation(&self) -> SynapseCalyxSnapshotGcObservation {
+        let metrics = self.vault.snapshot_gc_counters_only();
+        SynapseCalyxSnapshotGcObservation {
+            floor_seq: self.vault.snapshot_gc_floor_seq(),
+            current_seq: self.vault.latest_seq(),
+            versions_reclaimed_total: metrics.versions_reclaimed_total,
+            bytes_reclaimed_total: metrics.bytes_freed_total,
+            soft_deletes_purged_total: metrics.soft_deletes_purged_total,
+            last_measured_compaction_debt: metrics.compaction_debt,
+        }
     }
 
     /// Materializes pending durable checkpoints and advances the manifest

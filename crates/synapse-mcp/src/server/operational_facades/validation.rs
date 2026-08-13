@@ -18,6 +18,7 @@ pub(super) fn validate_storage_params(params: &StorageParams) -> Result<(), Erro
         &[
             ("inspect", params.inspect.is_some()),
             ("summary", params.summary.is_some()),
+            ("snapshot_gc_status", params.snapshot_gc_status.is_some()),
             ("gc_once", params.gc_once.is_some()),
             ("anchors", params.anchors.is_some()),
             ("row_read", params.row_read.is_some()),

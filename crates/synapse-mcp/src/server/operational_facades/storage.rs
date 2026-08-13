@@ -156,6 +156,45 @@ pub(super) async fn handle(
                 |out| out.summary = Some(response),
             )))
         }
+        StorageOperation::SnapshotGcStatus => {
+            let spec = params.0.snapshot_gc_status.unwrap_or_default();
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_inspect(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "snapshot_gc_status",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage initialization and read the live Calyx vault counters again",
+                )
+            })?;
+            let response =
+                crate::m3::storage::inspect_snapshot_gc_status(&db).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "snapshot_gc_status",
+                        STORAGE_SOT,
+                        error,
+                        "inspect the live Calyx vault lifecycle state and retry the counter read",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "snapshot GC floor_seq={} current_seq={} versions_reclaimed_total={} bytes_reclaimed_total={}",
+                    response.floor_seq,
+                    response.current_seq,
+                    response.versions_reclaimed_total,
+                    response.bytes_reclaimed_total,
+                ),
+                |out| out.snapshot_gc_status = Some(response),
+            )))
+        }
         StorageOperation::Anchors => {
             let spec = params
                 .0

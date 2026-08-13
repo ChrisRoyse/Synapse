@@ -940,6 +940,21 @@ impl Db {
         self.backend.cf_estimated_row_counts()
     }
 
+    /// Returns the live vault's physical snapshot-version reclamation counters.
+    ///
+    /// This is an O(1) independent Source-of-Truth read. It deliberately avoids
+    /// the whole-vault scans performed by `storage summary` and `storage inspect`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the live Calyx vault cannot be read.
+    #[tracing::instrument(skip_all, fields(backend = self.backend_name()))]
+    pub fn snapshot_gc_observation(
+        &self,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSnapshotGcObservation> {
+        self.backend.snapshot_gc_observation()
+    }
+
     /// Returns physical Calyx vault collection statistics.
     ///
     /// # Errors

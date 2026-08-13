@@ -1184,6 +1184,7 @@ pub struct StorageCalyxVaultInspect {
     pub schema_version: u32,
     pub vault_id: String,
     pub latest_seq: u64,
+    pub snapshot_gc: StorageSnapshotGcObservation,
     pub inspected_at_unix_ms: u64,
     pub collection_count: u64,
     pub raw_row_count: u64,
@@ -1261,10 +1262,59 @@ pub struct StorageGcOnceResponse {
     /// derived-source census.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_census: Option<StorageGcSourceCensus>,
+    /// Physical in-memory MVCC reclamation pass that followed logical eviction.
+    /// Absent only for audit-retention mode, which does not run storage GC.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_version_gc: Option<StorageSnapshotVersionGcPass>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention_report_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_retention: Option<AuditRetentionReport>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotGcObservation {
+    pub floor_seq: u64,
+    pub current_seq: u64,
+    pub versions_reclaimed_total: u64,
+    pub bytes_reclaimed_total: u64,
+    pub soft_deletes_purged_total: u64,
+    pub last_measured_compaction_debt: u64,
+}
+
+/// Reads the live MVCC reclamation Source of Truth without walking stored rows.
+pub fn inspect_snapshot_gc_status(
+    db: &synapse_storage::Db,
+) -> Result<StorageSnapshotGcObservation, ErrorData> {
+    db.snapshot_gc_observation()
+        .map(storage_snapshot_gc_observation)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotVersionGcPass {
+    pub floor_seq: u64,
+    pub current_seq: u64,
+    pub active_leases: u64,
+    pub versions_reclaimed: u64,
+    pub bytes_reclaimed: u64,
+    pub chains_compacted: u64,
+    pub chains_scanned: u64,
+    pub shards_visited: u64,
+    pub shards_total: u64,
+    pub shard_guard_holds: u64,
+    pub sweep_completed: bool,
+    pub stopped_on: String,
+    pub elapsed_us: u64,
+    pub max_shard_hold_us: u64,
+    pub resume_shard: u64,
+    pub private_bytes_before: u64,
+    pub private_bytes_after: u64,
+    pub escalation_factor: u32,
+    pub budget_max_versions: u64,
+    pub budget_max_pass_us: u64,
 }
 
 /// The pinned instant the #1882 protection set came from, reported so an
@@ -5554,6 +5604,7 @@ pub fn run_storage_gc_once(
             cache_evictions_total_delta: result.readback_report.total_deleted_rows,
             cf_reports: Vec::new(),
             source_census: None,
+            snapshot_version_gc: None,
             audit_retention_report_key: Some(result.report_key),
             audit_retention: Some(result.readback_report),
         });
@@ -5839,6 +5890,7 @@ fn storage_calyx_vault_inspect(report: BackendCalyxVaultInspect) -> StorageCalyx
         schema_version: report.schema_version,
         vault_id: report.vault_id,
         latest_seq: report.latest_seq,
+        snapshot_gc: storage_snapshot_gc_observation(report.snapshot_gc),
         inspected_at_unix_ms: report.inspected_at_unix_ms,
         collection_count: report.collection_count,
         raw_row_count: report.raw_row_count,
@@ -5858,6 +5910,19 @@ fn storage_calyx_vault_inspect(report: BackendCalyxVaultInspect) -> StorageCalyx
             .into_iter()
             .map(|(name, collection)| (name, storage_calyx_vault_collection(collection)))
             .collect(),
+    }
+}
+
+fn storage_snapshot_gc_observation(
+    report: synapse_calyx::SynapseCalyxSnapshotGcObservation,
+) -> StorageSnapshotGcObservation {
+    StorageSnapshotGcObservation {
+        floor_seq: report.floor_seq,
+        current_seq: report.current_seq,
+        versions_reclaimed_total: report.versions_reclaimed_total,
+        bytes_reclaimed_total: report.bytes_reclaimed_total,
+        soft_deletes_purged_total: report.soft_deletes_purged_total,
+        last_measured_compaction_debt: report.last_measured_compaction_debt,
     }
 }
 
@@ -6326,6 +6391,31 @@ fn gc_response(
         referenced_column_families: census.referenced_column_families,
         referenced_rows: census.referenced_rows,
     });
+    let snapshot_version_gc =
+        report
+            .snapshot_version_gc
+            .map(|report| StorageSnapshotVersionGcPass {
+                floor_seq: report.pass.floor_seq,
+                current_seq: report.pass.current_seq,
+                active_leases: report.pass.active_leases as u64,
+                versions_reclaimed: report.pass.versions_reclaimed,
+                bytes_reclaimed: report.pass.bytes_reclaimed,
+                chains_compacted: report.pass.chains_compacted,
+                chains_scanned: report.pass.chains_scanned,
+                shards_visited: report.pass.shards_visited as u64,
+                shards_total: report.pass.shards_total as u64,
+                shard_guard_holds: report.pass.shard_guard_holds,
+                sweep_completed: report.pass.sweep_completed,
+                stopped_on: report.pass.stopped_on,
+                elapsed_us: report.pass.elapsed_us,
+                max_shard_hold_us: report.pass.max_shard_hold_us,
+                resume_shard: report.pass.resume_shard as u64,
+                private_bytes_before: report.private_bytes_before,
+                private_bytes_after: report.private_bytes_after,
+                escalation_factor: report.escalation_factor,
+                budget_max_versions: report.budget_max_versions as u64,
+                budget_max_pass_us: report.budget_max_pass_us,
+            });
     StorageGcOnceResponse {
         cf_name: cf_name.to_owned(),
         before_rows,
@@ -6333,6 +6423,7 @@ fn gc_response(
         total_evicted_rows,
         cache_evictions_total_delta: total_evicted_rows,
         source_census,
+        snapshot_version_gc,
         cf_reports: report
             .cf_reports
             .into_iter()

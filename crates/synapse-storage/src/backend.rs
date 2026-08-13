@@ -41,11 +41,11 @@ use synapse_calyx::{
     SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
-    SynapseCalyxSearchRebuildReport, SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate,
-    SynapseCalyxTemporalParams, SynapseCalyxTemporalRerankReadback, SynapseCalyxVault,
-    SynapseCalyxVaultCloseReadback, SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport,
-    SynapseCalyxVerifyReport, SynapseCalyxWeaveParams, SynapseCalyxWeaveReport,
-    VaultTemporalPanelRegistration,
+    SynapseCalyxSearchRebuildReport, SynapseCalyxSnapshotGcObservation,
+    SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
+    SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
+    SynapseCalyxVaultStatus, SynapseCalyxVaultVerifyReport, SynapseCalyxVerifyReport,
+    SynapseCalyxWeaveParams, SynapseCalyxWeaveReport, VaultTemporalPanelRegistration,
 };
 use synapse_core::{
     error_codes,
@@ -185,6 +185,9 @@ pub struct CalyxVaultInspect {
     pub schema_version: u32,
     pub vault_id: String,
     pub latest_seq: u64,
+    /// Physical in-memory MVCC reclamation state read independently of a GC
+    /// trigger. Cumulative totals are monotonic for this process lifetime.
+    pub snapshot_gc: SynapseCalyxSnapshotGcObservation,
     pub inspected_at_unix_ms: u64,
     pub collection_count: u64,
     pub raw_row_count: u64,
@@ -686,6 +689,7 @@ pub trait StorageBackend: Send + Sync {
     fn cf_live_data_size_estimates(&self) -> StorageResult<CfEstimateMap>;
     fn cf_row_counts(&self) -> StorageResult<BTreeMap<String, u64>>;
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap>;
+    fn snapshot_gc_observation(&self) -> StorageResult<SynapseCalyxSnapshotGcObservation>;
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus>;
     /// Read-only state of the persisted search generation for the active panel
     /// (issue #1891). Side-effect free, so `health` can report it every call.
@@ -3070,6 +3074,19 @@ impl CalyxGcRunner {
         Ok(report)
     }
 
+    /// Caller-selected logical row-cap eviction followed by the same physical
+    /// snapshot-version reclamation that the scheduled full pass runs.
+    fn run_full_once_with_row_cap(
+        &self,
+        cf_name: &'static str,
+        soft_cap_rows: u64,
+        hard_cap_rows: u64,
+    ) -> StorageResult<gc::GcReport> {
+        let mut report = self.run_row_cap_once(cf_name, soft_cap_rows, hard_cap_rows)?;
+        report.snapshot_version_gc = Some(self.reclaim_snapshot_versions_once()?);
+        Ok(report)
+    }
+
     fn run_default_once(&self) -> StorageResult<gc::GcReport> {
         let budgets = calyx_gc_default_budgets()?;
         self.run_with_budgets(&budgets)
@@ -3690,7 +3707,7 @@ impl StorageBackend for CalyxBackend {
         soft_cap_rows: u64,
         hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault)).run_row_cap_once(
+        CalyxGcRunner::new(Arc::clone(&self.vault)).run_full_once_with_row_cap(
             cf_name,
             soft_cap_rows,
             hard_cap_rows,
@@ -4685,6 +4702,15 @@ impl StorageBackend for CalyxBackend {
     fn cf_estimated_row_counts(&self) -> StorageResult<CfEstimateMap> {
         let counts = self.cf_row_counts()?;
         Ok((counts, Vec::new()))
+    }
+
+    fn snapshot_gc_observation(&self) -> StorageResult<SynapseCalyxSnapshotGcObservation> {
+        self.with_vault(
+            "<calyx-vault>",
+            "read physical snapshot-version GC counters",
+            false,
+            |vault| Ok(vault.snapshot_gc_observation()),
+        )
     }
 
     fn calyx_vault_status(&self) -> StorageResult<SynapseCalyxVaultStatus> {
@@ -8804,6 +8830,7 @@ fn classify_value_encoding(bytes: &[u8]) -> String {
 trait CalyxVaultKvRead {
     fn vault_id_string(&self) -> String;
     fn latest_seq_value(&self) -> u64;
+    fn snapshot_gc_state(&self) -> SynapseCalyxSnapshotGcObservation;
     fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError>;
     fn read_kv_latest(&self, key: &[u8]) -> Result<Option<Vec<u8>>, SynapseCalyxError>;
     fn scan_kv_range_latest(
@@ -8825,6 +8852,10 @@ impl CalyxVaultKvRead for SynapseCalyxVault {
 
     fn latest_seq_value(&self) -> u64 {
         self.latest_seq()
+    }
+
+    fn snapshot_gc_state(&self) -> SynapseCalyxSnapshotGcObservation {
+        self.snapshot_gc_observation()
     }
 
     fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError> {
@@ -8859,6 +8890,10 @@ impl CalyxVaultKvRead for SynapseCalyxReadOnlyVault {
 
     fn latest_seq_value(&self) -> u64 {
         self.latest_seq()
+    }
+
+    fn snapshot_gc_state(&self) -> SynapseCalyxSnapshotGcObservation {
+        self.snapshot_gc_observation()
     }
 
     fn clock_now_ms(&self) -> Result<u64, SynapseCalyxError> {
@@ -9081,6 +9116,7 @@ fn inspect_calyx_vault_with_schema(
         schema_version,
         vault_id: vault.vault_id_string(),
         latest_seq: vault.latest_seq_value(),
+        snapshot_gc: vault.snapshot_gc_state(),
         inspected_at_unix_ms,
         collection_count: collections.len() as u64,
         raw_row_count: totals.raw_row_count,

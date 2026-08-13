@@ -32,8 +32,8 @@ use crate::m3::{
         StorageRestoreVerifyParams, StorageRestoreVerifyResponse, StorageRetireOrphanSlotCfsParams,
         StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
         StorageRetireSearchGenerationResponse, StorageRowReadParams, StorageRowReadResponse,
-        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSummaryResponse,
-        StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
+        StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSnapshotGcObservation,
+        StorageSummaryResponse, StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
         StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
         StorageTemporalRerankResponse, StorageTranscriptOrderRebuildParams,
         StorageTranscriptOrderRebuildResponse, StorageTranscriptOrderStatusParams,
@@ -45,6 +45,7 @@ use crate::m3::{
 pub enum StorageOperation {
     Inspect,
     Summary,
+    SnapshotGcStatus,
     GcOnce,
     Anchors,
     RowRead,
@@ -71,6 +72,7 @@ impl StorageOperation {
         match self {
             Self::Inspect => "inspect",
             Self::Summary => "summary",
+            Self::SnapshotGcStatus => "snapshot_gc_status",
             Self::GcOnce => "gc_once",
             Self::Anchors => "anchors",
             Self::RowRead => "row_read",
@@ -102,6 +104,8 @@ pub struct StorageParams {
     pub inspect: Option<StorageInspectParams>,
     #[serde(default)]
     pub summary: Option<StorageInspectParams>,
+    #[serde(default)]
+    pub snapshot_gc_status: Option<StorageInspectParams>,
     #[serde(default)]
     pub gc_once: Option<StorageGcOnceParams>,
     #[serde(default)]
@@ -152,6 +156,8 @@ pub struct StorageResponse {
     pub inspect: Option<StorageInspectResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<StorageSummaryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_gc_status: Option<StorageSnapshotGcObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gc_once: Option<StorageGcOnceResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

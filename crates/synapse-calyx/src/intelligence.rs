@@ -65,6 +65,10 @@ pub const SYNAPSE_WEAVE_MAX_BLIND_SPOTS: usize = 32;
 /// Structured code raised when an intelligence time window is empty/inverted.
 pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID: &str =
     "SYNAPSE_CALYX_INTELLIGENCE_TIME_RANGE_INVALID";
+/// Structured code raised when a caller addresses a panel generation that the
+/// durable Calyx allocator has never registered.
+pub const SYNAPSE_INTELLIGENCE_PANEL_UNREGISTERED: &str =
+    "SYNAPSE_CALYX_INTELLIGENCE_PANEL_UNREGISTERED";
 /// Structured code raised when a synergy pass is asked for an anchor no record
 /// in the panel carries.
 pub const SYNAPSE_SYNERGY_NO_ANCHORED_RECORDS: &str = "SYNAPSE_CALYX_SYNERGY_NO_ANCHORED_RECORDS";
@@ -370,6 +374,28 @@ impl SynapseCalyxVault {
         // Hot-path boundary (#1686): live Loom weave is an off-runtime
         // intelligence computation and must never be driven from a tagged tick.
         crate::lowering::hot_context::assert_cold_calyx("weave_panel");
+        // A syntactically valid u32 is not necessarily a panel. The allocator is
+        // the durable authority for both built-in and runtime-minted generations;
+        // validating there keeps known-empty panels valid while refusing a made-up
+        // generation before it can masquerade as a successful empty weave (#2238).
+        let allocator = self.panel_generation_allocator()?;
+        if !allocator.owners.contains_key(&params.panel_version) {
+            tracing::error!(
+                code = SYNAPSE_INTELLIGENCE_PANEL_UNREGISTERED,
+                panel_version = params.panel_version,
+                allocator_latest_seq = allocator.latest_seq,
+                registered_generations = allocator.owner_count,
+                "intelligence weave refused a panel generation absent from the durable Calyx allocator"
+            );
+            return Err(SynapseCalyxError::new(
+                SYNAPSE_INTELLIGENCE_PANEL_UNREGISTERED,
+                format!(
+                    "panel_version={} is absent from the durable Calyx panel-generation allocator at seq {} (registered_generations={})",
+                    params.panel_version, allocator.latest_seq, allocator.owner_count
+                ),
+                "read the durable Calyx panel-generation allocator and retry with one of its registered generation IDs",
+            ));
+        }
         let max_records = params
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
