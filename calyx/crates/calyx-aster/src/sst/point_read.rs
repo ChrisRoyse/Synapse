@@ -477,10 +477,17 @@ impl<'a> DiskIndexCursor<'a> {
 /// ceiling this accounts for at most 8 MiB of index buffers per page operation.
 const STREAMING_INDEX_BUFFER_BYTES: usize = 16 * 1_024;
 
+/// Data buffer retained by each SST point reader. Page scans visit record
+/// offsets in physical order, so retaining the next 64 KiB turns thousands of
+/// tiny row reads into bounded sequential I/O. At the hard 512-source fan-in
+/// ceiling this accounts for at most 32 MiB of data buffers per page operation.
+const STREAMING_DATA_BUFFER_BYTES: usize = 64 * 1_024;
+
 #[derive(Debug)]
 pub(crate) struct SstPointReader {
-    file: File,
+    file: BufReader<File>,
     path: PathBuf,
+    cursor_offset: u64,
     data_end: u64,
     index_end: u64,
     entries: usize,
@@ -527,8 +534,9 @@ impl SstPointReader {
         let entries = usize::try_from(header.entries)
             .map_err(|_| CalyxError::aster_corrupt_shard("SST entry count exceeds usize"))?;
         Ok(Self {
-            file,
+            file: BufReader::with_capacity(STREAMING_DATA_BUFFER_BYTES, file),
             path: path.to_path_buf(),
+            cursor_offset: HEADER_LEN as u64,
             data_end: header.index_offset,
             index_end: header.bloom_offset,
             entries,
@@ -556,7 +564,7 @@ impl SstPointReader {
             });
         }
         let mut key = try_zeroed(layout.key_len)?;
-        read_exact_indexed(&mut self.file, &mut key, &self.path, layout.key_start)?;
+        self.read_exact_at(&mut key, layout.key_start)?;
         if key != expected_key {
             return Err(index_key_mismatch(
                 &self.path,
@@ -566,7 +574,7 @@ impl SstPointReader {
             ));
         }
         let mut value = try_zeroed(layout.value_len)?;
-        read_exact_indexed(&mut self.file, &mut value, &self.path, layout.value_start)?;
+        self.read_exact_at(&mut value, layout.value_start)?;
         let actual_crc = record_crc(&key, &value);
         if actual_crc != layout.expected_crc {
             return Err(record_crc_mismatch(
@@ -596,7 +604,7 @@ impl SstPointReader {
         let mut cursor = layout.key_start;
         for expected in expected_key.chunks(RECORD_VALIDATION_BUFFER_BYTES) {
             let actual = &mut buffer[..expected.len()];
-            read_exact_indexed(&mut self.file, actual, &self.path, cursor)?;
+            self.read_exact_at(actual, cursor)?;
             if actual != expected {
                 return Err(index_key_mismatch(
                     &self.path,
@@ -613,7 +621,7 @@ impl SstPointReader {
         while remaining > 0 {
             let chunk_len = remaining.min(buffer.len());
             let chunk = &mut buffer[..chunk_len];
-            read_exact_indexed(&mut self.file, chunk, &self.path, cursor)?;
+            self.read_exact_at(chunk, cursor)?;
             hasher.update(chunk);
             remaining -= chunk_len;
             cursor = cursor.saturating_add(chunk_len as u64);
@@ -643,11 +651,8 @@ impl SstPointReader {
                 self.path.display()
             )));
         }
-        self.file
-            .seek(SeekFrom::Start(record_offset))
-            .map_err(|error| storage_error("seek SST indexed row", &self.path, error))?;
         let mut header = [0_u8; RECORD_HEADER_LEN];
-        read_exact_indexed(&mut self.file, &mut header, &self.path, record_offset)?;
+        self.read_exact_at(&mut header, record_offset)?;
         let key_len = u32::from_le_bytes(header[0..4].try_into().expect("key len")) as usize;
         let value_len = u32::from_le_bytes(header[4..8].try_into().expect("value len")) as usize;
         let expected_crc = u32::from_le_bytes(header[8..12].try_into().expect("record crc"));
@@ -681,6 +686,28 @@ impl SstPointReader {
             value_start,
             expected_crc,
         })
+    }
+
+    /// Reads at an absolute SST offset without issuing a seek when the next
+    /// record begins exactly where the previous read ended. This invariant is
+    /// what makes ordered page scans sequential while preserving random point
+    /// reads and their exact corruption diagnostics.
+    fn read_exact_at(&mut self, out: &mut [u8], offset: u64) -> Result<()> {
+        if self.cursor_offset != offset {
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .map_err(|error| storage_error("seek SST indexed row", &self.path, error))?;
+            self.cursor_offset = offset;
+        }
+        read_exact_indexed(&mut self.file, out, &self.path, offset)?;
+        self.cursor_offset = offset.checked_add(out.len() as u64).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "SST indexed row cursor overflow at {}:{offset} while reading {} bytes",
+                self.path.display(),
+                out.len()
+            ))
+        })?;
+        Ok(())
     }
 }
 

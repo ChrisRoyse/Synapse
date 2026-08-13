@@ -96,7 +96,7 @@ struct PageCursor<'a> {
 
 enum PageSource<'a> {
     Overlay { rows: Vec<SstEntry>, pos: usize },
-    Sst { reader: SstPageReader<'a> },
+    Sst { reader: Box<SstPageReader<'a>> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,7 +209,9 @@ fn open_page_cursor<'a>(
                 .current_key()
                 .is_some_and(|key| end.is_none_or(|end| key < end))
             {
-                Ok(Some(PageSource::Sst { reader }))
+                Ok(Some(PageSource::Sst {
+                    reader: Box::new(reader),
+                }))
             } else {
                 Ok(None)
             }
