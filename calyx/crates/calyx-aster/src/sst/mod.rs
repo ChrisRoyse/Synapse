@@ -69,6 +69,7 @@ use calyx_core::{CalyxError, Result};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use io_helpers::{record_crc, section_crc};
 pub(crate) use point_read::{SstPageReader, SstPointReader, SstStreamingReader};
@@ -103,6 +104,13 @@ pub struct SstSummary {
 pub(crate) struct SstBounds {
     pub(crate) first_key: Vec<u8>,
     pub(crate) last_key: Vec<u8>,
+    /// Validated whole-key filter used before any cold index or data I/O.
+    ///
+    /// The on-disk filter is about two bytes per key, while the decoded index
+    /// retains every key plus offsets and allocation overhead. Keeping this
+    /// compact negative index prevents a point miss from reopening and
+    /// walking every overlapping SST without restoring corpus-sized indexes.
+    bloom: Arc<BloomFilter>,
     /// Allocation-bounded seek points into the variable-length on-disk index.
     ///
     /// Cold readers use these to start within one bounded index interval of a
@@ -146,7 +154,7 @@ struct IndexEntry {
 pub(crate) struct SstLookupMetadata {
     pub(crate) first_key: Vec<u8>,
     pub(crate) last_key: Vec<u8>,
-    bloom: BloomFilter,
+    bloom: Arc<BloomFilter>,
     index: Vec<IndexEntry>,
 }
 
@@ -233,7 +241,7 @@ pub fn write_sst<'a>(
     let index_offset = bytes.len() as u64;
     write_index(&mut bytes, &index);
     let bloom_offset = bytes.len() as u64;
-    BloomFilter::from_keys(entries.iter().map(|(key, _)| key.as_slice())).encode(&mut bytes);
+    BloomFilter::from_keys(entries.iter().map(|(key, _)| key.as_slice()))?.encode(&mut bytes)?;
     let body_crc = section_crc(&bytes[HEADER_LEN..]);
     write_header(
         &mut bytes,
@@ -271,8 +279,7 @@ impl SstReader {
         let bloom_bytes = bytes
             .get(header.bloom_offset as usize..)
             .ok_or_else(|| CalyxError::aster_corrupt_shard("SST bloom offset out of bounds"))?;
-        let bloom = BloomFilter::decode(bloom_bytes)
-            .ok_or_else(|| CalyxError::aster_corrupt_shard("invalid SST bloom filter"))?;
+        let bloom = BloomFilter::decode(bloom_bytes)?;
         Ok(Self {
             column,
             index,
@@ -401,7 +408,7 @@ impl SstReader {
         Some(SstLookupMetadata {
             first_key,
             last_key,
-            bloom: self.bloom.clone(),
+            bloom: Arc::new(self.bloom.clone()),
             index: self.index.clone(),
         })
     }
@@ -457,6 +464,10 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
     let mut file =
         File::open(path).map_err(|error| sst_io_error("open SST bounds", path, error))?;
     let header = read_file_header_structure(&mut file, path)?;
+    let file_len = file
+        .metadata()
+        .map_err(|error| sst_io_error("stat SST bloom", path, error))?
+        .len();
     file.seek(SeekFrom::Start(header.index_offset))
         .map_err(|error| sst_io_error("seek SST bounds index", path, error))?;
     let mut reader = BufReader::with_capacity(SST_BOUNDS_BUFFER_BYTES, file);
@@ -557,6 +568,31 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
     if offset != end {
         return Err(CalyxError::aster_corrupt_shard("SST index length mismatch"));
     }
+    let bloom_len_u64 = file_len.checked_sub(header.bloom_offset).ok_or_else(|| {
+        CalyxError::aster_corrupt_shard("SST bloom offset exceeds the physical file length")
+    })?;
+    let bloom_len = usize::try_from(bloom_len_u64)
+        .map_err(|_| CalyxError::aster_corrupt_shard("SST bloom section exceeds usize"))?;
+    let mut bloom_bytes = Vec::new();
+    bloom_bytes
+        .try_reserve_exact(bloom_len)
+        .map_err(|error| CalyxError {
+            code: "CALYX_ASTER_SST_BLOOM_ALLOC",
+            message: format!(
+                "could not reserve {bloom_len} bytes to validate SST bloom section {}: {error}",
+                path.display()
+            ),
+            remediation: "free host memory or repair the oversized/corrupt SST; the vault refuses to open instead of aborting the daemon",
+        })?;
+    bloom_bytes.resize(bloom_len, 0);
+    read_exact_sst_stream(
+        &mut reader,
+        &mut bloom_bytes,
+        path,
+        header.bloom_offset,
+        "bloom filter",
+    )?;
+    let bloom = BloomFilter::decode(&bloom_bytes)?;
     let Some((first_key, first_offset)) = first else {
         if last_offset.is_some() || !previous.is_empty() {
             return Err(CalyxError::aster_corrupt_shard(
@@ -580,6 +616,7 @@ fn read_sst_bounds_inner(path: &Path) -> Result<Option<SstBounds>> {
         first_key,
         last_key,
         sparse_index,
+        bloom: Arc::new(bloom),
     }))
 }
 

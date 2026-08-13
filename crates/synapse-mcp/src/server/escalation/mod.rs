@@ -168,6 +168,11 @@ const WEBHOOK_RETRY_MAX_ATTEMPTS_PER_CHANNEL: u32 = 3;
 const WEBHOOK_RETRY_BASE_BACKOFF_MS: u64 = 30_000;
 const WEBHOOK_RETRY_MAX_BACKOFF_MS: u64 = DEFAULT_ACK_WINDOW_MS;
 const WORKER_TICK_MS: u64 = 1_000;
+/// Settled history only needs retention and orphan-toast housekeeping. New
+/// transition work wakes the worker directly, so polling the complete durable
+/// item history every second while no Pending escalation exists is pure read
+/// amplification.
+const WORKER_IDLE_MAINTENANCE_MS: u64 = 60_000;
 const TIER0_REMOVAL_RETRY_BASE_MS: u64 = 60_000;
 const TIER0_REMOVAL_RETRY_MAX_MS: u64 = 60 * 60 * 1_000;
 /// Consecutive physical removal failures after which the Tier-0 removal ladder
@@ -7766,6 +7771,12 @@ pub(crate) fn note_transition(
             "escalation engine could not record a state transition; attention escalation may be missed for this edge"
         );
     }
+    // Every authoritative transition is an event-driven worker boundary. A
+    // successful projection can create or terminalize delivery work; a failed
+    // projection leaves a durable Pending cursor that the worker must repair.
+    // Notify in both cases so an otherwise settled daemon never needs a hot
+    // polling loop for correctness.
+    wake_worker();
 }
 
 /// Executes one projection while the global transition pipeline lock is held.
@@ -7836,7 +7847,6 @@ fn note_transition_locked(
     // 1. Auto-resolve any open escalation for this anchor whose attention state
     //    differs from the new state. Leaving the attention state (resume/finish)
     //    or transitioning to a different attention state supersedes the old one.
-    let mut superseded = false;
     for scanned_item in open_items_for_anchor(db, &transition.anchor)? {
         let mut resolved_or_superseded = false;
         for attempt in 1..=ACK_REVISION_MAX_ATTEMPTS {
@@ -7901,7 +7911,6 @@ fn note_transition_locked(
             )? {
                 ItemWriteOutcome::Applied { committed_seq, .. } => {
                     resolved_or_superseded = true;
-                    superseded = true;
                     tracing::info!(
                         code = "ESCALATION_RESOLVED",
                         escalation_id = %item.escalation_id,
@@ -7956,11 +7965,8 @@ fn note_transition_locked(
             .any(|item| item.attention_state == new_state);
         if !already_open {
             let policy = load_policy_revisioned(db)?;
-            if open_escalation(db, transition, severity, &policy, generation, now_unix_ms)?
-                .is_some()
-            {
-                superseded = true;
-            }
+            let _opened =
+                open_escalation(db, transition, severity, &policy, generation, now_unix_ms)?;
         }
     }
 
@@ -7970,9 +7976,6 @@ fn note_transition_locked(
     let application = read_transition_projection_application(db, transition, target_expected)?;
     if !persist_projection_watermark_only(db, transition, generation, now_unix_ms, &application)? {
         return Ok(());
-    }
-    if superseded {
-        wake_worker();
     }
     Ok(())
 }
@@ -10058,6 +10061,12 @@ pub(crate) struct ProcessReport {
     pub terminal_resolved: usize,
     pub linked_approvals_closed: usize,
     pub scanned: usize,
+    /// Pending rows observed at the authoritative item-scan boundary.
+    ///
+    /// A non-zero value keeps the one-second delivery/TTL cadence. Zero lets
+    /// the worker sleep until a transition notification or the much slower
+    /// retention/orphan-cleanup maintenance cadence.
+    pub pending_scanned: usize,
 }
 
 /// One escalation-delivery sweep. Fires the on-PC toast for any pending
@@ -10173,6 +10182,10 @@ pub(crate) async fn process_pending(
         return Ok(None);
     }
     report.scanned = items.len();
+    report.pending_scanned = items
+        .iter()
+        .filter(|item| item.status == EscalationStatus::Pending)
+        .count();
     for (item_index, scanned_item) in items.into_iter().enumerate() {
         if item_index % WORKER_COOPERATIVE_YIELD_ROWS == 0 {
             tokio::task::yield_now().await;
@@ -14492,6 +14505,7 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
         let mut interval = tokio::time::interval(Duration::from_millis(WORKER_TICK_MS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_orphan_cleanup_unix_ms = 0_u64;
+        let mut fast_poll_required = true;
         tracing::info!(
             code = "ESCALATION_WORKER_STARTED",
             tick_ms = WORKER_TICK_MS,
@@ -14504,7 +14518,8 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                     break;
                 }
                 _ = signal.notified() => {}
-                _ = interval.tick() => {}
+                _ = interval.tick(), if fast_poll_required => {}
+                _ = tokio::time::sleep(Duration::from_millis(WORKER_IDLE_MAINTENANCE_MS)), if !fast_poll_required => {}
             }
             if shutdown.is_cancelled() {
                 tracing::info!(
@@ -14542,10 +14557,36 @@ pub(crate) fn spawn_worker(db: Arc<Db>, shutdown: CancellationToken) -> JoinHand
                         expired = report.expired,
                         terminal_resolved = report.terminal_resolved,
                         scanned = report.scanned,
+                        pending_scanned = report.pending_scanned,
                         "escalation sweep delivered"
                     );
+                    let next_fast_poll_required = report.pending_scanned != 0;
+                    if next_fast_poll_required != fast_poll_required {
+                        tracing::info!(
+                            code = "ESCALATION_WORKER_CADENCE_CHANGED",
+                            fast_poll_required = next_fast_poll_required,
+                            pending_scanned = report.pending_scanned,
+                            active_tick_ms = WORKER_TICK_MS,
+                            idle_maintenance_ms = WORKER_IDLE_MAINTENANCE_MS,
+                            "escalation worker cadence now follows durable Pending work"
+                        );
+                    }
+                    fast_poll_required = next_fast_poll_required;
                 }
-                Ok(Some(_quiet)) => {}
+                Ok(Some(report)) => {
+                    let next_fast_poll_required = report.pending_scanned != 0;
+                    if next_fast_poll_required != fast_poll_required {
+                        tracing::info!(
+                            code = "ESCALATION_WORKER_CADENCE_CHANGED",
+                            fast_poll_required = next_fast_poll_required,
+                            pending_scanned = report.pending_scanned,
+                            active_tick_ms = WORKER_TICK_MS,
+                            idle_maintenance_ms = WORKER_IDLE_MAINTENANCE_MS,
+                            "escalation worker cadence now follows durable Pending work"
+                        );
+                    }
+                    fast_poll_required = next_fast_poll_required;
+                }
                 Ok(None) => {
                     tracing::info!(
                         code = "ESCALATION_WORKER_STOPPED",

@@ -63,6 +63,7 @@ impl LevelFile {
                 first_key: lookup.first_key.clone(),
                 last_key: lookup.last_key.clone(),
                 sparse_index: Vec::new(),
+                bloom: Arc::clone(&lookup.bloom),
             })
         });
         Ok(Self {
@@ -137,7 +138,9 @@ impl LevelFile {
                 && lookup.bloom.may_contain(key);
         }
         if let Some(bounds) = &self.bounds {
-            return key >= bounds.first_key.as_slice() && key <= bounds.last_key.as_slice();
+            return key >= bounds.first_key.as_slice()
+                && key <= bounds.last_key.as_slice()
+                && bounds.bloom.may_contain(key);
         }
         !self.bounds_retained && !self.lookup_retained
     }
