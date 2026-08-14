@@ -91,9 +91,12 @@ pub(super) async fn handle(
             // reads on the same daemon generation stayed at 442-518 ms. Offload
             // it exactly like every other scan-bound storage operation in this
             // file.
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::storage::inspect_storage(&db, &spec)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_inspect",
+                    move || crate::m3::storage::inspect_storage(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -101,11 +104,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "storage_inspect",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("storage inspection blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs for STORAGE_CALYX_INSPECT_SWEEP_DONE records; the inspection task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion and STORAGE_CALYX_INSPECT_SWEEP_DONE records",
                 )
             })?
             .map_err(|error| {
@@ -326,44 +326,7 @@ pub(super) async fn handle(
                 .0
                 .corpus_histogram
                 .ok_or_else(|| missing_spec(STORAGE_TOOL, "corpus_histogram"))?;
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_corpus_histogram(&spec),
-            )?;
-            let db = service.m3_storage().map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    "calyx_storage",
-                    STORAGE_SOT,
-                    error,
-                    "repair storage/Calyx initialization and retry storage operation=corpus_histogram",
-                )
-            })?;
-            let response = crate::m3::storage::inspect_corpus_histogram(&db, &spec).map_err(
-                |error| {
-                    facade_delegate_error(
-                        STORAGE_TOOL,
-                        operation.as_str(),
-                        "calyx_storage",
-                        STORAGE_SOT,
-                        error,
-                        "name a supported source_cf and declared dimensions; a row that will not decode is counted, not skipped",
-                    )
-                },
-            )?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "{} rows_scanned={} rows_decoded={} decode_failures={} complete={}",
-                    response.source_cf,
-                    response.rows_scanned,
-                    response.rows_decoded,
-                    response.decode_failures,
-                    response.complete
-                ),
-                |out| out.corpus_histogram = Some(response),
-            )))
+            Box::pin(handle_corpus_histogram(service, spec)).await
         }
         StorageOperation::PanelCoverage => {
             let spec = params
@@ -387,9 +350,12 @@ pub(super) async fn handle(
             // A whole-Base scan plus one row count per declared full-CF source
             // is strictly blocking work and must never occupy a runtime worker
             // serving MCP requests.
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::storage::inspect_panel_coverage(&db, &spec)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_panel_coverage",
+                    move || crate::m3::storage::inspect_panel_coverage(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -397,11 +363,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "calyx_storage",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("panel-coverage blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs for SYNAPSE_CALYX_PANEL_CENSUS records; the census task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion and SYNAPSE_CALYX_PANEL_CENSUS records",
                 )
             })?
             .map_err(|error| {
@@ -650,9 +613,12 @@ pub(super) async fn handle(
                 &crate::m3::storage::required_permissions_transcript_order_status(&spec),
             )?;
             let db = service.m3_storage()?;
-            let response = tokio::task::spawn_blocking(move || {
-                crate::server::transcript_order::projection_status(&db)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_transcript_order_status",
+                    move || crate::server::transcript_order::projection_status(&db),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -660,11 +626,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "agent-transcript-order",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("transcript-order status task failed to join: {error}"),
-                    ),
-                    "inspect the daemon panic/error log before retrying the read-only projection census",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records before retrying the projection census",
                 )
             })?
             .map_err(|error| {
@@ -735,10 +698,15 @@ pub(super) async fn handle(
                 })?;
             let db = service.m3_storage()?;
             let token = spec.expected_repair_token;
-            let response = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                crate::server::transcript_order::rebuild_projection(&db, &token)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_transcript_order_rebuild",
+                    move || {
+                        let _permit = permit;
+                        crate::server::transcript_order::rebuild_projection(&db, &token)
+                    },
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -746,11 +714,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "agent-transcript-order",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("transcript-order rebuild task failed to join: {error}"),
-                    ),
-                    "inspect the daemon panic/error log and the durable repair marker before retrying",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the durable repair marker before retrying",
                 )
             })?
             .map_err(|error| {
@@ -972,10 +937,13 @@ pub(super) async fn handle(
             // drop: strictly blocking, CPU/IO-bound work that must not occupy a
             // Tokio runtime worker. Offload it and hold the permit for the task's
             // lifetime so a concurrent caller keeps failing closed until it ends.
-            let report = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                db.retire_orphan_slot_cfs()
-            })
+            let report = synapse_storage::maintenance::run_admitted_maintenance(
+                "storage_retire_orphan_slot_cfs",
+                move || {
+                    let _permit = permit;
+                    db.retire_orphan_slot_cfs()
+                },
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -983,21 +951,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("orphan slot-CF GC blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the orphan slot-CF GC task terminated abnormally",
-                )
-            })?
-            .map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    source_id,
-                    STORAGE_SOT,
                     crate::m1::mcp_error(error.code(), error.to_string()),
-                    "inspect the vault slot-CF tree and live Base membership before retrying",
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the vault slot-CF tree",
                 )
             })?;
             let response = crate::m3::storage::storage_orphan_slot_gc_response(report);
@@ -1140,13 +1095,20 @@ pub(super) async fn handle(
                         "restart the daemon; the backup admission gate is no longer available",
                     ),
                 })?;
-            // Backups are strictly blocking, CPU/IO-bound file copies that must
-            // not occupy a Tokio runtime worker serving MCP requests. Offload to
-            // the blocking pool and hold the permit for the task's lifetime.
-            let response = tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                crate::m3::storage::run_storage_backup(&db, &spec)
-            })
+            // A backup copies and re-verifies the whole physical vault. Keep its
+            // per-operation conflict permit, and also admit the blocking owner
+            // through the process-wide corpus lane so a bounded backup cannot
+            // overlap search, GC, derived state, or a live verifier and multiply
+            // their independent working sets.
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_backup",
+                    move || {
+                        let _permit = permit;
+                        crate::m3::storage::run_storage_backup(&db, &spec)
+                    },
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -1154,11 +1116,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("backup blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs for the SYNAPSE_CALYX_VAULT_BACKUP records; the backup task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion and SYNAPSE_CALYX_VAULT_BACKUP records",
                 )
             })??;
             Ok(Json(storage_response(
@@ -1212,11 +1171,15 @@ pub(super) async fn handle(
                 &crate::m3::storage::required_permissions_restore_verify(&spec),
             )?;
             let db = service.m3_storage()?;
-            // Byte-level verification scans every SST/WAL of the target vault; it
-            // is read-only but CPU/IO-bound, so run it off the runtime workers.
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::storage::run_storage_restore_verify(&db, &spec)
-            })
+            // Byte-level verification scans every SST/WAL of the target vault.
+            // Read-only does not mean resource-free: share the same exclusive
+            // whole-corpus owner as live verification and maintenance.
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_restore_verify",
+                    move || crate::m3::storage::run_storage_restore_verify(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -1224,11 +1187,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("restore-verify blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the restore-verify task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named restore-verification error",
                 )
             })??;
             Ok(Json(storage_response(
@@ -1720,41 +1680,123 @@ pub(super) async fn handle(
                 .0
                 .gc_once
                 .ok_or_else(|| missing_spec(STORAGE_TOOL, "gc_once"))?;
-            require_maintenance_profile(
-                service,
-                &request_context,
-                STORAGE_TOOL,
-                operation.as_str(),
-                &spec.cf_name,
-                STORAGE_SOT,
-            )?;
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_gc(&spec),
-            )?;
-            let db = service.m3_storage()?;
-            let response =
-                crate::m3::storage::run_storage_gc_once(&db, &spec).map_err(|error| {
-                    facade_delegate_error(
-                        STORAGE_TOOL,
-                        operation.as_str(),
-                        &spec.cf_name,
-                        STORAGE_SOT,
-                        error,
-                        "fix row caps / CF name and inspect CF row counts before retrying",
-                    )
-                })?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "{} before_rows={} after_rows={} evicted={}",
-                    response.cf_name,
-                    response.before_rows,
-                    response.after_rows,
-                    response.total_evicted_rows
-                ),
-                |out| out.gc_once = Some(response),
-            )))
+            Box::pin(handle_gc_once(service, &request_context, spec)).await
         }
     }
+}
+
+async fn handle_corpus_histogram(
+    service: &SynapseService,
+    spec: crate::m3::storage::StorageCorpusHistogramParams,
+) -> Result<Json<StorageResponse>, ErrorData> {
+    let operation = StorageOperation::CorpusHistogram;
+    service.require_m3_permissions(
+        STORAGE_TOOL,
+        &crate::m3::storage::required_permissions_corpus_histogram(&spec),
+    )?;
+    let db = service.m3_storage().map_err(|error| {
+        facade_delegate_error(
+            STORAGE_TOOL,
+            operation.as_str(),
+            "calyx_storage",
+            STORAGE_SOT,
+            error,
+            "repair storage/Calyx initialization and retry storage operation=corpus_histogram",
+        )
+    })?;
+    let response = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+        "storage_corpus_histogram",
+        move || crate::m3::storage::inspect_corpus_histogram(&db, &spec),
+    )
+    .await
+    .map_err(|error| {
+        facade_delegate_error(
+            STORAGE_TOOL,
+            operation.as_str(),
+            "calyx_storage",
+            STORAGE_SOT,
+            crate::m1::mcp_error(error.code(), error.to_string()),
+            "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named corpus-histogram error",
+        )
+    })?
+    .map_err(|error| {
+        facade_delegate_error(
+            STORAGE_TOOL,
+            operation.as_str(),
+            "calyx_storage",
+            STORAGE_SOT,
+            error,
+            "name a supported source_cf and declared dimensions; a row that will not decode is counted, not skipped",
+        )
+    })?;
+    Ok(Json(storage_response(
+        operation,
+        format!(
+            "{} rows_scanned={} rows_decoded={} decode_failures={} complete={}",
+            response.source_cf,
+            response.rows_scanned,
+            response.rows_decoded,
+            response.decode_failures,
+            response.complete
+        ),
+        |out| out.corpus_histogram = Some(response),
+    )))
+}
+
+async fn handle_gc_once(
+    service: &SynapseService,
+    request_context: &RequestContext<RoleServer>,
+    spec: crate::m3::storage::StorageGcOnceParams,
+) -> Result<Json<StorageResponse>, ErrorData> {
+    let operation = StorageOperation::GcOnce;
+    require_maintenance_profile(
+        service,
+        request_context,
+        STORAGE_TOOL,
+        operation.as_str(),
+        &spec.cf_name,
+        STORAGE_SOT,
+    )?;
+    service.require_m3_permissions(
+        STORAGE_TOOL,
+        &crate::m3::storage::required_permissions_gc(&spec),
+    )?;
+    let db = service.m3_storage()?;
+    let source_id = spec.cf_name.clone();
+    let response = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+        "storage_gc_once",
+        move || crate::m3::storage::run_storage_gc_once(&db, &spec),
+    )
+    .await
+    .map_err(|error| {
+        facade_delegate_error(
+            STORAGE_TOOL,
+            operation.as_str(),
+            &source_id,
+            STORAGE_SOT,
+            crate::m1::mcp_error(error.code(), error.to_string()),
+            "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named GC error",
+        )
+    })?
+    .map_err(|error| {
+        facade_delegate_error(
+            STORAGE_TOOL,
+            operation.as_str(),
+            &source_id,
+            STORAGE_SOT,
+            error,
+            "fix row caps / CF name and inspect CF row counts before retrying",
+        )
+    })?;
+    Ok(Json(storage_response(
+        operation,
+        format!(
+            "{} before_rows={} after_rows={} evicted={}",
+            response.cf_name,
+            response.before_rows,
+            response.after_rows,
+            response.total_evicted_rows
+        ),
+        |out| out.gc_once = Some(response),
+    )))
 }

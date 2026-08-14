@@ -269,12 +269,21 @@ async fn run_periodic_vault_verify_once(service: &SynapseService) {
             return;
         }
     };
-    let result = tokio::task::spawn_blocking(move || {
-        crate::m3::hygiene::run_vault_verify_typed(
-            &db,
-            &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
-        )
-    })
+    // Verification streams the complete Base, Anchors, and Ledger physical
+    // surfaces. It must share the same process-wide owner as search, GC,
+    // derived state, and public corpus intelligence: the vault maintenance
+    // guard prevents tree rewrites, but it does not bound independent readers'
+    // aggregate resident sets. The owned permit remains inside the blocking
+    // task if this scheduler future is cancelled during shutdown.
+    let result = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+        "periodic_vault_verify",
+        move || {
+            crate::m3::hygiene::run_vault_verify_typed(
+                &db,
+                &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
+            )
+        },
+    )
     .await;
     let outcome = match result {
         Ok(Ok(outcome)) => outcome,
@@ -296,8 +305,8 @@ async fn run_periodic_vault_verify_once(service: &SynapseService) {
             tracing::error!(
                 code = "VAULT_VERIFY_PERIODIC_TASK_FAILED",
                 error = %error,
-                remediation = "inspect daemon logs and process health; the blocking verification task terminated abnormally",
-                "scheduled physical vault verification task failed"
+                remediation = "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and process health; repair the named admission or blocking-owner failure",
+                "scheduled physical vault verification admission or blocking task failed"
             );
             return;
         }
@@ -596,9 +605,12 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::hygiene::run_grounding_gap(&db, &spec)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_grounding_gap",
+                    move || crate::m3::hygiene::run_grounding_gap(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -606,11 +618,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("grounding_gap blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the grounding-gap task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named grounding-gap error",
                 )
             })??;
             Ok(Json(hygiene_response(
@@ -645,22 +654,23 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response =
-                tokio::task::spawn_blocking(move || crate::m3::hygiene::run_blind_spot(&db, &spec))
-                    .await
-                    .map_err(|error| {
-                        facade_delegate_error(
-                            HYGIENE_TOOL,
-                            operation.as_str(),
-                            &source_id,
-                            HYGIENE_SOT,
-                            crate::m1::mcp_error(
-                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                                format!("blind_spot blocking task failed to join: {error}"),
-                            ),
-                            "inspect daemon logs; the blind-spot task terminated abnormally",
-                        )
-                    })??;
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_blind_spot",
+                    move || crate::m3::hygiene::run_blind_spot(&db, &spec),
+                ),
+            )
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named blind-spot error",
+                )
+            })??;
             Ok(Json(hygiene_response(
                 operation,
                 format!(
@@ -700,22 +710,23 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let mut response =
-                tokio::task::spawn_blocking(move || crate::m3::hygiene::run_drift(&db, &spec))
-                    .await
-                    .map_err(|error| {
-                        facade_delegate_error(
-                            HYGIENE_TOOL,
-                            operation.as_str(),
-                            &source_id,
-                            HYGIENE_SOT,
-                            crate::m1::mcp_error(
-                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                                format!("drift blocking task failed to join: {error}"),
-                            ),
-                            "inspect daemon logs; the MMD drift task terminated abnormally",
-                        )
-                    })??;
+            let mut response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_drift",
+                    move || crate::m3::hygiene::run_drift(&db, &spec),
+                ),
+            )
+            .await
+            .map_err(|error| {
+                facade_delegate_error(
+                    HYGIENE_TOOL,
+                    operation.as_str(),
+                    &source_id,
+                    HYGIENE_SOT,
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named MMD drift error",
+                )
+            })??;
             let event_bus = service.sse_state()?.event_bus();
             for finding in &response.persisted_findings {
                 let event_seq = finding
@@ -798,15 +809,16 @@ pub(super) async fn handle(
                 )
             })?;
             // The verification re-derives SST/WAL bytes and re-hashes a ledger
-            // window: strictly blocking CPU/IO work, exactly like the sibling
-            // backup and restore-verify operations, so it must not occupy a
-            // Tokio runtime worker serving MCP. Mutual exclusion with backup and
-            // erase is enforced one layer down by the vault maintenance guard
-            // those passes already share, so a scan can never race a tree
-            // rewrite and report the torn intermediate state as corruption.
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::hygiene::run_vault_verify(&db, &spec)
-            })
+            // window. The vault guard protects integrity against a concurrent
+            // rewrite; this process-wide lane separately prevents its bounded
+            // whole-vault reader from multiplying the working set of search,
+            // GC, derived state, backup, or another public corpus request.
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_vault_verify",
+                    move || crate::m3::hygiene::run_vault_verify(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -814,11 +826,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "calyx_vault",
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("vault_verify blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the vault verification task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named vault-verification error",
                 )
             })??;
             Ok(Json(hygiene_response(
@@ -1005,9 +1014,12 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::hygiene::run_guard_calibrate(&db, &spec)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_guard_calibrate",
+                    move || crate::m3::hygiene::run_guard_calibrate(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -1015,11 +1027,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("guard calibration blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the guard-calibration task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named guard-calibration error",
                 )
             })??;
             Ok(Json(hygiene_response(
@@ -1058,10 +1067,29 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let verify_db = std::sync::Arc::clone(&db);
-            let mut response = tokio::task::spawn_blocking(move || {
-                crate::m3::hygiene::run_guard_verify(&verify_db, &spec)
-            })
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_guard_verify",
+                    move || {
+                        let mut response = crate::m3::hygiene::run_guard_verify(&db, &spec)?;
+                        if response.persisted_novelty.is_some() {
+                            let relay = synapse_storage::derived_state::run_novelty_relay_once(&db)
+                                .map_err(|detail| {
+                                    crate::m1::mcp_error(
+                                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                        format!("Ward novelty relay failed: {detail}"),
+                                    )
+                                })?;
+                            response.notifications_matched =
+                                relay.last_novelty_notifications_matched;
+                            response.notifications_queued = relay.last_novelty_notifications_queued;
+                            response.notifications_dropped =
+                                relay.last_novelty_notifications_dropped;
+                        }
+                        Ok(response)
+                    },
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -1069,26 +1097,10 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("guard verification blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the guard-verification task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named guard-verification error",
                 )
             })??;
-            if response.persisted_novelty.is_some() {
-                let relay = synapse_storage::derived_state::run_novelty_relay_once(&db).map_err(
-                    |detail| {
-                        crate::m1::mcp_error(
-                            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                            format!("Ward novelty relay failed: {detail}"),
-                        )
-                    },
-                )?;
-                response.notifications_matched = relay.last_novelty_notifications_matched;
-                response.notifications_queued = relay.last_novelty_notifications_queued;
-                response.notifications_dropped = relay.last_novelty_notifications_dropped;
-            }
             Ok(Json(hygiene_response(
                 operation,
                 format!(
@@ -1230,16 +1242,11 @@ pub(super) async fn handle(
             candidate.index_alpha = spec.index_alpha;
             let panel_version = spec.panel_version;
             let description = spec.description;
-            let report = tokio::task::spawn_blocking(move || {
-                db.propose_calyx_search_tuning(panel_version, candidate, &description)
-            })
+            let report = synapse_storage::maintenance::run_admitted_maintenance(
+                "hygiene_anneal_search_propose",
+                move || db.propose_calyx_search_tuning(panel_version, candidate, &description),
+            )
             .await
-            .map_err(|error| {
-                crate::m1::mcp_error(
-                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                    format!("Anneal search proposal blocking task failed to join: {error}"),
-                )
-            })?
             .map_err(|error| {
                 crate::m1::mcp_error_with_remediation(
                     error.code(),

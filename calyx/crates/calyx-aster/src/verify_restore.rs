@@ -4,14 +4,15 @@
 //! directories, truncates WAL tails, or replays bytes into the vault. Counts are
 //! measured by scanning SST and WAL bytes directly.
 //!
-//! Every column-family traversal here is **paged** (#2059). The first version
-//! merged each CF into one in-memory map and then re-hashed the chain from a
-//! fully materialized `Vec<LedgerRow>`, so peak retention grew with the vault.
-//! On a production vault (~1M rows) the level merge hit the 1 GiB
-//! `MAX_RANGE_SCAN_BYTES` ceiling from #1809/#1810 and the scan was refused
-//! before it could reach any verdict at all — and a refusal was then reported as
-//! `success=false`, i.e. as corruption. A check that stops working once the data
-//! it protects gets large is not a check.
+//! Every column-family traversal here is **streamed** (#2059/#2243). The first
+//! version merged each CF into one in-memory map and then re-hashed the chain
+//! from a fully materialized `Vec<LedgerRow>`, so peak retention grew with the
+//! vault. The first paged correction still eagerly decoded every SST lookup
+//! index and reopened/re-sought the merge cursor for each output page. On a
+//! production vault that verifier overlapped scheduled kernel maintenance and
+//! raised process-private memory to 2.83 GiB. One cold immutable cursor now
+//! advances forward for the complete CF, retaining only one current row per SST
+//! source plus one bounded output page.
 //!
 //! Peak retention is now one page of rows plus the WAL overlay, independent of
 //! vault size, so the whole vault is covered on every pass. That is the shape
@@ -64,10 +65,12 @@ const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
 /// Each of these is a defensive ceiling failing closed before an allocator abort
 /// or an unbounded read. None of them is evidence about vault integrity, so none
 /// of them may reach an operator wearing the corruption remediation.
-const RESOURCE_REFUSAL_CODES: [&str; 3] = [
+const RESOURCE_REFUSAL_CODES: [&str; 5] = [
     "CALYX_ASTER_SCAN_MEMORY_BUDGET",
     "CALYX_ASTER_SCAN_ALLOC",
     "CALYX_ASTER_SST_PAGE_SOURCE_LIMIT_EXCEEDED",
+    "CALYX_ASTER_SST_SEQUENTIAL_SOURCE_LIMIT_EXCEEDED",
+    "CALYX_ASTER_SEQUENTIAL_SNAPSHOT_MEMORY_BUDGET",
 ];
 
 type WalOverlay = HashMap<ColumnFamily, Vec<(Vec<u8>, Vec<u8>)>>;
@@ -363,25 +366,28 @@ fn visit_cf_rows(
     value_crypto: Option<&SharedVaultContext>,
     mut visit: impl FnMut(SstEntry) -> Result<()>,
 ) -> Result<()> {
-    let wal_rows = overlay_rows(overlay, cf);
-    let level = cf_level_with_lookup(vault, cf)?;
-    let mut after_key: Option<Vec<u8>> = None;
-    loop {
-        let page =
-            level.range_page_until(&[], None, after_key.as_deref(), VERIFY_SCAN_PAGE_ROWS)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        after_key = Some(last.key.clone());
-        for entry in page {
-            if wal_rows.contains_key(&entry.key) {
-                continue;
+    let wal_rows = overlay_rows(overlay, cf)
+        .into_iter()
+        .map(|(key, value)| SstEntry { key, value })
+        .collect();
+    let level = cf_level(vault, cf)?;
+    let mut stream = level.open_sequential_page_stream_with_overlay_origins(
+        &[],
+        None,
+        VERIFY_SCAN_PAGE_ROWS,
+        wal_rows,
+    )?;
+    while let Some(page) = stream.next_page()? {
+        for winner in page {
+            let entry = if winner.from_overlay {
+                winner.entry
+            } else {
+                open_sst_entry(winner.entry, cf, value_crypto)?
+            };
+            if !crate::mvcc::is_tombstone_value(&entry.value) {
+                visit(entry)?;
             }
-            visit(open_sst_entry(entry, cf, value_crypto)?)?;
         }
-    }
-    for (key, value) in wal_rows {
-        visit(SstEntry { key, value })?;
     }
     Ok(())
 }
@@ -422,10 +428,14 @@ fn read_wal_overlay(vault: &Path, value_crypto: Option<&SharedVaultContext>) -> 
     Ok(overlay)
 }
 
-/// Opens a column family's SSTs with retained lookup indexes, which is what the
-/// bounded page cursor needs; it refuses to fall back to a whole-file scan.
-fn cf_level_with_lookup(vault: &Path, cf: ColumnFamily) -> Result<SstLevel> {
-    SstLevel::from_oldest_first_with_lookup(cf_sst_paths(vault, cf)?)
+/// Opens a column family's immutable files with only validated bounds retained.
+///
+/// The verifier subsequently owns one forward-only stream. Eager lookup
+/// metadata would duplicate every immutable key in memory, while reopening a
+/// cursor per output page would repeatedly rebuild and seek the same source
+/// frontier. Neither is part of a bounded integrity check.
+fn cf_level(vault: &Path, cf: ColumnFamily) -> Result<SstLevel> {
+    SstLevel::from_oldest_first(cf_sst_paths(vault, cf)?)
 }
 
 fn cf_sst_paths(vault: &Path, cf: ColumnFamily) -> Result<Vec<PathBuf>> {
@@ -544,7 +554,7 @@ fn verify_ledger_paged(
     discipline: AnchorDiscipline,
 ) -> Result<LedgerVerification> {
     let wal_rows = ledger_overlay_rows(overlay)?;
-    let level = cf_level_with_lookup(vault, ColumnFamily::Ledger)?;
+    let level = cf_level(vault, ColumnFamily::Ledger)?;
     let head = physical_ledger_head(&level, &wal_rows)?;
     if anchor.is_none() && head > 0 {
         return Err(crate::ledger_head::missing_head_anchor(vault, head));
@@ -607,18 +617,20 @@ fn feed_ledger_rows(
     let mut wal_iter = wal_rows.iter().peekable();
     let mut entry_count = 0_u64;
     let mut last_bytes: Option<Vec<u8>> = None;
-    let mut after_key: Option<Vec<u8>> = None;
     let mut verdict: Option<VerifyResult> = None;
-    'pages: loop {
-        let page =
-            level.range_page_until(&[], None, after_key.as_deref(), VERIFY_SCAN_PAGE_ROWS)?;
-        let Some(last) = page.last() else {
-            break;
-        };
-        after_key = Some(last.key.clone());
-        for entry in page {
+    let mut stream = level.open_sequential_page_stream_with_overlay_origins(
+        &[],
+        None,
+        VERIFY_SCAN_PAGE_ROWS,
+        Vec::new(),
+    )?;
+    'pages: while let Some(page) = stream.next_page()? {
+        for winner in page {
+            let entry = open_sst_entry(winner.entry, ColumnFamily::Ledger, value_crypto)?;
+            if crate::mvcc::is_tombstone_value(&entry.value) {
+                continue;
+            }
             let seq = parse_aster_ledger_seq(&entry.key)?;
-            let entry = open_sst_entry(entry, ColumnFamily::Ledger, value_crypto)?;
             // WAL-only sequences below this SST row come first in chain order.
             while wal_iter.peek().is_some_and(|(wal_seq, _)| **wal_seq < seq) {
                 let Some((wal_seq, bytes)) = wal_iter.next() else {
