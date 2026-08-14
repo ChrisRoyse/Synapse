@@ -85,6 +85,10 @@ pub const CHROME_STORAGE_KEY_INVALID: &str = "CHROME_STORAGE_KEY_INVALID";
 pub const CHROME_STORAGE_OPERATION_UNSUPPORTED: &str = "CHROME_STORAGE_OPERATION_UNSUPPORTED";
 pub const CHROME_STORAGE_STATE_LOAD_FAILED: &str = "CHROME_STORAGE_STATE_LOAD_FAILED";
 pub const CHROME_STORAGE_STATE_READ_FAILED: &str = "CHROME_STORAGE_STATE_READ_FAILED";
+/// The requested Chrome tab target is absent from an authoritative
+/// `chrome.tabs.query({})` enumeration. This is a terminal, idempotent close
+/// outcome rather than a transport failure.
+pub const CHROME_TAB_TARGET_ABSENT: &str = "CHROME_TAB_TARGET_ABSENT";
 /// A caller-supplied browser wait predicate could not be compiled or threw in
 /// the exact target document. Distinct from debugger attach/transport failure.
 pub const CHROME_WAIT_PREDICATE_INVALID: &str = "CHROME_WAIT_PREDICATE_INVALID";

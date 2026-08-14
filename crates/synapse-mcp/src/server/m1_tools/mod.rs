@@ -5491,7 +5491,7 @@ impl SynapseService {
                     let readback = self.reconcile_operator_panic_closed_cdp_target(
                         i64::from(closed.tab_id),
                         &closed.target_id,
-                        true,
+                        !closed.already_absent,
                     );
                     failures.extend(
                         readback
@@ -5502,10 +5502,7 @@ impl SynapseService {
                     targets.push(readback);
                 }
                 Err(close_error)
-                    if Self::chrome_bridge_close_target_already_absent(
-                        close_error.detail(),
-                        &target_id,
-                    ) =>
+                    if Self::chrome_bridge_close_target_already_absent(close_error.code()) =>
                 {
                     let listed = crate::chrome_debugger_bridge::list_tabs(
                         owner.window_hwnd,
@@ -10805,12 +10802,7 @@ impl SynapseService {
             .await
             {
                 Ok(closed) => closed,
-                Err(error)
-                    if Self::chrome_bridge_close_target_already_absent(
-                        error.detail(),
-                        cdp_target_id,
-                    ) =>
-                {
+                Err(error) if Self::chrome_bridge_close_target_already_absent(error.code()) => {
                     let listed = crate::chrome_debugger_bridge::list_tabs(
                             owner.window_hwnd,
                             owner.chrome_window_id,
@@ -11043,6 +11035,7 @@ impl SynapseService {
                 owner_created_at_unix_ms = owner.created_at_unix_ms,
                 target_count_before = closed.target_count_before,
                 target_count_after = closed.target_count_after,
+                already_absent = closed.already_absent,
                 target_claim_released = claim_released,
                 "readback=chrome.tabs.query outcome=target_absent"
             );
@@ -11051,7 +11044,7 @@ impl SynapseService {
                 window_hwnd: owner.window_hwnd,
                 endpoint: owner.endpoint,
                 cdp_target_id: closed.target_id,
-                closed: true,
+                closed: !closed.already_absent,
                 target_count_before: closed.target_count_before,
                 target_count_after: closed.target_count_after,
                 previous,
@@ -11126,10 +11119,8 @@ impl SynapseService {
         })
     }
 
-    fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
-        detail.contains("targetIdHint")
-            && detail.contains(target_id)
-            && detail.contains("did not match any chrome.tabs tab id")
+    fn chrome_bridge_close_target_already_absent(code: &str) -> bool {
+        code == error_codes::CHROME_TAB_TARGET_ABSENT
     }
 
     fn chrome_bridge_tab_id_from_target_id(target_id: &str) -> Option<i64> {

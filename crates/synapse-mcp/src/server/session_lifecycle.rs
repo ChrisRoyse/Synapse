@@ -2763,9 +2763,15 @@ async fn close_cdp_target_for_cleanup(
     if is_chrome_bridge_endpoint(&owner.endpoint) {
         return crate::chrome_debugger_bridge::close_tab(owner.window_hwnd, target_id)
             .await
-            .map(|_closed| CdpCleanupCloseOutcome::Closed)
+            .map(|closed| {
+                if closed.already_absent {
+                    CdpCleanupCloseOutcome::AlreadyAbsent
+                } else {
+                    CdpCleanupCloseOutcome::Closed
+                }
+            })
             .or_else(|error| {
-                if chrome_bridge_close_target_already_absent(error.detail(), target_id) {
+                if chrome_bridge_close_target_already_absent(error.code()) {
                     Ok(CdpCleanupCloseOutcome::AlreadyAbsent)
                 } else if chrome_bridge_close_refused_for_stale_prior_browser_session(
                     error.detail(),
@@ -2811,34 +2817,13 @@ fn is_chrome_bridge_endpoint(endpoint: &str) -> bool {
         && (endpoint.ends_with("/chrome.tabs") || endpoint.ends_with("/chrome.debugger"))
 }
 
-/// A CDP target the Chrome bridge no longer knows about is already in the desired
-/// closed state, so a close attempt that fails *because the tab is gone* is an
-/// already-absent success, not a teardown failure. The runtime bridge surfaces
-/// this as `"targetIdHint <id> did not match a live chrome.tabs tab id: No tab
-/// with id: <n>"` (Chrome's own `No tab with id` runtime error). An earlier
-/// bridge build phrased it `"did not match any chrome.tabs tab id"`. #1800: the
-/// classifier only matched the *legacy* "any" phrasing, so every current
-/// "a live"/"No tab with id" close was mis-scored `failed`, teardown returned
-/// `Err`, and the 250 ms stale-session sweep retried the same dead tab forever
-/// (~48.9k ERROR/day on 2026-07-23) — a session with a closed tab could never
-/// finish teardown. Match the stable "tab gone" markers instead of one exact
-/// sentence. This deliberately does NOT absorb the plain operator-panic
-/// mutation-admission refusal (the tab may still be open there): that stays a
-/// genuine fail-closed retention. The one proven-terminal refusal —
-/// stale-prior-browser-session continuity, where the tab id itself is dead —
-/// is classified separately by
-/// `chrome_bridge_close_refused_for_stale_prior_browser_session`.
+/// A CDP target absent from the extension's authoritative `chrome.tabs.query`
+/// read is already in the desired closed state. Classify only the trusted
+/// machine-readable code: Chrome runtime prose is unstable and must never
+/// decide whether a persisted owner row is deleted.
 #[cfg(windows)]
-fn chrome_bridge_close_target_already_absent(detail: &str, target_id: &str) -> bool {
-    // Chrome's definitive "the tab does not exist" runtime error.
-    if detail.contains("No tab with id") {
-        return true;
-    }
-    // Bridge wrapper phrasings ("a live" today, "any" on legacy builds).
-    detail.contains("targetIdHint")
-        && detail.contains(target_id)
-        && detail.contains("chrome.tabs tab id")
-        && detail.contains("did not match")
+fn chrome_bridge_close_target_already_absent(code: &str) -> bool {
+    code == error_codes::CHROME_TAB_TARGET_ABSENT
 }
 
 /// Recognises the extension's operator-panic mutation-admission refusal (#1801).

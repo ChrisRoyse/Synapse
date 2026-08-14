@@ -85,6 +85,11 @@ use crate::{
 type McpHttpService = StreamableHttpService<SynapseService, LocalSessionManager>;
 type HttpBackgroundTaskOwner = (&'static str, ShutdownTaskOwner<()>);
 const STALE_SESSION_INPUT_CLEANUP_INTERVAL: Duration = Duration::from_millis(250);
+/// Whole-session lifecycle teardown can close external browser targets and must
+/// not share the held-input expiry cadence. Bound it to a coarse, delayed sweep
+/// so vanished-target reconciliation cannot monopolize runtime workers.
+const STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
+const STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP: usize = 2;
 /// How often the abandoned-session reaper scans (#1800). Distinct from the 250ms
 /// held-input cleanup: reaping evicts whole rmcp sessions, so it runs on a
 /// coarser cadence to bound the process-probe/registry cost while still catching
@@ -4407,6 +4412,8 @@ fn spawn_stale_session_input_cleanup(
     tokio::spawn(async move {
         let mut interval = time::interval(STALE_SESSION_INPUT_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
+        let mut lifecycle_interval = time::interval(STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL);
+        lifecycle_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut reap_interval = time::interval(ABANDONED_SESSION_REAP_INTERVAL);
         reap_interval.set_missed_tick_behavior(time::MissedTickBehavior::Delay);
         let mut teardown_backoff = StaleTeardownBackoff::default();
@@ -4427,6 +4434,9 @@ fn spawn_stale_session_input_cleanup(
                     break;
                 }
                 _ = interval.tick() => {
+                    session_lifecycle.cleanup_expired_lease_inputs_once().await;
+                }
+                _ = lifecycle_interval.tick() => {
                     cleanup_stale_session_resources_once(
                         &session_lifecycle,
                         &session_manager,
@@ -4602,16 +4612,15 @@ fn spawn_agent_liveness_sweep(
     })
 }
 
-/// Per-session exponential backoff for stale-session teardowns that keep
-/// failing. Without this, one permanently-unrepairable sub-resource re-fails
-/// teardown on every 250 ms sweep — the 2026-07-23 storm logged ~48.9k
-/// identical `TOOL_INTERNAL_ERROR` lines/day and kept the daemon's cleanup
-/// path busy while agents were handshaking. The retry never gives up (no
-/// silent drop): it decays 250 ms → 500 ms → … → capped 60 s, still logging
-/// every real attempt, and resets the moment a teardown succeeds.
+/// Fair, bounded per-session scheduling and exponential backoff for stale
+/// teardowns. Without this, one permanently-unrepairable sub-resource re-fails
+/// across an unbounded sweep and keeps the daemon's cleanup path busy while
+/// agents are handshaking. Retry never silently drops work: 2 s → 4 s → … →
+/// capped 60 s, resetting the moment teardown succeeds.
 #[derive(Default)]
 struct StaleTeardownBackoff {
     entries: HashMap<String, StaleTeardownBackoffEntry>,
+    cursor_after: Option<String>,
 }
 
 struct StaleTeardownBackoffEntry {
@@ -4638,8 +4647,8 @@ impl StaleTeardownBackoff {
             .get(session_id)
             .map_or(0, |entry| entry.consecutive_failures)
             .saturating_add(1);
-        let exponent = failures.saturating_sub(1).min(8);
-        let delay = STALE_SESSION_INPUT_CLEANUP_INTERVAL
+        let exponent = failures.saturating_sub(1).min(5);
+        let delay = STALE_SESSION_LIFECYCLE_CLEANUP_INTERVAL
             .saturating_mul(1_u32 << exponent)
             .min(STALE_TEARDOWN_BACKOFF_CAP);
         self.entries.insert(
@@ -4654,9 +4663,54 @@ impl StaleTeardownBackoff {
 
     /// Drop tracking for sessions that are no longer stale candidates (cleaned
     /// up by another path) so the map cannot grow without bound.
-    fn retain_candidates(&mut self, candidates: &BTreeSet<String>) {
+    fn retain_candidates(&mut self, candidates: &BTreeMap<String, &'static str>) {
         self.entries
-            .retain(|session_id, _| candidates.contains(session_id));
+            .retain(|session_id, _| candidates.contains_key(session_id));
+        if candidates.is_empty() {
+            self.cursor_after = None;
+        }
+    }
+
+    fn candidates_for_sweep(
+        &mut self,
+        candidates: &BTreeMap<String, &'static str>,
+        now: Instant,
+    ) -> Vec<String> {
+        let mut selected = Vec::with_capacity(
+            STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP.min(candidates.len()),
+        );
+        let cursor = self.cursor_after.as_deref();
+
+        for session_id in candidates.keys() {
+            if cursor.is_some_and(|cursor| session_id.as_str() <= cursor) {
+                continue;
+            }
+            if self.should_attempt(session_id, now) {
+                selected.push(session_id.clone());
+                if selected.len() == STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
+                    break;
+                }
+            }
+        }
+        if selected.len() < STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
+            if let Some(cursor) = cursor {
+                for session_id in candidates.keys() {
+                    if session_id.as_str() > cursor {
+                        break;
+                    }
+                    if self.should_attempt(session_id, now) {
+                        selected.push(session_id.clone());
+                        if selected.len() == STALE_SESSION_LIFECYCLE_MAX_CANDIDATES_PER_SWEEP {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(last) = selected.last() {
+            self.cursor_after = Some(last.clone());
+        }
+        selected
     }
 }
 
@@ -4666,15 +4720,12 @@ async fn cleanup_stale_session_resources_once(
     teardown_backoff: &mut StaleTeardownBackoff,
 ) {
     let active_sessions = active_http_session_ids(session_manager).await;
-    session_lifecycle.cleanup_expired_lease_inputs_once().await;
     let stale_sessions = session_lifecycle.stale_session_candidates(&active_sessions);
-    let candidate_ids = stale_sessions.keys().cloned().collect::<BTreeSet<_>>();
-    teardown_backoff.retain_candidates(&candidate_ids);
+    teardown_backoff.retain_candidates(&stale_sessions);
     let now = Instant::now();
-    for (session_id, reason) in stale_sessions {
-        if !teardown_backoff.should_attempt(&session_id, now) {
-            continue;
-        }
+    let selected = teardown_backoff.candidates_for_sweep(&stale_sessions, now);
+    for session_id in selected {
+        let reason = stale_sessions[&session_id];
         match session_lifecycle
             .teardown_session(&session_id, reason)
             .await
@@ -4697,7 +4748,7 @@ async fn cleanup_stale_session_resources_once(
             // the backoff each pass.
             Ok(report) => {
                 let (consecutive_failures, retry_after) =
-                    teardown_backoff.record_failure(&session_id, now);
+                    teardown_backoff.record_failure(&session_id, Instant::now());
                 // #1801: the first refusal is the actionable signal; every
                 // repeat is the KNOWN, intentional fail-closed retention
                 // re-observed on schedule (an operator-panic browser-mutation
@@ -4736,7 +4787,7 @@ async fn cleanup_stale_session_resources_once(
             }
             Err(error) => {
                 let (consecutive_failures, retry_after) =
-                    teardown_backoff.record_failure(&session_id, now);
+                    teardown_backoff.record_failure(&session_id, Instant::now());
                 // #1801: same rule as the embedded-failure arm above - one ERROR
                 // per failure streak, WARN while the known refusal persists.
                 if consecutive_failures <= 1 {
@@ -4766,6 +4817,7 @@ async fn cleanup_stale_session_resources_once(
                 }
             }
         }
+        tokio::task::yield_now().await;
     }
 }
 

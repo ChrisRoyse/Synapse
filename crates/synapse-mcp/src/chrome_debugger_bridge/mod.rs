@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-12-target-scroll-v20";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-14-absent-target-v21";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "870cda343d5fe91cc67a3ae68e25c6919bc5139d96035d5d408648bc0dcb860d";
+    "ea9d4ea93914d7d86f9a23b742f47e8cefb7e367480f31b4cdf4ccbca02c35ce";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;
@@ -150,6 +150,7 @@ const TRUSTED_EXTENSION_ERROR_CODES: &[&str] = &[
     "CHROME_STORAGE_OPERATION_UNSUPPORTED",
     "CHROME_STORAGE_STATE_LOAD_FAILED",
     "CHROME_STORAGE_STATE_READ_FAILED",
+    "CHROME_TAB_TARGET_ABSENT",
     "CHROME_WAIT_PREDICATE_INVALID",
     "PAGE_VITALS_READ_FAILED",
     "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
@@ -2701,6 +2702,8 @@ pub struct ChromeDebuggerCloseTabResult {
     pub tab_id: u32,
     pub target_count_before: u32,
     pub target_count_after: u32,
+    #[serde(default)]
+    pub already_absent: bool,
     pub extension_id: Option<String>,
 }
 
@@ -9129,6 +9132,8 @@ fn chrome_response_readback_summary(kind: &str, result: Option<&Value>) -> Optio
             "tab_id": result.get("tab_id"),
             "target_count_before": result.get("target_count_before"),
             "target_count_after": result.get("target_count_after"),
+            "already_absent": result.get("already_absent"),
+            "readback_backend": result.get("readback_backend"),
             "extension_id": result.get("extension_id"),
             "operator_panic_cleanup": result.get("operator_panic_cleanup"),
             "expected_disable_sequence": result.get("expected_disable_sequence"),

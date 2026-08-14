@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-12-target-scroll-v20";
-const BRIDGE_DECLARED_BUILD_SHA256 = "870cda343d5fe91cc67a3ae68e25c6919bc5139d96035d5d408648bc0dcb860d";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-14-absent-target-v21";
+const BRIDGE_DECLARED_BUILD_SHA256 = "ea9d4ea93914d7d86f9a23b742f47e8cefb7e367480f31b4cdf4ccbca02c35ce";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -100,6 +100,7 @@ const ERROR_CHROME_DOM_ELEMENT_AMBIGUOUS = "CHROME_DOM_ELEMENT_AMBIGUOUS";
 const ERROR_CHROME_DOM_ELEMENT_NOT_ACTIONABLE = "CHROME_DOM_ELEMENT_NOT_ACTIONABLE";
 const ERROR_CHROME_DOM_ACTION_UNSUPPORTED = "CHROME_DOM_ACTION_UNSUPPORTED";
 const ERROR_CHROME_DOM_ACTION_POSTCONDITION_FAILED = "CHROME_DOM_ACTION_POSTCONDITION_FAILED";
+const ERROR_CHROME_TAB_TARGET_ABSENT = "CHROME_TAB_TARGET_ABSENT";
 const ERROR_ACTION_TARGET_INVALID = "ACTION_TARGET_INVALID";
 const ERROR_CODE_CONTRACT_VIOLATION = "CHROME_BRIDGE_ERROR_CODE_CONTRACT_VIOLATION";
 // Every machine-readable code that may cross the authenticated command-response
@@ -152,6 +153,7 @@ const PUBLIC_COMMAND_ERROR_CODES = Object.freeze([
   "CHROME_STORAGE_OPERATION_UNSUPPORTED",
   "CHROME_STORAGE_STATE_LOAD_FAILED",
   "CHROME_STORAGE_STATE_READ_FAILED",
+  "CHROME_TAB_TARGET_ABSENT",
   "CHROME_WAIT_PREDICATE_INVALID",
   "PAGE_VITALS_READ_FAILED",
   "SYNAPSE_CHROME_BRIDGE_MAINTENANCE_PAUSE_PERSIST_FAILED",
@@ -4355,24 +4357,75 @@ async function handleOpenTab(params, commandId) {
 }
 
 async function handleCloseTab(params) {
-  const selected = await selectTabTarget(params, { requireTargetId: true });
+  const targetIdHint = String(params.targetIdHint || "").trim();
+  const tabIdHint = tabIdFromTargetId(targetIdHint);
+  let selected;
+  try {
+    selected = await selectTabTarget(params, { requireTargetId: true });
+  } catch (error) {
+    if (error?.code !== ERROR_CHROME_TAB_TARGET_ABSENT || !Number.isInteger(tabIdHint)) {
+      throw error;
+    }
+    await persistClosedTabLedgerReconciliation(tabIdHint, targetIdHint, "already absent before close");
+    return {
+      extension_id: chrome.runtime.id,
+      target_id: targetIdHint,
+      tab_id: tabIdHint,
+      target_count_before: 0,
+      target_count_after: 0,
+      already_absent: true,
+      readback_backend: "chrome.tabs.query(absent)+chrome.storage.local(durable-owner-pruned)"
+    };
+  }
   await tabPageState(selected.tabId, selected.target);
+  let alreadyAbsent = false;
   try {
     assertPhysicalMutationAdmission(`chrome.tabs.remove:closeTab:tab=${selected.tabId}`);
     await chrome.tabs.remove(selected.tabId);
   } catch (error) {
-    throw bridgeError(ERROR_AXTREE_FAILED, `chrome.tabs.remove(${selected.tabId}): ${errorMessage(error)}`);
+    const authoritativeTab = await authoritativeTabById(
+      selected.tabId,
+      `chrome.tabs.remove(${selected.tabId}) failed: ${errorMessage(error)}`
+    );
+    if (authoritativeTab) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        `chrome.tabs.remove(${selected.tabId}) failed while authoritative chrome.tabs.query still returned the tab: ${errorMessage(error)}`
+      );
+    }
+    alreadyAbsent = true;
   }
-  await waitForTargetAbsent(selected.target.id, 10000);
-  pruneDurableOwnerLedgerForClosedTab(selected.tabId);
+  if (!alreadyAbsent) {
+    await waitForTargetAbsent(selected.target.id, 10000);
+  }
+  await persistClosedTabLedgerReconciliation(
+    selected.tabId,
+    selected.target.id,
+    alreadyAbsent ? "became absent during close" : "closed"
+  );
   return {
     extension_id: chrome.runtime.id,
     target_id: selected.target.id,
     tab_id: selected.tabId,
     target_count_before: 1,
     target_count_after: 0,
-    readback_backend: "chrome.tabs.get+chrome.tabs.remove+chrome.tabs.get(absent)"
+    already_absent: alreadyAbsent,
+    readback_backend: alreadyAbsent
+      ? "chrome.tabs.remove(error)+chrome.tabs.query(absent)+chrome.storage.local(durable-owner-pruned)"
+      : "chrome.tabs.get+chrome.tabs.remove+chrome.tabs.get(absent)+chrome.storage.local(durable-owner-pruned)"
   };
+}
+
+async function persistClosedTabLedgerReconciliation(tabId, targetId, outcome) {
+  pruneDurableOwnerLedgerForClosedTab(tabId);
+  try {
+    await persistDurableOwnerLedger({ mergeLiveOwners: true });
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `Chrome target ${targetId} is ${outcome}, but durable owner reconciliation failed for tab ${tabId}: ${errorMessage(error)}`
+    );
+  }
 }
 
 async function handleListTabs(params) {
@@ -17423,18 +17476,57 @@ async function tabTargetById(tabId, targetIdHint) {
   try {
     tab = await chrome.tabs.get(tabId);
   } catch (error) {
+    const authoritativeTab = await authoritativeTabById(
+      tabId,
+      `chrome.tabs.get(${tabId}) failed for targetIdHint ${targetIdHint}: ${errorMessage(error)}`
+    );
+    if (!authoritativeTab) {
+      throw bridgeError(
+        ERROR_CHROME_TAB_TARGET_ABSENT,
+        `targetIdHint ${targetIdHint} is absent from authoritative chrome.tabs.query after chrome.tabs.get(${tabId}) failed: ${errorMessage(error)}`
+      );
+    }
     throw bridgeError(
       ERROR_AXTREE_FAILED,
-      `targetIdHint ${targetIdHint} did not match a live chrome.tabs tab id: ${errorMessage(error)}`
+      `chrome.tabs.get(${tabId}) failed for targetIdHint ${targetIdHint}, but authoritative chrome.tabs.query still returned the tab: ${errorMessage(error)}`
     );
   }
   if (!tab || typeof tab.id !== "number") {
+    const authoritativeTab = await authoritativeTabById(
+      tabId,
+      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}`
+    );
+    if (!authoritativeTab) {
+      throw bridgeError(
+        ERROR_CHROME_TAB_TARGET_ABSENT,
+        `targetIdHint ${targetIdHint} is absent from authoritative chrome.tabs.query after chrome.tabs.get(${tabId}) returned no tab`
+      );
+    }
     throw bridgeError(
       ERROR_AXTREE_FAILED,
-      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}`
+      `chrome.tabs.get(${tabId}) returned no tab for targetIdHint ${targetIdHint}, but authoritative chrome.tabs.query still returned it`
     );
   }
   return tabTargetFromTab(tab);
+}
+
+async function authoritativeTabById(tabId, context) {
+  let tabs;
+  try {
+    tabs = await chrome.tabs.query({});
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${context}; authoritative chrome.tabs.query failed: ${errorMessage(error)}`
+    );
+  }
+  if (!Array.isArray(tabs)) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `${context}; authoritative chrome.tabs.query returned a non-array result`
+    );
+  }
+  return tabs.find((candidate) => candidate?.id === tabId) || null;
 }
 
 function selectedPage(target, targetCandidateCount, selectionReason) {
