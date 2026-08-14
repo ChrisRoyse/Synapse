@@ -649,6 +649,30 @@ struct DriftCorpus {
     walk: crate::SynapseCalyxCfWalk,
 }
 
+/// Exact MMD inputs after the estimator's own 1,024-row-per-side contract has
+/// been applied. These remain `f32` until their one lens is evaluated.
+struct MmdSlotSamples {
+    dimension: usize,
+    reference: Vec<Vec<f32>>,
+    recent: Vec<Vec<f32>>,
+}
+
+struct MmdCorpus {
+    by_slot: BTreeMap<SlotId, MmdSlotSamples>,
+    lenses_without_nonempty_shape: usize,
+    records_scanned: usize,
+    records_measured: usize,
+    walk: crate::SynapseCalyxCfWalk,
+}
+
+#[derive(Clone, Copy)]
+struct MmdSlotBounds {
+    total: usize,
+    reference_start: usize,
+    reference_end: usize,
+    recent_start: usize,
+}
+
 impl SynapseCalyxVault {
     /// Scans a panel for cross-lens blind spots: records where one lens judges a
     /// record close to a neighbor while a second lens on that same pair
@@ -951,15 +975,14 @@ impl SynapseCalyxVault {
         let recent_fraction = params.recent_fraction;
         let permutations = params.permutations;
         let alpha = params.alpha;
-        let corpus = self.load_drift_corpus(params.panel_version, max_records)?;
-
-        // Gather each lens's vectors in Base scan order (oldest first).
-        let mut by_slot: BTreeMap<SlotId, Vec<Vec<f32>>> = BTreeMap::new();
-        for record in &corpus.records {
-            for (slot, vector) in &record.slots {
-                by_slot.entry(*slot).or_default().push(vector.clone());
-            }
-        }
+        let corpus = self.load_mmd_corpus(params.panel_version, max_records, recent_fraction)?;
+        let MmdCorpus {
+            by_slot,
+            lenses_without_nonempty_shape,
+            records_scanned,
+            records_measured,
+            walk,
+        } = corpus;
 
         let config = MmdConfig {
             bandwidth: None,
@@ -971,46 +994,74 @@ impl SynapseCalyxVault {
 
         let mut lens_drift: Vec<SynapseCalyxLensDrift> = Vec::new();
         let mut writes: Vec<SynapseCalyxCfWrite> = Vec::new();
-        let mut lenses_insufficient = 0usize;
+        let mut lenses_insufficient = lenses_without_nonempty_shape;
         let mut drifted_lenses = 0usize;
 
-        for (slot, vectors) in by_slot {
-            // Restrict to the modal dimension so the window rows share a shape.
-            let Some(shaped) = modal_dimension_vectors(&vectors) else {
-                lenses_insufficient += 1;
-                continue;
-            };
-            let dimension = shaped[0].len();
-            let split = reference_split(shaped.len(), recent_fraction);
-            let reference = &shaped[..split];
-            let recent = &shaped[split..];
+        for (slot, samples) in by_slot {
+            let MmdSlotSamples {
+                dimension,
+                reference,
+                recent,
+            } = samples;
             if reference.len() < SYNAPSE_DRIFT_MIN_WINDOW || recent.len() < SYNAPSE_DRIFT_MIN_WINDOW
             {
                 lenses_insufficient += 1;
                 continue;
             }
-            let reference_f64 = to_f64_rows(reference, SYNAPSE_DRIFT_MAX_WINDOW);
-            let recent_f64 = to_f64_rows(recent, SYNAPSE_DRIFT_MAX_WINDOW);
+            let reference_f64 = to_f64_rows(&reference, SYNAPSE_DRIFT_MAX_WINDOW);
+            let recent_f64 = to_f64_rows(&recent, SYNAPSE_DRIFT_MAX_WINDOW);
 
-            let report = match gaussian_mmd_with_config(&reference_f64, &recent_f64, &config) {
-                Ok(report) => report,
-                Err(error) => {
-                    // A degenerate lens (zero pairwise distance / too few usable
-                    // samples) is unmeasurable, not a fault: report and continue.
-                    if is_unmeasurable(&error) {
-                        tracing::debug!(
-                            code = "SYNAPSE_DRIFT_LENS_UNMEASURABLE",
-                            slot = slot.get(),
-                            error = %error.message,
-                            "MMD drift lens unmeasurable"
-                        );
-                        lenses_insufficient += 1;
-                        continue;
-                    }
-                    return Err(SynapseCalyxError::from_calyx(
-                        "estimate MMD lens drift",
-                        &error,
+            let estimate = gaussian_mmd_with_config(&reference_f64, &recent_f64, &config);
+            drop(reference_f64);
+            drop(recent_f64);
+            let release = crate::release_process_memory("MMD lens estimator");
+            let report = match (estimate, release) {
+                (Err(estimate_error), Err(release_error)) => {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_DRIFT_ESTIMATE_AND_MEMORY_RELEASE_FAILED",
+                        format!(
+                            "panel {} slot {} MMD estimation failed with {}: {}; after every estimator-owned matrix and widened sample was dropped, allocator release also failed with {release_error}",
+                            params.panel_version,
+                            slot.get(),
+                            estimate_error.code,
+                            estimate_error.message
+                        ),
+                        "repair both the named MMD input/estimator failure and the process memory reclaimer before retrying",
                     ));
+                }
+                (Ok(_), Err(release_error)) => return Err(release_error),
+                (estimate, Ok(release)) => {
+                    tracing::info!(
+                        code = "SYNAPSE_CALYX_DRIFT_LENS_MEMORY_RELEASED",
+                        panel_version = params.panel_version,
+                        slot = slot.get(),
+                        private_bytes_before = release.private_bytes_before,
+                        private_bytes_after = release.private_bytes_after,
+                        private_bytes_reclaimed = release.private_bytes_reclaimed,
+                        release_elapsed_us = release.elapsed_us,
+                        "released one MMD lens's exact pair-distance/kernel workspace at its ownership boundary"
+                    );
+                    match estimate {
+                        Ok(report) => report,
+                        Err(error) => {
+                            // A degenerate lens (zero pairwise distance / too few usable
+                            // samples) is unmeasurable, not a fault: report and continue.
+                            if is_unmeasurable(&error) {
+                                tracing::debug!(
+                                    code = "SYNAPSE_DRIFT_LENS_UNMEASURABLE",
+                                    slot = slot.get(),
+                                    error = %error.message,
+                                    "MMD drift lens unmeasurable"
+                                );
+                                lenses_insufficient += 1;
+                                continue;
+                            }
+                            return Err(SynapseCalyxError::from_calyx(
+                                "estimate MMD lens drift",
+                                &error,
+                            ));
+                        }
+                    }
                 }
             };
 
@@ -1021,8 +1072,8 @@ impl SynapseCalyxVault {
                 panel_version: params.panel_version,
                 slot: slot.get(),
                 dimension,
-                reference_n: reference_f64.len(),
-                recent_n: recent_f64.len(),
+                reference_n: reference.len(),
+                recent_n: recent.len(),
                 mmd2: report.mmd2,
                 p_value: report.p_value,
                 bandwidth: report.bandwidth,
@@ -1039,8 +1090,8 @@ impl SynapseCalyxVault {
             lens_drift.push(SynapseCalyxLensDrift {
                 slot: slot.get(),
                 dimension,
-                reference_n: reference_f64.len(),
-                recent_n: recent_f64.len(),
+                reference_n: reference.len(),
+                recent_n: recent.len(),
                 mmd2: report.mmd2,
                 p_value: report.p_value,
                 bandwidth: report.bandwidth,
@@ -1088,9 +1139,9 @@ impl SynapseCalyxVault {
 
         Ok(SynapseCalyxPanelDriftReport {
             panel_version: params.panel_version,
-            records_scanned: corpus.records_scanned,
-            records_measured: corpus.records.len(),
-            walk: corpus.walk,
+            records_scanned,
+            records_measured,
+            walk,
             recent_fraction,
             permutations,
             lenses_evaluated: lens_drift.len(),
@@ -1100,6 +1151,242 @@ impl SynapseCalyxVault {
             reactive_cf_rows_after,
             drift_rows_persisted,
             persisted_findings,
+        })
+    }
+
+    /// Selects the same newest `max_records` panel rows as the generic drift
+    /// loader, but retains only the exact reference/recent tails consumed by
+    /// MMD. A first hydration pass establishes each slot's modal dimension;
+    /// the second pass can then select the final ordinals without ever owning
+    /// the whole multi-lens vector corpus or cloning it into per-slot groups.
+    #[allow(clippy::too_many_lines)]
+    fn load_mmd_corpus(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+        recent_fraction: f32,
+    ) -> Result<MmdCorpus, SynapseCalyxError> {
+        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+            let mut selected = BTreeSet::new();
+            let mut records_scanned = 0usize;
+            let walk = self.walk_cf_snapshot(
+                snapshot,
+                ColumnFamily::Base,
+                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+                |_key, value| {
+                    let base = decode_constellation_base(value).map_err(|error| {
+                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                    })?;
+                    if base.panel_version != panel_version {
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    records_scanned += 1;
+                    selected.insert((base.created_at, base.cx_id));
+                    if selected.len() > max_records {
+                        let oldest = selected.first().copied().ok_or_else(|| {
+                            SynapseCalyxError::new(
+                                "SYNAPSE_CALYX_DRIFT_SELECTION_EMPTY",
+                                "bounded chronological MMD selection lost its oldest candidate",
+                                "preserve the vault and inspect the Base CF selection invariant",
+                            )
+                        })?;
+                        selected.remove(&oldest);
+                    }
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                },
+            )?;
+            if records_scanned == 0 {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_DRIFT_CORPUS_EMPTY",
+                    format!(
+                        "MMD drift panel {panel_version} has no Base CF constellation at the pinned snapshot"
+                    ),
+                    "confirm the exact panel_version against panel lifecycle/coverage state, ingest at least one real constellation, then retry",
+                ));
+            }
+
+            let mut dense_slots = BTreeSet::new();
+            let mut dimensions: BTreeMap<SlotId, BTreeMap<usize, usize>> = BTreeMap::new();
+            for (_, cx_id) in &selected {
+                let constellation = self.hydrated_constellation_at_snapshot(*cx_id, snapshot)?;
+                for (slot, vector) in constellation.slots {
+                    if let SlotVector::Dense { data, .. } = vector {
+                        dense_slots.insert(slot);
+                        if !data.is_empty() {
+                            let count = dimensions.entry(slot).or_default().entry(data.len()).or_default();
+                            *count = count.checked_add(1).ok_or_else(|| {
+                                SynapseCalyxError::new(
+                                    "SYNAPSE_CALYX_DRIFT_DIMENSION_COUNT_OVERFLOW",
+                                    format!("panel {panel_version} slot {} modal-dimension count overflowed usize", slot.get()),
+                                    "preserve the vault and inspect the named panel/slot cardinality",
+                                )
+                            })?;
+                        }
+                    }
+                }
+            }
+            let census_release = crate::release_process_memory("MMD modal-dimension census")?;
+            tracing::info!(
+                code = "SYNAPSE_CALYX_DRIFT_CENSUS_MEMORY_RELEASED",
+                panel_version,
+                selected_records = selected.len(),
+                dense_slots = dense_slots.len(),
+                private_bytes_before = census_release.private_bytes_before,
+                private_bytes_after = census_release.private_bytes_after,
+                private_bytes_reclaimed = census_release.private_bytes_reclaimed,
+                release_elapsed_us = census_release.elapsed_us,
+                "released per-record hydration transients after the MMD modal-dimension census"
+            );
+
+            let mut bounds = BTreeMap::new();
+            let mut by_slot = BTreeMap::new();
+            for (slot, counts) in &dimensions {
+                let (dimension, total) = counts
+                    .iter()
+                    .max_by(|left, right| left.1.cmp(right.1).then(left.0.cmp(right.0)))
+                    .map(|(dimension, total)| (*dimension, *total))
+                    .ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_MODAL_DIMENSION_EMPTY",
+                            format!("panel {panel_version} slot {} has a dimension map but no dimension entry", slot.get()),
+                            "preserve the vault and inspect the named dense slot's stored vectors",
+                        )
+                    })?;
+                let reference_end = reference_split(total, recent_fraction);
+                let reference_start = reference_end.saturating_sub(SYNAPSE_DRIFT_MAX_WINDOW);
+                let recent_start = reference_end.max(total.saturating_sub(SYNAPSE_DRIFT_MAX_WINDOW));
+                let mut reference = Vec::new();
+                reference
+                    .try_reserve_exact(reference_end - reference_start)
+                    .map_err(|error| {
+                        drift_sample_reserve_error(panel_version, *slot, "reference rows", &error)
+                    })?;
+                let mut recent = Vec::new();
+                recent
+                    .try_reserve_exact(total - recent_start)
+                    .map_err(|error| {
+                        drift_sample_reserve_error(panel_version, *slot, "recent rows", &error)
+                    })?;
+                bounds.insert(
+                    *slot,
+                    MmdSlotBounds {
+                        total,
+                        reference_start,
+                        reference_end,
+                        recent_start,
+                    },
+                );
+                by_slot.insert(
+                    *slot,
+                    MmdSlotSamples {
+                        dimension,
+                        reference,
+                        recent,
+                    },
+                );
+            }
+
+            let mut ordinals = bounds.keys().map(|slot| (*slot, 0usize)).collect::<BTreeMap<_, _>>();
+            for (_, cx_id) in &selected {
+                let constellation = self.hydrated_constellation_at_snapshot(*cx_id, snapshot)?;
+                for (slot, vector) in constellation.slots {
+                    let SlotVector::Dense { data, .. } = vector else {
+                        continue;
+                    };
+                    let Some(samples) = by_slot.get_mut(&slot) else {
+                        continue;
+                    };
+                    if data.len() != samples.dimension {
+                        continue;
+                    }
+                    let ordinal = ordinals.get_mut(&slot).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_SAMPLE_ORDINAL_MISSING",
+                            format!("panel {panel_version} slot {} has samples but no ordinal counter", slot.get()),
+                            "preserve the vault and inspect the MMD sample-selection invariant",
+                        )
+                    })?;
+                    let bounds = bounds.get(&slot).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_SAMPLE_BOUNDS_MISSING",
+                            format!("panel {panel_version} slot {} has samples but no selection bounds", slot.get()),
+                            "preserve the vault and inspect the MMD sample-selection invariant",
+                        )
+                    })?;
+                    if (bounds.reference_start..bounds.reference_end).contains(ordinal) {
+                        samples.reference.push(clone_drift_sample(
+                            panel_version,
+                            slot,
+                            "reference",
+                            &data,
+                        )?);
+                    } else if *ordinal >= bounds.recent_start {
+                        samples.recent.push(clone_drift_sample(
+                            panel_version,
+                            slot,
+                            "recent",
+                            &data,
+                        )?);
+                    }
+                    *ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_SAMPLE_ORDINAL_OVERFLOW",
+                            format!("panel {panel_version} slot {} sample ordinal overflowed usize", slot.get()),
+                            "preserve the vault and inspect the named panel/slot cardinality",
+                        )
+                    })?;
+                }
+            }
+            for (slot, samples) in &by_slot {
+                let bounds = bounds.get(slot).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_DRIFT_SAMPLE_BOUNDS_MISSING",
+                        format!(
+                            "panel {panel_version} slot {} reached readback without selection bounds",
+                            slot.get()
+                        ),
+                        "preserve the vault and inspect the MMD sample-selection invariant",
+                    )
+                })?;
+                let observed = ordinals.get(slot).copied().unwrap_or_default();
+                let expected_reference = bounds.reference_end - bounds.reference_start;
+                let expected_recent = bounds.total - bounds.recent_start;
+                if observed != bounds.total
+                    || samples.reference.len() != expected_reference
+                    || samples.recent.len() != expected_recent
+                {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_DRIFT_SAMPLE_READBACK_MISMATCH",
+                        format!(
+                            "panel {panel_version} slot {} bounded MMD readback mismatch: modal_total={} observed={} reference={}/{} recent={}/{}",
+                            slot.get(), bounds.total, observed, samples.reference.len(), expected_reference, samples.recent.len(), expected_recent
+                        ),
+                        "preserve the pinned vault and inspect the two-pass hydration/readback invariant",
+                    ));
+                }
+            }
+
+            let lenses_without_nonempty_shape = dense_slots
+                .len()
+                .checked_sub(dimensions.len())
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_DRIFT_DENSE_SLOT_COUNT_INVALID",
+                        format!(
+                            "panel {panel_version} has {} modal-dimension slots but only {} observed dense slots",
+                            dimensions.len(),
+                            dense_slots.len()
+                        ),
+                        "preserve the vault and inspect the dense-slot census invariant",
+                    )
+                })?;
+            Ok(MmdCorpus {
+                by_slot,
+                lenses_without_nonempty_shape,
+                records_scanned,
+                records_measured: selected.len(),
+                walk,
+            })
         })
     }
 
@@ -1357,23 +1644,34 @@ fn dense_vector(vector: &SlotVector) -> Option<Vec<f32>> {
     }
 }
 
-/// Restricts a lens's vectors to its modal dimension, preserving scan order.
-fn modal_dimension_vectors(vectors: &[Vec<f32>]) -> Option<Vec<Vec<f32>>> {
-    let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
-    for vector in vectors {
-        if !vector.is_empty() {
-            *counts.entry(vector.len()).or_default() += 1;
-        }
-    }
-    let (dim, _) = counts
-        .into_iter()
-        .max_by(|left, right| left.1.cmp(&right.1).then(left.0.cmp(&right.0)))?;
-    let shaped: Vec<Vec<f32>> = vectors
-        .iter()
-        .filter(|vector| vector.len() == dim)
-        .cloned()
-        .collect();
-    (!shaped.is_empty()).then_some(shaped)
+fn drift_sample_reserve_error(
+    panel_version: u32,
+    slot: SlotId,
+    role: &str,
+    error: &std::collections::TryReserveError,
+) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_DRIFT_SAMPLE_RESERVE_FAILED",
+        format!(
+            "panel {panel_version} slot {} could not reserve its exact bounded {role}: {error}",
+            slot.get()
+        ),
+        "preserve the vault, inspect the named slot's modal dimension/sample cardinality, and restore sufficient host memory before retrying",
+    )
+}
+
+fn clone_drift_sample(
+    panel_version: u32,
+    slot: SlotId,
+    role: &str,
+    data: &[f32],
+) -> Result<Vec<f32>, SynapseCalyxError> {
+    let mut sample = Vec::new();
+    sample
+        .try_reserve_exact(data.len())
+        .map_err(|error| drift_sample_reserve_error(panel_version, slot, role, &error))?;
+    sample.extend_from_slice(data);
+    Ok(sample)
 }
 
 /// Reference/recent split index: the reference window is the older prefix.

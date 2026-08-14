@@ -2591,6 +2591,35 @@ struct WeaveSubpass {
 fn weave_panel_subpass(db: &Arc<Db>, panel_version: u32) -> WeaveSubpass {
     match drive_incremental_weave(db, panel_version) {
         Ok(progress) => {
+            // Every weave-owned corpus, Loom store, write batch, and exact CF
+            // count cursor has died when `drive_incremental_weave` returns.
+            // Release those pages before the following MMD pass opens another
+            // whole-Base cursor. Without this ownership boundary the real
+            // unattended tick began drift near 1 GiB and retained each lens's
+            // matrix arenas until the next panel scan forced a collection.
+            let release = match synapse_calyx::release_process_memory("scheduled incremental weave")
+            {
+                Ok(release) => release,
+                Err(error) => {
+                    return WeaveSubpass {
+                        weave: Err(format!(
+                            "panel {panel_version} committed its incremental weave frontier but could not release dead weave-owned memory before post-ingest drift: {error}"
+                        )),
+                        advisory: progress.advisory,
+                        drift_error: None,
+                    };
+                }
+            };
+            tracing::info!(
+                code = "STORAGE_DERIVED_STATE_WEAVE_MEMORY_RELEASED",
+                panel_version,
+                records_woven = progress.records_woven,
+                private_bytes_before = release.private_bytes_before,
+                private_bytes_after = release.private_bytes_after,
+                private_bytes_reclaimed = release.private_bytes_reclaimed,
+                release_elapsed_us = release.elapsed_us,
+                "released completed weave ownership before starting post-ingest drift"
+            );
             // Identical to the serial driver's `Ok(0) => {}` / `Ok(_) => drift`:
             // a panel that wove nothing has nothing new to measure drift over.
             let drift_error = if progress.records_woven == 0 {

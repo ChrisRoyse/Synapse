@@ -20,7 +20,7 @@ mod cuda;
 mod kernel;
 
 use self::cuda::{gaussian_mmd_cuda_strict_impl, mmd_change_point_cuda_strict_impl};
-use self::kernel::{KernelMatrix, quantile, squared_distance};
+use self::kernel::{KernelMatrix, packed_matrix_len, quantile, squared_distance};
 
 pub const MIN_MMD_SAMPLES: usize = 4;
 pub const MAX_MMD_SAMPLES: usize = 2_048;
@@ -84,8 +84,8 @@ pub fn gaussian_mmd_with_config(
     }
     let shape = validate_pair(x, y, config)?;
     let pooled = pooled_samples(x, y);
-    let bandwidth = resolve_bandwidth(&pooled, config.bandwidth)?;
-    let kernel = KernelMatrix::new(&pooled, bandwidth);
+    let (bandwidth, workspace) = resolve_bandwidth(&pooled, config.bandwidth)?;
+    let kernel = KernelMatrix::new(&pooled, bandwidth, workspace)?;
     let left = (0..x.len()).collect::<Vec<_>>();
     let right = (x.len()..pooled.len()).collect::<Vec<_>>();
     let observed = kernel.mmd2(&left, &right);
@@ -128,8 +128,9 @@ pub fn mmd_change_point(
             samples.len()
         )));
     }
-    let bandwidth = resolve_bandwidth(samples, config.bandwidth)?;
-    let kernel = KernelMatrix::new(samples, bandwidth);
+    let borrowed = samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let (bandwidth, workspace) = resolve_bandwidth(&borrowed, config.bandwidth)?;
+    let kernel = KernelMatrix::new(&borrowed, bandwidth, workspace)?;
     let (best_split, best_mmd) = best_contiguous_split(&kernel, samples.len(), min_window);
     let null = change_point_max_null(&kernel, samples.len(), min_window, config);
     let report = report_from_null(
@@ -160,7 +161,8 @@ pub fn gaussian_mmd_with_config_cuda_strict(
 ) -> Result<MmdReport> {
     let shape = validate_pair(x, y, config)?;
     let pooled = pooled_samples(x, y);
-    let bandwidth = resolve_bandwidth(&pooled, config.bandwidth)?;
+    let (bandwidth, workspace) = resolve_bandwidth(&pooled, config.bandwidth)?;
+    drop(workspace);
     let flat = flatten_samples(&pooled, shape.dimension)?;
     let permutations = deterministic_permutations(pooled.len(), config.permutations, config.seed)?;
     let result = gaussian_mmd_cuda_strict_impl(
@@ -200,9 +202,11 @@ pub fn mmd_change_point_cuda_strict(
             samples.len()
         )));
     }
-    let bandwidth = resolve_bandwidth(samples, config.bandwidth)?;
+    let borrowed = samples.iter().map(Vec::as_slice).collect::<Vec<_>>();
+    let (bandwidth, workspace) = resolve_bandwidth(&borrowed, config.bandwidth)?;
+    drop(workspace);
     let dimension = samples[0].len();
-    let flat = flatten_samples(samples, dimension)?;
+    let flat = flatten_samples(&borrowed, dimension)?;
     let permutations = deterministic_permutations(samples.len(), config.permutations, config.seed)?;
     let result = mmd_change_point_cuda_strict_impl(
         &flat,
@@ -327,11 +331,11 @@ fn validate_rows(rows: &[Vec<f64>], dimension: usize, side: &str) -> Result<()> 
     Ok(())
 }
 
-fn pooled_samples(x: &[Vec<f64>], y: &[Vec<f64>]) -> Vec<Vec<f64>> {
-    x.iter().chain(y.iter()).cloned().collect()
+fn pooled_samples<'a>(x: &'a [Vec<f64>], y: &'a [Vec<f64>]) -> Vec<&'a [f64]> {
+    x.iter().chain(y.iter()).map(Vec::as_slice).collect()
 }
 
-fn flatten_samples(samples: &[Vec<f64>], dimension: usize) -> Result<Vec<f64>> {
+fn flatten_samples(samples: &[&[f64]], dimension: usize) -> Result<Vec<f64>> {
     let len = samples
         .len()
         .checked_mul(dimension)
@@ -349,14 +353,21 @@ fn flatten_samples(samples: &[Vec<f64>], dimension: usize) -> Result<Vec<f64>> {
     Ok(flat)
 }
 
-fn resolve_bandwidth(samples: &[Vec<f64>], configured: Option<f64>) -> Result<f64> {
-    if let Some(bandwidth) = configured {
-        return Ok(bandwidth);
-    }
+fn resolve_bandwidth(samples: &[&[f64]], configured: Option<f64>) -> Result<(f64, Vec<f64>)> {
+    let packed_len = packed_matrix_len(samples.len())?;
     let mut distances = Vec::new();
+    distances.try_reserve_exact(packed_len).map_err(|error| {
+        CalyxError::forge_vram_budget(format!(
+            "MMD shared distance/kernel workspace reserve failed for {} samples ({packed_len} f64 values): {error}",
+            samples.len()
+        ))
+    })?;
+    if let Some(bandwidth) = configured {
+        return Ok((bandwidth, distances));
+    }
     for i in 0..samples.len() {
         for j in (i + 1)..samples.len() {
-            let distance = squared_distance(&samples[i], &samples[j]).sqrt();
+            let distance = squared_distance(samples[i], samples[j]).sqrt();
             if distance > 0.0 {
                 distances.push(distance);
             }
@@ -368,7 +379,8 @@ fn resolve_bandwidth(samples: &[Vec<f64>], configured: Option<f64>) -> Result<f6
         ));
     }
     distances.sort_by(|a, b| a.total_cmp(b));
-    Ok(quantile(&distances, 0.5))
+    let bandwidth = quantile(&distances, 0.5);
+    Ok((bandwidth, distances))
 }
 
 fn report_from_null(

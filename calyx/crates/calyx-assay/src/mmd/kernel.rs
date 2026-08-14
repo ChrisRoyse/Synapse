@@ -4,18 +4,42 @@ pub(super) struct KernelMatrix {
 }
 
 impl KernelMatrix {
-    pub(super) fn new(samples: &[Vec<f64>], bandwidth: f64) -> Self {
+    /// Builds the symmetric kernel into one packed upper-triangular arena.
+    ///
+    /// `workspace` is the exact pair-distance arena used to choose the median
+    /// bandwidth. Reusing it here prevents the distance vector and an `n x n`
+    /// kernel allocation from overlapping at the estimator's peak.
+    pub(super) fn new(
+        samples: &[&[f64]],
+        bandwidth: f64,
+        mut workspace: Vec<f64>,
+    ) -> calyx_core::Result<Self> {
         let n = samples.len();
-        let mut values = vec![0.0; n * n];
+        let packed_len = packed_matrix_len(n)?;
+        workspace.clear();
+        if workspace.capacity() < packed_len {
+            workspace
+                .try_reserve_exact(packed_len - workspace.capacity())
+                .map_err(|error| {
+                    calyx_core::CalyxError::forge_vram_budget(format!(
+                        "MMD packed kernel reserve failed for {n} samples ({packed_len} f64 values): {error}"
+                    ))
+                })?;
+        }
         for i in 0..n {
-            values[i * n + i] = 1.0;
-            for j in (i + 1)..n {
-                let value = gaussian_kernel(&samples[i], &samples[j], bandwidth);
-                values[i * n + j] = value;
-                values[j * n + i] = value;
+            for j in i..n {
+                workspace.push(if i == j {
+                    1.0
+                } else {
+                    gaussian_kernel(samples[i], samples[j], bandwidth)
+                });
             }
         }
-        Self { n, values }
+        debug_assert_eq!(workspace.len(), packed_len);
+        Ok(Self {
+            n,
+            values: workspace,
+        })
     }
 
     pub(super) fn mmd2(&self, x: &[usize], y: &[usize]) -> f64 {
@@ -32,7 +56,7 @@ impl KernelMatrix {
         for &i in indices {
             for &j in indices {
                 if i != j {
-                    sum += self.values[i * self.n + j];
+                    sum += self.get(i, j);
                 }
             }
         }
@@ -43,11 +67,35 @@ impl KernelMatrix {
         let mut sum = 0.0;
         for &i in left {
             for &j in right {
-                sum += self.values[i * self.n + j];
+                sum += self.get(i, j);
             }
         }
         sum / (left.len() * right.len()) as f64
     }
+
+    fn get(&self, left: usize, right: usize) -> f64 {
+        let (row, column) = if left <= right {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        // Construction proves n*(n+1)/2 fits usize. Both indices are drawn
+        // from 0..n, so this packed-row calculation is bounded by that same
+        // proven allocation length.
+        let row_start = row * self.n - row * row.saturating_sub(1) / 2;
+        self.values[row_start + column - row]
+    }
+}
+
+pub(super) fn packed_matrix_len(n: usize) -> calyx_core::Result<usize> {
+    n.checked_add(1)
+        .and_then(|next| n.checked_mul(next))
+        .map(|twice| twice / 2)
+        .ok_or_else(|| {
+            calyx_core::CalyxError::forge_vram_budget(format!(
+                "MMD packed kernel length overflow for {n} samples"
+            ))
+        })
 }
 
 fn gaussian_kernel(a: &[f64], b: &[f64], bandwidth: f64) -> f64 {
