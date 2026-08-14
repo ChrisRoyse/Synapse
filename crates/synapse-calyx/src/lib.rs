@@ -1298,6 +1298,31 @@ pub struct SynapseCalyxCfWalk {
     pub snapshot_seq_last: Seq,
 }
 
+/// Provenance of a panel-selective Base walk through the hash-sealed
+/// `(panel_version, CxId)` membership generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxPanelBaseWalk {
+    pub panel_version: u32,
+    pub membership_base_seq: Seq,
+    pub snapshot_seq: Seq,
+    pub panel_content_seq: Seq,
+    pub manifest_sha256: String,
+    pub sidecar_sha256: String,
+    pub indexed_rows: usize,
+    pub rows_visited: usize,
+    pub stopped_early: bool,
+}
+
+impl SynapseCalyxPanelBaseWalk {
+    /// Whether membership and every Base point read describe the same pinned
+    /// panel state.
+    #[must_use]
+    pub const fn atomic(&self) -> bool {
+        self.membership_base_seq <= self.snapshot_seq
+            && self.panel_content_seq <= self.membership_base_seq
+    }
+}
+
 impl SynapseCalyxCfWalk {
     /// Whether every page was served by the same committed sequence.
     ///
@@ -3968,6 +3993,185 @@ impl SynapseCalyxVault {
             |error| SynapseCalyxError::from_calyx("pin the scoped Calyx read snapshot", &error),
             read,
         )
+    }
+
+    /// Runs a panel-selective read against one atomic `(seq, panel watermark)`
+    /// snapshot. The Aster scoped handle releases the lease on success, error,
+    /// or unwind.
+    pub(crate) fn with_panel_read_snapshot<T>(
+        &self,
+        panel_version: u32,
+        max_age_ms: u64,
+        read: impl FnOnce(Snapshot) -> Result<T, SynapseCalyxError>,
+    ) -> Result<T, SynapseCalyxError> {
+        self.vault.with_scoped_latest_snapshot_for_panel(
+            panel_version,
+            Freshness::FreshDerived,
+            max_age_ms,
+            |error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("pin the scoped panel {panel_version} Calyx read snapshot"),
+                    &error,
+                )
+            },
+            read,
+        )
+    }
+
+    fn panel_membership_at_snapshot(
+        &self,
+        snapshot: Snapshot,
+        panel_version: u32,
+    ) -> Result<calyx_search::PersistedPanelMembership, SynapseCalyxError> {
+        let generation =
+            calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, panel_version)
+                .map_err(|error| {
+                    search_rebuild_error(
+                        &format!("open panel {panel_version} membership generation"),
+                        error,
+                    )
+                })?;
+        let base_seq = generation.base_seq();
+        if base_seq > snapshot.seq() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_FUTURE_GENERATION",
+                format!(
+                    "panel {panel_version} membership generation seq {base_seq} is newer than pinned snapshot {}",
+                    snapshot.seq()
+                ),
+                "re-pin the panel read after the published generation, or repair a manifest whose Base sequence is ahead of the vault",
+            ));
+        }
+        if snapshot.derived_content_seq() > base_seq {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_STALE_DERIVED",
+                format!(
+                    "panel {panel_version} content watermark {} is newer than membership generation seq {base_seq} at pinned snapshot {}",
+                    snapshot.derived_content_seq(),
+                    snapshot.seq()
+                ),
+                "rebuild the exact panel search generation before retrying the panel-scoped read",
+            ));
+        }
+        generation.panel_membership().map_err(|error| {
+            search_rebuild_error(
+                &format!("read panel {panel_version} membership sidecar"),
+                error,
+            )
+        })
+    }
+
+    fn verified_panel_base_row_at_snapshot(
+        &self,
+        snapshot: Snapshot,
+        panel_version: u32,
+        cx_id: CxId,
+    ) -> Result<Vec<u8>, SynapseCalyxError> {
+        let value = self
+            .vault
+            .read_cf_snapshot(snapshot, ColumnFamily::Base, cx_id.as_bytes())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!(
+                        "read panel {panel_version} membership Base row {cx_id} at snapshot {}",
+                        snapshot.seq()
+                    ),
+                    &error,
+                )
+            })?
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_PANEL_MEMBERSHIP_ROW_MISSING",
+                    format!(
+                        "panel {panel_version} membership names Base row {cx_id}, but it is absent at snapshot {}",
+                        snapshot.seq()
+                    ),
+                    "rebuild the exact panel generation and verify the Base CF before retrying",
+                )
+            })?;
+        let base = calyx_aster::vault::encode::decode_constellation_base_projection(&value)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("decode panel membership Base row {cx_id}"),
+                    &error,
+                )
+            })?;
+        if base.cx_id != cx_id || base.panel_version != panel_version {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_ROW_MISMATCH",
+                format!(
+                    "panel {panel_version} membership identity {cx_id} read Base header cx_id={} panel_version={} at snapshot {}",
+                    base.cx_id,
+                    base.panel_version,
+                    snapshot.seq()
+                ),
+                "rebuild the exact panel generation and repair the mismatched Base row before retrying",
+            ));
+        }
+        Ok(value)
+    }
+
+    /// Walks only one panel's Base identities through its hash-sealed
+    /// persistent membership sidecar, then point-reads each selected Base row
+    /// at the caller's registered snapshot.
+    ///
+    /// The sidecar is accepted only when its generation covers the atomically
+    /// pinned panel content watermark. Missing, stale, corrupt, or cross-panel
+    /// identities fail closed. There is intentionally no global Base scan
+    /// fallback: that would recreate the unbounded cross-panel work this access
+    /// path exists to eliminate.
+    pub(crate) fn walk_panel_base_snapshot<V>(
+        &self,
+        snapshot: Snapshot,
+        panel_version: u32,
+        mut visit: V,
+    ) -> Result<SynapseCalyxPanelBaseWalk, SynapseCalyxError>
+    where
+        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+    {
+        let membership = self.panel_membership_at_snapshot(snapshot, panel_version)?;
+        let indexed_rows = membership.ids.len();
+        let mut rows_visited = 0usize;
+        let mut stopped_early = false;
+        for cx_id in membership.ids {
+            let value = self.verified_panel_base_row_at_snapshot(snapshot, panel_version, cx_id)?;
+            rows_visited = rows_visited.checked_add(1).ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_PANEL_MEMBERSHIP_COUNT_OVERFLOW",
+                    format!("panel {panel_version} membership visit count overflowed usize"),
+                    "inspect the membership manifest row count and repair the corrupt generation",
+                )
+            })?;
+            if visit(cx_id.as_bytes(), &value)? == SynapseCalyxWalkStep::Stop {
+                stopped_early = true;
+                break;
+            }
+        }
+        let report = SynapseCalyxPanelBaseWalk {
+            panel_version,
+            membership_base_seq: membership.base_seq,
+            snapshot_seq: snapshot.seq(),
+            panel_content_seq: snapshot.derived_content_seq(),
+            manifest_sha256: membership.manifest_sha256,
+            sidecar_sha256: membership.sidecar_sha256,
+            indexed_rows,
+            rows_visited,
+            stopped_early,
+        };
+        tracing::info!(
+            code = "SYNAPSE_CALYX_PANEL_BASE_WALK_COMPLETED",
+            panel_version = report.panel_version,
+            membership_base_seq = report.membership_base_seq,
+            snapshot_seq = report.snapshot_seq,
+            panel_content_seq = report.panel_content_seq,
+            manifest_sha256 = %report.manifest_sha256,
+            sidecar_sha256 = %report.sidecar_sha256,
+            indexed_rows = report.indexed_rows,
+            rows_visited = report.rows_visited,
+            stopped_early = report.stopped_early,
+            "completed a freshness-proven panel-selective Base walk"
+        );
+        Ok(report)
     }
 
     /// Reads one constellation with its slot vectors hydrated from the per-slot

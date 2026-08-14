@@ -1036,20 +1036,16 @@ impl SynapseCalyxVault {
         let mut records_outside_window = 0usize;
         let mut panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind> = BTreeMap::new();
         let mut sparse_support: BTreeMap<SlotId, BTreeSet<u32>> = BTreeMap::new();
-        // #1968: paged rather than materialized. #2239: `max_records` is also a
-        // traversal bound, not merely a retained-vector bound. The previous
-        // implementation continued through the entire Base CF after filling
-        // the requested sample solely to report a population denominator. On
-        // the deployed vault max_records=1 therefore read ~64 GiB and expired
-        // its lease before returning one row. Exact whole-vault population
-        // questions belong to the explicit panel census; intelligence work is
-        // measured over the bounded corpus it actually hydrates.
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-            self.walk_cf_snapshot(
-                snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                |_key, value| {
+        // The sealed panel membership sidecar is the selective access path.
+        // #2239: `max_records` is also a traversal bound, not merely a
+        // retained-vector bound. Exact whole-vault population questions belong
+        // to the explicit panel census; intelligence work is measured over the
+        // bounded panel corpus it actually hydrates.
+        self.with_panel_read_snapshot(
+            panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
@@ -1085,9 +1081,9 @@ impl SynapseCalyxVault {
                     } else {
                         Ok(crate::SynapseCalyxWalkStep::Continue)
                     }
-                },
-            )
-        })?;
+                })
+            },
+        )?;
 
         // Densify every sparse slot whose observed support fits the bound. This
         // happens after the scan because the support is a property of the
@@ -5506,13 +5502,13 @@ impl SynapseCalyxVault {
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let mut records = Vec::new();
-        // #1968: paged rather than materialized. This is a streaming filter that
-        // stops at `max_records`, so it never needed a 106k-row `Vec` built under
-        // the `Base` row-guard before it looked at the first row.
-        self.walk_cf_latest(
-            ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-            |_key, value| {
+        // The panel-scoped membership sidecar is the selective access path.
+        // `max_records` now bounds point reads within this panel instead of
+        // decoding unrelated rows from the global CxId-ordered Base keyspace.
+        self.with_panel_read_snapshot(
+            params.panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
                 let constellation = decode_constellation_base(value).map_err(|error| {
                     SynapseCalyxError::from_calyx("decode Base constellation", &error)
                 })?;
@@ -5553,7 +5549,7 @@ impl SynapseCalyxVault {
                     return Ok(crate::SynapseCalyxWalkStep::Stop);
                 }
                 Ok(crate::SynapseCalyxWalkStep::Continue)
-            },
+            }),
         )?;
         records.sort_by(|a, b| a.secs.total_cmp(&b.secs));
         Ok(records)
@@ -7035,16 +7031,16 @@ impl SynapseCalyxVault {
             })?;
             let mut vault_corpus_size = 0usize;
             let mut rejects = ContentSlotRejects::default();
-            // #1968: paged rather than materialized. #2243 narrows the pinned
-            // hydration to the one vector consumed by this kernel; hydrating
-            // every unrelated slot made short-lived vectors share allocator
-            // pages with retained content rows and produced multi-GiB peaks.
-            self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-                self.walk_cf_snapshot(
-                    snapshot,
-                    ColumnFamily::Base,
-                    crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                    |_key, value| {
+            // The panel membership sidecar prevents a cross-panel Base scan.
+            // #2243 narrows pinned hydration to the one vector consumed by this
+            // kernel; hydrating every unrelated slot made short-lived vectors
+            // share allocator pages with retained content rows and produced
+            // multi-GiB peaks.
+            self.with_panel_read_snapshot(
+                params.panel_version,
+                crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+                |snapshot| {
+                    self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
                         let base = decode_constellation_base(value).map_err(|error| {
                             SynapseCalyxError::from_calyx("decode Base constellation", &error)
                         })?;
@@ -7125,9 +7121,9 @@ impl SynapseCalyxVault {
                             return Ok(crate::SynapseCalyxWalkStep::Stop);
                         }
                         Ok(crate::SynapseCalyxWalkStep::Continue)
-                    },
-                )
-            })?;
+                    })
+                },
+            )?;
 
             // Multi vectors require MaxSim and are deliberately not coerced
             // into cosine. Sparse vectors remain native kernel content.

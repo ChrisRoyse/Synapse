@@ -332,10 +332,11 @@ impl SynapseCalyxVault {
             return Err(invalid("panel constellation id limit must be positive"));
         }
         let mut ids = Vec::new();
-        self.walk_cf_latest(
-            ColumnFamily::Base,
-            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-            |_key, value| {
+        self.with_panel_read_snapshot(
+            panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
                 let base = calyx_aster::vault::encode::decode_constellation_base_projection(value)
                     .map_err(|error| {
                         SynapseCalyxError::from_calyx(
@@ -352,6 +353,7 @@ impl SynapseCalyxVault {
                     ids.push(base.cx_id);
                 }
                 Ok(crate::SynapseCalyxWalkStep::Continue)
+            })
             },
         )?;
         Ok(ids)

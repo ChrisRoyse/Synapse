@@ -167,6 +167,58 @@ pub(super) fn candidates(
     ))
 }
 
+pub(super) fn panel_membership(
+    vault_dir: &Path,
+    entry: &FilterIndexEntry,
+    manifest_base_seq: u64,
+    panel_version: u32,
+) -> CliResult<Vec<CxId>> {
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(entry.len).map_err(|error| {
+        stale(format!(
+            "reserve {} panel {panel_version} membership identities: {error}",
+            entry.len
+        ))
+    })?;
+    if entry.index_rel.ends_with(".jsonl") {
+        visit_stream(vault_dir, entry, manifest_base_seq, |row| {
+            if row.metadata.panel_version != panel_version {
+                return Err(stale(format!(
+                    "persistent panel membership row {} declares panel {}, expected {panel_version}; rebuild the exact panel generation",
+                    row.cx_id, row.metadata.panel_version
+                )));
+            }
+            ids.push(row.cx_id);
+            Ok(())
+        })?;
+    } else {
+        let index = read_legacy(vault_dir, entry, manifest_base_seq)?;
+        for row in index.rows {
+            if row.metadata.panel_version != panel_version {
+                return Err(stale(format!(
+                    "persistent panel membership row {} declares panel {}, expected {panel_version}; rebuild the exact panel generation",
+                    row.cx_id, row.metadata.panel_version
+                )));
+            }
+            ids.push(row.cx_id);
+        }
+    }
+    if ids.len() != entry.len {
+        return Err(stale(format!(
+            "persistent panel membership read {} identities, expected {}; rebuild the exact panel generation",
+            ids.len(),
+            entry.len
+        )));
+    }
+    if let Some(pair) = ids.windows(2).find(|pair| pair[0] >= pair[1]) {
+        return Err(stale(format!(
+            "persistent panel membership identities are not strictly ordered: prior {}, current {}; rebuild the exact panel generation",
+            pair[0], pair[1]
+        )));
+    }
+    Ok(ids)
+}
+
 pub(super) fn constellation_matches(cx: &Constellation, filters: &QueryFilters) -> bool {
     FilterRow::from(cx).matches(filters)
 }

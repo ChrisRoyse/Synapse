@@ -2754,8 +2754,16 @@ fn search_panels_affected_by_batch(
             )));
         }
         let tombstone = is_tombstone_value(value);
+        // A replacement can move an identity between panel generations. Both
+        // memberships become stale: the old panel lost a row and the new panel
+        // gained it. Reading the prior visible panel only for tombstones left
+        // the old generation falsely fresh after an in-place panel move.
+        let prior_panel = visible_base_panel(table, latest_router, key, visible_seq)?;
+        if let Some(prior_panel) = prior_panel {
+            panels.insert(prior_panel);
+        }
         let panel_version = if tombstone {
-            visible_base_panel(table, latest_router, key, visible_seq)?
+            None
         } else {
             Some(panel_from_base_value(key, value)?)
         };

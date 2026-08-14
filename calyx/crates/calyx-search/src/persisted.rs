@@ -69,6 +69,22 @@ pub struct PersistedSearchManifestArtifact {
     pub manifest_bytes: Vec<u8>,
 }
 
+/// Hash-verified membership of one panel-scoped search generation.
+///
+/// The filter sidecar is the compact secondary access path from
+/// `(panel_version, CxId)` to Base. It contains one row for every Base row in
+/// the panel, including records with no searchable vector, and is sealed by
+/// the live manifest. Callers must still compare `base_seq` with the panel's
+/// pinned content watermark before treating these identities as current.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedPanelMembership {
+    pub panel_version: u32,
+    pub base_seq: u64,
+    pub manifest_sha256: String,
+    pub sidecar_sha256: String,
+    pub ids: Vec<CxId>,
+}
+
 /// Load-bearing parameters for persisted dense DiskANN generations.
 ///
 /// Values are sealed into the immutable generation manifest and read back by
@@ -520,6 +536,34 @@ impl PersistedSearchIndexes {
             self.manifest.base_seq,
             filters,
         )
+    }
+
+    /// Reads and hash-verifies every Base identity in this exact panel.
+    ///
+    /// This is a secondary-index read, not a search query. The returned ids are
+    /// strictly ordered by `CxId`, match the sidecar's declared row count, and
+    /// have each been checked against the manifest panel. There is deliberately
+    /// no global-Base fallback: an absent or corrupt sidecar is an unavailable
+    /// panel access path and fails closed.
+    pub fn panel_membership(&self) -> CliResult<PersistedPanelMembership> {
+        let entry = self.manifest.filter.as_ref().ok_or_else(|| {
+            stale(
+                "persistent panel membership sidecar is absent from the search manifest; rebuild the exact panel generation before panel-scoped reads",
+            )
+        })?;
+        let ids = filter::panel_membership(
+            &self.vault_dir,
+            entry,
+            self.manifest.base_seq,
+            self.manifest.panel_version,
+        )?;
+        Ok(PersistedPanelMembership {
+            panel_version: self.manifest.panel_version,
+            base_seq: self.manifest.base_seq,
+            manifest_sha256: self.manifest_sha256.clone(),
+            sidecar_sha256: entry.sha256.clone(),
+            ids,
+        })
     }
 
     pub(crate) fn filter_candidates_reconciled(

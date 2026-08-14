@@ -1143,16 +1143,14 @@ impl SynapseCalyxVault {
             conflicting: 0,
             adjudicated_without_guarded_slots: 0,
         };
-        // #1968: paged rather than materialized. This fold selects adjudicated
-        // exemplars and stops at `max_records`; the whole-`Base` `Vec` it used
-        // to build was held under the row-guard every constellation commit
-        // contends for.
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-            self.walk_cf_snapshot(
-                snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                |_key, value| {
+        // The panel membership sidecar prevents a cross-panel Base scan. This
+        // fold selects adjudicated exemplars and stops at `max_records`, so its
+        // Base point reads are bounded to the requested panel corpus.
+        self.with_panel_read_snapshot(
+            params.panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
                     let constellation = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
@@ -1255,9 +1253,9 @@ impl SynapseCalyxVault {
                         return Ok(crate::SynapseCalyxWalkStep::Stop);
                     }
                     Ok(crate::SynapseCalyxWalkStep::Continue)
-                },
-            )
-        })?;
+                })
+            },
+        )?;
         Ok(corpus)
     }
 
@@ -1268,52 +1266,34 @@ impl SynapseCalyxVault {
         cx_id: CxId,
         params: &SynapseCalyxGuardCalibrateParams,
     ) -> Result<BTreeMap<u16, Vec<f32>>, SynapseCalyxError> {
-        // #1968: paged rather than materialized. This is a *lookup* for one
-        // `cx_id` that walked a whole-`Base` materialization and returned on the
-        // first match, so on average it built and discarded half the CF while
-        // holding the row-guard.
-        let mut found: Option<BTreeMap<u16, Vec<f32>>> = None;
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-            self.walk_cf_snapshot(
-                snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                |_key, value| {
-                    let base = decode_constellation_base(value).map_err(|error| {
-                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                    })?;
-                    if base.panel_version != panel_version || base.cx_id != cx_id {
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+        self.with_panel_read_snapshot(
+            panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                let constellation = self.hydrated_constellation_at_snapshot(cx_id, snapshot)?;
+                if constellation.panel_version != panel_version {
+                    return Err(guard_error(
+                        "SYNAPSE_CALYX_GUARD_QUERY_RECORD_PANEL_MISMATCH",
+                        format!(
+                            "record {cx_id} belongs to panel {}, not requested panel {panel_version}",
+                            constellation.panel_version
+                        ),
+                        "supply a cx_id that exists in this exact panel",
+                    ));
+                }
+                let mut slots = BTreeMap::new();
+                for spec in &params.slots {
+                    if let Some(vector) = constellation
+                        .slots
+                        .get(&SlotId::new(spec.slot))
+                        .and_then(guard_dense_vector)
+                    {
+                        slots.insert(spec.slot, vector);
                     }
-                    // The guard scores real slot vectors, which live in the per-slot
-                    // CFs. A Base row decodes every slot to `Absent`, so reading them
-                    // from it returned an empty slot map and the guard scored nothing
-                    // (#1894).
-                    let constellation =
-                        self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
-                    let mut slots = BTreeMap::new();
-                    for spec in &params.slots {
-                        if let Some(vector) = constellation
-                            .slots
-                            .get(&SlotId::new(spec.slot))
-                            .and_then(guard_dense_vector)
-                        {
-                            slots.insert(spec.slot, vector);
-                        }
-                    }
-                    found = Some(slots);
-                    Ok(crate::SynapseCalyxWalkStep::Stop)
-                },
-            )
-        })?;
-        if let Some(slots) = found {
-            return Ok(slots);
-        }
-        Err(guard_error(
-            "SYNAPSE_CALYX_GUARD_QUERY_RECORD_MISSING",
-            format!("record {cx_id} is not present in panel {panel_version}"),
-            "supply a cx_id that exists in this panel",
-        ))
+                }
+                Ok(slots)
+            },
+        )
     }
 }
 

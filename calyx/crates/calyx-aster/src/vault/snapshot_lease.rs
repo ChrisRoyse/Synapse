@@ -50,6 +50,27 @@ where
         read(snapshot.snapshot())
     }
 
+    /// Runs one panel-scoped read against an atomic `(seq, panel watermark)`
+    /// snapshot and releases the reader lease on every exit path.
+    pub fn with_scoped_latest_snapshot_for_panel<T, E>(
+        &self,
+        panel_version: u32,
+        freshness: Freshness,
+        max_age_ms: u64,
+        map_pin_error: impl FnOnce(calyx_core::CalyxError) -> E,
+        read: impl FnOnce(Snapshot) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let snapshot = self
+            .rows
+            .pin_snapshot_for_panel(panel_version, freshness, &self.clock, max_age_ms)
+            .map_err(map_pin_error)?;
+        let snapshot = ScopedSnapshot {
+            rows: &self.rows,
+            snapshot,
+        };
+        read(snapshot.snapshot())
+    }
+
     pub(crate) fn snapshot_handle(&self, seq: Seq) -> calyx_core::Result<ScopedSnapshot<'_>> {
         let snapshot = self.rows.pin_snapshot_at(
             seq,

@@ -533,9 +533,9 @@ pub struct SynapseCalyxBlindSpotReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_measured: usize,
-    /// Provenance of the bounded-hold `Base` walk the corpus was folded from
-    /// (#1968); `walk.atomic()` false means `records_scanned` counts an interval.
-    pub walk: crate::SynapseCalyxCfWalk,
+    /// Provenance of the panel-selective membership walk this corpus was folded
+    /// from at one pinned snapshot.
+    pub walk: crate::SynapseCalyxPanelBaseWalk,
     pub n_lenses: usize,
     /// Ordered `(A, B)` directions evaluated. Both directions of every unordered
     /// pair are candidates: "lens 4 is confident where lens 1 disagrees" is a
@@ -604,9 +604,9 @@ pub struct SynapseCalyxPanelDriftReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_measured: usize,
-    /// Provenance of the bounded-hold `Base` walk the corpus was folded from
-    /// (#1968); `walk.atomic()` false means `records_scanned` counts an interval.
-    pub walk: crate::SynapseCalyxCfWalk,
+    /// Provenance of the panel-selective membership walk this corpus was folded
+    /// from at one pinned snapshot.
+    pub walk: crate::SynapseCalyxPanelBaseWalk,
     pub recent_fraction: f32,
     pub permutations: usize,
     pub lenses_evaluated: usize,
@@ -643,10 +643,9 @@ struct DriftRecord {
 struct DriftCorpus {
     records: Vec<DriftRecord>,
     records_scanned: usize,
-    /// Provenance of the bounded-hold `Base` walk this corpus was folded from
-    /// (#1968). Kept on the corpus so both callers can report the window their
-    /// numbers were accumulated over rather than inferring it.
-    walk: crate::SynapseCalyxCfWalk,
+    /// Provenance of the panel-selective membership walk this corpus was folded
+    /// from. Kept so both callers report the exact generation and snapshot.
+    walk: crate::SynapseCalyxPanelBaseWalk,
 }
 
 /// Exact MMD inputs after the estimator's own 1,024-row-per-side contract has
@@ -668,7 +667,7 @@ struct MmdCorpus {
     lenses_without_nonempty_shape: usize,
     records_scanned: usize,
     records_measured: usize,
-    walk: crate::SynapseCalyxCfWalk,
+    walk: crate::SynapseCalyxPanelBaseWalk,
 }
 
 #[derive(Clone, Copy)]
@@ -1268,13 +1267,15 @@ impl SynapseCalyxVault {
         max_records: usize,
         recent_fraction: f32,
     ) -> Result<MmdCorpus, SynapseCalyxError> {
-        self.with_read_snapshot(crate::MMD_DRIFT_CORPUS_READER_LEASE_MS, |snapshot| {
+        self.with_panel_read_snapshot(
+            panel_version,
+            crate::MMD_DRIFT_CORPUS_READER_LEASE_MS,
+            |snapshot| {
             let mut selected = BTreeSet::new();
             let mut records_scanned = 0usize;
-            let walk = self.walk_cf_snapshot(
+            let walk = self.walk_panel_base_snapshot(
                 snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+                panel_version,
                 |_key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -1543,7 +1544,8 @@ impl SynapseCalyxVault {
                 records_measured: selected.len(),
                 walk,
             })
-        })
+        },
+        )
     }
 
     /// Scans the `Base` CF once and returns the newest bounded dense-slot corpus
@@ -1553,19 +1555,21 @@ impl SynapseCalyxVault {
         panel_version: u32,
         max_records: usize,
     ) -> Result<DriftCorpus, SynapseCalyxError> {
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+        self.with_panel_read_snapshot(
+            panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
             let mut selected = BTreeSet::new();
             let mut records_scanned = 0usize;
             // Base keys are content hashes, not chronology (#2003). Retain the
             // newest bounded set by the server-stamped creation time and use cx_id
             // as the deterministic tie-breaker. Slot hydration happens only after
             // selection, so a large panel costs O(max_records) memory and reads.
-            // The page scan and every hydration share this scope's one registered
-            // snapshot lease: no latest read can introduce a post-pin id.
-            let walk = self.walk_cf_snapshot(
+            // Membership point reads and every hydration share this scope's one
+            // registered snapshot lease: no latest read can introduce a post-pin id.
+            let walk = self.walk_panel_base_snapshot(
                 snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+                panel_version,
                 |_key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
@@ -1617,7 +1621,8 @@ impl SynapseCalyxVault {
                 records_scanned,
                 walk,
             })
-        })
+        },
+        )
     }
 }
 

@@ -130,14 +130,11 @@ pub struct SynapseCalyxGroundingGapReport {
     pub slot_coverage: Vec<SynapseCalyxSlotGroundingCoverage>,
     /// The largest ungrounded regions: lenses ranked by ungrounded record count.
     pub largest_ungrounded_slots: Vec<SynapseCalyxSlotGroundingCoverage>,
-    /// Physical `Base` CF row count read back at call time.
+    /// Physical `Base` rows named by the panel's hash-sealed membership index.
     pub base_cf_rows: usize,
-    /// Provenance of the bounded-hold walk this report was folded from (#1968).
-    ///
-    /// `walk.atomic()` false means the coverage numbers were accumulated across
-    /// an interval rather than at one instant, so two reports taken on a live
-    /// vault are not directly diffable.
-    pub walk: crate::SynapseCalyxCfWalk,
+    /// Provenance of the panel-selective membership walk this report was folded
+    /// from. The sidecar and every Base point read share the pinned snapshot.
+    pub walk: crate::SynapseCalyxPanelBaseWalk,
 }
 
 /// Compact provisional verdict for one domain, the reusable mechanism read paths
@@ -191,83 +188,80 @@ impl SynapseCalyxVault {
         let mut kind_records: BTreeMap<String, usize> = BTreeMap::new();
         let mut slots: BTreeMap<u16, SlotAccumulator> = BTreeMap::new();
 
-        // #1968: paged rather than materialized. This fold accumulates per-slot
-        // and per-anchor-kind totals; it never needed the whole `Base` CF
-        // resident, and holding the `Base` row-guard across the materialization
-        // stalled every constellation writer for the duration.
-        let walk =
-            self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-                self.walk_cf_snapshot(
-                    snapshot,
-                    ColumnFamily::Base,
-                    crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                    |_key, value| {
-                        let base = decode_constellation_base(value).map_err(|error| {
-                            SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                        })?;
-                        if base.panel_version != panel_version {
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        records_scanned += 1;
-                        if records_measured >= max_records {
-                            // Deliberately not `Stop`: `records_scanned` is a count over
-                            // the whole panel and `max_records` bounds only the
-                            // *measured* subset, so the walk must reach the end of the
-                            // CF for that denominator to mean what it says.
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        records_measured += 1;
-                        // Per-slot presence is measured from hydrated vectors: a Base row
-                        // decodes every slot to `Absent`, so the `is_absent` skip below
-                        // discarded every slot on every record and the grounding report
-                        // described zero lenses (issue #1894).
-                        let constellation =
-                            self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
+        // The sealed panel membership sidecar is the selective access path.
+        // This fold accumulates per-slot and per-anchor-kind totals without
+        // decoding unrelated rows from the global CxId-ordered Base keyspace.
+        let walk = self.with_panel_read_snapshot(
+            panel_version,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
+                    let base = decode_constellation_base(value).map_err(|error| {
+                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                    })?;
+                    if base.panel_version != panel_version {
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    records_scanned += 1;
+                    if records_measured >= max_records {
+                        // Deliberately not `Stop`: `records_scanned` is a count over
+                        // the whole panel and `max_records` bounds only the
+                        // *measured* subset, so the walk must reach the end of the
+                        // CF for that denominator to mean what it says.
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    records_measured += 1;
+                    // Per-slot presence is measured from hydrated vectors: a Base row
+                    // decodes every slot to `Absent`, so the `is_absent` skip below
+                    // discarded every slot on every record and the grounding report
+                    // described zero lenses (issue #1894).
+                    let constellation =
+                        self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
 
-                        let grounded_kinds = grounded_anchor_kinds(&constellation.anchors);
-                        let record_is_grounded = !grounded_kinds.is_empty();
+                    let grounded_kinds = grounded_anchor_kinds(&constellation.anchors);
+                    let record_is_grounded = !grounded_kinds.is_empty();
+                    if record_is_grounded {
+                        grounded_records += 1;
+                    }
+                    for kind in &grounded_kinds {
+                        *kind_records.entry(kind.clone()).or_default() += 1;
+                    }
+                    for (slot, vector) in &constellation.slots {
+                        if is_absent(vector) {
+                            // A lens refusal is an absence with a reason, and it is
+                            // the only absence worth counting: it means this row
+                            // *had* something to measure and the lens declined it
+                            // (#1924).
+                            if let SlotVector::Absent {
+                                reason: AbsentReason::Error(detail),
+                            } = vector
+                            {
+                                slots.entry(slot.get()).or_default().records_slot_refused += 1;
+                                tracing::debug!(
+                                    code = "CALYX_SLOT_REFUSAL_OBSERVED",
+                                    panel_version,
+                                    slot = slot.get(),
+                                    cx_id = %base.cx_id,
+                                    detail = %detail,
+                                    "grounding coverage counted a per-slot lens refusal"
+                                );
+                            }
+                            continue;
+                        }
+                        let entry = slots.entry(slot.get()).or_default();
+                        if is_empty_measurement(vector) {
+                            entry.records_empty_measurement += 1;
+                            continue;
+                        }
+                        entry.records_present += 1;
                         if record_is_grounded {
-                            grounded_records += 1;
+                            entry.grounded_records += 1;
                         }
-                        for kind in &grounded_kinds {
-                            *kind_records.entry(kind.clone()).or_default() += 1;
-                        }
-                        for (slot, vector) in &constellation.slots {
-                            if is_absent(vector) {
-                                // A lens refusal is an absence with a reason, and it is
-                                // the only absence worth counting: it means this row
-                                // *had* something to measure and the lens declined it
-                                // (#1924).
-                                if let SlotVector::Absent {
-                                    reason: AbsentReason::Error(detail),
-                                } = vector
-                                {
-                                    slots.entry(slot.get()).or_default().records_slot_refused += 1;
-                                    tracing::debug!(
-                                        code = "CALYX_SLOT_REFUSAL_OBSERVED",
-                                        panel_version,
-                                        slot = slot.get(),
-                                        cx_id = %base.cx_id,
-                                        detail = %detail,
-                                        "grounding coverage counted a per-slot lens refusal"
-                                    );
-                                }
-                                continue;
-                            }
-                            let entry = slots.entry(slot.get()).or_default();
-                            if is_empty_measurement(vector) {
-                                entry.records_empty_measurement += 1;
-                                continue;
-                            }
-                            entry.records_present += 1;
-                            if record_is_grounded {
-                                entry.grounded_records += 1;
-                            }
-                        }
-                        Ok(crate::SynapseCalyxWalkStep::Continue)
-                    },
-                )
-            })?;
+                    }
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                })
+            },
+        )?;
         let base_cf_rows = walk.rows_visited;
 
         let ungrounded_records = records_measured.saturating_sub(grounded_records);
