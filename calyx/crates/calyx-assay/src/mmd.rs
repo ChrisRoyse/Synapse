@@ -84,22 +84,67 @@ pub fn gaussian_mmd_with_config(
     }
     let shape = validate_pair(x, y, config)?;
     let pooled = pooled_samples(x, y);
-    let (bandwidth, workspace) = resolve_bandwidth(&pooled, config.bandwidth)?;
-    let kernel = KernelMatrix::new(&pooled, bandwidth, workspace)?;
-    let left = (0..x.len()).collect::<Vec<_>>();
-    let right = (x.len()..pooled.len()).collect::<Vec<_>>();
+    gaussian_mmd_borrowed_with_config(&pooled, x.len(), y.len(), shape.dimension, config)
+}
+
+/// Runs the same Gaussian MMD estimator over one contiguous row-major arena.
+///
+/// This is the ownership-preserving entry point for callers that already hold
+/// bounded flat samples. It avoids rebuilding thousands of separately
+/// allocated rows solely to satisfy the estimator API; row slices borrow the
+/// arena for the duration of the calculation.
+pub fn gaussian_mmd_flat_with_config(
+    pooled: &[f64],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    config: &MmdConfig,
+) -> Result<MmdReport> {
+    validate_flat_pair(pooled, n_a, n_b, dimension, config)?;
+    let samples = pooled.chunks_exact(dimension).collect::<Vec<_>>();
+    if strict_cuda_requested() {
+        let (bandwidth, workspace) = resolve_bandwidth(&samples, config.bandwidth)?;
+        drop(workspace);
+        let permutations =
+            deterministic_permutations(samples.len(), config.permutations, config.seed)?;
+        let result =
+            gaussian_mmd_cuda_strict_impl(pooled, n_a, n_b, dimension, bandwidth, &permutations)?;
+        return Ok(report_from_null(
+            n_a,
+            n_b,
+            dimension,
+            bandwidth,
+            result.mmd2,
+            result.null,
+            config.alpha,
+        ));
+    }
+    gaussian_mmd_borrowed_with_config(&samples, n_a, n_b, dimension, config)
+}
+
+fn gaussian_mmd_borrowed_with_config(
+    pooled: &[&[f64]],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    config: &MmdConfig,
+) -> Result<MmdReport> {
+    let (bandwidth, workspace) = resolve_bandwidth(pooled, config.bandwidth)?;
+    let kernel = KernelMatrix::new(pooled, bandwidth, workspace)?;
+    let left = (0..n_a).collect::<Vec<_>>();
+    let right = (n_a..pooled.len()).collect::<Vec<_>>();
     let observed = kernel.mmd2(&left, &right);
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
     let mut indices: Vec<usize> = (0..pooled.len()).collect();
     let mut null = Vec::with_capacity(config.permutations);
     for _ in 0..config.permutations {
         indices.shuffle(&mut rng);
-        null.push(kernel.mmd2(&indices[..x.len()], &indices[x.len()..]));
+        null.push(kernel.mmd2(&indices[..n_a], &indices[n_a..]));
     }
     Ok(report_from_null(
-        x.len(),
-        y.len(),
-        shape.dimension,
+        n_a,
+        n_b,
+        dimension,
         bandwidth,
         observed,
         null,
@@ -264,6 +309,53 @@ fn validate_pair(x: &[Vec<f64>], y: &[Vec<f64>], config: &MmdConfig) -> Result<S
     validate_rows(x, dimension, "A")?;
     validate_rows(y, dimension, "B")?;
     Ok(Shape { dimension })
+}
+
+fn validate_flat_pair(
+    pooled: &[f64],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    config: &MmdConfig,
+) -> Result<()> {
+    validate_config(config)?;
+    if n_a < MIN_MMD_SAMPLES || n_b < MIN_MMD_SAMPLES {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "MMD requires >= {MIN_MMD_SAMPLES} samples per side, got {n_a} and {n_b}"
+        )));
+    }
+    let rows = n_a
+        .checked_add(n_b)
+        .ok_or_else(|| CalyxError::forge_vram_budget("MMD flat input row count overflow"))?;
+    if rows > MAX_MMD_SAMPLES {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "MMD input has {rows} pooled samples (max {MAX_MMD_SAMPLES})"
+        )));
+    }
+    if dimension == 0 {
+        return Err(CalyxError::assay_insufficient_samples(
+            "MMD vectors must have at least one dimension",
+        ));
+    }
+    let expected_len = rows
+        .checked_mul(dimension)
+        .ok_or_else(|| CalyxError::forge_vram_budget("MMD flat input element count overflow"))?;
+    if pooled.len() != expected_len {
+        return Err(CalyxError::assay_insufficient_samples(format!(
+            "MMD flat input has {} elements, expected {rows} rows x {dimension} dimensions = {expected_len}",
+            pooled.len()
+        )));
+    }
+    for (index, value) in pooled.iter().enumerate() {
+        if !value.is_finite() {
+            return Err(CalyxError::assay_insufficient_samples(format!(
+                "MMD flat input row {} col {} is NaN or infinity",
+                index / dimension,
+                index % dimension
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_single(samples: &[Vec<f64>], config: &MmdConfig) -> Result<()> {

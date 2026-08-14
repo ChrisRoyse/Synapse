@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_assay::{
     DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
-    gaussian_mmd_with_config,
+    gaussian_mmd_flat_with_config,
 };
 use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -653,8 +653,14 @@ struct DriftCorpus {
 /// been applied. These remain `f32` until their one lens is evaluated.
 struct MmdSlotSamples {
     dimension: usize,
-    reference: Vec<Vec<f32>>,
-    recent: Vec<Vec<f32>>,
+    reference_rows: usize,
+    recent_rows: usize,
+    /// One allocation holding every retained reference row. Keeping the samples
+    /// flat prevents live row allocations from pinning pages filled with dead
+    /// per-record hydration transients.
+    reference: Vec<f32>,
+    /// One allocation holding every retained recent row; see `reference`.
+    recent: Vec<f32>,
 }
 
 struct MmdCorpus {
@@ -976,6 +982,87 @@ impl SynapseCalyxVault {
         let permutations = params.permutations;
         let alpha = params.alpha;
         let corpus = self.load_mmd_corpus(params.panel_version, max_records, recent_fraction)?;
+        let retained_sample_elements = corpus.by_slot.values().try_fold(0usize, |total, samples| {
+            total
+                .checked_add(samples.reference.len())
+                .and_then(|value| value.checked_add(samples.recent.len()))
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_DRIFT_SAMPLE_ELEMENT_COUNT_OVERFLOW",
+                        format!(
+                            "panel {} retained MMD sample element count overflowed usize",
+                            params.panel_version
+                        ),
+                        "preserve the vault and inspect the bounded MMD sample arenas before retrying",
+                    )
+                })
+        })?;
+        let retained_sample_bytes = retained_sample_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_DRIFT_SAMPLE_BYTE_COUNT_OVERFLOW",
+                    format!(
+                        "panel {} retained MMD sample byte count overflowed usize",
+                        params.panel_version
+                    ),
+                    "preserve the vault and inspect the bounded MMD sample arenas before retrying",
+                )
+            })?;
+        let retained_sample_capacity_elements = corpus.by_slot.values().try_fold(
+            0usize,
+            |total, samples| {
+                total
+                    .checked_add(samples.reference.capacity())
+                    .and_then(|value| value.checked_add(samples.recent.capacity()))
+                    .ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_SAMPLE_CAPACITY_COUNT_OVERFLOW",
+                            format!(
+                                "panel {} retained MMD sample capacity overflowed usize",
+                                params.panel_version
+                            ),
+                            "preserve the vault and inspect the bounded MMD sample arenas before retrying",
+                        )
+                    })
+            },
+        )?;
+        let retained_sample_capacity_bytes = retained_sample_capacity_elements
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_DRIFT_SAMPLE_CAPACITY_BYTE_COUNT_OVERFLOW",
+                    format!(
+                        "panel {} retained MMD sample capacity byte count overflowed usize",
+                        params.panel_version
+                    ),
+                    "preserve the vault and inspect the bounded MMD sample arenas before retrying",
+                )
+            })?;
+        let retained_allocations = corpus
+            .by_slot
+            .values()
+            .map(|samples| {
+                usize::from(samples.reference.capacity() > 0)
+                    + usize::from(samples.recent.capacity() > 0)
+            })
+            .sum::<usize>();
+        let corpus_release = crate::release_process_memory("MMD bounded corpus load")?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_DRIFT_BOUNDED_CORPUS_MEMORY_RELEASED",
+            panel_version = params.panel_version,
+            retained_slots = corpus.by_slot.len(),
+            retained_sample_elements,
+            retained_sample_bytes,
+            retained_sample_capacity_elements,
+            retained_sample_capacity_bytes,
+            retained_allocations,
+            private_bytes_before = corpus_release.private_bytes_before,
+            private_bytes_after = corpus_release.private_bytes_after,
+            private_bytes_reclaimed = corpus_release.private_bytes_reclaimed,
+            release_elapsed_us = corpus_release.elapsed_us,
+            "released second-pass hydration transients while preserving only contiguous bounded MMD sample arenas"
+        );
         let MmdCorpus {
             by_slot,
             lenses_without_nonempty_shape,
@@ -1000,20 +1087,35 @@ impl SynapseCalyxVault {
         for (slot, samples) in by_slot {
             let MmdSlotSamples {
                 dimension,
+                reference_rows,
+                recent_rows,
                 reference,
                 recent,
             } = samples;
-            if reference.len() < SYNAPSE_DRIFT_MIN_WINDOW || recent.len() < SYNAPSE_DRIFT_MIN_WINDOW
-            {
+            if reference_rows < SYNAPSE_DRIFT_MIN_WINDOW || recent_rows < SYNAPSE_DRIFT_MIN_WINDOW {
                 lenses_insufficient += 1;
                 continue;
             }
-            let reference_f64 = to_f64_rows(&reference, SYNAPSE_DRIFT_MAX_WINDOW);
-            let recent_f64 = to_f64_rows(&recent, SYNAPSE_DRIFT_MAX_WINDOW);
+            let pooled_f64 = widen_mmd_sample_arena(
+                params.panel_version,
+                slot,
+                dimension,
+                reference_rows,
+                recent_rows,
+                &reference,
+                &recent,
+            )?;
 
-            let estimate = gaussian_mmd_with_config(&reference_f64, &recent_f64, &config);
-            drop(reference_f64);
-            drop(recent_f64);
+            let estimate = gaussian_mmd_flat_with_config(
+                &pooled_f64,
+                reference_rows,
+                recent_rows,
+                dimension,
+                &config,
+            );
+            drop(pooled_f64);
+            drop(reference);
+            drop(recent);
             let release = crate::release_process_memory("MMD lens estimator");
             let report = match (estimate, release) {
                 (Err(estimate_error), Err(release_error)) => {
@@ -1072,8 +1174,8 @@ impl SynapseCalyxVault {
                 panel_version: params.panel_version,
                 slot: slot.get(),
                 dimension,
-                reference_n: reference.len(),
-                recent_n: recent.len(),
+                reference_n: reference_rows,
+                recent_n: recent_rows,
                 mmd2: report.mmd2,
                 p_value: report.p_value,
                 bandwidth: report.bandwidth,
@@ -1090,8 +1192,8 @@ impl SynapseCalyxVault {
             lens_drift.push(SynapseCalyxLensDrift {
                 slot: slot.get(),
                 dimension,
-                reference_n: reference.len(),
-                recent_n: recent.len(),
+                reference_n: reference_rows,
+                recent_n: recent_rows,
                 mmd2: report.mmd2,
                 p_value: report.p_value,
                 bandwidth: report.bandwidth,
@@ -1255,17 +1357,43 @@ impl SynapseCalyxVault {
                 let reference_end = reference_split(total, recent_fraction);
                 let reference_start = reference_end.saturating_sub(SYNAPSE_DRIFT_MAX_WINDOW);
                 let recent_start = reference_end.max(total.saturating_sub(SYNAPSE_DRIFT_MAX_WINDOW));
+                let reference_rows = reference_end - reference_start;
+                let recent_rows = total - recent_start;
+                let reference_elements = drift_sample_element_count(
+                    panel_version,
+                    *slot,
+                    "reference rows",
+                    reference_rows,
+                    dimension,
+                )?;
+                let recent_elements = drift_sample_element_count(
+                    panel_version,
+                    *slot,
+                    "recent rows",
+                    recent_rows,
+                    dimension,
+                )?;
                 let mut reference = Vec::new();
                 reference
-                    .try_reserve_exact(reference_end - reference_start)
+                    .try_reserve_exact(reference_elements)
                     .map_err(|error| {
-                        drift_sample_reserve_error(panel_version, *slot, "reference rows", &error)
+                        drift_sample_reserve_error(
+                            panel_version,
+                            *slot,
+                            "reference sample elements",
+                            &error,
+                        )
                     })?;
                 let mut recent = Vec::new();
                 recent
-                    .try_reserve_exact(total - recent_start)
+                    .try_reserve_exact(recent_elements)
                     .map_err(|error| {
-                        drift_sample_reserve_error(panel_version, *slot, "recent rows", &error)
+                        drift_sample_reserve_error(
+                            panel_version,
+                            *slot,
+                            "recent sample elements",
+                            &error,
+                        )
                     })?;
                 bounds.insert(
                     *slot,
@@ -1280,6 +1408,8 @@ impl SynapseCalyxVault {
                     *slot,
                     MmdSlotSamples {
                         dimension,
+                        reference_rows,
+                        recent_rows,
                         reference,
                         recent,
                     },
@@ -1314,19 +1444,25 @@ impl SynapseCalyxVault {
                         )
                     })?;
                     if (bounds.reference_start..bounds.reference_end).contains(ordinal) {
-                        samples.reference.push(clone_drift_sample(
+                        append_drift_sample(
                             panel_version,
                             slot,
                             "reference",
                             &data,
-                        )?);
+                            samples.reference_rows,
+                            samples.dimension,
+                            &mut samples.reference,
+                        )?;
                     } else if *ordinal >= bounds.recent_start {
-                        samples.recent.push(clone_drift_sample(
+                        append_drift_sample(
                             panel_version,
                             slot,
                             "recent",
                             &data,
-                        )?);
+                            samples.recent_rows,
+                            samples.dimension,
+                            &mut samples.recent,
+                        )?;
                     }
                     *ordinal = ordinal.checked_add(1).ok_or_else(|| {
                         SynapseCalyxError::new(
@@ -1351,15 +1487,35 @@ impl SynapseCalyxVault {
                 let observed = ordinals.get(slot).copied().unwrap_or_default();
                 let expected_reference = bounds.reference_end - bounds.reference_start;
                 let expected_recent = bounds.total - bounds.recent_start;
+                let expected_reference_elements = drift_sample_element_count(
+                    panel_version,
+                    *slot,
+                    "reference readback",
+                    expected_reference,
+                    samples.dimension,
+                )?;
+                let expected_recent_elements = drift_sample_element_count(
+                    panel_version,
+                    *slot,
+                    "recent readback",
+                    expected_recent,
+                    samples.dimension,
+                )?;
                 if observed != bounds.total
-                    || samples.reference.len() != expected_reference
-                    || samples.recent.len() != expected_recent
+                    || samples.reference_rows != expected_reference
+                    || samples.recent_rows != expected_recent
+                    || samples.reference.len() != expected_reference_elements
+                    || samples.recent.len() != expected_recent_elements
                 {
                     return Err(SynapseCalyxError::new(
                         "SYNAPSE_CALYX_DRIFT_SAMPLE_READBACK_MISMATCH",
                         format!(
-                            "panel {panel_version} slot {} bounded MMD readback mismatch: modal_total={} observed={} reference={}/{} recent={}/{}",
-                            slot.get(), bounds.total, observed, samples.reference.len(), expected_reference, samples.recent.len(), expected_recent
+                            "panel {panel_version} slot {} bounded MMD readback mismatch: modal_total={} observed={} reference_rows={}/{} reference_elements={}/{} recent_rows={}/{} recent_elements={}/{}",
+                            slot.get(), bounds.total, observed,
+                            samples.reference_rows, expected_reference,
+                            samples.reference.len(), expected_reference_elements,
+                            samples.recent_rows, expected_recent,
+                            samples.recent.len(), expected_recent_elements,
                         ),
                         "preserve the pinned vault and inspect the two-pass hydration/readback invariant",
                     ));
@@ -1660,18 +1816,61 @@ fn drift_sample_reserve_error(
     )
 }
 
-fn clone_drift_sample(
+fn drift_sample_element_count(
+    panel_version: u32,
+    slot: SlotId,
+    role: &str,
+    rows: usize,
+    dimension: usize,
+) -> Result<usize, SynapseCalyxError> {
+    rows.checked_mul(dimension).ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_DRIFT_SAMPLE_ELEMENT_COUNT_OVERFLOW",
+            format!(
+                "panel {panel_version} slot {} {role} element count overflowed usize: rows={rows} dimension={dimension}",
+                slot.get()
+            ),
+            "preserve the vault and inspect the named slot's modal dimension/sample cardinality",
+        )
+    })
+}
+
+fn append_drift_sample(
     panel_version: u32,
     slot: SlotId,
     role: &str,
     data: &[f32],
-) -> Result<Vec<f32>, SynapseCalyxError> {
-    let mut sample = Vec::new();
-    sample
-        .try_reserve_exact(data.len())
-        .map_err(|error| drift_sample_reserve_error(panel_version, slot, role, &error))?;
-    sample.extend_from_slice(data);
-    Ok(sample)
+    row_capacity: usize,
+    dimension: usize,
+    arena: &mut Vec<f32>,
+) -> Result<(), SynapseCalyxError> {
+    let element_capacity =
+        drift_sample_element_count(panel_version, slot, role, row_capacity, dimension)?;
+    let next_len = arena.len().checked_add(data.len()).ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_DRIFT_SAMPLE_ELEMENT_COUNT_OVERFLOW",
+            format!(
+                "panel {panel_version} slot {} {role} append overflowed usize at {} + {} elements",
+                slot.get(),
+                arena.len(),
+                data.len()
+            ),
+            "preserve the vault and inspect the bounded MMD sample-selection invariant",
+        )
+    })?;
+    if data.len() != dimension || next_len > element_capacity {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_DRIFT_SAMPLE_ARENA_BOUNDS_EXCEEDED",
+            format!(
+                "panel {panel_version} slot {} {role} append would exceed its exact contiguous arena: data_dimension={} modal_dimension={dimension} next_elements={next_len} capacity_elements={element_capacity}",
+                slot.get(),
+                data.len()
+            ),
+            "preserve the vault and inspect the named slot's modal-dimension and ordinal invariants",
+        ));
+    }
+    arena.extend_from_slice(data);
+    Ok(())
 }
 
 /// Reference/recent split index: the reference window is the older prefix.
@@ -1685,14 +1884,81 @@ fn reference_split(n: usize, recent_fraction: f32) -> usize {
     n.saturating_sub(recent.clamp(1, n))
 }
 
-/// Converts f32 rows to f64, capping the window at `max` most-recent-preserving
-/// rows (keeps the tail so a truncated reference stays contiguous with recent).
-fn to_f64_rows(rows: &[Vec<f32>], max: usize) -> Vec<Vec<f64>> {
-    let start = rows.len().saturating_sub(max);
-    rows[start..]
-        .iter()
-        .map(|row| row.iter().map(|value| f64::from(*value)).collect())
-        .collect()
+fn widen_mmd_sample_arena(
+    panel_version: u32,
+    slot: SlotId,
+    dimension: usize,
+    reference_rows: usize,
+    recent_rows: usize,
+    reference: &[f32],
+    recent: &[f32],
+) -> Result<Vec<f64>, SynapseCalyxError> {
+    if reference_rows > SYNAPSE_DRIFT_MAX_WINDOW || recent_rows > SYNAPSE_DRIFT_MAX_WINDOW {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_DRIFT_SAMPLE_WINDOW_EXCEEDED",
+            format!(
+                "panel {panel_version} slot {} reached widening with reference_rows={reference_rows} recent_rows={recent_rows}, exceeding the per-side maximum {SYNAPSE_DRIFT_MAX_WINDOW}",
+                slot.get()
+            ),
+            "preserve the vault and inspect the two-pass MMD sample bounds",
+        ));
+    }
+    let expected_reference = drift_sample_element_count(
+        panel_version,
+        slot,
+        "reference widening",
+        reference_rows,
+        dimension,
+    )?;
+    let expected_recent = drift_sample_element_count(
+        panel_version,
+        slot,
+        "recent widening",
+        recent_rows,
+        dimension,
+    )?;
+    if reference.len() != expected_reference || recent.len() != expected_recent {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_DRIFT_SAMPLE_READBACK_MISMATCH",
+            format!(
+                "panel {panel_version} slot {} contiguous MMD widening mismatch: reference_elements={}/{} recent_elements={}/{}",
+                slot.get(),
+                reference.len(),
+                expected_reference,
+                recent.len(),
+                expected_recent
+            ),
+            "preserve the vault and inspect the bounded MMD sample arenas before estimation",
+        ));
+    }
+    let total_elements = expected_reference
+        .checked_add(expected_recent)
+        .ok_or_else(|| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_SAMPLE_ELEMENT_COUNT_OVERFLOW",
+                format!(
+                    "panel {panel_version} slot {} widened pooled element count overflowed usize",
+                    slot.get()
+                ),
+                "preserve the vault and inspect the bounded MMD sample arenas before estimation",
+            )
+        })?;
+    let mut pooled = Vec::new();
+    pooled.try_reserve_exact(total_elements).map_err(|error| {
+        drift_sample_reserve_error(
+            panel_version,
+            slot,
+            "widened pooled sample elements",
+            &error,
+        )
+    })?;
+    pooled.extend(
+        reference
+            .iter()
+            .chain(recent)
+            .map(|value| f64::from(*value)),
+    );
+    Ok(pooled)
 }
 
 #[allow(clippy::cast_precision_loss)]

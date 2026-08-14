@@ -19,7 +19,12 @@ impl KernelMatrix {
         workspace.clear();
         if workspace.capacity() < packed_len {
             workspace
-                .try_reserve_exact(packed_len - workspace.capacity())
+                // `additional` is measured from `len`, not from `capacity`.
+                // The cleared workspace has len=0, so request the complete
+                // packed length; requesting only the capacity deficit would
+                // be a no-op and force a geometric reallocation on the final
+                // diagonal entries.
+                .try_reserve_exact(packed_len)
                 .map_err(|error| {
                     calyx_core::CalyxError::forge_vram_budget(format!(
                         "MMD packed kernel reserve failed for {n} samples ({packed_len} f64 values): {error}"
