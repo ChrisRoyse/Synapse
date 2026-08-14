@@ -621,6 +621,14 @@ pub(crate) const INTELLIGENCE_CORPUS_READER_LEASE_MS: u64 = 30_000;
 /// Five minutes is the repository's finite coherent-scan hard ceiling; the
 /// scoped snapshot still releases the lease immediately on every return path.
 pub(crate) const MMD_DRIFT_CORPUS_READER_LEASE_MS: u64 = 5 * 60_000;
+/// Reader-lease lifetime for native OLAP's whole-panel slot materialization.
+///
+/// The live timeline panel carries hundreds of thousands of rows, so the
+/// generic five-second Aster point-read lease can expire during its bounded
+/// Base walk. One finite caller-owned lease spans Base membership discovery,
+/// slot hydration, durable column publication, and the aggregate scan; scope
+/// exit releases it immediately.
+pub(crate) const OLAP_MATERIALIZATION_READER_LEASE_MS: u64 = 5 * 60_000;
 /// Reader-lease lifetime for an exact physical whole-CF census.
 ///
 /// Unlike a bounded intelligence corpus, this operation deliberately walks

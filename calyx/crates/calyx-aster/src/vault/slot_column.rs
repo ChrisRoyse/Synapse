@@ -1,6 +1,7 @@
 use super::{AsterVault, encode};
 use crate::cf::ColumnFamily;
 use crate::mmap_col::MmapColumn;
+use crate::mvcc::Snapshot;
 use crate::sst::arrow::{decode_column_chunk, encode_column_chunk};
 use calyx_core::{CalyxError, Clock, CxId, PanelSlotId, Result, Seq, SlotVector};
 use serde::{Deserialize, Serialize};
@@ -58,13 +59,18 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Materializes one dense slot column through a caller-owned snapshot.
+    ///
+    /// Requiring the registered snapshot in the type prevents a whole-panel
+    /// scan from silently inheriting the short point-read lease. Base paging
+    /// and slot hydration therefore share one live MVCC view.
     pub fn materialize_slot_column_at(
         &self,
-        snapshot: Seq,
+        snapshot: Snapshot,
         panel_slot: PanelSlotId,
         output_dir: impl AsRef<Path>,
     ) -> Result<SlotColumnMaterialization> {
-        let rows = self.dense_slot_rows_at(snapshot, panel_slot)?;
+        let rows = self.dense_slot_rows_snapshot(snapshot, panel_slot)?;
         let output_dir = output_dir.as_ref();
         fs::create_dir_all(output_dir)
             .map_err(|error| storage_error("create slot-column output dir", error))?;
@@ -87,7 +93,7 @@ where
             magic: MANIFEST_MAGIC.to_string(),
             version: MANIFEST_VERSION,
             panel_slot,
-            snapshot,
+            snapshot: snapshot.seq(),
             rows: rows.len(),
             dim,
             cx_ids: rows.iter().map(|row| row.cx_id).collect(),
@@ -101,7 +107,7 @@ where
 
         Ok(SlotColumnMaterialization {
             panel_slot,
-            snapshot,
+            snapshot: snapshot.seq(),
             rows: manifest.rows,
             dim,
             manifest_path,
@@ -112,12 +118,11 @@ where
         })
     }
 
-    fn dense_slot_rows_at(
+    fn dense_slot_rows_snapshot(
         &self,
-        snapshot: Seq,
+        snapshot: Snapshot,
         panel_slot: PanelSlotId,
     ) -> Result<Vec<SlotColumnRow>> {
-        let snapshot = self.snapshot_handle(snapshot);
         let mut expected_ids = Vec::new();
         // Paged at the already-pinned snapshot rather than materialized whole
         // (#1977). Every page resolves at the same sequence this caller pinned,
@@ -125,7 +130,7 @@ where
         // produced — only the guard hold changes, from one hold proportional to
         // `Base` to one hold per 256 rows (#1950, #1968).
         self.rows.scan_cf_pages_at(
-            snapshot.snapshot(),
+            snapshot,
             ColumnFamily::Base,
             super::ORPHAN_SLOT_GC_PAGE_ROWS,
             &self.clock,
@@ -154,11 +159,8 @@ where
             )));
         }
 
-        let values = self.read_slot_cf_batch_snapshot(
-            snapshot.snapshot(),
-            panel_slot.slot_id(),
-            &expected_ids,
-        )?;
+        let values =
+            self.read_slot_cf_batch_snapshot(snapshot, panel_slot.slot_id(), &expected_ids)?;
 
         let mut out = Vec::with_capacity(expected_ids.len());
         let mut dim = None;

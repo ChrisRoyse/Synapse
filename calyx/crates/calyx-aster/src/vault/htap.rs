@@ -2,7 +2,8 @@
 //! `read_cf_at`) and an analytical column (Arrow materialization + OLAP scan), at a
 //! single MVCC snapshot.
 //!
-//! `htap_dual_read_at` runs both independent access paths at one `seq` and proves
+//! `htap_dual_read_at` runs both independent access paths through one caller-owned
+//! snapshot and proves
 //! they return identical data — the HTAP contract from PRD `20 §1/§2`: OLTP and
 //! OLAP served from one core with no ETL, and snapshot-consistent (a write at a
 //! later seq cannot leak into an earlier snapshot on either path).
@@ -12,6 +13,7 @@ use std::path::Path;
 use super::slot_column::read_materialized_slot_column;
 use super::{AsterVault, SlotColumnMaterialization, encode};
 use crate::cf::{ColumnFamily, slot_key};
+use crate::mvcc::Snapshot;
 use crate::olap::{OlapScanPlan, OlapScanResult, scan_materialized_slot_column_aggregate};
 use calyx_core::{CalyxError, Clock, PanelSlotId, Result, Seq, SlotVector};
 
@@ -51,15 +53,15 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
-    /// HTAP dual read of `slot` at `snapshot`: materialize the analytical Arrow
+    /// HTAP dual read of `slot` through `snapshot`: materialize the analytical Arrow
     /// column + OLAP-aggregate `value_column`, then INDEPENDENTLY point-read every
     /// cx through the transactional row CF and recompute the same aggregate. Both
-    /// paths read the one MVCC snapshot, so they must agree bit-for-bit. The
+    /// paths read the one registered MVCC snapshot, so they must agree bit-for-bit. The
     /// recomputation mirrors the OLAP accumulator (`sum += f64::from(v)`, f32
     /// min/max, same row order) so equality is bit-exact, not merely approximate.
     pub fn htap_dual_read_at(
         &self,
-        snapshot: Seq,
+        snapshot: Snapshot,
         panel_slot: PanelSlotId,
         value_column: usize,
         output_dir: impl AsRef<Path>,
@@ -78,14 +80,15 @@ where
         let mut max = 0.0f32;
         for (idx, cx) in column.cx_ids.iter().enumerate() {
             let raw = self
-                .read_cf_at(
+                .read_cf_snapshot(
                     snapshot,
                     ColumnFamily::slot(panel_slot.slot_id()),
                     &slot_key(*cx),
                 )?
                 .ok_or_else(|| {
                     CalyxError::stale_derived(format!(
-                        "htap point read missing cx {cx} at snapshot {snapshot}"
+                        "htap point read missing cx {cx} at snapshot {}",
+                        snapshot.seq()
                     ))
                 })?;
             let SlotVector::Dense { data, .. } = encode::decode_slot_vector(&raw)? else {
@@ -122,7 +125,7 @@ where
             && max.to_bits() == olap.aggregate.max.to_bits();
 
         Ok(HtapDualRead {
-            snapshot,
+            snapshot: snapshot.seq(),
             panel_slot,
             value_column,
             row_count: count,

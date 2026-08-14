@@ -2,7 +2,7 @@ use calyx_aster::olap::OlapScanPlan;
 pub use calyx_aster::olap::OlapScanResult;
 use calyx_core::{PanelSlotId, SlotId};
 
-use crate::{SynapseCalyxError, SynapseCalyxVault};
+use crate::{OLAP_MATERIALIZATION_READER_LEASE_MS, SynapseCalyxError, SynapseCalyxVault};
 
 impl SynapseCalyxVault {
     /// Runs a bounded native OLAP aggregation over one persisted panel slot.
@@ -20,7 +20,6 @@ impl SynapseCalyxVault {
         max_rows: usize,
         max_groups: usize,
     ) -> Result<OlapScanResult, SynapseCalyxError> {
-        let snapshot = self.vault.latest_seq();
         let slot_id = u16::try_from(slot_id).map_err(|_| {
             SynapseCalyxError::from_calyx(
                 "validate native OLAP slot id",
@@ -42,13 +41,15 @@ impl SynapseCalyxVault {
         if let Some(column) = group_by_column {
             plan = plan.with_group_by(column);
         }
-        self.vault
-            .olap_scan_aggregate_slot_at(snapshot, panel_slot, output_dir, plan)
-            .map_err(|error| {
-                SynapseCalyxError::from_calyx(
-                    "materialize and scan native OLAP slot column",
-                    &error,
-                )
-            })
+        self.with_read_snapshot(OLAP_MATERIALIZATION_READER_LEASE_MS, |snapshot| {
+            self.vault
+                .olap_scan_aggregate_slot_at(snapshot, panel_slot, output_dir, plan)
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        "materialize and scan native OLAP slot column",
+                        &error,
+                    )
+                })
+        })
     }
 }

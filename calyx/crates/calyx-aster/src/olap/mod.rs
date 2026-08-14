@@ -6,9 +6,10 @@ pub use types::{
 };
 
 use crate::mmap_col::MmapColumn;
+use crate::mvcc::Snapshot;
 use crate::sst::arrow::{ArrowColumnView, decode_column_shape};
 use crate::vault::{AsterVault, SlotColumnManifest};
-use calyx_core::{CalyxError, Clock, PanelSlotId, Result, Seq};
+use calyx_core::{CalyxError, Clock, PanelSlotId, Result};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
@@ -22,9 +23,10 @@ impl<C> AsterVault<C>
 where
     C: Clock,
 {
+    /// Materializes and aggregates through one caller-owned MVCC snapshot.
     pub fn olap_scan_aggregate_slot_at(
         &self,
-        snapshot: Seq,
+        snapshot: Snapshot,
         panel_slot: PanelSlotId,
         output_dir: impl AsRef<Path>,
         plan: OlapScanPlan,
