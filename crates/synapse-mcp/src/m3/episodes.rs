@@ -152,6 +152,41 @@ pub(crate) fn key_after(key: &[u8]) -> Vec<u8> {
     next
 }
 
+fn fixed_width_key_successor(
+    key: &[u8],
+    expected_len: usize,
+    cf_name: &str,
+) -> Result<Vec<u8>, ErrorData> {
+    if key.len() != expected_len {
+        return Err(mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            format!(
+                "FIXED_WIDTH_RANGE_CURSOR_INVALID in {cf_name}: expected {expected_len} bytes, got {}; key_hex={}",
+                key.len(),
+                hex_encode(key)
+            ),
+        ));
+    }
+
+    let mut successor = key.to_vec();
+    for byte in successor.iter_mut().rev() {
+        if *byte == u8::MAX {
+            *byte = 0;
+            continue;
+        }
+        *byte = byte.saturating_add(1);
+        return Ok(successor);
+    }
+
+    Err(mcp_error(
+        error_codes::STORAGE_READ_FAILED,
+        format!(
+            "FIXED_WIDTH_RANGE_CURSOR_EXHAUSTED in {cf_name}: key has no representable {expected_len}-byte successor; key_hex={}",
+            hex_encode(key)
+        ),
+    ))
+}
+
 pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len().saturating_mul(2));
@@ -328,7 +363,8 @@ fn day_timeline_rows(
         }
         let last = rows.last().map(|(key, _value)| key.clone());
         let Some(last) = last else { break };
-        start = key_after(&last);
+        start =
+            fixed_width_key_successor(&last, timeline_codec::TIMELINE_KEY_LEN, cf::CF_TIMELINE)?;
     }
     Ok(records)
 }
@@ -371,7 +407,7 @@ fn existing_episode_keys(
         }
         let last = rows.last().map(|(key, _value)| key.clone());
         let Some(last) = last else { break };
-        start = key_after(&last);
+        start = fixed_width_key_successor(&last, episode_codec::EPISODE_KEY_LEN, cf::CF_EPISODES)?;
     }
     Ok(keys)
 }
