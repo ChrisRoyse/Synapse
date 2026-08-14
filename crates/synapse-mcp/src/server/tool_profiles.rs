@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    sync::Mutex,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -97,6 +98,250 @@ struct ProfileSnapshotTemplate {
     profile: ToolProfileKind,
     session_scoped: bool,
     snapshot: ToolProfileSnapshot,
+    codex_client_surface_cache: Mutex<CodexClientSurfaceCache>,
+}
+
+/// The Codex host-surface diagnostic is expensive but changes only when one of
+/// its physical inputs changes.  Keep the parsed/hashed readback beside the
+/// profile template and invalidate it from exact filesystem/process metadata,
+/// never from a TTL.  A TTL would knowingly serve stale setup state; rebuilding
+/// on every call was parsing and hashing a multi-megabyte JSON file plus
+/// enumerating hundreds of immutable restart handoffs (#2120).
+#[derive(Debug)]
+struct CodexClientSurfaceCache {
+    key: CodexClientSurfaceCacheKey,
+    snapshot: CodexClientSurfaceSnapshot,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CodexClientSurfaceCacheKey {
+    host_snapshot: PathInputStamp,
+    restart_handoff_dir: PathInputStamp,
+    latest_restart_handoff: Option<PathInputStamp>,
+    stale_codex_process: Option<CodexProcessGenerationStamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathInputStamp {
+    Path {
+        path: PathBuf,
+        metadata: PathMetadataStamp,
+    },
+    EnvironmentError(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PathMetadataStamp {
+    Present {
+        len: u64,
+        modified: Result<SystemTime, String>,
+        created: Result<SystemTime, String>,
+        change_identity: PlatformMetadataChangeIdentity,
+    },
+    Missing,
+    Error(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum PlatformMetadataChangeIdentity {
+    #[cfg(windows)]
+    Windows {
+        creation_time: u64,
+        last_write_time: u64,
+        file_size: u64,
+        attributes: u32,
+    },
+    #[cfg(unix)]
+    Unix {
+        device: u64,
+        inode: u64,
+        ctime: i64,
+        ctime_nsec: i64,
+    },
+    #[cfg(not(any(windows, unix)))]
+    Unavailable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CodexProcessGenerationStamp {
+    Present {
+        pid: u32,
+        creation_time: u64,
+        active: bool,
+    },
+    MissingOrUnreadable {
+        pid: u32,
+        detail: String,
+    },
+}
+
+impl ProfileSnapshotTemplate {
+    fn codex_client_surface_snapshot(
+        &self,
+        public_tool_names: &[String],
+        live_tool_count: usize,
+        live_tool_surface_sha256: String,
+        live_tool_surface_error: Option<String>,
+    ) -> Result<CodexClientSurfaceSnapshot, ErrorData> {
+        let mut cache = self.codex_client_surface_cache.lock().map_err(|_| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "CODEX_CLIENT_SURFACE_CACHE_LOCK_POISONED: profile={} session_scoped={}; remediation=restart the daemon and inspect the first panic which poisoned the profile cache",
+                    self.profile.as_str(),
+                    self.session_scoped
+                ),
+            )
+        })?;
+        cache.current(
+            public_tool_names,
+            live_tool_count,
+            live_tool_surface_sha256,
+            live_tool_surface_error,
+        )
+    }
+}
+
+impl CodexClientSurfaceCache {
+    fn new(snapshot: CodexClientSurfaceSnapshot) -> Self {
+        let key = CodexClientSurfaceCacheKey::capture(&snapshot);
+        Self { key, snapshot }
+    }
+
+    fn current(
+        &mut self,
+        public_tool_names: &[String],
+        live_tool_count: usize,
+        live_tool_surface_sha256: String,
+        live_tool_surface_error: Option<String>,
+    ) -> Result<CodexClientSurfaceSnapshot, ErrorData> {
+        let observed = CodexClientSurfaceCacheKey::capture(&self.snapshot);
+        if observed == self.key {
+            return Ok(self.snapshot.clone());
+        }
+
+        // A host/setup mutation can race this diagnostic.  Re-read only on an
+        // input change, and accept the refreshed value only when the metadata
+        // bracketing that read is stable.  This prevents caching old bytes
+        // under a new file stamp (or an old newest-handoff selection under a
+        // changed directory stamp).
+        let previous_key = self.key.clone();
+        let mut comparison_snapshot = self.snapshot.clone();
+        for attempt in 1..=3_u32 {
+            let before = CodexClientSurfaceCacheKey::capture(&comparison_snapshot);
+            let refreshed = codex_client_surface_snapshot(
+                public_tool_names,
+                live_tool_count,
+                live_tool_surface_sha256.clone(),
+                live_tool_surface_error.clone(),
+            );
+            let after = CodexClientSurfaceCacheKey::capture(&refreshed);
+            if before == after {
+                tracing::info!(
+                    code = "CODEX_CLIENT_SURFACE_CACHE_REFRESHED",
+                    attempt,
+                    ?previous_key,
+                    refreshed_status = ?refreshed.status,
+                    "Codex client-surface cache refreshed after an exact physical input changed"
+                );
+                self.key = after;
+                self.snapshot = refreshed;
+                return Ok(self.snapshot.clone());
+            }
+            comparison_snapshot = refreshed;
+        }
+
+        Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "CODEX_CLIENT_SURFACE_INPUTS_UNSTABLE: the host tool-surface file, restart-handoff directory/latest file, or stale Codex process generation changed during three consecutive read attempts; remediation=finish the concurrent setup/restart mutation, inspect CODEX_CLIENT_SURFACE_CACHE_REFRESHED diagnostics, and retry",
+        ))
+    }
+}
+
+impl CodexClientSurfaceCacheKey {
+    fn capture(snapshot: &CodexClientSurfaceSnapshot) -> Self {
+        let host_snapshot =
+            path_input_stamp_from_env("APPDATA", ["synapse", "codex-tool-surface.json"]);
+        let restart_handoff_dir =
+            path_input_stamp_from_env("LOCALAPPDATA", ["synapse", "codex-restart-handoffs"]);
+        let latest_restart_handoff = snapshot
+            .latest_restart_handoff
+            .as_ref()
+            .filter(|handoff| handoff.exists)
+            .map(|handoff| path_input_stamp(PathBuf::from(&handoff.path)));
+        let stale_codex_process = snapshot
+            .latest_restart_handoff
+            .as_ref()
+            .filter(|handoff| {
+                restart_handoff_requires_current_codex_restart(handoff, &snapshot.host_snapshot)
+            })
+            .and_then(|handoff| handoff.stale_codex_pid)
+            .map(codex_process_generation_stamp);
+        Self {
+            host_snapshot,
+            restart_handoff_dir,
+            latest_restart_handoff,
+            stale_codex_process,
+        }
+    }
+}
+
+fn path_input_stamp_from_env<const N: usize>(env_name: &str, parts: [&str; N]) -> PathInputStamp {
+    match env_path_checked(env_name, parts) {
+        Ok(path) => path_input_stamp(path),
+        Err(error) => PathInputStamp::EnvironmentError(error),
+    }
+}
+
+fn path_input_stamp(path: PathBuf) -> PathInputStamp {
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => PathMetadataStamp::Present {
+            len: metadata.len(),
+            modified: metadata
+                .modified()
+                .map_err(|error| format!("modified timestamp read failed: {error}")),
+            created: metadata
+                .created()
+                .map_err(|error| format!("creation timestamp read failed: {error}")),
+            change_identity: platform_metadata_change_identity(&metadata),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => PathMetadataStamp::Missing,
+        Err(error) => PathMetadataStamp::Error(format!(
+            "metadata read failed: kind={:?} raw_os_error={:?} detail={error}",
+            error.kind(),
+            error.raw_os_error()
+        )),
+    };
+    PathInputStamp::Path { path, metadata }
+}
+
+#[cfg(windows)]
+fn platform_metadata_change_identity(metadata: &fs::Metadata) -> PlatformMetadataChangeIdentity {
+    use std::os::windows::fs::MetadataExt as _;
+
+    PlatformMetadataChangeIdentity::Windows {
+        creation_time: metadata.creation_time(),
+        last_write_time: metadata.last_write_time(),
+        file_size: metadata.file_size(),
+        attributes: metadata.file_attributes(),
+    }
+}
+
+#[cfg(unix)]
+fn platform_metadata_change_identity(metadata: &fs::Metadata) -> PlatformMetadataChangeIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    PlatformMetadataChangeIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+#[cfg(not(any(windows, unix)))]
+fn platform_metadata_change_identity(_metadata: &fs::Metadata) -> PlatformMetadataChangeIdentity {
+    PlatformMetadataChangeIdentity::Unavailable
 }
 
 /// Every profile a session can hold, plus the unscoped (stdio-admin) case.
@@ -230,10 +475,14 @@ impl ImmutableToolSurface {
                         profile.as_str()
                     )
                 })?;
+            let codex_client_surface_cache = Mutex::new(CodexClientSurfaceCache::new(
+                snapshot.codex_client_surface.clone(),
+            ));
             profile_templates.push(ProfileSnapshotTemplate {
                 profile,
                 session_scoped,
                 snapshot,
+                codex_client_surface_cache,
             });
         }
         tracing::info!(
@@ -4636,7 +4885,7 @@ impl SynapseService {
                 )
             })?;
         let mut snapshot = template.snapshot.clone();
-        snapshot.codex_client_surface = codex_client_surface_snapshot(
+        snapshot.codex_client_surface = template.codex_client_surface_snapshot(
             &snapshot.public_tool_registry.public_tool_names,
             snapshot.codex_client_surface.live_tool_count,
             snapshot
@@ -4647,7 +4896,7 @@ impl SynapseService {
                 .codex_client_surface
                 .live_tool_surface_error
                 .clone(),
-        );
+        )?;
         snapshot.session_id = session_id.map(ToOwned::to_owned);
         snapshot.source = source;
         snapshot.foreground_route = foreground_route_readiness(session_id, profile);
@@ -6664,6 +6913,85 @@ fn codex_restart_handoff_readback(path: &Path) -> CodexRestartHandoffReadback {
         live_daemon_pid,
         daemon_pid_matches_live_daemon,
         daemon_pid_mismatch_detail,
+    }
+}
+
+#[cfg(windows)]
+fn codex_process_generation_stamp(pid: u32) -> CodexProcessGenerationStamp {
+    use windows::Win32::{
+        Foundation::{CloseHandle, FILETIME},
+        System::Threading::{
+            GetExitCodeProcess, GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        },
+    };
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(handle) => handle,
+        Err(error) => {
+            return CodexProcessGenerationStamp::MissingOrUnreadable {
+                pid,
+                detail: format!("OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) failed: {error}"),
+            };
+        }
+    };
+    let readback = (|| {
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        unsafe {
+            GetProcessTimes(
+                handle,
+                &raw mut creation,
+                &raw mut exit,
+                &raw mut kernel,
+                &raw mut user,
+            )
+        }
+        .map_err(|error| format!("GetProcessTimes failed: {error}"))?;
+        let mut exit_code = 0_u32;
+        unsafe { GetExitCodeProcess(handle, &raw mut exit_code) }
+            .map_err(|error| format!("GetExitCodeProcess failed: {error}"))?;
+        let creation_time =
+            (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        Ok(CodexProcessGenerationStamp::Present {
+            pid,
+            creation_time,
+            active: exit_code == 259,
+        })
+    })();
+    let close = unsafe { CloseHandle(handle) };
+    match (readback, close) {
+        (Ok(stamp), Ok(())) => stamp,
+        (Err(detail), _) => CodexProcessGenerationStamp::MissingOrUnreadable { pid, detail },
+        (Ok(_), Err(error)) => CodexProcessGenerationStamp::MissingOrUnreadable {
+            pid,
+            detail: format!("CloseHandle after process generation read failed: {error}"),
+        },
+    }
+}
+
+#[cfg(not(windows))]
+fn codex_process_generation_stamp(pid: u32) -> CodexProcessGenerationStamp {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    match system.process(sys_pid) {
+        Some(process) => CodexProcessGenerationStamp::Present {
+            pid,
+            creation_time: process.start_time(),
+            active: true,
+        },
+        None => CodexProcessGenerationStamp::MissingOrUnreadable {
+            pid,
+            detail: "target pid is absent from the live process table".to_owned(),
+        },
     }
 }
 
