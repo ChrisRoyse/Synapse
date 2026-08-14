@@ -2,11 +2,10 @@
 
 use calyx_assay::AssayStore;
 use calyx_aster::cf::{ColumnFamily, recurrence_prefix_range};
+use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
 use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{
-    AnchorValue, CalyxError, Clock, Constellation, CxId, Result as CalyxResult, VaultStore,
-};
+use calyx_core::{AnchorValue, CalyxError, Clock, Constellation, CxId, Result as CalyxResult};
 use serde::{Deserialize, Serialize};
 
 use crate::evidence_error;
@@ -31,20 +30,25 @@ impl OracleEvidence {
     where
         C: Clock,
     {
-        Self::load_at(vault, domain, vault.snapshot())
+        vault.with_scoped_latest_snapshot(
+            Freshness::FreshDerived,
+            evidence_error::ORACLE_CORPUS_READER_LEASE_MS,
+            |snapshot| Self::load_snapshot(vault, domain, snapshot),
+        )
     }
 
-    pub(crate) fn load_at<C>(
+    fn load_snapshot<C>(
         vault: &AsterVault<C>,
         domain: &DomainId,
-        snapshot: u64,
+        snapshot: Snapshot,
     ) -> Result<Self, OracleError>
     where
         C: Clock,
     {
-        let assay = AssayStore::load_from_vault_at(vault, snapshot).map_err(OracleError::from)?;
+        let assay =
+            AssayStore::load_from_vault_snapshot(vault, snapshot).map_err(OracleError::from)?;
         let mut evidence = Self {
-            snapshot,
+            snapshot: snapshot.seq(),
             assay,
             observations: Vec::new(),
             stats: OracleEvidenceStats {
@@ -55,7 +59,7 @@ impl OracleEvidence {
         };
 
         vault
-            .scan_cf_pages_at(
+            .scan_cf_pages_snapshot(
                 snapshot,
                 ColumnFamily::Base,
                 BASE_SCAN_PAGE_ROWS,
@@ -68,7 +72,7 @@ impl OracleEvidence {
                             continue;
                         }
                         evidence.stats.domain_rows_scanned += 1;
-                        evidence.collect_recurrence(vault, &cx, domain)?;
+                        evidence.collect_recurrence(vault, snapshot, &cx, domain)?;
                     }
                     Ok(())
                 },
@@ -80,6 +84,7 @@ impl OracleEvidence {
     fn collect_recurrence<C>(
         &mut self,
         vault: &AsterVault<C>,
+        snapshot: Snapshot,
         cx: &Constellation,
         domain: &DomainId,
     ) -> Result<(), OracleError>
@@ -88,7 +93,7 @@ impl OracleEvidence {
     {
         let range = recurrence_prefix_range(cx.cx_id);
         let rows = vault
-            .scan_cf_range_at(self.snapshot, ColumnFamily::Recurrence, &range)
+            .scan_cf_range_snapshot(snapshot, ColumnFamily::Recurrence, &range)
             .map_err(|error| evidence_error::recurrence_read(error, domain))?;
         self.stats.recurrence_range_scans += 1;
         self.stats.recurrence_rows_scanned += rows.len() as u64;

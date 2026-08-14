@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use calyx_aster::cf::{CfRouter, ColumnFamily};
-use calyx_aster::vault::AsterVault;
+use calyx_aster::{mvcc::Snapshot, vault::AsterVault};
 use calyx_core::{AnchorKind, CalyxError, Clock, Result, SlotId, VaultId, VaultStore};
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +175,30 @@ impl AssayStore {
     pub fn load_from_vault_at<C: Clock>(vault: &AsterVault<C>, snapshot: u64) -> Result<Self> {
         let mut store = Self::default();
         vault.scan_cf_pages_at(
+            snapshot,
+            ColumnFamily::Assay,
+            ASSAY_SCAN_PAGE_ROWS,
+            |rows| {
+                for (key, value) in rows {
+                    store.insert_aster_row(key, value)?;
+                }
+                Ok::<(), CalyxError>(())
+            },
+        )?;
+        Ok(store)
+    }
+
+    /// Loads every Assay row from one caller-owned MVCC snapshot.
+    ///
+    /// This is the composition boundary for a larger cross-column-family read:
+    /// the caller owns the lease lifetime and every Assay, Base, and recurrence
+    /// read can therefore observe the same committed sequence.
+    pub fn load_from_vault_snapshot<C: Clock>(
+        vault: &AsterVault<C>,
+        snapshot: Snapshot,
+    ) -> Result<Self> {
+        let mut store = Self::default();
+        vault.scan_cf_pages_snapshot(
             snapshot,
             ColumnFamily::Assay,
             ASSAY_SCAN_PAGE_ROWS,

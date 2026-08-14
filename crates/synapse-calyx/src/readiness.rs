@@ -237,7 +237,7 @@ impl SynapseCalyxVault {
                 false,
                 0.0,
                 calyx_oracle::ORACLE_CLEAN_THRESHOLD,
-                Some(error.remediation().to_owned()),
+                Some(error.to_string()),
             ),
         };
         let panel_sufficient = calyx_oracle::measure_tier_panel_sufficient(
@@ -941,11 +941,5 @@ fn refused_action_tiers(refusal: &AdmissionRefusal) -> (TierResult, TierResult) 
 }
 
 fn failed(tier: Tier, threshold: f32, error: &SynapseCalyxError) -> TierResult {
-    TierResult::new(
-        tier,
-        false,
-        0.0,
-        threshold,
-        Some(error.remediation.to_owned()),
-    )
+    TierResult::new(tier, false, 0.0, threshold, Some(error.to_string()))
 }

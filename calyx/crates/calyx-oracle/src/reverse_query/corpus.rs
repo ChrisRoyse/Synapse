@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use calyx_aster::cf::{ColumnFamily, recurrence_prefix_range};
+use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
 use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{AnchorValue, Clock, Constellation, CxId, VaultStore};
+use calyx_core::{AnchorValue, Clock, Constellation, CxId};
 use serde::Serialize;
 
 use crate::evidence_error;
@@ -20,7 +21,6 @@ const BASE_SCAN_PAGE_ROWS: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub(super) struct ReverseCorpus {
-    snapshot: u64,
     by_outcome: BTreeMap<String, Vec<OccurrenceEdge>>,
     by_action: HashMap<String, Vec<OccurrenceEdge>>,
     structural_by_answer: BTreeMap<String, Vec<StructuralEdge>>,
@@ -32,31 +32,34 @@ impl ReverseCorpus {
     where
         C: Clock,
     {
-        Self::load_at(vault, domain, vault.snapshot())
+        vault.with_scoped_latest_snapshot(
+            Freshness::FreshDerived,
+            evidence_error::ORACLE_CORPUS_READER_LEASE_MS,
+            |snapshot| Self::load_snapshot(vault, domain, snapshot),
+        )
     }
 
-    pub(super) fn load_at<C>(
+    fn load_snapshot<C>(
         vault: &AsterVault<C>,
         domain: &DomainId,
-        snapshot: u64,
+        snapshot: Snapshot,
     ) -> Result<Self, OracleError>
     where
         C: Clock,
     {
         let mut corpus = Self {
-            snapshot,
             by_outcome: BTreeMap::new(),
             by_action: HashMap::new(),
             structural_by_answer: BTreeMap::new(),
             stats: ReverseStats {
-                snapshot_seq: snapshot,
+                snapshot_seq: snapshot.seq(),
                 base_scans: 1,
                 ..ReverseStats::default()
             },
         };
 
         vault
-            .scan_cf_pages_at(
+            .scan_cf_pages_snapshot(
                 snapshot,
                 ColumnFamily::Base,
                 BASE_SCAN_PAGE_ROWS,
@@ -70,7 +73,7 @@ impl ReverseCorpus {
                         }
                         corpus.stats.domain_rows_scanned += 1;
                         corpus.collect_structural_edges(&cx, domain)?;
-                        corpus.collect_recurrence_edges(vault, &cx, domain)?;
+                        corpus.collect_recurrence_edges(vault, snapshot, &cx, domain)?;
                     }
                     Ok(())
                 },
@@ -139,6 +142,7 @@ impl ReverseCorpus {
     fn collect_recurrence_edges<C>(
         &mut self,
         vault: &AsterVault<C>,
+        snapshot: Snapshot,
         cx: &Constellation,
         domain: &DomainId,
     ) -> Result<(), OracleError>
@@ -147,7 +151,7 @@ impl ReverseCorpus {
     {
         let range = recurrence_prefix_range(cx.cx_id);
         let rows = vault
-            .scan_cf_range_at(self.snapshot, ColumnFamily::Recurrence, &range)
+            .scan_cf_range_snapshot(snapshot, ColumnFamily::Recurrence, &range)
             .map_err(|error| evidence_error::recurrence_read(error, domain))?;
         self.stats.recurrence_range_scans += 1;
         self.stats.recurrence_rows_scanned += rows.len() as u64;

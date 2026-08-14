@@ -31,6 +31,9 @@ pub enum OracleError {
     StorageReadFailure {
         domain: DomainId,
         operation: &'static str,
+        source_code: String,
+        source_message: String,
+        source_remediation: String,
     },
     EvidenceCorrupt {
         domain: DomainId,
@@ -106,9 +109,15 @@ impl OracleError {
             Self::NoRecurrence { domain } => {
                 format!("domain {domain} lacks enough grounded recurrence evidence")
             }
-            Self::StorageReadFailure { domain, operation } => {
-                format!("oracle storage read failed for domain {domain} during {operation}")
-            }
+            Self::StorageReadFailure {
+                domain,
+                operation,
+                source_code,
+                source_message,
+                source_remediation,
+            } => format!(
+                "oracle storage read failed for domain {domain} during {operation}: source_code={source_code} source_message={source_message}; source_remediation={source_remediation}"
+            ),
             Self::EvidenceCorrupt { domain, evidence } => {
                 format!("oracle evidence is corrupt for domain {domain}: {evidence}")
             }

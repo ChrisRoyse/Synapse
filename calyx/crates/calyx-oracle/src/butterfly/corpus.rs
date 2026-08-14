@@ -1,9 +1,10 @@
 use std::collections::BTreeMap;
 
 use calyx_aster::cf::{ColumnFamily, recurrence_prefix_range};
+use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::recurrence::{StoredRecurrenceRow, decode_recurrence_row};
 use calyx_aster::vault::{AsterVault, encode};
-use calyx_core::{Clock, Constellation, VaultStore};
+use calyx_core::{Clock, Constellation};
 
 use super::{ChildCandidate, ChildKey, context::ExpansionContext, outcome_label};
 use crate::evidence_error;
@@ -32,11 +33,25 @@ impl DomainCorpus {
     where
         C: Clock,
     {
-        let snapshot = vault.snapshot();
+        vault.with_scoped_latest_snapshot(
+            Freshness::FreshDerived,
+            evidence_error::ORACLE_CORPUS_READER_LEASE_MS,
+            |snapshot| Self::load_snapshot(vault, domain, snapshot),
+        )
+    }
+
+    fn load_snapshot<C>(
+        vault: &AsterVault<C>,
+        domain: &DomainId,
+        snapshot: Snapshot,
+    ) -> Result<(Self, DomainCorpusStats), OracleError>
+    where
+        C: Clock,
+    {
         let mut stats = DomainCorpusStats::default();
         let mut grouped = BTreeMap::<String, BTreeMap<ChildKey, ChildCandidate>>::new();
         vault
-            .scan_cf_pages_at(
+            .scan_cf_pages_snapshot(
                 snapshot,
                 ColumnFamily::Base,
                 BASE_SCAN_PAGE_ROWS,
@@ -81,7 +96,7 @@ impl DomainCorpus {
 
 fn collect_children<C>(
     vault: &AsterVault<C>,
-    snapshot: u64,
+    snapshot: Snapshot,
     cx: &Constellation,
     domain: &DomainId,
     stats: &mut DomainCorpusStats,
@@ -91,7 +106,7 @@ where
     C: Clock,
 {
     let rows = vault
-        .scan_cf_range_at(
+        .scan_cf_range_snapshot(
             snapshot,
             ColumnFamily::Recurrence,
             &recurrence_prefix_range(cx.cx_id),

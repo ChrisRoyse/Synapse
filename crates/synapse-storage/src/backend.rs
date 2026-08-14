@@ -5424,7 +5424,7 @@ impl StorageBackend for CalyxBackend {
 
     fn verify_calyx_restore(&self, vault_path: &Path) -> StorageResult<SynapseCalyxVerifyReport> {
         synapse_calyx::verify_vault_restore(vault_path).map_err(|source| {
-            calyx_write_failed("<calyx-vault>", "verify restored Calyx vault", &source)
+            calyx_read_failed("<calyx-vault>", "verify restored Calyx vault", &source)
         })
     }
 

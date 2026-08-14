@@ -3075,6 +3075,14 @@ pub fn required_permissions_retire_search_generation(
 /// Returns a structured MCP error for an invalid query mode / fusion strategy,
 /// a missing required field, or any fail-closed Calyx find error (missing/stale
 /// index, cross-panel example, temporal boost unavailable).
+fn find_similar_params_error(message: impl Into<String>) -> ErrorData {
+    mcp_error_with_remediation(
+        error_codes::TOOL_PARAMS_INVALID,
+        message.into(),
+        "correct the named field in the find `similar` block and retry; validation stopped before any storage operation was attempted",
+    )
+}
+
 pub fn run_find_similar(
     db: &synapse_storage::Db,
     params: &StorageFindSimilarParams,
@@ -3093,8 +3101,7 @@ pub fn run_find_similar(
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
+                    find_similar_params_error(
                         "storage operation=find_similar query_mode=by_example requires a non-empty cx_id".to_owned(),
                     )
                 })?;
@@ -3106,8 +3113,7 @@ pub fn run_find_similar(
                 .clone()
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
+                    find_similar_params_error(
                         "storage operation=find_similar query_mode=by_text requires non-empty text"
                             .to_owned(),
                     )
@@ -3116,39 +3122,31 @@ pub fn run_find_similar(
         }
         "by_exact" => {
             let slot = params.exact_slot.ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
+                find_similar_params_error(
                     "storage operation=find_similar query_mode=by_exact requires exact_slot"
                         .to_owned(),
                 )
             })?;
             let slot = u16::try_from(slot).map_err(|_| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    format!(
-                        "storage operation=find_similar exact_slot {slot} exceeds the u16 slot id range"
-                    ),
-                )
+                find_similar_params_error(format!(
+                    "storage operation=find_similar exact_slot {slot} exceeds the u16 slot id range"
+                ))
             })?;
             let value = params
                 .exact_value
                 .clone()
                 .filter(|value| !value.is_empty())
                 .ok_or_else(|| {
-                    mcp_error(
-                        error_codes::TOOL_PARAMS_INVALID,
+                    find_similar_params_error(
                         "storage operation=find_similar query_mode=by_exact requires a non-empty exact_value".to_owned(),
                     )
                 })?;
             synapse_calyx::SynapseCalyxFindQuery::ByExact { slot, value }
         }
         other => {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "storage operation=find_similar query_mode {other:?} must be by_example, by_text, or by_exact"
-                ),
-            ));
+            return Err(find_similar_params_error(format!(
+                "storage operation=find_similar query_mode {other:?} must be by_example, by_text, or by_exact"
+            )));
         }
     };
     let fusion = match params.fusion.trim() {
@@ -3156,27 +3154,22 @@ pub fn run_find_similar(
         "weighted_rrf" => synapse_calyx::SynapseCalyxFindFusion::WeightedRrf,
         "single_slot" => {
             let slot = params.single_slot.ok_or_else(|| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
+                find_similar_params_error(
                     "storage operation=find_similar fusion=single_slot requires single_slot"
                         .to_owned(),
                 )
             })?;
             let slot = u16::try_from(slot).map_err(|_| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
+                find_similar_params_error(
                     format!("storage operation=find_similar single_slot {slot} exceeds the u16 slot id range"),
                 )
             })?;
             synapse_calyx::SynapseCalyxFindFusion::SingleSlot { slot }
         }
         other => {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "storage operation=find_similar fusion {other:?} must be rrf, weighted_rrf, or single_slot"
-                ),
-            ));
+            return Err(find_similar_params_error(format!(
+                "storage operation=find_similar fusion {other:?} must be rrf, weighted_rrf, or single_slot"
+            )));
         }
     };
     let temporal =
@@ -3190,8 +3183,7 @@ pub fn run_find_similar(
     let guard = match params.guard_mode.as_deref().unwrap_or("off").trim() {
         "off" => {
             if params.guard_tau.is_some() {
-                return Err(mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
+                return Err(find_similar_params_error(
                     "storage operation=find_similar guard_tau requires guard_mode=in_region"
                         .to_owned(),
                 ));
@@ -3202,12 +3194,9 @@ pub fn run_find_similar(
             operator_tau: params.guard_tau,
         },
         other => {
-            return Err(mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!(
-                    "storage operation=find_similar guard_mode {other:?} must be off or in_region"
-                ),
-            ));
+            return Err(find_similar_params_error(format!(
+                "storage operation=find_similar guard_mode {other:?} must be off or in_region"
+            )));
         }
     };
     let find_params = synapse_calyx::SynapseCalyxFindParams {
