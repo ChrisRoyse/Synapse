@@ -21,9 +21,11 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 pub use backend::{
-    ActionOraclePublicationReport, CalyxAnchorBatchWriteReport, CalyxAnchorRow,
+    ActionOraclePublicationReport, CALYX_STORAGE_SNAPSHOT_MAX_AGE_MS,
+    CALYX_STORAGE_SNAPSHOT_MIN_AGE_MS, CalyxAnchorBatchWriteReport, CalyxAnchorRow,
     CalyxAnchorScanReport, CalyxAnchorValueReadback, CalyxAnchorWriteReport,
-    CalyxRecurrenceSubjectReport, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
+    CalyxRecurrenceSubjectReport, CalyxStorageSnapshotLease, CalyxStorageSnapshotReadback,
+    CalyxStorageSnapshotRelease, CalyxVaultCollectionInspect, CalyxVaultInspect, GroundingAnchor,
     GroundingAnchorSource, GroundingAnchorValue, McpUsageGroundedPublicationReport,
     PanelLifecycleBackfillReport, ReflexGroundedLifecycleMember,
     ReflexLifecycleBatchPublicationReport, ReflexRegistrationPublicationReport,
@@ -636,6 +638,51 @@ impl Db {
         key: &[u8],
     ) -> StorageResult<Option<RevisionedRawValue>> {
         self.backend.get_cf_revisioned(cf_name, key)
+    }
+
+    /// Opens a bounded process-local MVCC lease at the current committed
+    /// sequence. Subsequent snapshot reads retain that exact logical state even
+    /// while newer commits land.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage failure for an out-of-range lifetime, a
+    /// poisoned/capacity-exhausted lease table, or an unavailable Calyx owner.
+    pub fn open_calyx_storage_snapshot(
+        &self,
+        max_age_ms: u64,
+    ) -> StorageResult<CalyxStorageSnapshotLease> {
+        self.backend.open_calyx_storage_snapshot(max_age_ms)
+    }
+
+    /// Reads one logical CF/key through a previously opened MVCC lease.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage failure for an unknown/expired lease,
+    /// unknown logical CF, malformed retention envelope, or snapshot read
+    /// failure. Payload bytes are not returned by this engine-level surface.
+    pub fn read_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+        cf_name: &str,
+        key: &[u8],
+    ) -> StorageResult<CalyxStorageSnapshotReadback> {
+        self.backend
+            .read_calyx_storage_snapshot(lease_id, cf_name, key)
+    }
+
+    /// Releases one process-local MVCC lease exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage failure for an unknown, expired, or
+    /// internally inconsistent lease.
+    pub fn release_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+    ) -> StorageResult<CalyxStorageSnapshotRelease> {
+        self.backend.release_calyx_storage_snapshot(lease_id)
     }
 
     /// Commits one logical CF batch only when the guarded row's physical

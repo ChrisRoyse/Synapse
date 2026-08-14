@@ -2464,6 +2464,37 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "name an allowlisted readable cf_name (CF_OBSERVATIONS) and exactly one of key_hex / observation_id, both returned under `diagnostics.persisted` on every observe response; a non-allowlisted CF, a missing row, an oversized value, and an undecodable value all fail closed and no raw row bytes are ever returned",
             ),
             op(
+                "snapshot_open",
+                false,
+                false,
+                "Aster process-local reader lease registry and the current committed MVCC sequence",
+                Some("lease id, pinned sequence, exact expiry, and active bounded-lease count"),
+                error_codes::STORAGE_READ_FAILED,
+                "request a bounded 100..=60000 ms lease and release it when the historical reads are complete",
+            ),
+            op(
+                "snapshot_read",
+                false,
+                false,
+                "one exact logical Synapse CF/key resolved through the retained Aster MVCC snapshot",
+                Some(
+                    "snapshot/current sequence plus historical physical/logical presence and payload length/SHA-256; payload bytes remain behind the typed owner tool",
+                ),
+                error_codes::STORAGE_READ_FAILED,
+                "pass the exact active lease_id, logical CF name, and even-length hex logical user key before the lease expires",
+            ),
+            op(
+                "snapshot_release",
+                false,
+                false,
+                "Aster process-local reader lease registry after exact lease removal",
+                Some(
+                    "released lease id/sequence, current sequence, and remaining active bounded-lease count",
+                ),
+                error_codes::STORAGE_READ_FAILED,
+                "release each active lease exactly once before its reported expiry",
+            ),
+            op(
                 "temporal_panels",
                 false,
                 false,

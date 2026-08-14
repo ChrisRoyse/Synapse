@@ -14,7 +14,7 @@ use std::{
 
 use calyx_aster::{
     cf::{ColumnFamily, KeyRange, prefix_range},
-    mvcc::{CfRead, Freshness, LATEST_CF_RANGE_PAGE_MAX_ROWS, tombstone_value},
+    mvcc::{CfRead, Freshness, LATEST_CF_RANGE_PAGE_MAX_ROWS, Snapshot, tombstone_value},
     wal,
 };
 use calyx_core::{Anchor, AnchorKind, AnchorValue, Constellation, CxId, TemporalPolicy, VaultId};
@@ -138,6 +138,12 @@ const CALYX_GC_CACHE_EVICTIONS_TOTAL: &str = "cache_evictions_total";
 /// (#1882).
 const CALYX_GC_SOURCE_ROW_RETAINED_FOR_DERIVED: &str =
     "STORAGE_CALYX_GC_SOURCE_ROW_RETAINED_FOR_DERIVED";
+/// Process-local historical readers are deliberately few and short-lived.
+/// Each one pins MVCC versions that would otherwise be reclaimable, so an
+/// unbounded lease table is an unbounded memory-retention contract.
+const CALYX_STORAGE_SNAPSHOT_MAX_ACTIVE: usize = 64;
+pub const CALYX_STORAGE_SNAPSHOT_MIN_AGE_MS: u64 = 100;
+pub const CALYX_STORAGE_SNAPSHOT_MAX_AGE_MS: u64 = 60_000;
 const CALYX_GC_SOFT_CAP_REASON: &str = "soft_cap";
 const CALYX_WRITE_BATCH_ROW_COUNT_BYTES: usize = 4;
 const CALYX_WRITE_BATCH_CF_TAG_BYTES: usize = 1;
@@ -612,6 +618,20 @@ pub trait StorageBackend: Send + Sync {
         cf_name: &str,
         key: &[u8],
     ) -> StorageResult<Option<RevisionedRawValue>>;
+    fn open_calyx_storage_snapshot(
+        &self,
+        max_age_ms: u64,
+    ) -> StorageResult<CalyxStorageSnapshotLease>;
+    fn read_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+        cf_name: &str,
+        key: &[u8],
+    ) -> StorageResult<CalyxStorageSnapshotReadback>;
+    fn release_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+    ) -> StorageResult<CalyxStorageSnapshotRelease>;
     fn put_batch_if_revision_pressure_bypass(
         &self,
         cf_name: &str,
@@ -1216,6 +1236,55 @@ pub struct CalyxBackend {
     vault: Arc<CalyxVaultRuntime>,
     pressure: Arc<pressure::PressureState>,
     anchor_carry_lineage: Mutex<AnchorCarryLineageCache>,
+    storage_snapshots: Mutex<BTreeMap<u64, PinnedStorageSnapshot>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PinnedStorageSnapshot {
+    snapshot: Snapshot,
+    opened_at_unix_ms: u64,
+}
+
+/// A process-local Aster MVCC lease opened at one committed sequence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CalyxStorageSnapshotLease {
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub opened_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub max_age_ms: u64,
+    pub active_lease_count: u64,
+}
+
+/// Metadata-only readback of one logical Synapse row through an Aster snapshot.
+///
+/// Payload bytes stay behind their typed MCP owners. Length and SHA-256 prove
+/// exact historical identity without turning this engine-level capability into
+/// a raw-content exfiltration surface.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CalyxStorageSnapshotReadback {
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub current_seq: u64,
+    pub opened_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub cf_name: String,
+    pub physical_present: bool,
+    pub logical_present: bool,
+    pub expired_at_snapshot: bool,
+    pub written_at_unix_ms: Option<u64>,
+    pub retention_expires_at_unix_ms: Option<u64>,
+    pub payload_len_bytes: Option<u64>,
+    pub payload_sha256: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CalyxStorageSnapshotRelease {
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub current_seq: u64,
+    pub released: bool,
+    pub active_lease_count: u64,
 }
 
 type AnchorCarryLineageCache = BTreeMap<(String, Vec<u32>), Arc<BTreeMap<String, Vec<Anchor>>>>;
@@ -2343,6 +2412,7 @@ impl CalyxBackend {
             vault: Arc::new(CalyxVaultRuntime::new(vault)),
             pressure: Arc::new(pressure::PressureState::default()),
             anchor_carry_lineage: Mutex::new(BTreeMap::new()),
+            storage_snapshots: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -2354,6 +2424,44 @@ impl CalyxBackend {
         f: impl FnOnce(&SynapseCalyxVault) -> StorageResult<T>,
     ) -> StorageResult<T> {
         self.vault.with_vault(cf_name, operation, write, f)
+    }
+
+    fn lock_storage_snapshots(
+        &self,
+    ) -> StorageResult<std::sync::MutexGuard<'_, BTreeMap<u64, PinnedStorageSnapshot>>> {
+        self.storage_snapshots.lock().map_err(|_| StorageError::ReadFailed {
+            cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+            detail: "SYNAPSE_CALYX_SNAPSHOT_LEASE_TABLE_POISONED: the process-local MVCC lease table lock is poisoned; preserve daemon logs and restart the repo-built daemon before opening another historical reader".to_owned(),
+        })
+    }
+
+    fn prune_expired_storage_snapshots(
+        &self,
+        vault: &SynapseCalyxVault,
+        now_ms: u64,
+    ) -> StorageResult<()> {
+        let expired = {
+            let mut snapshots = self.lock_storage_snapshots()?;
+            let expired = snapshots
+                .iter()
+                .filter(|(_lease_id, pinned)| pinned.snapshot.lease().expires_at() <= now_ms)
+                .map(|(lease_id, _pinned)| *lease_id)
+                .collect::<Vec<_>>();
+            for lease_id in &expired {
+                snapshots.remove(lease_id);
+            }
+            expired
+        };
+        for lease_id in expired {
+            if !vault.release_reader(lease_id) {
+                tracing::debug!(
+                    code = "SYNAPSE_CALYX_SNAPSHOT_LEASE_ALREADY_EXPIRED",
+                    lease_id,
+                    "expired public snapshot lease was already absent from Aster's live reader registry"
+                );
+            }
+        }
+        Ok(())
     }
 
     fn commit_rows(&self, cf_name: &str, rows: Vec<SynapseCalyxCfWrite>) -> StorageResult<()> {
@@ -3636,6 +3744,242 @@ impl StorageBackend for CalyxBackend {
                 }))
             })
         })
+    }
+
+    fn open_calyx_storage_snapshot(
+        &self,
+        max_age_ms: u64,
+    ) -> StorageResult<CalyxStorageSnapshotLease> {
+        if !(CALYX_STORAGE_SNAPSHOT_MIN_AGE_MS..=CALYX_STORAGE_SNAPSHOT_MAX_AGE_MS)
+            .contains(&max_age_ms)
+        {
+            return Err(StorageError::ReadFailed {
+                cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                detail: format!(
+                    "SYNAPSE_CALYX_SNAPSHOT_LEASE_AGE_INVALID: max_age_ms={max_age_ms} is outside {CALYX_STORAGE_SNAPSHOT_MIN_AGE_MS}..={CALYX_STORAGE_SNAPSHOT_MAX_AGE_MS}; remediation=request a short bounded reader lease inside the reported range"
+                ),
+            });
+        }
+        self.with_vault(
+            "calyx_mvcc_snapshot_leases",
+            "open bounded Calyx MVCC storage snapshot",
+            false,
+            |vault| {
+                let opened_at_unix_ms = calyx_clock_now_for_read(
+                    vault,
+                    "calyx_mvcc_snapshot_leases",
+                )?;
+                self.prune_expired_storage_snapshots(vault, opened_at_unix_ms)?;
+                let mut snapshots = self.lock_storage_snapshots()?;
+                if snapshots.len() >= CALYX_STORAGE_SNAPSHOT_MAX_ACTIVE {
+                    return Err(StorageError::ReadFailed {
+                        cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_SNAPSHOT_LEASE_CAPACITY_EXHAUSTED: {} live historical readers already pin MVCC versions; remediation=release an existing lease or wait for its bounded expiry before opening another",
+                            snapshots.len()
+                        ),
+                    });
+                }
+                let snapshot = vault
+                    .pin_reader(Freshness::FreshDerived, max_age_ms)
+                    .map_err(|source| {
+                        calyx_read_failed(
+                            "calyx_mvcc_snapshot_leases",
+                            "pin bounded Calyx MVCC storage snapshot",
+                            &source,
+                        )
+                    })?;
+                let lease_id = snapshot.lease().id();
+                let expires_at_unix_ms = snapshot.lease().expires_at();
+                let active_lease_count = match snapshots.entry(lease_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(PinnedStorageSnapshot {
+                            snapshot,
+                            opened_at_unix_ms,
+                        });
+                        // The admission check above bounds this value to 64.
+                        snapshots.len() as u64
+                    }
+                    std::collections::btree_map::Entry::Occupied(_entry) => {
+                        drop(snapshots);
+                        let released = vault.release_reader(lease_id);
+                        tracing::error!(
+                            code = "SYNAPSE_CALYX_SNAPSHOT_LEASE_ID_COLLISION",
+                            lease_id,
+                            released,
+                            "Aster monotonic reader lease allocator reused a live public lease id"
+                        );
+                        return Err(StorageError::ReadFailed {
+                            cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                            detail: format!(
+                                "SYNAPSE_CALYX_SNAPSHOT_LEASE_ID_COLLISION: lease_id={lease_id} already exists in the process-local lease table; remediation=preserve daemon logs and restart the repo-built daemon because the monotonic Aster lease allocator regressed"
+                            ),
+                        });
+                    }
+                };
+                drop(snapshots);
+                Ok(CalyxStorageSnapshotLease {
+                    lease_id,
+                    snapshot_seq: snapshot.seq(),
+                    opened_at_unix_ms,
+                    expires_at_unix_ms,
+                    max_age_ms,
+                    active_lease_count,
+                })
+            },
+        )
+    }
+
+    fn read_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+        cf_name: &str,
+        key: &[u8],
+    ) -> StorageResult<CalyxStorageSnapshotReadback> {
+        if lease_id == 0 {
+            return Err(StorageError::ReadFailed {
+                cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                detail: "SYNAPSE_CALYX_SNAPSHOT_LEASE_ID_INVALID: lease_id must be nonzero; remediation=pass the exact lease_id returned by snapshot_open".to_owned(),
+            });
+        }
+        self.with_vault(cf_name, "read logical row through Calyx MVCC snapshot", false, |vault| {
+            let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
+            let pinned = {
+                let mut snapshots = self.lock_storage_snapshots()?;
+                let Some(pinned) = snapshots.get(&lease_id).copied() else {
+                    return Err(StorageError::ReadFailed {
+                        cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_SNAPSHOT_LEASE_UNKNOWN: lease_id={lease_id} is not active in this daemon; remediation=open a new snapshot and use its process-local lease_id before the daemon restarts or the lease expires"
+                        ),
+                    });
+                };
+                if pinned.snapshot.lease().expires_at() <= now_ms {
+                    snapshots.remove(&lease_id);
+                    drop(snapshots);
+                    let _ = vault.release_reader(lease_id);
+                    return Err(StorageError::ReadFailed {
+                        cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_SNAPSHOT_LEASE_EXPIRED: lease_id={lease_id} expired_at_unix_ms={} read_at_unix_ms={now_ms}; remediation=open a new bounded snapshot and complete historical reads before its reported expiry",
+                            pinned.snapshot.lease().expires_at()
+                        ),
+                    });
+                }
+                pinned
+            };
+            let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
+            let physical_key = encode_calyx_key_for_read(cf_name, collection_id, key)?;
+            let physical = vault
+                .read_cf_snapshot(pinned.snapshot, ColumnFamily::Kv, &physical_key)
+                .map_err(|source| {
+                    calyx_read_failed(cf_name, "read Calyx KV row at pinned snapshot", &source)
+                })?;
+            let expires_at_unix_ms = pinned.snapshot.lease().expires_at();
+            let current_seq = vault.latest_seq();
+            let Some(physical) = physical else {
+                return Ok(CalyxStorageSnapshotReadback {
+                    lease_id,
+                    snapshot_seq: pinned.snapshot.seq(),
+                    current_seq,
+                    opened_at_unix_ms: pinned.opened_at_unix_ms,
+                    expires_at_unix_ms,
+                    cf_name: cf_name.to_owned(),
+                    physical_present: false,
+                    logical_present: false,
+                    expired_at_snapshot: false,
+                    written_at_unix_ms: None,
+                    retention_expires_at_unix_ms: None,
+                    payload_len_bytes: None,
+                    payload_sha256: None,
+                });
+            };
+            let envelope = decode_calyx_value_raw(&physical).map_err(|detail| {
+                tracing::error!(
+                    code = error_codes::STORAGE_READ_FAILED,
+                    cf = cf_name,
+                    lease_id,
+                    snapshot_seq = pinned.snapshot.seq(),
+                    detail,
+                    "Calyx historical read rejected malformed KV retention envelope"
+                );
+                StorageError::ReadFailed {
+                    cf_name: cf_name.to_owned(),
+                    detail: format!(
+                        "SYNAPSE_CALYX_SNAPSHOT_ROW_ENVELOPE_INVALID: lease_id={lease_id} snapshot_seq={} physical row does not decode: {detail}; remediation=preserve the vault and inspect the exact logical CF/key writer",
+                        pinned.snapshot.seq()
+                    ),
+                }
+            })?;
+            let expired_at_snapshot = calyx_value_is_expired(
+                envelope.expires_at_ms,
+                pinned.opened_at_unix_ms,
+            );
+            Ok(CalyxStorageSnapshotReadback {
+                lease_id,
+                snapshot_seq: pinned.snapshot.seq(),
+                current_seq,
+                opened_at_unix_ms: pinned.opened_at_unix_ms,
+                expires_at_unix_ms,
+                cf_name: cf_name.to_owned(),
+                physical_present: true,
+                logical_present: !expired_at_snapshot,
+                expired_at_snapshot,
+                written_at_unix_ms: Some(envelope.written_at_ms),
+                retention_expires_at_unix_ms: (envelope.expires_at_ms != 0)
+                    .then_some(envelope.expires_at_ms),
+                payload_len_bytes: Some(
+                    u64::try_from(envelope.payload.len()).unwrap_or(u64::MAX),
+                ),
+                payload_sha256: Some(sha256_hex(envelope.payload)),
+            })
+        })
+    }
+
+    fn release_calyx_storage_snapshot(
+        &self,
+        lease_id: u64,
+    ) -> StorageResult<CalyxStorageSnapshotRelease> {
+        if lease_id == 0 {
+            return Err(StorageError::ReadFailed {
+                cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                detail: "SYNAPSE_CALYX_SNAPSHOT_LEASE_ID_INVALID: lease_id must be nonzero; remediation=pass the exact lease_id returned by snapshot_open".to_owned(),
+            });
+        }
+        self.with_vault(
+            "calyx_mvcc_snapshot_leases",
+            "release Calyx MVCC storage snapshot",
+            false,
+            |vault| {
+                let pinned = {
+                    let mut snapshots = self.lock_storage_snapshots()?;
+                    snapshots.remove(&lease_id).ok_or_else(|| StorageError::ReadFailed {
+                        cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_SNAPSHOT_LEASE_UNKNOWN: lease_id={lease_id} is not active in this daemon; remediation=release each lease exactly once, before its expiry and without crossing a daemon restart"
+                        ),
+                    })?
+                };
+                let released = vault.release_reader(lease_id);
+                if !released {
+                    return Err(StorageError::ReadFailed {
+                        cf_name: "calyx_mvcc_snapshot_leases".to_owned(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_SNAPSHOT_LEASE_NOT_LIVE: lease_id={lease_id} existed in the public lease table but Aster no longer considered it live; remediation=open a new bounded snapshot and preserve daemon logs if this occurred before the reported expiry"
+                        ),
+                    });
+                }
+                // The admission invariant keeps this table at or below 64 rows.
+                let active_lease_count = self.lock_storage_snapshots()?.len() as u64;
+                Ok(CalyxStorageSnapshotRelease {
+                    lease_id,
+                    snapshot_seq: pinned.snapshot.seq(),
+                    current_seq: vault.latest_seq(),
+                    released,
+                    active_lease_count,
+                })
+            },
+        )
     }
 
     fn put_batch_if_revision_pressure_bypass(

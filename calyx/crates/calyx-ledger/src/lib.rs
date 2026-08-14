@@ -13,7 +13,6 @@ pub mod head_anchor;
 pub mod kind;
 pub mod merkle;
 pub mod redaction;
-pub mod reproduce;
 pub mod stream_verify;
 pub mod tombstone;
 pub mod verify;
@@ -53,16 +52,6 @@ pub use merkle::{
     merkle_root, merkle_root_of_hashes, sign_root, verify_signature,
 };
 pub use redaction::{MAX_UNCLASSIFIED_TOKEN_LEN, PayloadBuilder, RedactedInput, RedactionPolicy};
-pub use reproduce::{
-    CALYX_REPRODUCE_EVIDENCE_UNAVAILABLE, ForgeBackend, FusionMode, FusionWeights, HitRef,
-    InlineInputResolver, QueryId, REPRODUCE_PAYLOAD_TAG, REPRODUCE_TOLERANCE, RecordedSlot,
-    RemeasuredSlot, ReproduceContext, ReproduceInputResolver, ReproduceLensRegistry,
-    ReproduceResult, SlotWeight, activate_forge_determinism, append_reproduce_entry,
-    assert_reproduced, assert_within_tolerance, build_reproduce_context, lookup_frozen_lens,
-    remeasure_slots, remeasure_slots_with_input_resolver, reproduce, reproduce_payload_bytes,
-    reproduce_verdict, reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
-    rerun_fusion,
-};
 pub use stream_verify::{AnchorDiscipline, StreamingChainVerifier, StreamingStart};
 pub use tombstone::{
     ErasureScope, ErasureTombstone, find_tombstone, is_tombstoned, tombstone_from_entry,

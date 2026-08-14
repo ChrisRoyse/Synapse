@@ -4,12 +4,10 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use crate::mvcc::SnapshotCfRowStream;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
-    ActorId, AnchorDiscipline, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry,
-    LedgerHeadAnchor, LedgerRow, QueryId, RedactionPolicy, ReproduceInputResolver,
-    ReproduceLensRegistry, ReproduceResult, StagedLedgerRow, StreamingChainVerifier,
+    ActorId, AnchorDiscipline, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry,
+    LedgerHeadAnchor, LedgerRow, RedactionPolicy, StagedLedgerRow, StreamingChainVerifier,
     StreamingStart, SubjectId, VerifyResult, decode as decode_ledger_entry,
-    decode_ref as decode_ledger_entry_ref, reproduce_payload_bytes,
-    reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
+    decode_ref as decode_ledger_entry_ref,
 };
 use std::ops::Range;
 
@@ -519,32 +517,6 @@ where
             self.commit_persistent_ledger_staged_locked(guard, &staged, "append_ledger_entry")?;
             Ok(ledger_ref)
         })
-    }
-
-    /// Records a reproduce verdict as a `reproduce_v1` Ledger Admin row.
-    pub fn record_reproduce_with_input_resolver(
-        &self,
-        registry: &dyn ReproduceLensRegistry,
-        forge: &mut dyn ForgeBackend,
-        resolver: &dyn ReproduceInputResolver,
-        answer_id: &QueryId,
-    ) -> Result<ReproduceResult> {
-        if self.ledger_hook.is_none() {
-            let mut store = AsterRawLedgerStore { vault: self };
-            return reproduce_with_input_resolver(&mut store, registry, forge, resolver, answer_id);
-        }
-
-        let store = AsterRawLedgerStore { vault: self };
-        let result =
-            reproduce_verdict_with_input_resolver(&store, registry, forge, resolver, answer_id)?;
-        let payload = reproduce_payload_bytes(answer_id, &result, self.clock_now())?;
-        self.append_ledger_entry(
-            EntryKind::Admin,
-            SubjectId::Query(answer_id.clone()),
-            payload,
-            ActorId::Service("calyx-reproduce".to_string()),
-        )?;
-        Ok(result)
     }
 
     /// Decodes and admits one already-framed Ledger row against the exact

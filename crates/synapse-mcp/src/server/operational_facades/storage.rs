@@ -156,45 +156,6 @@ pub(super) async fn handle(
                 |out| out.summary = Some(response),
             )))
         }
-        StorageOperation::SnapshotGcStatus => {
-            let spec = params.0.snapshot_gc_status.unwrap_or_default();
-            service.require_m3_permissions(
-                STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_inspect(&spec),
-            )?;
-            let db = service.m3_storage().map_err(|error| {
-                facade_delegate_error(
-                    STORAGE_TOOL,
-                    operation.as_str(),
-                    "snapshot_gc_status",
-                    STORAGE_SOT,
-                    error,
-                    "repair storage initialization and read the live Calyx vault counters again",
-                )
-            })?;
-            let response =
-                crate::m3::storage::inspect_snapshot_gc_status(&db).map_err(|error| {
-                    facade_delegate_error(
-                        STORAGE_TOOL,
-                        operation.as_str(),
-                        "snapshot_gc_status",
-                        STORAGE_SOT,
-                        error,
-                        "inspect the live Calyx vault lifecycle state and retry the counter read",
-                    )
-                })?;
-            Ok(Json(storage_response(
-                operation,
-                format!(
-                    "snapshot GC floor_seq={} current_seq={} versions_reclaimed_total={} bytes_reclaimed_total={}",
-                    response.floor_seq,
-                    response.current_seq,
-                    response.versions_reclaimed_total,
-                    response.bytes_reclaimed_total,
-                ),
-                |out| out.snapshot_gc_status = Some(response),
-            )))
-        }
         StorageOperation::Anchors => {
             let spec = params
                 .0
@@ -281,6 +242,10 @@ pub(super) async fn handle(
                 |out| out.row_read = Some(Box::new(response)),
             )))
         }
+        operation @ (StorageOperation::SnapshotGcStatus
+        | StorageOperation::SnapshotOpen
+        | StorageOperation::SnapshotRead
+        | StorageOperation::SnapshotRelease) => handle_snapshot(service, params.0, operation),
         StorageOperation::TemporalPanels => {
             let spec = params
                 .0
@@ -1741,6 +1706,189 @@ async fn handle_corpus_histogram(
         ),
         |out| out.corpus_histogram = Some(response),
     )))
+}
+
+fn handle_snapshot(
+    service: &SynapseService,
+    mut params: StorageParams,
+    operation: StorageOperation,
+) -> Result<Json<StorageResponse>, ErrorData> {
+    match operation {
+        StorageOperation::SnapshotGcStatus => {
+            let spec = params.snapshot_gc_status.take().unwrap_or_default();
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_inspect(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "snapshot_gc_status",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage initialization and read the live Calyx vault counters again",
+                )
+            })?;
+            let response =
+                crate::m3::storage::inspect_snapshot_gc_status(&db).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "snapshot_gc_status",
+                        STORAGE_SOT,
+                        error,
+                        "inspect the live Calyx vault lifecycle state and retry the counter read",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "snapshot GC floor_seq={} current_seq={} versions_reclaimed_total={} bytes_reclaimed_total={}",
+                    response.floor_seq,
+                    response.current_seq,
+                    response.versions_reclaimed_total,
+                    response.bytes_reclaimed_total,
+                ),
+                |out| out.snapshot_gc_status = Some(response),
+            )))
+        }
+        StorageOperation::SnapshotOpen => {
+            let spec = params
+                .snapshot_open
+                .take()
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "snapshot_open"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_snapshot_open(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_mvcc_snapshot_leases",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=snapshot_open",
+                )
+            })?;
+            let response =
+                crate::m3::storage::open_storage_snapshot(&db, &spec).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "calyx_mvcc_snapshot_leases",
+                        STORAGE_SOT,
+                        error,
+                        "request max_age_ms within 100..=60000 and release prior leases before retrying",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Aster reader lease id={} snapshot_seq={} expires_at_unix_ms={} active_leases={}",
+                    response.lease_id,
+                    response.snapshot_seq,
+                    response.expires_at_unix_ms,
+                    response.active_lease_count
+                ),
+                |out| out.snapshot_open = Some(response),
+            )))
+        }
+        StorageOperation::SnapshotRead => {
+            let spec = params
+                .snapshot_read
+                .take()
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "snapshot_read"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_snapshot_read(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_mvcc_snapshot_leases",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=snapshot_read",
+                )
+            })?;
+            let response =
+                crate::m3::storage::read_storage_snapshot(&db, &spec).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        &spec.cf_name,
+                        STORAGE_SOT,
+                        error,
+                        "pass an active lease_id plus one exact logical CF/key before the lease expires",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Aster snapshot lease={} seq={} current_seq={} logical_cf={} key={} physical_present={} logical_present={} payload_sha256={}",
+                    response.lease_id,
+                    response.snapshot_seq,
+                    response.current_seq,
+                    response.cf_name,
+                    response.key_hex,
+                    response.physical_present,
+                    response.logical_present,
+                    response.payload_sha256.as_deref().unwrap_or("absent")
+                ),
+                |out| out.snapshot_read = Some(response),
+            )))
+        }
+        StorageOperation::SnapshotRelease => {
+            let spec = params
+                .snapshot_release
+                .take()
+                .ok_or_else(|| missing_spec(STORAGE_TOOL, "snapshot_release"))?;
+            service.require_m3_permissions(
+                STORAGE_TOOL,
+                &crate::m3::storage::required_permissions_snapshot_release(&spec),
+            )?;
+            let db = service.m3_storage().map_err(|error| {
+                facade_delegate_error(
+                    STORAGE_TOOL,
+                    operation.as_str(),
+                    "calyx_mvcc_snapshot_leases",
+                    STORAGE_SOT,
+                    error,
+                    "repair storage/Calyx initialization and retry storage operation=snapshot_release",
+                )
+            })?;
+            let response =
+                crate::m3::storage::release_storage_snapshot(&db, &spec).map_err(|error| {
+                    facade_delegate_error(
+                        STORAGE_TOOL,
+                        operation.as_str(),
+                        "calyx_mvcc_snapshot_leases",
+                        STORAGE_SOT,
+                        error,
+                        "release the exact active lease_id once, before its reported expiry",
+                    )
+                })?;
+            Ok(Json(storage_response(
+                operation,
+                format!(
+                    "Aster reader lease id={} snapshot_seq={} released={} active_leases={} current_seq={}",
+                    response.lease_id,
+                    response.snapshot_seq,
+                    response.released,
+                    response.active_lease_count,
+                    response.current_seq
+                ),
+                |out| out.snapshot_release = Some(response),
+            )))
+        }
+        _ => Err(ErrorData::internal_error(
+            "SYNAPSE_STORAGE_SNAPSHOT_DISPATCH_INVALID: non-snapshot operation reached the snapshot handler; remediation=inspect storage operation routing",
+            None,
+        )),
+    }
 }
 
 async fn handle_gc_once(

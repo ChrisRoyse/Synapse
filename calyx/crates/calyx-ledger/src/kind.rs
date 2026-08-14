@@ -31,15 +31,9 @@ pub enum WriterStatus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EntryKind {
     Ingest,
-    /// A per-slot frozen-lens measurement record: the evidence
-    /// [`crate::reproduce::RecordedSlot`] describes and the reproduce path
-    /// consumes.
-    ///
-    /// **Reserved-unwritten (#2094).** No writer in the workspace mints one, and
-    /// no writer mints the `measure_refs` / `recorded_slots` answer-payload
-    /// fields that would point at one, so the whole reproduce context contract
-    /// is currently producer-less. `build_reproduce_context` therefore refuses
-    /// with evidence instead of quietly returning an empty context.
+    /// Reserved wire code for a historical per-slot measurement shape that was
+    /// never produced. It is intentionally not reused: old bytes, if any are
+    /// ever discovered, must remain unambiguous.
     Measure,
     Assay,
     Kernel,
@@ -156,8 +150,7 @@ impl EntryKind {
             Self::Anneal => WriterStatus::Minted,
             // vault/input_pointer.rs, vault/temporal_metadata.rs backfills.
             Self::Migrate => WriterStatus::Minted,
-            // gc/orphan_reconciler Base repair, reproduce::append_reproduce_entry,
-            // checkpoint publication.
+            // gc/orphan_reconciler Base repair and checkpoint publication.
             Self::Admin => WriterStatus::Minted,
             // vault/erase.rs per-constellation and vault-wide tombstones.
             Self::Erase => WriterStatus::Minted,
@@ -173,20 +166,6 @@ impl EntryKind {
                 WriterStatus::ReservedUnwritten
             }
         }
-    }
-
-    /// Whether an entry of this kind may carry a
-    /// [`crate::reproduce::RecordedSlot`] — one slot's frozen-lens measurement.
-    ///
-    /// The reproduce path follows `measure_refs` from an answer entry to the
-    /// entries holding its slot evidence, and must check that a referenced seq
-    /// resolves to a measurement record rather than to an unrelated entry whose
-    /// payload happens to parse. This predicate is that check's single
-    /// declaration; `Measure` is the only kind whose payload is defined to be a
-    /// recorded slot, and it is presently
-    /// [`WriterStatus::ReservedUnwritten`] (#2094).
-    pub const fn carries_recorded_slot(self) -> bool {
-        matches!(self, Self::Measure)
     }
 
     /// Stable lowercase label for logs/readbacks.

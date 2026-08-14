@@ -11,7 +11,6 @@ use crate::append::{LedgerCfStore, LedgerRow};
 use crate::codec::decode;
 use crate::entry::{ActorId, LedgerEntry, SubjectId};
 use crate::kind::EntryKind;
-use crate::reproduce::FusionWeights;
 use crate::verify::DecodedLedgerSnapshot;
 
 mod links;
@@ -34,7 +33,11 @@ pub struct AnswerTrace {
     pub kernel_entry: Option<LedgerEntry>,
     pub guard_entry: Option<LedgerEntry>,
     pub path: Vec<AnswerTraceHop>,
-    pub fusion_weights: Option<FusionWeights>,
+    /// Producer-owned fusion metadata, retained verbatim for provenance.
+    /// Ledger does not pretend it can replay this payload: replay requires the
+    /// exact immutable query input, panel/lenses, index generation and candidate
+    /// universe, none of which a generic JSON weight object establishes.
+    pub fusion_weights: Option<Value>,
     pub guard_result: Option<Value>,
     pub freshness_ts: Option<u64>,
     pub complete: bool,
@@ -215,11 +218,7 @@ pub fn answer_trace_from_entries(
         &["guard_id"],
         "guard_ref",
     );
-    let fusion_weights = payload
-        .get("fusion_weights")
-        .map(|value| serde_json::from_value(value.clone()))
-        .transpose()
-        .map_err(|error| CalyxError::ledger_corrupt(format!("decode fusion_weights: {error}")))?;
+    let fusion_weights = payload.get("fusion_weights").cloned();
     let guard_result = guard_entry
         .as_ref()
         .and_then(payload_value)

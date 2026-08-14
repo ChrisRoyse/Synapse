@@ -9,7 +9,6 @@ use serde::{Deserialize, Serialize};
 
 mod contract;
 mod registration;
-mod reproduce;
 mod validation;
 
 pub use validation::{ensure_input_modality, ensure_vector_shape};

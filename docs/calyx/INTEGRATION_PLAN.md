@@ -50,7 +50,7 @@ Rust 2024 workspace, **compiles clean on Windows** (verified 2026-07-15: `cargo 
 | `calyx-lodestar` | grounding kernel: SCC → betweenness → greedy FVS, kernel index/answer, recall gate, grounding gaps, domain bridges |
 | `calyx-ward` | fail-closed per-slot guard: conformal calibration, verdicts (accept/new-region/quarantine/refuse), identity-lock, drift, injection lens |
 | `calyx-oracle` | prediction: forward/butterfly/reverse walks, energy-descent completion, honesty gate, time-of-next-occurrence, readiness predicate |
-| `calyx-ledger` | append-only hash chain, Merkle checkpoints, verify/reproduce, redaction tombstones |
+| `calyx-ledger` | append-only hash chain, Merkle checkpoints, chain verification, record-provenance re-derivation, redaction tombstones; no generic answer replay without complete immutable derivation inputs |
 | `calyx-anneal` | reversible shadow-tested self-optimization + tripwires + rollback |
 | `calyx-sextant` / `calyx-search` | per-slot indexes (HNSW/DiskANN/SPANN/BM25/MaxSim), RRF fusion, planner, guarded search |
 | `calyx-mincut`, `calyx-paths` | graph/path primitives |
@@ -144,10 +144,10 @@ Everything not yet anchored is reported **provisional** — the grounding-gap re
 | Ward guard (conformal, per-slot, fail-closed) | `reality`/`verification`/`escalation` | out-of-distribution detection on observations and agent behavior; identity-lock confirmed routines; quarantine verdicts |
 | Oracle predict / butterfly / reverse / completion | `assist`/`act`/`routine` | next-occurrence forecasts, consequence what-if before risky actions, root-cause abduction, honesty-gated imputation |
 | Oracle readiness predicate | `health` | falsifiable per-domain "is this system ready" |
-| Ledger hash chain + reproduce | `audit`/`privacy` | tamper-evident provenance for every mutation; `verify_chain`; redaction/erase honoring privacy |
+| Ledger hash chain + record reproduction | `audit`/`privacy` | tamper-evident provenance for every mutation; `verify_chain`; re-derive a record's physical provenance binding; redaction/erase honoring privacy. Generic answer replay is intentionally absent until query input, frozen panel/lenses, index generation, candidate universe, tuning/seed, and output are persisted together |
 | Loom reactive triggers | `subscribe` | new-region / recurs / drift events pushed to subscribers |
 | Anneal | background | shadow-tested reversible tuning of fusion weights, quantization, thresholds; tripwires + rollback |
-| Aster MVCC time-travel | `replay`/`storage` | consistent historical snapshots for replay debugging |
+| Aster MVCC time-travel | `storage` `snapshot_open` / `snapshot_read` / `snapshot_release` | bounded current-sequence reader leases, exact logical-row historical identity, explicit release/expiry, and an observable snapshot-GC floor; no unsafe one-shot read of versions GC may already have reclaimed |
 | TimeSeries rollups + OLAP columns | `cost`/`telemetry` | bounded-read cost/metric analytics at any corpus size (retires scan-bound cost queries, #1640 class) |
 
 ### 4.1 Control & steering (Calyx drives Synapse and the agents using it)

@@ -976,6 +976,36 @@ pub struct StorageRowReadParams {
     pub observation_id: Option<String>,
 }
 
+/// Opens one bounded process-local Aster MVCC reader at the current committed
+/// sequence. The explicit lifetime is required because this lease retains old
+/// versions in memory until release or expiry.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotOpenParams {
+    #[schemars(range(min = 100, max = 60_000))]
+    pub max_age_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotReadParams {
+    #[schemars(range(min = 1))]
+    pub lease_id: u64,
+    /// Logical Synapse CF name. It is resolved through the same closed CF
+    /// catalog and ordered-key encoding as every normal storage read.
+    pub cf_name: String,
+    /// Exact logical user key, hex encoded. Raw physical Aster keys are never
+    /// accepted by this surface.
+    pub key_hex: String,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotReleaseParams {
+    #[schemars(range(min = 1))]
+    pub lease_id: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageTemporalRerankParams {
@@ -1055,6 +1085,54 @@ pub struct StorageRowReadResponse {
     /// What this response does and does not disclose from the row body.
     pub redaction_policy: String,
     pub observation: StorageObservationRowReadback,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotOpenResponse {
+    pub source_of_truth: String,
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub opened_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub max_age_ms: u64,
+    pub active_lease_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotReadResponse {
+    pub source_of_truth: String,
+    pub redaction_policy: String,
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub current_seq: u64,
+    pub opened_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub cf_name: String,
+    pub key_hex: String,
+    pub physical_present: bool,
+    pub logical_present: bool,
+    pub expired_at_snapshot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub written_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retention_expires_at_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_len_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_sha256: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSnapshotReleaseResponse {
+    pub source_of_truth: String,
+    pub lease_id: u64,
+    pub snapshot_seq: u64,
+    pub current_seq: u64,
+    pub released: bool,
+    pub active_lease_count: u64,
 }
 
 /// `StoredObservation` reduced to fixed-arity, non-content fields (#2064).
@@ -3411,6 +3489,27 @@ pub fn required_permissions_row_read(_params: &StorageRowReadParams) -> Required
 }
 
 #[must_use]
+pub fn required_permissions_snapshot_open(
+    _params: &StorageSnapshotOpenParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_snapshot_read(
+    _params: &StorageSnapshotReadParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
+pub fn required_permissions_snapshot_release(
+    _params: &StorageSnapshotReleaseParams,
+) -> RequiredPermissions {
+    required([Permission::ReadStorage])
+}
+
+#[must_use]
 pub fn required_permissions_corpus_histogram(
     _params: &StorageCorpusHistogramParams,
 ) -> RequiredPermissions {
@@ -3572,6 +3671,97 @@ pub fn read_storage_row(
         decoded_as: "StoredObservation".to_owned(),
         redaction_policy: STORAGE_ROW_READ_REDACTION_POLICY.to_owned(),
         observation: observation_row_readback(stored),
+    })
+}
+
+const STORAGE_SNAPSHOT_READ_REDACTION_POLICY: &str =
+    "metadata_and_sha256_only_payload_bytes_omitted_use_typed_owner_tool_for_content";
+
+pub fn open_storage_snapshot(
+    db: &synapse_storage::Db,
+    params: &StorageSnapshotOpenParams,
+) -> Result<StorageSnapshotOpenResponse, ErrorData> {
+    let lease = db
+        .open_calyx_storage_snapshot(params.max_age_ms)
+        .map_err(|error| storage_mcp_error(&error))?;
+    Ok(StorageSnapshotOpenResponse {
+        source_of_truth: "Aster process-local reader lease registry plus MVCC snapshot-GC floor"
+            .to_owned(),
+        lease_id: lease.lease_id,
+        snapshot_seq: lease.snapshot_seq,
+        opened_at_unix_ms: lease.opened_at_unix_ms,
+        expires_at_unix_ms: lease.expires_at_unix_ms,
+        max_age_ms: lease.max_age_ms,
+        active_lease_count: lease.active_lease_count,
+    })
+}
+
+pub fn read_storage_snapshot(
+    db: &synapse_storage::Db,
+    params: &StorageSnapshotReadParams,
+) -> Result<StorageSnapshotReadResponse, ErrorData> {
+    let key_hex = params.key_hex.trim();
+    if key_hex.is_empty() {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=snapshot_read requires a non-empty key_hex".to_owned(),
+            "pass the exact logical user key in even-length hexadecimal, not an Aster physical key",
+        ));
+    }
+    let key = hex_decode(key_hex).map_err(|detail| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage operation=snapshot_read key_hex invalid: {detail}"),
+            "pass the exact logical user key in even-length hexadecimal, not an Aster physical key",
+        )
+    })?;
+    let cf_name = params.cf_name.trim();
+    if cf_name.is_empty() {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=snapshot_read requires a non-empty cf_name".to_owned(),
+            "pass one logical CF name from the closed Synapse storage catalog",
+        ));
+    }
+    let readback = db
+        .read_calyx_storage_snapshot(params.lease_id, cf_name, &key)
+        .map_err(|error| storage_mcp_error(&error))?;
+    Ok(StorageSnapshotReadResponse {
+        source_of_truth: "exact logical CF row resolved through the retained Aster MVCC snapshot"
+            .to_owned(),
+        redaction_policy: STORAGE_SNAPSHOT_READ_REDACTION_POLICY.to_owned(),
+        lease_id: readback.lease_id,
+        snapshot_seq: readback.snapshot_seq,
+        current_seq: readback.current_seq,
+        opened_at_unix_ms: readback.opened_at_unix_ms,
+        expires_at_unix_ms: readback.expires_at_unix_ms,
+        cf_name: readback.cf_name,
+        key_hex: hex_encode(&key),
+        physical_present: readback.physical_present,
+        logical_present: readback.logical_present,
+        expired_at_snapshot: readback.expired_at_snapshot,
+        written_at_unix_ms: readback.written_at_unix_ms,
+        retention_expires_at_unix_ms: readback.retention_expires_at_unix_ms,
+        payload_len_bytes: readback.payload_len_bytes,
+        payload_sha256: readback.payload_sha256,
+    })
+}
+
+pub fn release_storage_snapshot(
+    db: &synapse_storage::Db,
+    params: &StorageSnapshotReleaseParams,
+) -> Result<StorageSnapshotReleaseResponse, ErrorData> {
+    let release = db
+        .release_calyx_storage_snapshot(params.lease_id)
+        .map_err(|error| storage_mcp_error(&error))?;
+    Ok(StorageSnapshotReleaseResponse {
+        source_of_truth: "Aster process-local reader lease registry after exact lease removal"
+            .to_owned(),
+        lease_id: release.lease_id,
+        snapshot_seq: release.snapshot_seq,
+        current_seq: release.current_seq,
+        released: release.released,
+        active_lease_count: release.active_lease_count,
     })
 }
 

@@ -33,6 +33,8 @@ use crate::m3::{
         StorageRetireOrphanSlotCfsResponse, StorageRetireSearchGenerationParams,
         StorageRetireSearchGenerationResponse, StorageRowReadParams, StorageRowReadResponse,
         StorageSearchRebuildParams, StorageSearchRebuildResponse, StorageSnapshotGcObservation,
+        StorageSnapshotOpenParams, StorageSnapshotOpenResponse, StorageSnapshotReadParams,
+        StorageSnapshotReadResponse, StorageSnapshotReleaseParams, StorageSnapshotReleaseResponse,
         StorageSummaryResponse, StorageTemporalBackfillParams, StorageTemporalBackfillResponse,
         StorageTemporalPanelsParams, StorageTemporalPanelsResponse, StorageTemporalRerankParams,
         StorageTemporalRerankResponse, StorageTranscriptOrderRebuildParams,
@@ -49,6 +51,9 @@ pub enum StorageOperation {
     GcOnce,
     Anchors,
     RowRead,
+    SnapshotOpen,
+    SnapshotRead,
+    SnapshotRelease,
     TemporalPanels,
     CorpusHistogram,
     PanelCoverage,
@@ -76,6 +81,9 @@ impl StorageOperation {
             Self::GcOnce => "gc_once",
             Self::Anchors => "anchors",
             Self::RowRead => "row_read",
+            Self::SnapshotOpen => "snapshot_open",
+            Self::SnapshotRead => "snapshot_read",
+            Self::SnapshotRelease => "snapshot_release",
             Self::TemporalPanels => "temporal_panels",
             Self::CorpusHistogram => "corpus_histogram",
             Self::PanelCoverage => "panel_coverage",
@@ -112,6 +120,12 @@ pub struct StorageParams {
     pub anchors: Option<StorageAnchorsParams>,
     #[serde(default)]
     pub row_read: Option<StorageRowReadParams>,
+    #[serde(default)]
+    pub snapshot_open: Option<StorageSnapshotOpenParams>,
+    #[serde(default)]
+    pub snapshot_read: Option<StorageSnapshotReadParams>,
+    #[serde(default)]
+    pub snapshot_release: Option<StorageSnapshotReleaseParams>,
     #[serde(default)]
     pub temporal_panels: Option<StorageTemporalPanelsParams>,
     #[serde(default)]
@@ -168,6 +182,12 @@ pub struct StorageResponse {
     /// every operation, including the ones that never touch a row body.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_read: Option<Box<StorageRowReadResponse>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_open: Option<StorageSnapshotOpenResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_read: Option<StorageSnapshotReadResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_release: Option<StorageSnapshotReleaseResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporal_panels: Option<StorageTemporalPanelsResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
