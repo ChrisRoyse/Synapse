@@ -1070,24 +1070,26 @@ pub(super) fn read_synapse_bearer_token() -> Result<String, ErrorData> {
 /// invisible to all of them until it is renamed into place.
 const AGENT_SPAWN_STAGING_PREFIX: &str = ".staging-";
 
-/// Creates the spawn directory and the manifest describing it as a single
-/// publish, and returns the published directory.
+/// Creates the spawn directory and every file required before it is visible to
+/// transcript ingestion as a single publish.
 ///
-/// The directory is built under a staging name, the manifest is written and
-/// fsynced inside it, and only then is it renamed to `agent-spawn-<id>` within
-/// the same parent directory. Microsoft documents `MoveFileEx` as moving a
-/// directory together with its children, and a rename within one directory on
-/// NTFS is a single metadata operation — so the published name either appears
-/// with its manifest already inside or does not appear at all.
+/// The directory is built under a staging name; the manifest, immutable prompt,
+/// and empty append-only stdout/stderr sources are created and fsynced inside
+/// it; only then is it renamed to `agent-spawn-<id>` within the same parent
+/// directory. Microsoft documents `MoveFileEx` as moving a directory together
+/// with its children, and a rename within one directory on NTFS is a single
+/// metadata operation — so the published name either appears with all required
+/// ingest inputs already inside or does not appear at all.
 ///
 /// If anything fails before the rename, the staging directory is removed, so an
-/// interrupted spawn leaves neither a directory nor a manifest (#1879).
-fn publish_agent_spawn_dir_with_manifest(
+/// interrupted spawn leaves no visible partial directory (#1879/#2244).
+fn publish_agent_spawn_dir_with_required_files(
     root: &Path,
     spawn_id: &str,
     params: &ActSpawnAgentParams,
     working_dir: &Path,
-) -> Result<PathBuf, ErrorData> {
+    prompt: &[u8],
+) -> Result<(), ErrorData> {
     let log_dir = root.join(spawn_id);
     if log_dir.exists() {
         return Err(mcp_error(
@@ -1139,16 +1141,27 @@ fn publish_agent_spawn_dir_with_manifest(
         )
     })?;
 
-    let staged_manifest_path = staging_dir.join(AGENT_SPAWN_MANIFEST_FILENAME);
-    if let Err(error) = write_and_sync_file(&staged_manifest_path, &manifest_bytes) {
-        discard_agent_spawn_staging_dir(&staging_dir);
-        return Err(mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to write the spawn manifest {}: {error}",
-                staged_manifest_path.display()
-            ),
-        ));
+    for (file_name, contents, purpose) in [
+        (
+            AGENT_SPAWN_MANIFEST_FILENAME,
+            manifest_bytes.as_slice(),
+            "spawn manifest",
+        ),
+        ("prompt.txt", prompt, "immutable prompt"),
+        ("stdout.jsonl", &[][..], "append-only transcript source"),
+        ("stderr.log", &[][..], "append-only stderr source"),
+    ] {
+        let staged_path = staging_dir.join(file_name);
+        if let Err(error) = write_and_sync_file(&staged_path, contents) {
+            discard_agent_spawn_staging_dir(&staging_dir);
+            return Err(mcp_error(
+                error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "act_spawn_agent failed to create and sync mandatory {purpose} {} before directory publication: {error}",
+                    staged_path.display()
+                ),
+            ));
+        }
     }
     if let Err(error) = fs::rename(&staging_dir, &log_dir) {
         discard_agent_spawn_staging_dir(&staging_dir);
@@ -1161,14 +1174,15 @@ fn publish_agent_spawn_dir_with_manifest(
             ),
         ));
     }
-    Ok(log_dir)
+    Ok(())
 }
 
-/// Writes `bytes` to `path` and flushes them to the device before returning, so
-/// a published spawn directory cannot contain a zero-length manifest.
+/// Creates one new staged file and flushes its content and metadata before the
+/// directory is published. `create_new` makes an unexpected pre-existing path
+/// a loud staging-integrity failure instead of truncating it.
 fn write_and_sync_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
-    let mut file = fs::File::create(path)?;
+    let mut file = fs::File::create_new(path)?;
     file.write_all(bytes)?;
     file.sync_all()
 }
@@ -1195,11 +1209,7 @@ pub(super) fn prepare_agent_spawn_files(
 ) -> Result<AgentSpawnFiles, ErrorData> {
     let agent_kind = params.effective_cli()?;
     let root = agent_spawn_root_dir()?;
-    // The spawn directory and the manifest describing it are published as one
-    // step (#1879). Before this, the directory was created first and the
-    // manifest written tenth; any failure in between left a transcript
-    // directory that nothing described and that could never be ingested.
-    let log_dir = publish_agent_spawn_dir_with_manifest(&root, spawn_id, params, working_dir)?;
+    let log_dir = root.join(spawn_id);
     let prompt_path = log_dir.join("prompt.txt");
     let stdout_path = log_dir.join("stdout.jsonl");
     let stderr_path = log_dir.join("stderr.log");
@@ -1236,15 +1246,17 @@ pub(super) fn prepare_agent_spawn_files(
         &task_started_path,
         &task_started_script_path,
     )?;
-    fs::write(&prompt_path, prompt).map_err(|error| {
-        mcp_error(
-            error_codes::STORAGE_WRITE_FAILED,
-            format!(
-                "act_spawn_agent failed to write prompt file {}: {error}",
-                prompt_path.display()
-            ),
-        )
-    })?;
+    // The visible spawn directory is the transcript ingester's discovery
+    // boundary. Publish it only after every path the ingester requires exists;
+    // a timeout can otherwise kill the wrapper before shell redirection creates
+    // stdout.jsonl, permanently parking the cursor on a missing source (#2244).
+    publish_agent_spawn_dir_with_required_files(
+        &root,
+        spawn_id,
+        params,
+        working_dir,
+        prompt.as_bytes(),
+    )?;
     if let Some(config_path) = &mcp_config_path {
         let config = json!({
             "mcpServers": {
