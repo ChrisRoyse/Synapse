@@ -612,6 +612,15 @@ const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
 /// Reader-lease lifetime for bounded off-runtime corpus scans that enumerate
 /// Base rows and hydrate their slot rows from the same MVCC view.
 pub(crate) const INTELLIGENCE_CORPUS_READER_LEASE_MS: u64 = 30_000;
+/// Reader-lease lifetime for MMD drift's exact two-pass bounded corpus.
+///
+/// The public drift contract accepts up to 20,000 selected records and must
+/// hydrate that bounded set twice at one coherent MVCC sequence. The generic
+/// 30-second intelligence lease is sufficient for the scheduled 2,000-row
+/// pass but expires during the supported maximum on the production vault.
+/// Five minutes is the repository's finite coherent-scan hard ceiling; the
+/// scoped snapshot still releases the lease immediately on every return path.
+pub(crate) const MMD_DRIFT_CORPUS_READER_LEASE_MS: u64 = 5 * 60_000;
 /// Reader-lease lifetime for an exact physical whole-CF census.
 ///
 /// Unlike a bounded intelligence corpus, this operation deliberately walks

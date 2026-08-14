@@ -1268,7 +1268,7 @@ impl SynapseCalyxVault {
         max_records: usize,
         recent_fraction: f32,
     ) -> Result<MmdCorpus, SynapseCalyxError> {
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+        self.with_read_snapshot(crate::MMD_DRIFT_CORPUS_READER_LEASE_MS, |snapshot| {
             let mut selected = BTreeSet::new();
             let mut records_scanned = 0usize;
             let walk = self.walk_cf_snapshot(
