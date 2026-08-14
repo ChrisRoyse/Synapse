@@ -4928,6 +4928,34 @@ impl StorageBackend for CalyxBackend {
             "scan native OLAP slot column",
             false,
             |vault| {
+                let created_at_ms = calyx_clock_now_for_read(vault, "calyx_registry")?;
+                let panel = resolve_panel_contract(vault, panel_version, created_at_ms)?
+                    .ok_or_else(|| StorageError::BackendInvalidConfig {
+                        value: panel_version.to_string(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_OLAP_PANEL_UNKNOWN: panel {panel_version} has no declared Registry contract; remediation=inspect the panel catalog and pass an exact declared panel_version"
+                        ),
+                    })?;
+                if !panel
+                    .panel
+                    .slots
+                    .iter()
+                    .any(|slot| u32::from(slot.slot_id.0) == slot_id)
+                {
+                    let declared_slot_ids = panel
+                        .panel
+                        .slots
+                        .iter()
+                        .map(|slot| slot.slot_id.0.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    return Err(StorageError::BackendInvalidConfig {
+                        value: slot_id.to_string(),
+                        detail: format!(
+                            "SYNAPSE_CALYX_OLAP_SLOT_UNDECLARED: slot {slot_id} is not declared by Registry panel {panel_version}; declared_slot_ids=[{declared_slot_ids}]; remediation=pass one of the exact declared slot ids for this panel"
+                        ),
+                    });
+                }
                 vault
                     .olap_aggregate_slot(
                         panel_version,

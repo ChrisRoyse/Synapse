@@ -40,8 +40,8 @@ use calyx_lodestar::{
     refine_kernel_with_recall_support, seal_completed_kernel_identity, write_kernel_artifact,
 };
 use calyx_loom::{
-    AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, NeffEstimate,
-    StaticPairGainGate, cross_term_upper_bound, dda_signal_yield, plan_cross_terms,
+    AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, MaterializationBatchReport,
+    NeffEstimate, StaticPairGainGate, cross_term_upper_bound, dda_signal_yield, plan_cross_terms,
 };
 use calyx_oracle::{AnnealConfig, DomainId, SlotSet, WardCompletionRegion};
 use calyx_paths::AssocGraph;
@@ -395,6 +395,7 @@ impl SynapseCalyxVault {
         &self,
         params: SynapseCalyxWeaveParams,
     ) -> Result<SynapseCalyxWeaveReport, SynapseCalyxError> {
+        let weave_started = std::time::Instant::now();
         // Hot-path boundary (#1686): live Loom weave is an off-runtime
         // intelligence computation and must never be driven from a tagged tick.
         crate::lowering::hot_context::assert_cold_calyx("weave_panel");
@@ -424,8 +425,10 @@ impl SynapseCalyxVault {
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let window = TimeWindowNs::new(params.since_ts_ns, params.until_ts_ns)?;
+        let corpus_load_started = std::time::Instant::now();
         let corpus =
             self.load_panel_dense_corpus_in_window(params.panel_version, max_records, window)?;
+        let corpus_load_secs = corpus_load_started.elapsed().as_secs_f64();
         let records_scanned = corpus.records_scanned;
         let records_outside_window = corpus.records_outside_window;
         let blind_spots = blind_spot_summary(&corpus);
@@ -436,9 +439,9 @@ impl SynapseCalyxVault {
         // interaction lazy (0.0 < floor) and only agreement is eager.
         let gate = StaticPairGainGate { gain_bits: 0.0 };
         let mut records_woven = 0usize;
-        let mut agreement_zero_norm_records = 0usize;
         let mut lens_ids: BTreeSet<SlotId> = BTreeSet::new();
         let mut measured_slot_instances = 0usize;
+        let mut materialization_plans = Vec::with_capacity(corpus.records.len());
         let configured_backend = if corpus.records.is_empty()
             || params.math_execution_class != SynapseCalyxMathExecutionClass::Configured
         {
@@ -472,6 +475,7 @@ impl SynapseCalyxVault {
             background_cpu_activated = background_backend.is_some(),
             "selected the declared weave math execution class without runtime fallback"
         );
+        let plan_started = std::time::Instant::now();
         for record in &corpus.records {
             for slot in record.slots.keys() {
                 lens_ids.insert(*slot);
@@ -480,19 +484,9 @@ impl SynapseCalyxVault {
             if record.slots.len() < 2 {
                 // A single-slot record still contributes its measured slots to
                 // the panel, but has no within-record cross-term to weave.
+                materialization_plans.push(None);
                 continue;
             }
-            let backend = backend.ok_or_else(|| {
-                SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_WEAVE_MATH_BACKEND_MISSING",
-                    format!(
-                        "panel {} has a math-bearing record but execution class {} produced no backend",
-                        params.panel_version,
-                        params.math_execution_class.as_str()
-                    ),
-                    "repair the declared execution-class backend initialization; Synapse refuses to omit association math",
-                )
-            })?;
             let mut slot_ids: Vec<SlotId> = record.slots.keys().copied().collect();
             slot_ids.sort_unstable();
             let mut plan = plan_cross_terms(&slot_ids, &gate);
@@ -508,23 +502,60 @@ impl SynapseCalyxVault {
                     entry.action = MaterializationAction::LazyCache;
                 }
             }
-            let skips_before = store.zero_norm_agreement_skip_total();
-            store
-                .materialize_plan(
-                    backend,
-                    params.panel_version,
-                    record.cx_id,
-                    &record.slots,
-                    &plan,
-                )
-                .map_err(|error| {
-                    loom_math_error("materialize within-record cross-terms", &error)
-                })?;
-            if store.zero_norm_agreement_skip_total() > skips_before {
-                agreement_zero_norm_records += 1;
-            }
+            materialization_plans.push(Some(plan));
             records_woven += 1;
         }
+        let plan_secs = plan_started.elapsed().as_secs_f64();
+
+        let materialize_started = std::time::Instant::now();
+        let materialization = if records_woven == 0 {
+            MaterializationBatchReport::default()
+        } else {
+            let backend = backend.ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_WEAVE_MATH_BACKEND_MISSING",
+                    format!(
+                        "panel {} has {records_woven} math-bearing records but execution class {} produced no backend",
+                        params.panel_version,
+                        params.math_execution_class.as_str()
+                    ),
+                    "repair the declared execution-class backend initialization; Synapse refuses to omit association math",
+                )
+            })?;
+            store
+                .materialize_plans(
+                    backend,
+                    params.panel_version,
+                    corpus
+                        .records
+                        .iter()
+                        .zip(&materialization_plans)
+                        .filter_map(|(record, plan)| {
+                            plan.as_ref()
+                                .map(|plan| (record.cx_id, &record.slots, plan))
+                        }),
+                )
+                .map_err(|error| {
+                    loom_math_error(
+                        "materialize panel-batched within-record cross-terms",
+                        &error,
+                    )
+                })?
+        };
+        let agreement_zero_norm_records = materialization.zero_norm_records;
+        let materialize_secs = materialize_started.elapsed().as_secs_f64();
+        tracing::info!(
+            code = "SYNAPSE_CALYX_WEAVE_MATERIALIZATION_COMPLETED",
+            panel_version = params.panel_version,
+            records_woven,
+            cross_terms_inserted = materialization.inserted,
+            backend_dispatches = materialization.backend_dispatches,
+            zero_norm_records = materialization.zero_norm_records,
+            corpus_load_secs,
+            plan_secs,
+            materialize_secs,
+            "completed bounded panel-wide Loom materialization"
+        );
 
         // #2076: lift Loom's agreement-lane skip ledger onto the report so the
         // unattended maintainer can name the lens pairs it could not score.
@@ -543,12 +574,12 @@ impl SynapseCalyxVault {
             .collect::<Vec<_>>();
 
         let cross_terms_materialized = store.xterm_count();
-        let xterm_rows = store
-            .xterm_kv_rows()
-            .map_err(|error| loom_math_error("encode XTerm rows", &error))?;
         let agreement_graph = store
             .agreement_graph()
             .map_err(|error| loom_math_error("aggregate agreement graph", &error))?;
+        let xterm_rows = store
+            .into_xterm_kv_rows()
+            .map_err(|error| loom_math_error("encode XTerm rows", &error))?;
 
         let mut writes: Vec<SynapseCalyxCfWrite> = Vec::with_capacity(xterm_rows.len());
         for (key, value) in xterm_rows {
@@ -579,20 +610,25 @@ impl SynapseCalyxVault {
             agreement_edges.push(out);
         }
 
+        let knn_started = std::time::Instant::now();
         let (between_record_edges, knn_zero_norm_exclusions) =
             Self::build_between_record_edges(backend, &corpus, params.knn_k)?;
-        for edge in &between_record_edges {
+        let between_record_edges_persisted = between_record_edges.len();
+        for edge in between_record_edges {
             writes.push(SynapseCalyxCfWrite {
                 cf: ColumnFamily::Graph,
-                key: between_record_edge_key(edge),
-                value: encode_json(edge)?,
+                key: between_record_edge_key(&edge),
+                value: encode_json(&edge)?,
             });
         }
+        let knn_secs = knn_started.elapsed().as_secs_f64();
 
+        let persist_started = std::time::Instant::now();
         if !writes.is_empty() {
             self.write_cf_batch(writes)?;
             self.flush()?;
         }
+        let persist_secs = persist_started.elapsed().as_secs_f64();
 
         // #2114: still a physical readback of what this weave persisted, but no
         // longer re-walked when the family provably has not changed since the
@@ -618,6 +654,25 @@ impl SynapseCalyxVault {
         );
         let xterm_cf_rows_after = xterm_readback.rows();
         let graph_cf_rows_after = graph_readback.rows();
+        let total_secs = weave_started.elapsed().as_secs_f64();
+        tracing::info!(
+            code = "SYNAPSE_CALYX_WEAVE_PHASES_COMPLETED",
+            panel_version = params.panel_version,
+            records_scanned,
+            records_woven,
+            backend_dispatches = materialization.backend_dispatches,
+            cross_terms_materialized,
+            between_record_edges_persisted,
+            corpus_load_secs,
+            plan_secs,
+            materialize_secs,
+            knn_secs,
+            persist_secs,
+            total_secs,
+            xterm_cf_rows_after,
+            graph_cf_rows_after,
+            "completed every Loom weave phase and independent physical CF count readback"
+        );
 
         let mut abundance = self.build_abundance_report(
             params.panel_version,
@@ -641,7 +696,7 @@ impl SynapseCalyxVault {
             slot_states: corpus.slot_states(),
             cross_terms_materialized,
             agreement_edges_persisted: agreement_edges.len(),
-            between_record_edges_persisted: between_record_edges.len(),
+            between_record_edges_persisted,
             knn_zero_norm_exclusions,
             agreement_zero_norm_skips,
             agreement_zero_norm_records,

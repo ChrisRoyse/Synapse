@@ -56,6 +56,26 @@ pub struct ZeroNormAgreementSkip {
 /// counted separately, so truncation is visible and never silent.
 pub const MAX_RECORDED_ZERO_NORM_SKIPS: usize = 1_024;
 
+/// Maximum measured host/device payload submitted by one agreement dispatch.
+///
+/// A panel weave groups pairs by dimension and then submits bounded slabs. This
+/// keeps the GPU fed without turning every record into its own reservation,
+/// allocation, transfer, launch, synchronization, and telemetry transaction.
+/// A single pair whose two vectors exceed the bound is still submitted whole;
+/// splitting a cosine vector would change the reduction contract.
+pub const MAX_AGREEMENT_DISPATCH_BYTES: usize = 16 * 1024 * 1024;
+
+/// Readback from one panel-wide Loom materialization pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaterializationBatchReport {
+    /// Newly materialized XTerm rows.
+    pub inserted: usize,
+    /// Actual Forge backend calls after dimension grouping and bounded slicing.
+    pub backend_dispatches: usize,
+    /// Distinct records with at least one zero-norm agreement pair.
+    pub zero_norm_records: usize,
+}
+
 #[derive(Clone, Debug)]
 pub struct LoomStore {
     xterm_cf: BTreeMap<CrossTermKey, XtermRow>,
@@ -165,101 +185,164 @@ impl LoomStore {
         slots: &BTreeMap<SlotId, Vec<f32>>,
         plan: &MaterializationPlan,
     ) -> Result<usize> {
-        let mut inserted = 0;
-        let mut zero_norm_by_slot = BTreeMap::<SlotId, bool>::new();
-        let mut queued_agreement_keys = BTreeSet::<CrossTermKey>::new();
-        let mut agreement_by_dim = BTreeMap::<usize, Vec<PendingAgreement<'_>>>::new();
-        for slot in slots.keys() {
-            self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
-        }
-        for entry in plan
-            .entries
-            .iter()
-            .filter(|entry| entry.action == MaterializationAction::EagerStore)
-        {
-            let (a, b) = canonical_pair(entry.a, entry.b);
-            let key = CrossTermKey {
-                cx_id: cx,
-                a: PanelSlotId::new(panel_version, a),
-                b: PanelSlotId::new(panel_version, b),
-                kind: entry.kind,
-            };
-            if self.xterm_cf.contains_key(&key) {
-                continue;
-            }
-            if entry.kind == CrossTermKind::Agreement {
-                let (left, right) = slot_pair(a, b, slots)?;
-                ensure_same_dim(left, right)?;
-                let left_zero = agreement_operand_zero_norm(a, slots, &mut zero_norm_by_slot)?;
-                let right_zero = agreement_operand_zero_norm(b, slots, &mut zero_norm_by_slot)?;
-                let zero_side = if left_zero {
-                    Some(ZeroNormSide::A)
-                } else if right_zero {
-                    Some(ZeroNormSide::B)
-                } else {
-                    None
-                };
-                if let Some(zero_side) = zero_side {
-                    self.record_zero_norm_skip(ZeroNormAgreementSkip {
-                        cx_id: cx,
-                        a: key.a,
-                        b: key.b,
-                        zero_side,
-                    });
-                    continue;
-                }
-                if !queued_agreement_keys.insert(key) {
-                    continue;
-                }
-                agreement_by_dim
-                    .entry(left.len())
-                    .or_default()
-                    .push(PendingAgreement { key, left, right });
-                continue;
-            }
-            let value = compute_cross_term(a, b, entry.kind, slots)?;
-            self.xterm_cf.insert(
-                key,
-                XtermRow {
-                    key,
-                    value,
-                    tag: SignalProvenanceTag::Derived,
-                },
-            );
-            inserted += 1;
-        }
+        self.materialize_plans(backend, panel_version, std::iter::once((cx, slots, plan)))
+            .map(|report| report.inserted)
+    }
 
-        for (dim, pending) in agreement_by_dim {
-            let pair_count = pending.len();
-            let row_values = pair_count.checked_mul(dim).ok_or_else(|| {
-                loom_error(
-                    CALYX_LOOM_DIM_MISMATCH,
-                    format!(
-                        "Loom agreement batch shape overflows usize: pairs={pair_count} dim={dim}"
-                    ),
-                )
-            })?;
-            let mut left_rows = Vec::with_capacity(row_values);
-            let mut right_rows = Vec::with_capacity(row_values);
-            for pair in &pending {
-                left_rows.extend_from_slice(pair.left);
-                right_rows.extend_from_slice(pair.right);
+    /// Materialize many record plans with one bounded batch per dimension slab.
+    ///
+    /// All validation and zero-norm accounting remain record-qualified. Only
+    /// the independent Forge calls are coalesced, so results are identical to
+    /// repeated [`Self::materialize_plan`] calls while avoiding thousands of
+    /// tiny GPU control-plane transactions for a complete panel.
+    pub fn materialize_plans<'a>(
+        &mut self,
+        backend: &dyn Backend,
+        panel_version: u32,
+        records: impl IntoIterator<
+            Item = (
+                CxId,
+                &'a BTreeMap<SlotId, Vec<f32>>,
+                &'a MaterializationPlan,
+            ),
+        >,
+    ) -> Result<MaterializationBatchReport> {
+        let mut inserted = 0;
+        let mut queued_agreement_keys = BTreeSet::<CrossTermKey>::new();
+        let mut zero_norm_records = BTreeSet::<CxId>::new();
+        let mut agreement_by_dim = BTreeMap::<usize, Vec<PendingAgreement<'a>>>::new();
+        for (cx, slots, plan) in records {
+            let mut zero_norm_by_slot = BTreeMap::<SlotId, bool>::new();
+            for slot in slots.keys() {
+                self.tag_measured(cx, PanelSlotId::new(panel_version, *slot));
             }
-            let scores =
-                agreement_batch_prevalidated(backend, &left_rows, &right_rows, pair_count, dim)?;
-            for (pair, value) in pending.into_iter().zip(scores) {
+            for entry in plan
+                .entries
+                .iter()
+                .filter(|entry| entry.action == MaterializationAction::EagerStore)
+            {
+                let (a, b) = canonical_pair(entry.a, entry.b);
+                let key = CrossTermKey {
+                    cx_id: cx,
+                    a: PanelSlotId::new(panel_version, a),
+                    b: PanelSlotId::new(panel_version, b),
+                    kind: entry.kind,
+                };
+                if self.xterm_cf.contains_key(&key) {
+                    continue;
+                }
+                if entry.kind == CrossTermKind::Agreement {
+                    let (left, right) = slot_pair(a, b, slots)?;
+                    ensure_same_dim(left, right)?;
+                    let left_zero = agreement_operand_zero_norm(a, slots, &mut zero_norm_by_slot)?;
+                    let right_zero = agreement_operand_zero_norm(b, slots, &mut zero_norm_by_slot)?;
+                    let zero_side = if left_zero {
+                        Some(ZeroNormSide::A)
+                    } else if right_zero {
+                        Some(ZeroNormSide::B)
+                    } else {
+                        None
+                    };
+                    if let Some(zero_side) = zero_side {
+                        self.record_zero_norm_skip(ZeroNormAgreementSkip {
+                            cx_id: cx,
+                            a: key.a,
+                            b: key.b,
+                            zero_side,
+                        });
+                        zero_norm_records.insert(cx);
+                        continue;
+                    }
+                    if !queued_agreement_keys.insert(key) {
+                        continue;
+                    }
+                    agreement_by_dim
+                        .entry(left.len())
+                        .or_default()
+                        .push(PendingAgreement { key, left, right });
+                    continue;
+                }
+                let value = compute_cross_term(a, b, entry.kind, slots)?;
                 self.xterm_cf.insert(
-                    pair.key,
+                    key,
                     XtermRow {
-                        key: pair.key,
-                        value: CrossTermValue::Scalar(value),
+                        key,
+                        value,
                         tag: SignalProvenanceTag::Derived,
                     },
                 );
                 inserted += 1;
             }
         }
-        Ok(inserted)
+
+        let mut backend_dispatches = 0usize;
+        for (dim, pending) in agreement_by_dim {
+            let measured_values_per_pair = dim
+                .checked_mul(2)
+                .and_then(|values| values.checked_add(1))
+                .ok_or_else(|| {
+                    loom_error(
+                        CALYX_LOOM_DIM_MISMATCH,
+                        format!("Loom agreement measured payload overflows usize: dim={dim}"),
+                    )
+                })?;
+            let measured_bytes_per_pair = measured_values_per_pair
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    loom_error(
+                        CALYX_LOOM_DIM_MISMATCH,
+                        format!("Loom agreement measured byte count overflows usize: dim={dim}"),
+                    )
+                })?;
+            let pairs_per_dispatch =
+                (MAX_AGREEMENT_DISPATCH_BYTES / measured_bytes_per_pair).max(1);
+            for batch in pending.chunks(pairs_per_dispatch) {
+                let pair_count = batch.len();
+                let row_values = pair_count.checked_mul(dim).ok_or_else(|| {
+                    loom_error(
+                        CALYX_LOOM_DIM_MISMATCH,
+                        format!(
+                            "Loom agreement batch shape overflows usize: pairs={pair_count} dim={dim}"
+                        ),
+                    )
+                })?;
+                let mut left_rows = Vec::with_capacity(row_values);
+                let mut right_rows = Vec::with_capacity(row_values);
+                for pair in batch {
+                    left_rows.extend_from_slice(pair.left);
+                    right_rows.extend_from_slice(pair.right);
+                }
+                let scores = agreement_batch_prevalidated(
+                    backend,
+                    &left_rows,
+                    &right_rows,
+                    pair_count,
+                    dim,
+                )?;
+                backend_dispatches = backend_dispatches.checked_add(1).ok_or_else(|| {
+                    loom_error(
+                        CALYX_LOOM_DIM_MISMATCH,
+                        "Loom agreement backend dispatch count overflows usize",
+                    )
+                })?;
+                for (pair, value) in batch.iter().zip(scores) {
+                    self.xterm_cf.insert(
+                        pair.key,
+                        XtermRow {
+                            key: pair.key,
+                            value: CrossTermValue::Scalar(value),
+                            tag: SignalProvenanceTag::Derived,
+                        },
+                    );
+                    inserted += 1;
+                }
+            }
+        }
+        Ok(MaterializationBatchReport {
+            inserted,
+            backend_dispatches,
+            zero_norm_records: zero_norm_records.len(),
+        })
     }
 
     pub fn cross_term(
@@ -326,6 +409,21 @@ impl LoomStore {
         }
         router.flush_cf(ColumnFamily::XTerm)?;
         Ok(self.xterm_cf.len())
+    }
+
+    /// Encode and consume all in-memory XTerm rows as `(key, value)` byte pairs.
+    ///
+    /// Consuming the store releases each decoded row while its encoded write is
+    /// built, avoiding two complete representations of a large panel in memory.
+    pub fn into_xterm_kv_rows(self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::with_capacity(self.xterm_cf.len());
+        for (_, row) in self.xterm_cf {
+            let key = xterm_key(&row.key);
+            let value = serde_json::to_vec(&row)
+                .map_err(|error| CalyxError::disk_pressure(format!("encode xterm row: {error}")))?;
+            out.push((key, value));
+        }
+        Ok(out)
     }
 
     /// Encode all in-memory XTerm rows as `(key, value)` byte pairs using the

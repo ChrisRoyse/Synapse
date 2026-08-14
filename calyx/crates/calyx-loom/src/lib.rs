@@ -15,7 +15,8 @@ pub use abundance::{
     meaning_compression_yield,
 };
 pub use agreement_graph::{
-    AgreementEdge, LoomStore, MAX_RECORDED_ZERO_NORM_SKIPS, ZeroNormAgreementSkip,
+    AgreementEdge, LoomStore, MAX_AGREEMENT_DISPATCH_BYTES, MAX_RECORDED_ZERO_NORM_SKIPS,
+    MaterializationBatchReport, ZeroNormAgreementSkip,
 };
 pub use blind_spot::{
     BlindSpotAlert, BlindSpotCalibration, BlindSpotCalibrationEvidence, BlindSpotCalibrationParams,
