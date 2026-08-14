@@ -2960,13 +2960,20 @@ impl SnapshotVersionGcPressure {
 struct CalyxGcRunner {
     vault: Arc<CalyxVaultRuntime>,
     snapshot_version_gc: Mutex<SnapshotVersionGcPressure>,
+    /// Exact derived-source reachability owned by this long-lived maintenance
+    /// runner. Operator-requested GC creates a fresh runner and therefore
+    /// performs the explicit full rebuild promised by the tool contract.
+    source_census: Mutex<Option<CalyxGcSourceCensusCache>>,
+    retain_source_census: bool,
 }
 
 impl CalyxGcRunner {
-    fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
+    fn new(vault: Arc<CalyxVaultRuntime>, retain_source_census: bool) -> Self {
         Self {
             vault,
             snapshot_version_gc: Mutex::new(SnapshotVersionGcPressure::default()),
+            source_census: Mutex::new(None),
+            retain_source_census,
         }
     }
 
@@ -3111,14 +3118,72 @@ impl CalyxGcRunner {
         hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport> {
         let budget = calyx_gc_row_budget(cf_name, soft_cap_rows, hard_cap_rows)?;
+        if budget.protected {
+            return Err(calyx_write_failed_detail(
+                cf_name,
+                format!(
+                    "STORAGE_CALYX_GC_PROTECTED_CF_POLICY: cf={cf_name} unit={} soft_cap={} hard_cap={}; generic GC has no deletion authority for this family, so the request was rejected before any source census or CF scan; remediation=use the typed retention owner declared for this family",
+                    budget.unit.as_str(),
+                    budget.soft_cap,
+                    budget.hard_cap
+                ),
+            ));
+        }
         self.run_with_budgets(std::slice::from_ref(&budget))
     }
 
     fn run_with_budgets(&self, budgets: &[CalyxGcBudget]) -> StorageResult<gc::GcReport> {
-        self.vault
+        let gc_result = self
+            .vault
             .with_vault(CALYX_GC_CF, "run Calyx GC", true, |vault| {
-                run_calyx_gc_budgets(vault, budgets)
-            })
+                run_calyx_gc_budgets(vault, budgets, &self.source_census)
+            });
+        if self.retain_source_census {
+            return gc_result;
+        }
+        let release_result = self.release_one_shot_source_census();
+        match (gc_result, release_result) {
+            (Ok(report), Ok(())) => Ok(report),
+            (Err(gc_error), Ok(())) => Err(gc_error),
+            (Ok(_report), Err(release_error)) => Err(release_error),
+            (Err(gc_error), Err(release_error)) => Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_AND_ONE_SHOT_CENSUS_RELEASE_FAILED: GC failed with {gc_error}; releasing its one-shot exact source census also failed with {release_error}; remediation=repair both independently reported failures before retrying"
+                ),
+            )),
+        }
+    }
+
+    fn release_one_shot_source_census(&self) -> StorageResult<()> {
+        let mut cache = self.source_census.lock().map_err(|poisoned| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_ONE_SHOT_CENSUS_CACHE_POISONED: could not destroy the operator GC census after use: {poisoned}; remediation=inspect the earlier panic and restart the daemon after repair"
+                ),
+            )
+        })?;
+        let had_census = cache.take().is_some();
+        drop(cache);
+        let release = synapse_calyx::release_process_memory("storage_gc_one_shot_census_complete")
+            .map_err(|source| {
+                calyx_write_failed(
+                    CALYX_GC_CF,
+                    "release the destroyed one-shot source census",
+                    &source,
+                )
+            })?;
+        tracing::info!(
+            code = "STORAGE_CALYX_GC_ONE_SHOT_CENSUS_RELEASED",
+            had_census,
+            private_bytes_before = release.private_bytes_before,
+            private_bytes_after = release.private_bytes_after,
+            private_bytes_reclaimed = release.private_bytes_reclaimed,
+            release_elapsed_us = release.elapsed_us,
+            "destroyed the explicit operator GC source census and returned its allocator pages"
+        );
+        Ok(())
     }
 }
 
@@ -3710,7 +3775,7 @@ impl StorageBackend for CalyxBackend {
     /// the unescalated base budget rather than inheriting the periodic tick's
     /// memory-pressure state.
     fn run_gc_once(&self) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault)).run_full_once()
+        CalyxGcRunner::new(Arc::clone(&self.vault), false).run_full_once()
     }
 
     fn run_gc_once_with_row_caps(
@@ -3719,7 +3784,7 @@ impl StorageBackend for CalyxBackend {
         soft_cap_rows: u64,
         hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault)).run_full_once_with_row_cap(
+        CalyxGcRunner::new(Arc::clone(&self.vault), false).run_full_once_with_row_cap(
             cf_name,
             soft_cap_rows,
             hard_cap_rows,
@@ -3729,7 +3794,7 @@ impl StorageBackend for CalyxBackend {
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask> {
         let config = gc::GcConfig::from_retention_defaults();
         gc::spawn_runner(
-            Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault))),
+            Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault), true)),
             config.interval(),
             gc::MaintenanceTaskKind::GarbageCollection,
         )
@@ -13856,6 +13921,97 @@ fn packed_source_reference_key(chunks: &[Vec<u8>], range: PackedSourceReferenceR
 /// still points at. The GC tick's allocation-compact protection set (#1882).
 type DerivedSourceReferences = BTreeMap<String, PackedSourceReferenceKeys>;
 
+const CALYX_GC_SOURCE_CENSUS_FULL_BASELINE: &str = "full_baseline";
+const CALYX_GC_SOURCE_CENSUS_INCREMENTAL_DELTA: &str = "incremental_delta";
+const CALYX_GC_SOURCE_CENSUS_UNCHANGED: &str = "unchanged";
+const CALYX_GC_SOURCE_CENSUS_FULL_REBASE: &str = "full_rebase";
+const CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE: &str = "base_tombstone";
+const CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND: &str = "delta_reference_bound";
+
+/// Maximum number of post-baseline exact references retained in individually
+/// allocated ordered sets. Crossing the bound rebuilds the packed baseline at
+/// one pinned sequence, so a long-lived process cannot accumulate an unbounded
+/// remembered-set overhead.
+const CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES: usize = 65_536;
+
+/// Exact reachability at one committed sequence.
+///
+/// The large baseline stays in allocation-compact arenas. Changes after that
+/// baseline are normally tiny and live in ordered sets so each tick updates
+/// only changed references instead of sorting 1.5M ranges again. Tombstones
+/// invalidate the additive representation and force an exact rebase.
+#[derive(Default)]
+struct DerivedSourceReferenceIndex {
+    baseline: DerivedSourceReferences,
+    delta: BTreeMap<String, BTreeSet<Vec<u8>>>,
+}
+
+impl DerivedSourceReferenceIndex {
+    fn contains(&self, cf_name: &str, key: &[u8]) -> bool {
+        self.baseline
+            .get(cf_name)
+            .is_some_and(|keys| keys.contains(key))
+            || self
+                .delta
+                .get(cf_name)
+                .is_some_and(|keys| keys.contains(key))
+    }
+
+    fn insert_delta(&mut self, cf_name: String, key: Vec<u8>) {
+        if self
+            .baseline
+            .get(&cf_name)
+            .is_some_and(|keys| keys.contains(&key))
+        {
+            return;
+        }
+        self.delta.entry(cf_name).or_default().insert(key);
+    }
+
+    fn delta_reference_count(&self) -> usize {
+        self.delta.values().map(BTreeSet::len).sum()
+    }
+
+    fn referenced_column_families(&self) -> usize {
+        self.baseline
+            .keys()
+            .chain(self.delta.keys())
+            .collect::<BTreeSet<_>>()
+            .len()
+    }
+
+    fn referenced_rows(&self) -> StorageResult<u64> {
+        let baseline = derived_source_reference_metrics(&self.baseline)?.rows;
+        let delta = calyx_len_to_u64(
+            CALYX_GC_CF,
+            "Calyx GC delta protected source rows",
+            self.delta_reference_count(),
+        )?;
+        baseline.checked_add(delta).ok_or_else(|| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "Calyx GC protected source row count overflowed u64",
+            )
+        })
+    }
+}
+
+struct CalyxGcSourceCensusCache {
+    pinned_seq: u64,
+    referenced: DerivedSourceReferenceIndex,
+}
+
+#[derive(Clone, Copy)]
+struct DerivedSourceCensusProvenance {
+    mode: &'static str,
+    pinned_seq: u64,
+    previous_pinned_seq: Option<u64>,
+    pages: u64,
+    base_rows_visited: u64,
+    changed_base_keys: u64,
+    rebase_reason: Option<&'static str>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct DerivedSourceReferenceMetrics {
     rows: u64,
@@ -14193,17 +14349,151 @@ where
 /// in its family eligible for eviction. The same window existed before this
 /// change — a census, however atomic, is always taken before the deletions it
 /// authorises — and it is bounded here by one GC interval.
-fn collect_derived_source_references(
+#[expect(
+    clippy::too_many_lines,
+    reason = "one exact baseline/delta/rebase state machine keeps every cache transition and its fail-closed invalidation adjacent"
+)]
+fn refresh_derived_source_references(
     vault: &SynapseCalyxVault,
-) -> StorageResult<(DerivedSourceReferences, gc::DerivedSourceCensus)> {
+    cache: &mut Option<CalyxGcSourceCensusCache>,
+) -> StorageResult<gc::DerivedSourceCensus> {
     let reader = CalyxPinnedReader::pin(
         vault,
         CALYX_GC_CF,
         "derived_source_references",
         CALYX_GC_SOURCE_CENSUS_LEASE_MS,
     )?;
+
+    let Some(previous) = cache.as_mut() else {
+        let (rebuilt, census) = rebuild_derived_source_references(
+            &reader,
+            CALYX_GC_SOURCE_CENSUS_FULL_BASELINE,
+            None,
+            0,
+            None,
+        )?;
+        *cache = Some(rebuilt);
+        return Ok(census);
+    };
+
+    let previous_pinned_seq = previous.pinned_seq;
+    if reader.pinned_seq() < previous_pinned_seq {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_SEQUENCE_INVERTED: previous_pinned_seq={previous_pinned_seq} current_pinned_seq={}; refusing to apply an inverted reachability delta; remediation=repair the vault sequence regression before retrying",
+                reader.pinned_seq()
+            ),
+        ));
+    }
+    let changed_keys = vault
+        .changed_cf_keys_after_snapshot(reader.snapshot(), ColumnFamily::Base, previous_pinned_seq)
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "read the exact Base changed-key delta for derived-source reachability",
+                &source,
+            )
+        })?;
+    let changed_base_keys = calyx_len_to_u64(
+        CALYX_GC_CF,
+        "Calyx GC changed Base keys",
+        changed_keys.len(),
+    )?;
+    if changed_keys.is_empty() {
+        previous.pinned_seq = reader.pinned_seq();
+        let census = derived_source_census_from_index(
+            &previous.referenced,
+            DerivedSourceCensusProvenance {
+                mode: CALYX_GC_SOURCE_CENSUS_UNCHANGED,
+                pinned_seq: reader.pinned_seq(),
+                previous_pinned_seq: Some(previous_pinned_seq),
+                pages: 0,
+                base_rows_visited: 0,
+                changed_base_keys: 0,
+                rebase_reason: None,
+            },
+        )?;
+        emit_derived_source_census(&previous.referenced, census)?;
+        return Ok(census);
+    }
+
+    for key in &changed_keys {
+        let Some(value) = vault
+            .read_cf_snapshot(reader.snapshot(), ColumnFamily::Base, key)
+            .map_err(|source| {
+                calyx_write_failed(
+                    CALYX_GC_CF,
+                    "read one changed Base row from the pinned reachability snapshot",
+                    &source,
+                )
+            })?
+        else {
+            let (rebuilt, census) = rebuild_derived_source_references(
+                &reader,
+                CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
+                Some(previous_pinned_seq),
+                changed_base_keys,
+                Some(CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE),
+            )?;
+            *previous = rebuilt;
+            return Ok(census);
+        };
+        if let Some((source_cf, source_key)) =
+            decode_derived_source_reference(&value).map_err(|source| {
+                calyx_write_failed(
+                    CALYX_GC_CF,
+                    "decode one changed Base row's derived source reference",
+                    &source,
+                )
+            })?
+        {
+            // Base identity is content-addressed and its source pointer is
+            // immutable across legitimate anchor/frequency rewrites. New rows
+            // therefore add reachability; deletion is the only subtractive
+            // transition and takes the full-rebase branch above.
+            previous.referenced.insert_delta(source_cf, source_key);
+        }
+    }
+
+    if previous.referenced.delta_reference_count() >= CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES {
+        let (rebuilt, census) = rebuild_derived_source_references(
+            &reader,
+            CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
+            Some(previous_pinned_seq),
+            changed_base_keys,
+            Some(CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND),
+        )?;
+        *previous = rebuilt;
+        return Ok(census);
+    }
+
+    previous.pinned_seq = reader.pinned_seq();
+    let census = derived_source_census_from_index(
+        &previous.referenced,
+        DerivedSourceCensusProvenance {
+            mode: CALYX_GC_SOURCE_CENSUS_INCREMENTAL_DELTA,
+            pinned_seq: reader.pinned_seq(),
+            previous_pinned_seq: Some(previous_pinned_seq),
+            pages: 0,
+            base_rows_visited: changed_base_keys,
+            changed_base_keys,
+            rebase_reason: None,
+        },
+    )?;
+    emit_derived_source_census(&previous.referenced, census)?;
+    Ok(census)
+}
+
+fn rebuild_derived_source_references(
+    reader: &CalyxPinnedReader<'_>,
+    mode: &'static str,
+    previous_pinned_seq: Option<u64>,
+    changed_base_keys: u64,
+    rebase_reason: Option<&'static str>,
+) -> StorageResult<(CalyxGcSourceCensusCache, gc::DerivedSourceCensus)> {
     let mut referenced = DerivedSourceReferences::new();
-    let walk = walk_cf_pages_pinned(&reader, ColumnFamily::Base, |_key, value| {
+    let walk = walk_cf_pages_pinned(reader, ColumnFamily::Base, |_key, value| {
         collect_derived_source_reference(value, &mut referenced).map_err(|source| {
             calyx_write_failed(
                 CALYX_GC_CF,
@@ -14215,27 +14505,93 @@ fn collect_derived_source_references(
     for keys in referenced.values_mut() {
         keys.sort_and_dedup();
     }
-    let packed = derived_source_reference_metrics(&referenced)?;
-    let census = gc::DerivedSourceCensus {
-        pinned_seq: walk.pinned_seq,
-        pages: calyx_len_to_u64(CALYX_GC_CF, "Calyx GC census pages", walk.pages)?,
-        base_rows_visited: calyx_len_to_u64(
-            CALYX_GC_CF,
-            "Calyx GC census Base rows",
-            walk.rows_visited,
-        )?,
+    let index = DerivedSourceReferenceIndex {
+        baseline: referenced,
+        delta: BTreeMap::new(),
+    };
+    let census = derived_source_census_from_index(
+        &index,
+        DerivedSourceCensusProvenance {
+            mode,
+            pinned_seq: walk.pinned_seq,
+            previous_pinned_seq,
+            pages: calyx_len_to_u64(CALYX_GC_CF, "Calyx GC census pages", walk.pages)?,
+            base_rows_visited: calyx_len_to_u64(
+                CALYX_GC_CF,
+                "Calyx GC census Base rows",
+                walk.rows_visited,
+            )?,
+            changed_base_keys,
+            rebase_reason,
+        },
+    )?;
+    emit_derived_source_census(&index, census)?;
+    Ok((
+        CalyxGcSourceCensusCache {
+            pinned_seq: walk.pinned_seq,
+            referenced: index,
+        },
+        census,
+    ))
+}
+
+fn derived_source_census_from_index(
+    referenced: &DerivedSourceReferenceIndex,
+    provenance: DerivedSourceCensusProvenance,
+) -> StorageResult<gc::DerivedSourceCensus> {
+    Ok(gc::DerivedSourceCensus {
+        mode: provenance.mode,
+        pinned_seq: provenance.pinned_seq,
+        previous_pinned_seq: provenance.previous_pinned_seq,
+        pages: provenance.pages,
+        base_rows_visited: provenance.base_rows_visited,
+        changed_base_keys: provenance.changed_base_keys,
+        rebase_reason: provenance.rebase_reason,
         referenced_column_families: calyx_len_to_u64(
             CALYX_GC_CF,
             "Calyx GC census source column families",
-            referenced.len(),
+            referenced.referenced_column_families(),
         )?,
-        referenced_rows: packed.rows,
-    };
+        referenced_rows: referenced.referenced_rows()?,
+    })
+}
+
+fn emit_derived_source_census(
+    referenced: &DerivedSourceReferenceIndex,
+    census: gc::DerivedSourceCensus,
+) -> StorageResult<()> {
+    let packed = derived_source_reference_metrics(&referenced.baseline)?;
+    let delta_reference_rows = calyx_len_to_u64(
+        CALYX_GC_CF,
+        "Calyx GC delta protected source rows",
+        referenced.delta_reference_count(),
+    )?;
+    let delta_key_bytes = referenced
+        .delta
+        .values()
+        .flat_map(|keys| keys.iter())
+        .try_fold(0_u64, |total, key| {
+            let key_bytes = calyx_len_to_u64(
+                CALYX_GC_CF,
+                "Calyx GC delta protected source key bytes",
+                key.len(),
+            )?;
+            total.checked_add(key_bytes).ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "Calyx GC delta protected source key bytes overflowed u64",
+                )
+            })
+        })?;
     tracing::info!(
         code = "STORAGE_CALYX_GC_SOURCE_CENSUS_COMPLETED",
+        mode = census.mode,
         pinned_seq = census.pinned_seq,
+        previous_pinned_seq = census.previous_pinned_seq,
         pages = census.pages,
         base_rows_visited = census.base_rows_visited,
+        changed_base_keys = census.changed_base_keys,
+        rebase_reason = census.rebase_reason,
         referenced_column_families = census.referenced_column_families,
         referenced_rows = census.referenced_rows,
         packed_key_bytes = packed.key_bytes,
@@ -14243,10 +14599,13 @@ fn collect_derived_source_references(
         packed_key_chunks = packed.chunks,
         range_index_bytes = packed.range_bytes,
         range_index_capacity_bytes = packed.range_capacity_bytes,
+        delta_reference_rows,
+        delta_key_bytes,
+        delta_reference_bound = CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES,
         chunk_bytes = PACKED_SOURCE_REFERENCE_CHUNK_BYTES,
-        "indexed every derived constellation's source reference from one pinned committed sequence into exact bounded-chunk key arenas"
+        "refreshed exact derived-source reachability from one pinned committed sequence"
     );
-    Ok((referenced, census))
+    Ok(())
 }
 
 /// Indexes one `Base` row's source reference, if it names one.
@@ -14254,14 +14613,30 @@ fn collect_derived_source_reference(
     value: &[u8],
     referenced: &mut DerivedSourceReferences,
 ) -> Result<(), synapse_calyx::SynapseCalyxError> {
-    let to_error = |detail: String| {
-        synapse_calyx::SynapseCalyxError::new(
-            "SYNAPSE_CALYX_GC_SOURCE_REFERENCE_UNDECODABLE",
-            detail,
-            "repair or remove the derived constellation naming an undecodable source key; GC must \
-             not treat a corrupt reference as an absent one",
-        )
+    let Some((source_cf, source_key)) = decode_derived_source_reference(value)? else {
+        return Ok(());
     };
+    referenced
+        .entry(source_cf.clone())
+        .or_default()
+        .push(&source_cf, &source_key)
+        .map_err(|detail| source_reference_decode_error(&detail))?;
+    Ok(())
+}
+
+fn source_reference_decode_error(detail: &str) -> synapse_calyx::SynapseCalyxError {
+    synapse_calyx::SynapseCalyxError::new(
+        "SYNAPSE_CALYX_GC_SOURCE_REFERENCE_UNDECODABLE",
+        detail,
+        "repair or remove the derived constellation naming an undecodable source key; GC must \
+         not treat a corrupt reference as an absent one",
+    )
+}
+
+fn decode_derived_source_reference(
+    value: &[u8],
+) -> Result<Option<(String, Vec<u8>)>, synapse_calyx::SynapseCalyxError> {
+    let to_error = |detail: String| source_reference_decode_error(&detail);
     {
         let constellation =
             calyx_aster::vault::encode::decode_constellation_base(value).map_err(|source| {
@@ -14277,7 +14652,7 @@ fn collect_derived_source_reference(
                 .metadata
                 .get(crate::constellations::META_SOURCE_KEY_HEX),
         ) else {
-            return Ok(());
+            return Ok(None);
         };
         // A derived row that records an undecodable source key is a corrupt
         // reference, not an absent one. Fail closed rather than let GC treat it
@@ -14289,13 +14664,8 @@ fn collect_derived_source_reference(
                 crate::constellations::META_SOURCE_KEY_HEX
             ))
         })?;
-        referenced
-            .entry(source_cf.clone())
-            .or_default()
-            .push(source_cf, &source_key)
-            .map_err(to_error)?;
+        Ok(Some((source_cf.clone(), source_key)))
     }
-    Ok(())
 }
 
 /// Decodes a `synapse_source_key_hex` metadata value back to the raw source
@@ -14322,12 +14692,13 @@ fn decode_source_key_hex(value: &str) -> Result<Vec<u8>, String> {
 fn run_calyx_gc_budgets(
     vault: &SynapseCalyxVault,
     budgets: &[CalyxGcBudget],
+    source_census: &Mutex<Option<CalyxGcSourceCensusCache>>,
 ) -> StorageResult<gc::GcReport> {
-    // The inner scope owns every corpus-sized GC transient: the derived-source
-    // index, per-CF retention vectors, eviction proposals, and pending
-    // tombstones. Collection belongs after that scope returns on both success
-    // and failure; collecting inside a stream would only inspect live objects.
-    let gc_result = run_calyx_gc_budgets_owned(vault, budgets);
+    // The inner scope owns every per-pass GC transient: per-CF retention
+    // vectors, eviction proposals, and pending tombstones. The exact packed
+    // source baseline is intentionally live in the runner across passes;
+    // allocator collection must therefore release only dead ownership.
+    let gc_result = run_calyx_gc_budgets_owned(vault, budgets, source_census);
     let release_result = synapse_calyx::release_process_memory("storage_gc_complete");
     match (gc_result, release_result) {
         (Ok(report), Ok(release)) => {
@@ -14363,26 +14734,71 @@ fn run_calyx_gc_budgets(
 fn run_calyx_gc_budgets_owned(
     vault: &SynapseCalyxVault,
     budgets: &[CalyxGcBudget],
+    source_census_cache: &Mutex<Option<CalyxGcSourceCensusCache>>,
 ) -> StorageResult<gc::GcReport> {
     let now_ms = calyx_clock_now_for_write(vault, CALYX_GC_CF)?;
-    let (referenced, source_census) = collect_derived_source_references(vault)?;
+    let mut source_census_cache = source_census_cache.lock().map_err(|poisoned| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CACHE_POISONED: exact reachability cache lock was poisoned by an earlier panic: {poisoned}; refusing GC because deletion authority cannot be proven; remediation=inspect the earlier panic and restart the daemon after repair"
+            ),
+        )
+    })?;
+    let source_census = if budgets.iter().any(|budget| !budget.protected) {
+        Some(refresh_derived_source_references(
+            vault,
+            &mut source_census_cache,
+        )?)
+    } else {
+        None
+    };
     let mut cf_reports = Vec::with_capacity(budgets.len());
     let mut tombstones = Vec::new();
     for budget in budgets {
+        if budget.protected {
+            tracing::warn!(
+                code = "STORAGE_CALYX_GC_PROTECTED_CF_POLICY_SKIPPED",
+                cf = budget.cf_name,
+                unit = budget.unit.as_str(),
+                soft_cap = budget.soft_cap,
+                hard_cap = budget.hard_cap,
+                reason = CALYX_GC_PROTECTED_CF_POLICY_SKIPPED,
+                "generic Calyx GC skipped a policy-protected family before source census lookup or row scan"
+            );
+            cf_reports.push(gc::GcCfReport {
+                cf_name: budget.cf_name.to_owned(),
+                before_value: None,
+                after_value: None,
+                before_estimated_num_keys: None,
+                after_estimated_num_keys: None,
+                examined_rows: 0,
+                scan_limited: false,
+                evicted_rows: 0,
+                eviction_skipped_reason: Some(CALYX_GC_PROTECTED_CF_POLICY_SKIPPED),
+                hard_cap_reached: false,
+                hard_cap_code: None,
+            });
+            continue;
+        }
+        let referenced = source_census_cache.as_ref().ok_or_else(|| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ABSENT: an actionable retention budget reached deletion adjudication without an exact source-reachability census; remediation=repair the GC census state machine before retrying",
+            )
+        })?;
         cf_reports.push(run_calyx_gc_budget(
             vault,
             *budget,
             now_ms,
-            referenced.get(budget.cf_name),
+            &referenced.referenced,
             &mut tombstones,
         )?);
     }
-    // No phase after retention adjudication consults the derived-source
-    // protection index. Destroy its 1.5M-key corpus before tombstone I/O and
-    // native fan-out compaction can acquire their own bounded working sets.
-    // Keeping it until the outer function returned made independent, bounded
-    // phases overlap and was the remaining >1 GiB GC peak in #2243.
-    drop(referenced);
+    // Retention adjudication is the only phase that reads the exact cache.
+    // Release its mutex before tombstone I/O and native maintenance; the packed
+    // baseline itself intentionally remains owned by the long-lived runner.
+    drop(source_census_cache);
 
     if !tombstones.is_empty() {
         let tombstone_rows =
@@ -14429,11 +14845,11 @@ fn run_calyx_gc_budgets_owned(
         }
     }
 
-    // `referenced`, every per-CF retention vector, and any committed tombstone
-    // payloads are now dead. Return their allocator pages before compaction;
-    // the compactor must start from the steady-state daemon, not from the prior
-    // phase's dead heap. The executable allocator hook is mandatory and this
-    // operation fails closed if the OS readback or release itself fails.
+    // Every per-CF retention vector and committed tombstone payload is now
+    // dead. Return those allocator pages before compaction; the exact packed
+    // source baseline remains live by design. The executable allocator hook is
+    // mandatory and this operation fails closed if the OS readback or release
+    // itself fails.
     let retention_release = synapse_calyx::release_process_memory("storage_gc_retention_complete")
         .map_err(|source| {
             calyx_write_failed(
@@ -14499,7 +14915,7 @@ fn run_calyx_gc_budgets_owned(
 
     Ok(gc::GcReport {
         cf_reports,
-        source_census: Some(source_census),
+        source_census,
         // The eviction pass takes no reclamation decision. `CalyxGcRunner`
         // attaches the pass it runs *after* this one returns (#2122).
         snapshot_version_gc: None,
@@ -14510,7 +14926,7 @@ fn run_calyx_gc_budget(
     vault: &SynapseCalyxVault,
     budget: CalyxGcBudget,
     now_ms: u64,
-    referenced: Option<&PackedSourceReferenceKeys>,
+    referenced: &DerivedSourceReferenceIndex,
     pending_tombstones: &mut Vec<SynapseCalyxCfWrite>,
 ) -> StorageResult<gc::GcCfReport> {
     let collection_id = calyx_collection_id_for_cf_write(budget.cf_name)?;
@@ -14601,8 +15017,8 @@ fn run_calyx_gc_budget(
 
     Ok(gc::GcCfReport {
         cf_name: budget.cf_name.to_owned(),
-        before_value,
-        after_value: cap_outcome.after_value,
+        before_value: Some(before_value),
+        after_value: Some(cap_outcome.after_value),
         before_estimated_num_keys: Some(before_estimated_num_keys),
         after_estimated_num_keys: Some(after_estimated_num_keys),
         examined_rows: before_estimated_num_keys,
@@ -14842,7 +15258,7 @@ fn collect_calyx_retention_state(
     collection_id: u64,
     now_ms: u64,
     protected: bool,
-    referenced: Option<&PackedSourceReferenceKeys>,
+    referenced: &DerivedSourceReferenceIndex,
 ) -> StorageResult<CalyxRetentionState> {
     let range = prefix_range(&calyx_namespace_prefix(collection_id));
     let mut state = CalyxRetentionState {
@@ -14887,7 +15303,7 @@ fn collect_calyx_retention_state(
             // error at the moment of loss. Retained rows are excluded from cap
             // eviction too, and counted so the retention is reported rather
             // than silent.
-            let referenced_by_derived = referenced.is_some_and(|keys| keys.contains(&user_key));
+            let referenced_by_derived = referenced.contains(cf_name, &user_key);
             if referenced_by_derived {
                 state.retained_referenced_rows = state.retained_referenced_rows.saturating_add(1);
                 return Ok(ControlFlow::Continue(()));

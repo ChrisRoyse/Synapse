@@ -1319,12 +1319,16 @@ pub struct StorageSnapshotVersionGcPass {
 
 /// The pinned instant the #1882 protection set came from, reported so an
 /// operator can prove one census covered one sequence (#2058).
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, JsonSchema)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageGcSourceCensus {
+    pub mode: String,
     pub pinned_seq: u64,
+    pub previous_pinned_seq: Option<u64>,
     pub pages: u64,
     pub base_rows_visited: u64,
+    pub changed_base_keys: u64,
+    pub rebase_reason: Option<String>,
     pub referenced_column_families: u64,
     pub referenced_rows: u64,
 }
@@ -1333,8 +1337,8 @@ pub struct StorageGcSourceCensus {
 #[serde(deny_unknown_fields)]
 pub struct StorageGcCfReport {
     pub cf_name: String,
-    pub before_value: u64,
-    pub after_value: u64,
+    pub before_value: Option<u64>,
+    pub after_value: Option<u64>,
     pub before_estimated_num_keys: Option<u64>,
     pub after_estimated_num_keys: Option<u64>,
     pub examined_rows: u64,
@@ -5614,10 +5618,30 @@ pub fn run_storage_gc_once(
     let report = db
         .run_gc_once_with_row_caps(cf_name, params.soft_cap_rows, params.hard_cap_rows)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
-    let (before, after) = report
-        .cf(cf_name)
-        .map(|cf_report| (cf_report.before_value, cf_report.after_value))
-        .unwrap_or((0, 0));
+    let cf_report = report.cf(cf_name).ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "STORAGE_GC_CF_REPORT_ABSENT cf_name={cf_name}; the GC operation completed without the requested physical CF readback"
+            ),
+        )
+    })?;
+    let before = cf_report.before_value.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "STORAGE_GC_CF_BEFORE_UNMEASURED cf_name={cf_name}; the requested GC family was not scanned"
+            ),
+        )
+    })?;
+    let after = cf_report.after_value.ok_or_else(|| {
+        mcp_error(
+            error_codes::STORAGE_WRITE_FAILED,
+            format!(
+                "STORAGE_GC_CF_AFTER_UNMEASURED cf_name={cf_name}; the requested GC family was not scanned"
+            ),
+        )
+    })?;
     Ok(gc_response(cf_name, before, after, report))
 }
 
@@ -6385,9 +6409,13 @@ fn gc_response(
 ) -> StorageGcOnceResponse {
     let total_evicted_rows = report.total_evicted_rows();
     let source_census = report.source_census.map(|census| StorageGcSourceCensus {
+        mode: census.mode.to_owned(),
         pinned_seq: census.pinned_seq,
+        previous_pinned_seq: census.previous_pinned_seq,
         pages: census.pages,
         base_rows_visited: census.base_rows_visited,
+        changed_base_keys: census.changed_base_keys,
+        rebase_reason: census.rebase_reason.map(str::to_owned),
         referenced_column_families: census.referenced_column_families,
         referenced_rows: census.referenced_rows,
     });

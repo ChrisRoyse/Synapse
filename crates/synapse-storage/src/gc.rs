@@ -132,12 +132,21 @@ impl SnapshotVersionGcPassReport {
 /// census from a skipped one without inferring it from the absence of an error.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DerivedSourceCensus {
+    /// Whether this pass established a full baseline, applied an exact MVCC
+    /// delta, observed no Base changes, or rebuilt after explicit invalidation.
+    pub mode: &'static str,
     /// The committed sequence the census pinned for its whole walk.
     pub pinned_seq: u64,
+    /// Sequence of the prior exact census when this pass refreshed a cache.
+    pub previous_pinned_seq: Option<u64>,
     /// Bounded pages read at that sequence.
     pub pages: u64,
     /// `Base` rows handed to the fold.
     pub base_rows_visited: u64,
+    /// Exact Base keys changed after `previous_pinned_seq`.
+    pub changed_base_keys: u64,
+    /// Why incremental state was invalidated and fully rebuilt, when it was.
+    pub rebase_reason: Option<&'static str>,
     /// Source column families with at least one protected row.
     pub referenced_column_families: u64,
     /// Source rows protected from eviction because a live derived
@@ -168,8 +177,10 @@ impl GcReport {
 #[derive(Debug)]
 pub struct GcCfReport {
     pub cf_name: String,
-    pub before_value: u64,
-    pub after_value: u64,
+    /// Measured values. `None` means policy resolved the outcome before any
+    /// scan; zero remains a real measured zero.
+    pub before_value: Option<u64>,
+    pub after_value: Option<u64>,
     pub before_estimated_num_keys: Option<u64>,
     pub after_estimated_num_keys: Option<u64>,
     pub examined_rows: u64,
@@ -216,10 +227,18 @@ pub struct GcTaskReadback {
     /// The single pinned committed sequence the last successful pass took its
     /// #1882 protection set from (#2058).
     pub last_successful_source_census_pinned_seq: Option<u64>,
+    /// Exact census refresh mode published by the last successful pass.
+    pub last_successful_source_census_mode: Option<String>,
+    /// Previous exact sequence used as this pass's delta lower bound.
+    pub last_successful_source_census_previous_pinned_seq: Option<u64>,
     /// Bounded pages that census read at that one sequence.
     pub last_successful_source_census_pages: Option<u64>,
     /// `Base` rows that census folded at that one sequence.
     pub last_successful_source_census_base_rows: Option<u64>,
+    /// Base keys in the exact MVCC delta for the last successful pass.
+    pub last_successful_source_census_changed_base_keys: Option<u64>,
+    /// Explicit reason the cache was rebuilt rather than incremented.
+    pub last_successful_source_census_rebase_reason: Option<String>,
     /// Source rows that census protected from eviction.
     pub last_successful_source_census_referenced_rows: Option<u64>,
     /// In-RAM MVCC versions reclaimed by the last successful pass (#2122).
@@ -649,7 +668,7 @@ fn mark_gc_tick_completed(
                     report
                         .cf_reports
                         .iter()
-                        .map(|cf| cf.after_value)
+                        .filter_map(|cf| cf.after_value)
                         .fold(0_u64, u64::saturating_add),
                 );
             }
@@ -658,8 +677,15 @@ fn mark_gc_tick_completed(
             // derived-state tick reports through the same readback (#2058).
             if let Some(census) = report.source_census {
                 readback.last_successful_source_census_pinned_seq = Some(census.pinned_seq);
+                readback.last_successful_source_census_mode = Some(census.mode.to_owned());
+                readback.last_successful_source_census_previous_pinned_seq =
+                    census.previous_pinned_seq;
                 readback.last_successful_source_census_pages = Some(census.pages);
                 readback.last_successful_source_census_base_rows = Some(census.base_rows_visited);
+                readback.last_successful_source_census_changed_base_keys =
+                    Some(census.changed_base_keys);
+                readback.last_successful_source_census_rebase_reason =
+                    census.rebase_reason.map(str::to_owned);
                 readback.last_successful_source_census_referenced_rows =
                     Some(census.referenced_rows);
             }

@@ -312,9 +312,17 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_pinned_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_previous_pinned_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_pages: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_base_rows: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_changed_base_keys: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_gc_last_successful_source_census_rebase_reason: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_gc_last_successful_source_census_referenced_rows: Option<u64>,
     /// In-RAM MVCC version-chain versions reclaimed by the last successful

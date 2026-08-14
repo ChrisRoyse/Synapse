@@ -7291,6 +7291,35 @@ impl SynapseCalyxVault {
             })
     }
 
+    /// Returns every key changed in one native column family after an exact
+    /// committed sequence and no later than the supplied pinned snapshot.
+    /// Tombstoned keys are included.
+    ///
+    /// This is the exact delta surface used by long-lived storage maintenance
+    /// owners. It deliberately accepts the caller's pinned snapshot so the
+    /// change list and every subsequent point read describe the same instant.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error if the requested range cannot
+    /// be proven from the process's MVCC history, the lease expired, or the CF
+    /// is unavailable in the opened vault mode.
+    pub fn changed_cf_keys_after_snapshot(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        after_exclusive: Seq,
+    ) -> Result<Vec<Vec<u8>>, SynapseCalyxError> {
+        self.vault
+            .changed_cf_keys_after_snapshot(snapshot, cf, after_exclusive)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "read Calyx CF changed-key history from a pinned snapshot",
+                    &error,
+                )
+            })
+    }
+
     /// Scans visible raw CF rows at a numeric snapshot.
     ///
     /// # Errors
