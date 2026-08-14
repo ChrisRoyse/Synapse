@@ -36,9 +36,13 @@ where
         &self,
         freshness: Freshness,
         max_age_ms: u64,
+        map_pin_error: impl FnOnce(calyx_core::CalyxError) -> E,
         read: impl FnOnce(Snapshot) -> std::result::Result<T, E>,
     ) -> std::result::Result<T, E> {
-        let snapshot = self.rows.pin_snapshot(freshness, &self.clock, max_age_ms);
+        let snapshot = self
+            .rows
+            .pin_snapshot(freshness, &self.clock, max_age_ms)
+            .map_err(map_pin_error)?;
         let snapshot = ScopedSnapshot {
             rows: &self.rows,
             snapshot,
@@ -46,14 +50,17 @@ where
         read(snapshot.snapshot())
     }
 
-    pub(crate) fn snapshot_handle(&self, seq: Seq) -> ScopedSnapshot<'_> {
-        let snapshot =
-            self.rows
-                .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, DEFAULT_LEASE_MS);
-        ScopedSnapshot {
+    pub(crate) fn snapshot_handle(&self, seq: Seq) -> calyx_core::Result<ScopedSnapshot<'_>> {
+        let snapshot = self.rows.pin_snapshot_at(
+            seq,
+            Freshness::FreshDerived,
+            &self.clock,
+            DEFAULT_LEASE_MS,
+        )?;
+        Ok(ScopedSnapshot {
             rows: &self.rows,
             snapshot,
-        }
+        })
     }
 
     pub(crate) fn with_scoped_snapshot<T>(
@@ -61,7 +68,7 @@ where
         seq: Seq,
         read: impl FnOnce(Snapshot) -> calyx_core::Result<T>,
     ) -> calyx_core::Result<T> {
-        let snapshot = self.snapshot_handle(seq);
+        let snapshot = self.snapshot_handle(seq)?;
         read(snapshot.snapshot())
     }
 }

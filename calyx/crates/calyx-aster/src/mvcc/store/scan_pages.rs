@@ -1,16 +1,5 @@
 use super::*;
 
-/// Maximum transient copy of the post-recovery MVCC delta retained by one
-/// pinned router-backed scan.
-///
-/// The immutable corpus is streamed and never counts here. Sixty-four MiB is
-/// one normal Aster SST target, large enough for a meaningful changed-key
-/// journal but small enough that a scan cannot duplicate an unbounded row
-/// table and push a lightweight daemon into allocator failure. Exceeding this
-/// limit is an explicit compaction/checkpoint debt error, never a request to
-/// fall back to whole-range materialization.
-const SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES: usize = 64 << 20;
-
 /// Re-check a long-lived snapshot lease at this row cadence. The underlying
 /// row cursor holds no corpus-wide value page, so this is a time/liveness bound
 /// only, not a memory batching knob.

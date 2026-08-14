@@ -49,7 +49,9 @@ use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::dedup::EpochSecs;
 use calyx_aster::erase::{EraseRegistry, EraseScope, subject_metadata_value};
-use calyx_aster::mvcc::{Freshness, Snapshot, SnapshotVersionGcBudget, SnapshotVersionGcPass};
+use calyx_aster::mvcc::{
+    Freshness, Snapshot, SnapshotDeltaRebaseReport, SnapshotVersionGcBudget, SnapshotVersionGcPass,
+};
 use calyx_aster::recurrence::{
     ConstellationRecurrenceAppendRequest, OccurrenceContext, RecurrenceAppendDisposition,
     RecurrenceAppendOnceRequest, RecurrenceSeriesReadback, RetentionPolicy, append_occurrence_once,
@@ -2710,6 +2712,40 @@ pub struct SynapseCalyxSnapshotGcObservation {
     pub last_measured_compaction_debt: u64,
 }
 
+/// Physical readback from a checkpoint-time process-local MVCC delta rebase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxSnapshotDeltaRebaseReport {
+    pub rebased: bool,
+    pub active_leases: usize,
+    pub previous_floor_seq: u64,
+    pub new_floor_seq: u64,
+    pub flushed_ssts: usize,
+    pub before_keys: u64,
+    pub before_versions: u64,
+    pub before_payload_bytes: u64,
+    pub after_keys: u64,
+    pub after_versions: u64,
+    pub after_payload_bytes: u64,
+}
+
+impl From<SnapshotDeltaRebaseReport> for SynapseCalyxSnapshotDeltaRebaseReport {
+    fn from(report: SnapshotDeltaRebaseReport) -> Self {
+        Self {
+            rebased: report.rebased,
+            active_leases: report.active_leases,
+            previous_floor_seq: report.previous_floor_seq,
+            new_floor_seq: report.new_floor_seq,
+            flushed_ssts: report.flushed_ssts,
+            before_keys: report.before.keys,
+            before_versions: report.before.versions,
+            before_payload_bytes: report.before.payload_bytes(),
+            after_keys: report.after.keys,
+            after_versions: report.after.versions,
+            after_payload_bytes: report.after.payload_bytes(),
+        }
+    }
+}
+
 impl From<SnapshotVersionGcPass> for SynapseCalyxSnapshotVersionGcPass {
     fn from(pass: SnapshotVersionGcPass) -> Self {
         Self {
@@ -3690,6 +3726,9 @@ impl SynapseCalyxReadOnlyVault {
         self.vault.with_scoped_latest_snapshot(
             Freshness::FreshDerived,
             INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |error| {
+                SynapseCalyxError::from_calyx("pin the intelligence corpus walk snapshot", &error)
+            },
             |snapshot| {
                 walk_cf_range_snapshot_stream(&self.vault, snapshot, cf, range, page_rows, visit)
             },
@@ -3923,8 +3962,12 @@ impl SynapseCalyxVault {
         max_age_ms: u64,
         read: impl FnOnce(Snapshot) -> Result<T, SynapseCalyxError>,
     ) -> Result<T, SynapseCalyxError> {
-        self.vault
-            .with_scoped_latest_snapshot(Freshness::FreshDerived, max_age_ms, read)
+        self.vault.with_scoped_latest_snapshot(
+            Freshness::FreshDerived,
+            max_age_ms,
+            |error| SynapseCalyxError::from_calyx("pin the scoped Calyx read snapshot", &error),
+            read,
+        )
     }
 
     /// Reads one constellation with its slot vectors hydrated from the per-slot
@@ -4365,7 +4408,10 @@ impl SynapseCalyxVault {
         // read against the same view and the number cannot mix sequences.
         let snapshot = self
             .vault
-            .pin_reader(Freshness::FreshDerived, SEARCH_DELTA_SCAN_LEASE_MS);
+            .pin_reader(Freshness::FreshDerived, SEARCH_DELTA_SCAN_LEASE_MS)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("pin the search delta scan snapshot", &error)
+            })?;
         let measured = calyx_search::measure_panel_delta(
             &self.vault,
             snapshot,
@@ -4616,7 +4662,12 @@ impl SynapseCalyxVault {
                 "name a native column family (base, anchors, scalars, slot_<n>, kv, ...)",
             )
         })?;
-        let snapshot = self.vault.pin_reader(Freshness::FreshDerived, 30_000);
+        let snapshot = self
+            .vault
+            .pin_reader(Freshness::FreshDerived, 30_000)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("pin the changed-key history snapshot", &error)
+            })?;
         let keys = self
             .vault
             .changed_cf_keys_after_snapshot(snapshot, cf, after_seq);
@@ -7897,7 +7948,9 @@ impl SynapseCalyxVault {
                 "request a bounded positive lease lifetime; use release_reader when the read is complete",
             ));
         }
-        Ok(self.vault.pin_reader(freshness, max_age_ms))
+        self.vault
+            .pin_reader(freshness, max_age_ms)
+            .map_err(|error| SynapseCalyxError::from_calyx("pin a Calyx reader", &error))
     }
 
     #[must_use]
@@ -7997,6 +8050,26 @@ impl SynapseCalyxVault {
         self.vault
             .checkpoint()
             .map_err(|error| SynapseCalyxError::from_calyx("checkpoint Calyx Aster vault", &error))
+    }
+
+    /// Checkpoints and returns the exact changed-key journal rebase outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx-backed error when a pending checkpoint,
+    /// router flush, lease read, or physical snapshot-delta rebase fails.
+    pub fn checkpoint_with_snapshot_delta_rebase(
+        &self,
+    ) -> Result<SynapseCalyxSnapshotDeltaRebaseReport, SynapseCalyxError> {
+        self.vault
+            .checkpoint_with_snapshot_delta_rebase()
+            .map(SynapseCalyxSnapshotDeltaRebaseReport::from)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "checkpoint and rebase Calyx Aster snapshot delta",
+                    &error,
+                )
+            })
     }
 
     /// Flushes and closes the durable vault, then proves the lock can be

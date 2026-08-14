@@ -44,7 +44,7 @@ impl<'a, C: Clock> TimeTravelSnapshot<'a, C> {
         let horizon = vault.retention_horizon();
         retention::check_horizon_at(&horizon, t_millis, vault.clock_now())?;
         let seqno = time_index::resolve(vault, t_millis)?;
-        let lease_id = vault.pin_reader_at(seqno, TIMETRAVEL_LEASE_MS);
+        let lease_id = vault.pin_reader_at(seqno, TIMETRAVEL_LEASE_MS)?;
         Ok(Self {
             vault,
             seqno,

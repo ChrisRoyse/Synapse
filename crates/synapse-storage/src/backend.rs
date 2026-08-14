@@ -2980,20 +2980,50 @@ impl CalyxCheckpointRunner {
 
 impl gc::GcRunner for CalyxCheckpointRunner {
     fn run_once(&self) -> StorageResult<gc::GcReport> {
-        self.vault.with_vault(
+        let rebase = self.vault.with_vault(
             CALYX_CHECKPOINT_CF,
             "periodic durable checkpoint",
             true,
             |vault| {
-                vault.checkpoint().map_err(|source| {
+                vault
+                    .checkpoint_with_snapshot_delta_rebase()
+                    .map_err(|source| {
                     calyx_write_failed(
                         CALYX_CHECKPOINT_CF,
-                        "materialize staged durable checkpoints and advance manifest floor",
+                        "materialize staged durable checkpoints, advance the manifest floor, and rebase the process-local snapshot delta",
                         &source,
                     )
                 })
             },
         )?;
+        if rebase.rebased {
+            let release =
+                synapse_calyx::release_process_memory("periodic checkpoint snapshot-delta rebase")
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            CALYX_CHECKPOINT_CF,
+                            "return retired snapshot-delta pages to the operating system",
+                            &source,
+                        )
+                    })?;
+            tracing::info!(
+                code = "STORAGE_CALYX_SNAPSHOT_DELTA_REBASE_COMPLETED",
+                previous_floor_seq = rebase.previous_floor_seq,
+                new_floor_seq = rebase.new_floor_seq,
+                flushed_ssts = rebase.flushed_ssts,
+                before_keys = rebase.before_keys,
+                before_versions = rebase.before_versions,
+                before_payload_bytes = rebase.before_payload_bytes,
+                after_keys = rebase.after_keys,
+                after_versions = rebase.after_versions,
+                after_payload_bytes = rebase.after_payload_bytes,
+                allocator_before_private_bytes = release.private_bytes_before,
+                allocator_after_private_bytes = release.private_bytes_after,
+                allocator_released_private_bytes = release.private_bytes_reclaimed,
+                allocator_release_elapsed_us = release.elapsed_us,
+                "checkpoint installed the immutable serving baseline, retired the redundant MVCC journal, and read back process memory"
+            );
+        }
         Ok(gc::GcReport::default())
     }
 }

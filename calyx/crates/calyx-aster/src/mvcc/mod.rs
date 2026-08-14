@@ -14,6 +14,7 @@ pub use store::{
     DEFAULT_SNAPSHOT_VERSION_GC_MAX_VERSIONS, FlushStatus, LATEST_CF_RANGE_PAGE_MAX_ROWS,
     LatestCfRangePage, MVCC_STAGE_COUNT, MVCC_STAGE_NAMES, MvccCommitTimings, MvccResidentStatus,
     PanelScopedChangedKeys, ROW_READ_GUARD_WARN_US, RowGuardSite, RowGuardSiteCensus,
-    SnapshotVersionGcBudget, SnapshotVersionGcPass, SnapshotVersionGcStop, VersionedCfStore,
-    is_tombstone_value, tombstone_value,
+    SNAPSHOT_DELTA_REBASE_TRIGGER_BYTES, SnapshotDeltaRebaseReport, SnapshotVersionGcBudget,
+    SnapshotVersionGcPass, SnapshotVersionGcStop, VersionedCfStore, is_tombstone_value,
+    tombstone_value,
 };

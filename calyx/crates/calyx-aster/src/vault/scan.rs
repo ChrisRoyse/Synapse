@@ -37,7 +37,7 @@ where
     {
         self.assert_cf_selected(cf, "scan_cf_pages_at")
             .map_err(E::from)?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows
             .scan_cf_pages_at(snapshot.snapshot(), cf, limit, &self.clock, on_page)
     }
@@ -87,7 +87,7 @@ where
         for page_keys in keys.chunks(limit) {
             ensure_latest()?;
             let page = {
-                let pinned = self.snapshot_handle(snapshot);
+                let pinned = self.snapshot_handle(snapshot)?;
                 let reads = page_keys
                     .iter()
                     .cloned()

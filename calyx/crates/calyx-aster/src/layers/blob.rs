@@ -268,7 +268,7 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
     /// Reads the manifest only, without reassembling the payload.
     pub fn blob_manifest(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobManifest>> {
         require_blob_mode(col)?;
-        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
+        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq())?;
         let Some(bytes) = self.vault.read_cf_snapshot(
             snapshot.snapshot(),
             ColumnFamily::Blob,
@@ -291,7 +291,7 @@ impl<'a, C: Clock> BlobLayer<'a, C> {
     /// length and content hash, and returns both without rereading the manifest.
     pub fn blob_read(&self, col: &Collection, blob_id: BlobId) -> Result<Option<BlobReadResult>> {
         require_blob_mode(col)?;
-        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq());
+        let snapshot = self.vault.snapshot_handle(self.vault.latest_seq())?;
         let Some(manifest_bytes) = self.vault.read_cf_snapshot(
             snapshot.snapshot(),
             ColumnFamily::Blob,

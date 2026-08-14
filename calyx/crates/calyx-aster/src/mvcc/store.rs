@@ -32,6 +32,26 @@ use std::time::Instant;
 
 pub(crate) const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
 
+/// Maximum transient copy of the post-recovery MVCC delta retained by one
+/// pinned router-backed scan.
+///
+/// The immutable corpus is streamed and never counts here. Sixty-four MiB is
+/// one normal Aster SST target, large enough for a meaningful changed-key
+/// journal but small enough that a scan cannot duplicate an unbounded row
+/// table and push a lightweight daemon into allocator failure.
+pub(crate) const SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES: usize = 64 << 20;
+
+/// Rebase the process-local changed-key journal before a snapshot would need
+/// to duplicate more than half of its hard transient-overlay budget.
+///
+/// This is a maintenance trigger, not a memory limit: rebasing first installs
+/// the complete current router view as immutable SSTs, then discards only the
+/// redundant in-memory journal when no reader lease can still observe an older
+/// sequence. Keeping half the scan budget as headroom covers entry/container
+/// overhead that [`MvccResidentStatus`] deliberately does not pretend to
+/// measure.
+pub const SNAPSHOT_DELTA_REBASE_TRIGGER_BYTES: u64 = (SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES / 2) as u64;
+
 /// Whole microseconds since `started`, saturating rather than wrapping.
 fn elapsed_us(started: &Instant) -> u64 {
     u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
@@ -271,6 +291,18 @@ pub struct MvccResidentStatus {
     pub value_bytes: u64,
 }
 
+/// Physical result of one checkpoint-time changed-key journal rebase.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotDeltaRebaseReport {
+    pub rebased: bool,
+    pub active_leases: usize,
+    pub previous_floor_seq: Seq,
+    pub new_floor_seq: Seq,
+    pub flushed_ssts: usize,
+    pub before: MvccResidentStatus,
+    pub after: MvccResidentStatus,
+}
+
 impl MvccResidentStatus {
     #[must_use]
     pub const fn payload_bytes(self) -> u64 {
@@ -320,6 +352,16 @@ impl MvccResidentCounters {
             key_bytes: self.key_bytes.load(Ordering::Acquire),
             value_bytes: self.value_bytes.load(Ordering::Acquire),
         }
+    }
+
+    fn reset_after_rebase(&self) {
+        // The caller holds every row-table shard for write, so no commit or
+        // version reclaimer can change these counters between clearing the
+        // tables and publishing zero here.
+        self.keys.store(0, Ordering::Release);
+        self.versions.store(0, Ordering::Release);
+        self.key_bytes.store(0, Ordering::Release);
+        self.value_bytes.store(0, Ordering::Release);
     }
 }
 
@@ -497,6 +539,11 @@ pub enum RowGuardSite {
     /// would mean proving boundedness in a different instrument from the one
     /// that proved the absence.
     SnapshotVersionReclaim,
+    /// Latest-snapshot registration. The read guard closes the race with a
+    /// checkpoint-time delta rebase that takes every shard for write.
+    PinSnapshot,
+    /// Historical-snapshot registration. See [`Self::PinSnapshot`].
+    PinSnapshotAt,
     PinSnapshotForPanel,
     PanelContentSeqsSnapshot,
     MigratePanelContentSeqsToAtLeast,
@@ -513,7 +560,7 @@ impl RowGuardSite {
     /// Every site, in declaration order. The census is indexed by position
     /// here, so this array is the contract that makes a zero-hold site
     /// reportable rather than invisible.
-    pub const ALL: [Self; 23] = [
+    pub const ALL: [Self; 25] = [
         Self::ReadLatest,
         Self::ReadBatchLatest,
         Self::ScanCfLatest,
@@ -533,6 +580,8 @@ impl RowGuardSite {
         Self::OverlayTableKeys,
         Self::SnapshotGcDebt,
         Self::SnapshotVersionReclaim,
+        Self::PinSnapshot,
+        Self::PinSnapshotAt,
         Self::PinSnapshotForPanel,
         Self::PanelContentSeqsSnapshot,
         Self::MigratePanelContentSeqsToAtLeast,
@@ -565,6 +614,8 @@ impl RowGuardSite {
             Self::OverlayTableKeys => "overlay_table_keys",
             Self::SnapshotGcDebt => "snapshot_gc_debt",
             Self::SnapshotVersionReclaim => "snapshot_version_reclaim",
+            Self::PinSnapshot => "pin_snapshot",
+            Self::PinSnapshotAt => "pin_snapshot_at",
             Self::PinSnapshotForPanel => "pin_snapshot_for_panel",
             Self::PanelContentSeqsSnapshot => "panel_content_seqs_snapshot",
             Self::MigratePanelContentSeqsToAtLeast => "migrate_panel_content_seqs_to_at_least",
@@ -856,6 +907,18 @@ impl RowWriteSet<'_> {
         Ok(self.guards[slot].1.entry(cf).or_default())
     }
 
+    /// Atomically detaches every row table while all shards remain locked.
+    ///
+    /// Only checkpoint-time snapshot-delta rebasing may call this. The
+    /// detached maps are destroyed after the guards are released so freeing a
+    /// large journal cannot extend the all-shard write hold.
+    fn take_all_for_snapshot_delta_rebase(&mut self) -> Vec<RowTable> {
+        self.guards
+            .iter_mut()
+            .map(|(_, guard)| std::mem::take(&mut **guard))
+            .collect()
+    }
+
     // `iter`/`iter_mut` over every locked shard were removed with the
     // whole-table snapshot-version reclaim they existed for (#2122). Nothing
     // else wants a writer that spans shards: the recovery restore paths write
@@ -1016,7 +1079,7 @@ pub struct VersionedCfStore {
     /// checkpoint rows from the router without their original per-row
     /// sequence, so a delta query below this floor must fail closed and rebase
     /// instead of silently omitting checkpointed changes (#1842).
-    changed_key_history_floor: Seq,
+    changed_key_history_floor: AtomicU64,
     router_eager_lookup_on_refresh: AtomicBool,
     read_barriers: RwLock<Vec<ReadBarrier>>,
     leases: LeaseRegistry,
@@ -1220,7 +1283,7 @@ impl VersionedCfStore {
             flusher: OnceLock::new(),
             router: None,
             router_latest_readback: AtomicBool::new(false),
-            changed_key_history_floor: 0,
+            changed_key_history_floor: AtomicU64::new(0),
             router_eager_lookup_on_refresh: AtomicBool::new(true),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -1254,7 +1317,11 @@ impl VersionedCfStore {
             flusher: OnceLock::new(),
             router: Some(Arc::new(router)),
             router_latest_readback: AtomicBool::new(router_latest_readback),
-            changed_key_history_floor: if router_latest_readback { start_seq } else { 0 },
+            changed_key_history_floor: AtomicU64::new(if router_latest_readback {
+                start_seq
+            } else {
+                0
+            }),
             router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -1648,13 +1715,23 @@ impl VersionedCfStore {
         freshness: Freshness,
         clock: &dyn Clock,
         max_age_ms: u64,
-    ) -> Snapshot {
+    ) -> Result<Snapshot> {
+        // The previous reader may have been the lease that deferred a rebase.
+        // Retry before registering this one so a just-released journal cannot
+        // make the next operation fail its transient overlay budget while the
+        // periodic checkpoint is still asleep.
+        self.rebase_snapshot_delta_if_needed(clock)?;
+        // Registration happens while holding one row shard. A rebase takes
+        // every shard for write and rechecks the lease registry only after all
+        // are held, so it either observes this lease or this pin observes the
+        // new history floor. There is no check/register race.
+        let _table = self.read_rows(RowGuardSite::PinSnapshot, ColumnFamily::Base);
         let seq = self.current_seq();
         let lease_id = self.next_lease_id.fetch_add(1, Ordering::AcqRel) + 1;
         let lease = ReaderLease::new(lease_id, seq, clock.now(), max_age_ms);
         self.leases.register(lease);
-        Snapshot::new(seq, freshness, lease)
-            .with_derived_content_seq(self.derived_content_seq_at(seq))
+        Ok(Snapshot::new(seq, freshness, lease)
+            .with_derived_content_seq(self.derived_content_seq_at(seq)))
     }
 
     /// Pins the latest committed view with the search-input watermark for one
@@ -1686,6 +1763,7 @@ impl VersionedCfStore {
         clock: &dyn Clock,
         max_age_ms: u64,
     ) -> Result<Snapshot> {
+        self.rebase_snapshot_delta_if_needed(clock)?;
         let _table = self.try_read_rows(
             RowGuardSite::PinSnapshotForPanel,
             ColumnFamily::Base,
@@ -1806,12 +1884,28 @@ impl VersionedCfStore {
         freshness: Freshness,
         clock: &dyn Clock,
         max_age_ms: u64,
-    ) -> Snapshot {
+    ) -> Result<Snapshot> {
+        let _table = self.try_read_rows(
+            RowGuardSite::PinSnapshotAt,
+            ColumnFamily::Base,
+            "MVCC row-table lock was poisoned while pinning a historical snapshot",
+        )?;
+        let history_floor = self.changed_key_history_floor.load(Ordering::Acquire);
+        let latest = self.current_seq();
+        if seq < history_floor || seq > latest {
+            return Err(CalyxError {
+                code: "CALYX_ASTER_SNAPSHOT_SEQUENCE_UNAVAILABLE",
+                message: format!(
+                    "snapshot sequence {seq} is outside the process-local readable range {history_floor}..={latest}"
+                ),
+                remediation: "rebase the reader inside the reported range; released pre-rebase history is no longer retained in process memory",
+            });
+        }
         let lease_id = self.next_lease_id.fetch_add(1, Ordering::AcqRel) + 1;
         let lease = ReaderLease::new(lease_id, seq, clock.now(), max_age_ms);
         self.leases.register(lease);
-        Snapshot::new(seq, freshness, lease)
-            .with_derived_content_seq(self.derived_content_seq_at(seq))
+        Ok(Snapshot::new(seq, freshness, lease)
+            .with_derived_content_seq(self.derived_content_seq_at(seq)))
     }
 
     /// Derived-content watermark as knowable for a pin at `seq`, clamped
@@ -1884,6 +1978,110 @@ impl VersionedCfStore {
     #[must_use]
     pub fn mvcc_resident_status(&self) -> MvccResidentStatus {
         self.mvcc_resident.snapshot()
+    }
+
+    /// Installs and retires a checkpointed process-local snapshot delta.
+    ///
+    /// Latest-only recovery keeps the immutable router as its baseline and the
+    /// row table as an exact changed-key journal above
+    /// `changed_key_history_floor`. Once that journal reaches half of the
+    /// transient snapshot-overlay budget, retaining it after the same keys are
+    /// installed in immutable SSTs is duplicate state: every later snapshot
+    /// would clone it again, and unique keys could otherwise accumulate for
+    /// the daemon's entire lifetime.
+    ///
+    /// A rebase takes every row shard for write. Snapshot registration holds a
+    /// row read guard until its lease is registered, so the lease recheck under
+    /// these guards closes the check/register race. With no live lease, the
+    /// method drains sealed memtables, flushes the current router view, advances
+    /// the history floor to the now-stable current sequence, and detaches the
+    /// redundant maps. Any flush failure occurs before the floor/table change.
+    /// Detached maps are destroyed after unlocking.
+    pub fn rebase_snapshot_delta_if_needed(
+        &self,
+        clock: &dyn Clock,
+    ) -> Result<SnapshotDeltaRebaseReport> {
+        let before = self.mvcc_resident.snapshot();
+        let previous_floor_seq = self.changed_key_history_floor.load(Ordering::Acquire);
+        let unchanged = |active_leases| SnapshotDeltaRebaseReport {
+            rebased: false,
+            active_leases,
+            previous_floor_seq,
+            new_floor_seq: previous_floor_seq,
+            flushed_ssts: 0,
+            before,
+            after: self.mvcc_resident.snapshot(),
+        };
+        if !self.router_latest_readback.load(Ordering::Acquire)
+            || before.payload_bytes() < SNAPSHOT_DELTA_REBASE_TRIGGER_BYTES
+        {
+            return Ok(unchanged(0));
+        }
+
+        let mut tables = self.write_rows_all(
+            "MVCC row-table lock was poisoned while rebasing the checkpointed snapshot delta",
+        )?;
+        let locked_before = self.mvcc_resident.snapshot();
+        if locked_before.payload_bytes() < SNAPSHOT_DELTA_REBASE_TRIGGER_BYTES {
+            return Ok(SnapshotDeltaRebaseReport {
+                before: locked_before,
+                after: locked_before,
+                ..unchanged(0)
+            });
+        }
+        let leases = self.leases.live_view(clock.now());
+        if leases.active_leases > 0 {
+            tracing::info!(
+                code = "CALYX_ASTER_SNAPSHOT_DELTA_REBASE_DEFERRED",
+                active_leases = leases.active_leases,
+                oldest_pinned_seq = leases.oldest_pinned_seq,
+                current_seq = self.current_seq(),
+                payload_bytes = locked_before.payload_bytes(),
+                trigger_bytes = SNAPSHOT_DELTA_REBASE_TRIGGER_BYTES,
+                "retained the changed-key journal for live snapshots; the next checkpoint retries after lease release or expiry"
+            );
+            return Ok(SnapshotDeltaRebaseReport {
+                active_leases: leases.active_leases,
+                before: locked_before,
+                after: locked_before,
+                ..unchanged(leases.active_leases)
+            });
+        }
+
+        // Every row shard is held, so no MVCC commit can publish a sequence or
+        // enter the router while this physical serving baseline is installed.
+        self.drain_pending_flushes()?;
+        let flushed_ssts = self.flush_all_cfs()?.len();
+        let new_floor_seq = self.current_seq();
+        let retired = tables.take_all_for_snapshot_delta_rebase();
+        self.changed_key_history_floor
+            .store(new_floor_seq, Ordering::Release);
+        self.mvcc_resident.reset_after_rebase();
+        drop(tables);
+        drop(retired);
+        let after = self.mvcc_resident.snapshot();
+        tracing::info!(
+            code = "CALYX_ASTER_SNAPSHOT_DELTA_REBASED",
+            previous_floor_seq,
+            new_floor_seq,
+            flushed_ssts,
+            retired_keys = locked_before.keys,
+            retired_versions = locked_before.versions,
+            retired_payload_bytes = locked_before.payload_bytes(),
+            remaining_keys = after.keys,
+            remaining_versions = after.versions,
+            remaining_payload_bytes = after.payload_bytes(),
+            "installed the immutable router baseline and retired its redundant process-local changed-key journal"
+        );
+        Ok(SnapshotDeltaRebaseReport {
+            rebased: true,
+            active_leases: 0,
+            previous_floor_seq,
+            new_floor_seq,
+            flushed_ssts,
+            before: locked_before,
+            after,
+        })
     }
 
     /// Admission check for rows that cannot fit even in an empty memtable.
@@ -2162,12 +2360,12 @@ impl VersionedCfStore {
                 "router-backed MVCC history requested without a CF router".to_owned(),
             )
         })?;
+        let history_floor = self.changed_key_history_floor.load(Ordering::Acquire);
         for (cf, key, _value) in rows {
-            let has_baseline = table.entry_mut(*cf)?.get(key).is_some_and(|chain| {
-                chain
-                    .iter()
-                    .any(|version| version.seq <= self.changed_key_history_floor)
-            });
+            let has_baseline = table
+                .entry_mut(*cf)?
+                .get(key)
+                .is_some_and(|chain| chain.iter().any(|version| version.seq <= history_floor));
             if has_baseline {
                 continue;
             }
@@ -2181,7 +2379,7 @@ impl VersionedCfStore {
                 Entry::Vacant(entry) => {
                     let mut chain = VersionChain::new();
                     chain.push_front(VersionedValue {
-                        seq: self.changed_key_history_floor,
+                        seq: history_floor,
                         value: baseline,
                     });
                     entry.insert(chain);
@@ -2189,7 +2387,7 @@ impl VersionedCfStore {
                 }
                 Entry::Occupied(mut entry) => {
                     entry.get_mut().push_front(VersionedValue {
-                        seq: self.changed_key_history_floor,
+                        seq: history_floor,
                         value: baseline,
                     });
                     false

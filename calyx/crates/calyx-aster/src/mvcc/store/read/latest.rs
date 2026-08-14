@@ -172,7 +172,8 @@ impl VersionedCfStore {
         snapshot: Snapshot,
     ) -> Result<()> {
         let latest = self.current_seq();
-        if snapshot.seq() >= self.changed_key_history_floor && snapshot.seq() <= latest {
+        let history_floor = self.changed_key_history_floor.load(Ordering::Acquire);
+        if snapshot.seq() >= history_floor && snapshot.seq() <= latest {
             return Ok(());
         }
         if snapshot.seq() > latest {
@@ -186,7 +187,7 @@ impl VersionedCfStore {
             message: format!(
                 "snapshot {} predates the disk-backed MVCC recovery floor {}; latest committed sequence is {latest}",
                 snapshot.seq(),
-                self.changed_key_history_floor
+                history_floor
             ),
             remediation: "rebase the reader at or after the reported recovery floor; this process preserves every later change as an exact in-memory delta over the durable router baseline",
         })

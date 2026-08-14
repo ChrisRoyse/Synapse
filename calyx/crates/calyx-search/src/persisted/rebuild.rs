@@ -393,7 +393,7 @@ pub(super) fn previous_manifest(
 }
 
 pub fn load_docs<C: Clock>(vault: &AsterVault<C>) -> CliResult<BTreeMap<CxId, Constellation>> {
-    let snapshot = vault.pin_reader(calyx_aster::mvcc::Freshness::FreshDerived, 300_000);
+    let snapshot = vault.pin_reader(calyx_aster::mvcc::Freshness::FreshDerived, 300_000)?;
     let _guard = PinnedReadGuard::new(vault, snapshot);
     load_docs_at(vault, _guard.snapshot())
 }

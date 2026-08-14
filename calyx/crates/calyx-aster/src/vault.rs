@@ -52,8 +52,8 @@ mod temporal_xterm;
 use crate::cf::{CfRouter, ColumnFamily, KeyRange};
 use crate::dedup::DedupPolicy;
 use crate::mvcc::{
-    CfRead, Freshness, MvccResidentStatus, ReadBarrier, Snapshot, VersionedCfStore,
-    is_tombstone_value,
+    CfRead, Freshness, MvccResidentStatus, ReadBarrier, Snapshot, SnapshotDeltaRebaseReport,
+    VersionedCfStore, is_tombstone_value,
 };
 use crate::resource::{MemtableStatus, ResourceStatus, VramBudgetStatus, collect_resource_status};
 use crate::timetravel::RetentionHorizon;
@@ -1014,7 +1014,7 @@ where
         key: &[u8],
     ) -> Result<Option<Vec<u8>>> {
         self.assert_cf_selected(cf, "read_cf_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows.read_at(snapshot.snapshot(), cf, key, &self.clock)
     }
 
@@ -1405,7 +1405,7 @@ where
     /// Scans visible raw CF rows at `snapshot`; use `scan_cf_pages_at` for large data CFs.
     pub fn scan_cf_at(&self, snapshot: Seq, cf: ColumnFamily) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.assert_cf_selected(cf, "scan_cf_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows.scan_cf_at(snapshot.snapshot(), cf, &self.clock)
     }
 
@@ -1485,7 +1485,7 @@ where
         range: &KeyRange,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.assert_cf_selected(cf, "scan_cf_range_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows
             .scan_cf_range_at(snapshot.snapshot(), cf, range, &self.clock)
     }
@@ -1532,7 +1532,7 @@ where
         range: &KeyRange,
     ) -> Result<Vec<Vec<u8>>> {
         self.assert_cf_selected(cf, "scan_cf_range_keys_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows
             .scan_cf_range_keys_at(snapshot.snapshot(), cf, range, &self.clock)
     }
@@ -1547,7 +1547,7 @@ where
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.assert_cf_selected(cf, "scan_cf_range_page_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows.scan_cf_range_page_at(
             snapshot.snapshot(),
             cf,
@@ -1567,7 +1567,7 @@ where
         upper: &[u8],
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         self.assert_cf_selected(cf, "predecessor_cf_at")?;
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows
             .predecessor_cf_at(snapshot.snapshot(), cf, start, upper, &self.clock)
     }
@@ -1824,6 +1824,17 @@ where
     /// separate prevents a caller requesting durability from creating one
     /// tiny router SST per logical flush.
     pub fn checkpoint(&self) -> Result<()> {
+        self.checkpoint_with_snapshot_delta_rebase().map(|_| ())
+    }
+
+    /// Checkpoints durable state and retires a redundant process-local MVCC
+    /// delta when its physical router baseline is complete and no live reader
+    /// still needs the old history floor.
+    ///
+    /// The returned report is independently observable maintenance state: a
+    /// caller can distinguish no debt, a live-lease deferral, and a completed
+    /// physical rebase instead of inferring reclamation from `Ok(())`.
+    pub fn checkpoint_with_snapshot_delta_rebase(&self) -> Result<SnapshotDeltaRebaseReport> {
         self.drain_checkpoints_paced("periodic checkpoint")?;
         // The background flusher's barrier (#1951).
         //
@@ -1839,7 +1850,8 @@ where
         // `drain` surfaces the first background failure rather than swallowing
         // it, so a write that failed after its commit returned fails the next
         // checkpoint instead of disappearing.
-        self.rows.drain_pending_flushes()
+        self.rows.drain_pending_flushes()?;
+        self.rows.rebase_snapshot_delta_if_needed(&self.clock)
     }
 
     /// Waits until every submitted group-commit WAL append has reached its
@@ -1923,7 +1935,7 @@ where
     /// Unlike scoped vault-internal snapshot handles, explicit pins remain in
     /// the store lease registry after one read call, until
     /// [`Self::release_reader`] or lease expiry.
-    pub fn pin_reader(&self, freshness: Freshness, max_age_ms: u64) -> Snapshot {
+    pub fn pin_reader(&self, freshness: Freshness, max_age_ms: u64) -> Result<Snapshot> {
         self.rows.pin_snapshot(freshness, &self.clock, max_age_ms)
     }
 
@@ -1945,11 +1957,12 @@ where
 
     /// Pins a reader lease at a historical `seq` (time-travel) and returns its
     /// lease id, which the caller must release with [`Self::release_reader`].
-    pub fn pin_reader_at(&self, seq: Seq, max_age_ms: u64) -> u64 {
-        self.rows
-            .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, max_age_ms)
+    pub fn pin_reader_at(&self, seq: Seq, max_age_ms: u64) -> Result<u64> {
+        Ok(self
+            .rows
+            .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, max_age_ms)?
             .lease()
-            .id()
+            .id())
     }
 
     /// Opens a time-travel snapshot as of wall-clock `t_millis` (PRD `17 §8`).

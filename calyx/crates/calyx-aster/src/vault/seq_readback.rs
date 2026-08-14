@@ -13,7 +13,7 @@ where
         cf: ColumnFamily,
         key: &[u8],
     ) -> Result<Option<Seq>> {
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.rows
             .seq_for_key_at(snapshot.snapshot(), cf, key, &self.clock)
     }

@@ -279,7 +279,7 @@ where
             &durable.root().join("locks").join("durable.commit.lock"),
         )?;
         let snapshot_seq = self.snapshot();
-        let snapshot_handle = self.snapshot_handle(snapshot_seq);
+        let snapshot_handle = self.snapshot_handle(snapshot_seq)?;
         let snapshot = snapshot_handle.snapshot();
         let head = crate::ledger_head::read_head_anchor(durable.root())?;
         drop(commit_guard);

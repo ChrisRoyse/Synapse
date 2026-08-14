@@ -36,6 +36,7 @@ impl DomainCorpus {
         vault.with_scoped_latest_snapshot(
             Freshness::FreshDerived,
             evidence_error::ORACLE_CORPUS_READER_LEASE_MS,
+            OracleError::from,
             |snapshot| Self::load_snapshot(vault, domain, snapshot),
         )
     }

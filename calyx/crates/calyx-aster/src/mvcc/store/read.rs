@@ -365,11 +365,12 @@ impl VersionedCfStore {
                 cf.name()
             )));
         }
-        if after_exclusive < self.changed_key_history_floor {
+        let history_floor = self.changed_key_history_floor.load(Ordering::Acquire);
+        if after_exclusive < history_floor {
             return Err(CalyxError::stale_derived(format!(
                 "changed-key history for {} begins at recovered seq {}, but the requested delta starts after seq {after_exclusive}; rebuild the persisted search generation at or beyond the recovery floor before querying",
                 cf.name(),
-                self.changed_key_history_floor
+                history_floor
             )));
         }
         // `O(1)` exit for the answer this is asked for most often: nothing

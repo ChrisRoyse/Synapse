@@ -200,7 +200,7 @@ where
         duplicate_policy: DuplicatePutPolicy,
     ) -> Result<BatchIngestCommit> {
         let latest = self.snapshot();
-        let snapshot = self.snapshot_handle(latest);
+        let snapshot = self.snapshot_handle(latest)?;
         let mut accepted_indexes = BTreeMap::<Vec<u8>, usize>::new();
         // Cache both present and absent Base rows. Every unique CxId is looked
         // up at most once from the single pinned snapshot, regardless of how

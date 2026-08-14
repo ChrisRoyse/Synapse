@@ -121,7 +121,7 @@ where
             }
             _ => (0, 0),
         };
-        let snapshot = self.snapshot_handle(durable_seq);
+        let snapshot = self.snapshot_handle(durable_seq)?;
         let mut base_count = 0u64;
         self.rows.scan_cf_pages_at(
             snapshot.snapshot(),

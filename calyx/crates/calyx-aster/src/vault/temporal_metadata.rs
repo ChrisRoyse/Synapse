@@ -107,7 +107,7 @@ where
             }
         }
         self.with_durable_commit_lock(|| {
-            let snapshot = self.snapshot_handle(self.snapshot());
+            let snapshot = self.snapshot_handle(self.snapshot())?;
             let mut outcomes = vec![None; input.len()];
             let mut pending = Vec::new();
             for (input_index, request) in input.iter().enumerate() {

@@ -45,7 +45,7 @@ where
         }
     }
 
-    pub fn pin_stale_snapshot(&self, max_lag: Seq) -> Snapshot {
+    pub fn pin_stale_snapshot(&self, max_lag: Seq) -> Result<Snapshot> {
         self.rows.pin_snapshot(
             Freshness::StaleOk { max_lag },
             &self.clock,

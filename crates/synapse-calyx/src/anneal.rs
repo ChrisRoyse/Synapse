@@ -346,7 +346,12 @@ impl SynapseCalyxVault {
         let candidate_tuning = candidate_tuning.validate()?;
         let (prior_hash, _, incumbent_tuning) = self.read_live_tuning()?;
         ensure_index_only_candidate(&incumbent_tuning, &candidate_tuning)?;
-        let snapshot = self.vault.pin_reader(Freshness::FreshDerived, 300_000);
+        let snapshot = self
+            .vault
+            .pin_reader(Freshness::FreshDerived, 300_000)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx("pin the Anneal search snapshot", &error)
+            })?;
         let reader_lease = AnnealReaderLease {
             owner: self,
             lease_id: Some(snapshot.lease().id()),

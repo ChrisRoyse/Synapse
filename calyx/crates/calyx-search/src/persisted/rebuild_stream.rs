@@ -177,7 +177,7 @@ where
     let snapshot = vault.pin_reader(
         Freshness::FreshDerived,
         configured_rebuild_reader_lease_ms()?,
-    );
+    )?;
     let guard = PinnedReadGuard::new(vault, snapshot);
     rebuild_for_vault_with_request_at_snapshot(
         vault_dir,

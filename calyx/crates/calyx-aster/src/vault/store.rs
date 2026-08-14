@@ -84,7 +84,7 @@ where
             let id = constellation.cx_id;
             let base_key = base_key(id);
             let latest = self.snapshot();
-            let snapshot = self.snapshot_handle(latest);
+            let snapshot = self.snapshot_handle(latest)?;
             if let Some(existing) = self.rows.read_at(
                 snapshot.snapshot(),
                 ColumnFamily::Base,
@@ -324,7 +324,7 @@ where
     }
 
     fn get(&self, id: CxId, snapshot: Seq) -> Result<Constellation> {
-        let snapshot = self.snapshot_handle(snapshot);
+        let snapshot = self.snapshot_handle(snapshot)?;
         self.get_at_snapshot(id, snapshot.snapshot())
     }
 
