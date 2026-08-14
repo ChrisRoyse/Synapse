@@ -820,6 +820,27 @@ impl SynapseCalyxVault {
         panel_version: u32,
     ) -> Result<Constellation, SynapseCalyxError> {
         let snapshot = self.vault.snapshot();
+        let base_key = calyx_aster::cf::base_key(cx_id);
+        let base_row = self
+            .vault
+            .read_cf_at(snapshot, calyx_aster::cf::ColumnFamily::Base, &base_key)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!(
+                        "read fused-find example Base-row presence for {cx_id} at snapshot {snapshot}"
+                    ),
+                    &error,
+                )
+            })?;
+        if base_row.is_none() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_FIND_EXAMPLE_NOT_FOUND",
+                format!(
+                    "example {cx_id} has no Base row at vault snapshot {snapshot} for panel {panel_version}"
+                ),
+                "supply an exact cx_id returned by fused find for the same panel, or use query_kind=by_text",
+            ));
+        }
         let constellation = self.vault.get(cx_id, snapshot).map_err(|error| {
             SynapseCalyxError::from_calyx(
                 &format!("read fused-find example Base row {cx_id}"),
