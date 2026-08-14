@@ -4389,15 +4389,22 @@ impl SynapseCalyxVault {
     /// Counts the distinct constellations changed since `base_seq` for exactly
     /// one panel, across the `Base` CF and the generation's own slot CFs.
     ///
-    /// This calls the *same* `calyx_search::measure_panel_delta` the query
-    /// path's delta collector calls, rather than mirroring it: it must count the
-    /// same keys the query path counts, or the maintenance trigger and the
-    /// query-time limit drift apart. It is a distinct-key count, not a sum,
-    /// because the same constellation changing in the Base CF and in three slot
-    /// CFs is one key to reconcile, not four. The `Base` share is scoped to
-    /// `panel_version` (#1901): `Base` is shared by every panel, and counting
-    /// all of it charged a 329-row timeline generation for 17,785 keys of
-    /// unrelated agent-transcript ingest.
+    /// This follows the *same* control law as the query path's delta collector:
+    /// pin the exact panel watermark with the read sequence, prove an empty
+    /// delta without consulting history when that watermark is at or before the
+    /// generation base, and otherwise call the same
+    /// `calyx_search::measure_panel_delta`. The watermark gate matters after an
+    /// Aster snapshot-delta rebase: generic changed-key history may begin after
+    /// `base_seq` even though this exact panel provably did not change. Treating
+    /// that state as stale made a just-rebuilt generation fail its own readback
+    /// because of unrelated vault commits.
+    ///
+    /// A measured delta is a distinct-key count, not a sum, because the same
+    /// constellation changing in the Base CF and in three slot CFs is one key to
+    /// reconcile, not four. The `Base` share is scoped to `panel_version`
+    /// (#1901): `Base` is shared by every panel, and counting all of it charged a
+    /// 329-row timeline generation for 17,785 keys of unrelated
+    /// agent-transcript ingest.
     fn measure_search_delta_changed_keys(
         &self,
         panel_version: u32,
@@ -4408,17 +4415,30 @@ impl SynapseCalyxVault {
         // read against the same view and the number cannot mix sequences.
         let snapshot = self
             .vault
-            .pin_reader(Freshness::FreshDerived, SEARCH_DELTA_SCAN_LEASE_MS)
+            .pin_reader_for_panel(
+                panel_version,
+                Freshness::FreshDerived,
+                SEARCH_DELTA_SCAN_LEASE_MS,
+            )
             .map_err(|error| {
                 SynapseCalyxError::from_calyx("pin the search delta scan snapshot", &error)
             })?;
-        let measured = calyx_search::measure_panel_delta(
-            &self.vault,
-            snapshot,
-            panel_version,
-            base_seq,
-            slots.iter().map(|slot| calyx_core::SlotId::new(slot.slot)),
-        );
+        let measured = if snapshot.derived_content_seq() <= base_seq {
+            Ok(calyx_search::PanelDeltaComposition {
+                panel_version,
+                base_seq,
+                pinned_seq: snapshot.seq(),
+                ..calyx_search::PanelDeltaComposition::default()
+            })
+        } else {
+            calyx_search::measure_panel_delta(
+                &self.vault,
+                snapshot,
+                panel_version,
+                base_seq,
+                slots.iter().map(|slot| calyx_core::SlotId::new(slot.slot)),
+            )
+        };
         // Release the lease on every path: a leaked reader lease pins the GC
         // frontier, which is a far worse outcome than a failed measurement.
         let _released = self.vault.release_reader(snapshot.lease().id());
