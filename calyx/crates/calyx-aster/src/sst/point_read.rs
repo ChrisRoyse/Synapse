@@ -7,8 +7,7 @@ use calyx_core::{CalyxError, Result};
 
 use super::{
     HEADER_LEN, INDEX_ENTRY_FIXED_LEN, IndexEntry, MAX_RANGE_SCAN_BYTES, RECORD_HEADER_LEN,
-    SstBounds, SstEntry, SstLookupMetadata, clone_scan_bytes, materialized_entry_bytes,
-    read_file_header_structure, record_crc, scan_reserve_failed,
+    SstBounds, SstEntry, SstLookupMetadata, read_file_header_structure, scan_reserve_failed,
 };
 
 /// Uses an already whole-file-validated immutable SST index and performs
@@ -135,6 +134,17 @@ impl SstPageReader {
     }
 
     pub(crate) fn read_current(&mut self) -> Result<SstEntry> {
+        let mut entry = SstEntry {
+            key: Vec::new(),
+            value: Vec::new(),
+        };
+        self.read_current_into(&mut entry)?;
+        Ok(entry)
+    }
+
+    /// Reads the current row into caller-owned buffers, retaining their
+    /// capacity for the next row from the same immutable source.
+    pub(crate) fn read_current_into(&mut self, entry: &mut SstEntry) -> Result<()> {
         match self {
             Self::Retained {
                 path,
@@ -149,13 +159,10 @@ impl SstPageReader {
                         path.display()
                     ))
                 })?;
-                let value = point_reader.read_value(offset, key)?;
-                Ok(SstEntry {
-                    key: key.to_vec(),
-                    value,
-                })
+                replace_scan_bytes(&mut entry.key, key)?;
+                point_reader.read_value_into(offset, key, &mut entry.value)
             }
-            Self::Streaming(reader) => reader.read_current(),
+            Self::Streaming(reader) => reader.read_current_into(entry),
         }
     }
 
@@ -475,7 +482,7 @@ impl DiskIndexCursor {
         Ok(())
     }
 
-    fn read_current(&mut self) -> Result<SstEntry> {
+    fn read_current_into(&mut self, entry: &mut SstEntry) -> Result<()> {
         let current = self.current.as_ref().ok_or_else(|| {
             CalyxError::aster_corrupt_shard(format!(
                 "SST streaming page cursor is exhausted in {}",
@@ -483,25 +490,9 @@ impl DiskIndexCursor {
             ))
         })?;
         let indexed_key = current.key.as_slice();
-        let value = self
-            .point_reader
-            .read_value(current.record_offset, indexed_key)?;
-        let row_bytes = materialized_entry_bytes::<SstEntry>(indexed_key, &value);
-        if row_bytes > MAX_RANGE_SCAN_BYTES {
-            return Err(CalyxError {
-                code: "CALYX_ASTER_SCAN_MEMORY_BUDGET",
-                message: format!(
-                    "SST streaming page row at ordinal {} in {} requires {row_bytes} bytes, above the {MAX_RANGE_SCAN_BYTES}-byte materialization budget",
-                    self.ordinal,
-                    self.path.display()
-                ),
-                remediation: "repair or split the oversized immutable row; paging refuses an allocation that can abort the daemon",
-            });
-        }
-        Ok(SstEntry {
-            key: clone_scan_bytes(indexed_key)?,
-            value,
-        })
+        self.point_reader
+            .read_value_into(current.record_offset, indexed_key, &mut entry.value)?;
+        replace_scan_bytes(&mut entry.key, indexed_key)
     }
 
     fn read_current_tombstone_state(&mut self) -> Result<bool> {
@@ -652,6 +643,18 @@ impl SstPointReader {
         record_offset: u64,
         expected_key: &[u8],
     ) -> Result<Vec<u8>> {
+        let mut value = Vec::new();
+        self.read_value_into(record_offset, expected_key, &mut value)?;
+        Ok(value)
+    }
+
+    /// Reads and validates an exact value into a reusable caller-owned buffer.
+    pub(crate) fn read_value_into(
+        &mut self,
+        record_offset: u64,
+        expected_key: &[u8],
+        value: &mut Vec<u8>,
+    ) -> Result<()> {
         let layout = self.read_record_layout(record_offset, expected_key)?;
         let row_bytes = std::mem::size_of::<SstEntry>()
             .saturating_add(layout.key_len)
@@ -666,19 +669,31 @@ impl SstPointReader {
                 remediation: "repair or split the oversized immutable row; indexed reads refuse an allocation that can abort the daemon",
             });
         }
-        let mut key = try_zeroed(layout.key_len)?;
-        self.read_exact_at(&mut key, layout.key_start)?;
-        if key != expected_key {
-            return Err(index_key_mismatch(
-                &self.path,
-                record_offset,
-                &key,
-                expected_key,
-            ));
+        let mut hasher = crc32fast::Hasher::new();
+        let mut key_buffer = [0_u8; RECORD_VALIDATION_BUFFER_BYTES];
+        let mut key_cursor = layout.key_start;
+        for expected in expected_key.chunks(RECORD_VALIDATION_BUFFER_BYTES) {
+            let actual = &mut key_buffer[..expected.len()];
+            self.read_exact_at(actual, key_cursor)?;
+            if actual != expected {
+                return Err(index_key_mismatch(
+                    &self.path,
+                    record_offset,
+                    actual,
+                    expected,
+                ));
+            }
+            hasher.update(actual);
+            key_cursor = key_cursor.saturating_add(expected.len() as u64);
         }
-        let mut value = try_zeroed(layout.value_len)?;
-        self.read_exact_at(&mut value, layout.value_start)?;
-        let actual_crc = record_crc(&key, &value);
+        value.clear();
+        value
+            .try_reserve_exact(layout.value_len)
+            .map_err(scan_reserve_failed)?;
+        value.resize(layout.value_len, 0);
+        self.read_exact_at(value, layout.value_start)?;
+        hasher.update(value);
+        let actual_crc = hasher.finalize();
         if actual_crc != layout.expected_crc {
             return Err(record_crc_mismatch(
                 &self.path,
@@ -687,7 +702,7 @@ impl SstPointReader {
                 actual_crc,
             ));
         }
-        Ok(value)
+        Ok(())
     }
 
     /// Validates one record without materializing its value.
@@ -869,6 +884,15 @@ fn try_zeroed(len: usize) -> Result<Vec<u8>> {
     bytes.try_reserve_exact(len).map_err(scan_reserve_failed)?;
     bytes.resize(len, 0);
     Ok(bytes)
+}
+
+fn replace_scan_bytes(target: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
+    target.clear();
+    target
+        .try_reserve_exact(bytes.len())
+        .map_err(scan_reserve_failed)?;
+    target.extend_from_slice(bytes);
+    Ok(())
 }
 
 fn read_exact_indexed(

@@ -50,14 +50,6 @@ pub const CALYX_ASTER_RESTORE_INVALID: &str = "CALYX_ASTER_RESTORE_INVALID";
 
 const OPTIONAL_REBUILDABLE_DIRS: [&str; 3] = ["ann", "kernel", "guard"];
 
-/// Rows materialized per bounded verification page.
-///
-/// Peak retention of a scan is this many decoded rows, not the column family.
-/// One cursor remains open across pages. Hot families use retained lookup
-/// indexes; cold families use the bounded on-disk index cursor. Neither path
-/// materializes the immutable corpus or re-seeks its sources per page.
-const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
-
 /// Scan refusals that mean "this check could not run to completion", never
 /// "this data is bad".
 ///
@@ -337,14 +329,17 @@ fn scan_cf_rows(
     value_crypto: Option<&SharedVaultContext>,
 ) -> Result<CfScan> {
     let mut scan = CfScan::default();
-    visit_cf_rows(vault, cf, overlay, value_crypto, |entry| {
+    visit_cf_rows(vault, cf, overlay, value_crypto, |key, value| {
         scan.row_count = scan.row_count.saturating_add(1);
         if scan
             .first_row
             .as_ref()
-            .is_none_or(|first| entry.key < first.key)
+            .is_none_or(|first| key < first.key.as_slice())
         {
-            scan.first_row = Some(entry);
+            scan.first_row = Some(SstEntry {
+                key: key.to_vec(),
+                value: value.to_vec(),
+            });
         }
         Ok(())
     })?;
@@ -363,32 +358,22 @@ fn visit_cf_rows(
     cf: ColumnFamily,
     overlay: &WalOverlay,
     value_crypto: Option<&SharedVaultContext>,
-    mut visit: impl FnMut(SstEntry) -> Result<()>,
+    mut visit: impl FnMut(&[u8], &[u8]) -> Result<()>,
 ) -> Result<()> {
     let wal_rows = overlay_rows(overlay, cf)
         .into_iter()
         .map(|(key, value)| SstEntry { key, value })
         .collect();
     let level = cf_level(vault, cf)?;
-    let mut stream = level.open_sequential_page_stream_with_overlay_origins(
-        &[],
-        None,
-        VERIFY_SCAN_PAGE_ROWS,
-        wal_rows,
-    )?;
-    while let Some(page) = stream.next_page()? {
-        for winner in page {
-            let entry = if winner.from_overlay {
-                winner.entry
-            } else {
-                open_sst_entry(winner.entry, cf, value_crypto)?
-            };
-            if !crate::mvcc::is_tombstone_value(&entry.value) {
-                visit(entry)?;
-            }
+    level.visit_sequential_with_overlay_origins(&[], None, wal_rows, |key, value, from_overlay| {
+        if !from_overlay {
+            open_sst_value_in_place(key, value, cf, value_crypto)?;
         }
-    }
-    Ok(())
+        if !crate::mvcc::is_tombstone_value(value) {
+            visit(key, value)?;
+        }
+        Ok(true)
+    })
 }
 
 /// Collapses the WAL overlay for one column family to its last-write-wins view.
@@ -517,18 +502,18 @@ fn read_back_first_constellation(
     Ok(hex(key))
 }
 
-fn open_sst_entry(
-    entry: SstEntry,
+fn open_sst_value_in_place(
+    key: &[u8],
+    value: &mut Vec<u8>,
     cf: ColumnFamily,
     value_crypto: Option<&SharedVaultContext>,
-) -> Result<SstEntry> {
+) -> Result<()> {
     let Some(context) = value_crypto else {
-        return Ok(entry);
+        return Ok(());
     };
-    Ok(SstEntry {
-        value: open_value_owned(context, cf, &entry.key, entry.value)?,
-        key: entry.key,
-    })
+    let owned = std::mem::take(value);
+    *value = open_value_owned(context, cf, key, owned)?;
+    Ok(())
 }
 
 struct LedgerVerification {
@@ -617,19 +602,16 @@ fn feed_ledger_rows(
     let mut entry_count = 0_u64;
     let mut last_hash: Option<[u8; 32]> = None;
     let mut verdict: Option<VerifyResult> = None;
-    let mut stream = level.open_sequential_page_stream_with_overlay_origins(
+    level.visit_sequential_with_overlay_origins(
         &[],
         None,
-        VERIFY_SCAN_PAGE_ROWS,
         Vec::new(),
-    )?;
-    'pages: while let Some(page) = stream.next_page()? {
-        for winner in page {
-            let entry = open_sst_entry(winner.entry, ColumnFamily::Ledger, value_crypto)?;
-            if crate::mvcc::is_tombstone_value(&entry.value) {
-                continue;
+        |key, value, _from_overlay| {
+            open_sst_value_in_place(key, value, ColumnFamily::Ledger, value_crypto)?;
+            if crate::mvcc::is_tombstone_value(value) {
+                return Ok(true);
             }
-            let seq = parse_aster_ledger_seq(&entry.key)?;
+            let seq = parse_aster_ledger_seq(key)?;
             // WAL-only sequences below this SST row come first in chain order.
             while wal_iter.peek().is_some_and(|(wal_seq, _)| **wal_seq < seq) {
                 let Some((wal_seq, bytes)) = wal_iter.next() else {
@@ -643,7 +625,7 @@ fn feed_ledger_rows(
                     &mut last_hash,
                 )? {
                     verdict = Some(result);
-                    break 'pages;
+                    return Ok(false);
                 }
             }
             // The same sequence present in both an SST and the WAL must be
@@ -651,25 +633,22 @@ fn feed_ledger_rows(
             if let Some((wal_seq, wal_bytes)) = wal_iter.peek()
                 && **wal_seq == seq
             {
-                if wal_bytes.as_slice() != entry.value.as_slice() {
+                if wal_bytes.as_slice() != value.as_slice() {
                     return Err(CalyxError::ledger_corrupt(format!(
                         "divergent ledger bytes for seq {seq} between SST and WAL"
                     )));
                 }
                 wal_iter.next();
             }
-            if let Some(result) = feed_ledger_row(
-                &mut verifier,
-                seq,
-                &entry.value,
-                &mut entry_count,
-                &mut last_hash,
-            )? {
+            if let Some(result) =
+                feed_ledger_row(&mut verifier, seq, value, &mut entry_count, &mut last_hash)?
+            {
                 verdict = Some(result);
-                break 'pages;
+                return Ok(false);
             }
-        }
-    }
+            Ok(true)
+        },
+    )?;
     if verdict.is_none() {
         for (wal_seq, bytes) in wal_iter {
             if let Some(result) = feed_ledger_row(

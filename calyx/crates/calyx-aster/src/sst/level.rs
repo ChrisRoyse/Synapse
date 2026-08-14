@@ -645,6 +645,16 @@ impl SstLevel {
         page::open_sequential_page_stream_with_overlay_origins(self, start, end, limit, overlay)
     }
 
+    pub(crate) fn visit_sequential_with_overlay_origins(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        overlay: Vec<SstEntry>,
+        visit: impl FnMut(&[u8], &mut Vec<u8>, bool) -> Result<bool>,
+    ) -> Result<()> {
+        page::visit_sequential_with_overlay_origins(self, start, end, overlay, visit)
+    }
+
     pub fn iter(&self) -> Result<Vec<SstEntry>> {
         self.collect_range(&[], None)
     }

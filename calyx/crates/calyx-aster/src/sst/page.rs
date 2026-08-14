@@ -134,6 +134,49 @@ pub(super) fn open_sequential_page_stream_with_overlay_origins(
     })
 }
 
+/// Visits a newest-wins snapshot while reusing one value buffer per source.
+///
+/// Returning pages transfers every winning `Vec` to the caller, forcing the
+/// next row from that source to allocate a replacement before merge ordering
+/// can continue. A whole-CF verifier consumes each winner synchronously, so it
+/// can return that same allocation to its source immediately. The callback may
+/// mutate the value in place (for authenticated decryption) but must not mutate
+/// the key. Returning `false` stops the scan after the accepted row.
+pub(super) fn visit_sequential_with_overlay_origins(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    overlay: Vec<SstEntry>,
+    mut visit: impl FnMut(&[u8], &mut Vec<u8>, bool) -> Result<bool>,
+) -> Result<()> {
+    let mut cursor = open_sequential_page_cursor(level, start, end, overlay)?;
+    loop {
+        let Some(first) = cursor.pop() else {
+            return Ok(());
+        };
+        let winner_source = first.source;
+        let from_overlay = matches!(&cursor.sources[winner_source], PageSource::Overlay { .. });
+        let mut entry = first.entry;
+        if !visit(&entry.key, &mut entry.value, from_overlay)? {
+            return Ok(());
+        }
+        let next_key = entry.key.as_slice();
+        while cursor
+            .heap
+            .peek()
+            .is_some_and(|item| item.entry.key.as_slice() == next_key)
+        {
+            let mut duplicate = cursor
+                .pop()
+                .expect("peek confirmed duplicate sequential heap item");
+            cursor.sources[duplicate.source].advance_past(next_key)?;
+            cursor.push_current_reusing(duplicate.source, &mut duplicate.entry)?;
+        }
+        cursor.sources[winner_source].advance_past(next_key)?;
+        cursor.push_current_reusing(winner_source, &mut entry)?;
+    }
+}
+
 /// An owning set of already-open immutable file handles plus its bounded
 /// newest-wins merge state.
 ///
@@ -344,6 +387,22 @@ impl PageSource {
         match self {
             Self::Overlay { rows, pos } => Ok(rows[*pos].clone()),
             Self::Sst { reader } => reader.read_current(),
+        }
+    }
+
+    fn read_current_into(&mut self, entry: &mut SstEntry) -> Result<()> {
+        match self {
+            Self::Overlay { rows, pos } => {
+                let row = rows.get(*pos).ok_or_else(|| {
+                    CalyxError::aster_corrupt_shard(
+                        "sequential overlay cursor is exhausted".to_owned(),
+                    )
+                })?;
+                entry.key.clone_from(&row.key);
+                entry.value.clone_from(&row.value);
+                Ok(())
+            }
+            Self::Sst { reader } => reader.read_current_into(entry),
         }
     }
 
@@ -664,6 +723,34 @@ impl SequentialPageCursor {
         }
         self.heap_bytes = next_bytes;
         self.heap.push(SequentialHeapItem { entry, source });
+        Ok(())
+    }
+
+    fn push_current_reusing(&mut self, source: usize, entry: &mut SstEntry) -> Result<()> {
+        if self.sources[source]
+            .current_key(self.end.as_deref())
+            .is_none()
+        {
+            return Ok(());
+        }
+        self.sources[source].read_current_into(entry)?;
+        let row_bytes = materialized_entry_bytes::<SstEntry>(&entry.key, &entry.value);
+        let next_bytes = self.heap_bytes.saturating_add(row_bytes);
+        if next_bytes > SEQUENTIAL_SNAPSHOT_PAGE_MAX_BYTES {
+            return Err(sequential_snapshot_memory_budget(
+                "merge frontier",
+                next_bytes,
+                row_bytes,
+            ));
+        }
+        self.heap_bytes = next_bytes;
+        self.heap.push(SequentialHeapItem {
+            entry: SstEntry {
+                key: std::mem::take(&mut entry.key),
+                value: std::mem::take(&mut entry.value),
+            },
+            source,
+        });
         Ok(())
     }
 
