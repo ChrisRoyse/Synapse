@@ -22,7 +22,7 @@ publish.workspace = true
 # `math_backend="cuda"`, and `math_backend="auto"` only resolves to CPU after
 # NVML proves this host has no CUDA device (see src/math.rs).
 default = []
-calyx-cuda = ["calyx-forge/cuda"]
+calyx-cuda = ["calyx-assay/cuda", "calyx-forge/cuda"]
 
 [dependencies]
 arc-swap.workspace = true

@@ -2,18 +2,96 @@ use calyx_core::{CalyxError, Result};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
 use rand_chacha::ChaCha8Rng;
+use std::sync::OnceLock;
 
 pub const STRICT_CUDA_ENV: &str = "CALYX_ASSAY_CUDA_STRICT";
+pub const CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT: &str = "CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT";
+const COMPUTE_BACKEND_REMEDIATION: &str = "configure one Calyx Assay compute backend before serving estimator requests and restart the process to change it";
 
+/// Process-wide execution backend for generic Calyx Assay estimators.
+///
+/// Synapse selects one serving math backend during vault open. Assay's generic
+/// APIs must obey that same decision instead of independently consulting a
+/// process environment variable and silently choosing CPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssayComputeBackend {
+    Cpu,
+    Cuda,
+}
+
+impl AssayComputeBackend {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Cpu => "cpu",
+            Self::Cuda => "cuda",
+        }
+    }
+}
+
+static COMPUTE_BACKEND: OnceLock<AssayComputeBackend> = OnceLock::new();
+
+/// Configures the generic Assay execution backend exactly once per process.
+///
+/// Repeating the same selection is idempotent. A conflicting selection fails
+/// closed because one process cannot honestly advertise two serving backends.
+///
+/// # Errors
+///
+/// Returns [`CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT`] when another caller has
+/// already selected a different backend for this process.
+pub fn configure_compute_backend(backend: AssayComputeBackend) -> Result<()> {
+    match COMPUTE_BACKEND.set(backend) {
+        Ok(()) => Ok(()),
+        Err(requested) => {
+            let Some(configured) = COMPUTE_BACKEND.get().copied() else {
+                return Err(CalyxError {
+                    code: CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT,
+                    message: "Calyx Assay backend initialization reported a conflict without retaining the configured value".to_owned(),
+                    remediation: COMPUTE_BACKEND_REMEDIATION,
+                });
+            };
+            if configured == requested {
+                Ok(())
+            } else {
+                Err(CalyxError {
+                    code: CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT,
+                    message: format!(
+                        "Calyx Assay process backend is already configured as {} and cannot be changed to {} while the process is running",
+                        configured.as_str(),
+                        requested.as_str()
+                    ),
+                    remediation: COMPUTE_BACKEND_REMEDIATION,
+                })
+            }
+        }
+    }
+}
+
+/// Returns the immutable process-wide Assay backend, when explicitly set.
+#[must_use]
+pub fn configured_compute_backend() -> Option<AssayComputeBackend> {
+    COMPUTE_BACKEND.get().copied()
+}
+
+/// Returns whether generic Assay entry points must use CUDA.
+///
+/// Embedders should call [`configure_compute_backend`] before serving work.
+/// The environment read remains only for standalone Calyx compatibility.
 pub fn strict_cuda_requested() -> bool {
-    std::env::var(STRICT_CUDA_ENV)
-        .map(|value| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "1" | "true" | "yes" | "on"
-            )
-        })
-        .unwrap_or(false)
+    configured_compute_backend().map_or_else(
+        || {
+            std::env::var(STRICT_CUDA_ENV)
+                .map(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        },
+        |backend| backend == AssayComputeBackend::Cuda,
+    )
 }
 
 #[cfg(not(feature = "cuda"))]

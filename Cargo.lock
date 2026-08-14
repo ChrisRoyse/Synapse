@@ -422,6 +422,7 @@ dependencies = [
  "blake3",
  "calyx-aster",
  "calyx-core",
+ "calyx-forge",
  "calyx-loom",
  "rand 0.9.4",
  "rand_chacha",

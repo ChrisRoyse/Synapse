@@ -1063,6 +1063,8 @@ pub struct SubsystemHealth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_assay_compute_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_backend_requested: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_cuda_compiled: Option<bool>,

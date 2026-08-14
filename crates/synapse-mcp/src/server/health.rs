@@ -1756,6 +1756,7 @@ impl SynapseService {
             calyx_math_backend: math_backend
                 .as_ref()
                 .map(|math| math.selected_backend.clone()),
+            calyx_assay_compute_backend: status.assay_compute_backend,
             calyx_math_backend_requested: math_backend
                 .as_ref()
                 .map(|math| math.requested_backend.as_str().to_owned())

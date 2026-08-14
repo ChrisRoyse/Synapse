@@ -45,6 +45,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use calyx_assay::{AssayComputeBackend, configure_compute_backend, configured_compute_backend};
 use calyx_aster::cf::{ColumnFamily, KeyRange, anchor_key, anchor_prefix_range};
 use calyx_aster::compaction::CompactionResult;
 use calyx_aster::dedup::EpochSecs;
@@ -2600,6 +2601,7 @@ pub struct SynapseCalyxVaultStatus {
     pub tuning: Option<SynapseCalyxTuningConfig>,
     pub anneal: Option<SynapseCalyxAnnealStatus>,
     pub math_backend: Option<SynapseCalyxMathBackendStatus>,
+    pub assay_compute_backend: Option<String>,
     /// Per-site row-table read-guard tallies since this vault was opened.
     ///
     /// Empty when the vault is not open. Every declared site appears when it
@@ -4455,6 +4457,39 @@ impl SynapseCalyxVault {
             Ok(runtime) => runtime,
             Err(error) => return Err(cleanup_open_lock(lock, error)),
         };
+        let math_status = math_runtime.status_snapshot();
+        let assay_compute_backend = match math_status.selected_backend.as_str() {
+            "cpu" => AssayComputeBackend::Cpu,
+            "cuda" => AssayComputeBackend::Cuda,
+            selected => {
+                let error = SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_ASSAY_BACKEND_UNKNOWN",
+                    format!(
+                        "Synapse selected math backend {selected:?}, which cannot be mapped to a Calyx Assay execution backend"
+                    ),
+                    "repair Synapse math backend selection so it resolves to exactly cpu or cuda before opening the Calyx vault",
+                );
+                drop(math_runtime);
+                drop(vault);
+                return Err(cleanup_open_lock(lock, error));
+            }
+        };
+        if let Err(error) = configure_compute_backend(assay_compute_backend) {
+            let error = SynapseCalyxError::from_calyx(
+                "configure the process-wide Calyx Assay compute backend",
+                &error,
+            );
+            drop(math_runtime);
+            drop(vault);
+            return Err(cleanup_open_lock(lock, error));
+        }
+        tracing::info!(
+            code = "SYNAPSE_CALYX_ASSAY_BACKEND_CONFIGURED",
+            requested_backend = math_status.requested_backend.as_str(),
+            selected_backend = math_status.selected_backend.as_str(),
+            assay_compute_backend = assay_compute_backend.as_str(),
+            "configured every generic Calyx Assay estimator to use the selected Synapse serving backend"
+        );
         let opened = Self {
             config,
             vault,
@@ -9086,6 +9121,8 @@ fn status_from_vault(
     };
     status.apply_paths(config);
     status.math_backend = Some(math_backend.clone());
+    status.assay_compute_backend =
+        configured_compute_backend().map(|backend| backend.as_str().to_owned());
     status.row_guard_census = vault
         .row_guard_census()
         .into_iter()

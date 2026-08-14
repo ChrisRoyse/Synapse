@@ -97,6 +97,10 @@ pub use cross_correlation::{
     CCF_LAG_CONVENTION, CrossCorrelationPoint, CrossCorrelationReport, cross_correlation_profile,
     cross_correlation_profile_cuda_strict,
 };
+pub use cuda_strict::{
+    AssayComputeBackend, CALYX_ASSAY_COMPUTE_BACKEND_CONFLICT, configure_compute_backend,
+    configured_compute_backend,
+};
 pub use distance_correlation::{
     DEFAULT_DCOR_PERMUTATIONS, DEFAULT_DCOR_SEED, DcorPermConfig, DcorReport, DcorTest,
     MIN_DCOR_SAMPLES, distance_correlation, distance_correlation_cuda_strict,
