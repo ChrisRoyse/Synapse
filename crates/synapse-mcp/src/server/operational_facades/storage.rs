@@ -1291,10 +1291,16 @@ pub(super) async fn handle(
                     "repair storage/Calyx initialization and retry storage operation=intelligence",
                 )
             })?;
-            // Weaving and abundance both scan the whole Base panel and run the
-            // substrate math; that is blocking CPU/IO work that must not occupy a
-            // runtime worker serving MCP requests. Offload to the blocking pool.
-            let response = tokio::task::spawn_blocking(move || {
+            // These intelligence operations scan a bounded but potentially
+            // large Base corpus and run substrate math. Admit the entire public
+            // intelligence surface through the same exclusive whole-corpus
+            // lane as scheduled derived state, search rebuild, GC, pressure,
+            // and hygiene kernel rebuild. This prevents a second public route
+            // from reintroducing multiplied resident sets (#2243).
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "storage_intelligence",
+                    move || {
                 use crate::m3::storage::{StorageIntelligenceOperation, StorageIntelligenceResponse};
                 let base = StorageIntelligenceResponse {
                     operation: sub_operation,
@@ -1489,7 +1495,9 @@ pub(super) async fn handle(
                         })
                     }
                 }
-            })
+                    },
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -1497,11 +1505,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(
-                        error_codes::TOOL_INTERNAL_ERROR,
-                        format!("intelligence blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the intelligence weave/abundance task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named intelligence error",
                 )
             })??;
             let summary = if let Some(weave) = &response.weave {

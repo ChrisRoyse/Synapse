@@ -66,6 +66,37 @@ where
     F: FnOnce() -> StorageResult<T> + Send + 'static,
     T: Send + 'static,
 {
+    run_admitted_maintenance_preserving_error(operation, work).await?
+}
+
+/// Runs one blocking whole-corpus pass while preserving its domain error type.
+///
+/// MCP facades have typed protocol errors which must not be flattened into a
+/// generic storage failure merely to share the process-wide maintenance lane.
+/// The outer [`StorageResult`] describes admission or blocking-task ownership;
+/// the inner `Result<T, E>` is the operation's unchanged domain verdict.
+///
+/// The completion record is emitted by the blocking owner before it drops the
+/// permit. `spawn_blocking` work cannot be cancelled once running, so logging
+/// completion only after awaiting the join handle loses the authoritative end
+/// record when an HTTP client times out and drops its request future (#2243).
+/// Keeping both the permit and completion telemetry inside the worker proves
+/// that detached work remains admitted until its real ownership boundary.
+///
+/// # Errors
+///
+/// Returns a structured storage error if the admission semaphore was closed or
+/// the blocking task failed to join. The operation's own error is returned
+/// unchanged in the nested result.
+pub async fn run_admitted_maintenance_preserving_error<T, E, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<Result<T, E>>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
     let semaphore = Arc::clone(&STORAGE_MAINTENANCE_PERMITS);
     let lane_occupied_at_request = semaphore.available_permits() == 0;
     let admission_started = Instant::now();
@@ -103,22 +134,21 @@ where
         // pass just produced, and its own failures never mask the maintenance
         // result.
         publish_lowered_guard_thresholds();
+        let exec_ms = u64::try_from(exec_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            code = "STORAGE_MAINTENANCE_COMPLETED",
+            operation,
+            exec_ms,
+            admission_wait_ms,
+            is_ok = outcome.is_ok(),
+            completion_emitted_by_blocking_owner = true,
+            "completed off-runtime storage maintenance pass"
+        );
         outcome
     })
     .await;
-    let exec_ms = u64::try_from(exec_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     match joined {
-        Ok(result) => {
-            tracing::info!(
-                code = "STORAGE_MAINTENANCE_COMPLETED",
-                operation,
-                exec_ms,
-                admission_wait_ms,
-                is_ok = result.is_ok(),
-                "completed off-runtime storage maintenance pass"
-            );
-            result
-        }
+        Ok(result) => Ok(result),
         Err(join_error) => Err(StorageError::WriteFailed {
             cf_name: "storage_maintenance".to_owned(),
             detail: format!(

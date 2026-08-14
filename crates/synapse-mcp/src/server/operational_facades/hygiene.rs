@@ -929,9 +929,17 @@ pub(super) async fn handle(
                 )
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
-            let response = tokio::task::spawn_blocking(move || {
-                crate::m3::hygiene::run_kernel_rebuild(&db, &spec)
-            })
+            // Kernel rebuild owns a bounded but substantial corpus for minutes.
+            // Route it through the same exclusive whole-corpus lane as
+            // scheduled derived-state/search maintenance. The permit moves
+            // into the blocking owner, so a disconnected/timed-out client
+            // cannot detach unadmitted work that later overlaps the scheduler.
+            let response = Box::pin(
+                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    "hygiene_kernel_rebuild",
+                    move || crate::m3::hygiene::run_kernel_rebuild(&db, &spec),
+                ),
+            )
             .await
             .map_err(|error| {
                 facade_delegate_error(
@@ -939,11 +947,8 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(
-                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                        format!("kernel rebuild blocking task failed to join: {error}"),
-                    ),
-                    "inspect daemon logs; the kernel-rebuild task terminated abnormally",
+                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named kernel-rebuild error",
                 )
             })??;
             Ok(Json(hygiene_response(
