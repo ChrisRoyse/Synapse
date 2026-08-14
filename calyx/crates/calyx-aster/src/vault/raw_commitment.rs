@@ -10,7 +10,7 @@
 use super::encode::WriteRow;
 use crate::cf::ColumnFamily;
 use calyx_core::{CalyxError, Result};
-use calyx_ledger::{EntryKind, LedgerEntry, SubjectId};
+use calyx_ledger::{EntryKind, LedgerEntry, LedgerEntryRef, SubjectId};
 use sha2::{Digest as _, Sha256};
 
 pub(crate) const RAW_COMMITMENT_SUBJECT: &[u8] = b"calyx-aster/raw-batch-commitment/v1";
@@ -347,6 +347,304 @@ pub(crate) fn ledger_seal(entry: &LedgerEntry) -> Result<Option<RawCommitmentSea
     decode_seal(&entry.payload).map(Some)
 }
 
+pub(crate) fn ledger_seal_ref(entry: &LedgerEntryRef<'_>) -> Result<Option<RawCommitmentSeal>> {
+    if entry.kind() != EntryKind::BatchCommitment {
+        return Ok(None);
+    }
+    if !entry.subject_is_query(RAW_COMMITMENT_SUBJECT) {
+        return Err(CalyxError::aster_corrupt_shard(format!(
+            "batch_commitment Ledger entry {} has a foreign subject; the kind is reserved for Aster raw-batch checkpoint seals",
+            entry.seq()
+        )));
+    }
+    decode_seal(entry.payload()).map(Some)
+}
+
+/// Allocation-bounded verifier for one checkpoint-cohort seal.
+///
+/// The legacy verifier below needs the complete cohort and a second vector of
+/// leaf hashes. New live-vault walks use this RFC 6962 frontier instead: it
+/// retains one 32-byte node per occupied tree level and no more than the 256
+/// diagnostic buckets already sealed into the Ledger. Small cohorts retain at
+/// most 256 rows so the established exact diagnostics remain byte-identical.
+pub(crate) struct StreamingSealVerifier {
+    seal: RawCommitmentSeal,
+    root: StreamingMerkleRoot,
+    buckets: Vec<StreamingDiagnosticBucket>,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+    outside_range_count: u64,
+    outside_range_examples: Vec<u64>,
+    leaf_examples: Vec<(u64, [u8; HASH_BYTES])>,
+    exact_rows: Option<Vec<RawCommitment>>,
+}
+
+impl StreamingSealVerifier {
+    pub(crate) fn new(seal: RawCommitmentSeal) -> Self {
+        let buckets = (0..seal.leaf_digests.len())
+            .map(|_| StreamingDiagnosticBucket::default())
+            .collect();
+        let exact_rows = (seal.commitment_count <= LOCALIZATION_MAX_DIGESTS as u64)
+            .then(|| Vec::with_capacity(seal.commitment_count as usize));
+        Self {
+            seal,
+            root: StreamingMerkleRoot::default(),
+            buckets,
+            first_seq: None,
+            last_seq: None,
+            outside_range_count: 0,
+            outside_range_examples: Vec::new(),
+            leaf_examples: Vec::new(),
+            exact_rows,
+        }
+    }
+
+    pub(crate) const fn expected_count(&self) -> u64 {
+        self.seal.commitment_count
+    }
+
+    pub(crate) fn push(&mut self, commitment: &RawCommitment) -> Result<()> {
+        let index = self.root.count();
+        let leaf = commitment_leaf_hash(commitment);
+        self.root.push_leaf(leaf)?;
+        self.first_seq.get_or_insert(commitment.seq);
+        self.last_seq = Some(commitment.seq);
+
+        if commitment.seq < self.seal.first_seq || commitment.seq > self.seal.last_seq {
+            self.outside_range_count = self.outside_range_count.saturating_add(1);
+            if self.outside_range_examples.len() < MISMATCH_ROW_LISTING_CAP {
+                self.outside_range_examples.push(commitment.seq);
+            }
+        }
+        if self.leaf_examples.len() < MISMATCH_ROW_LISTING_CAP {
+            self.leaf_examples.push((commitment.seq, leaf));
+        }
+        if let Some(rows) = &mut self.exact_rows {
+            rows.push(commitment.clone());
+        }
+
+        if !self.buckets.is_empty() && index < self.seal.commitment_count {
+            let bucket_count = self.buckets.len() as u128;
+            let expected_count = u128::from(self.seal.commitment_count);
+            let bucket = ((u128::from(index) + 1) * bucket_count - 1) / expected_count;
+            let bucket = usize::try_from(bucket).map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "raw commitment diagnostic bucket index does not fit this host",
+                )
+            })?;
+            let bucket_count = self.buckets.len();
+            let target = self.buckets.get_mut(bucket).ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "raw commitment diagnostic bucket {bucket} is outside {bucket_count} sealed buckets"
+                ))
+            })?;
+            target.push(commitment.seq, leaf)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish(self) -> Result<StreamingSealVerdict> {
+        let count = self.root.count();
+        let physical_root = self.root.root();
+        let intact = count == self.seal.commitment_count
+            && self.first_seq == Some(self.seal.first_seq)
+            && self.last_seq == Some(self.seal.last_seq)
+            && physical_root == self.seal.merkle_root;
+        if let Some(rows) = &self.exact_rows {
+            let established = seal_matches(&self.seal, rows)?;
+            if established != intact {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "streaming raw commitment Merkle verdict {intact} disagrees with the established bounded-cohort verdict {established} for sealed range {}..={} count={}",
+                    self.seal.first_seq, self.seal.last_seq, self.seal.commitment_count
+                )));
+            }
+        }
+        if intact {
+            return Ok(StreamingSealVerdict {
+                intact: true,
+                last_physical_seq: self.last_seq,
+                failure: None,
+            });
+        }
+
+        if let Some(rows) = &self.exact_rows {
+            let failure = if count < self.seal.commitment_count {
+                describe_truncated_cohort(&self.seal, rows)
+            } else {
+                describe_mismatch(&self.seal, rows)
+            };
+            return Ok(StreamingSealVerdict {
+                intact: false,
+                last_physical_seq: self.last_seq,
+                failure: Some(failure),
+            });
+        }
+
+        let mut parts = vec![format!(
+            "sealed rows {}..={} count={} physical_first={:?} physical_last={:?} physical_count={count}",
+            self.seal.first_seq,
+            self.seal.last_seq,
+            self.seal.commitment_count,
+            self.first_seq,
+            self.last_seq,
+        )];
+        if count < self.seal.commitment_count {
+            parts.push(format!(
+                "missing_commitment_count={}",
+                self.seal.commitment_count - count
+            ));
+        }
+        if self.outside_range_count > 0 {
+            parts.push(format!(
+                "offending_sequences_outside_sealed_range=[{}] outside_count={}",
+                self.outside_range_examples
+                    .iter()
+                    .map(u64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                self.outside_range_count
+            ));
+        }
+        if physical_root != self.seal.merkle_root {
+            parts.push(format!(
+                "merkle_root sealed={} physical={}",
+                hex32(&self.seal.merkle_root),
+                hex32(&physical_root)
+            ));
+            parts.push(self.localize_root_mismatch());
+        }
+        Ok(StreamingSealVerdict {
+            intact: false,
+            last_physical_seq: self.last_seq,
+            failure: Some(parts.join(" ")),
+        })
+    }
+
+    fn localize_root_mismatch(&self) -> String {
+        if self.seal.leaf_digests.is_empty() {
+            let leaves = self
+                .leaf_examples
+                .iter()
+                .map(|(seq, digest)| format!("{seq}:{}", hex32(digest)))
+                .collect::<Vec<_>>()
+                .join(",");
+            return format!(
+                "offending_sequences=unavailable reason=this pre-#1876 seal carries only the RFC 6962 root, not an inclusion ladder physical_leaf_digests=[{leaves}]"
+            );
+        }
+
+        let mut offenders = Vec::new();
+        let mut exact = true;
+        for (index, (bucket, sealed_digest)) in
+            self.buckets.iter().zip(&self.seal.leaf_digests).enumerate()
+        {
+            let Some(first_seq) = bucket.first_seq else {
+                offenders.push(format!("sealed_bucket_{index}=missing"));
+                exact = false;
+                continue;
+            };
+            if bucket.root.root() == *sealed_digest {
+                continue;
+            }
+            let last_seq = bucket.last_seq.unwrap_or(first_seq);
+            if bucket.root.count() == 1 {
+                offenders.push(first_seq.to_string());
+            } else {
+                exact = false;
+                offenders.push(format!(
+                    "{first_seq}..={last_seq}({} rows)",
+                    bucket.root.count()
+                ));
+            }
+        }
+        if offenders.is_empty() {
+            return "offending_sequences=none reason=every sealed diagnostic bucket matches the physical rows; the sealed root field itself diverged".to_owned();
+        }
+        let precision = if exact { "exact" } else { "bucketed" };
+        format!(
+            "offending_sequences=[{}] localization={precision}",
+            offenders.join(",")
+        )
+    }
+}
+
+pub(crate) struct StreamingSealVerdict {
+    pub(crate) intact: bool,
+    pub(crate) last_physical_seq: Option<u64>,
+    pub(crate) failure: Option<String>,
+}
+
+#[derive(Default)]
+struct StreamingDiagnosticBucket {
+    root: StreamingMerkleRoot,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
+}
+
+impl StreamingDiagnosticBucket {
+    fn push(&mut self, seq: u64, leaf: [u8; HASH_BYTES]) -> Result<()> {
+        self.root.push_leaf(leaf)?;
+        self.first_seq.get_or_insert(seq);
+        self.last_seq = Some(seq);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+struct StreamingMerkleRoot {
+    branches: [Option<[u8; HASH_BYTES]>; 64],
+    count: u64,
+}
+
+impl Default for StreamingMerkleRoot {
+    fn default() -> Self {
+        Self {
+            branches: [None; 64],
+            count: 0,
+        }
+    }
+}
+
+impl StreamingMerkleRoot {
+    const fn count(&self) -> u64 {
+        self.count
+    }
+
+    fn push_leaf(&mut self, mut node: [u8; HASH_BYTES]) -> Result<()> {
+        if self.count == u64::MAX {
+            return Err(CalyxError::aster_corrupt_shard(
+                "raw commitment cohort exceeds the u64 Merkle leaf-count limit",
+            ));
+        }
+        let mut occupied = self.count;
+        let mut level = 0_usize;
+        while occupied & 1 == 1 {
+            let left = self.branches[level].take().ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "raw commitment Merkle frontier is missing occupied level {level}"
+                ))
+            })?;
+            node = merkle_parent(left, node);
+            occupied >>= 1;
+            level += 1;
+        }
+        self.branches[level] = Some(node);
+        self.count += 1;
+        Ok(())
+    }
+
+    fn root(&self) -> [u8; HASH_BYTES] {
+        let mut right = None;
+        for left in self.branches.iter().flatten() {
+            right = Some(match right {
+                Some(right) => merkle_parent(*left, right),
+                None => *left,
+            });
+        }
+        right.unwrap_or_else(|| Sha256::digest([]).into())
+    }
+}
+
 pub(crate) fn seal_matches(
     seal: &RawCommitmentSeal,
     commitments: &[RawCommitment],
@@ -667,6 +965,14 @@ fn commitment_leaf_hash(commitment: &RawCommitment) -> [u8; HASH_BYTES] {
     hasher.finalize().into()
 }
 
+fn merkle_parent(left: [u8; HASH_BYTES], right: [u8; HASH_BYTES]) -> [u8; HASH_BYTES] {
+    let mut hasher = Sha256::new();
+    hasher.update([1]);
+    hasher.update(left);
+    hasher.update(right);
+    hasher.finalize().into()
+}
+
 fn merkle_root(leaves: &[[u8; HASH_BYTES]]) -> [u8; HASH_BYTES] {
     match leaves.len() {
         0 => Sha256::digest([]).into(),
@@ -675,11 +981,7 @@ fn merkle_root(leaves: &[[u8; HASH_BYTES]]) -> [u8; HASH_BYTES] {
             let split = len.next_power_of_two() / 2;
             let left = merkle_root(&leaves[..split]);
             let right = merkle_root(&leaves[split..]);
-            let mut hasher = Sha256::new();
-            hasher.update([1]);
-            hasher.update(left);
-            hasher.update(right);
-            hasher.finalize().into()
+            merkle_parent(left, right)
         }
     }
 }

@@ -40,7 +40,7 @@ pub use checkpoint::{
     CHECKPOINT_TAG, CheckpointConfig, CheckpointPayload, CheckpointScheduler,
     DEFAULT_CHECKPOINT_INTERVAL, OverlayLedgerStore,
 };
-pub use codec::{decode, decode_header, encode};
+pub use codec::{LedgerEntryRef, decode, decode_header, decode_ref, encode};
 pub use entry::{ActorId, LedgerEntry, SubjectId, compute_entry_hash};
 pub use group_commit::{
     DefaultLedgerHook, LedgerBatchRow, LedgerWriteBatch, StagedLedgerRow, WriteBatch, WriteOp,

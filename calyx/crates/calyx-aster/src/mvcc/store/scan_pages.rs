@@ -11,7 +11,186 @@ use super::*;
 /// fall back to whole-range materialization.
 const SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES: usize = 64 << 20;
 
+/// Re-check a long-lived snapshot lease at this row cadence. The underlying
+/// row cursor holds no corpus-wide value page, so this is a time/liveness bound
+/// only, not a memory batching knob.
+const SNAPSHOT_ROW_STREAM_LEASE_CHECK_ROWS: usize = 256;
+
+/// One pinned, allocation-reusing CF row stream.
+pub(crate) struct SnapshotCfRowStream<'a> {
+    store: &'a VersionedCfStore,
+    snapshot: Snapshot,
+    cf: ColumnFamily,
+    clock: &'a dyn Clock,
+    rows_until_lease_check: usize,
+    inner: SnapshotCfRowStreamInner<'a>,
+}
+
+enum SnapshotCfRowStreamInner<'a> {
+    Router(crate::cf::CfImmutableRowStream<'a>),
+    Paged {
+        range: KeyRange,
+        after_key: Option<Vec<u8>>,
+        page: std::vec::IntoIter<(Vec<u8>, Vec<u8>)>,
+        exhausted: bool,
+    },
+}
+
+impl SnapshotCfRowStream<'_> {
+    /// Lends the next visible row to `visit`; returns `false` at EOF.
+    pub(crate) fn next_with(
+        &mut self,
+        visit: impl FnOnce(&[u8], &[u8]) -> Result<()>,
+    ) -> Result<bool> {
+        if self.rows_until_lease_check == 0 {
+            self.store.ensure_snapshot_live(self.snapshot, self.clock)?;
+            self.rows_until_lease_check = SNAPSHOT_ROW_STREAM_LEASE_CHECK_ROWS;
+        }
+
+        let store = self.store;
+        let snapshot = self.snapshot;
+        let cf = self.cf;
+        let clock = self.clock;
+        let mut visit = Some(visit);
+        let present = match &mut self.inner {
+            SnapshotCfRowStreamInner::Router(stream) => stream.next_with(|key, value| {
+                let barriers = store
+                    .read_barriers
+                    .read()
+                    .expect("mvcc read barriers poisoned");
+                if let Some(error) = first_blocking(&barriers, cf, key) {
+                    return Err(error);
+                }
+                drop(barriers);
+                visit
+                    .take()
+                    .expect("snapshot row visitor is consumed exactly once")(
+                    key, value
+                )
+            })?,
+            SnapshotCfRowStreamInner::Paged {
+                range,
+                after_key,
+                page,
+                exhausted,
+            } => loop {
+                if let Some((key, value)) = page.next() {
+                    visit
+                        .take()
+                        .expect("snapshot row visitor is consumed exactly once")(
+                        &key, &value
+                    )?;
+                    break true;
+                }
+                if *exhausted {
+                    break false;
+                }
+                let rows = store.scan_cf_range_page_at(
+                    snapshot,
+                    cf,
+                    range,
+                    after_key.as_deref(),
+                    1,
+                    clock,
+                )?;
+                let Some(last_key) = rows.last().map(|(key, _)| key.clone()) else {
+                    *exhausted = true;
+                    continue;
+                };
+                *after_key = Some(last_key);
+                *page = rows.into_iter();
+            },
+        };
+        if present {
+            self.rows_until_lease_check -= 1;
+        } else {
+            self.store.ensure_snapshot_live(self.snapshot, self.clock)?;
+        }
+        Ok(present)
+    }
+}
+
 impl VersionedCfStore {
+    /// Opens one coherent row-at-a-time scan over a pinned snapshot.
+    ///
+    /// Router-backed stores retain one reusable value buffer per intersecting
+    /// SST source plus a bounded MVCC overlay; they never build an output page
+    /// or a corpus-wide row vector. The in-memory fallback also advances one
+    /// row at a time and exists for non-router vaults only.
+    pub(crate) fn open_cf_range_row_stream_at<'a>(
+        &'a self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        clock: &'a dyn Clock,
+    ) -> Result<SnapshotCfRowStream<'a>> {
+        self.ensure_snapshot_live(snapshot, clock)?;
+        let inner = if self.router_latest_readback.load(Ordering::Acquire) {
+            self.ensure_router_latest_snapshot(snapshot)?;
+            let router = self.router.as_ref().ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(
+                    "router-backed snapshot row stream requested without a CF router".to_owned(),
+                )
+            })?;
+
+            let table = self.read_rows(RowGuardSite::SnapshotPagedOverlay, cf);
+            let mut overlay = Vec::<crate::sst::SstEntry>::new();
+            let mut overlay_bytes = 0_usize;
+            if let Some(cf_rows) = table.get(&cf) {
+                for (key, versions) in super::read::latest::overlay_range(cf_rows, cf, Some(range))?
+                {
+                    let value = versions
+                        .iter()
+                        .rev()
+                        .find(|version| version.seq <= snapshot.seq())
+                        .map_or(TOMBSTONE_VALUE, |version| version.value.as_slice());
+                    let row_bytes =
+                        crate::sst::materialized_entry_bytes::<crate::sst::SstEntry>(key, value);
+                    overlay_bytes = overlay_bytes.saturating_add(row_bytes);
+                    if overlay_bytes > SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES {
+                        return Err(CalyxError {
+                            code: "CALYX_ASTER_SNAPSHOT_OVERLAY_MEMORY_BUDGET",
+                            message: format!(
+                                "the {} snapshot row-stream delta needs {overlay_bytes} bytes, above the {}-byte transient overlay budget",
+                                cf.name(),
+                                SNAPSHOT_ROUTER_OVERLAY_MAX_BYTES
+                            ),
+                            remediation: "checkpoint and compact the changed-key journal before retrying; the row stream refuses unbounded overlay duplication instead of risking host memory exhaustion",
+                        });
+                    }
+                    overlay
+                        .try_reserve(1)
+                        .map_err(crate::sst::scan_reserve_failed)?;
+                    overlay.push(crate::sst::SstEntry {
+                        key: crate::sst::clone_scan_bytes(key)?,
+                        value: crate::sst::clone_scan_bytes(value)?,
+                    });
+                }
+            }
+            SnapshotCfRowStreamInner::Router(router.open_immutable_row_stream(
+                cf,
+                range,
+                overlay,
+                move || drop(table),
+            )?)
+        } else {
+            SnapshotCfRowStreamInner::Paged {
+                range: range.clone(),
+                after_key: None,
+                page: Vec::new().into_iter(),
+                exhausted: false,
+            }
+        };
+        Ok(SnapshotCfRowStream {
+            store: self,
+            snapshot,
+            cf,
+            clock,
+            rows_until_lease_check: 0,
+            inner,
+        })
+    }
+
     /// Streams visible rows for one CF at the pinned sequence in bounded pages.
     pub fn scan_cf_pages_at<F, E>(
         &self,

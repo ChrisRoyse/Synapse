@@ -1198,6 +1198,15 @@ impl CfRouter {
         self.config.cf_dir(cf)
     }
 
+    pub(super) fn open_value(
+        &self,
+        cf: ColumnFamily,
+        key: &[u8],
+        value: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        self.config.open_value(cf, key, value)
+    }
+
     pub(super) fn open_entries<I>(&self, cf: ColumnFamily, entries: I) -> Result<Vec<SstEntry>>
     where
         I: IntoIterator<Item = SstEntry>,

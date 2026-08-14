@@ -21,6 +21,7 @@ pub use gc::{
     DEFAULT_SNAPSHOT_VERSION_GC_MAX_SHARD_HOLD_US, DEFAULT_SNAPSHOT_VERSION_GC_MAX_VERSIONS,
     SnapshotVersionGcBudget, SnapshotVersionGcPass, SnapshotVersionGcStop,
 };
+pub(crate) use scan_pages::SnapshotCfRowStream;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;

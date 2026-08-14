@@ -645,6 +645,15 @@ impl SstLevel {
         page::open_sequential_page_stream_with_overlay_origins(self, start, end, limit, overlay)
     }
 
+    pub(crate) fn open_sequential_row_stream_with_overlay_origins(
+        &self,
+        start: &[u8],
+        end: Option<&[u8]>,
+        overlay: Vec<SstEntry>,
+    ) -> Result<page::SstSequentialRowStream> {
+        page::open_sequential_row_stream_with_overlay_origins(self, start, end, overlay)
+    }
+
     pub(crate) fn visit_sequential_with_overlay_origins(
         &self,
         start: &[u8],

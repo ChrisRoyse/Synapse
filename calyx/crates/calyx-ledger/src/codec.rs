@@ -17,7 +17,7 @@ const HEADER_LEN: usize = KIND_OFFSET;
 /// Whole-chain verification needs every field for canonical hashing but never
 /// needs to own any of them. Keeping the slices tied to the caller's row buffer
 /// prevents a second payload-sized allocation for every historical entry.
-pub(crate) struct LedgerEntryRef<'a> {
+pub struct LedgerEntryRef<'a> {
     pub(crate) seq: u64,
     pub(crate) prev_hash: [u8; HASH_BYTES],
     pub(crate) kind: EntryKind,
@@ -28,6 +28,39 @@ pub(crate) struct LedgerEntryRef<'a> {
     pub(crate) actor_bytes: &'a [u8],
     pub(crate) ts: u64,
     pub(crate) entry_hash: [u8; HASH_BYTES],
+}
+
+impl LedgerEntryRef<'_> {
+    pub const fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    pub const fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    pub fn subject_is_query(&self, expected: &[u8]) -> bool {
+        self.subject_tag == TAG_QUERY && self.subject_bytes == expected
+    }
+
+    pub const fn payload(&self) -> &[u8] {
+        self.payload
+    }
+
+    pub fn verify(&self) -> bool {
+        self.entry_hash
+            == crate::entry::compute_entry_hash_slices(
+                self.seq,
+                &self.prev_hash,
+                self.kind,
+                self.subject_tag,
+                self.subject_bytes,
+                self.payload,
+                self.actor_tag,
+                self.actor_bytes,
+                self.ts,
+            )
+    }
 }
 
 /// Encodes a ledger entry with a stable, padding-free binary layout.
@@ -58,6 +91,23 @@ pub fn encode(entry: &LedgerEntry) -> Vec<u8> {
 /// Decodes a ledger entry and verifies its embedded hash.
 pub fn decode(bytes: &[u8]) -> Result<LedgerEntry> {
     let entry = decode_unchecked(bytes)?;
+    if entry.verify() {
+        Ok(entry)
+    } else {
+        Err(corrupt(format!(
+            "ledger entry seq {} hash mismatch",
+            entry.seq
+        )))
+    }
+}
+
+/// Returns a borrowed, structurally and cryptographically validated entry.
+///
+/// The returned view owns no subject, payload, or actor allocation. It is the
+/// read path for whole-history classifiers that need trusted fields but do not
+/// need to retain the entry after advancing their storage cursor.
+pub fn decode_ref(bytes: &[u8]) -> Result<LedgerEntryRef<'_>> {
+    let entry = decode_ref_unchecked(bytes)?;
     if entry.verify() {
         Ok(entry)
     } else {

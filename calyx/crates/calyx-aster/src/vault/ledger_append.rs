@@ -1,13 +1,15 @@
 use super::{AsterVault, encode, ledger_hook, raw_commitment};
-use crate::cf::{ColumnFamily, anchor_key, base_key, ledger_key};
+use crate::cf::{ColumnFamily, KeyRange, anchor_key, base_key, ledger_key};
 use crate::ledger_view::parse_aster_ledger_seq;
+use crate::mvcc::SnapshotCfRowStream;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
-    ActorId, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry, LedgerHeadAnchor,
-    LedgerRow, LedgerSnapshot, QueryId, RedactionPolicy, ReproduceInputResolver,
-    ReproduceLensRegistry, ReproduceResult, StagedLedgerRow, SubjectId, VerifyResult,
-    decode as decode_ledger_entry, reproduce_payload_bytes, reproduce_verdict_with_input_resolver,
-    reproduce_with_input_resolver, verify_snapshot,
+    ActorId, AnchorDiscipline, EntryKind, ForgeBackend, LedgerAppender, LedgerCfStore, LedgerEntry,
+    LedgerHeadAnchor, LedgerRow, QueryId, RedactionPolicy, ReproduceInputResolver,
+    ReproduceLensRegistry, ReproduceResult, StagedLedgerRow, StreamingChainVerifier,
+    StreamingStart, SubjectId, VerifyResult, decode as decode_ledger_entry,
+    decode_ref as decode_ledger_entry_ref, reproduce_payload_bytes,
+    reproduce_verdict_with_input_resolver, reproduce_with_input_resolver,
 };
 use std::ops::Range;
 
@@ -270,9 +272,39 @@ where
                 remediation: "verify through a write-capable handle, or use verify_restore, which reads the vault directory directly and needs no durable handle",
             });
         }
-        let store = AsterRawLedgerStore { vault: self };
-        let (snapshot_seq, snapshot) = store.coherent_snapshot()?;
-        let head = snapshot.head_anchor().cloned();
+        let durable = self.durable.as_ref().ok_or_else(|| CalyxError {
+            code: "CALYX_ASTER_LEDGER_VERIFY_UNAVAILABLE",
+            message: "ledger snapshot requires a durable vault handle".to_owned(),
+            remediation: "verify through a write-capable handle or use verify_restore",
+        })?;
+        let commit_guard = crate::file_lock::FileLockGuard::acquire(
+            &durable.root().join("locks").join("durable.commit.lock"),
+        )?;
+        let snapshot_seq = self.snapshot();
+        let snapshot_handle = self.snapshot_handle(snapshot_seq);
+        let snapshot = snapshot_handle.snapshot();
+        let head = crate::ledger_head::read_head_anchor(durable.root())?;
+        drop(commit_guard);
+
+        if head.is_none() {
+            let mut probe = self.rows.open_cf_range_row_stream_at(
+                snapshot,
+                ColumnFamily::Ledger,
+                &KeyRange::all(),
+                &self.clock,
+            )?;
+            let mut first_seq = None;
+            let present = probe.next_with(|key, _| {
+                first_seq = Some(parse_aster_ledger_seq(key)?);
+                Ok(())
+            })?;
+            if present {
+                return Err(crate::ledger_head::missing_head_anchor(
+                    durable.root(),
+                    first_seq.unwrap_or(0).saturating_add(1),
+                ));
+            }
+        }
         let head_height = head.as_ref().map_or(0, |anchor| anchor.height);
         let verified_range = range.unwrap_or(0..head_height);
         if verified_range.start > verified_range.end || verified_range.end > head_height {
@@ -285,159 +317,76 @@ where
                 remediation: "use a half-open range with start <= end <= the reported pinned durable head; omit the range to verify the complete pinned chain",
             });
         }
-        let result = verify_snapshot(&snapshot, verified_range.clone())?;
-        let raw_commitments = self.verify_raw_commitments(snapshot_seq, snapshot.rows())?;
+
+        let previous = if verified_range.start == 0 {
+            None
+        } else {
+            let seq = verified_range.start - 1;
+            self.read_cf_snapshot(snapshot, ColumnFamily::Ledger, &ledger_key(seq))?
+                .map(|bytes| LedgerRow { seq, bytes })
+        };
+        let (mut chain, mut result) = match StreamingChainVerifier::start(
+            verified_range.clone(),
+            head.clone(),
+            previous.as_ref(),
+            AnchorDiscipline::ExactHead,
+        )? {
+            StreamingStart::Ready(verifier) => (Some(verifier), None),
+            StreamingStart::Complete(result) => (None, Some(result)),
+        };
+
+        let raw_stream = self.rows.open_cf_range_row_stream_at(
+            snapshot,
+            ColumnFamily::RawCommitment,
+            &KeyRange::all(),
+            &self.clock,
+        )?;
+        let mut raw_cursor = RawCommitmentCursor::new(raw_stream);
+        let mut raw_state = RawCommitmentVerificationState::default();
+        let mut ledger_stream = self.rows.open_cf_range_row_stream_at(
+            snapshot,
+            ColumnFamily::Ledger,
+            &KeyRange::all(),
+            &self.clock,
+        )?;
+        while ledger_stream.next_with(|key, bytes| {
+            let seq = parse_aster_ledger_seq(key)?;
+            raw_state.observe_ledger_row(seq, bytes, &mut raw_cursor)?;
+            let terminal = if seq >= verified_range.start && seq < verified_range.end {
+                match chain.as_mut() {
+                    Some(verifier) => verifier.verify_next_bytes(seq, bytes)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let Some(terminal) = terminal {
+                result = Some(terminal);
+                chain = None;
+            }
+            Ok(())
+        })? {}
+
+        if result.is_none() {
+            let verifier = chain.as_mut().ok_or_else(|| {
+                CalyxError::ledger_corrupt(
+                    "ledger streaming verifier ended without a verdict or active cursor",
+                )
+            })?;
+            result = verifier.verify_next(None)?;
+        }
+        let result = result.ok_or_else(|| {
+            CalyxError::ledger_corrupt(
+                "ledger streaming verifier reached end of input without a terminal verdict",
+            )
+        })?;
+        let raw_commitments = raw_state.finish(&mut raw_cursor);
         Ok(AsterLedgerChainVerification {
             result,
             head_height,
             tip_hash: head.map(|anchor| anchor.tip_hash),
             verified_range,
             raw_commitments,
-        })
-    }
-
-    fn verify_raw_commitments(
-        &self,
-        snapshot_seq: u64,
-        ledger_rows: &[LedgerRow],
-    ) -> Result<AsterRawCommitmentVerification> {
-        let rows = self.scan_cf_at(snapshot_seq, ColumnFamily::RawCommitment)?;
-        let mut commitments = Vec::with_capacity(rows.len());
-        for (key, value) in rows {
-            match raw_commitment::decode_commitment(&key, &value) {
-                Ok(commitment) => commitments.push(commitment),
-                Err(error) => {
-                    return Ok(raw_commitment_failure(
-                        &commitments,
-                        0,
-                        0,
-                        format!(
-                            "raw commitment CF decode failed with error[{}]: {}",
-                            error.code, error.message
-                        ),
-                    ));
-                }
-            }
-        }
-        commitments.sort_by_key(|commitment| commitment.seq);
-        if let Some(window) = commitments
-            .windows(2)
-            .find(|window| window[0].seq >= window[1].seq)
-        {
-            return Ok(raw_commitment_failure(
-                &commitments,
-                0,
-                0,
-                format!(
-                    "raw commitment CF sequence is not strictly ordered: {} then {}",
-                    window[0].seq, window[1].seq
-                ),
-            ));
-        }
-
-        let mut cursor = 0_usize;
-        let mut seal_count = 0_u64;
-        let mut sealed_through_seq = None;
-        for ledger_row in ledger_rows {
-            let entry = match decode_ledger_entry(&ledger_row.bytes) {
-                Ok(entry) => entry,
-                // The primary Ledger verifier already classifies malformed
-                // entry bytes. Avoid inventing a second, less precise error.
-                Err(_) => continue,
-            };
-            let seal = match raw_commitment::ledger_seal(&entry) {
-                Ok(Some(seal)) => seal,
-                Ok(None) => continue,
-                Err(error) => {
-                    return Ok(raw_commitment_failure(
-                        &commitments,
-                        seal_count,
-                        cursor,
-                        format!(
-                            "raw commitment Ledger seal {} failed decode with error[{}]: {}",
-                            entry.seq, error.code, error.message
-                        ),
-                    ));
-                }
-            };
-            let cohort_len = match usize::try_from(seal.commitment_count) {
-                Ok(count) => count,
-                Err(_) => {
-                    return Ok(raw_commitment_failure(
-                        &commitments,
-                        seal_count,
-                        cursor,
-                        format!(
-                            "raw commitment Ledger seal {} count {} does not fit this host",
-                            entry.seq, seal.commitment_count
-                        ),
-                    ));
-                }
-            };
-            let Some(end) = cursor.checked_add(cohort_len) else {
-                return Ok(raw_commitment_failure(
-                    &commitments,
-                    seal_count,
-                    cursor,
-                    format!(
-                        "raw commitment Ledger seal {} count overflows the verification cursor",
-                        entry.seq
-                    ),
-                ));
-            };
-            let Some(cohort) = commitments.get(cursor..end) else {
-                return Ok(raw_commitment_failure(
-                    &commitments,
-                    seal_count,
-                    cursor,
-                    // Issue #1876: how many rows vanished is not where they
-                    // vanished. Pin the position against the sealed ladder.
-                    format!(
-                        "raw commitment Ledger seal {} claims {} rows but only {} remain in the physical commitment CF: {}",
-                        entry.seq,
-                        seal.commitment_count,
-                        commitments.len().saturating_sub(cursor),
-                        raw_commitment::describe_truncated_cohort(
-                            &seal,
-                            commitments.get(cursor..).unwrap_or(&[])
-                        )
-                    ),
-                ));
-            };
-            if !raw_commitment::seal_matches(&seal, cohort)? {
-                return Ok(raw_commitment_failure(
-                    &commitments,
-                    seal_count,
-                    cursor,
-                    // Issue #1876: the cohort range alone gave the operator a
-                    // span to hand-search. Decompose the divergence and name the
-                    // offending sequence(s). Failure path only, so the extra
-                    // hashing costs nothing on an intact vault.
-                    format!(
-                        "raw commitment Ledger seal {} does not match physical commitment rows {}..={} count={}: {}",
-                        entry.seq,
-                        seal.first_seq,
-                        seal.last_seq,
-                        seal.commitment_count,
-                        raw_commitment::describe_mismatch(&seal, cohort)
-                    ),
-                ));
-            }
-            cursor = end;
-            seal_count = seal_count.saturating_add(1);
-            sealed_through_seq = Some(seal.last_seq);
-        }
-
-        Ok(AsterRawCommitmentVerification {
-            intact: true,
-            seal_count,
-            commitment_count: usize_to_u64(commitments.len()),
-            sealed_commitment_count: usize_to_u64(cursor),
-            pending_commitment_count: usize_to_u64(commitments.len().saturating_sub(cursor)),
-            coverage_from_seq: commitments.first().map(|commitment| commitment.seq),
-            sealed_through_seq,
-            first_pending_seq: commitments.get(cursor).map(|commitment| commitment.seq),
-            failure: None,
         })
     }
 
@@ -879,32 +828,207 @@ where
     }
 }
 
-fn raw_commitment_failure(
-    commitments: &[raw_commitment::RawCommitment],
-    seal_count: u64,
-    sealed_count: usize,
-    failure: String,
-) -> AsterRawCommitmentVerification {
-    AsterRawCommitmentVerification {
-        intact: false,
-        seal_count,
-        commitment_count: usize_to_u64(commitments.len()),
-        sealed_commitment_count: usize_to_u64(sealed_count),
-        pending_commitment_count: usize_to_u64(commitments.len().saturating_sub(sealed_count)),
-        coverage_from_seq: commitments.first().map(|commitment| commitment.seq),
-        sealed_through_seq: sealed_count
-            .checked_sub(1)
-            .and_then(|index| commitments.get(index))
-            .map(|commitment| commitment.seq),
-        first_pending_seq: commitments
-            .get(sealed_count)
-            .map(|commitment| commitment.seq),
-        failure: Some(failure),
+struct RawCommitmentCursor<'a> {
+    stream: SnapshotCfRowStream<'a>,
+    previous_seq: Option<u64>,
+    count: u64,
+    coverage_from_seq: Option<u64>,
+}
+
+impl<'a> RawCommitmentCursor<'a> {
+    fn new(stream: SnapshotCfRowStream<'a>) -> Self {
+        Self {
+            stream,
+            previous_seq: None,
+            count: 0,
+            coverage_from_seq: None,
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<raw_commitment::RawCommitment>> {
+        let mut decoded = None;
+        let present = self.stream.next_with(|key, value| {
+            decoded = Some(raw_commitment::decode_commitment(key, value)?);
+            Ok(())
+        })?;
+        if !present {
+            return Ok(None);
+        }
+        let commitment = decoded.ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "raw commitment row stream reported a row without invoking its decoder",
+            )
+        })?;
+        if let Some(previous) = self.previous_seq
+            && previous >= commitment.seq
+        {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "raw commitment CF sequence is not strictly ordered: {previous} then {}",
+                commitment.seq
+            )));
+        }
+        self.count = self.count.checked_add(1).ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(
+                "raw commitment physical row count exceeds the durable u64 limit",
+            )
+        })?;
+        self.coverage_from_seq.get_or_insert(commitment.seq);
+        self.previous_seq = Some(commitment.seq);
+        Ok(Some(commitment))
     }
 }
 
-fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).unwrap_or(u64::MAX)
+#[derive(Default)]
+struct RawCommitmentVerificationState {
+    seal_count: u64,
+    sealed_commitment_count: u64,
+    sealed_through_seq: Option<u64>,
+    first_pending_seq: Option<u64>,
+    failure: Option<String>,
+    cursor_unreadable: bool,
+}
+
+impl RawCommitmentVerificationState {
+    fn observe_ledger_row(
+        &mut self,
+        ledger_seq: u64,
+        bytes: &[u8],
+        cursor: &mut RawCommitmentCursor<'_>,
+    ) -> Result<()> {
+        if self.failure.is_some() {
+            return Ok(());
+        }
+        let entry = match decode_ledger_entry_ref(bytes) {
+            Ok(entry) => entry,
+            Err(error) => {
+                self.failure = Some(format!(
+                    "raw commitment Ledger scan could not decode row {ledger_seq} with error[{}]: {}; the verifier cannot prove that the unreadable row is not a cohort seal",
+                    error.code, error.message
+                ));
+                return Ok(());
+            }
+        };
+        if entry.seq() != ledger_seq {
+            self.failure = Some(format!(
+                "raw commitment Ledger scan key seq {ledger_seq} does not match encoded seq {}",
+                entry.seq()
+            ));
+            return Ok(());
+        }
+        let seal = match raw_commitment::ledger_seal_ref(&entry) {
+            Ok(Some(seal)) => seal,
+            Ok(None) => return Ok(()),
+            Err(error) => {
+                self.failure = Some(format!(
+                    "raw commitment Ledger seal {ledger_seq} failed decode with error[{}]: {}",
+                    error.code, error.message
+                ));
+                return Ok(());
+            }
+        };
+        self.verify_seal(ledger_seq, seal, cursor);
+        Ok(())
+    }
+
+    fn verify_seal(
+        &mut self,
+        ledger_seq: u64,
+        seal: raw_commitment::RawCommitmentSeal,
+        cursor: &mut RawCommitmentCursor<'_>,
+    ) {
+        let mut verifier = raw_commitment::StreamingSealVerifier::new(seal);
+        let mut first_candidate_seq = None;
+        for _ in 0..verifier.expected_count() {
+            let commitment = match cursor.next() {
+                Ok(Some(commitment)) => commitment,
+                Ok(None) => break,
+                Err(error) => {
+                    self.failure = Some(format!(
+                        "raw commitment CF decode/order failed while matching Ledger seal {ledger_seq} with error[{}]: {}",
+                        error.code, error.message
+                    ));
+                    self.cursor_unreadable = true;
+                    return;
+                }
+            };
+            first_candidate_seq.get_or_insert(commitment.seq);
+            if let Err(error) = verifier.push(&commitment) {
+                self.failure = Some(format!(
+                    "raw commitment Merkle stream failed while matching Ledger seal {ledger_seq} with error[{}]: {}",
+                    error.code, error.message
+                ));
+                return;
+            }
+        }
+        let verdict = match verifier.finish() {
+            Ok(verdict) => verdict,
+            Err(error) => {
+                self.failure = Some(format!(
+                    "raw commitment Merkle verdict failed for Ledger seal {ledger_seq} with error[{}]: {}",
+                    error.code, error.message
+                ));
+                return;
+            }
+        };
+        if !verdict.intact {
+            self.first_pending_seq = first_candidate_seq;
+            self.failure = Some(format!(
+                "raw commitment Ledger seal {ledger_seq} does not match the physical commitment stream: {}",
+                verdict
+                    .failure
+                    .unwrap_or_else(|| "streaming seal mismatch had no diagnostic".to_owned())
+            ));
+            return;
+        }
+        self.seal_count = match self.seal_count.checked_add(1) {
+            Some(count) => count,
+            None => {
+                self.failure = Some(
+                    "raw commitment Ledger seal count exceeds the durable u64 limit".to_owned(),
+                );
+                return;
+            }
+        };
+        // An intact verdict consumed exactly the next sealed cohort. The raw
+        // commit sequence is sparse, so the cursor's physical row count is the
+        // only valid cumulative count; sequence distance is not a substitute.
+        self.sealed_commitment_count = cursor.count;
+        self.sealed_through_seq = verdict.last_physical_seq;
+    }
+
+    fn finish(mut self, cursor: &mut RawCommitmentCursor<'_>) -> AsterRawCommitmentVerification {
+        if !self.cursor_unreadable {
+            loop {
+                match cursor.next() {
+                    Ok(Some(commitment)) => {
+                        self.first_pending_seq.get_or_insert(commitment.seq);
+                    }
+                    Ok(None) => break,
+                    Err(error) => {
+                        if self.failure.is_none() {
+                            self.failure = Some(format!(
+                                "raw commitment CF trailing decode/order failed with error[{}]: {}",
+                                error.code, error.message
+                            ));
+                        }
+                        self.cursor_unreadable = true;
+                        break;
+                    }
+                }
+            }
+        }
+        AsterRawCommitmentVerification {
+            intact: self.failure.is_none(),
+            seal_count: self.seal_count,
+            commitment_count: cursor.count,
+            sealed_commitment_count: self.sealed_commitment_count,
+            pending_commitment_count: cursor.count.saturating_sub(self.sealed_commitment_count),
+            coverage_from_seq: cursor.coverage_from_seq,
+            sealed_through_seq: self.sealed_through_seq,
+            first_pending_seq: self.first_pending_seq,
+            failure: self.failure,
+        }
+    }
 }
 
 fn anchor_rows(
@@ -928,35 +1052,6 @@ fn anchor_rows(
 
 struct AsterRawLedgerStore<'a, C> {
     vault: &'a AsterVault<C>,
-}
-
-impl<C> AsterRawLedgerStore<'_, C>
-where
-    C: Clock,
-{
-    fn coherent_snapshot(&self) -> Result<(u64, LedgerSnapshot<'static>)> {
-        let durable = self.vault.durable.as_ref().ok_or_else(|| CalyxError {
-            code: "CALYX_ASTER_LEDGER_VERIFY_UNAVAILABLE",
-            message: "ledger snapshot requires a durable vault handle".to_owned(),
-            remediation: "verify through a write-capable handle or use verify_restore",
-        })?;
-        let _commit_guard = crate::file_lock::FileLockGuard::acquire(
-            &durable.root().join("locks").join("durable.commit.lock"),
-        )?;
-        let snapshot_seq = self.vault.snapshot();
-        let mut rows = Vec::new();
-        for (key, bytes) in self.vault.scan_cf_at(snapshot_seq, ColumnFamily::Ledger)? {
-            rows.push(LedgerRow {
-                seq: parse_aster_ledger_seq(&key)?,
-                bytes,
-            });
-        }
-        rows.sort_by_key(|row| row.seq);
-        let anchor = crate::ledger_head::read_head_anchor(durable.root())?;
-        let anchor =
-            crate::ledger_head::require_head_anchor_for_rows(durable.root(), anchor, &rows)?;
-        Ok((snapshot_seq, LedgerSnapshot::owned(rows, anchor)))
-    }
 }
 
 impl<C> LedgerCfStore for AsterRawLedgerStore<'_, C>

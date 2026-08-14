@@ -134,6 +134,24 @@ pub(super) fn open_sequential_page_stream_with_overlay_origins(
     })
 }
 
+/// Opens the allocation-reusing form of the sequential newest-wins stream.
+///
+/// [`SstSequentialPageStream`] must transfer owned values into output pages.
+/// This stream instead lends one winning row to a synchronous callback, then
+/// returns both key and value allocations to that row's physical source before
+/// advancing. Multiple instances can be held concurrently to merge two CFs
+/// without materializing either corpus.
+pub(super) fn open_sequential_row_stream_with_overlay_origins(
+    level: &SstLevel,
+    start: &[u8],
+    end: Option<&[u8]>,
+    overlay: Vec<SstEntry>,
+) -> Result<SstSequentialRowStream> {
+    Ok(SstSequentialRowStream {
+        cursor: open_sequential_page_cursor(level, start, end, overlay)?,
+    })
+}
+
 /// Visits a newest-wins snapshot while reusing one value buffer per source.
 ///
 /// Returning pages transfers every winning `Vec` to the caller, forcing the
@@ -149,31 +167,58 @@ pub(super) fn visit_sequential_with_overlay_origins(
     overlay: Vec<SstEntry>,
     mut visit: impl FnMut(&[u8], &mut Vec<u8>, bool) -> Result<bool>,
 ) -> Result<()> {
-    let mut cursor = open_sequential_page_cursor(level, start, end, overlay)?;
-    loop {
-        let Some(first) = cursor.pop() else {
-            return Ok(());
+    let mut stream = open_sequential_row_stream_with_overlay_origins(level, start, end, overlay)?;
+    let mut keep_scanning = true;
+    while keep_scanning
+        && stream.next_with(|key, value, from_overlay| {
+            keep_scanning = visit(key, value, from_overlay)?;
+            Ok(())
+        })?
+    {}
+    Ok(())
+}
+
+/// Owning, allocation-reusing sequential row cursor.
+pub(crate) struct SstSequentialRowStream {
+    cursor: SequentialPageCursor,
+}
+
+impl SstSequentialRowStream {
+    /// Lends the next newest-wins row to `visit` and returns `false` at EOF.
+    /// The callback must not retain the slices beyond the call.
+    pub(crate) fn next_with(
+        &mut self,
+        visit: impl FnOnce(&[u8], &mut Vec<u8>, bool) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(first) = self.cursor.pop() else {
+            return Ok(false);
         };
         let winner_source = first.source;
-        let from_overlay = matches!(&cursor.sources[winner_source], PageSource::Overlay { .. });
+        let from_overlay = matches!(
+            &self.cursor.sources[winner_source],
+            PageSource::Overlay { .. }
+        );
         let mut entry = first.entry;
-        if !visit(&entry.key, &mut entry.value, from_overlay)? {
-            return Ok(());
-        }
+        visit(&entry.key, &mut entry.value, from_overlay)?;
         let next_key = entry.key.as_slice();
-        while cursor
+        while self
+            .cursor
             .heap
             .peek()
             .is_some_and(|item| item.entry.key.as_slice() == next_key)
         {
-            let mut duplicate = cursor
+            let mut duplicate = self
+                .cursor
                 .pop()
                 .expect("peek confirmed duplicate sequential heap item");
-            cursor.sources[duplicate.source].advance_past(next_key)?;
-            cursor.push_current_reusing(duplicate.source, &mut duplicate.entry)?;
+            self.cursor.sources[duplicate.source].advance_past(next_key)?;
+            self.cursor
+                .push_current_reusing(duplicate.source, &mut duplicate.entry)?;
         }
-        cursor.sources[winner_source].advance_past(next_key)?;
-        cursor.push_current_reusing(winner_source, &mut entry)?;
+        self.cursor.sources[winner_source].advance_past(next_key)?;
+        self.cursor
+            .push_current_reusing(winner_source, &mut entry)?;
+        Ok(true)
     }
 }
 

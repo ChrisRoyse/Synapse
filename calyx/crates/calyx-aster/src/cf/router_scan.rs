@@ -2,6 +2,7 @@ use super::router::{CfRouter, RouterShard};
 use super::{ColumnFamily, KeyRange};
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
+use crate::sst::page::SstSequentialRowStream;
 use calyx_core::CalyxError;
 use std::collections::BTreeMap;
 
@@ -137,6 +138,34 @@ impl CfRouter {
         Ok(())
     }
 
+    /// Opens one allocation-reusing immutable row stream after the same atomic
+    /// rows-to-router lock hand-off used by snapshot paging.
+    pub(crate) fn open_immutable_row_stream<R>(
+        &self,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        overlay: Vec<SstEntry>,
+        release_row_guard: R,
+    ) -> Result<CfImmutableRowStream<'_>, CalyxError>
+    where
+        R: FnOnce(),
+    {
+        let shard = self.read_shard(cf)?;
+        release_row_guard();
+        let level = shard.levels.get(&cf).cloned().unwrap_or_default();
+        let stream = level.open_sequential_row_stream_with_overlay_origins(
+            &range.start,
+            range.end.as_deref(),
+            overlay,
+        )?;
+        drop(shard);
+        Ok(CfImmutableRowStream {
+            router: self,
+            cf,
+            stream,
+        })
+    }
+
     /// Streams exact newest-wins key/tombstone state without opening values.
     ///
     /// The lock hand-off is identical to `range_immutable_pages_until`, but
@@ -202,5 +231,47 @@ impl CfRouter {
             }
         }
         Ok(entries)
+    }
+}
+
+/// Allocation-reusing decrypted row stream over one immutable CF view.
+pub(crate) struct CfImmutableRowStream<'a> {
+    router: &'a CfRouter,
+    cf: ColumnFamily,
+    stream: SstSequentialRowStream,
+}
+
+impl CfImmutableRowStream<'_> {
+    pub(crate) fn next_with(
+        &mut self,
+        visit: impl FnOnce(&[u8], &[u8]) -> Result<(), CalyxError>,
+    ) -> Result<bool, CalyxError> {
+        let router = self.router;
+        let cf = self.cf;
+        let mut visit = Some(visit);
+        loop {
+            let mut emitted = false;
+            let present = self.stream.next_with(|key, value, from_overlay| {
+                if !from_overlay {
+                    let sealed = std::mem::take(value);
+                    *value = router.open_value(cf, key, sealed)?;
+                }
+                if !crate::mvcc::is_tombstone_value(value) {
+                    visit
+                        .take()
+                        .expect("live row visitor is consumed exactly once")(
+                        key, value
+                    )?;
+                    emitted = true;
+                }
+                Ok(())
+            })?;
+            if emitted {
+                return Ok(true);
+            }
+            if !present {
+                return Ok(false);
+            }
+        }
     }
 }
