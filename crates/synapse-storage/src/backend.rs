@@ -3503,7 +3503,7 @@ fn resolve_panel_contract(
         let Some(candidate) = vault
             .reconstruct_panel_lifecycle_contract(entry.panel_name, base_registry)
             .map_err(|source| {
-                calyx_write_failed(
+                calyx_read_failed(
                     "calyx_registry",
                     "reconstruct durable panel lifecycle contract",
                     &source,
@@ -3516,12 +3516,12 @@ fn resolve_panel_contract(
             continue;
         }
         if matched.is_some() {
-            return Err(calyx_write_failed_detail(
-                "calyx_registry",
-                format!(
+            return Err(StorageError::ReadFailed {
+                cf_name: "calyx_registry".to_owned(),
+                detail: format!(
                     "multiple durable lifecycle panels claim generation {panel_version}; generation identity is ambiguous"
                 ),
-            ));
+            });
         }
         matched = Some(candidate);
     }
@@ -5356,7 +5356,7 @@ impl StorageBackend for CalyxBackend {
                 // than searching a panel whose slots were never validated.
                 let supplied = match params.panel_version {
                     Some(version) => {
-                        let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
+                        let created_at_ms = calyx_clock_now_for_read(vault, "calyx_manifest")?;
                         resolve_panel_contract(vault, version, created_at_ms)?
                     }
                     None => None,
@@ -5364,7 +5364,7 @@ impl StorageBackend for CalyxBackend {
                 vault
                     .find_similar_in_panel(params, supplied.as_ref())
                     .map_err(|source| {
-                        calyx_write_failed(
+                        calyx_read_failed(
                             "calyx_search",
                             "run fused Calyx find-similar search",
                             &source,
