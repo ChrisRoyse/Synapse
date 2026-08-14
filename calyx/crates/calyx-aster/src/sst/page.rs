@@ -756,25 +756,22 @@ fn next_latest_sequential_entry(
     let Some(first) = cursor.pop() else {
         return Ok(None);
     };
-    let next_key = first.entry.key.clone();
     let winner_source = first.source;
     let from_overlay = matches!(&cursor.sources[winner_source], PageSource::Overlay { .. });
     let entry = first.entry;
-    let mut duplicate_sources = vec![winner_source];
+    let next_key = entry.key.as_slice();
+    cursor.sources[winner_source].advance_past(next_key)?;
+    cursor.push_current(winner_source)?;
     while cursor
         .heap
         .peek()
-        .is_some_and(|item| item.entry.key.as_slice() == next_key.as_slice())
+        .is_some_and(|item| item.entry.key.as_slice() == next_key)
     {
-        duplicate_sources.push(
-            cursor
-                .pop()
-                .expect("peek confirmed duplicate sequential heap item")
-                .source,
-        );
-    }
-    for source in duplicate_sources {
-        cursor.sources[source].advance_past(&next_key)?;
+        let source = cursor
+            .pop()
+            .expect("peek confirmed duplicate sequential heap item")
+            .source;
+        cursor.sources[source].advance_past(next_key)?;
         cursor.push_current(source)?;
     }
     Ok(Some(SstPageWinner {

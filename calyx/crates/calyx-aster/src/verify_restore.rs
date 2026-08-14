@@ -12,7 +12,9 @@
 //! production vault that verifier overlapped scheduled kernel maintenance and
 //! raised process-private memory to 2.83 GiB. One cold immutable cursor now
 //! advances forward for the complete CF, retaining only one current row per SST
-//! source plus one bounded output page.
+//! source plus one bounded output page. Ledger rows are parsed through borrowed
+//! wire slices and hashed incrementally, so the scrubber does not copy the
+//! entire logical journal through a second decoded allocation stream.
 //!
 //! Peak retention is now one page of rows plus the WAL overlay, independent of
 //! vault size, so the whole vault is covered on every pass. That is the shape
@@ -34,16 +36,13 @@ use std::path::{Path, PathBuf};
 use crate::cf::{ColumnFamily, slot_key};
 use crate::ledger_head::read_head_anchor;
 use crate::ledger_view::parse_aster_ledger_seq;
-use crate::security::value_crypto::{SharedVaultContext, open_rows, open_value};
+use crate::security::value_crypto::{SharedVaultContext, open_rows, open_value, open_value_owned};
 use crate::sst::SstEntry;
 use crate::sst::level::SstLevel;
 use crate::vault::encode::{decode_constellation_base, decode_slot_vector, decode_write_batch};
 use crate::wal::replay_dir_read_only;
 use calyx_core::{CalyxError, Result};
-use calyx_ledger::{
-    AnchorDiscipline, LedgerRow, StreamingChainVerifier, StreamingStart, VerifyResult,
-    decode as decode_ledger_entry,
-};
+use calyx_ledger::{AnchorDiscipline, StreamingChainVerifier, StreamingStart, VerifyResult};
 use serde::Serialize;
 
 /// Invalid restore target path.
@@ -54,9 +53,9 @@ const OPTIONAL_REBUILDABLE_DIRS: [&str; 3] = ["ann", "kernel", "guard"];
 /// Rows materialized per bounded verification page.
 ///
 /// Peak retention of a scan is this many decoded rows, not the column family.
-/// The page cursor is re-opened per page. Hot families use retained lookup
+/// One cursor remains open across pages. Hot families use retained lookup
 /// indexes; cold families use the bounded on-disk index cursor. Neither path
-/// materializes the immutable corpus.
+/// materializes the immutable corpus or re-seeks its sources per page.
 const VERIFY_SCAN_PAGE_ROWS: usize = 4_096;
 
 /// Scan refusals that mean "this check could not run to completion", never
@@ -527,7 +526,7 @@ fn open_sst_entry(
         return Ok(entry);
     };
     Ok(SstEntry {
-        value: open_value(context, cf, &entry.key, &entry.value)?,
+        value: open_value_owned(context, cf, &entry.key, entry.value)?,
         key: entry.key,
     })
 }
@@ -616,7 +615,7 @@ fn feed_ledger_rows(
 ) -> Result<LedgerVerification> {
     let mut wal_iter = wal_rows.iter().peekable();
     let mut entry_count = 0_u64;
-    let mut last_bytes: Option<Vec<u8>> = None;
+    let mut last_hash: Option<[u8; 32]> = None;
     let mut verdict: Option<VerifyResult> = None;
     let mut stream = level.open_sequential_page_stream_with_overlay_origins(
         &[],
@@ -639,9 +638,9 @@ fn feed_ledger_rows(
                 if let Some(result) = feed_ledger_row(
                     &mut verifier,
                     *wal_seq,
-                    bytes.clone(),
+                    bytes,
                     &mut entry_count,
-                    &mut last_bytes,
+                    &mut last_hash,
                 )? {
                     verdict = Some(result);
                     break 'pages;
@@ -662,9 +661,9 @@ fn feed_ledger_rows(
             if let Some(result) = feed_ledger_row(
                 &mut verifier,
                 seq,
-                entry.value,
+                &entry.value,
                 &mut entry_count,
-                &mut last_bytes,
+                &mut last_hash,
             )? {
                 verdict = Some(result);
                 break 'pages;
@@ -676,9 +675,9 @@ fn feed_ledger_rows(
             if let Some(result) = feed_ledger_row(
                 &mut verifier,
                 *wal_seq,
-                bytes.clone(),
+                bytes,
                 &mut entry_count,
-                &mut last_bytes,
+                &mut last_hash,
             )? {
                 verdict = Some(result);
                 break;
@@ -697,8 +696,8 @@ fn feed_ledger_rows(
             })?
         }
     };
-    let tip_hash = match &last_bytes {
-        Some(bytes) => hex(&decode_ledger_entry(bytes)?.entry_hash),
+    let tip_hash = match &last_hash {
+        Some(hash) => hex(hash),
         None => hex(&[0_u8; 32]),
     };
     Ok(LedgerVerification {
@@ -713,16 +712,17 @@ fn feed_ledger_rows(
 fn feed_ledger_row(
     verifier: &mut StreamingChainVerifier,
     seq: u64,
-    bytes: Vec<u8>,
+    bytes: &[u8],
     entry_count: &mut u64,
-    last_bytes: &mut Option<Vec<u8>>,
+    last_hash: &mut Option<[u8; 32]>,
 ) -> Result<Option<VerifyResult>> {
     if seq != verifier.next_seq() {
         return verifier.verify_next(None);
     }
     *entry_count = entry_count.saturating_add(1);
-    *last_bytes = Some(bytes.clone());
-    verifier.verify_next(Some(LedgerRow { seq, bytes }))
+    let result = verifier.verify_next_bytes(seq, bytes)?;
+    *last_hash = Some(verifier.verified_tip_hash());
+    Ok(result)
 }
 
 fn wal_total_bytes(vault: &Path) -> Result<u64> {

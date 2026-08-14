@@ -3,8 +3,8 @@ use std::ops::Range;
 use calyx_core::{CalyxError, Result};
 
 use crate::append::LedgerRow;
-use crate::codec::decode_unchecked;
-use crate::entry::{HASH_BYTES, LedgerEntry, compute_entry_hash};
+use crate::codec::{LedgerEntryRef, decode_ref_unchecked};
+use crate::entry::{HASH_BYTES, compute_entry_hash_slices};
 use crate::head_anchor::LedgerHeadAnchor;
 use crate::verify::VerifyResult;
 
@@ -107,6 +107,14 @@ impl StreamingChainVerifier {
         self.count
     }
 
+    /// Hash of the last row accepted by this verifier.
+    ///
+    /// The restore verifier uses this fixed-size state as its final tip instead
+    /// of retaining and decoding a second copy of the last encoded row.
+    pub const fn verified_tip_hash(&self) -> [u8; HASH_BYTES] {
+        self.expected_prev
+    }
+
     pub fn verify_next(&mut self, row: Option<LedgerRow>) -> Result<Option<VerifyResult>> {
         let seq = self.next_seq;
         let Some(row) = row else {
@@ -115,7 +123,21 @@ impl StreamingChainVerifier {
                 format!("missing ledger row for seq {seq}"),
             )));
         };
-        let entry = match decode_unchecked(&row.bytes) {
+        self.verify_next_bytes(row.seq, &row.bytes)
+    }
+
+    /// Verifies one encoded row directly from its caller-owned bytes.
+    ///
+    /// This is the whole-chain scrub path: parsing returns borrowed slices and
+    /// canonical hashing feeds those slices incrementally, so verification does
+    /// not allocate another payload/subject/actor object for every row.
+    pub fn verify_next_bytes(
+        &mut self,
+        row_seq: u64,
+        bytes: &[u8],
+    ) -> Result<Option<VerifyResult>> {
+        let seq = self.next_seq;
+        let entry = match decode_ref_unchecked(bytes) {
             Ok(entry) => entry,
             Err(error) => {
                 return Ok(Some(corrupt_result(
@@ -124,7 +146,7 @@ impl StreamingChainVerifier {
                 )));
             }
         };
-        if row.seq != seq || entry.seq != seq {
+        if row_seq != seq || entry.seq != seq {
             return Ok(Some(corrupt_result(
                 seq,
                 format!("ledger key seq {seq} != encoded seq {}", entry.seq),
@@ -197,7 +219,7 @@ fn expected_prev_hash(start: u64, previous: Option<&LedgerRow>) -> Result<[u8; H
             "missing ledger row for previous seq {previous_seq}"
         )));
     };
-    let entry = decode_unchecked(&row.bytes).map_err(|error| {
+    let entry = decode_ref_unchecked(&row.bytes).map_err(|error| {
         CalyxError::ledger_corrupt(format!(
             "cannot verify range start {start}: previous seq {previous_seq}: {error}"
         ))
@@ -208,7 +230,7 @@ fn expected_prev_hash(start: u64, previous: Option<&LedgerRow>) -> Result<[u8; H
             entry.seq
         )));
     }
-    if !entry.verify() {
+    if entry.entry_hash != recompute_hash(&entry) {
         return Err(CalyxError::ledger_corrupt(format!(
             "cannot verify range start {start}: previous seq {previous_seq} is broken"
         )));
@@ -216,14 +238,16 @@ fn expected_prev_hash(start: u64, previous: Option<&LedgerRow>) -> Result<[u8; H
     Ok(entry.entry_hash)
 }
 
-fn recompute_hash(entry: &LedgerEntry) -> [u8; HASH_BYTES] {
-    compute_entry_hash(
+fn recompute_hash(entry: &LedgerEntryRef<'_>) -> [u8; HASH_BYTES] {
+    compute_entry_hash_slices(
         entry.seq,
         &entry.prev_hash,
         entry.kind,
-        &entry.subject,
-        &entry.payload,
-        &entry.actor,
+        entry.subject_tag,
+        entry.subject_bytes,
+        entry.payload,
+        entry.actor_tag,
+        entry.actor_bytes,
         entry.ts,
     )
 }

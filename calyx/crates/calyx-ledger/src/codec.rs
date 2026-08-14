@@ -12,6 +12,24 @@ const SEQ_LEN: usize = 8;
 const KIND_OFFSET: usize = SEQ_LEN + HASH_BYTES;
 const HEADER_LEN: usize = KIND_OFFSET;
 
+/// Borrowed, fully validated view of one encoded ledger entry.
+///
+/// Whole-chain verification needs every field for canonical hashing but never
+/// needs to own any of them. Keeping the slices tied to the caller's row buffer
+/// prevents a second payload-sized allocation for every historical entry.
+pub(crate) struct LedgerEntryRef<'a> {
+    pub(crate) seq: u64,
+    pub(crate) prev_hash: [u8; HASH_BYTES],
+    pub(crate) kind: EntryKind,
+    pub(crate) subject_tag: u8,
+    pub(crate) subject_bytes: &'a [u8],
+    pub(crate) payload: &'a [u8],
+    pub(crate) actor_tag: u8,
+    pub(crate) actor_bytes: &'a [u8],
+    pub(crate) ts: u64,
+    pub(crate) entry_hash: [u8; HASH_BYTES],
+}
+
 /// Encodes a ledger entry with a stable, padding-free binary layout.
 pub fn encode(entry: &LedgerEntry) -> Vec<u8> {
     let subject = entry.subject.wire_bytes();
@@ -51,6 +69,22 @@ pub fn decode(bytes: &[u8]) -> Result<LedgerEntry> {
 }
 
 pub(crate) fn decode_unchecked(bytes: &[u8]) -> Result<LedgerEntry> {
+    let entry = decode_ref_unchecked(bytes)?;
+    let subject = decode_subject(entry.subject_tag, entry.subject_bytes)?;
+    let actor = decode_actor(entry.actor_tag, entry.actor_bytes)?;
+    Ok(LedgerEntry {
+        seq: entry.seq,
+        prev_hash: entry.prev_hash,
+        kind: entry.kind,
+        subject,
+        payload: entry.payload.to_vec(),
+        actor,
+        ts: entry.ts,
+        entry_hash: entry.entry_hash,
+    })
+}
+
+pub(crate) fn decode_ref_unchecked(bytes: &[u8]) -> Result<LedgerEntryRef<'_>> {
     let mut cursor = Cursor::new(bytes);
     let seq = cursor.u64("seq")?;
     let prev_hash = cursor.hash("prev_hash")?;
@@ -60,28 +94,29 @@ pub(crate) fn decode_unchecked(bytes: &[u8]) -> Result<LedgerEntry> {
     let subject_tag = cursor.u8("subject_tag")?;
     let subject_len = cursor.u16("subject_len")? as usize;
     let subject_bytes = cursor.bytes(subject_len, "subject_bytes")?;
-    let subject = decode_subject(subject_tag, subject_bytes)?;
+    validate_subject(subject_tag, subject_bytes)?;
     let payload_len = cursor.u32("payload_len")? as usize;
-    let payload = cursor.bytes(payload_len, "payload")?.to_vec();
+    let payload = cursor.bytes(payload_len, "payload")?;
     let actor_tag = cursor.u8("actor_tag")?;
     let actor_len = cursor.u16("actor_len")? as usize;
     let actor_bytes = cursor.bytes(actor_len, "actor_bytes")?;
-    let actor = decode_actor(actor_tag, actor_bytes)?;
+    validate_actor(actor_tag, actor_bytes)?;
     let ts = cursor.u64("ts")?;
     let entry_hash = cursor.hash("entry_hash")?;
     cursor.finish()?;
 
-    let entry = LedgerEntry {
+    Ok(LedgerEntryRef {
         seq,
         prev_hash,
         kind,
-        subject,
+        subject_tag,
+        subject_bytes,
         payload,
-        actor,
+        actor_tag,
+        actor_bytes,
         ts,
         entry_hash,
-    };
-    Ok(entry)
+    })
 }
 
 /// Decodes only `seq` and `prev_hash` for fast chain-link checks.
@@ -126,6 +161,15 @@ fn decode_subject(tag: u8, bytes: &[u8]) -> Result<SubjectId> {
     }
 }
 
+fn validate_subject(tag: u8, bytes: &[u8]) -> Result<()> {
+    match tag {
+        TAG_CX => copy_16(bytes, "cx").map(|_| ()),
+        TAG_LENS => copy_16(bytes, "lens").map(|_| ()),
+        TAG_KERNEL | TAG_GUARD | TAG_QUERY => Ok(()),
+        _ => Err(corrupt(format!("invalid subject tag {tag}"))),
+    }
+}
+
 fn decode_actor(tag: u8, bytes: &[u8]) -> Result<ActorId> {
     let value = String::from_utf8(bytes.to_vec())
         .map_err(|_| corrupt(format!("actor tag {tag} is not utf8")))?;
@@ -133,6 +177,17 @@ fn decode_actor(tag: u8, bytes: &[u8]) -> Result<ActorId> {
         TAG_AGENT => Ok(ActorId::Agent(value)),
         TAG_SERVICE => Ok(ActorId::Service(value)),
         TAG_SYSTEM if bytes.is_empty() => Ok(ActorId::System),
+        TAG_SYSTEM => Err(corrupt("system actor must have zero actor bytes")),
+        _ => Err(corrupt(format!("invalid actor tag {tag}"))),
+    }
+}
+
+fn validate_actor(tag: u8, bytes: &[u8]) -> Result<()> {
+    match tag {
+        TAG_AGENT | TAG_SERVICE => std::str::from_utf8(bytes)
+            .map(|_| ())
+            .map_err(|_| corrupt(format!("actor tag {tag} is not utf8"))),
+        TAG_SYSTEM if bytes.is_empty() => Ok(()),
         TAG_SYSTEM => Err(corrupt("system actor must have zero actor bytes")),
         _ => Err(corrupt(format!("invalid actor tag {tag}"))),
     }

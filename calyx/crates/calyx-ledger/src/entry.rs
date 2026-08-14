@@ -44,10 +44,6 @@ impl SubjectId {
             Self::Kernel(bytes) | Self::Guard(bytes) | Self::Query(bytes) => bytes.clone(),
         }
     }
-
-    fn canonical_bytes(&self) -> Vec<u8> {
-        tagged_slice(self.wire_tag(), &self.wire_bytes())
-    }
 }
 
 /// Tagged actor identifier for the service or agent that caused an entry.
@@ -83,10 +79,6 @@ impl ActorId {
                 "actor id has {len} UTF-8 bytes, max {MAX_ACTOR_ID_BYTES}"
             )))
         }
-    }
-
-    fn canonical_bytes(&self) -> Vec<u8> {
-        tagged_var(self.wire_tag(), self.wire_bytes())
     }
 }
 
@@ -152,13 +144,51 @@ pub fn compute_entry_hash(
     actor: &ActorId,
     ts: u64,
 ) -> [u8; HASH_BYTES] {
+    let subject_bytes = match subject {
+        SubjectId::Cx(id) => id.as_bytes().as_slice(),
+        SubjectId::Lens(id) => id.as_bytes().as_slice(),
+        SubjectId::Kernel(bytes) | SubjectId::Guard(bytes) | SubjectId::Query(bytes) => bytes,
+    };
+    compute_entry_hash_slices(
+        seq,
+        prev_hash,
+        kind,
+        subject.wire_tag(),
+        subject_bytes,
+        payload,
+        actor.wire_tag(),
+        actor.wire_bytes(),
+        ts,
+    )
+}
+
+/// Computes the canonical entry hash directly from validated wire slices.
+///
+/// Ledger scrubbers already own the encoded row. Hashing the borrowed subject,
+/// payload, and actor fields preserves the exact canonical framing without
+/// allocating decoded copies for every row in the history.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the arguments are the complete canonical ledger wire frame"
+)]
+pub(crate) fn compute_entry_hash_slices(
+    seq: u64,
+    prev_hash: &[u8; HASH_BYTES],
+    kind: EntryKind,
+    subject_tag: u8,
+    subject_bytes: &[u8],
+    payload: &[u8],
+    actor_tag: u8,
+    actor_bytes: &[u8],
+    ts: u64,
+) -> [u8; HASH_BYTES] {
     let mut hasher = blake3::Hasher::new();
     frame(&mut hasher, &seq.to_be_bytes());
     frame(&mut hasher, prev_hash);
     frame(&mut hasher, &[kind.wire_code()]);
-    frame(&mut hasher, &subject.canonical_bytes());
+    frame_tagged_slice(&mut hasher, subject_tag, subject_bytes);
     frame(&mut hasher, payload);
-    frame(&mut hasher, &actor.canonical_bytes());
+    frame_tagged_var(&mut hasher, actor_tag, actor_bytes);
     frame(&mut hasher, &ts.to_be_bytes());
     *hasher.finalize().as_bytes()
 }
@@ -168,17 +198,24 @@ fn frame(hasher: &mut blake3::Hasher, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn tagged_slice(tag: u8, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + bytes.len());
-    out.push(tag);
-    out.extend_from_slice(bytes);
-    out
+fn frame_tagged_slice(hasher: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
+    let framed_len = u64::try_from(bytes.len())
+        .expect("ledger slice length fits the u64 canonical frame")
+        .checked_add(1)
+        .expect("tagged ledger slice length fits u64");
+    hasher.update(&framed_len.to_be_bytes());
+    hasher.update(&[tag]);
+    hasher.update(bytes);
 }
 
-fn tagged_var(tag: u8, bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(1 + 8 + bytes.len());
-    out.push(tag);
-    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
-    out.extend_from_slice(bytes);
-    out
+fn frame_tagged_var(hasher: &mut blake3::Hasher, tag: u8, bytes: &[u8]) {
+    let bytes_len =
+        u64::try_from(bytes.len()).expect("ledger variable length fits the u64 canonical frame");
+    let framed_len = bytes_len
+        .checked_add(9)
+        .expect("tagged ledger variable length fits u64");
+    hasher.update(&framed_len.to_be_bytes());
+    hasher.update(&[tag]);
+    hasher.update(&bytes_len.to_be_bytes());
+    hasher.update(bytes);
 }
