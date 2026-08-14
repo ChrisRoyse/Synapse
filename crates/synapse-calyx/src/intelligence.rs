@@ -5969,6 +5969,11 @@ pub struct SynapseCalyxKernelParams {
     pub knn: usize,
     pub edge_cos_threshold: f32,
     pub min_recall_ratio: f32,
+    /// Physical math resource this kernel build is allowed to activate.
+    /// Explicit MCP requests keep the configured backend; unattended
+    /// maintenance selects `BackgroundCpu` so it cannot create a CUDA context
+    /// behind a foreground game.
+    pub math_execution_class: SynapseCalyxMathExecutionClass,
     /// Optional grounded outcome anchor kind. This is a real domain *scope*
     /// (calyx-lodestar `Scope::Domain { anchor_kind }`), not a cosmetic label:
     /// when set, only concepts anchored on that outcome axis count as anchors,
@@ -5988,6 +5993,7 @@ impl SynapseCalyxKernelParams {
             knn: SYNAPSE_KERNEL_DEFAULT_KNN,
             edge_cos_threshold: SYNAPSE_KERNEL_DEFAULT_EDGE_COS,
             min_recall_ratio: SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
+            math_execution_class: SynapseCalyxMathExecutionClass::Configured,
             anchor_kind: None,
         }
     }
@@ -6063,6 +6069,501 @@ pub struct DomainKernelInputs {
 enum KernelContentRows {
     Dense(Vec<RecallQuery>),
     Sparse(SparseCosineIndex),
+}
+
+/// One MiB keeps sparse survivor ownership independent of the allocator pages
+/// used by transient constellation hydration. It is an allocation topology,
+/// not a corpus cap: additional exact chunks are allocated as required.
+const KERNEL_SPARSE_ARENA_CHUNK_BYTES: usize = 1024 * 1024;
+
+struct KernelSparseArena {
+    chunks: Vec<Vec<SparseEntry>>,
+    len: usize,
+}
+
+impl KernelSparseArena {
+    const fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            len: 0,
+        }
+    }
+
+    fn append(
+        &mut self,
+        panel_version: u32,
+        slot: u16,
+        entries: &[SparseEntry],
+    ) -> Result<(), SynapseCalyxError> {
+        let entries_per_chunk =
+            (KERNEL_SPARSE_ARENA_CHUNK_BYTES / std::mem::size_of::<SparseEntry>()).max(1);
+        let new_len = self.len.checked_add(entries.len()).ok_or_else(|| {
+            kernel_corpus_allocation_error(
+                panel_version,
+                slot,
+                "sparse entry count overflowed usize",
+            )
+        })?;
+        let mut remaining = entries;
+        while !remaining.is_empty() {
+            let needs_chunk = self
+                .chunks
+                .last()
+                .is_none_or(|chunk| chunk.len() == chunk.capacity());
+            if needs_chunk {
+                self.chunks.try_reserve(1).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!("reserve sparse chunk index: {error}"),
+                    )
+                })?;
+                let mut chunk = Vec::new();
+                chunk.try_reserve_exact(entries_per_chunk).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!(
+                            "reserve {entries_per_chunk} entries for a sparse survivor chunk: {error}"
+                        ),
+                    )
+                })?;
+                self.chunks.push(chunk);
+            }
+            let chunk = self.chunks.last_mut().ok_or_else(|| {
+                kernel_corpus_allocation_error(
+                    panel_version,
+                    slot,
+                    "sparse chunk allocation completed without a writable chunk",
+                )
+            })?;
+            let take = remaining.len().min(chunk.capacity() - chunk.len());
+            chunk.extend_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+        }
+        self.len = new_len;
+        Ok(())
+    }
+
+    fn capacity(&self, panel_version: u32, slot: u16) -> Result<usize, SynapseCalyxError> {
+        self.chunks.iter().try_fold(0usize, |total, chunk| {
+            total.checked_add(chunk.capacity()).ok_or_else(|| {
+                kernel_corpus_allocation_error(
+                    panel_version,
+                    slot,
+                    "sparse chunk capacity accounting overflowed usize",
+                )
+            })
+        })
+    }
+}
+
+/// Survivor ownership for the one slot a kernel actually consumes. Hydrated
+/// row allocations are copied into one exact dense arena or fixed-size sparse
+/// chunks and then destroyed immediately, so they cannot pin allocator pages
+/// full of dead vectors from unrelated slots.
+enum KernelHydrationRows {
+    Empty,
+    Dense {
+        dim: usize,
+        ids: Vec<CxId>,
+        flat: Vec<f32>,
+    },
+    Sparse {
+        dim: u32,
+        ids: Vec<CxId>,
+        entries: KernelSparseArena,
+        row_ends: Vec<usize>,
+    },
+}
+
+impl KernelHydrationRows {
+    const fn len(&self) -> usize {
+        match self {
+            Self::Empty => 0,
+            Self::Dense { ids, .. } | Self::Sparse { ids, .. } => ids.len(),
+        }
+    }
+
+    fn push(
+        &mut self,
+        panel_version: u32,
+        slot: u16,
+        max_records: usize,
+        cx_id: CxId,
+        vector: SlotVector,
+    ) -> Result<(), SynapseCalyxError> {
+        if self.len() >= max_records {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_SURVIVOR_BOUND_EXCEEDED",
+                format!(
+                    "panel {panel_version} slot {slot} attempted to retain row {cx_id} after the declared max_records={max_records} boundary"
+                ),
+                "inspect the kernel Base walk stop condition; never retain more content rows than the public request permits",
+            ));
+        }
+        match vector {
+            SlotVector::Dense { dim, data } => {
+                self.push_dense(panel_version, slot, max_records, cx_id, dim, &data)
+            }
+            SlotVector::Sparse { dim, entries } => {
+                self.push_sparse(panel_version, slot, max_records, cx_id, dim, &entries)
+            }
+            SlotVector::Multi { .. } | SlotVector::Absent { .. } => Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                "unsupported vector entered the kernel survivor collector",
+            )),
+        }
+    }
+
+    fn push_dense(
+        &mut self,
+        panel_version: u32,
+        slot: u16,
+        max_records: usize,
+        cx_id: CxId,
+        row_dim: u32,
+        data: &[f32],
+    ) -> Result<(), SynapseCalyxError> {
+        let row_dim = usize::try_from(row_dim).map_err(|error| {
+            kernel_corpus_allocation_error(
+                panel_version,
+                slot,
+                &format!("dense dimension does not fit usize: {error}"),
+            )
+        })?;
+        if row_dim == 0 || data.len() != row_dim {
+            return Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                format!(
+                    "dense row {cx_id} declares dimension {row_dim} but stores {} values",
+                    data.len()
+                ),
+            ));
+        }
+        match self {
+            Self::Empty => {
+                let elements = max_records.checked_mul(row_dim).ok_or_else(|| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        "dense survivor capacity overflowed usize",
+                    )
+                })?;
+                let mut ids = Vec::new();
+                ids.try_reserve_exact(max_records).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!("reserve {max_records} dense row identities: {error}"),
+                    )
+                })?;
+                let mut flat = Vec::new();
+                flat.try_reserve_exact(elements).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!("reserve {elements} dense survivor elements: {error}"),
+                    )
+                })?;
+                ids.push(cx_id);
+                flat.extend_from_slice(data);
+                *self = Self::Dense {
+                    dim: row_dim,
+                    ids,
+                    flat,
+                };
+                Ok(())
+            }
+            Self::Dense { dim, ids, flat } if *dim == row_dim => {
+                ids.push(cx_id);
+                flat.extend_from_slice(data);
+                Ok(())
+            }
+            Self::Dense { dim, .. } => Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                format!(
+                    "dense row {cx_id} has dimension {row_dim} but the frozen survivor arena dimension is {dim}"
+                ),
+            )),
+            Self::Sparse { .. } => Err(kernel_corpus_kind_mixed_error(panel_version, slot)),
+        }
+    }
+
+    fn push_sparse(
+        &mut self,
+        panel_version: u32,
+        slot: u16,
+        max_records: usize,
+        cx_id: CxId,
+        row_dim: u32,
+        row: &[SparseEntry],
+    ) -> Result<(), SynapseCalyxError> {
+        if row_dim == 0 {
+            return Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                format!("sparse row {cx_id} has zero dimension"),
+            ));
+        }
+        match self {
+            Self::Empty => {
+                let mut ids = Vec::new();
+                ids.try_reserve_exact(max_records).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!("reserve {max_records} sparse row identities: {error}"),
+                    )
+                })?;
+                let mut row_ends = Vec::new();
+                row_ends.try_reserve_exact(max_records).map_err(|error| {
+                    kernel_corpus_allocation_error(
+                        panel_version,
+                        slot,
+                        &format!("reserve {max_records} sparse row offsets: {error}"),
+                    )
+                })?;
+                let mut entries = KernelSparseArena::new();
+                entries.append(panel_version, slot, row)?;
+                ids.push(cx_id);
+                row_ends.push(entries.len);
+                *self = Self::Sparse {
+                    dim: row_dim,
+                    ids,
+                    entries,
+                    row_ends,
+                };
+                Ok(())
+            }
+            Self::Sparse {
+                dim,
+                ids,
+                entries,
+                row_ends,
+            } if *dim == row_dim => {
+                entries.append(panel_version, slot, row)?;
+                ids.push(cx_id);
+                row_ends.push(entries.len);
+                Ok(())
+            }
+            Self::Sparse { dim, .. } => Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                format!(
+                    "sparse row {cx_id} has dimension {row_dim} but the frozen survivor arena dimension is {dim}"
+                ),
+            )),
+            Self::Dense { .. } => Err(kernel_corpus_kind_mixed_error(panel_version, slot)),
+        }
+    }
+
+    fn ownership(
+        &self,
+        panel_version: u32,
+        slot: u16,
+    ) -> Result<(&'static str, usize, usize, usize), SynapseCalyxError> {
+        match self {
+            Self::Empty => Ok(("empty", 0, 0, 0)),
+            Self::Dense { ids, flat, .. } => Ok((
+                "dense",
+                flat.len(),
+                flat.capacity(),
+                usize::from(ids.capacity() > 0) + usize::from(flat.capacity() > 0),
+            )),
+            Self::Sparse {
+                ids,
+                entries,
+                row_ends,
+                ..
+            } => Ok((
+                "sparse",
+                entries.len,
+                entries.capacity(panel_version, slot)?,
+                entries.chunks.len()
+                    + usize::from(ids.capacity() > 0)
+                    + usize::from(row_ends.capacity() > 0),
+            )),
+        }
+    }
+
+    fn into_rows(
+        self,
+        panel_version: u32,
+        slot: u16,
+    ) -> Result<KernelContentRows, SynapseCalyxError> {
+        match self {
+            Self::Empty => Err(kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                "kernel survivor collector is empty",
+            )),
+            Self::Dense { dim, ids, flat } => {
+                kernel_dense_rows_from_arena(panel_version, slot, dim, ids, &flat)
+            }
+            Self::Sparse {
+                dim: _,
+                ids,
+                entries,
+                row_ends,
+            } => kernel_sparse_rows_from_arena(panel_version, slot, ids, entries, row_ends),
+        }
+    }
+}
+
+fn kernel_dense_rows_from_arena(
+    panel_version: u32,
+    slot: u16,
+    dim: usize,
+    ids: Vec<CxId>,
+    flat: &[f32],
+) -> Result<KernelContentRows, SynapseCalyxError> {
+    let expected = ids.len().checked_mul(dim).ok_or_else(|| {
+        kernel_corpus_allocation_error(
+            panel_version,
+            slot,
+            "dense survivor length readback overflowed usize",
+        )
+    })?;
+    if flat.len() != expected {
+        return Err(kernel_corpus_shape_error(
+            panel_version,
+            slot,
+            format!(
+                "dense survivor arena has {} elements; {} rows x dimension {dim} requires {expected}",
+                flat.len(),
+                ids.len()
+            ),
+        ));
+    }
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(ids.len()).map_err(|error| {
+        kernel_corpus_allocation_error(
+            panel_version,
+            slot,
+            &format!("reserve {} dense recall rows: {error}", ids.len()),
+        )
+    })?;
+    for (cx_id, values) in ids.into_iter().zip(flat.chunks_exact(dim)) {
+        let mut vector = Vec::new();
+        vector.try_reserve_exact(dim).map_err(|error| {
+            kernel_corpus_allocation_error(
+                panel_version,
+                slot,
+                &format!("reserve dense recall row {cx_id} dimension {dim}: {error}"),
+            )
+        })?;
+        vector.extend_from_slice(values);
+        rows.push(RecallQuery { cx_id, vector });
+    }
+    Ok(KernelContentRows::Dense(rows))
+}
+
+fn kernel_sparse_rows_from_arena(
+    panel_version: u32,
+    slot: u16,
+    ids: Vec<CxId>,
+    entries: KernelSparseArena,
+    row_ends: Vec<usize>,
+) -> Result<KernelContentRows, SynapseCalyxError> {
+    if ids.len() != row_ends.len() {
+        return Err(kernel_corpus_shape_error(
+            panel_version,
+            slot,
+            format!(
+                "sparse survivor identity/offset counts diverged: {} vs {}",
+                ids.len(),
+                row_ends.len()
+            ),
+        ));
+    }
+    let KernelSparseArena {
+        chunks,
+        len: entry_count,
+    } = entries;
+    let mut source = chunks.into_iter().flatten();
+    let mut previous_end = 0usize;
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(ids.len()).map_err(|error| {
+        kernel_corpus_allocation_error(
+            panel_version,
+            slot,
+            &format!("reserve {} sparse recall rows: {error}", ids.len()),
+        )
+    })?;
+    for (cx_id, end) in ids.into_iter().zip(row_ends) {
+        let row_len = end.checked_sub(previous_end).ok_or_else(|| {
+            kernel_corpus_shape_error(
+                panel_version,
+                slot,
+                format!("sparse row {cx_id} end offset {end} precedes {previous_end}"),
+            )
+        })?;
+        let mut row = Vec::new();
+        row.try_reserve_exact(row_len).map_err(|error| {
+            kernel_corpus_allocation_error(
+                panel_version,
+                slot,
+                &format!("reserve sparse recall row {cx_id} entries={row_len}: {error}"),
+            )
+        })?;
+        for _ in 0..row_len {
+            row.push(source.next().ok_or_else(|| {
+                kernel_corpus_shape_error(
+                    panel_version,
+                    slot,
+                    format!("sparse survivor arena ended inside row {cx_id}"),
+                )
+            })?);
+        }
+        rows.push((cx_id, row));
+        previous_end = end;
+    }
+    if previous_end != entry_count || source.next().is_some() {
+        return Err(kernel_corpus_shape_error(
+            panel_version,
+            slot,
+            format!("sparse survivor readback consumed {previous_end} of {entry_count} entries"),
+        ));
+    }
+    Ok(KernelContentRows::Sparse(SparseCosineIndex::new(rows)?))
+}
+
+fn kernel_corpus_allocation_error(
+    panel_version: u32,
+    slot: u16,
+    detail: &str,
+) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_CORPUS_ALLOCATION_FAILED",
+        format!("panel {panel_version} slot {slot} kernel survivor allocation failed: {detail}"),
+        "preserve the vault and inspect the named panel/slot corpus shape and process allocator before retrying",
+    )
+}
+
+fn kernel_corpus_shape_error(
+    panel_version: u32,
+    slot: u16,
+    detail: impl std::fmt::Display,
+) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_SHAPE_INVALID",
+        format!("panel {panel_version} slot {slot} kernel content shape is invalid: {detail}"),
+        "repair or remeasure the frozen content slot so every physical row has one consistent dense or sparse shape",
+    )
+}
+
+fn kernel_corpus_kind_mixed_error(panel_version: u32, slot: u16) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_KIND_MIXED",
+        format!(
+            "panel {panel_version} slot {slot} mixes dense and sparse vectors; one frozen slot must have one physical shape"
+        ),
+        "repair or remeasure the slot so every record agrees with its frozen lens shape",
+    )
 }
 
 impl KernelContentRows {
@@ -6228,6 +6729,16 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxKernelParams,
     ) -> Result<SynapseCalyxKernelReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("build_domain_kernel");
+        finish_kernel_memory_release(
+            "kernel domain build",
+            self.build_domain_kernel_owned(params),
+        )
+    }
+
+    fn build_domain_kernel_owned(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<SynapseCalyxKernelReport, SynapseCalyxError> {
         let inputs = self.build_domain_kernel_inputs(params)?;
         // The honesty gate: an ungrounded kernel (recall below the gate) is a
         // structured error, never persisted or served.
@@ -6337,6 +6848,18 @@ impl SynapseCalyxVault {
         max_hops: usize,
     ) -> Result<SynapseCalyxKernelAnswerReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("kernel_answer");
+        finish_kernel_memory_release(
+            "kernel grounded answer",
+            self.kernel_answer_owned(params, query_cx_id, max_hops),
+        )
+    }
+
+    fn kernel_answer_owned(
+        &self,
+        params: &SynapseCalyxKernelParams,
+        query_cx_id: &str,
+        max_hops: usize,
+    ) -> Result<SynapseCalyxKernelAnswerReport, SynapseCalyxError> {
         let query_cx = crate::parse_cx_id(query_cx_id)?;
         let inputs = self.build_domain_kernel_inputs(params)?;
         if inputs.recall_ratio < params.min_recall_ratio {
@@ -6427,7 +6950,7 @@ impl SynapseCalyxVault {
 
     /// Assembles the kernel inputs from the vault: scans the panel's Base CF for
     /// the content-slot embedding, builds the embedding-proximity kNN association
-    /// graph (GPU-preferred/CPU-fallback cosine), selects the kernel via the
+    /// graph through the explicitly declared math execution class, selects the kernel via the
     /// substrate MFVS pipeline, builds the kernel index, and measures kernel-only
     /// recall against the full corpus.
     ///
@@ -6445,178 +6968,215 @@ impl SynapseCalyxVault {
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let content_slot = PanelSlotId::new(params.panel_version, SlotId::new(params.content_slot));
-        let mut measured_rows: Vec<(CxId, SlotVector)> = Vec::new();
-        let mut anchors: Vec<CxId> = Vec::new();
-        let mut vault_corpus_size = 0usize;
-        let mut rejects = ContentSlotRejects::default();
-        // #1968: paged rather than materialized. Each row is decoded once and
-        // then either hydrated or discarded, so the whole-CF `Vec` bought
-        // nothing and cost every constellation writer a ~204 ms `Base` row-guard
-        // stall for the duration.
-        self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
-            self.walk_cf_snapshot(
-                snapshot,
-                ColumnFamily::Base,
-                crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
-                |_key, value| {
-                    let base = decode_constellation_base(value).map_err(|error| {
-                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                    })?;
-                    if base.panel_version != params.panel_version {
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    vault_corpus_size += 1;
-                    // The Base row says whether the content slot exists on this record;
-                    // it cannot supply the vector, which lives in the slot CF. Reading
-                    // the vector straight off the Base row yielded `Absent` for every
-                    // record, so every concept was excluded and the kernel reported
-                    // `0 embedded concept(s)` over a panel full of measurements (#1894).
-                    if !base.slots.contains_key(&content_slot.slot_id()) {
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    let constellation =
-                        self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
-                    let stored = constellation.slots.get(&content_slot.slot_id());
-                    let Some(vector) = stored else {
-                        rejects.record("absent");
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    };
-                    match vector {
-                        SlotVector::Dense { data, .. }
-                            if data.iter().all(|value| *value == 0.0) =>
-                        {
-                            rejects.record("empty");
+        let hydration = (|| {
+            let mut measured_rows = KernelHydrationRows::Empty;
+            let mut anchors: Vec<CxId> = Vec::new();
+            anchors.try_reserve_exact(max_records).map_err(|error| {
+                kernel_corpus_allocation_error(
+                    params.panel_version,
+                    params.content_slot,
+                    &format!("reserve {max_records} anchored row identities: {error}"),
+                )
+            })?;
+            let mut vault_corpus_size = 0usize;
+            let mut rejects = ContentSlotRejects::default();
+            // #1968: paged rather than materialized. #2243 narrows the pinned
+            // hydration to the one vector consumed by this kernel; hydrating
+            // every unrelated slot made short-lived vectors share allocator
+            // pages with retained content rows and produced multi-GiB peaks.
+            self.with_read_snapshot(crate::INTELLIGENCE_CORPUS_READER_LEASE_MS, |snapshot| {
+                self.walk_cf_snapshot(
+                    snapshot,
+                    ColumnFamily::Base,
+                    crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+                    |_key, value| {
+                        let base = decode_constellation_base(value).map_err(|error| {
+                            SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                        })?;
+                        if base.panel_version != params.panel_version {
                             return Ok(crate::SynapseCalyxWalkStep::Continue);
                         }
-                        SlotVector::Sparse { entries, .. } if entries.is_empty() => {
-                            rejects.record("empty");
+                        vault_corpus_size = vault_corpus_size.checked_add(1).ok_or_else(|| {
+                            kernel_corpus_allocation_error(
+                                params.panel_version,
+                                params.content_slot,
+                                "panel corpus count overflowed usize",
+                            )
+                        })?;
+                        // Base identifies slot presence but the vector lives in
+                        // its slot CF. The selected-slot read preserves the same
+                        // pinned snapshot and anchors without allocating every
+                        // other slot in the constellation.
+                        if !base.slots.contains_key(&content_slot.slot_id()) {
                             return Ok(crate::SynapseCalyxWalkStep::Continue);
                         }
-                        SlotVector::Multi { .. } => {
-                            rejects.record("multi");
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        SlotVector::Absent { .. } => {
+                        let mut constellation = self
+                            .vault
+                            .get_selected_slots_at_snapshot(
+                                base.cx_id,
+                                snapshot,
+                                [content_slot.slot_id()],
+                            )
+                            .map_err(|error| {
+                                SynapseCalyxError::from_calyx(
+                                    "hydrate pinned kernel content slot",
+                                    &error,
+                                )
+                            })?;
+                        let Some(vector) = constellation.slots.remove(&content_slot.slot_id())
+                        else {
                             rejects.record("absent");
                             return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
-                    }
-                    // Domain scope: with `anchor_kind` set only that outcome axis
-                    // anchors the kernel, so a per-domain sweep selects one kernel per
-                    // domain instead of one blended kernel over every anchored concept.
-                    let has_anchor = constellation.anchors.iter().any(|anchor| {
-                        anchor.confidence > 0.0
-                            && params.anchor_kind.as_deref().is_none_or(|kind| {
-                                crate::grounding::anchor_kind_label(&anchor.kind) == kind
-                            })
-                    });
-                    let cx_id = constellation.cx_id;
-                    measured_rows.push((cx_id, vector.clone()));
-                    if has_anchor {
-                        anchors.push(cx_id);
-                    }
-                    // The pre-paging form `break`s here, after both pushes, so
-                    // `vault_corpus_size` is truncated at exactly the same row it was
-                    // before. It counts the population the loader *reached*, not the
-                    // whole panel, and that has not changed.
-                    if measured_rows.len() >= max_records {
-                        return Ok(crate::SynapseCalyxWalkStep::Stop);
-                    }
-                    Ok(crate::SynapseCalyxWalkStep::Continue)
-                },
-            )
-        })?;
-        // Multi vectors require MaxSim and are deliberately not interpreted as
-        // either dense or sparse cosine. Sparse vectors are native kernel
-        // content and stay sparse end-to-end (#1979).
-        if rejects.wrong_kind() > 0 {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_UNSUPPORTED",
-                format!(
-                    "panel {} slot {} stores an unsupported vector on {} of {} measured or excluded record(s) ({}); dense cosine and sparse cosine are supported, but multi vectors require an explicit MaxSim kernel",
-                    params.panel_version,
-                    params.content_slot,
-                    rejects.wrong_kind(),
-                    rejects.wrong_kind() + rejects.absent + rejects.empty + measured_rows.len(),
-                    rejects.describe()
-                ),
-                "name a dense or sparse content slot; add an explicit MaxSim association path before using a multi-vector slot",
-            ));
-        }
-        if measured_rows.len() < 2 {
-            return Err(SynapseCalyxError::new(
-                LodestarError::KernelEmptyResult.code(),
-                format!(
-                    "panel {} slot {} has {} embedded concept(s) out of {} record(s) in the panel; a kernel needs at least two (excluded: {})",
-                    params.panel_version,
-                    params.content_slot,
-                    measured_rows.len(),
-                    vault_corpus_size,
-                    rejects.describe()
-                ),
-                "capture more grounded concepts with the content-slot embedding for this domain; if every record is 'absent' the slot CF rows were never hydrated (see #1894) rather than never measured",
-            ));
-        }
-        if anchors.is_empty() {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_NO_ANCHOR",
-                format!(
-                    "panel {} slot {} has no anchored concept in domain scope {}; a grounded kernel needs at least one outcome anchor",
-                    params.panel_version,
-                    params.content_slot,
-                    params
-                        .anchor_kind
-                        .as_deref()
-                        .unwrap_or("<all anchor kinds>")
-                ),
-                "anchor at least one concept (a grounded outcome) in this domain before building a kernel",
-            ));
-        }
-
-        let dense_count = measured_rows
-            .iter()
-            .filter(|(_, vector)| matches!(vector, SlotVector::Dense { .. }))
-            .count();
-        let sparse_count = measured_rows.len() - dense_count;
-        if dense_count > 0 && sparse_count > 0 {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_KIND_MIXED",
-                format!(
-                    "panel {} slot {} stores {dense_count} dense and {sparse_count} sparse vectors; one frozen slot must have one physical shape",
-                    params.panel_version, params.content_slot
-                ),
-                "repair or remeasure the slot so every record agrees with its frozen lens shape",
-            ));
-        }
-        let rows = if dense_count > 0 {
-            KernelContentRows::Dense(
-                measured_rows
-                    .into_iter()
-                    .map(|(cx_id, vector)| {
-                        let SlotVector::Dense { data, .. } = vector else {
-                            unreachable!("kind checked above")
                         };
-                        RecallQuery {
-                            cx_id,
-                            vector: data,
+                        match &vector {
+                            SlotVector::Dense { data, .. }
+                                if data.iter().all(|value| *value == 0.0) =>
+                            {
+                                rejects.record("empty");
+                                return Ok(crate::SynapseCalyxWalkStep::Continue);
+                            }
+                            SlotVector::Sparse { entries, .. } if entries.is_empty() => {
+                                rejects.record("empty");
+                                return Ok(crate::SynapseCalyxWalkStep::Continue);
+                            }
+                            SlotVector::Multi { .. } => {
+                                rejects.record("multi");
+                                return Ok(crate::SynapseCalyxWalkStep::Continue);
+                            }
+                            SlotVector::Absent { .. } => {
+                                rejects.record("absent");
+                                return Ok(crate::SynapseCalyxWalkStep::Continue);
+                            }
+                            SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
                         }
-                    })
-                    .collect(),
-            )
-        } else {
-            let mut dim = None;
-            let source = measured_rows.into_iter().map(|(cx_id, vector)| {
-                let SlotVector::Sparse { dim: row_dim, entries } = vector else { unreachable!("kind checked above") };
-                if let Some(expected) = dim { if expected != row_dim { return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_KERNEL_SPARSE_DIM_MISMATCH",
-                    format!("sparse content slot {} mixes dimensions {expected} and {row_dim}", params.content_slot),
-                    "repair or remeasure the slot so every row matches the frozen lens dimension",
-                )); }} else { dim = Some(row_dim); }
-                Ok((cx_id, entries))
-            }).collect::<Result<Vec<_>, _>>()?;
-            KernelContentRows::Sparse(SparseCosineIndex::new(source)?)
+                        let has_anchor = constellation.anchors.iter().any(|anchor| {
+                            anchor.confidence > 0.0
+                                && params.anchor_kind.as_deref().is_none_or(|kind| {
+                                    crate::grounding::anchor_kind_label(&anchor.kind) == kind
+                                })
+                        });
+                        let cx_id = constellation.cx_id;
+                        measured_rows.push(
+                            params.panel_version,
+                            params.content_slot,
+                            max_records,
+                            cx_id,
+                            vector,
+                        )?;
+                        if has_anchor {
+                            anchors.push(cx_id);
+                        }
+                        if measured_rows.len() >= max_records {
+                            return Ok(crate::SynapseCalyxWalkStep::Stop);
+                        }
+                        Ok(crate::SynapseCalyxWalkStep::Continue)
+                    },
+                )
+            })?;
+
+            // Multi vectors require MaxSim and are deliberately not coerced
+            // into cosine. Sparse vectors remain native kernel content.
+            if rejects.wrong_kind() > 0 {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_CONTENT_SLOT_UNSUPPORTED",
+                    format!(
+                        "panel {} slot {} stores an unsupported vector on {} of {} measured or excluded record(s) ({}); dense cosine and sparse cosine are supported, but multi vectors require an explicit MaxSim kernel",
+                        params.panel_version,
+                        params.content_slot,
+                        rejects.wrong_kind(),
+                        rejects.wrong_kind() + rejects.absent + rejects.empty + measured_rows.len(),
+                        rejects.describe()
+                    ),
+                    "name a dense or sparse content slot; add an explicit MaxSim association path before using a multi-vector slot",
+                ));
+            }
+            if measured_rows.len() < 2 {
+                return Err(SynapseCalyxError::new(
+                    LodestarError::KernelEmptyResult.code(),
+                    format!(
+                        "panel {} slot {} has {} embedded concept(s) out of {} record(s) in the panel; a kernel needs at least two (excluded: {})",
+                        params.panel_version,
+                        params.content_slot,
+                        measured_rows.len(),
+                        vault_corpus_size,
+                        rejects.describe()
+                    ),
+                    "capture more grounded concepts with the content-slot embedding for this domain; if every record is 'absent' the slot CF rows were never hydrated (see #1894) rather than never measured",
+                ));
+            }
+            if anchors.is_empty() {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_NO_ANCHOR",
+                    format!(
+                        "panel {} slot {} has no anchored concept in domain scope {}; a grounded kernel needs at least one outcome anchor",
+                        params.panel_version,
+                        params.content_slot,
+                        params
+                            .anchor_kind
+                            .as_deref()
+                            .unwrap_or("<all anchor kinds>")
+                    ),
+                    "anchor at least one concept (a grounded outcome) in this domain before building a kernel",
+                ));
+            }
+            let ownership = measured_rows.ownership(params.panel_version, params.content_slot)?;
+            Ok((measured_rows, anchors, vault_corpus_size, ownership))
+        })();
+
+        // At this boundary every Base decode, selected-slot temporary, cursor,
+        // and page is dead. The only live corpus ownership is the explicitly
+        // logged survivor arena, so allocator release is both effective and
+        // auditable. Preserve both causes if hydration and release fail.
+        let release = crate::release_process_memory("kernel content-slot hydration");
+        let (measured_rows, anchors, vault_corpus_size) = match (hydration, release) {
+            (Err(hydration_error), Err(release_error)) => {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_HYDRATION_AND_MEMORY_RELEASE_FAILED",
+                    format!(
+                        "panel {} slot {} content hydration failed with {}: {}; after hydration ownership ended, allocator release also failed with {release_error}",
+                        params.panel_version,
+                        params.content_slot,
+                        hydration_error.code,
+                        hydration_error.message
+                    ),
+                    "repair both the named content hydration failure and the process memory reclaimer before retrying",
+                ));
+            }
+            (Err(hydration_error), Ok(_)) => return Err(hydration_error),
+            (Ok(_), Err(release_error)) => return Err(release_error),
+            (Ok(hydration), Ok(release)) => {
+                tracing::info!(
+                    code = "SYNAPSE_CALYX_KERNEL_CORPUS_MEMORY_RELEASED",
+                    panel_version = params.panel_version,
+                    slot = params.content_slot,
+                    records = hydration.0.len(),
+                    survivor_kind = hydration.3.0,
+                    survivor_vector_elements = hydration.3.1,
+                    survivor_vector_capacity_elements = hydration.3.2,
+                    survivor_allocations = hydration.3.3,
+                    private_bytes_before = release.private_bytes_before,
+                    private_bytes_after = release.private_bytes_after,
+                    private_bytes_reclaimed = release.private_bytes_reclaimed,
+                    release_elapsed_us = release.elapsed_us,
+                    "released dead selected-slot hydration ownership while preserving the exact bounded kernel corpus"
+                );
+                (hydration.0, hydration.1, hydration.2)
+            }
         };
+
+        let rows = measured_rows.into_rows(params.panel_version, params.content_slot)?;
+        let conversion_release = crate::release_process_memory("kernel survivor arena conversion")?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_KERNEL_SURVIVOR_CONVERSION_MEMORY_RELEASED",
+            panel_version = params.panel_version,
+            slot = params.content_slot,
+            rows = rows.len(),
+            private_bytes_before = conversion_release.private_bytes_before,
+            private_bytes_after = conversion_release.private_bytes_after,
+            private_bytes_reclaimed = conversion_release.private_bytes_reclaimed,
+            release_elapsed_us = conversion_release.elapsed_us,
+            "released the flat/chunked hydration arena after moving the exact survivors into kernel-native rows"
+        );
 
         let graph = self.build_kernel_assoc_graph(&rows, params)?;
         let corpus_fingerprint = corpus_fingerprint(&rows);
@@ -6792,86 +7352,236 @@ impl SynapseCalyxVault {
 
     /// Builds the embedding-proximity association graph: a node per embedded
     /// concept, an edge to each of its `knn` cosine-nearest neighbours at or above
-    /// `edge_cos_threshold` (GPU-preferred/CPU-fallback Forge kNN).
+    /// `edge_cos_threshold` through the declared Forge execution class.
     fn build_kernel_assoc_graph(
         &self,
         rows: &KernelContentRows,
         params: &SynapseCalyxKernelParams,
     ) -> Result<AssocGraph, SynapseCalyxError> {
+        match rows {
+            KernelContentRows::Dense(rows) => self.build_dense_kernel_assoc_graph(rows, params),
+            KernelContentRows::Sparse(index) => build_sparse_kernel_assoc_graph(index, params),
+        }
+    }
+
+    fn build_dense_kernel_assoc_graph(
+        &self,
+        rows: &[RecallQuery],
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<AssocGraph, SynapseCalyxError> {
         let mut builder = AssocGraph::builder();
-        for cx_id in rows.ids() {
+        for row in rows {
             builder
-                .add_node(cx_id, 1.0)
+                .add_node(row.cx_id, 1.0)
                 .map_err(|error| paths_error("add kernel graph node", &error))?;
         }
         let knn = params.knn.clamp(1, 64);
-        if let KernelContentRows::Sparse(index) = rows {
-            for row in &index.rows {
-                for (candidate, score) in index
-                    .search(row.cx_id, knn + 1, None)?
-                    .into_iter()
-                    .filter(|(candidate, _)| *candidate != row.cx_id)
-                    .take(knn)
-                {
-                    let score = kernel_graph_cosine(score)?;
-                    if score < params.edge_cos_threshold {
-                        continue;
-                    }
-                    builder
-                        .add_edge(row.cx_id, candidate, score)
-                        .map_err(|error| paths_error("add sparse kernel graph edge", &error))?;
-                }
-            }
-            return Ok(builder.build());
-        }
-        let KernelContentRows::Dense(rows) = rows else {
-            unreachable!()
-        };
         // Only equal-dimension vectors can be compared by cosine; group by dim.
         let mut by_dim: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (index, row) in rows.iter().enumerate() {
             by_dim.entry(row.vector.len()).or_default().push(index);
         }
-        let backend_lease = self.math_runtime.backend()?;
-        let backend = &*backend_lease;
+        let configured_backend = (params.math_execution_class
+            == SynapseCalyxMathExecutionClass::Configured)
+            .then(|| self.math_runtime.backend())
+            .transpose()?;
+        let background_backend = (params.math_execution_class
+            == SynapseCalyxMathExecutionClass::BackgroundCpu)
+            .then(crate::math::verified_background_cpu_backend)
+            .transpose()?;
+        let backend = configured_backend
+            .as_ref()
+            .map(|lease| &**lease as &dyn Backend)
+            .or(background_backend.as_deref())
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_MATH_BACKEND_MISSING",
+                    format!(
+                        "panel {} slot {} execution class {} produced no dense kNN backend",
+                        params.panel_version,
+                        params.content_slot,
+                        params.math_execution_class.as_str()
+                    ),
+                    "repair the declared kernel math backend; the kernel graph never falls back to another execution class",
+                )
+            })?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_KERNEL_MATH_EXECUTION_CLASS",
+            panel_version = params.panel_version,
+            slot = params.content_slot,
+            requested_execution_class = params.math_execution_class.as_str(),
+            backend_used = params.math_execution_class.as_str(),
+            configured_runtime_activated = configured_backend.is_some(),
+            background_cpu_activated = background_backend.is_some(),
+            "selected the declared dense kernel math execution class without runtime fallback"
+        );
         for (dim, group) in by_dim {
-            if dim == 0 || group.len() < 2 {
-                continue;
-            }
-            let count = group.len();
-            let mut flat = Vec::with_capacity(count * dim);
-            for &index in &group {
-                flat.extend_from_slice(&rows[index].vector);
-            }
-            let k = (knn + 1).min(count);
-            let batch = backend
-                .knn(&flat, &flat, count, dim, k, KnnMetric::Cosine)
-                .map_err(|error| forge_math_error("kernel-graph kNN", &error))?;
-            for (query_offset, &query_index) in group.iter().enumerate() {
-                let base = query_offset * batch.k;
-                let mut added = 0usize;
-                for slot in 0..batch.k {
-                    let candidate_offset = batch.indices[base + slot];
-                    if candidate_offset == query_offset {
-                        continue;
-                    }
-                    let score = batch.scores[base + slot];
-                    let score = kernel_graph_cosine(score)?;
-                    if score < params.edge_cos_threshold {
-                        continue;
-                    }
-                    let candidate_index = group[candidate_offset];
-                    builder
-                        .add_edge(rows[query_index].cx_id, rows[candidate_index].cx_id, score)
-                        .map_err(|error| paths_error("add kernel graph edge", &error))?;
-                    added += 1;
-                    if added >= knn {
-                        break;
-                    }
-                }
-            }
+            append_dense_kernel_group_edges(&mut builder, backend, rows, &group, dim, knn, params)?;
         }
         Ok(builder.build())
+    }
+}
+
+fn build_sparse_kernel_assoc_graph(
+    index: &SparseCosineIndex,
+    params: &SynapseCalyxKernelParams,
+) -> Result<AssocGraph, SynapseCalyxError> {
+    let mut builder = AssocGraph::builder();
+    for row in &index.rows {
+        builder
+            .add_node(row.cx_id, 1.0)
+            .map_err(|error| paths_error("add sparse kernel graph node", &error))?;
+    }
+    let knn = params.knn.clamp(1, 64);
+    tracing::info!(
+        code = "SYNAPSE_CALYX_KERNEL_MATH_EXECUTION_CLASS",
+        panel_version = params.panel_version,
+        slot = params.content_slot,
+        requested_execution_class = params.math_execution_class.as_str(),
+        backend_used = "sparse_cpu_exact",
+        configured_runtime_activated = false,
+        background_cpu_activated = false,
+        "selected the native sparse CPU path without activating the configured math runtime"
+    );
+    for row in &index.rows {
+        for (candidate, score) in index
+            .search(row.cx_id, knn + 1, None)?
+            .into_iter()
+            .filter(|(candidate, _)| *candidate != row.cx_id)
+            .take(knn)
+        {
+            let score = kernel_graph_cosine(score)?;
+            if score < params.edge_cos_threshold {
+                continue;
+            }
+            builder
+                .add_edge(row.cx_id, candidate, score)
+                .map_err(|error| paths_error("add sparse kernel graph edge", &error))?;
+        }
+    }
+    Ok(builder.build())
+}
+
+fn append_dense_kernel_group_edges(
+    builder: &mut calyx_paths::AssocGraphBuilder,
+    backend: &dyn Backend,
+    rows: &[RecallQuery],
+    group: &[usize],
+    dim: usize,
+    knn: usize,
+    params: &SynapseCalyxKernelParams,
+) -> Result<(), SynapseCalyxError> {
+    if dim == 0 || group.len() < 2 {
+        return Ok(());
+    }
+    let count = group.len();
+    let elements = count.checked_mul(dim).ok_or_else(|| {
+        kernel_corpus_allocation_error(
+            params.panel_version,
+            params.content_slot,
+            "dense kernel graph arena size overflowed usize",
+        )
+    })?;
+    let mut flat = Vec::new();
+    flat.try_reserve_exact(elements).map_err(|error| {
+        kernel_corpus_allocation_error(
+            params.panel_version,
+            params.content_slot,
+            &format!("reserve {elements} dense kernel graph elements: {error}"),
+        )
+    })?;
+    for &index in group {
+        flat.extend_from_slice(&rows[index].vector);
+    }
+    let k = (knn + 1).min(count);
+    let batch = backend
+        .knn(&flat, &flat, count, dim, k, KnnMetric::Cosine)
+        .map_err(|error| forge_math_error("kernel-graph kNN", &error))?;
+    for (query_offset, &query_index) in group.iter().enumerate() {
+        let base = query_offset.checked_mul(batch.k).ok_or_else(|| {
+            kernel_corpus_shape_error(
+                params.panel_version,
+                params.content_slot,
+                "dense kNN result offset overflowed usize",
+            )
+        })?;
+        let mut added = 0usize;
+        for slot in 0..batch.k {
+            let result_index = base.checked_add(slot).ok_or_else(|| {
+                kernel_corpus_shape_error(
+                    params.panel_version,
+                    params.content_slot,
+                    "dense kNN result index overflowed usize",
+                )
+            })?;
+            let candidate_offset = *batch.indices.get(result_index).ok_or_else(|| {
+                kernel_corpus_shape_error(
+                    params.panel_version,
+                    params.content_slot,
+                    format!(
+                        "dense kNN backend returned {} indices; result {result_index} is absent",
+                        batch.indices.len()
+                    ),
+                )
+            })?;
+            if candidate_offset == query_offset {
+                continue;
+            }
+            let score = *batch.scores.get(result_index).ok_or_else(|| {
+                kernel_corpus_shape_error(
+                    params.panel_version,
+                    params.content_slot,
+                    format!(
+                        "dense kNN backend returned {} scores; result {result_index} is absent",
+                        batch.scores.len()
+                    ),
+                )
+            })?;
+            let score = kernel_graph_cosine(score)?;
+            if score < params.edge_cos_threshold {
+                continue;
+            }
+            let candidate_index = *group.get(candidate_offset).ok_or_else(|| {
+                kernel_corpus_shape_error(
+                    params.panel_version,
+                    params.content_slot,
+                    format!(
+                        "dense kNN backend returned candidate offset {candidate_offset} for group size {count}"
+                    ),
+                )
+            })?;
+            builder
+                .add_edge(rows[query_index].cx_id, rows[candidate_index].cx_id, score)
+                .map_err(|error| paths_error("add kernel graph edge", &error))?;
+            added += 1;
+            if added >= knn {
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn finish_kernel_memory_release<T>(
+    operation: &'static str,
+    result: Result<T, SynapseCalyxError>,
+) -> Result<T, SynapseCalyxError> {
+    // The inner operation has returned, so every graph, recall index, corpus,
+    // and query workspace it owned is dead before the allocator is asked to
+    // release pages. Preserve both independent causes if work and release fail.
+    let release = crate::release_process_memory(operation);
+    match (result, release) {
+        (Err(operation_error), Err(release_error)) => Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_KERNEL_OPERATION_AND_MEMORY_RELEASE_FAILED",
+            format!(
+                "{operation} failed with {}: {}; after all kernel-owned transients were dropped, allocator release also failed with {release_error}",
+                operation_error.code, operation_error.message
+            ),
+            "repair both the named kernel operation failure and the process memory reclaimer before retrying",
+        )),
+        (Err(operation_error), Ok(_)) => Err(operation_error),
+        (Ok(_), Err(release_error)) => Err(release_error),
+        (Ok(value), Ok(_)) => Ok(value),
     }
 }
 

@@ -43,7 +43,10 @@ use calyx_lodestar::{
 use serde::{Deserialize, Serialize};
 
 use crate::intelligence::{KERNEL_ROW_PREFIX, kernel_row_key};
-use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxKernelParams, SynapseCalyxVault};
+use crate::{
+    SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxKernelParams,
+    SynapseCalyxMathExecutionClass, SynapseCalyxVault,
+};
 
 /// Row prefix of a persisted full Kernel artifact inside the `Kernel` CF.
 const KERNEL_ARTIFACT_PREFIX: &[u8; 5] = b"KART1";
@@ -106,6 +109,8 @@ pub struct SynapseCalyxKernelRebuildParams {
     pub edge_cos_threshold: f32,
     pub min_recall_ratio: f32,
     pub max_domains: usize,
+    /// Physical math resource this sweep is allowed to activate.
+    pub math_execution_class: SynapseCalyxMathExecutionClass,
 }
 
 impl SynapseCalyxKernelRebuildParams {
@@ -119,6 +124,7 @@ impl SynapseCalyxKernelRebuildParams {
             edge_cos_threshold: crate::SYNAPSE_KERNEL_DEFAULT_EDGE_COS,
             min_recall_ratio: crate::SYNAPSE_KERNEL_DEFAULT_MIN_RECALL,
             max_domains: SYNAPSE_KERNEL_MAX_DOMAINS,
+            math_execution_class: SynapseCalyxMathExecutionClass::Configured,
         }
     }
 
@@ -130,6 +136,7 @@ impl SynapseCalyxKernelRebuildParams {
             knn: self.knn,
             edge_cos_threshold: self.edge_cos_threshold,
             min_recall_ratio: self.min_recall_ratio,
+            math_execution_class: self.math_execution_class,
             anchor_kind,
         }
     }

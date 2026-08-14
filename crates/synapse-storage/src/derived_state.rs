@@ -2372,6 +2372,11 @@ fn drive_scheduled_kernels(
         let mut params =
             synapse_calyx::SynapseCalyxKernelRebuildParams::new(panel_version, content_slot);
         params.max_records = KERNEL_REBUILD_MAX_RECORDS;
+        // Scheduled kernel maintenance is an explicit background execution
+        // class. It must never initialize or reserve the configured CUDA
+        // runtime behind a foreground game; a CPU probe failure is a hard,
+        // named maintenance failure rather than permission to fall back.
+        params.math_execution_class = synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu;
         let report = match db.rebuild_domain_kernels_intelligence(&params) {
             Ok(report) => report,
             Err(error) => {
@@ -2427,6 +2432,8 @@ fn drive_scheduled_kernels(
         targets = crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS.len(),
         eligible_targets,
         max_records = KERNEL_REBUILD_MAX_RECORDS,
+        math_execution_class =
+            synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu.as_str(),
         "eligible grounding kernels persisted and physically counted; ineligible targets were explicitly classified"
     );
     Ok(())
