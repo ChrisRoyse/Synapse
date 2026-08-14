@@ -1217,39 +1217,14 @@ impl From<calyx_aster::vault::ConditionalCfWriteOutcome> for SynapseCalyxConditi
     }
 }
 
-/// Rows per page for [`SynapseCalyxVault::walk_cf_latest`].
+/// Rows handed to a [`SynapseCalyxVault::walk_cf_latest`] callback at once.
 ///
-/// Chosen so one page's row-table read guard is bounded by a small constant
-/// rather than by the size of the column family. #1968 measured
-/// `scan_cf_latest(Base)` at a 290 ms mean hold and a 2.65 s maximum, over
-/// budget on 335 of 335 holds.
-///
-/// **This value was swept, not picked.** Manual FSV walked the real 106,787-row
-/// `Base` CF at six page sizes and read the worst single hold against
-/// `ROW_READ_GUARD_WARN_US` (25,000 us):
-///
-/// ```text
-/// page_rows   pages  worst_hold_us  mean_hold_us   total_us  over_budget
-///       256     418           4,062       2,394.9  1,001,082            0
-///       512     209           5,978       4,057.0    847,918            0
-///     1,024     105          11,167       7,866.4    825,970            0
-///     2,048      53          16,828      14,897.4    789,560            0
-///     4,096      27          33,690      28,940.9    781,404           26
-///     8,192      14          67,221      56,785.9    795,002           13
-/// ```
-///
-/// Two things decide it. **Total CPU is nearly flat** across the whole sweep
-/// (1.00 s to 0.78 s), so a smaller page buys a shorter hold almost for free —
-/// the per-page merge is not a fixed cost worth amortizing. And the budget has
-/// a **cliff between 2,048 and 4,096**, so 2,048 would have shipped a value one
-/// step from going over on a busier machine. 256 lands the worst hold at 16% of
-/// budget, which is also the regime the existing `scan_cf_range_page_latest`
-/// callers already operate in on the live daemon (1.91 ms mean).
-///
-/// The cost this does pay is ~27% more total CPU than the unpaged scan, spent
-/// re-cloning each page's candidates through the merge. That is the trade: a
-/// maintenance pass uses a little more CPU in total, and stops holding a lock
-/// that every constellation writer needs for a third of a second.
+/// #1968 established 256 as the bounded handoff that avoids a whole-CF
+/// materialization. Since #2239, paging is an output boundary inside one
+/// persistent immutable merge cursor: it must never become the unit at which
+/// SST readers are reopened or re-sought. #2243 physically measured the latter
+/// mistake taking 49,915 source reconstructions to discover 2,000 matching
+/// records and driving a real daemon to a 2.824 GiB lifetime peak.
 pub const SYNAPSE_CALYX_CF_WALK_PAGE_ROWS: usize = 256;
 /// Base-specific streaming handoff size.
 ///
@@ -1287,18 +1262,12 @@ impl From<calyx_core::CalyxError> for SynapseCalyxSnapshotWalkControl {
     }
 }
 
-/// Provenance of one bounded-hold walk over a column family (#1968).
+/// Provenance of one bounded-handoff walk over a column family (#1968).
 ///
-/// A walk trades one long atomic view for many short ones, so the window it
-/// observed is a property of the result and is reported rather than assumed.
-/// `snapshot_seq_first == snapshot_seq_last` ([`Self::atomic`]) means no commit
-/// landed between the first and last page, and only then is the fold's output
-/// an exact census of one instant; otherwise it is a census over an interval.
-///
-/// This distinction is not cosmetic. Comparing a paged census against an
-/// unpaged one on a *live* vault compares two different windows and disagrees
-/// for a reason that is not a defect, so an equivalence check is only
-/// well-posed when [`Self::atomic`] holds on both sides.
+/// Current public walks retain one registered snapshot and one immutable merge
+/// cursor, so every non-sentinel result describes one committed sequence.
+/// Keeping both sequence fields makes that invariant externally auditable and
+/// preserves compatibility with historical moving-window reports.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SynapseCalyxCfWalk {
     /// Column family walked.
@@ -1323,22 +1292,21 @@ impl SynapseCalyxCfWalk {
     /// Whether every page was served by the same committed sequence.
     ///
     /// True means the fold's output describes one instant and is directly
-    /// comparable with an unpaged `scan_cf_latest` fold. False means one or
-    /// more commits landed mid-walk and the output describes an interval, or
-    /// that no walk ran at all ([`Self::not_walked`]).
+    /// comparable with an unpaged `scan_cf_latest` fold. A physically empty
+    /// walk is still atomic; [`Self::not_walked`] is distinguished by its zero
+    /// `page_rows` provenance.
     #[must_use]
     pub const fn atomic(&self) -> bool {
-        self.pages > 0 && self.snapshot_seq_first == self.snapshot_seq_last
+        self.page_rows > 0 && self.snapshot_seq_first == self.snapshot_seq_last
     }
 
     /// A walk record for a value that was **not** folded from a real walk.
     ///
-    /// [`SynapseCalyxVault::walk_cf_latest`] always reads at least one page, so
-    /// `pages == 0` cannot describe any real walk. That makes it an unambiguous
-    /// marker rather than a plausible-looking fabrication, which is the point:
-    /// a hand-assembled census exercising the selection logic downstream of the
-    /// fold must not be able to pass itself off as a measurement, and
-    /// [`Self::atomic`] is false here for the same reason.
+    /// `page_rows == 0` cannot describe a real walk. That makes this an
+    /// unambiguous marker even when a real empty column family produces zero
+    /// data pages: a hand-assembled census exercising selection logic must not
+    /// pass itself off as a physical measurement, and [`Self::atomic`] is false
+    /// here for the same reason.
     #[must_use]
     pub fn not_walked(column_family: impl Into<String>) -> Self {
         Self {
@@ -7407,136 +7375,39 @@ impl SynapseCalyxVault {
         self.vault.router_latest_readback()
     }
 
-    /// Folds over every visible row of one column family with a **bounded**
-    /// row-table read-guard hold (#1968).
+    /// Folds every visible row of one column family through one registered
+    /// latest snapshot and one persistent immutable merge cursor.
     ///
-    /// `scan_cf_latest` holds the `cf`'s row-table shard for the whole scan:
-    /// the router's full-CF materialization, the tombstone merge, the table
-    /// overlay and the barrier check all run inside one guard whose duration
-    /// grows with the column family. On the live daemon that measured a 290 ms
-    /// mean and a 2.65 s maximum on `Base`, over budget on 335 of 335 holds —
-    /// and `Base` is the family every constellation write lands in, so a
-    /// publishing MCP call could queue behind a maintenance scan for seconds.
+    /// The row-table/router lock hand-off ends before visitor callbacks, so
+    /// writers continue while the walk retains a coherent committed view. Each
+    /// immutable SST reader is opened and positioned once, then advanced
+    /// forward across bounded output pages. This is load-bearing: the previous
+    /// `scan_cf_range_page_latest` loop rebuilt and re-sought every source for
+    /// every 16 Base rows. A real #2243 kernel rebuild needed 49,915 such opens
+    /// before its domain discovery ended and reached a 2.824 GiB process peak;
+    /// the persistent scan immediately after it stayed near 831 MiB.
     ///
-    /// Every one of those callers was a *streaming aggregate written as a
-    /// collect-then-iterate*: a 106,409-row `Vec<(Vec<u8>, Vec<u8>)>` of dense
-    /// slot payloads built under the guard and then walked exactly once. This
-    /// walks the same rows through `scan_cf_range_page_latest`, which bounds
-    /// both serving layers per page and releases the guard between pages.
-    ///
-    /// This is the standard remedy rather than a local trick: `RocksDB`'s own
-    /// guidance is that long-running scans must not pin engine resources, and
-    /// it shipped `Iterator::Refresh()` so a long scan can release what it
-    /// pinned and re-derive the current state — the same release-between-chunks
-    /// shape a resume cursor gives here.
-    ///
-    /// # Which column families this works on
-    ///
-    /// Every selected column family supports candidate-bounded paging. Hot
-    /// families may use a retained, validated lookup index; cold families use
-    /// Aster's allocation-constant on-disk cursor, which retains one buffered
-    /// index window and validates the selected record's key and CRC before
-    /// returning it. Open mode therefore changes latency, never correctness or
-    /// whether a populated family can be walked.
-    ///
-    /// # The window this trades away, and why it is reported
-    ///
-    /// The guard is released between pages, so a walk sees a *moving* window
-    /// where `scan_cf_latest` saw one instant. That is not hidden: the returned
-    /// [`SynapseCalyxCfWalk`] carries the committed sequence of the first and
-    /// last page, and [`SynapseCalyxCfWalk::atomic`] is true exactly when no
-    /// commit landed mid-walk. A caller publishing an exact census must report
-    /// that flag rather than assume it.
+    /// The snapshot has the bounded intelligence-corpus lease. If I/O or a
+    /// visitor cannot finish inside that declared lifetime, the walk fails with
+    /// the lease error; it never restarts on a newer view or returns a partial
+    /// moving-window result.
     ///
     /// # Errors
     ///
-    /// Returns a structured error when `page_rows` is zero, when a page reports
-    /// more rows without a resume cursor, when a cursor fails to advance (both
-    /// of which would spin forever), when the visitor errors, or when the
-    /// underlying page read fails. The visitor's error is propagated verbatim —
-    /// a fold that cannot decode a row decides that itself.
+    /// Returns a structured error when `page_rows` is zero, snapshot
+    /// registration/validation fails, the immutable stream fails, memory
+    /// accounting fails, or the visitor rejects a row. The visitor's error is
+    /// propagated verbatim.
     pub fn walk_cf_latest<V>(
         &self,
         cf: ColumnFamily,
         page_rows: usize,
-        mut visit: V,
+        visit: V,
     ) -> Result<SynapseCalyxCfWalk, SynapseCalyxError>
     where
         V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
     {
-        if page_rows == 0 {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_CF_WALK_PAGE_ROWS_ZERO",
-                format!(
-                    "a bounded-hold walk over {} needs a positive page size; zero rows per page cannot make forward progress",
-                    cf.name()
-                ),
-                "pass SYNAPSE_CALYX_CF_WALK_PAGE_ROWS, or another positive page size",
-            ));
-        }
-        let range = KeyRange::all();
-        let mut cursor: Option<Vec<u8>> = None;
-        let mut walk = SynapseCalyxCfWalk {
-            column_family: cf.name(),
-            page_rows,
-            pages: 0,
-            rows_examined: 0,
-            rows_visited: 0,
-            stopped_early: false,
-            snapshot_seq_first: 0,
-            snapshot_seq_last: 0,
-        };
-        loop {
-            let page = self.scan_cf_range_page_latest(cf, &range, cursor.as_deref(), page_rows)?;
-            if walk.pages == 0 {
-                walk.snapshot_seq_first = page.snapshot_seq;
-            }
-            walk.snapshot_seq_last = page.snapshot_seq;
-            walk.pages += 1;
-            walk.rows_examined += page.examined_rows;
-            for (key, value) in &page.rows {
-                walk.rows_visited += 1;
-                if visit(key, value)? == SynapseCalyxWalkStep::Stop {
-                    walk.stopped_early = true;
-                    return Ok(walk);
-                }
-            }
-            if !page.more {
-                return Ok(walk);
-            }
-            // `more` without a cursor, or a cursor that does not advance, would
-            // re-read the same page forever. Both are impossible against the
-            // documented pager contract (`resume_after` is the last candidate
-            // key and `after_key` is exclusive), which is exactly why they are
-            // worth failing closed on rather than trusting: an unbounded silent
-            // loop inside a maintenance pass is a worse outcome than an error.
-            let Some(resume) = page.resume_after else {
-                return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_CF_WALK_CURSOR_MISSING",
-                    format!(
-                        "page {} of the {} walk reported more rows but returned no resume cursor, so the walk cannot advance",
-                        walk.pages,
-                        cf.name()
-                    ),
-                    "repair the range pager so a page reporting `more` always carries `resume_after`",
-                ));
-            };
-            if cursor
-                .as_deref()
-                .is_some_and(|previous| resume.as_slice() <= previous)
-            {
-                return Err(SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_CF_WALK_CURSOR_STALLED",
-                    format!(
-                        "page {} of the {} walk returned a resume cursor that does not advance past the previous one, so the walk would re-read the same page forever",
-                        walk.pages,
-                        cf.name()
-                    ),
-                    "repair the range pager so `resume_after` is strictly greater than the exclusive `after_key` it was given",
-                ));
-            }
-            cursor = Some(resume);
-        }
+        self.walk_cf_range_latest_snapshot(cf, &KeyRange::all(), page_rows, visit)
     }
 
     /// Walks one column family in bounded pages through an already-registered
