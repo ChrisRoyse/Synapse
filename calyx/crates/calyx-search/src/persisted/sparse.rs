@@ -1,9 +1,8 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock};
 
 use calyx_core::{CxId, SlotId, SlotVector, SparseEntry};
 use calyx_sextant::index::bm25::Bm25;
@@ -11,20 +10,15 @@ use calyx_sextant::index::{IndexSearchHit, ranked};
 use serde::{Deserialize, Serialize};
 
 use super::fs_io::HashingReader;
-use super::pinned::{self, PinKey};
-use super::{SearchIndexEntry, sha256_hex, stale};
+use super::{SearchIndexEntry, stale};
 use crate::error::CliResult;
 
 #[path = "sparse/writer.rs"]
 mod writer;
 pub(in crate::persisted) use writer::StreamingWriter;
 
-const SPARSE_FORMAT_V2: &str = "calyx-search-sparse-index-v2";
-const SPARSE_FORMAT_V3: &str = "calyx-search-sparse-index-v3";
 const SPARSE_FORMAT_V4: &str = "calyx-search-sparse-index-v4-jsonl";
 const MAX_SPARSE_LINE_BYTES: u64 = 64 * 1024 * 1024;
-const LEGACY_BM25_KIND: &str = "sparse_inverted";
-const PIN_KIND: &str = "sparse";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,41 +34,6 @@ impl SparseScoring {
             Self::DotProduct => "sparse_dot",
         }
     }
-}
-
-const fn legacy_sparse_scoring() -> SparseScoring {
-    SparseScoring::Bm25
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct SparseIndex {
-    format: String,
-    #[serde(default = "legacy_sparse_scoring")]
-    scoring: SparseScoring,
-    slot: u16,
-    dim: u32,
-    base_seq: u64,
-    rows: Vec<SparseRow>,
-    postings: BTreeMap<u32, Vec<SparsePosting>>,
-    doc_lengths: BTreeMap<CxId, f32>,
-    avg_doc_len: f32,
-    /// Rows that carry at least one term in this lane.
-    ///
-    /// **Not persisted**, and deliberately so: it is derivable from `rows` in one
-    /// pass at load time, and a stored copy could disagree with the payload it
-    /// summarizes. Populated by `build_index` and by `read` after
-    /// deserialization; `SparseIndex` is constructed nowhere else.
-    ///
-    /// This is BM25's `N` (and the denominator of `avg_doc_len`), which must
-    /// count documents that *have the field* rather than every row in the panel.
-    /// On the live timeline panel 238 of 339 rows carry no title at all, so
-    /// averaging over all rows put `avg_doc_len` at 0.2956 instead of 0.992 —
-    /// making every title-bearing document look 3x longer than average and
-    /// re-introducing, through the `b` term, exactly the short-document bias `b`
-    /// exists to remove. Lucene scopes both to the field's `docCount` for the
-    /// same reason (#1900).
-    #[serde(skip)]
-    field_docs: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -94,12 +53,6 @@ struct SparseRow {
     cx_id: CxId,
     doc_len: f32,
     entries: Vec<SparseEntry>,
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-struct SparsePosting {
-    cx_id: CxId,
-    tf: f32,
 }
 
 pub(super) fn search(
@@ -129,30 +82,18 @@ pub(super) fn search(
             err.message
         ))
     })?;
-    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
-        let scored = score_streaming(
-            vault_dir,
-            entry,
-            manifest_base_seq,
-            slot,
-            *query_dim,
-            entries,
-            candidates,
-        )?;
-        return Ok(ranked(top_k(scored, k)));
-    }
-    let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
-    validate_sparse_query_weights(entries, index.scoring, "query")?;
-    if index.dim != *query_dim {
-        return Err(stale(format!(
-            "persistent sparse slot {slot} index dim {} != query dim {query_dim}; reingest/backfill the vault",
-            index.dim
-        )));
-    }
-    if entries.is_empty() {
-        return Ok(Vec::new());
-    }
-    Ok(ranked(top_k(score(&index, entries, candidates)?, k)))
+    require_streaming_sidecar(entry, slot)?;
+    let scored = score_streaming(SparseSearchRequest {
+        vault_dir,
+        entry,
+        manifest_base_seq,
+        slot,
+        query_dim: *query_dim,
+        query: entries,
+        candidates,
+        k,
+    })?;
+    Ok(ranked(scored))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -185,46 +126,22 @@ pub(super) fn search_reconciled(
             error.message
         ))
     })?;
-    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
-        let scored = score_streaming_reconciled(
+    require_streaming_sidecar(entry, slot)?;
+    let scored = score_streaming_reconciled(
+        SparseSearchRequest {
             vault_dir,
             entry,
             manifest_base_seq,
             slot,
-            *query_dim,
-            query_entries,
+            query_dim: *query_dim,
+            query: query_entries,
             candidates,
-            changed,
-            replacements,
-        )?;
-        return Ok(ranked(top_k(scored, k)));
-    }
-    let index = pinned_index(vault_dir, entry, manifest_base_seq, slot)?;
-    if index.dim != *query_dim {
-        return Err(stale(format!(
-            "persistent sparse slot {slot} index dim {} != delta query dim {query_dim}",
-            index.dim
-        )));
-    }
-    validate_sparse_query_weights(query_entries, index.scoring, "delta query")?;
-    let replacement_rows = sparse_replacement_rows(slot, *query_dim, index.scoring, replacements)?;
-    let scored = match index.scoring {
-        SparseScoring::DotProduct => score_dot_reconciled(
-            &index,
-            query_entries,
-            candidates,
-            changed,
-            &replacement_rows,
-        )?,
-        SparseScoring::Bm25 => score_bm25_reconciled(
-            &index,
-            query_entries,
-            candidates,
-            changed,
-            &replacement_rows,
-        )?,
-    };
-    Ok(ranked(top_k(scored, k)))
+            k,
+        },
+        changed,
+        replacements,
+    )?;
+    Ok(ranked(scored))
 }
 
 fn sparse_replacement_rows(
@@ -265,145 +182,30 @@ fn sparse_replacement_rows(
         .collect()
 }
 
-fn score_dot_reconciled(
-    index: &SparseIndex,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
-    changed: &BTreeSet<CxId>,
-    replacements: &BTreeMap<CxId, SparseRow>,
-) -> CliResult<Vec<(CxId, f32)>> {
-    let mut scores = score_dot_product(index, query, candidates)?
-        .into_iter()
-        .filter(|(cx_id, _)| !changed.contains(cx_id))
-        .collect::<BTreeMap<_, _>>();
-    for row in replacements.values() {
-        if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
-            continue;
-        }
-        let mut score = 0.0_f32;
-        for query_entry in query {
-            if let Some(entry) = row
-                .entries
-                .iter()
-                .find(|entry| entry.idx == query_entry.idx)
-            {
-                score += entry.val * query_entry.val;
-            }
-        }
-        if !score.is_finite() {
-            return Err(stale(format!(
-                "reconciled sparse dot-product score overflowed for {}",
-                row.cx_id
-            )));
-        }
-        if score != 0.0 {
-            scores.insert(row.cx_id, score);
-        }
-    }
-    Ok(scores.into_iter().collect())
-}
-
-fn score_bm25_reconciled(
-    index: &SparseIndex,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
-    changed: &BTreeSet<CxId>,
-    replacements: &BTreeMap<CxId, SparseRow>,
-) -> CliResult<Vec<(CxId, f32)>> {
-    let removed = index
-        .rows
-        .iter()
-        .filter(|row| changed.contains(&row.cx_id))
-        .collect::<Vec<_>>();
-    // Field-bearing counts on both sides of the delta, for the same reason the
-    // static path uses `field_docs`: a removed or replacing row that carries no
-    // term in this lane is not a document of this field.
-    let removed_field_docs = removed.iter().filter(|row| !row.entries.is_empty()).count();
-    let replacement_field_docs = replacements
-        .values()
-        .filter(|row| !row.entries.is_empty())
-        .count();
-    let total_docs = index
-        .field_docs
-        .saturating_sub(removed_field_docs)
-        .saturating_add(replacement_field_docs);
-    let old_total = index.doc_lengths.values().copied().sum::<f32>();
-    let removed_total = removed.iter().map(|row| row.doc_len).sum::<f32>();
-    let replacement_total = replacements.values().map(|row| row.doc_len).sum::<f32>();
-    let current_total = old_total - removed_total + replacement_total;
-    if !current_total.is_finite() || current_total < 0.0 {
-        return Err(stale(
-            "reconciled sparse BM25 corpus length is invalid; rebuild the search generation",
-        ));
-    }
-    let avg_doc_len = if total_docs == 0 {
-        0.0
-    } else {
-        current_total / total_docs as f32
-    };
-    let scorer = Bm25::default();
-    let mut scores = BTreeMap::<CxId, f32>::new();
-    for query_entry in query {
-        let old_postings = index.postings.get(&query_entry.idx);
-        let removed_df = removed
-            .iter()
-            .filter(|row| row.entries.iter().any(|entry| entry.idx == query_entry.idx))
-            .count();
-        let replacement_df = replacements
-            .values()
-            .filter(|row| row.entries.iter().any(|entry| entry.idx == query_entry.idx))
-            .count();
-        let df = old_postings
-            .map_or(0, Vec::len)
-            .saturating_sub(removed_df)
-            .saturating_add(replacement_df);
-        if let Some(postings) = old_postings {
-            for posting in postings {
-                if changed.contains(&posting.cx_id)
-                    || candidates.is_some_and(|allowed| !allowed.contains(&posting.cx_id))
-                {
-                    continue;
-                }
-                let len = *index.doc_lengths.get(&posting.cx_id).unwrap_or(&1.0);
-                *scores.entry(posting.cx_id).or_default() +=
-                    scorer.score_term(posting.tf, len, avg_doc_len, total_docs, df)
-                        * query_entry.val;
-            }
-        }
-        for row in replacements.values() {
-            if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
-                continue;
-            }
-            if let Some(entry) = row
-                .entries
-                .iter()
-                .find(|entry| entry.idx == query_entry.idx)
-            {
-                *scores.entry(row.cx_id).or_default() +=
-                    scorer.score_term(entry.val, row.doc_len, avg_doc_len, total_docs, df)
-                        * query_entry.val;
-            }
-        }
-    }
-    if let Some((cx_id, _)) = scores.iter().find(|(_, score)| !score.is_finite()) {
-        return Err(stale(format!(
-            "reconciled sparse BM25 score overflowed for {cx_id}"
-        )));
-    }
-    Ok(scores.into_iter().collect())
-}
-
-fn score_streaming(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
+struct SparseSearchRequest<'a> {
+    vault_dir: &'a Path,
+    entry: &'a SearchIndexEntry,
     manifest_base_seq: u64,
     slot: SlotId,
     query_dim: u32,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
-) -> CliResult<Vec<(CxId, f32)>> {
+    query: &'a [SparseEntry],
+    candidates: Option<&'a BTreeSet<CxId>>,
+    k: usize,
+}
+
+fn score_streaming(request: SparseSearchRequest<'_>) -> CliResult<Vec<(CxId, f32)>> {
+    let SparseSearchRequest {
+        vault_dir,
+        entry,
+        manifest_base_seq,
+        slot,
+        query_dim,
+        query,
+        candidates,
+        k,
+    } = request;
     let mut scoring = None;
-    let mut dot_scores = BTreeMap::new();
+    let mut dot_scores = Vec::new();
     let mut document_frequencies = BTreeMap::<u32, usize>::new();
     let header = visit_stream(vault_dir, entry, manifest_base_seq, slot, |header, row| {
         if scoring.is_none() {
@@ -411,7 +213,7 @@ fn score_streaming(
             scoring = Some(header.scoring);
         }
         if header.scoring == SparseScoring::DotProduct {
-            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores, k)?;
         } else {
             count_query_terms(row, query, &mut document_frequencies);
         }
@@ -425,9 +227,9 @@ fn score_streaming(
     }
     validate_sparse_query_weights(query, header.scoring, "query")?;
     if header.scoring == SparseScoring::DotProduct {
-        return Ok(dot_scores.into_iter().collect());
+        return Ok(top_k(dot_scores, k));
     }
-    let mut scores = BTreeMap::new();
+    let mut scores = Vec::new();
     visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, row| {
         score_streaming_bm25_row(
             row,
@@ -437,25 +239,29 @@ fn score_streaming(
             header.avg_doc_len,
             &document_frequencies,
             &mut scores,
+            k,
         )
     })?;
-    Ok(scores.into_iter().collect())
+    Ok(top_k(scores, k))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn score_streaming_reconciled(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    manifest_base_seq: u64,
-    slot: SlotId,
-    query_dim: u32,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
+    request: SparseSearchRequest<'_>,
     changed: &BTreeSet<CxId>,
     replacements: &BTreeMap<CxId, SlotVector>,
 ) -> CliResult<Vec<(CxId, f32)>> {
+    let SparseSearchRequest {
+        vault_dir,
+        entry,
+        manifest_base_seq,
+        slot,
+        query_dim,
+        query,
+        candidates,
+        k,
+    } = request;
     let mut scoring = None;
-    let mut dot_scores = BTreeMap::new();
+    let mut dot_scores = Vec::new();
     let mut document_frequencies = BTreeMap::<u32, usize>::new();
     let mut unchanged_field_docs = 0usize;
     let mut unchanged_total_doc_len = 0.0_f32;
@@ -468,7 +274,7 @@ fn score_streaming_reconciled(
             return Ok(());
         }
         if header.scoring == SparseScoring::DotProduct {
-            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores, k)?;
         } else if !row.entries.is_empty() {
             unchanged_field_docs = unchanged_field_docs
                 .checked_add(1)
@@ -491,9 +297,9 @@ fn score_streaming_reconciled(
     let replacement_rows = sparse_replacement_rows(slot, header.dim, header.scoring, replacements)?;
     if header.scoring == SparseScoring::DotProduct {
         for row in replacement_rows.values() {
-            score_streaming_dot_row(row, query, candidates, &mut dot_scores)?;
+            score_streaming_dot_row(row, query, candidates, &mut dot_scores, k)?;
         }
-        return Ok(dot_scores.into_iter().collect());
+        return Ok(top_k(dot_scores, k));
     }
     let mut total_docs = unchanged_field_docs;
     let mut total_doc_len = unchanged_total_doc_len;
@@ -515,7 +321,7 @@ fn score_streaming_reconciled(
     } else {
         total_doc_len / total_docs as f32
     };
-    let mut scores = BTreeMap::new();
+    let mut scores = Vec::new();
     visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, row| {
         if changed.contains(&row.cx_id) {
             return Ok(());
@@ -528,6 +334,7 @@ fn score_streaming_reconciled(
             avg_doc_len,
             &document_frequencies,
             &mut scores,
+            k,
         )
     })?;
     for row in replacement_rows.values() {
@@ -539,9 +346,10 @@ fn score_streaming_reconciled(
             avg_doc_len,
             &document_frequencies,
             &mut scores,
+            k,
         )?;
     }
-    Ok(scores.into_iter().collect())
+    Ok(top_k(scores, k))
 }
 
 fn count_query_terms(
@@ -564,7 +372,8 @@ fn score_streaming_dot_row(
     row: &SparseRow,
     query: &[SparseEntry],
     candidates: Option<&BTreeSet<CxId>>,
-    scores: &mut BTreeMap<CxId, f32>,
+    scores: &mut Vec<(CxId, f32)>,
+    k: usize,
 ) -> CliResult {
     if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
         return Ok(());
@@ -584,8 +393,9 @@ fn score_streaming_dot_row(
             row.cx_id
         )));
     }
-    if score != 0.0 {
-        scores.insert(row.cx_id, score);
+    if score != 0.0 && k != 0 {
+        scores.push((row.cx_id, score));
+        prune_score_window(scores, k);
     }
     Ok(())
 }
@@ -598,7 +408,8 @@ fn score_streaming_bm25_row(
     total_docs: usize,
     avg_doc_len: f32,
     document_frequencies: &BTreeMap<u32, usize>,
-    scores: &mut BTreeMap<CxId, f32>,
+    scores: &mut Vec<(CxId, f32)>,
+    k: usize,
 ) -> CliResult {
     if candidates.is_some_and(|allowed| !allowed.contains(&row.cx_id)) {
         return Ok(());
@@ -630,8 +441,9 @@ fn score_streaming_bm25_row(
             row.cx_id
         )));
     }
-    if score != 0.0 {
-        scores.insert(row.cx_id, score);
+    if score != 0.0 && k != 0 {
+        scores.push((row.cx_id, score));
+        prune_score_window(scores, k);
     }
     Ok(())
 }
@@ -646,7 +458,7 @@ fn visit_stream<F>(
 where
     F: FnMut(&StreamingSparseHeader, &SparseRow) -> CliResult,
 {
-    retire_legacy_cache(vault_dir, slot)?;
+    require_streaming_sidecar(entry, slot)?;
     require_sparse_kind(entry, slot)?;
     let path = vault_dir.join(entry.require_index_rel(slot)?);
     if !path.is_file() {
@@ -831,321 +643,15 @@ fn read_bounded_line<R: BufRead>(
     Ok(Some(line))
 }
 
-type SparsePinCache = Mutex<BTreeMap<(String, u16), (String, Arc<SparseIndex>)>>;
-
-fn cache() -> &'static SparsePinCache {
-    static CACHE: OnceLock<SparsePinCache> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
-}
-
-fn retire_legacy_cache(vault_dir: &Path, slot: SlotId) -> CliResult {
-    let key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
-    cache()
-        .lock()
-        .expect("sparse pin cache poisoned")
-        .remove(&key);
-    Ok(())
-}
-
-/// Verify-once-then-pin: the sparse sidecar is fully read, hashed, and
-/// structurally validated on first use per manifest generation (keyed by the
-/// manifest entry sha256); cache hits still fail closed on any seq drift
-/// between the pinned index and the manifest being served.
-fn pinned_index(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    manifest_base_seq: u64,
-    slot: SlotId,
-) -> CliResult<Arc<SparseIndex>> {
-    let entry_sha256 = entry.require_sha256(slot)?.to_string();
-    let cache_key = (pinned::canonical_vault_dir(vault_dir)?, slot.get());
-    {
-        let cache = cache().lock().expect("sparse pin cache poisoned");
-        if let Some((pinned_sha, index)) = cache.get(&cache_key)
-            && *pinned_sha == entry_sha256
-        {
-            if index.base_seq != manifest_base_seq || entry.built_at_seq != manifest_base_seq {
-                return Err(stale(format!(
-                    "persistent sparse sidecar seq {} / entry seq {} != manifest seq {manifest_base_seq}; rebuild the vault search indexes",
-                    index.base_seq, entry.built_at_seq
-                )));
-            }
-            return Ok(Arc::clone(index));
-        }
-    }
-    let path = vault_dir.join(entry.require_index_rel(slot)?);
-    let sidecar_bytes = if path.is_file() {
-        fs::metadata(&path)?.len()
-    } else {
-        0
-    };
-    let index = Arc::new(read(vault_dir, entry, manifest_base_seq, slot)?);
-    let pin_key = PinKey::new(vault_dir, slot.get(), PIN_KIND)?;
-    pinned::reserve(&pin_key, sidecar_bytes)?;
-    let mut cache = cache().lock().expect("sparse pin cache poisoned");
-    cache.insert(cache_key, (entry_sha256, Arc::clone(&index)));
-    Ok(index)
-}
-
-fn read(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    manifest_base_seq: u64,
-    slot: SlotId,
-) -> CliResult<SparseIndex> {
-    require_sparse_kind(entry, slot)?;
-    let path = vault_dir.join(entry.require_index_rel(slot)?);
-    if !path.is_file() {
-        return Err(stale(format!(
-            "persistent sparse sidecar missing at {}; rebuild the vault search indexes",
-            path.display()
-        )));
-    }
-    let bytes = fs::read(&path)?;
-    let actual = sha256_hex(&bytes);
-    let expected = entry.require_sha256(slot)?;
-    if actual != expected {
-        return Err(stale(format!(
-            "persistent sparse sidecar sha256 {actual} != manifest {expected}; rebuild the vault search indexes"
-        )));
-    }
-    let mut index: SparseIndex = serde_json::from_slice(&bytes).map_err(|err| {
-        stale(format!(
-            "persistent sparse sidecar {} is not valid JSON: {err}; rebuild the vault search indexes",
-            path.display()
-        ))
-    })?;
-    // Derived from the payload, not read from it: `field_docs` is `#[serde(skip)]`
-    // precisely so a persisted copy cannot disagree with the rows it counts.
-    index.field_docs = field_doc_count(&index.rows);
-    validate(&index, entry, manifest_base_seq, slot)?;
-    Ok(index)
-}
-
 pub(super) fn validate_entry(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
     manifest_base_seq: u64,
     slot: SlotId,
 ) -> CliResult {
-    if entry.require_index_rel(slot)?.ends_with(".sparse.jsonl") {
-        visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, _| Ok(()))?;
-    } else {
-        let _ = read(vault_dir, entry, manifest_base_seq, slot)?;
-    }
+    require_streaming_sidecar(entry, slot)?;
+    visit_stream(vault_dir, entry, manifest_base_seq, slot, |_, _| Ok(()))?;
     Ok(())
-}
-
-fn validate(
-    index: &SparseIndex,
-    entry: &SearchIndexEntry,
-    manifest_base_seq: u64,
-    slot: SlotId,
-) -> CliResult {
-    if index.format != SPARSE_FORMAT_V2 && index.format != SPARSE_FORMAT_V3 {
-        return Err(stale(format!(
-            "persistent sparse sidecar has format {}; expected {SPARSE_FORMAT_V2} or {SPARSE_FORMAT_V3}",
-            index.format
-        )));
-    }
-    let expected_kind = if index.format == SPARSE_FORMAT_V2 {
-        if index.scoring != SparseScoring::Bm25 {
-            return Err(stale(
-                "persistent sparse v2 sidecar declares non-BM25 scoring; rebuild the vault search indexes",
-            ));
-        }
-        LEGACY_BM25_KIND
-    } else {
-        index.scoring.index_kind()
-    };
-    entry.require_kind(expected_kind, slot)?;
-    if index.slot != slot.get() || entry.slot != slot.get() {
-        return Err(stale(format!(
-            "persistent sparse sidecar slot {} / entry slot {} != query slot {}",
-            index.slot,
-            entry.slot,
-            slot.get()
-        )));
-    }
-    let entry_dim = entry.require_dim(slot)?;
-    if index.dim != entry_dim {
-        return Err(stale(format!(
-            "persistent sparse sidecar dim {} != manifest dim {entry_dim}; rebuild the vault search indexes",
-            index.dim
-        )));
-    }
-    if index.base_seq != manifest_base_seq || entry.built_at_seq != manifest_base_seq {
-        return Err(stale(format!(
-            "persistent sparse sidecar seq {} / entry seq {} != manifest seq {manifest_base_seq}; rebuild the vault search indexes",
-            index.base_seq, entry.built_at_seq
-        )));
-    }
-    if index.rows.len() != entry.len {
-        return Err(stale(format!(
-            "persistent sparse sidecar row len {} != manifest len {}; rebuild the vault search indexes",
-            index.rows.len(),
-            entry.len
-        )));
-    }
-    let mut seen = BTreeSet::new();
-    for row in &index.rows {
-        if !seen.insert(row.cx_id) {
-            return Err(stale(format!(
-                "persistent sparse sidecar repeats {}; rebuild the vault search indexes",
-                row.cx_id
-            )));
-        }
-        let expected_doc_len =
-            validate_sparse_weights(&row.entries, index.scoring, &format!("row {}", row.cx_id))?;
-        if row.doc_len.to_bits() != expected_doc_len.to_bits() {
-            return Err(stale(format!(
-                "persistent sparse row {} doc_len {} != weight sum {expected_doc_len}; rebuild the vault search indexes",
-                row.cx_id, row.doc_len
-            )));
-        }
-        SlotVector::Sparse {
-            dim: index.dim,
-            entries: row.entries.clone(),
-        }
-        .validate_schema()
-        .map_err(|err| {
-            stale(format!(
-                "persistent sparse row {} has invalid payload: {}; rebuild the vault search indexes",
-                row.cx_id, err.message
-            ))
-        })?;
-    }
-    let expected = postings_from_rows(&index.rows);
-    if expected != index.postings {
-        return Err(stale(
-            "persistent sparse postings do not match row payloads; rebuild the vault search indexes",
-        ));
-    }
-    let (expected_doc_lengths, expected_avg_doc_len) = sparse_stats(&index.rows)?;
-    if index.doc_lengths != expected_doc_lengths {
-        return Err(stale(
-            "persistent sparse doc-length metadata does not match row payloads; rebuild the vault search indexes",
-        ));
-    }
-    if (index.avg_doc_len - expected_avg_doc_len).abs() > f32::EPSILON {
-        return Err(stale(
-            "persistent sparse average doc length does not match row payloads; rebuild the vault search indexes",
-        ));
-    }
-    Ok(())
-}
-
-fn postings_from_rows(rows: &[SparseRow]) -> BTreeMap<u32, Vec<SparsePosting>> {
-    let mut out = BTreeMap::<u32, Vec<SparsePosting>>::new();
-    for row in rows {
-        for entry in &row.entries {
-            out.entry(entry.idx).or_default().push(SparsePosting {
-                cx_id: row.cx_id,
-                tf: entry.val,
-            });
-        }
-    }
-    out
-}
-
-/// Rows carrying at least one term in this lane — BM25's `N`.
-///
-/// A row whose vector is empty is a document that does not have this field at
-/// all. It is retained in `rows` (the lane must know the row exists so a delta
-/// can mask it) but it is not a document the field's statistics describe.
-fn field_doc_count(rows: &[SparseRow]) -> usize {
-    rows.iter().filter(|row| !row.entries.is_empty()).count()
-}
-
-fn sparse_stats(rows: &[SparseRow]) -> CliResult<(BTreeMap<CxId, f32>, f32)> {
-    let doc_lengths = rows
-        .iter()
-        .map(|row| (row.cx_id, row.doc_len))
-        .collect::<BTreeMap<_, _>>();
-    let mut total_doc_len = 0.0_f32;
-    for doc_len in doc_lengths.values() {
-        total_doc_len += doc_len;
-        if !total_doc_len.is_finite() {
-            return Err(stale("persistent sparse corpus length overflowed"));
-        }
-    }
-    // Averaged over the documents that carry the field, never over every row in
-    // the panel: see `SparseIndex::field_docs`.
-    let field_docs = field_doc_count(rows);
-    let avg_doc_len = if field_docs == 0 {
-        0.0
-    } else {
-        total_doc_len / field_docs as f32
-    };
-    Ok((doc_lengths, avg_doc_len))
-}
-
-fn score(
-    index: &SparseIndex,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
-) -> CliResult<Vec<(CxId, f32)>> {
-    if index.scoring == SparseScoring::DotProduct {
-        return score_dot_product(index, query, candidates);
-    }
-    // BM25's N is the number of documents that carry this field, matching the
-    // `avg_doc_len` denominator. Using every panel row would deflate IDF for
-    // every term on a panel where most rows have no text at all.
-    let total_docs = index.field_docs;
-    let scorer = Bm25::default();
-    let mut scores = BTreeMap::<CxId, f32>::new();
-    for query_entry in query {
-        let Some(postings) = index.postings.get(&query_entry.idx) else {
-            continue;
-        };
-        let df = postings.len();
-        for posting in postings {
-            if candidates.is_some_and(|allowed| !allowed.contains(&posting.cx_id)) {
-                continue;
-            }
-            let len = *index.doc_lengths.get(&posting.cx_id).unwrap_or(&1.0);
-            let contribution =
-                scorer.score_term(posting.tf, len, index.avg_doc_len, total_docs, df)
-                    * query_entry.val;
-            let score = scores.entry(posting.cx_id).or_default();
-            *score += contribution;
-            if !score.is_finite() {
-                return Err(stale(format!(
-                    "persistent sparse score overflowed for {}; rebuild the vault search indexes",
-                    posting.cx_id
-                )));
-            }
-        }
-    }
-    Ok(scores.into_iter().collect())
-}
-
-fn score_dot_product(
-    index: &SparseIndex,
-    query: &[SparseEntry],
-    candidates: Option<&BTreeSet<CxId>>,
-) -> CliResult<Vec<(CxId, f32)>> {
-    let mut scores = BTreeMap::<CxId, f32>::new();
-    for query_entry in query {
-        let Some(postings) = index.postings.get(&query_entry.idx) else {
-            continue;
-        };
-        for posting in postings {
-            if candidates.is_some_and(|allowed| !allowed.contains(&posting.cx_id)) {
-                continue;
-            }
-            let contribution = posting.tf * query_entry.val;
-            let score = scores.entry(posting.cx_id).or_default();
-            *score += contribution;
-            if !score.is_finite() {
-                return Err(stale(format!(
-                    "persistent sparse dot-product score overflowed for {}; rebuild the vault search indexes",
-                    posting.cx_id
-                )));
-            }
-        }
-    }
-    Ok(scores.into_iter().collect())
 }
 
 /// Whether this call is validating a stored document row or a query vector.
@@ -1243,11 +749,21 @@ fn validate_sparse_weights_for(
 
 pub(super) fn require_sparse_kind(entry: &SearchIndexEntry, slot: SlotId) -> CliResult {
     match entry.kind.as_str() {
-        LEGACY_BM25_KIND | "sparse_bm25" | "sparse_dot" => Ok(()),
+        "sparse_bm25" | "sparse_dot" => Ok(()),
         other => Err(stale(format!(
             "persistent slot {slot} index kind {other} is not a supported sparse index; rebuild the vault search indexes"
         ))),
     }
+}
+
+fn require_streaming_sidecar(entry: &SearchIndexEntry, slot: SlotId) -> CliResult {
+    let index_rel = entry.require_index_rel(slot)?;
+    if !index_rel.ends_with(".sparse.jsonl") {
+        return Err(stale(format!(
+            "persistent sparse slot {slot} uses legacy sidecar {index_rel}; legacy whole-corpus sparse indexes are not loaded because their decoded postings have unbounded process lifetime. Rebuild the vault search indexes into {SPARSE_FORMAT_V4}"
+        )));
+    }
+    Ok(())
 }
 
 fn top_k(mut scored: Vec<(CxId, f32)>, k: usize) -> Vec<(CxId, f32)> {
@@ -1259,4 +775,11 @@ fn top_k(mut scored: Vec<(CxId, f32)>, k: usize) -> Vec<(CxId, f32)> {
     });
     scored.truncate(k);
     scored
+}
+
+fn prune_score_window(scored: &mut Vec<(CxId, f32)>, k: usize) {
+    let prune_at = k.saturating_mul(2).max(k.saturating_add(1));
+    if scored.len() >= prune_at {
+        *scored = top_k(std::mem::take(scored), k);
+    }
 }

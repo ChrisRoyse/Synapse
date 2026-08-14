@@ -1642,6 +1642,13 @@ impl Db {
             .collect()
     }
 
+    /// Drops process-local anchor lineage after the caller's multi-batch
+    /// repair pass reaches a terminal boundary. Returns the number of cached
+    /// generation entries physically released.
+    pub(crate) fn release_temporal_backfill_lineage(&self, source_cf: Option<&str>) -> usize {
+        self.backend.release_temporal_backfill_lineage(source_cf)
+    }
+
     /// Returns the status of the exact process-local Calyx vault that owns
     /// Synapse storage and native intelligence rows.
     ///

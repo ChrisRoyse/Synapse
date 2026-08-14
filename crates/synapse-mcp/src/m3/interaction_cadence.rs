@@ -43,7 +43,7 @@ impl InteractionHook {
     ///
     /// Returns an error if the platform hook cannot be installed. The daemon
     /// must fail closed rather than silently run without cadence rows.
-    pub fn start(sender: mpsc::UnboundedSender<InteractionEvent>) -> Result<Self> {
+    pub fn start(sender: mpsc::Sender<InteractionEvent>) -> Result<Self> {
         Ok(Self {
             inner: platform::InteractionHook::start(sender)?,
         })
@@ -120,7 +120,7 @@ mod platform {
     use std::{
         sync::{
             Arc, Mutex, OnceLock,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicU64, Ordering},
             mpsc as std_mpsc,
         },
         thread,
@@ -161,8 +161,9 @@ mod platform {
     const VK_Z_CODE: u32 = 0x5a;
     const VK_PACKET_CODE: u32 = 0xe7;
 
-    static HOOK_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<InteractionEvent>>>> =
-        OnceLock::new();
+    static HOOK_SENDER: OnceLock<Mutex<Option<mpsc::Sender<InteractionEvent>>>> = OnceLock::new();
+    static HOOK_QUEUE_FULL_PENDING: AtomicU64 = AtomicU64::new(0);
+    static HOOK_QUEUE_CLOSED_PENDING: AtomicU64 = AtomicU64::new(0);
     type HookThreadResult = std::result::Result<(), String>;
     type HookThreadOwner = thread::JoinHandle<HookThreadResult>;
 
@@ -236,8 +237,10 @@ mod platform {
     }
 
     impl InteractionHook {
-        pub fn start(sender: mpsc::UnboundedSender<InteractionEvent>) -> Result<Self> {
+        pub fn start(sender: mpsc::Sender<InteractionEvent>) -> Result<Self> {
             begin_hook_start()?;
+            HOOK_QUEUE_FULL_PENDING.store(0, Ordering::Release);
+            HOOK_QUEUE_CLOSED_PENDING.store(0, Ordering::Release);
             {
                 let mut slot = match hook_sender().lock() {
                     Ok(slot) => slot,
@@ -425,7 +428,7 @@ mod platform {
         }
     }
 
-    fn hook_sender() -> &'static Mutex<Option<mpsc::UnboundedSender<InteractionEvent>>> {
+    fn hook_sender() -> &'static Mutex<Option<mpsc::Sender<InteractionEvent>>> {
         HOOK_SENDER.get_or_init(|| Mutex::new(None))
     }
 
@@ -618,8 +621,10 @@ mod platform {
                 };
             }
             if stop_requested.load(Ordering::Acquire) {
+                drain_ingress_diagnostics();
                 return Ok(());
             }
+            drain_ingress_diagnostics();
         }
     }
 
@@ -692,7 +697,34 @@ mod platform {
         if let Ok(guard) = hook_sender().lock()
             && let Some(sender) = guard.as_ref()
         {
-            let _ = sender.send(event);
+            match sender.try_send(event) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_event)) => {
+                    HOOK_QUEUE_FULL_PENDING.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Closed(_event)) => {
+                    HOOK_QUEUE_CLOSED_PENDING.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
+    fn drain_ingress_diagnostics() {
+        let full = HOOK_QUEUE_FULL_PENDING.swap(0, Ordering::AcqRel);
+        if full != 0 {
+            tracing::error!(
+                code = "TIMELINE_INTERACTION_QUEUE_SATURATED",
+                dropped_event_count = full,
+                "bounded interaction cadence ingress saturated; interaction events were rejected"
+            );
+        }
+        let closed = HOOK_QUEUE_CLOSED_PENDING.swap(0, Ordering::AcqRel);
+        if closed != 0 {
+            tracing::error!(
+                code = "TIMELINE_INTERACTION_QUEUE_CLOSED",
+                rejected_event_count = closed,
+                "interaction cadence hook emitted after its recorder bridge closed"
+            );
         }
     }
 
@@ -753,7 +785,7 @@ mod platform {
     }
 
     impl InteractionHook {
-        pub fn start(_sender: mpsc::UnboundedSender<InteractionEvent>) -> Result<Self> {
+        pub fn start(_sender: mpsc::Sender<InteractionEvent>) -> Result<Self> {
             bail!("interaction cadence hook requires Windows")
         }
 

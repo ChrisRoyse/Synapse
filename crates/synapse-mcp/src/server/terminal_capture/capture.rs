@@ -112,7 +112,16 @@ struct LiveTerminalState {
 static LIVE_TERMINAL_SESSIONS: OnceLock<Mutex<BTreeMap<String, Arc<LiveTerminalSession>>>> =
     OnceLock::new();
 
-const LIVE_TERMINAL_BROADCAST_CAPACITY: usize = 16_384;
+/// The event ring bridges only the brief interval between subscribing and
+/// reading the authoritative shadow-screen snapshot. It is not terminal
+/// history: the asciicast and shadow screen are the Sources of Truth.
+/// Reader output is chunked at `TERMINAL_READER_CHUNK_BYTES`, so this bounds
+/// retained output to one MiB per actively attached terminal (plus small event
+/// metadata) instead of 128 MiB per terminal.
+const TERMINAL_READER_CHUNK_BYTES: usize = 8 * 1024;
+const LIVE_TERMINAL_EVENT_WINDOW_BYTES: usize = 1024 * 1024;
+const LIVE_TERMINAL_BROADCAST_CAPACITY: usize =
+    LIVE_TERMINAL_EVENT_WINDOW_BYTES / TERMINAL_READER_CHUNK_BYTES;
 
 /// Specification for a capture session.
 #[derive(Clone, Debug)]
@@ -399,6 +408,49 @@ pub(crate) fn terminal_capture_session(spawn_id: &str) -> Option<Arc<LiveTermina
     let sessions = live_terminal_sessions();
     let sessions = sessions.lock().ok()?;
     sessions.get(spawn_id).cloned()
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LiveTerminalReapReadback {
+    pub sessions_before: usize,
+    pub dead_process_sessions_reaped: usize,
+    pub sessions_after: usize,
+}
+
+/// Removes terminal event rings whose physical child process no longer
+/// exists. The normal waiter remains the artifact finalizer; this periodic
+/// ownership sweep prevents a stalled waiter from retaining its session ring
+/// for the daemon lifetime.
+pub(crate) fn reap_dead_live_terminal_sessions() -> LiveTerminalReapReadback {
+    let mut sessions = match live_terminal_sessions().lock() {
+        Ok(sessions) => sessions,
+        Err(poisoned) => {
+            tracing::error!(
+                code = "PTY_CAPTURE_REGISTRY_LOCK_POISONED",
+                "recovering poisoned live-terminal registry during process sweep"
+            );
+            poisoned.into_inner()
+        }
+    };
+    let sessions_before = sessions.len();
+    sessions.retain(|spawn_id, session| {
+        let live = crate::m4::process_exists(session.process_id);
+        if !live {
+            tracing::info!(
+                code = "PTY_CAPTURE_DEAD_SESSION_REAPED",
+                spawn_id,
+                process_id = session.process_id,
+                source_of_truth = "OS process table",
+                "released live-terminal ring after its physical child process exited"
+            );
+        }
+        live
+    });
+    LiveTerminalReapReadback {
+        sessions_before,
+        dead_process_sessions_reaped: sessions_before.saturating_sub(sessions.len()),
+        sessions_after: sessions.len(),
+    }
 }
 
 fn register_live_terminal_session(session: Arc<LiveTerminalSession>) {
@@ -725,7 +777,7 @@ fn spawn_reader_thread(
             .map_err(|error| anyhow::anyhow!("ASCIICAST_HEADER_WRITE_FAILED: {error}"))?;
         let mut screen = ShadowScreen::new(cols, rows);
         let start = Instant::now();
-        let mut buffer = [0u8; 8192];
+        let mut buffer = [0u8; TERMINAL_READER_CHUNK_BYTES];
         let mut bytes_captured = 0u64;
         let mut output_events = 0u64;
         loop {

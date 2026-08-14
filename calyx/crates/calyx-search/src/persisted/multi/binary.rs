@@ -133,6 +133,130 @@ pub(super) fn search_binary(
     Ok(ranked(top_k(scored, k)))
 }
 
+/// Independently verify and score one bounded segmented sidecar.
+///
+/// The segment is consumed row-by-row from disk. Only the current row's token
+/// payload is decoded, and the score accumulator is pruned to the requested
+/// result window, so query memory is bounded by the writer's single-row limit
+/// plus `O(k)` rather than the size of the generation. The complete file hash
+/// and every structural count are still verified before scores are accepted.
+pub(in crate::persisted::multi) struct SegmentSearchRequest<'a> {
+    pub path: &'a Path,
+    pub index_rel: &'a str,
+    pub expected_sha256: &'a str,
+    pub slot: SlotId,
+    pub token_dim: u32,
+    pub base_seq: u64,
+    pub expected_rows: usize,
+    pub expected_tokens: usize,
+    pub query: &'a [Vec<f32>],
+    pub k: usize,
+    pub candidates: Option<&'a BTreeSet<CxId>>,
+}
+
+pub(in crate::persisted::multi) fn search_segment(
+    request: SegmentSearchRequest<'_>,
+) -> CliResult<SegmentSearchReadback> {
+    let SegmentSearchRequest {
+        path,
+        index_rel,
+        expected_sha256,
+        slot,
+        token_dim,
+        base_seq,
+        expected_rows,
+        expected_tokens,
+        query,
+        k,
+        candidates,
+    } = request;
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut hasher = Sha256::new();
+    let header = read_binary_header_hashed(path, &mut reader, &mut hasher)?;
+    if header.slot != slot.get()
+        || header.token_dim != token_dim
+        || header.base_seq != base_seq
+        || header.row_count != expected_rows as u64
+        || header.token_count != expected_tokens as u64
+    {
+        return Err(stale(format!(
+            "persistent segmented multi sidecar {index_rel} header slot={} token_dim={} base_seq={} rows={} tokens={} does not match manifest slot={} token_dim={token_dim} base_seq={base_seq} rows={expected_rows} tokens={expected_tokens}; rebuild the vault search indexes",
+            header.slot,
+            header.token_dim,
+            header.base_seq,
+            header.row_count,
+            header.token_count,
+            slot.get()
+        )));
+    }
+    let mut ids = BTreeSet::new();
+    let mut observed_tokens = 0usize;
+    let mut scored = Vec::new();
+    for _ in 0..expected_rows {
+        let cx_id = read_cx_id(path, &mut reader, &mut hasher)?;
+        if !ids.insert(cx_id) {
+            return Err(stale(format!(
+                "persistent segmented multi sidecar {index_rel} repeats {cx_id}; rebuild the vault search indexes"
+            )));
+        }
+        let row_token_count = read_u32(path, &mut reader, &mut hasher)? as usize;
+        observed_tokens = observed_tokens
+            .checked_add(row_token_count)
+            .ok_or_else(|| stale("persistent segmented multi token_count overflow"))?;
+        if observed_tokens > expected_tokens {
+            return Err(stale(format!(
+                "persistent segmented multi sidecar {index_rel} token_count exceeds manifest {expected_tokens}; rebuild the vault search indexes"
+            )));
+        }
+        let tokens = read_tokens(
+            path,
+            &mut reader,
+            &mut hasher,
+            slot,
+            cx_id,
+            token_dim,
+            row_token_count as u64,
+        )?;
+        if k != 0 && candidates.is_none_or(|allowed| allowed.contains(&cx_id)) {
+            scored.push((cx_id, MaxSimIndex::maxsim(query, &tokens)));
+            prune_score_window(&mut scored, k);
+        }
+    }
+    if observed_tokens != expected_tokens {
+        return Err(stale(format!(
+            "persistent segmented multi sidecar {index_rel} token_count {observed_tokens} != manifest {expected_tokens}; rebuild the vault search indexes"
+        )));
+    }
+    ensure_no_trailing_bytes(path, &mut reader, &mut hasher)?;
+    let actual = finish_sha256_hex(hasher);
+    if actual != expected_sha256 {
+        return Err(stale(format!(
+            "persistent segmented multi sidecar sha256 {actual} != manifest {expected_sha256} for {index_rel}; rebuild the vault search indexes"
+        )));
+    }
+    Ok(SegmentSearchReadback {
+        ids,
+        row_count: expected_rows,
+        token_count: observed_tokens,
+        scored: top_k(scored, k),
+    })
+}
+
+fn prune_score_window(scored: &mut Vec<(CxId, f32)>, k: usize) {
+    let prune_at = k.saturating_mul(2).max(k.saturating_add(1));
+    if scored.len() >= prune_at {
+        *scored = top_k(std::mem::take(scored), k);
+    }
+}
+
+pub(in crate::persisted::multi) struct SegmentSearchReadback {
+    pub(in crate::persisted::multi) ids: BTreeSet<CxId>,
+    pub(in crate::persisted::multi) row_count: usize,
+    pub(in crate::persisted::multi) token_count: usize,
+    pub(in crate::persisted::multi) scored: Vec<(CxId, f32)>,
+}
+
 #[path = "binary/segments.rs"]
 mod segments;
 

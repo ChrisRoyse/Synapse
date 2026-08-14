@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashMap},
     convert::Infallible,
     fmt::Write as _,
     fs,
@@ -77,7 +77,7 @@ use crate::{
         SynapseService,
         terminal_capture::capture::{
             LiveTerminalSession, TerminalCaptureEvent, TerminalCaptureEventKind,
-            TerminalCaptureStatus, terminal_capture_session,
+            TerminalCaptureStatus, reap_dead_live_terminal_sessions, terminal_capture_session,
         },
     },
 };
@@ -4606,6 +4606,16 @@ fn spawn_agent_liveness_sweep(
                             "liveness sweep emitted state transitions"
                         );
                     }
+                    let terminal_reap = reap_dead_live_terminal_sessions();
+                    if terminal_reap.dead_process_sessions_reaped > 0 {
+                        tracing::info!(
+                            code = "PTY_CAPTURE_DEAD_SESSION_SWEEP",
+                            sessions_before = terminal_reap.sessions_before,
+                            sessions_reaped = terminal_reap.dead_process_sessions_reaped,
+                            sessions_after = terminal_reap.sessions_after,
+                            "periodic liveness sweep released dead live-terminal ownership"
+                        );
+                    }
                 }
             }
         }
@@ -4819,6 +4829,8 @@ async fn cleanup_stale_session_resources_once(
         }
         tokio::task::yield_now().await;
     }
+    let _pruned = session_lifecycle
+        .prune_closed_session_registry(crate::server::session_registry::unix_time_ms_now());
 }
 
 async fn active_http_session_ids(session_manager: &LocalSessionManager) -> BTreeSet<String> {
@@ -6804,8 +6816,6 @@ const TERMINAL_WS_COMMAND_AUTH_INIT: u8 = b'{';
 const TERMINAL_WS_SERVER_OUTPUT: u8 = b'0';
 const TERMINAL_WS_SERVER_TITLE: u8 = b'1';
 const TERMINAL_WS_SERVER_PREFS: u8 = b'2';
-const TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX: usize = 64 * 1024 * 1024;
-
 async fn dashboard_agent_terminal_ws(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -6903,10 +6913,8 @@ async fn dashboard_agent_terminal_ws_loop(
             return;
         }
     };
-    let snapshot_seq = snapshot.seq;
+    let mut snapshot_seq = snapshot.seq;
     let mut paused = false;
-    let mut paused_frames: VecDeque<Vec<u8>> = VecDeque::new();
-    let mut paused_bytes = 0usize;
 
     if terminal_ws_send_prefs(
         &mut sender,
@@ -6962,8 +6970,7 @@ async fn dashboard_agent_terminal_ws_loop(
                                     &connection_id,
                                     mode,
                                     &mut paused,
-                                    &mut paused_frames,
-                                    &mut paused_bytes,
+                                    &mut snapshot_seq,
                                     payload,
                                 ).await.is_err() {
                                     break;
@@ -6995,21 +7002,20 @@ async fn dashboard_agent_terminal_ws_loop(
                             &mut sender,
                             event,
                             paused,
-                            &mut paused_frames,
-                            &mut paused_bytes,
                         ).await.is_err() {
                             break;
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(dropped)) => {
-                        let _ = terminal_ws_send_prefs(
+                        match terminal_ws_resync_from_snapshot(
+                            &session,
                             &mut sender,
-                            serde_json::json!({
-                                "event": "stream_lagged",
-                                "dropped_events": dropped,
-                            }),
-                        ).await;
-                        break;
+                            "stream_lagged",
+                            Some(dropped),
+                        ).await {
+                            Ok(resynced_seq) => snapshot_seq = resynced_seq,
+                            Err(()) => break,
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => {
                         let _ = terminal_ws_send_prefs(
@@ -7037,8 +7043,7 @@ async fn terminal_ws_handle_client_payload(
     connection_id: &str,
     mode: DashboardTerminalMode,
     paused: &mut bool,
-    paused_frames: &mut VecDeque<Vec<u8>>,
-    paused_bytes: &mut usize,
+    snapshot_seq: &mut u64,
     payload: Vec<u8>,
 ) -> Result<(), ()> {
     let Some((&command, body)) = payload.split_first() else {
@@ -7117,7 +7122,8 @@ async fn terminal_ws_handle_client_payload(
                 sender,
                 serde_json::json!({
                     "event": "paused",
-                    "buffered_bytes": paused_bytes,
+                    "retained_output_bytes": 0,
+                    "resume_source_of_truth": "live_terminal_shadow_screen",
                 }),
             )
             .await
@@ -7125,22 +7131,9 @@ async fn terminal_ws_handle_client_payload(
         }
         TERMINAL_WS_COMMAND_RESUME => {
             *paused = false;
-            while let Some(frame) = paused_frames.pop_front() {
-                *paused_bytes = paused_bytes.saturating_sub(frame.len());
-                sender
-                    .send(Message::Binary(frame.into()))
-                    .await
-                    .map_err(|_| ())?;
-            }
-            terminal_ws_send_prefs(
-                sender,
-                serde_json::json!({
-                    "event": "resumed",
-                    "buffered_bytes": paused_bytes,
-                }),
-            )
-            .await
-            .map_err(|_| ())?;
+            *snapshot_seq = terminal_ws_resync_from_snapshot(session, sender, "resumed", None)
+                .await
+                .map_err(|_| ())?;
         }
         TERMINAL_WS_COMMAND_AUTH_INIT => {
             terminal_ws_send_prefs(
@@ -7173,9 +7166,10 @@ async fn terminal_ws_deliver_event(
     sender: &mut SplitSink<WebSocket, Message>,
     event: TerminalCaptureEvent,
     paused: bool,
-    paused_frames: &mut VecDeque<Vec<u8>>,
-    paused_bytes: &mut usize,
 ) -> Result<(), ()> {
+    if paused {
+        return Ok(());
+    }
     let frame = match event.kind {
         TerminalCaptureEventKind::Output(bytes) => {
             terminal_ws_frame(TERMINAL_WS_SERVER_OUTPUT, &bytes)
@@ -7196,28 +7190,51 @@ async fn terminal_ws_deliver_event(
             terminal_ws_frame(TERMINAL_WS_SERVER_PREFS, &bytes)
         }
     };
-    if paused {
-        terminal_ws_buffer_paused_frame(paused_frames, paused_bytes, frame)
-    } else {
-        sender
-            .send(Message::Binary(frame.into()))
-            .await
-            .map_err(|_| ())
-    }
+    sender
+        .send(Message::Binary(frame.into()))
+        .await
+        .map_err(|_| ())
 }
 
-fn terminal_ws_buffer_paused_frame(
-    paused_frames: &mut VecDeque<Vec<u8>>,
-    paused_bytes: &mut usize,
-    frame: Vec<u8>,
-) -> Result<(), ()> {
-    let new_total = paused_bytes.saturating_add(frame.len());
-    if new_total > TERMINAL_WS_PAUSED_BUFFER_BYTES_MAX {
-        return Err(());
+async fn terminal_ws_resync_from_snapshot(
+    session: &LiveTerminalSession,
+    sender: &mut SplitSink<WebSocket, Message>,
+    event: &'static str,
+    dropped_events: Option<u64>,
+) -> Result<u64, ()> {
+    let snapshot = session.snapshot().map_err(|error| {
+        tracing::warn!(
+            code = "DASHBOARD_TERMINAL_RESYNC_SNAPSHOT_FAILED",
+            event,
+            error = %error,
+            "terminal WebSocket could not resynchronize from its authoritative shadow screen"
+        );
+    })?;
+    if !snapshot.title.is_empty() {
+        terminal_ws_send_frame(sender, TERMINAL_WS_SERVER_TITLE, snapshot.title.as_bytes())
+            .await
+            .map_err(|_| ())?;
     }
-    *paused_bytes = new_total;
-    paused_frames.push_back(frame);
-    Ok(())
+    terminal_ws_send_frame(
+        sender,
+        TERMINAL_WS_SERVER_OUTPUT,
+        &terminal_snapshot_dump(&snapshot.screen_text),
+    )
+    .await
+    .map_err(|_| ())?;
+    terminal_ws_send_prefs(
+        sender,
+        serde_json::json!({
+            "event": event,
+            "snapshot_seq": snapshot.seq,
+            "dropped_events": dropped_events,
+            "retained_output_bytes": 0,
+            "source_of_truth": "live_terminal_shadow_screen",
+        }),
+    )
+    .await
+    .map_err(|_| ())?;
+    Ok(snapshot.seq)
 }
 
 fn terminal_ws_client_payload(message: Message) -> Option<Vec<u8>> {

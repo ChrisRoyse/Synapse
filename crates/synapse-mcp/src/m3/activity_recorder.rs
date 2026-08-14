@@ -98,6 +98,11 @@ const RECORDER_INTERACTION_HOOK_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const RECORDER_SHUTDOWN_SUPERVISOR_TIMEOUT: Duration = Duration::from_secs(45);
 const RECORDER_SHUTDOWN_SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ASSIST_EVENT_KIND: &str = "assist.opportunity";
+/// All recorder producers share this bounded queue. The worker owns the only
+/// timeline write cursor, so producer backpressure is the correct ordering
+/// boundary and prevents desktop event bursts from becoming retained heap.
+const RECORDER_EVENT_CHANNEL_CAPACITY: usize = 1_024;
+const INTERACTION_EVENT_CHANNEL_CAPACITY: usize = 1_024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecorderConfig {
@@ -2416,11 +2421,8 @@ fn resume_recording(writer: &TimelineWriter, changed_by: &str) -> Result<Recorde
     })
 }
 
-async fn run_worker(
-    mut receiver: mpsc::UnboundedReceiver<RecorderMessage>,
-    mut state: WorkerState,
-) {
-    while let Some(message) = receiver.recv().await {
+fn run_worker(mut receiver: mpsc::Receiver<RecorderMessage>, mut state: WorkerState) {
+    while let Some(message) = receiver.blocking_recv() {
         match message {
             RecorderMessage::Accessible(event) => state.handle_accessible(&event),
             RecorderMessage::Interaction(event) => state.handle_interaction(&event),
@@ -2462,7 +2464,7 @@ async fn run_worker(
 }
 
 async fn run_idle_probe(
-    sender: mpsc::UnboundedSender<RecorderMessage>,
+    sender: mpsc::Sender<RecorderMessage>,
     poll_interval_ms: u64,
     cancel: CancellationToken,
 ) {
@@ -2478,7 +2480,11 @@ async fn run_idle_probe(
         }
         match synapse_a11y::millis_since_last_input() {
             Ok(idle_ms) => {
-                if sender.send(RecorderMessage::IdleProbe { idle_ms }).is_err() {
+                if sender
+                    .send(RecorderMessage::IdleProbe { idle_ms })
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -2494,9 +2500,9 @@ async fn run_idle_probe(
 }
 
 fn start_interaction_pipeline(
-    recorder_sender: &mpsc::UnboundedSender<RecorderMessage>,
+    recorder_sender: &mpsc::Sender<RecorderMessage>,
 ) -> Result<(InteractionHook, RecorderTaskShutdownOwner)> {
-    let (interaction_tx, mut interaction_rx) = mpsc::unbounded_channel();
+    let (interaction_tx, mut interaction_rx) = mpsc::channel(INTERACTION_EVENT_CHANNEL_CAPACITY);
     let hook = InteractionHook::start(interaction_tx)?;
     let recorder_sender = recorder_sender.clone();
     let bridge = RecorderTaskShutdownOwner::new(
@@ -2505,6 +2511,7 @@ fn start_interaction_pipeline(
             while let Some(event) = interaction_rx.recv().await {
                 if recorder_sender
                     .send(RecorderMessage::Interaction(event))
+                    .await
                     .is_err()
                 {
                     return;
@@ -2518,7 +2525,7 @@ fn start_interaction_pipeline(
 /// Always-on operator-activity recorder. One per daemon; owns the timeline
 /// write path for foreground/title/idle/session rows.
 pub struct ActivityRecorder {
-    sender: mpsc::UnboundedSender<RecorderMessage>,
+    sender: mpsc::Sender<RecorderMessage>,
     writer: TimelineWriter,
     config: RecorderConfig,
     last_clipboard_sha256: Mutex<Option<String>>,
@@ -2656,7 +2663,7 @@ impl ActivityRecorder {
             }
         }
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(RECORDER_EVENT_CHANNEL_CAPACITY);
         let assist_sink = AssistEventSink {
             db: Arc::clone(&writer.db),
             event_bus,
@@ -2708,8 +2715,13 @@ impl ActivityRecorder {
             }
         };
         let idle_probe_cancel = CancellationToken::new();
-        let worker =
-            RecorderTaskShutdownOwner::new("worker", tokio::spawn(run_worker(receiver, state)));
+        // Timeline persistence is synchronous by contract. Keep its
+        // process-lifetime consumer on Tokio's blocking pool so storage I/O
+        // cannot pin an async scheduler worker.
+        let worker = RecorderTaskShutdownOwner::new(
+            "worker",
+            tokio::task::spawn_blocking(move || run_worker(receiver, state)),
+        );
         let idle_probe = RecorderTaskShutdownOwner::new(
             "idle_probe",
             tokio::spawn(run_idle_probe(
@@ -2753,9 +2765,9 @@ impl ActivityRecorder {
         })
     }
 
-    /// Cheap, non-blocking sink for the WinEvent bridge. Irrelevant kinds are
-    /// filtered before crossing the channel.
-    pub fn record_accessible_event(&self, event: &AccessibleEvent) {
+    /// Backpressured sink for the WinEvent bridge. Irrelevant kinds are
+    /// filtered before crossing the bounded recorder channel.
+    pub async fn record_accessible_event(&self, event: &AccessibleEvent) {
         let Some(_producer_permit) = self.producer_gate.enter() else {
             return;
         };
@@ -2769,6 +2781,7 @@ impl ActivityRecorder {
         if self
             .sender
             .send(RecorderMessage::Accessible(event.clone()))
+            .await
             .is_err()
             && !self.sink_closed_logged.swap(true, Ordering::Relaxed)
         {
@@ -3195,6 +3208,7 @@ impl ActivityRecorder {
             if self
                 .sender
                 .send(RecorderMessage::Shutdown { done: done_tx })
+                .await
                 .is_ok()
             {
                 (true, Some(done_rx))
@@ -3459,7 +3473,7 @@ impl ActivityRecorder {
             .enter()
             .context("timeline recorder is shutting down; pause was not applied")?;
         if self.config.interaction_hook_enabled {
-            self.flush_interactions_blocking();
+            self.flush_interactions_blocking()?;
         }
         let outcome = pause_recording(&self.writer, paused_until_ns, changed_by)?;
         if !outcome.was_paused {
@@ -3588,39 +3602,40 @@ impl ActivityRecorder {
         hook_report
     }
 
-    fn flush_interactions_blocking(&self) {
+    fn flush_interactions_blocking(&self) -> Result<()> {
         let (done_tx, mut done_rx) = oneshot::channel();
-        if self
+        match self
             .sender
-            .send(RecorderMessage::FlushInteractions { done: done_tx })
-            .is_err()
+            .try_send(RecorderMessage::FlushInteractions { done: done_tx })
         {
-            tracing::error!(
-                code = "TIMELINE_INTERACTION_FLUSH_WORKER_GONE",
-                "activity recorder worker is gone; interaction cadence bucket cannot be flushed"
-            );
-            return;
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_message)) => {
+                anyhow::bail!(
+                    "TIMELINE_RECORDER_QUEUE_SATURATED: interaction flush could not enter the bounded recorder queue; pause was not applied"
+                );
+            }
+            Err(mpsc::error::TrySendError::Closed(_message)) => {
+                anyhow::bail!(
+                    "TIMELINE_INTERACTION_FLUSH_WORKER_GONE: activity recorder worker is gone; pause was not applied"
+                );
+            }
         }
         let deadline = Instant::now() + RECORDER_TASK_STOP_TIMEOUT;
         loop {
             match done_rx.try_recv() {
-                Ok(()) => return,
+                Ok(()) => return Ok(()),
                 Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
                     if Instant::now() >= deadline {
-                        tracing::error!(
-                            code = "TIMELINE_INTERACTION_FLUSH_TIMEOUT",
-                            "activity recorder did not acknowledge interaction cadence flush"
+                        anyhow::bail!(
+                            "TIMELINE_INTERACTION_FLUSH_TIMEOUT: activity recorder did not acknowledge interaction cadence flush; pause was not applied"
                         );
-                        return;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                    tracing::error!(
-                        code = "TIMELINE_INTERACTION_FLUSH_ACK_DROPPED",
-                        "activity recorder did not acknowledge interaction cadence flush"
+                    anyhow::bail!(
+                        "TIMELINE_INTERACTION_FLUSH_ACK_DROPPED: activity recorder worker dropped the interaction flush acknowledgement; pause was not applied"
                     );
-                    return;
                 }
             }
         }

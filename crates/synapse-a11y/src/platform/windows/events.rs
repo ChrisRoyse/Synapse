@@ -9,7 +9,7 @@ use std::{
 };
 
 use synapse_core::{ElementId, element_id, win32_hwnd::hwnd_to_wire};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::{Sender, error::TrySendError};
 use windows::Win32::{
     Foundation::{GetLastError, HWND},
     System::Com::{
@@ -46,7 +46,7 @@ const WIN_EVENT_STATE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const WIN_EVENT_CALLBACK_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 
 struct WinEventDeliveryState {
-    sender: Option<UnboundedSender<AccessibleEvent>>,
+    sender: Option<Sender<AccessibleEvent>>,
     subscription_owner_id: Option<u64>,
     last_released_owner_id: Option<u64>,
 }
@@ -71,6 +71,8 @@ static WIN_EVENT_CALLBACKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// Reset when a slot is reserved so each owner's shutdown report describes its
 /// own delivery volume. See `WinEventSubscriptionShutdownReport::events_delivered_at_disconnect`.
 static WIN_EVENT_EVENTS_DELIVERED: AtomicU64 = AtomicU64::new(0);
+static WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL: AtomicU64 = AtomicU64::new(0);
+static WIN_EVENT_QUEUE_FULL_PENDING_LOG: AtomicU64 = AtomicU64::new(0);
 static WIN_EVENT_EVENT_SENDS_REJECTED: AtomicU64 = AtomicU64::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_CONTENTION: AtomicUsize = AtomicUsize::new(0);
 static WIN_EVENT_CALLBACK_DELIVERY_POISON: AtomicUsize = AtomicUsize::new(0);
@@ -206,6 +208,15 @@ fn drain_callback_diagnostics() {
             "WinEvent callbacks observed a poisoned delivery-state lock"
         );
     }
+    let queue_full = WIN_EVENT_QUEUE_FULL_PENDING_LOG.swap(0, Ordering::AcqRel);
+    if queue_full != 0 {
+        tracing::error!(
+            code = "A11Y_WIN_EVENT_QUEUE_SATURATED",
+            dropped_event_count = queue_full,
+            operation = "owner_loop_readback",
+            "bounded WinEvent ingress saturated; accessibility events were rejected before delivery"
+        );
+    }
 }
 
 fn wake_win_event_owner_before_stop(
@@ -302,6 +313,8 @@ impl WinEventSubscription {
         // boundary (#1792). No further send can be admitted past this point,
         // so these totals are terminal for this owner.
         let events_delivered_at_disconnect = WIN_EVENT_EVENTS_DELIVERED.load(Ordering::Acquire);
+        let events_dropped_queue_full_at_disconnect =
+            WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.load(Ordering::Acquire);
         let event_sends_rejected_at_disconnect =
             WIN_EVENT_EVENT_SENDS_REJECTED.load(Ordering::Acquire);
 
@@ -399,6 +412,7 @@ impl WinEventSubscription {
             stop_wake_sent,
             sender_disconnected,
             events_delivered_at_disconnect,
+            events_dropped_queue_full_at_disconnect,
             event_sends_rejected_at_disconnect,
             subscription_slot_released,
             thread_owner_present,
@@ -692,7 +706,7 @@ fn lock_win_event_delivery_until(
 
 fn reserve_win_event_subscription_slot(
     owner_id: u64,
-    sender: UnboundedSender<AccessibleEvent>,
+    sender: Sender<AccessibleEvent>,
 ) -> A11yResult<()> {
     reconcile_retained_win_event_owners();
     let retained_owner_count = RETAINED_WIN_EVENT_OWNER_COUNT.load(Ordering::Acquire);
@@ -720,6 +734,8 @@ fn reserve_win_event_subscription_slot(
     // Per-owner delivery ledger (#1792): the slot is exclusive, so resetting
     // here scopes both counters to exactly this subscription owner.
     WIN_EVENT_EVENTS_DELIVERED.store(0, Ordering::Release);
+    WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.store(0, Ordering::Release);
+    WIN_EVENT_QUEUE_FULL_PENDING_LOG.store(0, Ordering::Release);
     WIN_EVENT_EVENT_SENDS_REJECTED.store(0, Ordering::Release);
     Ok(())
 }
@@ -961,9 +977,7 @@ fn unwind_failed_startup(
     }
 }
 
-pub fn subscribe_win_events(
-    sender: UnboundedSender<AccessibleEvent>,
-) -> A11yResult<WinEventSubscription> {
+pub fn subscribe_win_events(sender: Sender<AccessibleEvent>) -> A11yResult<WinEventSubscription> {
     let owner_id = NEXT_WIN_EVENT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     reserve_win_event_subscription_slot(owner_id, sender)?;
 
@@ -1284,10 +1298,17 @@ unsafe extern "system" fn win_event_proc(
     // drain everything counted here that it had not yet taken before it can
     // observe the disconnect, so this total is the evidence that separates a
     // drain backlog from a scheduling problem.
-    if sender.send(event).is_ok() {
-        WIN_EVENT_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
-    } else {
-        WIN_EVENT_EVENT_SENDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+    match sender.try_send(event) {
+        Ok(()) => {
+            WIN_EVENT_EVENTS_DELIVERED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Full(_event)) => {
+            WIN_EVENT_EVENTS_DROPPED_QUEUE_FULL.fetch_add(1, Ordering::Relaxed);
+            WIN_EVENT_QUEUE_FULL_PENDING_LOG.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(TrySendError::Closed(_event)) => {
+            WIN_EVENT_EVENT_SENDS_REJECTED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 

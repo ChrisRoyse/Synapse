@@ -3605,6 +3605,7 @@ fn drive_anchor_debt_repair(
     let mut pass = AnchorDebtPass::default();
     let targets = report.anchor_debt_targets();
     if targets.is_empty() {
+        db.release_temporal_backfill_lineage(None);
         publish_anchor_debt_readback(
             &pass,
             None,
@@ -3989,6 +3990,7 @@ fn drive_anchor_debt_repair(
         remaining_global = remaining_global.saturating_sub(attempted);
     }
 
+    db.release_temporal_backfill_lineage(None);
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let lineage = crate::backend::anchor_carry_lineage_counters().since(lineage_before);
     // --- Per-identity cost, measured against the work it actually describes ---

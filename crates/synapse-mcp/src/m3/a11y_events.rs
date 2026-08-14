@@ -11,7 +11,7 @@ use synapse_a11y::{
 };
 use synapse_core::{Event, EventFilter, EventSource, ForegroundContext};
 use synapse_reflex::EventBus;
-use tokio::{sync::mpsc::UnboundedReceiver, task::JoinHandle};
+use tokio::{sync::mpsc::Receiver, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use super::activity_recorder::ActivityRecorder;
@@ -24,8 +24,10 @@ pub struct A11yEventBridge {
     /// `Receiver::recv` returns `None` only once all senders are dropped *and
     /// every buffered value has been received* — so with 10 system-wide WinEvent
     /// hooks feeding an unbounded channel, the cooperative deadline was
-    /// structurally unmeetable: the task first had to consume a
-    /// desktop-controlled backlog, doing synchronous Win32 work per item.
+    /// structurally unmeetable before #2128: the task first had to consume a
+    /// desktop-controlled backlog, doing synchronous Win32 work per item. The
+    /// queue is bounded now, while this independent stop remains the immediate
+    /// lifecycle boundary.
     /// Raising the deadline cannot fix that; a signal the queue does not gate
     /// can.
     stop: CancellationToken,
@@ -33,7 +35,7 @@ pub struct A11yEventBridge {
 
 pub(crate) struct PreparedA11yEventBridge {
     subscription: WinEventSubscription,
-    receiver: UnboundedReceiver<AccessibleEvent>,
+    receiver: Receiver<AccessibleEvent>,
 }
 
 #[derive(Clone, Debug)]
@@ -152,6 +154,11 @@ impl A11yEventBridgeShutdownReport {
 const A11Y_SUBSCRIPTION_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const A11Y_BRIDGE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const A11Y_BRIDGE_ABORT_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// WinEvent payloads created by the OS hook contain only scalar IDs and enum
+/// state. A 1,024-event queue leaves ample scheduling headroom while keeping
+/// ingress ownership bounded; saturation is counted and emitted by
+/// `synapse-a11y` as `A11Y_WIN_EVENT_QUEUE_SATURATED`.
+const A11Y_EVENT_CHANNEL_CAPACITY: usize = 1_024;
 /// Cadence at which the shutdown path round-trips a trivial task through the
 /// Tokio scheduler while it waits for the bridge task's cooperative deadline.
 /// This is a sampling interval, not a deadline: it never extends any shutdown
@@ -310,7 +317,7 @@ pub fn is_a11y_event_kind(kind: &str) -> bool {
 
 impl A11yEventBridge {
     pub(crate) fn prepare() -> synapse_a11y::A11yResult<PreparedA11yEventBridge> {
-        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, receiver) = tokio::sync::mpsc::channel(A11Y_EVENT_CHANNEL_CAPACITY);
         let subscription = synapse_a11y::subscribe_win_events(sender)?;
         Ok(PreparedA11yEventBridge {
             subscription,
@@ -547,7 +554,7 @@ impl Drop for A11yEventBridge {
 
 async fn run_bridge(
     event_bus: EventBus,
-    mut receiver: UnboundedReceiver<AccessibleEvent>,
+    mut receiver: Receiver<AccessibleEvent>,
     activity_recorder: Option<Arc<ActivityRecorder>>,
     stop: CancellationToken,
 ) {
@@ -575,7 +582,7 @@ async fn run_bridge(
             },
         };
         if let Some(recorder) = &activity_recorder {
-            recorder.record_accessible_event(&accessible_event);
+            recorder.record_accessible_event(&accessible_event).await;
         }
         let event = event_from_accessible(&accessible_event, next_seq);
         next_seq = next_seq.saturating_add(1);

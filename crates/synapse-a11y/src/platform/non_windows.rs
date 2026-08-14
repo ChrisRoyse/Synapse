@@ -1,7 +1,7 @@
 use synapse_core::{
     AccessibleNode, AccessibleSubtree, ElementId, ForegroundContext, Point, UiaPattern,
 };
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::{
     A11yError, A11yResult, AccessibleEvent, ElementClickAction, ElementMetadataReadback,
@@ -291,9 +291,7 @@ pub fn expand_state_of_id(_id: &ElementId) -> A11yResult<ExpandState> {
     ))
 }
 
-pub fn subscribe_win_events(
-    _sender: UnboundedSender<AccessibleEvent>,
-) -> A11yResult<WinEventSubscription> {
+pub fn subscribe_win_events(_sender: Sender<AccessibleEvent>) -> A11yResult<WinEventSubscription> {
     Err(A11yError::not_available("WinEvent hooks require Windows"))
 }
 

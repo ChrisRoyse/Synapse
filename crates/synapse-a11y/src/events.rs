@@ -2,11 +2,11 @@ use std::{collections::HashMap, time::Duration};
 
 use serde::{Deserialize, Serialize};
 use synapse_core::ElementId;
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 
 use crate::{A11yError, A11yResult, platform};
 
-pub type AccessibleEventSender = UnboundedSender<AccessibleEvent>;
+pub type AccessibleEventSender = Sender<AccessibleEvent>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -121,6 +121,7 @@ impl WinEventSubscription {
                 stop_wake_sent: true,
                 sender_disconnected: true,
                 events_delivered_at_disconnect: 0,
+                events_dropped_queue_full_at_disconnect: 0,
                 event_sends_rejected_at_disconnect: 0,
                 subscription_slot_released: true,
                 thread_owner_present: false,
@@ -154,10 +155,10 @@ pub struct WinEventSubscriptionShutdownReport {
     /// its shutdown bound and the process-global sender read back empty.
     pub sender_disconnected: bool,
     /// #1792: total `AccessibleEvent`s this owner accepted into the delivery
-    /// channel, read at the instant the sender was disconnected.
+    /// bounded channel, read at the instant the sender was disconnected.
     ///
     /// `sender_disconnected` proves the producer side is closed; it does NOT
-    /// prove the consumer can observe the closure. A Tokio `UnboundedReceiver`
+    /// prove the consumer can observe the closure. A Tokio `Receiver`
     /// returns `None` only after every sender is dropped **and every buffered
     /// value has been received**, so a consumer whose only stop signal is
     /// channel closure must first drain whatever this counter accumulated but
@@ -167,6 +168,10 @@ pub struct WinEventSubscriptionShutdownReport {
     /// consumer" from subscription-thread delay, scheduler starvation, and join
     /// ordering.
     pub events_delivered_at_disconnect: u64,
+    /// Events explicitly rejected because the bounded ingress queue was full.
+    /// The hook-owner loop emits `A11Y_WIN_EVENT_QUEUE_SATURATED` whenever this
+    /// advances; shutdown preserves the terminal count here for readback.
+    pub events_dropped_queue_full_at_disconnect: u64,
     /// Sends this owner attempted after its receiver was already gone. Nonzero
     /// means the consumer stopped before the producer did.
     pub event_sends_rejected_at_disconnect: u64,

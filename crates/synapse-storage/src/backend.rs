@@ -931,6 +931,9 @@ pub trait StorageBackend: Send + Sync {
         after_physical: Option<&[u8]>,
         max_rows: usize,
     ) -> StorageResult<constellations::TemporalMetadataBackfillReport>;
+    /// Releases process-local anchor-lineage ownership at an explicit repair
+    /// lifecycle boundary. `None` releases every completed source scope.
+    fn release_temporal_backfill_lineage(&self, source_cf: Option<&str>) -> usize;
     fn put_timeline_constellation(
         &self,
         source_key: &[u8],
@@ -1212,14 +1215,10 @@ pub struct CalyxBackend {
     path: PathBuf,
     vault: Arc<CalyxVaultRuntime>,
     pressure: Arc<pressure::PressureState>,
-    anchor_carry_lineage: Mutex<Option<AnchorCarryLineageCache>>,
+    anchor_carry_lineage: Mutex<AnchorCarryLineageCache>,
 }
 
-struct AnchorCarryLineageCache {
-    source_cf: String,
-    superseded_versions: Vec<u32>,
-    by_source_key: Arc<BTreeMap<String, Vec<Anchor>>>,
-}
+type AnchorCarryLineageCache = BTreeMap<(String, Vec<u32>), Arc<BTreeMap<String, Vec<Anchor>>>>;
 
 /// Grounded-anchor-lineage index builds, cache hits, and time spent building
 /// (#2080 defect 3).
@@ -2173,18 +2172,25 @@ impl CalyxBackend {
     ) -> StorageResult<Arc<BTreeMap<String, Vec<Anchor>>>> {
         let superseded = constellations::superseded_panel_versions_for_source_cf(source_cf)?;
         if superseded.is_empty() {
+            self.release_anchor_carry_lineage(Some(source_cf));
             return Ok(Arc::new(BTreeMap::new()));
         }
-        if !reset_for_new_sweep {
+        let cache_key = (source_cf.to_owned(), superseded.to_vec());
+        if reset_for_new_sweep {
+            let mut guard = self
+                .anchor_carry_lineage
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard.remove(&cache_key);
+            drop(guard);
+        } else {
             let guard = self
                 .anchor_carry_lineage
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(cache) = guard.as_ref().filter(|cache| {
-                cache.source_cf == source_cf && cache.superseded_versions == superseded
-            }) {
+            if let Some(by_source_key) = guard.get(&cache_key) {
                 ANCHOR_CARRY_LINEAGE_HITS.fetch_add(1, Ordering::Relaxed);
-                return Ok(Arc::clone(&cache.by_source_key));
+                return Ok(Arc::clone(by_source_key));
             }
         }
 
@@ -2218,13 +2224,39 @@ impl CalyxBackend {
             .anchor_carry_lineage
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        *guard = Some(AnchorCarryLineageCache {
-            source_cf: source_cf.to_owned(),
-            superseded_versions: superseded.to_vec(),
-            by_source_key: Arc::clone(&by_source_key),
-        });
+        guard.insert(cache_key, Arc::clone(&by_source_key));
         drop(guard);
         Ok(by_source_key)
+    }
+
+    fn release_anchor_carry_lineage(&self, source_cf: Option<&str>) -> usize {
+        let mut guard = self
+            .anchor_carry_lineage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entries_before = guard.len();
+        let rows_released = guard
+            .iter()
+            .filter(|((cached_source_cf, _versions), _lineage)| {
+                source_cf.is_none_or(|source_cf| cached_source_cf == source_cf)
+            })
+            .map(|(_key, lineage)| lineage.len())
+            .sum::<usize>();
+        guard.retain(|(cached_source_cf, _versions), _lineage| {
+            source_cf.is_some_and(|source_cf| cached_source_cf != source_cf)
+        });
+        let entries_released = entries_before.saturating_sub(guard.len());
+        if entries_released != 0 {
+            tracing::info!(
+                code = "CALYX_ANCHOR_CARRY_LINEAGE_RELEASED",
+                source_cf = source_cf.unwrap_or("all"),
+                entries_released,
+                rows_released,
+                entries_remaining = guard.len(),
+                "released completed temporal-backfill lineage ownership"
+            );
+        }
+        entries_released
     }
 
     pub fn open(path: &Path, schema_version: u32) -> StorageResult<Self> {
@@ -2310,7 +2342,7 @@ impl CalyxBackend {
             path: path.to_path_buf(),
             vault: Arc::new(CalyxVaultRuntime::new(vault)),
             pressure: Arc::new(pressure::PressureState::default()),
-            anchor_carry_lineage: Mutex::new(None),
+            anchor_carry_lineage: Mutex::new(BTreeMap::new()),
         })
     }
 
@@ -6435,7 +6467,7 @@ impl StorageBackend for CalyxBackend {
                 false,
                 |vault| Ok(vault.latest_seq()),
             )?;
-            return Ok(constellations::TemporalMetadataBackfillReport {
+            let report = constellations::TemporalMetadataBackfillReport {
                 source_cf: source_cf.to_owned(),
                 examined_rows: 0,
                 inserted_rows: 0,
@@ -6455,7 +6487,11 @@ impl StorageBackend for CalyxBackend {
                 more,
                 row_reports: Vec::new(),
                 row_failures,
-            });
+            };
+            if (!pointwise_preflight && source_keys.is_some()) || (source_keys.is_none() && !more) {
+                self.release_anchor_carry_lineage(Some(source_cf));
+            }
+            return Ok(report);
         }
         let examined_rows = rows.len() as u64;
         let mut inserted_rows = 0_u64;
@@ -6944,7 +6980,7 @@ impl StorageBackend for CalyxBackend {
         for row_report in &mut row_reports {
             row_report.latest_seq = latest_seq;
         }
-        Ok(constellations::TemporalMetadataBackfillReport {
+        let report = constellations::TemporalMetadataBackfillReport {
             source_cf: source_cf.to_owned(),
             examined_rows,
             inserted_rows,
@@ -6964,7 +7000,15 @@ impl StorageBackend for CalyxBackend {
             more,
             row_reports,
             row_failures,
-        })
+        };
+        if (!pointwise_preflight && source_keys.is_some()) || (source_keys.is_none() && !more) {
+            self.release_anchor_carry_lineage(Some(source_cf));
+        }
+        Ok(report)
+    }
+
+    fn release_temporal_backfill_lineage(&self, source_cf: Option<&str>) -> usize {
+        self.release_anchor_carry_lineage(source_cf)
     }
 
     #[allow(clippy::too_many_lines)]

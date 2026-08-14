@@ -9,6 +9,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_STALE_AFTER_MS: u64 = 5 * 60 * 1000;
+/// Closed MCP sessions are durable in `CF_SESSIONS` and the agent-event log.
+/// The process-local registry exists only for recent lifecycle correlation, so
+/// retaining every closed session for the daemon lifetime duplicated history
+/// in heap. Keep a short recent window and a deterministic hard ceiling.
+const CLOSED_SESSION_RETENTION_MS: u64 = 5 * 60 * 1000;
+const MAX_RETAINED_CLOSED_SESSIONS: usize = 256;
 
 pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 
@@ -16,6 +22,20 @@ pub(crate) type SharedSessionRegistry = Arc<Mutex<SessionRegistry>>;
 pub(crate) struct SessionRegistry {
     stale_after_ms: u64,
     entries: BTreeMap<String, SessionRegistryEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SessionRegistryPruneReadback {
+    pub entries_before: usize,
+    pub expired_removed: usize,
+    pub overflow_removed: usize,
+    pub entries_after: usize,
+}
+
+impl SessionRegistryPruneReadback {
+    pub const fn removed(self) -> usize {
+        self.expired_removed + self.overflow_removed
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -198,6 +218,51 @@ impl Default for SessionRegistry {
 }
 
 impl SessionRegistry {
+    pub(crate) fn prune_closed(&mut self, now_unix_ms: u64) -> SessionRegistryPruneReadback {
+        let entries_before = self.entries.len();
+        let cutoff = now_unix_ms.saturating_sub(CLOSED_SESSION_RETENTION_MS);
+        let before_expiry = self.entries.len();
+        self.entries.retain(|_session_id, entry| {
+            entry
+                .closed_at_unix_ms
+                .is_none_or(|closed_at| closed_at >= cutoff)
+        });
+        let expired_removed = before_expiry.saturating_sub(self.entries.len());
+
+        let mut closed = self
+            .entries
+            .iter()
+            .filter_map(|(session_id, entry)| {
+                entry
+                    .closed_at_unix_ms
+                    .map(|closed_at| (closed_at, session_id.clone()))
+            })
+            .collect::<Vec<_>>();
+        closed.sort_unstable();
+        let overflow = closed.len().saturating_sub(MAX_RETAINED_CLOSED_SESSIONS);
+        for (_closed_at, session_id) in closed.into_iter().take(overflow) {
+            self.entries.remove(&session_id);
+        }
+        let readback = SessionRegistryPruneReadback {
+            entries_before,
+            expired_removed,
+            overflow_removed: overflow,
+            entries_after: self.entries.len(),
+        };
+        if readback.removed() != 0 {
+            tracing::info!(
+                code = "MCP_SESSION_REGISTRY_CLOSED_PRUNED",
+                entries_before = readback.entries_before,
+                expired_removed = readback.expired_removed,
+                overflow_removed = readback.overflow_removed,
+                entries_after = readback.entries_after,
+                durable_source_of_truth = "CF_SESSIONS + CF_AGENT_EVENTS",
+                "released process-local copies of durably closed MCP sessions"
+            );
+        }
+        readback
+    }
+
     pub(crate) fn set_stale_after(&mut self, ttl: Option<Duration>) {
         self.stale_after_ms = ttl
             .map(duration_millis_u64)
@@ -325,6 +390,7 @@ impl SessionRegistry {
         now_unix_ms: u64,
         reason_code: Option<&str>,
     ) -> bool {
+        self.prune_closed(now_unix_ms);
         let entry = self
             .entries
             .entry(session_id.to_owned())
@@ -346,6 +412,7 @@ impl SessionRegistry {
         entry.last_seen_unix_ms = now_unix_ms;
         entry.closed_at_unix_ms = Some(now_unix_ms);
         entry.last_reason_code = reason_code.map(ToOwned::to_owned);
+        self.prune_closed(now_unix_ms);
         transitioned
     }
 

@@ -122,21 +122,14 @@ pub(super) fn ensure_bounded_sidecar(
     slot: SlotId,
 ) -> CliResult {
     if entry.kind == "multi_maxsim_segments" {
-        let entry_sha256 = entry.require_sha256(slot)?;
-        if let Some(files) = pinned::memoized_bounded_segment_files(vault_dir, slot, entry_sha256)?
-        {
-            return pinned::stat_check_segment_files(slot, &files);
-        }
         let manifest =
             segments::read_segments_manifest(vault_dir, entry, entry.built_at_seq, slot)?;
-        let mut files = vec![segments_manifest_file(vault_dir, entry, slot)?];
-        files.extend(segments::validate_segment_files(
+        segments::validate_segment_files(
             vault_dir,
             slot,
             entry.require_token_dim(slot)?,
             &manifest,
-        )?);
-        pinned::memoize_bounded_segment_files(vault_dir, slot, entry_sha256, files)?;
+        )?;
     } else if binary::is_binary_sidecar(entry.require_index_rel(slot)?) {
         ensure_binary_entry_bounded(vault_dir, entry, slot)?;
         let path = sidecar_path(vault_dir, entry, slot)?;
@@ -201,28 +194,6 @@ pub(super) fn score_replacements(
             Ok((*cx_id, MaxSimIndex::maxsim(query_tokens, tokens)))
         })
         .collect()
-}
-
-fn segments_manifest_file(
-    vault_dir: &Path,
-    entry: &SearchIndexEntry,
-    slot: SlotId,
-) -> CliResult<pinned::BoundedSegmentFile> {
-    let index_rel = entry.require_index_rel(slot)?;
-    let path = vault_dir.join(index_rel);
-    let expected_bytes = fs::metadata(&path)
-        .map_err(|_| {
-            stale(format!(
-                "persistent segmented multi sidecar missing for slot {slot} at {}; rebuild the vault search indexes",
-                path.display()
-            ))
-        })?
-        .len();
-    Ok(pinned::BoundedSegmentFile {
-        path,
-        index_rel: index_rel.to_string(),
-        expected_bytes,
-    })
 }
 
 fn ensure_binary_entry_bounded(
@@ -331,9 +302,6 @@ fn unbounded_multi_sidecar(message: impl Into<String>) -> CliError {
 
 #[path = "multi/binary.rs"]
 mod binary;
-
-#[path = "multi/pinned.rs"]
-mod pinned;
 
 #[path = "multi/segments.rs"]
 mod segments;
