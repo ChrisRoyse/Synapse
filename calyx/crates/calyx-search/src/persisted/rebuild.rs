@@ -142,7 +142,7 @@ pub fn rebuild_candidate_for_vault_with_panel_state_and_dense_config<C: Clock>(
     dense_index_config: PersistedDenseIndexConfig,
     candidate_key: [u8; 32],
 ) -> CliResult<CandidateSearchGeneration> {
-    let active_slots = active_panel_slots(state);
+    let active_slots = searchable_panel_slots(state);
     let sparse_scoring = active_sparse_scoring(state)?;
     let summary = super::rebuild_stream::rebuild_candidate_for_vault_with_active_slots(
         vault_dir,
@@ -172,7 +172,7 @@ pub fn rebuild_for_vault_with_panel_state_and_dense_config_at_snapshot<C: Clock>
     dense_index_config: PersistedDenseIndexConfig,
     snapshot: Snapshot,
 ) -> CliResult {
-    let active_slots = active_panel_slots(state);
+    let active_slots = searchable_panel_slots(state);
     let sparse_scoring = active_sparse_scoring(state)?;
     super::rebuild_stream::rebuild_for_vault_with_active_slots_at_snapshot(
         vault_dir,
@@ -195,7 +195,7 @@ pub fn rebuild_candidate_for_vault_with_panel_state_and_dense_config_at_snapshot
     candidate_key: [u8; 32],
     snapshot: Snapshot,
 ) -> CliResult<CandidateSearchGeneration> {
-    let active_slots = active_panel_slots(state);
+    let active_slots = searchable_panel_slots(state);
     let sparse_scoring = active_sparse_scoring(state)?;
     let summary = super::rebuild_stream::rebuild_candidate_for_vault_with_active_slots_at_snapshot(
         vault_dir,
@@ -231,7 +231,7 @@ pub fn rebuild_for_vault_with_panel_state_dense_config_progress<C: Clock, F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
-    let active_slots = active_panel_slots(state);
+    let active_slots = searchable_panel_slots(state);
     let sparse_scoring = active_sparse_scoring(state)?;
     super::rebuild_stream::rebuild_for_vault_with_active_slots_progress(
         vault_dir,
@@ -274,12 +274,19 @@ where
     )
 }
 
-fn active_panel_slots(state: &VaultPanelState) -> BTreeSet<SlotId> {
+/// Slots eligible to become primary-retrieval indexes.
+///
+/// `retrieval_only` slots are post-retrieval ordinates (for example a scalar
+/// recency rank). Persisting a similarity index for one makes the generation
+/// advertise a lane that weighted fusion correctly refuses to bind. Keeping
+/// the exclusion at generation construction makes the on-disk contract match
+/// the panel's declared retrieval semantics.
+fn searchable_panel_slots(state: &VaultPanelState) -> BTreeSet<SlotId> {
     state
         .panel
         .slots
         .iter()
-        .filter(|slot| slot.state == SlotState::Active)
+        .filter(|slot| slot.state == SlotState::Active && !slot.retrieval_only)
         .map(|slot| slot.slot_id)
         .collect()
 }
@@ -292,7 +299,7 @@ fn active_sparse_scoring(
         .panel
         .slots
         .iter()
-        .filter(|slot| slot.state == SlotState::Active)
+        .filter(|slot| slot.state == SlotState::Active && !slot.retrieval_only)
     {
         if !matches!(slot.shape, SlotShape::Sparse(_)) {
             continue;

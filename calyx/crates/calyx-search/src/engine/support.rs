@@ -1,14 +1,135 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use calyx_aster::mvcc::{Freshness, Snapshot};
 use calyx_aster::vault::AsterVault;
 use calyx_aster::{cf::ColumnFamily, vault::encode::decode_constellation_base};
-use calyx_core::{Clock, Constellation, CxId, SlotVector};
+use calyx_core::{CalyxError, Clock, Constellation, CxId, Panel, SlotId, SlotState, SlotVector};
 use calyx_sextant::{FreshnessTag, Hit};
 
 use super::{SEARCH_READER_LEASE_MS, SearchFreshness};
 use crate::error::CliResult;
-use crate::persisted::PersistedSearchIndexes;
+use crate::persisted::{PersistedSearchGeneration, PersistedSearchIndexes};
+
+/// Proves that an immutable generation advertises only slots the exact panel
+/// contract permits for primary retrieval.
+///
+/// This is deliberately checked on every open, not merely during rebuild. A
+/// daemon may be upgraded while an older manifest remains on disk; accepting
+/// that manifest would let a post-retrieval ordinate participate in recall or
+/// defer the defect until weighted fusion fails on the first matching query.
+pub(super) fn validate_generation_panel_contract(
+    generation: &PersistedSearchGeneration,
+    panel: &Panel,
+) -> CliResult<()> {
+    if generation.panel_version != panel.version {
+        return Err(CalyxError::stale_derived(format!(
+            "search generation panel {} does not match active panel {}; rebuild the exact panel generation",
+            generation.panel_version, panel.version
+        ))
+        .into());
+    }
+
+    let mut seen = BTreeSet::new();
+    for persisted in &generation.slots {
+        let slot_id = persisted.panel_slot.slot_id();
+        if !seen.insert(slot_id) {
+            return Err(CalyxError::stale_derived(format!(
+                "search generation {} declares slot {slot_id} more than once; rebuild the corrupt generation",
+                generation.manifest_sha256
+            ))
+            .into());
+        }
+        let declared = panel
+            .slots
+            .iter()
+            .find(|candidate| candidate.slot_id == slot_id)
+            .ok_or_else(|| {
+                CalyxError::stale_derived(format!(
+                    "search generation {} indexes undeclared slot {slot_id} for panel {}; rebuild from the exact panel contract",
+                    generation.manifest_sha256, panel.version
+                ))
+            })?;
+        if declared.state != SlotState::Active {
+            return Err(CalyxError::stale_derived(format!(
+                "search generation {} indexes panel {} slot {slot_id}, but its declared state is {:?}; rebuild after the lifecycle change",
+                generation.manifest_sha256, panel.version, declared.state
+            ))
+            .into());
+        }
+        if declared.retrieval_only {
+            return Err(CalyxError::stale_derived(format!(
+                "search generation {} indexes retrieval-only panel {} slot {slot_id}; this slot is a post-retrieval ordinate and must not participate in primary similarity search; rebuild from the exact panel contract",
+                generation.manifest_sha256, panel.version
+            ))
+            .into());
+        }
+        if persisted.shape != declared.shape {
+            return Err(CalyxError::stale_derived(format!(
+                "search generation {} slot {slot_id} shape {:?} differs from panel {} contract {:?}; rebuild from the exact panel contract",
+                generation.manifest_sha256, persisted.shape, panel.version, declared.shape
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Rejects caller-provided primary query vectors that address a slot the panel
+/// does not permit for similarity retrieval.
+pub(super) fn validate_primary_query_slots(
+    panel: &Panel,
+    query_vectors: &[(SlotId, SlotVector)],
+) -> CliResult<()> {
+    let mut seen = BTreeSet::new();
+    for (slot_id, _) in query_vectors {
+        if !seen.insert(*slot_id) {
+            return Err(CalyxError {
+                code: calyx_sextant::error::CALYX_SEXTANT_QUERY_SHAPE,
+                message: format!(
+                    "primary query names panel {} slot {slot_id} more than once",
+                    panel.version
+                ),
+                remediation: "supply exactly one query vector per active searchable panel slot",
+            }
+            .into());
+        }
+        let declared = panel
+            .slots
+            .iter()
+            .find(|candidate| candidate.slot_id == *slot_id)
+            .ok_or_else(|| CalyxError {
+                code: calyx_sextant::error::CALYX_SEXTANT_SLOT_MISSING,
+                message: format!(
+                    "primary query names slot {slot_id}, which panel {} does not declare",
+                    panel.version
+                ),
+                remediation: "supply query vectors only for slots declared by the exact active panel",
+            })?;
+        if declared.state != SlotState::Active {
+            return Err(CalyxError {
+                code: calyx_sextant::error::CALYX_SEXTANT_SLOT_INACTIVE,
+                message: format!(
+                    "primary query names panel {} slot {slot_id}, whose state is {:?}",
+                    panel.version, declared.state
+                ),
+                remediation: "supply query vectors only for active searchable panel slots",
+            }
+            .into());
+        }
+        if declared.retrieval_only {
+            return Err(CalyxError {
+                code: calyx_sextant::error::CALYX_SEXTANT_QUERY_SHAPE,
+                message: format!(
+                    "primary query names retrieval-only panel {} slot {slot_id}; it is a post-retrieval ordinate, not a similarity lane",
+                    panel.version
+                ),
+                remediation: "remove retrieval-only ordinates from primary query vectors and apply them only in the declared post-retrieval stage",
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn index_freshness_tag(
     indexes: &PersistedSearchIndexes,

@@ -22,7 +22,7 @@ use super::guard::{
 use super::hydration::hydrate_hit_docs_with_bounded_readbacks;
 use super::support::{
     SearchReadSnapshot, index_freshness_tag, is_stale_derived, renumber_and_truncate,
-    vault_base_count_at,
+    validate_generation_panel_contract, validate_primary_query_slots, vault_base_count_at,
 };
 use super::{
     FusionChoice, FusionResolution, FusionTuning, GuardChoice, SearchBudget, SearchFreshness,
@@ -83,6 +83,8 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
         Err(error) => return Err(error),
     };
     let generation = indexes.generation()?;
+    validate_generation_panel_contract(&generation, panel)?;
+    validate_primary_query_slots(panel, query_vectors)?;
     let indexed_max_len = indexes.max_len_for_slots(allowed_slots);
     trace.emit("indexes.open.done", None, Some(indexed_max_len));
     trace.emit("indexes.ensure_bounded.start", None, None);

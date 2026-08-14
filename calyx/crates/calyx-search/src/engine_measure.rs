@@ -37,6 +37,9 @@ use crate::error::CliResult;
 
 /// Reason code for a panel slot that did not contribute a text query vector.
 pub const QUERY_SKIP_SLOT_NOT_ACTIVE: &str = "slot_not_active";
+/// The slot is an ordinate used only after primary retrieval and cannot be
+/// admitted as a similarity query lane.
+pub const QUERY_SKIP_RETRIEVAL_ONLY: &str = "retrieval_only";
 /// The caller restricted the query to a physical slot set that excludes this slot.
 pub const QUERY_SKIP_NOT_SELECTED: &str = "not_selected_by_caller";
 /// The panel references a lens id this registry does not hold.
@@ -183,6 +186,16 @@ pub(crate) fn measure_query_traced(
             continue;
         }
         out.active_slots += 1;
+        if slot.retrieval_only {
+            out.skipped.push(QuerySlotSkip {
+                slot: slot.slot_id,
+                slot_key,
+                reason: QUERY_SKIP_RETRIEVAL_ONLY,
+                detail: "post-retrieval ordinate; excluded from primary similarity search"
+                    .to_owned(),
+            });
+            continue;
+        }
         if allowed_slots.is_some_and(|allowed| !allowed.contains(&slot.slot_id)) {
             out.skipped.push(QuerySlotSkip {
                 slot: slot.slot_id,
