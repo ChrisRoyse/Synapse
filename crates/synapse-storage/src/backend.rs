@@ -13668,67 +13668,114 @@ fn calyx_gc_budget(
 /// Built once per GC tick and shared across every CF budget, so the Base scan
 /// is paid once rather than per column family.
 ///
-/// One source key's exact byte range in [`PackedSourceReferenceKeys::bytes`].
+/// One source key's exact byte range in one
+/// [`PackedSourceReferenceKeys::chunks`] allocation.
 ///
-/// Two fixed-width offsets replace a `Vec` allocation and a B-tree node per
-/// reference. The production corpus has more than 1.5 million references, so
-/// the ownership shape matters more than lookup's constant factor.
+/// One fixed-width chunk index plus two offsets replace a `Vec` allocation and
+/// a B-tree node per reference. The production corpus has more than 1.5
+/// million references, so the ownership shape matters more than lookup's
+/// constant factor.
 #[derive(Clone, Copy, Debug)]
 struct PackedSourceReferenceRange {
+    chunk: u32,
     start: u32,
     end: u32,
 }
 
-/// Exact source-key membership backed by one byte arena plus compact ranges.
+const PACKED_SOURCE_REFERENCE_CHUNK_BYTES: usize = 1024 * 1024;
+
+/// Exact source-key membership backed by bounded byte chunks plus compact
+/// ranges.
 ///
 /// Base is ordered by constellation identity rather than source key, so keys
-/// are appended to the arena during the pinned stream and only the fixed-width
-/// ranges are sorted/deduplicated afterward. Membership remains an exact binary
-/// search; there is no probabilistic filter and no false-positive deletion
-/// risk.
+/// are appended during the pinned stream and only the fixed-width ranges are
+/// sorted/deduplicated afterward. A single growing `Vec<u8>` is deliberately
+/// not used here: when it doubles near 64-128 MiB, the allocator must own the
+/// old and new buffers simultaneously while copying, creating a short
+/// corpus-proportional commit spike even though steady-state ownership is
+/// compact. One-MiB chunks bound that overlap while retaining exact binary
+/// search; an individual key larger than a chunk gets one exact-size chunk.
+/// There is no probabilistic filter and no false-positive deletion risk.
 #[derive(Default)]
 struct PackedSourceReferenceKeys {
-    bytes: Vec<u8>,
+    chunks: Vec<Vec<u8>>,
     ranges: Vec<PackedSourceReferenceRange>,
 }
 
 impl PackedSourceReferenceKeys {
     fn push(&mut self, cf_name: &str, key: &[u8]) -> Result<(), String> {
-        let start = u32::try_from(self.bytes.len()).map_err(|_| {
+        let key_len = u32::try_from(key.len()).map_err(|_| {
             format!(
-                "source-reference byte arena for {cf_name} already exceeds the u32 offset representation"
-            )
-        })?;
-        let end = self.bytes.len().checked_add(key.len()).ok_or_else(|| {
-            format!(
-                "source-reference byte arena length overflowed usize while appending a {}-byte key for {cf_name}",
+                "one source-reference key for {cf_name} requires {} bytes, exceeding the u32 per-chunk offset representation",
                 key.len()
             )
         })?;
-        let end = u32::try_from(end).map_err(|_| {
+        self.ranges.try_reserve(1).map_err(|source| {
+            format!("reserve one exact source-reference range for {cf_name} failed: {source}")
+        })?;
+
+        let needs_chunk = self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.capacity().saturating_sub(chunk.len()) < key.len());
+        if needs_chunk {
+            let chunk_capacity = PACKED_SOURCE_REFERENCE_CHUNK_BYTES.max(key.len());
+            let mut chunk = Vec::new();
+            chunk.try_reserve_exact(chunk_capacity).map_err(|source| {
+                format!(
+                    "reserve a {chunk_capacity}-byte source-reference chunk for {cf_name} failed: {source}"
+                )
+            })?;
+            self.chunks.try_reserve(1).map_err(|source| {
+                format!("reserve one source-reference chunk slot for {cf_name} failed: {source}")
+            })?;
+            self.chunks.push(chunk);
+        }
+
+        let chunk_index = u32::try_from(self.chunks.len() - 1).map_err(|_| {
             format!(
-                "source-reference byte arena for {cf_name} requires {end} bytes, exceeding the u32 offset representation"
+                "source-reference arena for {cf_name} exceeds the u32 chunk-index representation"
             )
         })?;
-        self.bytes.extend_from_slice(key);
-        self.ranges.push(PackedSourceReferenceRange { start, end });
+        let chunk = self
+            .chunks
+            .last_mut()
+            .ok_or_else(|| format!("source-reference chunk allocation vanished for {cf_name}"))?;
+        let start = u32::try_from(chunk.len()).map_err(|_| {
+            format!(
+                "source-reference chunk for {cf_name} already exceeds the u32 offset representation"
+            )
+        })?;
+        let end = start.checked_add(key_len).ok_or_else(|| {
+            format!(
+                "source-reference chunk offset overflowed u32 while appending a {}-byte key for {cf_name}",
+                key.len()
+            )
+        })?;
+        chunk.extend_from_slice(key);
+        self.ranges.push(PackedSourceReferenceRange {
+            chunk: chunk_index,
+            start,
+            end,
+        });
         Ok(())
     }
 
     fn sort_and_dedup(&mut self) {
-        let bytes = self.bytes.as_slice();
+        let chunks = self.chunks.as_slice();
         self.ranges.sort_unstable_by(|left, right| {
-            packed_source_reference_key(bytes, *left)
-                .cmp(packed_source_reference_key(bytes, *right))
+            packed_source_reference_key(chunks, *left)
+                .cmp(packed_source_reference_key(chunks, *right))
         });
         self.ranges.dedup_by(|left, right| {
-            packed_source_reference_key(bytes, *left) == packed_source_reference_key(bytes, *right)
+            packed_source_reference_key(chunks, *left)
+                == packed_source_reference_key(chunks, *right)
         });
     }
 
     fn contains(&self, key: &[u8]) -> bool {
         self.ranges
-            .binary_search_by(|range| packed_source_reference_key(&self.bytes, *range).cmp(key))
+            .binary_search_by(|range| packed_source_reference_key(&self.chunks, *range).cmp(key))
             .is_ok()
     }
 
@@ -13736,22 +13783,95 @@ impl PackedSourceReferenceKeys {
         self.ranges.len()
     }
 
-    const fn packed_bytes(&self) -> usize {
-        self.bytes.len()
+    fn packed_bytes(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
+    }
+
+    fn packed_capacity_bytes(&self) -> usize {
+        self.chunks.iter().map(Vec::capacity).sum()
+    }
+
+    const fn chunk_count(&self) -> usize {
+        self.chunks.len()
     }
 
     const fn range_bytes(&self) -> usize {
         self.ranges.len() * size_of::<PackedSourceReferenceRange>()
     }
+
+    const fn range_capacity_bytes(&self) -> usize {
+        self.ranges.capacity() * size_of::<PackedSourceReferenceRange>()
+    }
 }
 
-fn packed_source_reference_key(bytes: &[u8], range: PackedSourceReferenceRange) -> &[u8] {
-    &bytes[range.start as usize..range.end as usize]
+fn packed_source_reference_key(chunks: &[Vec<u8>], range: PackedSourceReferenceRange) -> &[u8] {
+    &chunks[range.chunk as usize][range.start as usize..range.end as usize]
 }
 
 /// Source column family -> exact source row keys a live derived constellation
 /// still points at. The GC tick's allocation-compact protection set (#1882).
 type DerivedSourceReferences = BTreeMap<String, PackedSourceReferenceKeys>;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DerivedSourceReferenceMetrics {
+    rows: u64,
+    key_bytes: u64,
+    key_capacity_bytes: u64,
+    chunks: u64,
+    range_bytes: u64,
+    range_capacity_bytes: u64,
+}
+
+fn add_derived_source_reference_metric(
+    total: &mut u64,
+    label: &'static str,
+    value: usize,
+) -> StorageResult<()> {
+    let value = calyx_len_to_u64(CALYX_GC_CF, label, value)?;
+    *total = total
+        .checked_add(value)
+        .ok_or_else(|| calyx_write_failed_detail(CALYX_GC_CF, format!("{label} overflowed u64")))?;
+    Ok(())
+}
+
+fn derived_source_reference_metrics(
+    referenced: &DerivedSourceReferences,
+) -> StorageResult<DerivedSourceReferenceMetrics> {
+    let mut metrics = DerivedSourceReferenceMetrics::default();
+    for keys in referenced.values() {
+        add_derived_source_reference_metric(
+            &mut metrics.rows,
+            "Calyx GC protected source rows",
+            keys.len(),
+        )?;
+        add_derived_source_reference_metric(
+            &mut metrics.key_bytes,
+            "Calyx GC packed source-reference key bytes",
+            keys.packed_bytes(),
+        )?;
+        add_derived_source_reference_metric(
+            &mut metrics.key_capacity_bytes,
+            "Calyx GC packed source-reference key capacity bytes",
+            keys.packed_capacity_bytes(),
+        )?;
+        add_derived_source_reference_metric(
+            &mut metrics.chunks,
+            "Calyx GC packed source-reference chunks",
+            keys.chunk_count(),
+        )?;
+        add_derived_source_reference_metric(
+            &mut metrics.range_bytes,
+            "Calyx GC packed source-reference range bytes",
+            keys.range_bytes(),
+        )?;
+        add_derived_source_reference_metric(
+            &mut metrics.range_capacity_bytes,
+            "Calyx GC packed source-reference range capacity bytes",
+            keys.range_capacity_bytes(),
+        )?;
+    }
+    Ok(metrics)
+}
 
 /// Lease lifetime for the pinned `Base` census snapshot (#2058).
 ///
@@ -14051,43 +14171,7 @@ fn collect_derived_source_references(
     for keys in referenced.values_mut() {
         keys.sort_and_dedup();
     }
-    let mut referenced_rows = 0_u64;
-    let mut packed_key_bytes = 0_u64;
-    let mut range_index_bytes = 0_u64;
-    for keys in referenced.values() {
-        let key_count =
-            calyx_len_to_u64(CALYX_GC_CF, "Calyx GC protected source rows", keys.len())?;
-        referenced_rows = referenced_rows.checked_add(key_count).ok_or_else(|| {
-            calyx_write_failed_detail(
-                CALYX_GC_CF,
-                "Calyx GC protected source-row count overflowed u64".to_owned(),
-            )
-        })?;
-        packed_key_bytes = packed_key_bytes
-            .checked_add(calyx_len_to_u64(
-                CALYX_GC_CF,
-                "Calyx GC packed source-reference key bytes",
-                keys.packed_bytes(),
-            )?)
-            .ok_or_else(|| {
-                calyx_write_failed_detail(
-                    CALYX_GC_CF,
-                    "Calyx GC packed source-reference key bytes overflowed u64".to_owned(),
-                )
-            })?;
-        range_index_bytes = range_index_bytes
-            .checked_add(calyx_len_to_u64(
-                CALYX_GC_CF,
-                "Calyx GC packed source-reference range bytes",
-                keys.range_bytes(),
-            )?)
-            .ok_or_else(|| {
-                calyx_write_failed_detail(
-                    CALYX_GC_CF,
-                    "Calyx GC packed source-reference range bytes overflowed u64".to_owned(),
-                )
-            })?;
-    }
+    let packed = derived_source_reference_metrics(&referenced)?;
     let census = gc::DerivedSourceCensus {
         pinned_seq: walk.pinned_seq,
         pages: calyx_len_to_u64(CALYX_GC_CF, "Calyx GC census pages", walk.pages)?,
@@ -14101,7 +14185,7 @@ fn collect_derived_source_references(
             "Calyx GC census source column families",
             referenced.len(),
         )?,
-        referenced_rows,
+        referenced_rows: packed.rows,
     };
     tracing::info!(
         code = "STORAGE_CALYX_GC_SOURCE_CENSUS_COMPLETED",
@@ -14110,9 +14194,13 @@ fn collect_derived_source_references(
         base_rows_visited = census.base_rows_visited,
         referenced_column_families = census.referenced_column_families,
         referenced_rows = census.referenced_rows,
-        packed_key_bytes,
-        range_index_bytes,
-        "indexed every derived constellation's source reference from one pinned committed sequence into exact packed key arenas"
+        packed_key_bytes = packed.key_bytes,
+        packed_key_capacity_bytes = packed.key_capacity_bytes,
+        packed_key_chunks = packed.chunks,
+        range_index_bytes = packed.range_bytes,
+        range_index_capacity_bytes = packed.range_capacity_bytes,
+        chunk_bytes = PACKED_SOURCE_REFERENCE_CHUNK_BYTES,
+        "indexed every derived constellation's source reference from one pinned committed sequence into exact bounded-chunk key arenas"
     );
     Ok((referenced, census))
 }
