@@ -67,7 +67,7 @@ impl CfRouter {
         )?;
         let prepared = SstLevel::prepare(&summary, self.config.retains_lookup(cf))?;
         let mut replacement = SstLevel::new();
-        replacement.push_prepared(prepared);
+        replacement.push_prepared(prepared)?;
         shard.levels.insert(cf, replacement);
 
         for input in input_paths {

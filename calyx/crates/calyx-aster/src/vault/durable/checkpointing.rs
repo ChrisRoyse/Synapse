@@ -85,10 +85,11 @@ impl PreparedCheckpoint {
 }
 
 /// Physical output produced before a prepared checkpoint is manifested.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(in crate::vault) struct CheckpointMaterialization {
     pub sst_files: usize,
     pub sst_bytes: u64,
+    pub files: Vec<(ColumnFamily, crate::sst::SstSummary)>,
 }
 
 impl DurableVault {
@@ -159,6 +160,7 @@ impl DurableVault {
         &self,
         seq: u64,
         rows: &[WriteRow],
+        install: impl FnMut(&CheckpointMaterialization) -> Result<()>,
     ) -> Result<()> {
         self.stage_recovered_wal_batches(vec![(seq, rows.to_vec())])?;
         let Some(_checkpoint_guard) =
@@ -168,7 +170,7 @@ impl DurableVault {
                 "checkpoint reconciliation for committed seq {seq} could not acquire the checkpoint publisher lock without waiting while the global commit lock is held; the WAL batch remains staged and must be reconciled by the active checkpoint publisher"
             )));
         };
-        self.flush_pending_checkpoints()
+        self.flush_pending_checkpoints(install)
     }
 
     pub(in crate::vault) fn stage_checkpoint_batch(
@@ -290,31 +292,28 @@ impl DurableVault {
             let dir = self.cf_dir(cf);
             fs::create_dir_all(&dir).map_err(|error| storage_error("create CF dir", error))?;
             let path = dir.join(format!("{last_seq:020}-{COALESCED_FLUSH_INDEX:04}.sst"));
-            match &self.value_crypto {
+            let summary = match &self.value_crypto {
                 Some(context) => {
                     let entries = rows
                         .iter()
                         .map(|(key, value)| Ok((key.clone(), seal_value(context, cf, key, value)?)))
                         .collect::<Result<Vec<_>>>()?;
-                    let summary = write_sst(
+                    write_sst(
                         &path,
                         entries
                             .iter()
                             .map(|(key, value)| (key.as_slice(), value.as_slice())),
-                    )?;
-                    materialized.sst_files = materialized.sst_files.saturating_add(1);
-                    materialized.sst_bytes = materialized.sst_bytes.saturating_add(summary.bytes);
+                    )?
                 }
-                None => {
-                    let summary = write_sst(
-                        &path,
-                        rows.iter()
-                            .map(|(key, value)| (key.as_slice(), value.as_slice())),
-                    )?;
-                    materialized.sst_files = materialized.sst_files.saturating_add(1);
-                    materialized.sst_bytes = materialized.sst_bytes.saturating_add(summary.bytes);
-                }
-            }
+                None => write_sst(
+                    &path,
+                    rows.iter()
+                        .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                )?,
+            };
+            materialized.sst_files = materialized.sst_files.saturating_add(1);
+            materialized.sst_bytes = materialized.sst_bytes.saturating_add(summary.bytes);
+            materialized.files.push((cf, summary));
         }
         Ok(materialized)
     }
@@ -528,9 +527,13 @@ impl DurableVault {
     /// already hold the global commit lock and have exclusively acquired the
     /// checkpoint publisher lock. Routine maintenance uses the split
     /// reserve/materialize/publish path above so physical I/O is off-lock.
-    pub(super) fn flush_pending_checkpoints(&self) -> Result<()> {
+    pub(super) fn flush_pending_checkpoints(
+        &self,
+        mut install: impl FnMut(&CheckpointMaterialization) -> Result<()>,
+    ) -> Result<()> {
         loop {
-            let chunk = self.flush_pending_checkpoints_bounded(CHECKPOINT_DRAIN_MAX_BATCHES)?;
+            let chunk =
+                self.flush_pending_checkpoints_bounded(CHECKPOINT_DRAIN_MAX_BATCHES, &mut install)?;
             if chunk.remaining_batches == 0 {
                 return Ok(());
             }
@@ -559,11 +562,31 @@ impl DurableVault {
     pub(in crate::vault) fn flush_pending_checkpoints_bounded(
         &self,
         max_batches: usize,
+        install: &mut impl FnMut(&CheckpointMaterialization) -> Result<()>,
     ) -> Result<CheckpointDrainChunk> {
         let Some(prepared) = self.prepare_pending_checkpoint(max_batches)? else {
             return Ok(CheckpointDrainChunk::default());
         };
-        if let Err(error) = self.materialize_prepared_checkpoint(&prepared) {
+        let materialized = match self.materialize_prepared_checkpoint(&prepared) {
+            Ok(materialized) => materialized,
+            Err(error) => {
+                self.restage_prepared_checkpoint(prepared)?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = install(&materialized) {
+            tracing::error!(
+                code = "CALYX_ASTER_CHECKPOINT_ROUTER_INSTALL_FAILED",
+                base_durable_seq = prepared.base_durable_seq,
+                first_seq = prepared.first_seq,
+                last_seq = prepared.last_seq,
+                batches = prepared.batch_count(),
+                rows = prepared.rows,
+                sst_files = materialized.sst_files,
+                error_code = error.code,
+                error = %error.message,
+                "checkpoint SSTs are durable but could not be installed into the live router; refusing to advance the manifest and restoring the reserved prefix"
+            );
             self.restage_prepared_checkpoint(prepared)?;
             return Err(error);
         }

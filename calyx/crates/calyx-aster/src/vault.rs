@@ -1666,6 +1666,7 @@ where
         let mut sst_bytes_written = 0_u64;
         let mut max_reserve_elapsed_ms = 0_u128;
         let mut max_materialize_ms = 0_u128;
+        let mut max_router_install_ms = 0_u128;
         let mut max_publish_elapsed_ms = 0_u128;
         loop {
             // Sync the WAL BEFORE taking the commit lock.
@@ -1746,6 +1747,42 @@ where
             };
             let materialize_ms = materialize_started.elapsed().as_millis();
             max_materialize_ms = max_materialize_ms.max(materialize_ms);
+            // An immutable file is not part of a live LSM merely because its
+            // directory entry exists. Publish the prepared files into the
+            // current router version before advancing the manifest/replay
+            // floor; otherwise a latest-only process can later retire its
+            // recovered MVCC overlay and strand this exact WAL cohort until a
+            // restart rebuilds the router from disk (#2248).
+            let router_install_started = Instant::now();
+            if let Err(error) = self
+                .rows
+                .install_materialized_checkpoint_ssts(&materialized.files, operation)
+            {
+                tracing::error!(
+                    code = "CALYX_ASTER_CHECKPOINT_ROUTER_INSTALL_FAILED",
+                    operation,
+                    base_durable_seq = prepared.base_durable_seq,
+                    first_seq = prepared.first_seq,
+                    last_seq = prepared.last_seq,
+                    batches = prepared.batch_count(),
+                    rows = prepared.rows,
+                    sst_files = materialized.sst_files,
+                    materialize_ms,
+                    elapsed_ms = router_install_started.elapsed().as_millis(),
+                    error_code = error.code,
+                    error = %error.message,
+                    "checkpoint SSTs are durable but could not be installed into the live router; refusing to advance the manifest and restoring the reserved prefix"
+                );
+                if let Err(restage) = durable.restage_prepared_checkpoint(prepared) {
+                    return Err(CalyxError::aster_corrupt_shard(format!(
+                        "checkpoint router installation failed with error[{}]: {}; restoring its reserved prefix also failed with error[{}]: {}",
+                        error.code, error.message, restage.code, restage.message
+                    )));
+                }
+                return Err(error);
+            }
+            let router_install_ms = router_install_started.elapsed().as_millis();
+            max_router_install_ms = max_router_install_ms.max(router_install_ms);
             let publish_started = Instant::now();
             let chunk = match (|| {
                 self.ensure_writeable("checkpoint publication")?;
@@ -1797,8 +1834,9 @@ where
                 sst_files = materialized.sst_files,
                 sst_bytes = materialized.sst_bytes,
                 materialize_ms,
+                router_install_ms,
                 remaining_batches = chunk.remaining_batches,
-                "materialized immutable checkpoint SSTs with the global durable commit lock released"
+                "materialized and installed immutable checkpoint SSTs with the global durable commit lock released"
             );
             if chunk.remaining_batches == 0 {
                 break;
@@ -1828,6 +1866,7 @@ where
                 checkpoint_lock_wait_ms,
                 max_reserve_elapsed_ms,
                 max_materialize_ms,
+                max_router_install_ms,
                 max_publish_elapsed_ms,
                 elapsed_ms = started.elapsed().as_millis(),
                 max_batches_per_chunk = durable::CHECKPOINT_DRAIN_MAX_BATCHES,
@@ -1920,7 +1959,10 @@ where
             durable.advance_panel_content_watermarks_to_at_least(
                 &self.rows.panel_content_seqs_snapshot()?,
             )?;
-            durable.flush()?;
+            durable.flush(|materialized| {
+                self.rows
+                    .install_materialized_checkpoint_ssts(&materialized.files, "locked checkpoint")
+            })?;
         }
         Ok(())
     }

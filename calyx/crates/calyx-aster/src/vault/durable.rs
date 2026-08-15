@@ -613,9 +613,12 @@ impl DurableVault {
         self.batcher.flush_sync()
     }
 
-    pub(super) fn flush(&self) -> Result<()> {
+    pub(super) fn flush(
+        &self,
+        install: impl FnMut(&checkpointing::CheckpointMaterialization) -> Result<()>,
+    ) -> Result<()> {
         self.sync_wal()?;
-        self.flush_pending_checkpoints()
+        self.flush_pending_checkpoints(install)
     }
 
     pub(super) fn recycle_durable_wal_segments(

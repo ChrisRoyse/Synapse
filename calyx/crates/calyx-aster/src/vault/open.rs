@@ -222,7 +222,12 @@ where
                             durable.advance_panel_content_watermarks_to_at_least(
                                 &rows.panel_content_seqs_snapshot()?,
                             )?;
-                            durable.flush()?;
+                            durable.flush(|materialized| {
+                                rows.install_materialized_checkpoint_ssts(
+                                    &materialized.files,
+                                    "streaming recovery checkpoint",
+                                )
+                            })?;
                             staged_bytes = 0;
                         }
                         Ok(true)

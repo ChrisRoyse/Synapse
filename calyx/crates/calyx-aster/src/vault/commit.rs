@@ -930,7 +930,16 @@ where
                 let panel_watermarks = self.rows.panel_content_seqs_snapshot();
                 let checkpoint = panel_watermarks.and_then(|panel_watermarks| {
                     durable.advance_panel_content_watermarks_to_at_least(&panel_watermarks)?;
-                    durable.checkpoint_committed_batch_with_pending(durable_seq, rows)
+                    durable.checkpoint_committed_batch_with_pending(
+                        durable_seq,
+                        rows,
+                        |materialized| {
+                            self.rows.install_materialized_checkpoint_ssts(
+                                &materialized.files,
+                                "post-WAL reconciliation checkpoint",
+                            )
+                        },
+                    )
                 });
                 if rows
                     .iter()

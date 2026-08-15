@@ -1606,6 +1606,23 @@ impl VersionedCfStore {
         }
     }
 
+    /// Installs newly materialized durable checkpoint files into this
+    /// process's live router before the durable manifest can advance past
+    /// their WAL cohort.
+    pub(crate) fn install_materialized_checkpoint_ssts(
+        &self,
+        files: &[(ColumnFamily, SstSummary)],
+        operation: &'static str,
+    ) -> Result<()> {
+        let Some(router) = self.router.as_ref() else {
+            return Err(CalyxError::aster_corrupt_shard(format!(
+                "{operation}: checkpoint publication requires a live CF router to install {} materialized SSTs",
+                files.len()
+            )));
+        };
+        router.install_materialized_ssts(files, operation)
+    }
+
     /// Lists the physical `SlotId`s present as `cf/slot_*` directories.
     pub(crate) fn present_slot_cf_ids(&self) -> Result<BTreeSet<SlotId>> {
         let Some(router) = self.router.as_ref() else {

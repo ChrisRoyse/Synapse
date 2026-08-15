@@ -443,10 +443,10 @@ impl RouterShard {
     }
 
     /// Publishes every written sealed memtable at the front of `cf`'s queue.
-    fn drain_installable(&mut self, cf: ColumnFamily) {
+    fn drain_installable(&mut self, cf: ColumnFamily) -> Result<()> {
         loop {
             let Some(queue) = self.sealed.get_mut(&cf) else {
-                return;
+                return Ok(());
             };
             if !queue
                 .front()
@@ -455,15 +455,25 @@ impl RouterShard {
                 if queue.is_empty() {
                     self.sealed.remove(&cf);
                 }
-                return;
+                return Ok(());
             }
-            let Some(mut pending) = queue.pop_front() else {
-                return;
+            // Validate the complete replacement before removing the sealed
+            // memtable from the read path. A malformed/ambiguous SST name must
+            // leave the pending table authoritative rather than partially
+            // publishing a level change.
+            let Some(prepared) = queue
+                .front()
+                .and_then(|pending| pending.prepared.as_ref())
+                .cloned()
+            else {
+                return Ok(());
             };
-            let Some(prepared) = pending.prepared.take() else {
-                return;
+            let mut replacement = self.levels.get(&cf).cloned().unwrap_or_default();
+            replacement.push_prepared(prepared)?;
+            let Some(_pending) = queue.pop_front() else {
+                return Ok(());
             };
-            self.levels.entry(cf).or_default().push_prepared(prepared);
+            self.levels.insert(cf, replacement);
         }
     }
 }
@@ -1111,7 +1121,71 @@ impl CfRouter {
             )));
         }
         pending.prepared = Some(written.prepared);
-        shard.drain_installable(sealed.cf);
+        shard.drain_installable(sealed.cf)
+    }
+
+    /// Publishes already-fsynced durable checkpoint SSTs into the live serving
+    /// version without rescanning every file in the touched column families.
+    ///
+    /// File validation and retained-index construction happen before any
+    /// router lock is taken. All replacement levels are then built under the
+    /// complete touched-shard lock set and swapped only after every file has
+    /// passed canonical ordering checks. Active and sealed memtables remain in
+    /// place, so concurrent committed state is never discarded.
+    pub(crate) fn install_materialized_ssts(
+        &self,
+        files: &[(ColumnFamily, SstSummary)],
+        operation: &'static str,
+    ) -> Result<()> {
+        if files.is_empty() {
+            return Ok(());
+        }
+        let started_at = Instant::now();
+        let mut prepared_by_cf = BTreeMap::<ColumnFamily, Vec<PreparedLevelFile>>::new();
+        for (cf, summary) in files {
+            let expected_dir = self.cf_dir(*cf);
+            if summary.path.parent() != Some(expected_dir.as_path()) {
+                return Err(CalyxError::aster_corrupt_shard(format!(
+                    "{operation}: checkpoint SST {} claims column family {}, but its canonical directory is {}",
+                    summary.path.display(),
+                    cf.name(),
+                    expected_dir.display()
+                )));
+            }
+            prepared_by_cf
+                .entry(*cf)
+                .or_default()
+                .push(SstLevel::prepare(summary, self.config.retains_lookup(*cf))?);
+        }
+        let cfs = prepared_by_cf.keys().copied().collect::<Vec<_>>();
+        let cf_names = cfs.iter().map(|cf| cf.name()).collect::<Vec<_>>().join(",");
+        let mut guards = self.write_shards_for(cfs.iter().copied())?;
+        let mut replacements = BTreeMap::new();
+        for (cf, prepared_files) in prepared_by_cf {
+            let shard = guards.shard_mut(cf)?;
+            let mut replacement = shard.levels.get(&cf).cloned().unwrap_or_default();
+            for prepared in prepared_files {
+                replacement.push_prepared(prepared)?;
+            }
+            replacements.insert(cf, replacement);
+        }
+        // `ensure_cf` can still surface a real filesystem failure. Complete
+        // every such precondition before changing any served level so a
+        // multi-CF checkpoint never becomes partially visible.
+        for cf in &cfs {
+            guards.shard_mut(*cf)?.ensure_cf(&self.config, *cf)?;
+        }
+        for (cf, replacement) in replacements {
+            guards.shard_mut(cf)?.levels.insert(cf, replacement);
+        }
+        tracing::info!(
+            code = "CALYX_ASTER_CHECKPOINT_ROUTER_INSTALL_DONE",
+            operation,
+            cfs = %cf_names,
+            sst_files = files.len(),
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "installed materialized checkpoint SSTs into the live router serving version"
+        );
         Ok(())
     }
 

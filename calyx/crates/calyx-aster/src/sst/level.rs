@@ -8,7 +8,7 @@ use calyx_core::{CalyxError, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::storage_names::{SstName, classify_sst};
+use crate::storage_names::{SstName, classify_sst, ensure_unambiguous_sst_order, sst_order_key};
 
 const SST_LOOKUP_BUILD_PROGRESS_FILE_INTERVAL: usize = 10_000;
 
@@ -28,7 +28,7 @@ pub(super) struct LevelFile {
 
 /// A level entry whose lookup index has already been read from disk, so that
 /// installing it into a level costs no I/O. See [`SstLevel::prepare_with_lookup`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PreparedLevelFile(LevelFile);
 
 #[derive(Debug)]
@@ -357,10 +357,47 @@ impl SstLevel {
         }
     }
 
-    /// Inserts an entry prepared by [`Self::prepare_with_lookup`]. Pointer move
-    /// only — no filesystem access.
-    pub fn push_prepared(&mut self, prepared: PreparedLevelFile) {
-        self.files.insert(0, prepared.0);
+    /// Installs a prepared immutable file in canonical newest-first order.
+    ///
+    /// A newly written router flush is usually the newest file, but durable
+    /// checkpoint publication can race an older sealed-memtable writer. Always
+    /// ordering by the filename's commit-domain key prevents whichever I/O
+    /// happens to finish last from taking read precedence. The preparation
+    /// step already performed all file I/O; this method only validates names
+    /// and moves Arc-backed metadata.
+    pub fn push_prepared(&mut self, prepared: PreparedLevelFile) -> Result<()> {
+        let path = &prepared.0.path;
+        if self.files.iter().any(|file| file.path == *path) {
+            return Ok(());
+        }
+        ensure_unambiguous_sst_order(
+            self.files
+                .iter()
+                .map(|file| file.path.as_path())
+                .chain(std::iter::once(path.as_path())),
+        )?;
+        let order_key = sst_order_key(path)?.ok_or_else(|| {
+            CalyxError::aster_corrupt_shard(format!(
+                "prepared immutable level file {} is not a canonical SST",
+                path.display()
+            ))
+        })?;
+        let order = (order_key, path.clone());
+        let mut insert_at = self.files.len();
+        for (index, current) in self.files.iter().enumerate() {
+            let current_key = sst_order_key(&current.path)?.ok_or_else(|| {
+                CalyxError::aster_corrupt_shard(format!(
+                    "installed immutable level file {} is not a canonical SST",
+                    current.path.display()
+                ))
+            })?;
+            if order > (current_key, current.path.clone()) {
+                insert_at = index;
+                break;
+            }
+        }
+        self.files.insert(insert_at, prepared.0);
+        Ok(())
     }
 
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
