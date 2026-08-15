@@ -34,7 +34,10 @@ mod search;
 mod support;
 mod types;
 pub use budget::SearchBudget;
-pub use delta::{MAX_RECONCILED_DELTA_KEYS, PanelDeltaComposition, measure_panel_delta};
+pub use delta::{
+    MAX_RECONCILED_DELTA_KEYS, PanelDeltaComposition, ReconciledPanelMembership,
+    measure_panel_delta, reconcile_panel_membership,
+};
 use search::search_outcome_with_measured_slots;
 pub use types::{
     FusionChoice, FusionResolution, FusionTuning, GuardChoice, SearchFreshness, SearchOutcome,

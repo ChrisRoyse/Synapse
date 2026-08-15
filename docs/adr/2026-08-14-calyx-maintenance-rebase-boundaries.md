@@ -47,9 +47,13 @@ require its base sequence to cover the exact panel's derived-content watermark.
 One panel-content commit could therefore make membership unusable while the
 query delta was still small enough for search maintenance to report
 `none_needed`. Lens coverage and Loom then failed every scheduled tick with
-`SYNAPSE_CALYX_STALE_DERIVED`. Those independent whole-corpus phases also ran
-without explicit allocator-release boundaries, so dead pages from one phase
-remained committed while the next phase allocated its own corpus.
+`SYNAPSE_CALYX_STALE_DERIVED`. A first attempted repair made any newer content
+watermark force a rebuild. Physical readback disproved that policy: the real
+MCP rebuild's own durable audit ingest advanced the watermark four sequences
+after publication, so every successful rebuild immediately invalidated itself.
+Those independent whole-corpus phases also ran without explicit
+allocator-release boundaries, so dead pages from one phase remained committed
+while the next phase allocated its own corpus.
 
 ## Decision
 
@@ -95,13 +99,13 @@ the authority.
    in-place destination is required never to advance beyond unread source bytes,
    avoiding a second corpus-sized allocation while preserving exact lookup.
 9. Search-generation status reads the manifest, vault sequence, exact-panel
-   content watermark, and changed-key delta from one panel-pinned snapshot. A
-   content watermark newer than the generation base is a distinct
-   `content_stale` state. It forces an immediate authoritative rebuild even when
-   the bounded query delta remains reconcilable and regardless of the minimum
-   rebuild interval, because immutable membership consumers are already
-   unusable. The rebuild is accepted only after an independent status read says
-   `membership_stale=false`.
+   content watermark, and changed-key delta from one panel-pinned snapshot.
+   Panel membership uses the hash-verified immutable sidecar as its baseline,
+   then merges only the exact panel's changed Base identities at that same
+   snapshot: live additions are inserted, tombstoned or moved identities are
+   removed. It shares search's changed-key definition and 8,192-key hard bound.
+   An over-bound or unprovable history interval fails closed and requires an
+   authoritative rebuild; ordinary post-generation ingest does not.
 10. Each independent whole-corpus maintenance phase owns and releases its
     allocations before the next phase begins. The daemon invokes its installed
     allocator reclaimer after graph lanes, before panel coverage, after panel
@@ -130,8 +134,9 @@ the authority.
   an unbounded lease; stalled/abandoned readers still expire.
 - Duplicate references no longer leave their raw key bytes resident in the
   long-lived GC cache after their index entries are removed.
-- A generation cannot be reported healthy merely because its query delta is
-  bounded while its immutable panel-membership view is already stale.
+- Panel membership stays current under bounded routine ingest without a global
+  Base scan or a rebuild for every event, while over-bound/unprovable deltas
+  still refuse instead of serving an incomplete membership set.
 - Search status and maintenance decisions cannot combine a manifest from one
   instant with a panel watermark or delta from another.
 - Derived-state peak private memory is the largest live phase rather than the

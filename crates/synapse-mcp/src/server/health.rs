@@ -999,14 +999,13 @@ impl SynapseService {
             }),
             status: health_status.to_owned(),
             detail: Some(format!(
-                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} panel_content_seq={:?} membership_stale={:?} seq_lag={:?}                  delta_changed_keys={:?} delta_measured_at_unix_ms={:?} delta_composition={}                  max_reconciled_delta_keys={} rows_covered={:?} dense_lanes={} sparse_lanes={}                  age_ms={:?} rebuild_required={} slots=[{}] manifest_path={} panel_state_error={}                  remediation={}",
+                "state={} panel_version={:?} manifest_present={} built_at_seq={:?}                  vault_latest_seq={} panel_content_seq={:?} seq_lag={:?} delta_changed_keys={:?}                  delta_measured_at_unix_ms={:?} delta_composition={} max_reconciled_delta_keys={}                  rows_covered={:?} dense_lanes={} sparse_lanes={} age_ms={:?} rebuild_required={} slots=[{}]                  manifest_path={} panel_state_error={} remediation={}",
                 state,
                 status.panel_version,
                 status.manifest_present,
                 status.built_at_seq,
                 status.vault_latest_seq,
                 status.panel_content_seq,
-                status.membership_stale,
                 status.seq_lag,
                 measured_delta,
                 measured_at,
@@ -1031,7 +1030,6 @@ impl SynapseService {
             calyx_search_generation_manifest_present: Some(status.manifest_present),
             calyx_search_generation_built_at_seq: status.built_at_seq,
             calyx_search_generation_panel_content_seq: status.panel_content_seq,
-            calyx_search_generation_membership_stale: status.membership_stale,
             calyx_search_generation_seq_lag: status.seq_lag,
             calyx_search_generation_max_reconciled_delta_keys: Some(
                 status.max_reconciled_delta_keys,

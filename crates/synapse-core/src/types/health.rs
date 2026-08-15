@@ -632,10 +632,6 @@ pub struct SubsystemHealth {
     /// status snapshot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_search_generation_panel_content_seq: Option<u64>,
-    /// Whether the immutable membership sidecar predates that content
-    /// watermark. Any `true` value means panel-scoped consumers fail closed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub calyx_search_generation_membership_stale: Option<bool>,
     /// How far the generation is behind the vault, in sequences.
     ///
     /// Informational. It is NOT the quantity the limit below is enforced on and

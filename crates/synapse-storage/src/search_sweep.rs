@@ -285,15 +285,9 @@ impl PanelGenerationMaintenance {
                     .map_or(report.before.panel_content_seq, |after| {
                         after.panel_content_seq
                     });
-                let membership_stale = report
-                    .after
-                    .as_ref()
-                    .map_or(report.before.membership_stale, |after| {
-                        after.membership_stale
-                    });
                 format!(
                     "panel {}{active}{queryable} {disposition} action={} state={state} built_at_seq={:?} \
-                     panel_content_seq={panel_content_seq:?} membership_stale={membership_stale:?} \
+                     panel_content_seq={panel_content_seq:?} \
                      delta_changed_keys={:?} keys_to_bound={:?} limit={} rebuild_private_bytes={:?} elapsed_ms={}",
                     self.panel_version,
                     report.action.as_str(),

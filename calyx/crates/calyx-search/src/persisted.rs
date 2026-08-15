@@ -74,8 +74,8 @@ pub struct PersistedSearchManifestArtifact {
 /// The filter sidecar is the compact secondary access path from
 /// `(panel_version, CxId)` to Base. It contains one row for every Base row in
 /// the panel, including records with no searchable vector, and is sealed by
-/// the live manifest. Callers must still compare `base_seq` with the panel's
-/// pinned content watermark before treating these identities as current.
+/// the live manifest. Callers needing a current snapshot must pass it through
+/// `reconcile_panel_membership`; the immutable ids alone describe `base_seq`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PersistedPanelMembership {
     pub panel_version: u32,

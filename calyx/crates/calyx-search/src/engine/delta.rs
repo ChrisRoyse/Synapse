@@ -7,7 +7,7 @@ use calyx_sextant::IndexSearchHit;
 
 use crate::engine_trace::SearchTracer;
 use crate::error::CliResult;
-use crate::persisted::PersistedSearchIndexes;
+use crate::persisted::{PersistedPanelMembership, PersistedSearchIndexes};
 
 use super::support::SearchReadSnapshot;
 
@@ -116,6 +116,113 @@ impl PanelDeltaComposition {
             if self.slot_keys.is_empty() { "" } else { " " },
         )
     }
+}
+
+/// Current-snapshot membership derived from one hash-verified immutable
+/// sidecar plus its bounded, panel-scoped Base delta.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReconciledPanelMembership {
+    pub panel_version: u32,
+    pub base_seq: u64,
+    pub covered_to_seq: u64,
+    pub manifest_sha256: String,
+    pub sidecar_sha256: String,
+    pub sidecar_rows: usize,
+    pub changed_keys: usize,
+    pub ids: Vec<CxId>,
+}
+
+fn require_reconcilable_delta(composition: &PanelDeltaComposition, surface: &str) -> CliResult<()> {
+    if composition.changed_len() <= MAX_RECONCILED_DELTA_KEYS {
+        return Ok(());
+    }
+    Err(CalyxError {
+        code: DELTA_REBASE_CODE,
+        message: format!(
+            "{surface} delta contains {} changed keys between manifest base seq {} and pinned seq {}, exceeding the bounded reconciliation limit {MAX_RECONCILED_DELTA_KEYS} ({})",
+            composition.changed_len(),
+            composition.base_seq,
+            composition.pinned_seq,
+            composition.composition()
+        ),
+        remediation: "rebuild the exact panel search generation, then retry; the immutable generation is too far behind for bounded current-snapshot reconciliation",
+    }
+    .into())
+}
+
+fn merge_membership_delta(
+    persisted: PersistedPanelMembership,
+    changed: &[(CxId, bool)],
+    covered_to_seq: u64,
+) -> CliResult<ReconciledPanelMembership> {
+    let sidecar_rows = persisted.ids.len();
+    let capacity = sidecar_rows.checked_add(changed.len()).ok_or_else(|| CalyxError {
+        code: "CALYX_SEARCH_MEMBERSHIP_CAPACITY_OVERFLOW",
+        message: format!(
+            "panel {} membership capacity overflow: sidecar_rows={sidecar_rows} changed_keys={}",
+            persisted.panel_version,
+            changed.len()
+        ),
+        remediation: "preserve the manifest and changed-key history; inspect the reported counts before retrying",
+    })?;
+    let mut ids = Vec::new();
+    ids.try_reserve_exact(capacity).map_err(|error| CalyxError {
+        code: "CALYX_SEARCH_MEMBERSHIP_RESERVE_FAILED",
+        message: format!(
+            "reserve panel {} reconciled membership capacity {capacity}: {error}",
+            persisted.panel_version
+        ),
+        remediation: "release completed corpus owners and retry; if allocation still fails, inspect process-private memory and the reported membership counts",
+    })?;
+
+    let mut persisted_index = 0_usize;
+    let mut changed_index = 0_usize;
+    while persisted_index < persisted.ids.len() || changed_index < changed.len() {
+        match (
+            persisted.ids.get(persisted_index).copied(),
+            changed.get(changed_index).copied(),
+        ) {
+            (Some(existing), Some((changed_id, _))) if existing < changed_id => {
+                ids.push(existing);
+                persisted_index += 1;
+            }
+            (Some(existing), Some((changed_id, live_in_panel))) if existing == changed_id => {
+                if live_in_panel {
+                    ids.push(changed_id);
+                }
+                persisted_index += 1;
+                changed_index += 1;
+            }
+            (Some(_), Some((changed_id, live_in_panel))) => {
+                if live_in_panel {
+                    ids.push(changed_id);
+                }
+                changed_index += 1;
+            }
+            (Some(existing), None) => {
+                ids.push(existing);
+                persisted_index += 1;
+            }
+            (None, Some((changed_id, live_in_panel))) => {
+                if live_in_panel {
+                    ids.push(changed_id);
+                }
+                changed_index += 1;
+            }
+            (None, None) => break,
+        }
+    }
+
+    Ok(ReconciledPanelMembership {
+        panel_version: persisted.panel_version,
+        base_seq: persisted.base_seq,
+        covered_to_seq,
+        manifest_sha256: persisted.manifest_sha256,
+        sidecar_sha256: persisted.sidecar_sha256,
+        sidecar_rows,
+        changed_keys: changed.len(),
+        ids,
+    })
 }
 
 /// Measures one panel generation's changed-key delta against a pinned snapshot.
@@ -239,6 +346,72 @@ pub fn measure_panel_delta<C: Clock>(
     })
 }
 
+/// Reconciles one immutable panel-membership sidecar to an exact pinned
+/// snapshot using the same bounded changed-key law as search queries.
+///
+/// The sidecar remains the authoritative compact baseline. Only Base keys that
+/// changed after its generation are point-read: a live row for this panel is
+/// inserted/replaced, while a tombstoned or moved row is removed. Exceeding the
+/// query reconciliation bound fails closed with the same rebase error as a
+/// search query; there is no global Base scan.
+pub fn reconcile_panel_membership<C: Clock>(
+    vault: &AsterVault<C>,
+    indexes: &PersistedSearchIndexes,
+    snapshot: calyx_aster::mvcc::Snapshot,
+) -> CliResult<ReconciledPanelMembership> {
+    let persisted = indexes.panel_membership()?;
+    if persisted.base_seq > snapshot.seq() {
+        return Err(CalyxError {
+            code: "CALYX_SEARCH_MEMBERSHIP_FUTURE_GENERATION",
+            message: format!(
+                "panel {} membership generation seq {} is newer than pinned snapshot {}",
+                persisted.panel_version,
+                persisted.base_seq,
+                snapshot.seq()
+            ),
+            remediation: "re-pin after the published generation, or repair a manifest whose Base sequence is ahead of the vault",
+        }
+        .into());
+    }
+    if snapshot.derived_content_seq() <= persisted.base_seq {
+        let covered_to_seq = snapshot.seq();
+        return merge_membership_delta(persisted, &[], covered_to_seq);
+    }
+
+    let composition = measure_panel_delta(
+        vault,
+        snapshot,
+        persisted.panel_version,
+        persisted.base_seq,
+        std::iter::empty(),
+    )?;
+    require_reconcilable_delta(&composition, "panel membership")?;
+    let mut changed = Vec::new();
+    changed
+        .try_reserve_exact(composition.changed_len())
+        .map_err(|error| CalyxError {
+            code: "CALYX_SEARCH_MEMBERSHIP_DELTA_RESERVE_FAILED",
+            message: format!(
+                "reserve {} changed membership identities for panel {}: {error}",
+                composition.changed_len(),
+                persisted.panel_version
+            ),
+            remediation: "release completed corpus owners and retry; if allocation still fails, inspect process-private memory and the reported delta count",
+        })?;
+    for cx_id in &composition.changed {
+        let present = vault
+            .read_cf_snapshot(snapshot, ColumnFamily::Base, cx_id.as_bytes())?
+            .is_some();
+        let live_in_panel = if present {
+            vault.get_base_at_snapshot(*cx_id, snapshot)?.panel_version == persisted.panel_version
+        } else {
+            false
+        };
+        changed.push((*cx_id, live_in_panel));
+    }
+    merge_membership_delta(persisted, &changed, snapshot.seq())
+}
+
 pub(super) struct SearchDelta {
     changed: BTreeSet<CxId>,
     docs: BTreeMap<CxId, Constellation>,
@@ -316,19 +489,7 @@ impl SearchDelta {
             Some(changed_keys.len()),
             Some(composition.composition()),
         );
-        if changed_keys.len() > MAX_RECONCILED_DELTA_KEYS {
-            return Err(CalyxError {
-                code: DELTA_REBASE_CODE,
-                message: format!(
-                    "search delta contains {} changed keys between manifest base seq {base_seq} and pinned seq {}, exceeding the bounded reconciliation limit {MAX_RECONCILED_DELTA_KEYS} ({})",
-                    changed_keys.len(),
-                    read.seq(),
-                    composition.composition()
-                ),
-                remediation: "rebuild the exact panel search generation, then retry; the immutable generation is too far behind for bounded current-snapshot reconciliation",
-            }
-            .into());
-        }
+        require_reconcilable_delta(&composition, "search")?;
         let mut docs = BTreeMap::new();
         let mut vectors = query_slots
             .iter()
