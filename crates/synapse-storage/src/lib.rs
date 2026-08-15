@@ -2084,7 +2084,7 @@ impl Db {
     /// slot id (#2046).
     #[must_use]
     pub fn kernel_content_slot_for_panel(panel_version: u32) -> Option<u16> {
-        constellations::SYN_KERNEL_MAINTENANCE_TARGETS
+        constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS
             .iter()
             .find(|(declared_version, _)| *declared_version == panel_version)
             .map(|(_, content_slot)| *content_slot)

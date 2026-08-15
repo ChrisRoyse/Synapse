@@ -72,7 +72,8 @@ use crate::constellations::{
     SYN_PROCESS_PANEL_NAME, SYN_PROCESS_PANEL_VERSION, SYN_RECURRENCE_SUBJECT_PANEL_NAME,
     SYN_RECURRENCE_SUBJECT_PANEL_VERSION, SYN_REFLEX_PANEL_NAME, SYN_REFLEX_PANEL_VERSION,
     SYN_TIMELINE_PANEL_NAME, SYN_TIMELINE_PANEL_VERSION, SupersededPanelLineage,
-    assert_syn_lens_provenance_complete, superseded_panel_lineage, syn_active_panel_contract,
+    assert_panel_carries_graded_dense_lens, assert_syn_lens_provenance_complete,
+    superseded_panel_lineage, syn_queryable_panel_contract, syn_reconstructable_panel_contract,
 };
 use crate::{
     CfEstimateMap, CfRevisionGuard, CoherentScanLease, CoherentScanScope, FixedWidthScanPage,
@@ -1615,14 +1616,15 @@ impl CalyxVaultRuntime {
             true,
             |vault| {
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
-                let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
-                    .ok_or_else(|| {
-                        calyx_write_failed_detail(
-                            "calyx_oracle",
-                            "syn-action panel contract is absent",
-                        )
-                    })?
-                    .panel;
+                let mut panel =
+                    syn_queryable_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+                        .ok_or_else(|| {
+                            calyx_write_failed_detail(
+                                "calyx_oracle",
+                                "syn-action panel contract is absent",
+                            )
+                        })?
+                        .panel;
                 let assay = synapse_calyx::SynapseCalyxAssayParams::new(
                     SYN_ACTION_PANEL_VERSION,
                     "reward".to_owned(),
@@ -1685,7 +1687,7 @@ impl CalyxVaultRuntime {
         })?;
         self.with_vault("calyx_oracle", "complete action constellation", true, |vault| {
             let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
-            let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+            let mut panel = syn_queryable_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
                 .ok_or_else(|| calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent"))?
                 .panel;
             if free_slots.is_empty() {
@@ -1753,7 +1755,7 @@ impl CalyxVaultRuntime {
     fn oracle_measure_readiness(&self) -> StorageResult<Value> {
         self.with_vault("calyx_oracle", "measure action readiness", true, |vault| {
             let created_at_ms = calyx_clock_now_for_write(vault, "calyx_oracle")?;
-            let mut panel = syn_active_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
+            let mut panel = syn_queryable_panel_contract(SYN_ACTION_PANEL_VERSION, created_at_ms)?
                 .ok_or_else(|| calyx_write_failed_detail("calyx_oracle", "syn-action panel contract is absent"))?
                 .panel;
             let assay = synapse_calyx::SynapseCalyxAssayParams::new(
@@ -2579,12 +2581,31 @@ fn ensure_builtin_temporal_panel_registrations(vault: &SynapseCalyxVault) -> Sto
 /// this is a no-op once the version is published and never churns `manifest_seq`.
 fn ensure_active_panel_published(vault: &SynapseCalyxVault) -> StorageResult<()> {
     let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-    let Some(contract) = syn_active_panel_contract(SYN_TIMELINE_PANEL_VERSION, created_at_ms)?
+    let mut scheduled = BTreeSet::new();
+    for &(panel_version, _content_slot) in constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
+        if !scheduled.insert(panel_version) {
+            return Err(StorageError::WriteFailed {
+                cf_name: "calyx_manifest".to_owned(),
+                detail: format!(
+                    "STORAGE_CALYX_MAINTENANCE_PANEL_DUPLICATE: association-maintenance panel {panel_version} is declared more than once; remediation=keep exactly one scheduled target per panel generation"
+                ),
+            });
+        }
+        if syn_queryable_panel_contract(panel_version, created_at_ms)?.is_none() {
+            return Err(StorageError::WriteFailed {
+                cf_name: "calyx_manifest".to_owned(),
+                detail: format!(
+                    "STORAGE_CALYX_MAINTENANCE_PANEL_NOT_QUERYABLE: association-maintenance panel {panel_version} has no query-admissible contract; remediation=remove the finite-only panel from SYN_ASSOCIATION_MAINTENANCE_TARGETS or explicitly add a genuinely graded dense lens before scheduling neighbourhood work"
+                ),
+            });
+        }
+    }
+    let Some(contract) = syn_queryable_panel_contract(SYN_TIMELINE_PANEL_VERSION, created_at_ms)?
     else {
         return Err(StorageError::WriteFailed {
             cf_name: "calyx_manifest".to_owned(),
             detail: format!(
-                "STORAGE_CALYX_ACTIVE_PANEL_CONTRACT_MISSING: no enumerated content-slot contract for primary panel generation {SYN_TIMELINE_PANEL_VERSION}; remediation=add the panel's slot contract to syn_active_panel_contract before publication"
+                "STORAGE_CALYX_ACTIVE_PANEL_CONTRACT_MISSING: no query-admissible content-slot contract for primary panel generation {SYN_TIMELINE_PANEL_VERSION}; remediation=add the exact reconstructable contract and explicitly admit its graded geometry through syn_queryable_panel_contract before publication"
             ),
         });
     };
@@ -2660,7 +2681,7 @@ fn retire_search_generation_on_vault(
         true,
         |vault| {
             let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-            if syn_active_panel_contract(panel_version, created_at_ms)?.is_some() {
+            if syn_queryable_panel_contract(panel_version, created_at_ms)?.is_some() {
                 return Err(StorageError::CalyxWriteFailed {
                     cf_name: source.clone(),
                     code: "STORAGE_SEARCH_GENERATION_NOT_RETIRABLE",
@@ -3462,12 +3483,12 @@ fn lifecycle_base_constellation_from_source(
     Ok((identity, base))
 }
 
-fn resolve_panel_contract(
+fn resolve_queryable_panel_contract(
     vault: &SynapseCalyxVault,
     panel_version: u32,
     created_at_ms: u64,
 ) -> StorageResult<Option<SynapseCalyxPanelState>> {
-    if let Some(contract) = syn_active_panel_contract(panel_version, created_at_ms)? {
+    if let Some(contract) = syn_queryable_panel_contract(panel_version, created_at_ms)? {
         return Ok(Some(SynapseCalyxPanelState {
             panel: contract.panel,
             registry: contract.registry,
@@ -3476,19 +3497,20 @@ fn resolve_panel_contract(
     }
     let mut matched = None;
     for entry in constellations::builtin_panel_catalog() {
-        let base_registry = match syn_active_panel_contract(entry.panel_version, created_at_ms)? {
-            Some(base) => base.registry,
-            None if matches!(
-                entry.panel_name,
-                constellations::SYN_GRAPHPOS_APP_PANEL_NAME
-                    | constellations::SYN_GRAPHPOS_PROCESS_PANEL_NAME
-                    | constellations::SYN_PATH_HIERARCHY_PANEL_NAME
-            ) =>
-            {
-                calyx_registry::Registry::new()
-            }
-            None => continue,
-        };
+        let base_registry =
+            match syn_reconstructable_panel_contract(entry.panel_version, created_at_ms)? {
+                Some(base) => base.registry,
+                None if matches!(
+                    entry.panel_name,
+                    constellations::SYN_GRAPHPOS_APP_PANEL_NAME
+                        | constellations::SYN_GRAPHPOS_PROCESS_PANEL_NAME
+                        | constellations::SYN_PATH_HIERARCHY_PANEL_NAME
+                ) =>
+                {
+                    calyx_registry::Registry::new()
+                }
+                None => continue,
+            };
         let Some(candidate) = vault
             .reconstruct_panel_lifecycle_contract(entry.panel_name, base_registry)
             .map_err(|source| {
@@ -3504,6 +3526,11 @@ fn resolve_panel_contract(
         if candidate.panel.version != panel_version {
             continue;
         }
+        assert_panel_carries_graded_dense_lens(
+            candidate.panel.version,
+            &candidate.panel.slots,
+            &candidate.registry,
+        )?;
         if matched.is_some() {
             return Err(StorageError::ReadFailed {
                 cf_name: "calyx_registry".to_owned(),
@@ -4528,7 +4555,7 @@ impl StorageBackend for CalyxBackend {
                 }
 
                 // Genuinely pass-level, so it is checked once here rather than
-                // once per panel inside `syn_active_panel_contract`. An
+                // once per panel inside `syn_queryable_panel_contract`. An
                 // undeclared lens provenance is a property of the *code*, not of
                 // any one generation, and attributing it to whichever panel the
                 // loop happened to reach first would name the wrong culprit
@@ -4555,7 +4582,8 @@ impl StorageBackend for CalyxBackend {
                     // with it and recall went to zero (#1971 finding 2). It is
                     // now recorded against its own generation exactly like a
                     // rebuild failure, and the sweep continues.
-                    let supplied = match syn_active_panel_contract(panel_version, created_at_ms) {
+                    let supplied = match syn_queryable_panel_contract(panel_version, created_at_ms)
+                    {
                         Ok(contract) => contract.map(|contract| SynapseCalyxPanelState {
                             panel: contract.panel,
                             registry: contract.registry,
@@ -4726,22 +4754,18 @@ impl StorageBackend for CalyxBackend {
         &self,
         max_records: usize,
     ) -> StorageResult<synapse_calyx::SynapseCalyxLensCoverageStatus> {
-        // The panels Synapse registers and writes rows to. Measured together so
-        // one panel losing its lens layer is visible next to the panels that
-        // still carry theirs (#1894).
-        const PANELS: [u32; 4] = [
-            SYN_TIMELINE_PANEL_VERSION,
-            SYN_EPISODE_PANEL_VERSION,
-            SYN_AGENT_EVENT_PANEL_VERSION,
-            SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
-        ];
+        // Association health follows query admission rather than the storage
+        // schema catalog. Every panel here has a sealed search-membership
+        // generation and graded geometry; reconstructable finite-only panels
+        // (notably agent-event after #1965) are intentionally absent.
+        let panels = constellations::declared_queryable_panel_versions(0);
         self.vault.with_vault(
             "calyx_lens_coverage",
             "measure Calyx panel lens coverage",
             true,
             |vault| {
                 vault
-                    .lens_coverage_status(&PANELS, max_records)
+                    .lens_coverage_status(&panels, max_records)
                     .map_err(|source| {
                         calyx_write_failed(
                             "calyx_lens_coverage",
@@ -4915,7 +4939,7 @@ impl StorageBackend for CalyxBackend {
             false,
             |vault| {
                 let created_at_ms = calyx_clock_now_for_read(vault, "calyx_registry")?;
-                let panel = resolve_panel_contract(vault, panel_version, created_at_ms)?
+                let panel = resolve_queryable_panel_contract(vault, panel_version, created_at_ms)?
                     .ok_or_else(|| StorageError::BackendInvalidConfig {
                         value: panel_version.to_string(),
                         detail: format!(
@@ -5281,7 +5305,7 @@ impl StorageBackend for CalyxBackend {
                 // different panel — the same refusal as before.
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
                 let supplied =
-                    resolve_panel_contract(vault, expected_panel_version, created_at_ms)?;
+                    resolve_queryable_panel_contract(vault, expected_panel_version, created_at_ms)?;
                 vault
                     .rebuild_search_indexes_for_panel(expected_panel_version, supplied.as_ref())
                     .map_err(|source| {
@@ -5307,7 +5331,7 @@ impl StorageBackend for CalyxBackend {
             true,
             |vault| {
                 let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
-                let panel = resolve_panel_contract(vault, expected_panel_version, created_at_ms)?
+                let panel = resolve_queryable_panel_contract(vault, expected_panel_version, created_at_ms)?
                     .ok_or_else(|| {
                         StorageError::BackendInvalidConfig {
                             value: expected_panel_version.to_string(),
@@ -5360,7 +5384,7 @@ impl StorageBackend for CalyxBackend {
             |vault| {
                 // A find that names a non-active panel needs that panel's slot
                 // map to measure its query through (#1668). synapse-calyx cannot
-                // reconstruct it — `syn_active_panel_contract` lives here, in the
+                // reconstruct it — `syn_queryable_panel_contract` lives here, in the
                 // crate that depends on it — so the contract is resolved on this
                 // side and handed down.
                 //
@@ -5371,7 +5395,7 @@ impl StorageBackend for CalyxBackend {
                 let supplied = match params.panel_version {
                     Some(version) => {
                         let created_at_ms = calyx_clock_now_for_read(vault, "calyx_manifest")?;
-                        resolve_panel_contract(vault, version, created_at_ms)?
+                        resolve_queryable_panel_contract(vault, version, created_at_ms)?
                     }
                     None => None,
                 };
@@ -5839,10 +5863,10 @@ impl StorageBackend for CalyxBackend {
                         detail: "panel lifecycle mutations require an exact active built-in panel generation; superseded and unknown generations are immutable".to_owned(),
                     })?;
                 let now = calyx_clock_now_for_write(vault, "calyx_registry")?;
-                let contract = syn_active_panel_contract(panel_version, now)?.ok_or_else(|| {
+                let contract = syn_reconstructable_panel_contract(panel_version, now)?.ok_or_else(|| {
                     StorageError::BackendInvalidConfig {
                         value: panel_version.to_string(),
-                        detail: "the active panel has no reconstructable built-in contract; declare every slot runtime in syn_active_panel_contract before mutating it".to_owned(),
+                        detail: "the active panel has no reconstructable built-in contract; declare every slot runtime in syn_reconstructable_panel_contract before mutating it".to_owned(),
                     }
                 })?;
                 let candidates = vault
@@ -6640,7 +6664,7 @@ impl StorageBackend for CalyxBackend {
                 if params.calibration_panel.is_none() {
                     let created_at_ms = calyx_clock_now_for_write(vault, "calyx_manifest")?;
                     params.calibration_panel =
-                        syn_active_panel_contract(params.panel_version, created_at_ms)?
+                        syn_queryable_panel_contract(params.panel_version, created_at_ms)?
                             .map(|contract| contract.panel);
                 }
                 vault.guard_calibrate(&params).map_err(|source| {

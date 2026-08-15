@@ -444,13 +444,15 @@ const AE_SLOT_USAGE_TOTAL_LOG1P: SlotId = SlotId::new(33);
 // magnitude-weighted record vector. New generations must not write it (#1965).
 const AE_SLOT_HAS_END_STATE: SlotId = SlotId::new(114);
 
-/// Cold grounding-kernel maintenance contracts for the three operator-history
-/// domains named by #1675. These live beside the slot declarations so a panel
-/// bump cannot silently leave the scheduler targeting a retired lane.
-pub(crate) const SYN_KERNEL_MAINTENANCE_TARGETS: &[(u32, u16)] = &[
+/// Query-admissible panels whose neighbourhood-derived Loom and Lodestar
+/// artifacts are maintained unattended.
+///
+/// One table owns both schedules because both consumers require the same sealed
+/// search-membership generation and graded dense geometry. A finite-only panel
+/// must not appear here merely because its storage schema is reconstructable.
+pub(crate) const SYN_ASSOCIATION_MAINTENANCE_TARGETS: &[(u32, u16)] = &[
     (SYN_TIMELINE_PANEL_VERSION, TL_SLOT_RECORD_VECTOR.get()),
     (SYN_EPISODE_PANEL_VERSION, EP_SLOT_RECORD_VECTOR.get()),
-    (SYN_AGENT_EVENT_PANEL_VERSION, AE_SLOT_KIND_ONEHOT.get()),
 ];
 
 const AT_SLOT_ROLE_ONEHOT: SlotId = SlotId::new(35);
@@ -2427,7 +2429,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
 /// live panel version, so a version bump cannot silently detach the anchor's
 /// determining-field set and turn a refusal into a clean pass.
 ///
-/// Called from [`syn_active_panel_contract`], which is on the daemon's startup
+/// Called from [`syn_reconstructable_panel_contract`], which is on the daemon's startup
 /// path: a drifted declaration stops the process rather than publishing a panel
 /// whose slots cannot be adjudicated.
 ///
@@ -2949,9 +2951,9 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
 ///
 /// `find operation=similar` / `storage operation=find_similar` accept an
 /// explicit `panel_version` and search it directly. What they accept is decided
-/// by exactly one thing: whether [`syn_active_panel_contract`] declares a slot
-/// contract for that version. A version with no contract fails closed rather
-/// than being searched through a neighbouring panel's slot map, so the set of
+/// by exactly one thing: whether [`syn_queryable_panel_contract`] advertises a
+/// query contract for that version. A version with no query contract fails
+/// closed rather than being searched through a neighbouring panel's slot map, so the set of
 /// versions a query can *reach* is precisely the live catalog generations that
 /// have a contract.
 ///
@@ -2980,7 +2982,7 @@ pub fn declared_queryable_panel_versions(created_at_ms: u64) -> Vec<u32> {
         .into_iter()
         .filter(|entry| {
             !matches!(
-                syn_active_panel_contract(entry.panel_version, created_at_ms),
+                syn_queryable_panel_contract(entry.panel_version, created_at_ms),
                 Ok(None)
             )
         })
@@ -3431,17 +3433,22 @@ pub struct SynActivePanelContract {
     pub registry: Registry,
 }
 
-/// Returns the complete built-in contract for a known panel generation.
+/// Returns the complete reconstructable storage contract for a known panel
+/// generation.
 ///
-/// Unknown generations return `Ok(None)` and are never synthesized from a
-/// nearby version.
+/// This describes how the panel's persisted slots are encoded. It does **not**
+/// advertise that a search/neighbourhood operation can rank the panel. That
+/// separate capability is declared by [`syn_queryable_panel_contract`]. In
+/// particular, agent-event is reconstructable here but intentionally not
+/// queryable: #1965 retired its tied record vector and every remaining direction
+/// is finite.
 ///
 /// # Errors
 ///
 /// Returns an error when a built-in slot has a non-reconstructable runtime or
 /// when its frozen lens contract and structured registry specification differ.
 #[must_use = "panel contract errors and unknown generations must be handled"]
-pub fn syn_active_panel_contract(
+pub fn syn_reconstructable_panel_contract(
     panel_version: u32,
     created_at_ms: u64,
 ) -> StorageResult<Option<SynActivePanelContract>> {
@@ -3462,9 +3469,6 @@ pub fn syn_active_panel_contract(
         SYN_ACTION_PANEL_VERSION => action_panel_slots(panel_version, &mut registry)?,
         _ => return Ok(None),
     };
-    // #1963 ask 3: a panel that cannot support a neighbourhood analysis says so
-    // at admission, not three analyses later.
-    assert_panel_carries_graded_dense_lens(panel_version, &slots, &registry)?;
     Ok(Some(SynActivePanelContract {
         panel: Panel {
             version: panel_version,
@@ -3477,12 +3481,62 @@ pub fn syn_active_panel_contract(
     }))
 }
 
+/// Returns the complete contract only when the generation explicitly supports
+/// fused search and neighbourhood-derived intelligence.
+///
+/// Queryability is a capability declaration, not an inference from the presence
+/// of a storage schema. Every declared generation is also checked for a graded
+/// dense lens, so a broken declaration is a hard error and remains visible to
+/// the search maintainer. Reconstructable finite-only panels return `Ok(None)`.
+///
+/// # Errors
+///
+/// Returns an error when a declared queryable generation has no exact
+/// reconstructable contract, when that contract has no graded dense lens, or
+/// when a frozen slot runtime/provenance declaration is invalid.
+#[must_use = "query-admission errors and non-queryable generations must be handled"]
+pub fn syn_queryable_panel_contract(
+    panel_version: u32,
+    created_at_ms: u64,
+) -> StorageResult<Option<SynActivePanelContract>> {
+    if !matches!(
+        panel_version,
+        SYN_TIMELINE_PANEL_VERSION
+            | SYN_EPISODE_PANEL_VERSION
+            | SYN_MCP_USAGE_PANEL_VERSION
+            | SYN_AGENT_TRANSCRIPT_PANEL_VERSION
+            | SYN_ACTION_PANEL_VERSION
+    ) {
+        return Ok(None);
+    }
+    let contract = syn_reconstructable_panel_contract(panel_version, created_at_ms)?.ok_or_else(
+        || {
+            panel_lifecycle_error(
+                "CALYX_QUERYABLE_PANEL_CONTRACT_MISSING",
+                &format!(
+                    "panel {panel_version} is declared queryable but has no reconstructable slot contract"
+                ),
+                "declare the exact frozen slot runtimes before advertising this panel as queryable",
+            )
+        },
+    )?;
+    // #1963 ask 3: a panel that cannot support a neighbourhood analysis says so
+    // at admission, not three analyses later.
+    assert_panel_carries_graded_dense_lens(
+        panel_version,
+        &contract.panel.slots,
+        &contract.registry,
+    )?;
+    Ok(Some(contract))
+}
+
 /// The built-in contract for the live agent-event panel.
 ///
-/// This mirrors [`build_agent_event_constellation`] exactly. The scheduled Loom
-/// and Lodestar routes consume this panel, so omitting it from the reconstructable
-/// contract made those real consumers depend on a search-membership generation
-/// that the declared-queryable maintainer was structurally unable to build.
+/// This mirrors [`build_agent_event_constellation`] exactly. It exists for
+/// lifecycle, grading, and measurement consumers. It is deliberately absent
+/// from [`syn_queryable_panel_contract`]: its measured-constant record vector was
+/// retired by #1965, so the remaining finite-direction lanes cannot honestly
+/// rank a neighbourhood or support a search-membership generation.
 #[allow(
     clippy::too_many_lines,
     reason = "agent event panel contract is a one-to-one slot-to-frozen-lens map mirroring build_agent_event_constellation; splitting would obscure the stable contract"
@@ -3663,7 +3717,7 @@ pub struct SynSlotCosineGrading {
 pub fn syn_panel_cosine_grading(
     panel_version: u32,
 ) -> StorageResult<Option<Vec<SynSlotCosineGrading>>> {
-    let Some(contract) = syn_active_panel_contract(panel_version, 0)? else {
+    let Some(contract) = syn_reconstructable_panel_contract(panel_version, 0)? else {
         return Ok(None);
     };
     let mut rows = Vec::with_capacity(contract.panel.slots.len());
@@ -4086,7 +4140,7 @@ fn persisted_syn_runtime_kind(encoder: RegistryAlgorithmicEncoder) -> StorageRes
 ///
 /// Declared for `SYN_AGENT_TRANSCRIPT_PANEL_VERSION` only. The superseded
 /// generations (`..._PRE_1921` = 1904003, `..._PRE_1904` = 1665002) carry
-/// different slot sets and are deliberately absent: `syn_active_panel_contract`
+/// different slot sets and are deliberately absent: `syn_reconstructable_panel_contract`
 /// returns `None` for them rather than validating their rows against this map.
 ///
 /// This is the largest corpus on the vault — 26,049 records at 1.0 coverage,
@@ -7162,12 +7216,13 @@ pub(crate) fn resolve_deferred_measurement_plans(
     created_at_ms: u64,
     plans: &[&DeferredMeasurementPlan],
 ) -> StorageResult<Vec<Vec<(SlotId, SlotVector)>>> {
-    let contract = syn_active_panel_contract(panel_version, created_at_ms)?.ok_or_else(|| {
-        measurement_error(
-            "Calyx measurement batch panel is not registered",
-            panel_version,
-        )
-    })?;
+    let contract =
+        syn_reconstructable_panel_contract(panel_version, created_at_ms)?.ok_or_else(|| {
+            measurement_error(
+                "Calyx measurement batch panel is not registered",
+                panel_version,
+            )
+        })?;
     let mut slot_by_lens = BTreeMap::new();
     for slot in &contract.panel.slots {
         if let Some(first_slot) = slot_by_lens.insert(slot.lens_id, slot.slot_id) {

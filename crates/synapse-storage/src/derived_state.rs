@@ -609,11 +609,7 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        for panel_version in [
-            crate::constellations::SYN_TIMELINE_PANEL_VERSION,
-            crate::constellations::SYN_EPISODE_PANEL_VERSION,
-            crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
-        ] {
+        for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
             watermarks.entry(panel_version).or_insert(registered_at_ns);
         }
     } else {
@@ -1260,19 +1256,14 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     // This runs after the coverage census so it never delays the cheaper
     // structural health signals above. Each target owns an independent
     // watermark; one failed panel cannot advance itself or suppress the other
-    // two panels' work.
+    // panel's work.
     //
     // Each panel owns disjoint keys, but that does not make its resident set
     // free: a weave retains its dense corpus and graph products until its batch
     // is committed. Run and account for one panel completely before loading the
     // next. Fixed panel order also preserves the outcome-ledger and advisory
     // semantics without result slots that keep completed products alive.
-    let weave_panels = [
-        crate::constellations::SYN_TIMELINE_PANEL_VERSION,
-        crate::constellations::SYN_EPISODE_PANEL_VERSION,
-        crate::constellations::SYN_AGENT_EVENT_PANEL_VERSION,
-    ];
-    for panel_version in weave_panels {
+    for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
         let outcome = weave_panel_subpass(&db, panel_version);
         if let Some((code, detail)) = outcome.advisory {
             record_advisory(code, detail);
@@ -2332,7 +2323,8 @@ fn drive_scheduled_kernels(
 
     let mut failures = Vec::new();
     let mut eligible_targets = 0usize;
-    for &(panel_version, content_slot) in crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS {
+    for &(panel_version, content_slot) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS
+    {
         let panel = coverage
             .panels
             .iter()
@@ -2429,7 +2421,7 @@ fn drive_scheduled_kernels(
     }
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_KERNEL_REBUILD_PASS",
-        targets = crate::constellations::SYN_KERNEL_MAINTENANCE_TARGETS.len(),
+        targets = crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS.len(),
         eligible_targets,
         max_records = KERNEL_REBUILD_MAX_RECORDS,
         math_execution_class =

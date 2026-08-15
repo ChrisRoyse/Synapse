@@ -20,13 +20,19 @@ second runner and rebuilt the same corpus-sized census. The duplicate ownership,
 not an absent memory limit, raised process-private commit above 1 GiB.
 
 A later physical tick exposed two adjacent contract failures. The live
-`syn-agent-event-v1` generation was an explicit Loom/Lodestar consumer but was
-absent from the reconstructable panel contract, so the search maintainer could
-never publish the membership generation those consumers require. Separately, a
-progressing panel-membership walk outlived its fixed 30-second reader lease and
-failed after the watchdog correctly expired the pin. The lease duration had
-become an accidental operation timeout even though the scan was still making
-bounded forward progress.
+`syn-agent-event-v1` generation was an explicit Loom/Lodestar consumer but had
+no search membership generation. An initial change added its exact storage
+schema to the existing `syn_active_panel_contract`; the real search trigger then
+correctly refused it with `CALYX_PANEL_NO_GRADED_DENSE_LENS`. #1965 had retired
+the panel's only graded record vector after measuring one tied cosine value over
+the real corpus. Its remaining lanes have finite directions and cannot rank a
+neighbourhood. The actual defect was therefore conflating a reconstructable
+storage schema with advertised query capability, plus scheduling a finite-only
+panel for consumers that require query membership. Separately, a progressing
+panel-membership walk outlived its fixed 30-second reader lease and failed after
+the watchdog correctly expired the pin. The lease duration had become an
+accidental operation timeout even though the scan was still making bounded
+forward progress.
 
 Neither condition can be repaired incrementally. The first lacks the historical
 facts needed to prove a delta. The second would require changing already
@@ -59,12 +65,14 @@ the authority.
    allocating the replacement. A failed replacement leaves the cache absent,
    so the next pass must rebuild authoritative state instead of serving stale
    reachability.
-6. The panel catalog, ingest constructor, reconstructable contract, declared
-   queryable set, and scheduled consumers form one closed schema contract. A
-   scheduled consumer may not name a live built-in generation whose exact lens
-   contract cannot be reconstructed. The agent-event contract therefore mirrors
-   its ingest lenses slot-for-slot and is derived into the maintained/queryable
-   set by the existing single authority.
+6. Storage schema and query capability are distinct authorities. The
+   reconstructable contract mirrors ingest slot-for-slot and supports lifecycle,
+   grading, and measurement. The queryable contract is an explicit subset and
+   additionally enforces a genuinely graded dense lens. Agent-event keeps its
+   exact reconstructable contract but is intentionally absent from query
+   admission. Lens coverage follows the declared-queryable set; unattended Loom
+   and Lodestar share one target table containing only query-admissible panels.
+   Startup validates that table and refuses duplicate or non-queryable targets.
 7. A progressing panel walk renews the same registered reader id and pinned
    sequence at a bounded row cadence. Renewal validates presence, liveness, and
    sequence identity atomically under the lease-registry lock. Missing, expired,
@@ -88,8 +96,10 @@ the authority.
 - Periodic and operator GC can no longer retain two copies of the exact Base
   reachability index, and rebase peak memory no longer includes old + new
   baselines simultaneously.
-- Scheduled Loom/Lodestar maintenance can build and open the live agent-event
-  membership generation instead of failing forever on an impossible manifest.
+- Scheduled search, lens coverage, Loom, and Lodestar no longer request an
+  impossible agent-event membership generation. Agent-event's real schema stays
+  available to non-neighbourhood lifecycle and grading consumers, while a
+  direct neighbourhood request fails closed instead of inventing queryability.
 - Large progressing panel scans remain one coherent MVCC instant without using
   an unbounded lease; stalled/abandoned readers still expire.
 - Duplicate references no longer leave their raw key bytes resident in the
@@ -104,5 +114,7 @@ the authority.
 - [Rust `Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) and [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html): shared ownership points clones at one allocation, while synchronized interior mutability gives one-at-a-time access to the protected state.
 - [Rust `Vec`](https://doc.rust-lang.org/std/vec/struct.Vec.html): vectors do not shrink automatically; capacity is observable, and `shrink_to_fit` explicitly requests release of unused backing capacity.
 - [Confluent Schema Registry concepts](https://docs.confluent.io/platform/current/schema-registry/fundamentals/index.html): one versioned registry is the serving authority for schemas and compatibility metadata, preventing producers and consumers from maintaining divergent declarations.
+- [Kubernetes API discovery](https://kubernetes.io/docs/concepts/overview/kubernetes-api/): supported resources/versions/operations are advertised by Discovery separately from the OpenAPI resource schemas; a schema's existence is not itself an operation capability.
+- [PostgreSQL operator classes](https://www.postgresql.org/docs/current/indexes-opclass.html): an index is valid for the operators and semantics declared by its operator class, not merely because a column's data type can be stored.
 - [etcd lease API](https://etcd.io/docs/v3.7/learning/api/): a live lease is extended through explicit keep-alives; expiry remains the fail-closed liveness boundary when keep-alives stop.
 - [Kubernetes Leases](https://kubernetes.io/docs/concepts/architecture/leases/): active holders update `renewTime`, while the absence of renewal is what permits expiry and reclamation.

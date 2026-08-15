@@ -43,7 +43,7 @@
 //! ## The declared expiry state (#1938 ask 2)
 //!
 //! Rebuilding a generation requires that panel's slot contract, and only
-//! code-declared panel versions have one (`syn_active_panel_contract`). A
+//! query-admitted panel versions have one (`syn_queryable_panel_contract`). A
 //! published generation for a version with no contract therefore **cannot** be
 //! rebuilt by anything, and a query naming it already fails closed at the
 //! contract lookup. That is a permanent, stable condition, so it is reported as

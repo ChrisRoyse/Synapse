@@ -327,7 +327,7 @@ fn panel_state_for_find(
             "fused find requested panel {requested}, but no definition was supplied for it and the durable active panel is {}",
             active.panel.version
         ),
-        "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or omit panel_version to query the active panel",
+        "supply the queryable panel contract for the requested version (Synapse reconstructs and capability-gates code-declared generations), or omit panel_version to query the active panel",
     ))
 }
 
@@ -514,7 +514,7 @@ impl SynapseCalyxVault {
     /// generation named by `params.panel_version` (#1668).
     ///
     /// `synapse-calyx` cannot reconstruct a code-declared panel itself —
-    /// `syn_active_panel_contract` lives in `synapse-storage`, which depends on
+    /// `syn_queryable_panel_contract` lives in `synapse-storage`, which depends on
     /// this crate — so a non-active panel's definition is supplied by the
     /// caller, exactly as Ward's guard calibration takes one. Passing `None`
     /// restricts the query to the durable active panel.

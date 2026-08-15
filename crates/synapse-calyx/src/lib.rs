@@ -5712,7 +5712,7 @@ impl SynapseCalyxVault {
                         "requested search rebuild panel {expected_panel_version}, but no definition was supplied for it and the durable active panel is {}",
                         active.panel.version
                     ),
-                    "supply the panel contract for the requested version (a code-declared generation can be reconstructed with syn_active_panel_contract), or retry with the active panel's exact version",
+                    "supply the queryable panel contract for the requested version (Synapse reconstructs and capability-gates code-declared generations), or retry with the active panel's exact version",
                 ));
             }
             active
