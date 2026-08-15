@@ -55,6 +55,14 @@ Those independent whole-corpus phases also ran without explicit
 allocator-release boundaries, so dead pages from one phase remained committed
 while the next phase allocated its own corpus.
 
+Manual boundary verification then showed that an invalid drift request
+(`max_records=0`) returned the correct named error but only after waiting behind
+the exclusive maintenance owner for roughly ninety seconds. Bounds validation
+lived at the start of Calyx execution, which was still too late: the facade had
+already entered maintenance admission. Invalid input could therefore consume
+queue time and delay its actionable error even though it required no vault
+state.
+
 ## Decision
 
 Incremental maintenance state is an optimization over authoritative rows, never
@@ -113,6 +121,12 @@ the authority.
     bytes before and after every release. An unavailable reclaimer or unreadable
     process-memory Source of Truth fails the tick with a named diagnostic; this
     is lifecycle ownership, not a memory limit or degraded execution path.
+11. Drift's complete typed parameter validator is one authoritative Calyx
+    function. The MCP facade builds and validates that typed request before
+    maintenance admission; Calyx validates it again before its first physical
+    read so non-MCP callers retain the same invariant. Invalid input never opens
+    storage, acquires the exclusive lane, allocates a corpus, or changes a
+    bound, and preserves its exact named error and remediation.
 
 ## Consequences
 
@@ -141,6 +155,8 @@ the authority.
   instant with a panel watermark or delta from another.
 - Derived-state peak private memory is the largest live phase rather than the
   accumulated committed pages of unrelated completed phases.
+- Structurally invalid drift requests fail at the public admission boundary
+  instead of waiting behind unrelated whole-vault maintenance.
 
 ## Research basis
 
@@ -160,3 +176,5 @@ the authority.
 - [Materialize self-correcting materialized views](https://materialize.com/blog/self-correcting-materialized-views/): authoritative readback and serialized hydration avoid retaining duplicate snapshot state during repair.
 - [RocksDB snapshots](https://github.com/facebook/rocksdb/wiki/Snapshot) and [memory usage](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB): snapshots provide a consistent point-in-time view, while iterator and cache lifetime directly controls retained resources.
 - [Materialize isolation levels](https://materialize.com/docs/reference/isolation-level/): readers are served the freshest consistent snapshot and fail or wait when no qualifying consistent view exists.
+- [Tower HTTP request validation](https://docs.rs/tower-http/latest/tower_http/validate_request/): validation middleware rejects an invalid request before allowing it through to the wrapped service.
+- [Model Context Protocol tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools): servers must validate tool inputs, and out-of-range values are tool execution errors with actionable feedback.

@@ -590,6 +590,61 @@ impl SynapseCalyxPanelDriftParams {
             math_execution_class: SynapseCalyxMathExecutionClass::Configured,
         }
     }
+
+    /// Validates the complete drift request without opening the vault,
+    /// acquiring a maintenance lane, or allocating a corpus.
+    ///
+    /// Public callers use this at their admission boundary so a malformed
+    /// request cannot wait behind or consume exclusive storage work. The
+    /// execution path repeats the same authoritative validation before doing
+    /// any physical read, preserving the invariant for non-MCP callers.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact named bounds error for the first invalid field.
+    pub fn validate(&self) -> Result<(), SynapseCalyxError> {
+        if !(1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&self.max_records) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_MAX_RECORDS_INVALID",
+                format!(
+                    "MMD drift max_records={} is outside the supported range 1..={SYNAPSE_INTELLIGENCE_MAX_RECORDS}",
+                    self.max_records
+                ),
+                "set max_records to an integer inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !self.recent_fraction.is_finite() || !(0.05..=0.95).contains(&self.recent_fraction) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_RECENT_FRACTION_INVALID",
+                format!(
+                    "MMD drift recent_fraction={} must be finite and inside 0.05..=0.95",
+                    self.recent_fraction
+                ),
+                "set recent_fraction to a finite value inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !(1..=SYNAPSE_DRIFT_MAX_PERMUTATIONS).contains(&self.permutations) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_PERMUTATIONS_INVALID",
+                format!(
+                    "MMD drift permutations={} is outside the supported range 1..={SYNAPSE_DRIFT_MAX_PERMUTATIONS}",
+                    self.permutations
+                ),
+                "set permutations to an integer inside the named range and retry; the request is never clamped",
+            ));
+        }
+        if !self.alpha.is_finite() || !(0.0..1.0).contains(&self.alpha) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_ALPHA_INVALID",
+                format!(
+                    "MMD drift alpha={} must be finite and strictly inside 0..1",
+                    self.alpha
+                ),
+                "set alpha to a finite probability strictly between zero and one and retry; the request never substitutes a default",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// One lens's MMD reference-vs-recent distribution-drift measurement.
@@ -946,46 +1001,7 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxPanelDriftParams,
     ) -> Result<SynapseCalyxPanelDriftReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("mmd_panel_drift");
-        if !(1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&params.max_records) {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_DRIFT_MAX_RECORDS_INVALID",
-                format!(
-                    "MMD drift max_records={} is outside the supported range 1..={SYNAPSE_INTELLIGENCE_MAX_RECORDS}",
-                    params.max_records
-                ),
-                "set max_records to an integer inside the named range and retry; the request is never clamped",
-            ));
-        }
-        if !params.recent_fraction.is_finite() || !(0.05..=0.95).contains(&params.recent_fraction) {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_DRIFT_RECENT_FRACTION_INVALID",
-                format!(
-                    "MMD drift recent_fraction={} must be finite and inside 0.05..=0.95",
-                    params.recent_fraction
-                ),
-                "set recent_fraction to a finite value inside the named range and retry; the request is never clamped",
-            ));
-        }
-        if !(1..=SYNAPSE_DRIFT_MAX_PERMUTATIONS).contains(&params.permutations) {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_DRIFT_PERMUTATIONS_INVALID",
-                format!(
-                    "MMD drift permutations={} is outside the supported range 1..={SYNAPSE_DRIFT_MAX_PERMUTATIONS}",
-                    params.permutations
-                ),
-                "set permutations to an integer inside the named range and retry; the request is never clamped",
-            ));
-        }
-        if !params.alpha.is_finite() || !(0.0..1.0).contains(&params.alpha) {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_DRIFT_ALPHA_INVALID",
-                format!(
-                    "MMD drift alpha={} must be finite and strictly inside 0..1",
-                    params.alpha
-                ),
-                "set alpha to a finite probability strictly between zero and one and retry; the request never substitutes a default",
-            ));
-        }
+        params.validate()?;
         let max_records = params.max_records;
         let recent_fraction = params.recent_fraction;
         let permutations = params.permutations;

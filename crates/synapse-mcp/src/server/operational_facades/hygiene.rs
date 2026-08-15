@@ -685,6 +685,10 @@ pub(super) async fn handle(
                 .0
                 .drift
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "drift"))?;
+            // Reject malformed bounded-work parameters before entering the
+            // exclusive maintenance lane. The Calyx execution path validates
+            // the same typed spec again before its first physical read.
+            let drift_spec = crate::m3::hygiene::prepare_drift_spec(&spec)?;
             // Drift persists findings to the native Reactive CF: maintenance-gated
             // exactly like the other mutating hygiene operations.
             require_maintenance_profile(
@@ -713,7 +717,7 @@ pub(super) async fn handle(
             let mut response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_drift",
-                    move || crate::m3::hygiene::run_drift(&db, &spec),
+                    move || crate::m3::hygiene::run_drift_spec(&db, &drift_spec),
                 ),
             )
             .await

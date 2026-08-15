@@ -1352,15 +1352,15 @@ pub fn run_blind_spot(
     })
 }
 
-/// Measures per-lens MMD distribution drift between a reference and a recent
-/// window, persisting each finding to the native `Reactive` CF for downstream
-/// consumers, then reads the CF back.
+/// Builds and validates the typed Calyx request at the public admission edge.
 ///
 /// # Errors
 ///
-/// Returns a structured error when the corpus cannot be read, the MMD estimator
-/// hard-fails, or the `Reactive` CF write/readback fails.
-pub fn run_drift(db: &Db, params: &HygieneDriftParams) -> Result<HygieneDriftResponse, ErrorData> {
+/// Returns the exact structured Calyx bounds error without opening storage or
+/// waiting for the exclusive maintenance lane.
+pub fn prepare_drift_spec(
+    params: &HygieneDriftParams,
+) -> Result<synapse_calyx::SynapseCalyxPanelDriftParams, ErrorData> {
     let mut spec = synapse_calyx::SynapseCalyxPanelDriftParams::new(params.panel_version);
     if let Some(max_records) = params.max_records {
         spec.max_records = max_records as usize;
@@ -1371,8 +1371,17 @@ pub fn run_drift(db: &Db, params: &HygieneDriftParams) -> Result<HygieneDriftRes
     if let Some(permutations) = params.permutations {
         spec.permutations = permutations as usize;
     }
+    spec.validate()
+        .map_err(|error| mcp_error(error.code, error.to_string()))?;
+    Ok(spec)
+}
+
+pub fn run_drift_spec(
+    db: &Db,
+    spec: &synapse_calyx::SynapseCalyxPanelDriftParams,
+) -> Result<HygieneDriftResponse, ErrorData> {
     let report = db
-        .panel_drift_intelligence(&spec)
+        .panel_drift_intelligence(spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneDriftResponse {
         source_of_truth: "Calyx Reactive CF drift findings",
