@@ -3202,6 +3202,31 @@ fn spawn_rollup_contribution(
 /// Processes one spawn: recomputes its contribution and, if it differs from the
 /// stored marker, subtracts the old contribution, adds the new, and rewrites the
 /// marker. Returns whether the spawn changed the rollups.
+enum ProcessSpawnRollupError {
+    ImmutableContributionConflict { spawn_id: String },
+    Other(ErrorData),
+}
+
+impl From<ErrorData> for ProcessSpawnRollupError {
+    fn from(error: ErrorData) -> Self {
+        Self::Other(error)
+    }
+}
+
+impl ProcessSpawnRollupError {
+    fn into_mcp_error(self) -> ErrorData {
+        match self {
+            Self::ImmutableContributionConflict { spawn_id } => mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT: finalized contribution for {spawn_id} changed after publication; rebuild a new TimeSeries generation from authoritative transcript rows"
+                ),
+            ),
+            Self::Other(error) => error,
+        }
+    }
+}
+
 fn process_spawn_rollup(
     db: &Db,
     collection_name: &str,
@@ -3210,7 +3235,7 @@ fn process_spawn_rollup(
     sealed_horizon_ns: u64,
     series_roster: &mut BTreeMap<u64, CostSeriesDescriptor>,
     cells_written: &mut u64,
-) -> Result<bool, ErrorData> {
+) -> Result<bool, ProcessSpawnRollupError> {
     let new_cells = spawn_rollup_contribution(spawn_id, rows, sealed_horizon_ns)?;
     register_cost_series(&new_cells, series_roster)?;
     let old_cells = read_spawn_mark(db, spawn_id)?;
@@ -3232,12 +3257,9 @@ fn process_spawn_rollup(
         None if new_cells.is_empty() => return Ok(false),
         Some(existing) if existing == new_cells.as_slice() => return Ok(false),
         Some(_) => {
-            return Err(mcp_error(
-                error_codes::TOOL_INTERNAL_ERROR,
-                format!(
-                    "AGENT_COST_TIMESERIES_IMMUTABLE_CONTRIBUTION_CONFLICT: finalized contribution for {spawn_id} changed after publication; run rollup_backfill reset=true to publish a new TimeSeries generation"
-                ),
-            ));
+            return Err(ProcessSpawnRollupError::ImmutableContributionConflict {
+                spawn_id: spawn_id.to_owned(),
+            });
         }
         None => {}
     }
@@ -3414,8 +3436,8 @@ fn persist_cost_point_owner(
     Ok(())
 }
 
-/// Deletes every `agent-cost/rollup/v1/` row (cells, markers, control rows) for
-/// a `reset=true` rebuild.
+/// Deletes every cost-rollup row (cells, markers, control rows) before a new
+/// immutable TimeSeries generation is built, then proves each namespace empty.
 fn purge_all_rollup_rows(db: &Db) -> Result<(), ErrorData> {
     for prefix in [
         ROLLUP_KEY_PREFIX,
@@ -3429,6 +3451,19 @@ fn purge_all_rollup_rows(db: &Db) -> Result<(), ErrorData> {
             let keys: Vec<Vec<u8>> = chunk.iter().map(|(key, _value)| key.clone()).collect();
             db.delete_batch(cf::CF_KV, keys)
                 .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        }
+        let remaining = db
+            .scan_cf_prefix(cf::CF_KV, prefix.as_bytes())
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        if let Some((key, _value)) = remaining.first() {
+            return Err(mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "AGENT_COST_ROLLUP_PURGE_READBACK_MISMATCH: prefix={prefix:?} remaining_rows={} first_key_hex={}; the old generation was not fully removed, so no replacement generation was started",
+                    remaining.len(),
+                    hex_encode(key)
+                ),
+            ));
         }
     }
     Ok(())
@@ -3444,6 +3479,42 @@ pub(crate) fn materialize_cost_rollups(
     db: &Db,
     reset: bool,
 ) -> Result<RollupMaterializeReport, ErrorData> {
+    match materialize_cost_rollups_once(db, reset) {
+        Ok(report) => Ok(report),
+        Err(ProcessSpawnRollupError::ImmutableContributionConflict { spawn_id }) if !reset => {
+            // A spawn without terminal usage can legitimately acquire more
+            // transcript rows after its hour first sealed (ambient clients can
+            // reconnect to an existing session). Its already-published native
+            // TimeSeries points are immutable, so an in-place repair would
+            // falsify history. Rotate the entire rebuildable generation from a
+            // fresh authoritative corpus instead. This is the same full-relist
+            // boundary used when a delta history is compacted: no stale cells
+            // are served and no operator has to notice an invariant error before
+            // the unattended maintainer can converge.
+            tracing::warn!(
+                code = "AGENT_COST_ROLLUP_IMMUTABLE_CONFLICT_REBASE_REQUIRED",
+                conflict_spawn_id = %spawn_id,
+                "a finalized spawn contribution changed; rebuilding a new immutable TimeSeries generation from authoritative transcript rows"
+            );
+            materialize_cost_rollups_once(db, true).map_err(|error| {
+                let source = error.into_mcp_error();
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "AGENT_COST_ROLLUP_IMMUTABLE_CONFLICT_REBASE_FAILED: conflict_spawn_id={spawn_id}; replacement generation failed: {}",
+                        source.message
+                    ),
+                )
+            })
+        }
+        Err(error) => Err(error.into_mcp_error()),
+    }
+}
+
+fn materialize_cost_rollups_once(
+    db: &Db,
+    reset: bool,
+) -> Result<RollupMaterializeReport, ProcessSpawnRollupError> {
     let built_at_ns = unix_time_ns_now();
     let sealed_horizon_ns = rollup_floor_hour(built_at_ns.saturating_sub(ROLLUP_SEAL_GRACE_NS));
     // Sampled BEFORE the first row is read. A commit that lands while this pass
@@ -3493,7 +3564,8 @@ pub(crate) fn materialize_cost_rollups(
                     "AGENT_COST_ROLLUP_PROGRESS_SCHEMA_UNSUPPORTED: {} != {ROLLUP_SCHEMA_VERSION}; run rollup_backfill reset=true",
                     progress.schema_version
                 ),
-            ));
+            )
+            .into());
         }
         let resume_after = hex_decode(&progress.resume_after_key_hex).ok_or_else(|| {
             mcp_error(

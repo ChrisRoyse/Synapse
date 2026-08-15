@@ -713,6 +713,11 @@ where
         self.rows.latest_seq_for_cf(cf)
     }
 
+    /// Oldest sequence from which exact per-key changed-key deltas are retained.
+    pub fn changed_key_history_floor(&self) -> Seq {
+        self.rows.changed_key_history_floor()
+    }
+
     /// Latest committed seq whose batch wrote derived-search-content inputs
     /// (issue #1100). Content-neutral commits (idempotency-ledger appends,
     /// time-index sentinels) advance [`Self::latest_seq`] but not this.

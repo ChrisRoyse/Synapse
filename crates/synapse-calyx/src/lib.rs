@@ -7670,6 +7670,13 @@ impl SynapseCalyxVault {
         })
     }
 
+    /// Oldest sequence from which this process can prove exact per-key change
+    /// history after a latest-only durable recovery.
+    #[must_use]
+    pub fn changed_key_history_floor(&self) -> u64 {
+        self.vault.changed_key_history_floor()
+    }
+
     /// Scans visible raw CF rows from one atomic latest committed view.
     ///
     /// # Errors

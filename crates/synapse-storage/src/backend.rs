@@ -14329,6 +14329,7 @@ const CALYX_GC_SOURCE_CENSUS_UNCHANGED: &str = "unchanged";
 const CALYX_GC_SOURCE_CENSUS_FULL_REBASE: &str = "full_rebase";
 const CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE: &str = "base_tombstone";
 const CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND: &str = "delta_reference_bound";
+const CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP: &str = "changed_key_history_gap";
 
 /// Maximum number of post-baseline exact references retained in individually
 /// allocated ordered sets. Crossing the bound rebuilds the packed baseline at
@@ -14787,6 +14788,37 @@ fn refresh_derived_source_references(
                 reader.pinned_seq()
             ),
         ));
+    }
+    let history_floor = vault.changed_key_history_floor();
+    if previous_pinned_seq < history_floor {
+        // The cache is an optimization over authoritative Base rows, not an
+        // authority of its own. Aster deliberately discards pre-recovery
+        // per-key history when it restores a latest-only router. Once this
+        // process has advanced the history floor past our cached sequence,
+        // no delta can prove the interval. Repeating that impossible delta
+        // request made every retention-GC pass fail forever and left
+        // logically expired rows physically resident.
+        //
+        // Re-pin already happened above, so rebuild from the exact current
+        // snapshot and replace the cache only after the complete baseline
+        // succeeds. Other error classes remain hard failures; there is no
+        // partial set and no stale-cache fallback.
+        tracing::warn!(
+            code = "STORAGE_CALYX_GC_SOURCE_CENSUS_HISTORY_GAP_REBASE_REQUIRED",
+            previous_pinned_seq,
+            current_pinned_seq = reader.pinned_seq(),
+            changed_key_history_floor = history_floor,
+            "the cached reachability baseline predates retained Base change history; rebuilding from the authoritative pinned snapshot"
+        );
+        let (rebuilt, census) = rebuild_derived_source_references(
+            &reader,
+            CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
+            Some(previous_pinned_seq),
+            0,
+            Some(CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP),
+        )?;
+        *previous = rebuilt;
+        return Ok(census);
     }
     let changed_keys = vault
         .changed_cf_keys_after_snapshot(reader.snapshot(), ColumnFamily::Base, previous_pinned_seq)

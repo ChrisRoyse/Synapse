@@ -1647,6 +1647,17 @@ impl VersionedCfStore {
         self.cf_change_signal(cf).last_commit_seq
     }
 
+    /// Oldest sequence from which this process can prove an exact per-key
+    /// changed-key delta.
+    ///
+    /// A latest-only durable recovery restores authoritative current rows but
+    /// cannot recreate their older per-key sequence history. Long-lived delta
+    /// consumers compare their cached baseline with this floor and rebuild from
+    /// one current snapshot when the baseline is older.
+    pub fn changed_key_history_floor(&self) -> Seq {
+        self.changed_key_history_floor.load(Ordering::Acquire)
+    }
+
     /// Publishes `seq` as the family's last-commit sequence for every family in
     /// `rows`.
     ///
