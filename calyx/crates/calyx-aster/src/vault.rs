@@ -113,6 +113,7 @@ pub use orphan_slot_gc::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
 };
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
+pub use scan::AsterSnapshotCfRowWalk;
 pub use slot_column::{
     SlotColumnManifest, SlotColumnMaterialization, SlotColumnReadback, SlotColumnRow,
     read_materialized_slot_column,

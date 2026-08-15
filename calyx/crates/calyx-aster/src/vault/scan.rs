@@ -1,4 +1,14 @@
 use super::*;
+use std::ops::ControlFlow;
+
+/// Outcome of one allocation-reusing row walk through a pinned snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsterSnapshotCfRowWalk {
+    /// Live rows lent to the visitor.
+    pub rows_visited: usize,
+    /// Whether the visitor ended the walk before cursor exhaustion.
+    pub stopped_early: bool,
+}
 
 impl<C> AsterVault<C>
 where
@@ -180,6 +190,74 @@ where
         self.assert_cf_selected(cf, "scan_cf_range_page_snapshot")?;
         self.rows
             .scan_cf_range_page_at(snapshot, cf, range, after_key, limit, &self.clock)
+    }
+
+    /// Walks visible rows through one allocation-reusing pinned-snapshot cursor.
+    ///
+    /// The visitor borrows each key/value only until it returns. Router-backed
+    /// vaults retain one reusable value buffer per intersecting immutable
+    /// source plus the bounded MVCC overlay; this method never constructs an
+    /// output page or corpus-sized collection. The cursor revalidates the
+    /// snapshot lease at its internal cadence and applies read barriers before
+    /// lending a row. Visitor errors are returned unchanged through `E`.
+    pub fn walk_cf_range_rows_snapshot<F, E>(
+        &self,
+        snapshot: Snapshot,
+        cf: ColumnFamily,
+        range: &KeyRange,
+        mut on_row: F,
+    ) -> std::result::Result<AsterSnapshotCfRowWalk, E>
+    where
+        F: FnMut(&[u8], &[u8]) -> std::result::Result<ControlFlow<()>, E>,
+        E: From<calyx_core::CalyxError>,
+    {
+        self.assert_cf_selected(cf, "walk_cf_range_rows_snapshot")
+            .map_err(E::from)?;
+        let mut stream = self
+            .rows
+            .open_cf_range_row_stream_at(snapshot, cf, range, &self.clock)
+            .map_err(E::from)?;
+        let mut rows_visited = 0_usize;
+        loop {
+            let mut visitor_result = None;
+            let present = stream
+                .next_with(|key, value| {
+                    visitor_result = Some(on_row(key, value));
+                    Ok(())
+                })
+                .map_err(E::from)?;
+            if !present {
+                return Ok(AsterSnapshotCfRowWalk {
+                    rows_visited,
+                    stopped_early: false,
+                });
+            }
+            rows_visited = rows_visited.checked_add(1).ok_or_else(|| {
+                E::from(calyx_core::CalyxError {
+                    code: "CALYX_ASTER_SNAPSHOT_ROW_WALK_OVERFLOW",
+                    message: format!(
+                        "the {} snapshot row walk exceeded usize on this host",
+                        cf.name()
+                    ),
+                    remediation: "inspect the immutable manifest and repair the impossible row cardinality before retrying",
+                })
+            })?;
+            let control = visitor_result.take().ok_or_else(|| {
+                E::from(calyx_core::CalyxError::aster_corrupt_shard(format!(
+                    "the {} snapshot row cursor reported a present row without invoking its visitor",
+                    cf.name()
+                )))
+            })??;
+            match control {
+                ControlFlow::Continue(()) => {}
+                ControlFlow::Break(()) => {
+                    return Ok(AsterSnapshotCfRowWalk {
+                        rows_visited,
+                        stopped_early: true,
+                    });
+                }
+            }
+        }
     }
 
     /// Streams visible raw CF rows in bounded pages using an already-pinned snapshot lease.

@@ -49,10 +49,12 @@ static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
 /// Number of concurrent bounded foreground storage reads.
 ///
 /// This lane is intentionally separate from whole-corpus maintenance. Its
-/// callers must have a statically enforced input bound and must not mutate the
-/// vault. A single permit prevents a client fan-out from multiplying even those
-/// bounded working sets while allowing one foreground read to remain servable
-/// during a long background pass.
+/// callers must have a statically enforced resident-corpus bound and must not
+/// mutate the vault. A single permit prevents a client fan-out from multiplying
+/// even those bounded working sets while allowing one foreground read to remain
+/// servable during a long background pass. A caller may stream an exact
+/// physical count without materializing that family; that I/O is reported
+/// separately and does not turn this permit into a second corpus owner.
 const STORAGE_BOUNDED_READ_LANES: usize = 1;
 
 static STORAGE_BOUNDED_READ_PERMITS: LazyLock<Arc<Semaphore>> =
@@ -174,9 +176,11 @@ where
 /// runtime while preserving its domain error type.
 ///
 /// This is not a second whole-corpus lane. Callers must prove both properties at
-/// their dispatch boundary: the operation cannot write, and every corpus input
-/// is bounded independently of vault size. Operations that can scan an entire
-/// physical family, even when read-only, remain on
+/// their dispatch boundary: the operation cannot write, and every resident
+/// corpus input is bounded independently of vault size. A streaming,
+/// constant-resident-memory exact-count walk is allowed and must expose whether
+/// it walked or used maintained metadata. Operations that materialize an
+/// entire physical family, even when read-only, remain on
 /// [`run_admitted_maintenance_preserving_error`].
 ///
 /// The permit and completion record remain inside the blocking owner because a

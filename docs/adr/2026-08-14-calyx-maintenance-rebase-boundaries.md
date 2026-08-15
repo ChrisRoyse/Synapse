@@ -89,6 +89,16 @@ ownership was wrong, however. An immutable exact baseline is cold index data,
 not mutable process state, and Windows can page file-backed mapped data without
 retaining its entire corpus as private commit.
 
+After that baseline was moved out of private heap, a real 2,300,021-row Base
+coverage pass still crossed 1 GiB transiently. The scan itself was logically
+bounded to 16-row pages, but each of its 143,752 callbacks received a newly
+owned `Vec<(Vec<u8>, Vec<u8>)>` assembled from another owned Aster entry vector.
+The cursor already retained reusable per-source buffers; copying every small
+page across the crate boundary created allocation churn without adding a
+correctness boundary. Allocator collection reclaimed only 458,752 bytes during
+the pass because the cursor was still live and repeated page allocation, not a
+missing memory cap, was the defect.
+
 ## Decision
 
 Incremental maintenance state is an optimization over authoritative rows, never
@@ -205,6 +215,15 @@ the authority.
     reads. Repair reuses that representation before validation and at the final
     mutation boundary, so any relevant state drift changes the same token the
     client observed.
+15. Aster owns the physical pinned-snapshot row cursor and exposes a typed
+    borrowing walk rather than exposing its private cursor type or allocating
+    output pages. It retains the existing atomic rows-to-router hand-off,
+    bounded MVCC overlay, periodic lease validation, read barriers, early stop,
+    and verbatim visitor errors. Synapse's `page_rows` remains logical progress
+    provenance only. Base memory telemetry samples every 65,536 visited rows
+    and collection occurs after the cursor is destroyed; a threshold is never
+    used to excuse or truncate work. The cursor and visitor independently count
+    rows/early-stop and any disagreement fails closed.
 
 ## Consequences
 
@@ -246,6 +265,10 @@ the authority.
 - Idle GC no longer charges the complete exact protection corpus to private
   process commit. Cold baseline pages are file-backed and pageable, while exact
   binary-search membership and fail-closed corruption behavior remain intact.
+- Whole-Base coverage no longer constructs and discards one owned vector per
+  16 rows. Its resident scan state is bounded by the immutable source frontier,
+  reusable value buffers, and the already-bounded MVCC overlay, independent of
+  total row count.
 
 ## Research basis
 
@@ -264,6 +287,8 @@ the authority.
 - [Debezium incremental snapshot design](https://github.com/debezium/debezium-design-documents/blob/main/DDD-3.md): explicit low/high watermarks and bounded chunks make incremental reconstruction consistent and resumable.
 - [Materialize self-correcting materialized views](https://materialize.com/blog/self-correcting-materialized-views/): authoritative readback and serialized hydration avoid retaining duplicate snapshot state during repair.
 - [RocksDB snapshots](https://github.com/facebook/rocksdb/wiki/Snapshot) and [memory usage](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB): snapshots provide a consistent point-in-time view, while iterator and cache lifetime directly controls retained resources.
+- [RocksDB iterator guidance](https://github.com/facebook/rocksdb/wiki/Iterator), [FAQ](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ), and [overview](https://github.com/facebook/rocksdb/wiki/RocksDB-Overview): range scans advance a forward iterator over one consistent view; iterator lifetime owns its pinned resources and must be bounded explicitly.
+- [Rust iterators](https://doc.rust-lang.org/std/iter/) and [`FromIterator<Vec<_>>`](https://doc.rust-lang.org/std/iter/trait.FromIterator.html): iterator consumption is lazy, while `collect` creates a collection whose allocation strategy and retained capacity are not a streaming-memory guarantee.
 - [Materialize isolation levels](https://materialize.com/docs/reference/isolation-level/): readers are served the freshest consistent snapshot and fail or wait when no qualifying consistent view exists.
 - [Tower HTTP request validation](https://docs.rs/tower-http/latest/tower_http/validate_request/): validation middleware rejects an invalid request before allowing it through to the wrapped service.
 - [Model Context Protocol tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools): servers must validate tool inputs, and out-of-range values are tool execution errors with actionable feedback.
