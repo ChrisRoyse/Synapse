@@ -322,6 +322,18 @@ pub struct SynapseCalyxSearchGenerationStatus {
     /// Current vault sequence. `latest_seq - built_at_seq` is how far behind the
     /// generation is.
     pub vault_latest_seq: u64,
+    /// Exact-panel derived-content watermark observed atomically with
+    /// `vault_latest_seq`.
+    ///
+    /// Panel-membership consumers require the persisted generation to cover
+    /// this watermark. This is intentionally distinct from `seq_lag` and
+    /// `delta_changed_keys`: even one membership-affecting content commit makes
+    /// an immutable membership sidecar stale, while a fused query may still be
+    /// able to reconcile that same commit from its bounded delta.
+    pub panel_content_seq: Option<u64>,
+    /// Whether the immutable membership sidecar is older than the exact-panel
+    /// content watermark. `None` means there is no usable generation to compare.
+    pub membership_stale: Option<bool>,
     /// `latest_seq - built_at_seq`, saturating.
     ///
     /// Informational only. It is **not** the quantity the query-time limit is
@@ -381,9 +393,10 @@ pub struct SynapseCalyxSearchGenerationStatus {
     /// A staked rebuild-required intent, when one is present.
     pub rebuild_required: Option<String>,
     /// `absent` | `rebuild_required` | `lagging` | `built`. `absent` and
-    /// `rebuild_required` mean recall cannot serve at all; `lagging` means the
-    /// seq lag exceeds the bounded reconciliation limit, so it very likely
-    /// cannot either.
+    /// `rebuild_required` mean recall cannot serve at all; `content_stale`
+    /// means immutable panel-membership consumers cannot serve; `lagging`
+    /// means the measured changed-key delta exceeds the bounded reconciliation
+    /// limit.
     pub state: String,
     /// What to do about the reported state, or `none` when it is healthy.
     pub remediation: String,
@@ -502,6 +515,8 @@ fn search_generation_status_without_panel(
         manifest_sha256: None,
         built_at_seq: None,
         vault_latest_seq,
+        panel_content_seq: None,
+        membership_stale: None,
         seq_lag: None,
         delta_changed_keys: None,
         delta_composition: None,
@@ -534,6 +549,7 @@ const fn classify_search_generation(
     rebuild_marker_staked: bool,
     manifest_present: bool,
     built_at_seq: Option<u64>,
+    panel_content_seq: Option<u64>,
     delta_changed_keys: Option<u64>,
     max_reconciled_delta_keys: u64,
 ) -> (&'static str, &'static str) {
@@ -557,6 +573,15 @@ const fn classify_search_generation(
             "the manifest exists but does not describe a usable generation for this panel \
              (format, panel, or slot shape mismatch). Rebuild it with storage \
              operation=search_rebuild.",
+        );
+    }
+    if matches!((panel_content_seq, built_at_seq), (Some(content), Some(built)) if content > built)
+    {
+        return (
+            "content_stale",
+            "the exact-panel derived-content watermark is newer than the immutable membership \
+             sidecar, so panel-scoped consumers fail closed with SYNAPSE_CALYX_STALE_DERIVED. \
+             Rebuild it with storage operation=search_rebuild.",
         );
     }
     // Classified on the measured changed-key count, because that is the exact
@@ -4690,24 +4715,13 @@ impl SynapseCalyxVault {
     /// (#1901): `Base` is shared by every panel, and counting all of it charged a
     /// 329-row timeline generation for 17,785 keys of unrelated
     /// agent-transcript ingest.
-    fn measure_search_delta_changed_keys(
+    fn measure_search_delta_changed_keys_at_snapshot(
         &self,
+        snapshot: Snapshot,
         panel_version: u32,
         base_seq: u64,
         slots: &[SynapseCalyxSearchGenerationSlot],
     ) -> Result<calyx_search::PanelDeltaComposition, SynapseCalyxError> {
-        // One pinned snapshot for the whole count, so every column family is
-        // read against the same view and the number cannot mix sequences.
-        let snapshot = self
-            .vault
-            .pin_reader_for_panel(
-                panel_version,
-                Freshness::FreshDerived,
-                SEARCH_DELTA_SCAN_LEASE_MS,
-            )
-            .map_err(|error| {
-                SynapseCalyxError::from_calyx("pin the search delta scan snapshot", &error)
-            })?;
         let measured = if snapshot.derived_content_seq() <= base_seq {
             Ok(calyx_search::PanelDeltaComposition {
                 panel_version,
@@ -4724,9 +4738,6 @@ impl SynapseCalyxVault {
                 slots.iter().map(|slot| calyx_core::SlotId::new(slot.slot)),
             )
         };
-        // Release the lease on every path: a leaked reader lease pins the GC
-        // frontier, which is a far worse outcome than a failed measurement.
-        let _released = self.vault.release_reader(snapshot.lease().id());
         measured.map_err(|error| {
             search_rebuild_error(
                 &format!(
@@ -4762,105 +4773,121 @@ impl SynapseCalyxVault {
         panel_version: u32,
         measure_delta: bool,
     ) -> Result<SynapseCalyxSearchGenerationStatus, SynapseCalyxError> {
-        let vault_dir = self.config.vault_dir.as_path();
-        let vault_latest_seq = self.vault.latest_seq();
-        let max_reconciled_delta_keys = calyx_search::MAX_RECONCILED_DELTA_KEYS as u64;
-        let panel_state_error = None;
+        self.with_panel_read_snapshot(panel_version, SEARCH_DELTA_SCAN_LEASE_MS, |snapshot| {
+            let vault_dir = self.config.vault_dir.as_path();
+            let vault_latest_seq = snapshot.seq();
+            let panel_content_seq = snapshot.derived_content_seq();
+            let max_reconciled_delta_keys = calyx_search::MAX_RECONCILED_DELTA_KEYS as u64;
+            let panel_state_error = None;
 
-        let manifest = calyx_search::manifest_path(vault_dir, panel_version);
-        let manifest_present = manifest.is_file();
-        let manifest_sha256 = read_optional_sha256(&manifest)?;
-        let rebuild_required = calyx_search::read_rebuild_required_marker(vault_dir, panel_version)
-            .map_err(|error| {
-                search_rebuild_error("read rebuild-required marker for generation status", error)
-            })?
-            .map(|marker| format!("source={} detail={}", marker.source, marker.detail));
+            let manifest = calyx_search::manifest_path(vault_dir, panel_version);
+            let manifest_present = manifest.is_file();
+            let manifest_sha256 = read_optional_sha256(&manifest)?;
+            let rebuild_required =
+                calyx_search::read_rebuild_required_marker(vault_dir, panel_version)
+                    .map_err(|error| {
+                        search_rebuild_error(
+                            "read rebuild-required marker for generation status",
+                            error,
+                        )
+                    })?
+                    .map(|marker| format!("source={} detail={}", marker.source, marker.detail));
 
-        let (built_at_seq, rows_covered, slots) = if manifest_present {
-            match calyx_search::PersistedSearchIndexes::open(vault_dir, panel_version)
-                .and_then(|indexes| indexes.generation())
-            {
-                Ok(generation) => {
-                    let slots: Vec<SynapseCalyxSearchGenerationSlot> = generation
-                        .slots
-                        .iter()
-                        .map(|slot| SynapseCalyxSearchGenerationSlot {
-                            slot: slot.panel_slot.slot_id().get(),
-                            kind: slot.kind.clone(),
-                            lane: search_slot_lane(&slot.kind).to_owned(),
-                            len: slot.len as u64,
-                            built_at_seq: slot.built_at_seq,
-                        })
-                        .collect();
-                    let rows = slots.iter().map(|slot| slot.len).max();
-                    (Some(generation.base_seq), rows, slots)
+            let (built_at_seq, rows_covered, slots) = if manifest_present {
+                match calyx_search::PersistedSearchIndexes::open(vault_dir, panel_version)
+                    .and_then(|indexes| indexes.generation())
+                {
+                    Ok(generation) => {
+                        let slots: Vec<SynapseCalyxSearchGenerationSlot> = generation
+                            .slots
+                            .iter()
+                            .map(|slot| SynapseCalyxSearchGenerationSlot {
+                                slot: slot.panel_slot.slot_id().get(),
+                                kind: slot.kind.clone(),
+                                lane: search_slot_lane(&slot.kind).to_owned(),
+                                len: slot.len as u64,
+                                built_at_seq: slot.built_at_seq,
+                            })
+                            .collect();
+                        let rows = slots.iter().map(|slot| slot.len).max();
+                        (Some(generation.base_seq), rows, slots)
+                    }
+                    // The manifest exists but does not describe a usable generation
+                    // (wrong format, wrong panel, malformed slot shape). That is a
+                    // reportable state, not a reason to fail the health read.
+                    Err(_) => (None, None, Vec::new()),
                 }
-                // The manifest exists but does not describe a usable generation
-                // (wrong format, wrong panel, malformed slot shape). That is a
-                // reportable state, not a reason to fail the health read.
-                Err(_) => (None, None, Vec::new()),
-            }
-        } else {
-            (None, None, Vec::new())
-        };
-
-        let dense_slot_count = slots.iter().filter(|slot| slot.lane == "dense").count() as u64;
-        let sparse_slot_count = slots.iter().filter(|slot| slot.lane == "sparse").count() as u64;
-        let built_at_unix_ms = file_modified_unix_ms(&manifest);
-        let now_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .ok()
-            .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
-        let age_ms = match (built_at_unix_ms, now_unix_ms) {
-            (Some(built), Some(now)) => Some(now.saturating_sub(built)),
-            _ => None,
-        };
-        let seq_lag = built_at_seq.map(|seq| vault_latest_seq.saturating_sub(seq));
-        let (delta_changed_keys, delta_composition, delta_measured_at_unix_ms) =
-            match (measure_delta, built_at_seq) {
-                (true, Some(base_seq)) => {
-                    let measured =
-                        self.measure_search_delta_changed_keys(panel_version, base_seq, &slots)?;
-                    (
-                        Some(measured.changed_len() as u64),
-                        Some(measured.composition()),
-                        now_unix_ms,
-                    )
-                }
-                _ => (None, None, None),
+            } else {
+                (None, None, Vec::new())
             };
 
-        let (state, remediation) = classify_search_generation(
-            rebuild_required.is_some(),
-            manifest_present,
-            built_at_seq,
-            delta_changed_keys,
-            max_reconciled_delta_keys,
-        );
+            let dense_slot_count = slots.iter().filter(|slot| slot.lane == "dense").count() as u64;
+            let sparse_slot_count =
+                slots.iter().filter(|slot| slot.lane == "sparse").count() as u64;
+            let built_at_unix_ms = file_modified_unix_ms(&manifest);
+            let now_unix_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
+            let age_ms = match (built_at_unix_ms, now_unix_ms) {
+                (Some(built), Some(now)) => Some(now.saturating_sub(built)),
+                _ => None,
+            };
+            let seq_lag = built_at_seq.map(|seq| vault_latest_seq.saturating_sub(seq));
+            let membership_stale = built_at_seq.map(|seq| panel_content_seq > seq);
+            let (delta_changed_keys, delta_composition, delta_measured_at_unix_ms) =
+                match (measure_delta, built_at_seq) {
+                    (true, Some(base_seq)) => {
+                        let measured = self.measure_search_delta_changed_keys_at_snapshot(
+                            snapshot,
+                            panel_version,
+                            base_seq,
+                            &slots,
+                        )?;
+                        (
+                            Some(measured.changed_len() as u64),
+                            Some(measured.composition()),
+                            now_unix_ms,
+                        )
+                    }
+                    _ => (None, None, None),
+                };
 
-        Ok(SynapseCalyxSearchGenerationStatus {
-            panel_version: Some(panel_version),
-            panel_state_error,
-            manifest_path: Some(manifest.display().to_string()),
-            manifest_present,
-            manifest_sha256,
-            built_at_seq,
-            vault_latest_seq,
-            seq_lag,
-            delta_changed_keys,
-            delta_composition,
-            delta_measured_at_unix_ms,
-            max_reconciled_delta_keys,
-            rows_covered,
-            delta_coverage_ratio: delta_coverage_ratio(delta_changed_keys, rows_covered),
-            slots,
-            dense_slot_count,
-            sparse_slot_count,
-            built_at_unix_ms,
-            age_ms,
-            rebuild_required,
-            state: state.to_owned(),
-            remediation: remediation.to_owned(),
+            let (state, remediation) = classify_search_generation(
+                rebuild_required.is_some(),
+                manifest_present,
+                built_at_seq,
+                Some(panel_content_seq),
+                delta_changed_keys,
+                max_reconciled_delta_keys,
+            );
+
+            Ok(SynapseCalyxSearchGenerationStatus {
+                panel_version: Some(panel_version),
+                panel_state_error,
+                manifest_path: Some(manifest.display().to_string()),
+                manifest_present,
+                manifest_sha256,
+                built_at_seq,
+                vault_latest_seq,
+                panel_content_seq: Some(panel_content_seq),
+                membership_stale,
+                seq_lag,
+                delta_changed_keys,
+                delta_composition,
+                delta_measured_at_unix_ms,
+                max_reconciled_delta_keys,
+                rows_covered,
+                delta_coverage_ratio: delta_coverage_ratio(delta_changed_keys, rows_covered),
+                slots,
+                dense_slot_count,
+                sparse_slot_count,
+                built_at_unix_ms,
+                age_ms,
+                rebuild_required,
+                state: state.to_owned(),
+                remediation: remediation.to_owned(),
+            })
         })
     }
 
@@ -5321,6 +5348,7 @@ impl SynapseCalyxVault {
         // measurement must never read as "nothing to do".
         let delta_keys = before.delta_changed_keys.unwrap_or(u64::MAX);
         let seq_lag = before.seq_lag.unwrap_or(u64::MAX);
+        let membership_stale = before.membership_stale.unwrap_or(true);
         let (action, reason) = if !before.manifest_present || before.built_at_seq.is_none() {
             (
                 SearchGenerationMaintenanceAction::InitialBuild,
@@ -5345,6 +5373,14 @@ impl SynapseCalyxVault {
                     error.code,
                     error.source_code.unwrap_or("none"),
                     error.message
+                ),
+            )
+        } else if membership_stale {
+            (
+                SearchGenerationMaintenanceAction::RefreshOverExisting,
+                format!(
+                    "panel content watermark {:?} is newer than membership generation seq {:?}; immutable membership consumers already fail closed with SYNAPSE_CALYX_STALE_DERIVED even though the query delta ({delta_keys} keys) may remain reconcilable",
+                    before.panel_content_seq, before.built_at_seq
                 ),
             )
         } else if delta_keys > SEARCH_GENERATION_REFRESH_DELTA_KEYS {
@@ -5408,8 +5444,9 @@ impl SynapseCalyxVault {
         // every query is already failing closed, so waiting protects nothing and
         // costs recall. Two exemptions therefore apply — an absent generation
         // (no live artifact to protect) and an already-unusable one.
-        let already_unusable =
-            delta_history_gap.is_some() || delta_keys > before.max_reconciled_delta_keys;
+        let already_unusable = membership_stale
+            || delta_history_gap.is_some()
+            || delta_keys > before.max_reconciled_delta_keys;
         if action == SearchGenerationMaintenanceAction::RefreshOverExisting
             && !already_unusable
             && before
@@ -5443,6 +5480,8 @@ impl SynapseCalyxVault {
             before_state = %before.state,
             before_built_at_seq = ?before.built_at_seq,
             vault_latest_seq = before.vault_latest_seq,
+            panel_content_seq = ?before.panel_content_seq,
+            membership_stale,
             seq_lag = ?before.seq_lag,
             delta_changed_keys = ?before.delta_changed_keys,
             delta_history_gap_code = delta_history_gap.as_ref().map(|error| error.code),
@@ -5462,6 +5501,19 @@ impl SynapseCalyxVault {
         // non-active generation would report a healthy generation that has
         // nothing to do with the work just performed.
         let after = self.search_generation_status_for_panel(panel_version, true)?;
+        if after.membership_stale != Some(false) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_SEARCH_REBUILD_READBACK_STALE",
+                format!(
+                    "panel {panel_version} rebuild returned but independent status readback still reports membership_stale={:?} (built_at_seq={:?}, panel_content_seq={:?}, vault_latest_seq={})",
+                    after.membership_stale,
+                    after.built_at_seq,
+                    after.panel_content_seq,
+                    after.vault_latest_seq,
+                ),
+                "inspect concurrent panel-content writers and the persisted generation manifest; do not serve membership consumers until a rebuild readback covers the exact-panel content watermark",
+            ));
+        }
         tracing::info!(
             code = "SYNAPSE_CALYX_SEARCH_GENERATION_MAINTENANCE_COMMITTED",
             panel_version,
@@ -5469,6 +5521,8 @@ impl SynapseCalyxVault {
             destructive = action.is_destructive(),
             after_state = %after.state,
             after_built_at_seq = ?after.built_at_seq,
+            after_panel_content_seq = ?after.panel_content_seq,
+            after_membership_stale = ?after.membership_stale,
             after_seq_lag = ?after.seq_lag,
             after_delta_changed_keys = ?after.delta_changed_keys,
             after_rows_covered = ?after.rows_covered,

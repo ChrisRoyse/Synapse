@@ -40,6 +40,17 @@ published immutable points. Retrying the same operation every 15 seconds did no
 useful work, retained expired physical rows, repeatedly scanned the transcript
 corpus, and drove committed private memory above the lightweight daemon budget.
 
+A subsequent live read exposed a third invariant mismatch. Search maintenance
+used the query-time changed-key count and coverage ratio as its only refresh
+triggers, but panel-membership consumers read an immutable generation and
+require its base sequence to cover the exact panel's derived-content watermark.
+One panel-content commit could therefore make membership unusable while the
+query delta was still small enough for search maintenance to report
+`none_needed`. Lens coverage and Loom then failed every scheduled tick with
+`SYNAPSE_CALYX_STALE_DERIVED`. Those independent whole-corpus phases also ran
+without explicit allocator-release boundaries, so dead pages from one phase
+remained committed while the next phase allocated its own corpus.
+
 ## Decision
 
 Incremental maintenance state is an optimization over authoritative rows, never
@@ -83,6 +94,21 @@ the authority.
    is not reclamation: unreachable duplicate key bytes remain resident. The
    in-place destination is required never to advance beyond unread source bytes,
    avoiding a second corpus-sized allocation while preserving exact lookup.
+9. Search-generation status reads the manifest, vault sequence, exact-panel
+   content watermark, and changed-key delta from one panel-pinned snapshot. A
+   content watermark newer than the generation base is a distinct
+   `content_stale` state. It forces an immediate authoritative rebuild even when
+   the bounded query delta remains reconcilable and regardless of the minimum
+   rebuild interval, because immutable membership consumers are already
+   unusable. The rebuild is accepted only after an independent status read says
+   `membership_stale=false`.
+10. Each independent whole-corpus maintenance phase owns and releases its
+    allocations before the next phase begins. The daemon invokes its installed
+    allocator reclaimer after graph lanes, before panel coverage, after panel
+    coverage, and after the final scheduled kernels, and reads process-private
+    bytes before and after every release. An unavailable reclaimer or unreadable
+    process-memory Source of Truth fails the tick with a named diagnostic; this
+    is lifecycle ownership, not a memory limit or degraded execution path.
 
 ## Consequences
 
@@ -104,6 +130,12 @@ the authority.
   an unbounded lease; stalled/abandoned readers still expire.
 - Duplicate references no longer leave their raw key bytes resident in the
   long-lived GC cache after their index entries are removed.
+- A generation cannot be reported healthy merely because its query delta is
+  bounded while its immutable panel-membership view is already stale.
+- Search status and maintenance decisions cannot combine a manifest from one
+  instant with a panel watermark or delta from another.
+- Derived-state peak private memory is the largest live phase rather than the
+  accumulated committed pages of unrelated completed phases.
 
 ## Research basis
 
@@ -118,3 +150,8 @@ the authority.
 - [PostgreSQL operator classes](https://www.postgresql.org/docs/current/indexes-opclass.html): an index is valid for the operators and semantics declared by its operator class, not merely because a column's data type can be stored.
 - [etcd lease API](https://etcd.io/docs/v3.7/learning/api/): a live lease is extended through explicit keep-alives; expiry remains the fail-closed liveness boundary when keep-alives stop.
 - [Kubernetes Leases](https://kubernetes.io/docs/concepts/architecture/leases/): active holders update `renewTime`, while the absence of renewal is what permits expiry and reclamation.
+- [Materialize snapshotting](https://materialize.com/docs/concepts/snapshotting/): a materialized snapshot is committed atomically and queries wait for a complete serving version instead of observing a partial generation.
+- [Debezium incremental snapshot design](https://github.com/debezium/debezium-design-documents/blob/main/DDD-3.md): explicit low/high watermarks and bounded chunks make incremental reconstruction consistent and resumable.
+- [Materialize self-correcting materialized views](https://materialize.com/blog/self-correcting-materialized-views/): authoritative readback and serialized hydration avoid retaining duplicate snapshot state during repair.
+- [RocksDB snapshots](https://github.com/facebook/rocksdb/wiki/Snapshot) and [memory usage](https://github.com/facebook/rocksdb/wiki/Memory-usage-in-RocksDB): snapshots provide a consistent point-in-time view, while iterator and cache lifetime directly controls retained resources.
+- [Materialize isolation levels](https://materialize.com/docs/reference/isolation-level/): readers are served the freshest consistent snapshot and fail or wait when no qualifying consistent view exists.

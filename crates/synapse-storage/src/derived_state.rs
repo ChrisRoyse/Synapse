@@ -773,6 +773,28 @@ fn record_failure(code: &'static str, detail: String) {
     guard.last_failure_detail = Some(detail);
 }
 
+/// Returns allocator-owned pages after every complete corpus owner has been
+/// dropped, before the next independent whole-corpus phase starts.
+///
+/// The phase boundary is correctness, not a memory cap: keeping dead graph,
+/// search, coverage, or weave arenas committed until the next phase makes the
+/// peak the sum of unrelated operations. A missing executable-owned reclaimer
+/// or unreadable process-memory Source of Truth is an explicit tick failure.
+fn release_completed_phase_memory(operation: &'static str) -> Result<(), String> {
+    let release = synapse_calyx::release_process_memory(operation)
+        .map_err(|error| format!("release allocator pages after {operation}: {error}"))?;
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_PHASE_MEMORY_RELEASED",
+        operation,
+        private_bytes_before = release.private_bytes_before,
+        private_bytes_after = release.private_bytes_after,
+        private_bytes_reclaimed = release.private_bytes_reclaimed,
+        release_elapsed_us = release.elapsed_us,
+        "released one completed derived-state phase before the next independent corpus owner"
+    );
+    Ok(())
+}
+
 /// Records a cost or quality **advisory** — loud, and never a failure (#2080
 /// ask 2).
 ///
@@ -930,6 +952,10 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
                 error.to_string(),
             );
         }
+    }
+    if let Err(error) = release_completed_phase_memory("scheduled derived-state graph lanes") {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_GRAPH_MEMORY_RELEASE_FAILED", error);
     }
 
     // --- Durable hot-added lens backfill (#1668) ---
@@ -1132,6 +1158,19 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
         }
     }
 
+    // Search and lens measurements have no ownership relationship with the
+    // exact panel census. Their products are now either published or dropped;
+    // return the allocator's dead pages before the largest streaming pass starts.
+    if let Err(error) =
+        release_completed_phase_memory("scheduled derived-state pre-panel-coverage phases")
+    {
+        any_failed = true;
+        record_failure(
+            "STORAGE_DERIVED_STATE_PRE_COVERAGE_MEMORY_RELEASE_FAILED",
+            error,
+        );
+    }
+
     // --- Panel coverage census + driven backfill (#1927 asks 1/2, #1920 ask 1) ---
     //
     // Deliberately last and deliberately independent of the two halves above:
@@ -1251,6 +1290,18 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
         }
     }
 
+    // `measure_panel_coverage` owns the packed physical-key indexes and Base
+    // cursor only through the call above. Reclaim them before Loom loads its
+    // dense corpus; otherwise the steady-state peak is the sum of two unrelated
+    // full-corpus operations.
+    if let Err(error) = release_completed_phase_memory("scheduled panel coverage census") {
+        any_failed = true;
+        record_failure(
+            "STORAGE_DERIVED_STATE_PANEL_COVERAGE_MEMORY_RELEASE_FAILED",
+            error,
+        );
+    }
+
     // --- Incremental Loom weave (#1671) ---
     //
     // This runs after the coverage census so it never delays the cheaper
@@ -1297,6 +1348,10 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     if let Err(error) = drive_scheduled_kernels(&db, current_panel_coverage.as_ref()) {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_KERNEL_REBUILD_FAILED", error);
+    }
+    if let Err(error) = release_completed_phase_memory("scheduled derived-state tick") {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_FINAL_MEMORY_RELEASE_FAILED", error);
     }
 
     // --- One verdict, from one ledger (#2080 ask 1) ---
