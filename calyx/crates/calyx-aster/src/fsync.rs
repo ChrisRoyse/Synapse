@@ -19,6 +19,44 @@ pub(crate) fn write_atomic_create_new(path: &Path, bytes: &[u8], label: &str) ->
     write_atomic(path, bytes, label, PublishMode::CreateNew)
 }
 
+/// Publishes a caller-streamed immutable file with the same durability
+/// boundary as [`write_atomic_create_new`], without first materializing the
+/// complete file in a second heap allocation.
+pub(crate) fn write_atomic_create_new_stream(
+    path: &Path,
+    label: &str,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| durable_error(label, "resolve parent", path, None, 0))?;
+    create_dir_all(parent, label)?;
+    if path.exists() {
+        return Err(create_new_publish_collision_error(
+            label,
+            "publish streamed create-new target already exists",
+            path,
+        ));
+    }
+    let temp = temp_path(path)?;
+    let result = (|| {
+        let mut file = open_create_new(&temp, label, "create streamed atomic temp")?;
+        write(&mut file).map_err(|error| {
+            durable_error(label, "write streamed atomic temp", &temp, Some(error), 0)
+        })?;
+        file.sync_all().map_err(|error| {
+            durable_error(label, "fsync streamed atomic temp", &temp, Some(error), 0)
+        })?;
+        drop(file);
+        publish_path(&temp, path, label, PublishMode::CreateNew)?;
+        sync_parent(path, label)
+    })();
+    if result.is_err() {
+        cleanup_unpublished_temp(&temp, label);
+    }
+    result
+}
+
 pub(crate) fn write_atomic_replace(path: &Path, bytes: &[u8], label: &str) -> Result<()> {
     write_atomic(path, bytes, label, PublishMode::ReplaceExisting)
 }

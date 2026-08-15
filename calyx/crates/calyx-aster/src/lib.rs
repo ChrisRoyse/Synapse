@@ -5,6 +5,7 @@ pub mod cf;
 pub mod collection;
 pub mod compaction;
 pub mod dedup;
+pub mod durable_artifact;
 pub mod erase;
 mod file_lock;
 mod fsync;

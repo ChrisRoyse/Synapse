@@ -1,6 +1,8 @@
 use std::{
     cmp::Ordering as CmpOrdering,
     collections::{BTreeMap, BTreeSet},
+    fs,
+    io::{Seek, SeekFrom, Write},
     mem::size_of,
     ops::ControlFlow,
     path::{Path, PathBuf},
@@ -14,6 +16,8 @@ use std::{
 
 use calyx_aster::{
     cf::{ColumnFamily, KeyRange, prefix_range},
+    durable_artifact,
+    mmap_col::MmapColumn,
     mvcc::{CfRead, Freshness, LATEST_CF_RANGE_PAGE_MAX_ROWS, Snapshot, tombstone_value},
     wal,
 };
@@ -14285,6 +14289,61 @@ impl PackedSourceReferenceKeys {
         Ok(())
     }
 
+    fn truncate_chunks_to_reachable_ranges(
+        &mut self,
+        cf_name: &str,
+        retained_chunks: usize,
+    ) -> Result<(), String> {
+        self.chunks.truncate(retained_chunks);
+        let mut used_bytes_by_chunk = Vec::new();
+        used_bytes_by_chunk
+            .try_reserve_exact(retained_chunks)
+            .map_err(|source| {
+                format!(
+                    "reserve {retained_chunks} source-reference chunk watermarks for {cf_name} failed: {source}"
+                )
+            })?;
+        used_bytes_by_chunk.resize(retained_chunks, 0_usize);
+        for range in &self.ranges {
+            let used = used_bytes_by_chunk.get_mut(range.chunk()).ok_or_else(|| {
+                format!(
+                    "source-reference compacted range names absent chunk {} for {cf_name}",
+                    range.chunk()
+                )
+            })?;
+            *used = (*used).max(range.end());
+        }
+        for (chunk_index, (chunk, used)) in
+            self.chunks.iter_mut().zip(used_bytes_by_chunk).enumerate()
+        {
+            if used == 0 || used > chunk.len() {
+                return Err(format!(
+                    "source-reference compacted chunk {chunk_index} for {cf_name} has invalid reachable bytes {used} with physical length {}",
+                    chunk.len()
+                ));
+            }
+            chunk.truncate(used);
+        }
+        Ok(())
+    }
+
+    fn validate_exact_packed_bytes(&self, cf_name: &str) -> Result<(), String> {
+        let reachable_key_bytes = self.ranges.iter().try_fold(0_usize, |total, range| {
+            total
+                .checked_add(range.end().saturating_sub(range.start()))
+                .ok_or_else(|| {
+                    format!("source-reference reachable key bytes overflowed for {cf_name}")
+                })
+        })?;
+        let packed_key_bytes = self.packed_bytes();
+        if packed_key_bytes != reachable_key_bytes {
+            return Err(format!(
+                "source-reference compaction for {cf_name} retained {packed_key_bytes} physical bytes but ranges address {reachable_key_bytes} bytes"
+            ));
+        }
+        Ok(())
+    }
+
     fn sort_and_dedup(&mut self, cf_name: &str) -> Result<(), String> {
         let chunks = self.chunks.as_slice();
         self.ranges.sort_unstable_by(|left, right| {
@@ -14378,9 +14437,21 @@ impl PackedSourceReferenceKeys {
         if self.ranges.is_empty() {
             self.chunks.clear();
         } else {
-            self.chunks.truncate(destination_chunk + 1);
-            self.chunks[destination_chunk].truncate(destination_start);
+            let retained_chunks = destination_chunk.checked_add(1).ok_or_else(|| {
+                format!("source-reference retained chunk count overflowed for {cf_name}")
+            })?;
+            // Keys never straddle chunks. When the next key does not fit in
+            // the current destination chunk, compaction advances to the next
+            // chunk and leaves a short unused tail behind. Truncating only the
+            // final chunk therefore made `packed_bytes()` count those tails
+            // even though no range could address them. The durable artifact
+            // correctly streams only addressable keys, so its planned length
+            // diverged from the encoded length on real variable-sized keys.
+            // Derive every retained chunk's exact reachable end from the
+            // rewritten ranges, then remove all unreachable tails.
+            self.truncate_chunks_to_reachable_ranges(cf_name, retained_chunks)?;
         }
+        self.validate_exact_packed_bytes(cf_name)?;
         let chunks = self.chunks.as_slice();
         self.ranges.sort_unstable_by(|left, right| {
             packed_source_reference_key(chunks, *left)
@@ -14392,12 +14463,6 @@ impl PackedSourceReferenceKeys {
         }
         self.chunks.shrink_to_fit();
         Ok(())
-    }
-
-    fn contains(&self, key: &[u8]) -> bool {
-        self.ranges
-            .binary_search_by(|range| packed_source_reference_key(&self.chunks, *range).cmp(key))
-            .is_ok()
     }
 
     const fn len(&self) -> usize {
@@ -14440,6 +14505,23 @@ const CALYX_GC_SOURCE_CENSUS_FULL_REBASE: &str = "full_rebase";
 const CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE: &str = "base_tombstone";
 const CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND: &str = "delta_reference_bound";
 const CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP: &str = "changed_key_history_gap";
+const CALYX_GC_SOURCE_CENSUS_REBASE_OUT_OF_BAND: &str = "base_out_of_band_change";
+const CALYX_GC_SOURCE_CENSUS_MAPPED_REUSE: &str = "mapped_generation_reuse";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIR: &str = "gc-source-census-v1";
+const CALYX_GC_SOURCE_CENSUS_CURRENT_FILE: &str = "CURRENT";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_PREFIX: &str = "source-census-";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_SUFFIX: &str = ".idx";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_LABEL: &str = "Synapse GC source-census artifact";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAGIC: &[u8; 16] = b"SYN-GC-REF-IDX1\0";
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_VERSION: u32 = 1;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES: usize = 192;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES_U32: u32 = 192;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES: usize = 48;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES_U32: u32 = 48;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES: usize = 8;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES_U32: u32 = 8;
+const CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAX_CFS: usize = 1_024;
+static CALYX_GC_SOURCE_CENSUS_NEXT_ARTIFACT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum number of post-baseline exact references retained in individually
 /// allocated ordered sets. Crossing the bound rebuilds the packed baseline at
@@ -14447,23 +14529,114 @@ const CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP: &str = "changed_key_history_gap
 /// remembered-set overhead.
 const CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES: usize = 65_536;
 
+struct MappedSourceReferenceSection {
+    rows: usize,
+    ranges_offset: usize,
+    data_offset: usize,
+}
+
+struct MappedDerivedSourceReferences {
+    artifact: MmapColumn,
+    pinned_seq: u64,
+    base_last_commit_seq: u64,
+    base_out_of_band_epoch: u64,
+    sections: BTreeMap<String, MappedSourceReferenceSection>,
+    metrics: DerivedSourceReferenceMetrics,
+}
+
+impl MappedDerivedSourceReferences {
+    fn contains(&self, cf_name: &str, key: &[u8]) -> bool {
+        let Some(section) = self.sections.get(cf_name) else {
+            return false;
+        };
+        let bytes = self.artifact.as_bytes();
+        let mut low = 0_usize;
+        let mut high = section.rows;
+        while low < high {
+            let middle = low + ((high - low) / 2);
+            let range_offset =
+                section.ranges_offset + (middle * CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES);
+            let key_offset = match usize::try_from(read_artifact_u32(bytes, range_offset)) {
+                Ok(offset) => offset,
+                Err(source) => {
+                    tracing::error!(
+                        code = "STORAGE_CALYX_GC_SOURCE_CENSUS_MAPPED_OFFSET_INVALID",
+                        path = %self.artifact.path().display(),
+                        cf = cf_name,
+                        row = middle,
+                        error = %source,
+                        "validated source-census mapping produced an unrepresentable offset; retaining the source row and refusing deletion authority"
+                    );
+                    return true;
+                }
+            };
+            let key_len = usize::from(read_artifact_u16(bytes, range_offset + 4));
+            let start = section.data_offset.saturating_add(key_offset);
+            let end = start.saturating_add(key_len);
+            let Some(candidate) = bytes.get(start..end) else {
+                // The complete mapping is validated before this structure can
+                // exist. A later impossible bounds failure must retain the
+                // source row instead of authorizing deletion.
+                tracing::error!(
+                    code = "STORAGE_CALYX_GC_SOURCE_CENSUS_MAPPED_RANGE_INVALID",
+                    path = %self.artifact.path().display(),
+                    cf = cf_name,
+                    row = middle,
+                    key_offset,
+                    key_len,
+                    "validated source-census mapping produced an out-of-bounds range; retaining the source row and refusing deletion authority"
+                );
+                return true;
+            };
+            match candidate.cmp(key) {
+                CmpOrdering::Less => low = middle + 1,
+                CmpOrdering::Equal => return true,
+                CmpOrdering::Greater => high = middle,
+            }
+        }
+        false
+    }
+}
+
+fn read_artifact_u16(bytes: &[u8], offset: usize) -> u16 {
+    let mut raw = [0_u8; 2];
+    if let Some(value) = bytes.get(offset..offset.saturating_add(raw.len())) {
+        raw.copy_from_slice(value);
+    }
+    u16::from_le_bytes(raw)
+}
+
+fn read_artifact_u32(bytes: &[u8], offset: usize) -> u32 {
+    let mut raw = [0_u8; 4];
+    if let Some(value) = bytes.get(offset..offset.saturating_add(raw.len())) {
+        raw.copy_from_slice(value);
+    }
+    u32::from_le_bytes(raw)
+}
+
+fn read_artifact_u64(bytes: &[u8], offset: usize) -> u64 {
+    let mut raw = [0_u8; 8];
+    if let Some(value) = bytes.get(offset..offset.saturating_add(raw.len())) {
+        raw.copy_from_slice(value);
+    }
+    u64::from_le_bytes(raw)
+}
+
 /// Exact reachability at one committed sequence.
 ///
-/// The large baseline stays in allocation-compact arenas. Changes after that
-/// baseline are normally tiny and live in ordered sets so each tick updates
-/// only changed references instead of sorting 1.5M ranges again. Tombstones
+/// The corpus-sized baseline is an immutable, checksummed, read-only mapping;
+/// the OS can evict its cold pages instead of charging ~100 MiB of private heap
+/// to an idle daemon. Changes after that baseline are normally tiny and live in
+/// ordered sets so each tick updates only changed references. Tombstones
 /// invalidate the additive representation and force an exact rebase.
-#[derive(Default)]
 struct DerivedSourceReferenceIndex {
-    baseline: DerivedSourceReferences,
+    baseline: MappedDerivedSourceReferences,
     delta: BTreeMap<String, BTreeSet<Vec<u8>>>,
 }
 
 impl DerivedSourceReferenceIndex {
     fn contains(&self, cf_name: &str, key: &[u8]) -> bool {
-        self.baseline
-            .get(cf_name)
-            .is_some_and(|keys| keys.contains(key))
+        self.baseline.contains(cf_name, key)
             || self
                 .delta
                 .get(cf_name)
@@ -14471,11 +14644,7 @@ impl DerivedSourceReferenceIndex {
     }
 
     fn insert_delta(&mut self, cf_name: String, key: Vec<u8>) {
-        if self
-            .baseline
-            .get(&cf_name)
-            .is_some_and(|keys| keys.contains(&key))
-        {
+        if self.baseline.contains(&cf_name, &key) {
             return;
         }
         self.delta.entry(cf_name).or_default().insert(key);
@@ -14487,6 +14656,7 @@ impl DerivedSourceReferenceIndex {
 
     fn referenced_column_families(&self) -> usize {
         self.baseline
+            .sections
             .keys()
             .chain(self.delta.keys())
             .collect::<BTreeSet<_>>()
@@ -14494,7 +14664,7 @@ impl DerivedSourceReferenceIndex {
     }
 
     fn referenced_rows(&self) -> StorageResult<u64> {
-        let baseline = derived_source_reference_metrics(&self.baseline)?.rows;
+        let baseline = self.baseline.metrics.rows;
         let delta = calyx_len_to_u64(
             CALYX_GC_CF,
             "Calyx GC delta protected source rows",
@@ -14584,6 +14754,1000 @@ fn derived_source_reference_metrics(
         )?;
     }
     Ok(metrics)
+}
+
+struct SourceCensusArtifactSectionLayout {
+    cf_name: String,
+    name_offset: usize,
+    rows: usize,
+    ranges_offset: usize,
+    data_offset: usize,
+    data_len: usize,
+}
+
+struct SourceCensusArtifactLayout {
+    sections: Vec<SourceCensusArtifactSectionLayout>,
+    rows: u64,
+    file_len: usize,
+}
+
+fn source_census_artifact_dir(vault: &SynapseCalyxVault) -> PathBuf {
+    vault
+        .vault_dir()
+        .join("derived")
+        .join(CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIR)
+}
+
+fn source_census_current_path(vault: &SynapseCalyxVault) -> PathBuf {
+    source_census_artifact_dir(vault).join(CALYX_GC_SOURCE_CENSUS_CURRENT_FILE)
+}
+
+fn source_census_vault_id_sha256(vault: &SynapseCalyxVault) -> [u8; 32] {
+    Sha256::digest(vault.vault_id().as_bytes()).into()
+}
+
+fn checked_artifact_add(cursor: usize, amount: usize, field: &'static str) -> StorageResult<usize> {
+    cursor.checked_add(amount).ok_or_else(|| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: {field} overflowed usize; remediation=preserve the vault and inspect the Base source-key corpus before retrying"
+            ),
+        )
+    })
+}
+
+fn source_census_artifact_layout(
+    referenced: &DerivedSourceReferences,
+) -> StorageResult<SourceCensusArtifactLayout> {
+    if referenced.len() > CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAX_CFS {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CF_BOUND: source column families={} max={}; remediation=inspect unexpected source_cf metadata before retrying",
+                referenced.len(),
+                CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAX_CFS
+            ),
+        ));
+    }
+    let directory_bytes = referenced
+        .len()
+        .checked_mul(CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: directory length overflowed usize",
+            )
+        })?;
+    let mut cursor = checked_artifact_add(
+        CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES,
+        directory_bytes,
+        "directory end",
+    )?;
+    let mut name_offsets = BTreeMap::new();
+    for cf_name in referenced.keys() {
+        if cf_name.is_empty() {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CF_EMPTY: derived source reference names an empty column family",
+            ));
+        }
+        let name_offset = cursor;
+        cursor = checked_artifact_add(cursor, cf_name.len(), "column-family name end")?;
+        name_offsets.insert(cf_name.clone(), name_offset);
+    }
+    let mut sections = Vec::with_capacity(referenced.len());
+    let mut rows = 0_u64;
+    for (cf_name, keys) in referenced {
+        let data_len = keys.packed_bytes();
+        if data_len > u32::MAX as usize {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_SECTION_TOO_LARGE: cf={cf_name} key_bytes={data_len} max={}; remediation=split the source namespace at the schema boundary before retrying",
+                    u32::MAX
+                ),
+            ));
+        }
+        let range_bytes = keys
+            .len()
+            .checked_mul(CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: cf={cf_name} range bytes overflowed usize"
+                    ),
+                )
+            })?;
+        let ranges_offset = cursor;
+        cursor = checked_artifact_add(cursor, range_bytes, "range directory end")?;
+        let data_offset = cursor;
+        cursor = checked_artifact_add(cursor, data_len, "key data end")?;
+        rows = rows
+            .checked_add(calyx_len_to_u64(
+                CALYX_GC_CF,
+                "Calyx GC source-census artifact rows",
+                keys.len(),
+            )?)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: row count overflowed u64",
+                )
+            })?;
+        sections.push(SourceCensusArtifactSectionLayout {
+            cf_name: cf_name.clone(),
+            name_offset: name_offsets[cf_name],
+            rows: keys.len(),
+            ranges_offset,
+            data_offset,
+            data_len,
+        });
+    }
+    Ok(SourceCensusArtifactLayout {
+        sections,
+        rows,
+        file_len: cursor,
+    })
+}
+
+fn write_hashed_artifact_bytes(
+    file: &mut fs::File,
+    hasher: &mut Sha256,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    file.write_all(bytes)?;
+    hasher.update(bytes);
+    Ok(())
+}
+
+fn encode_source_census_artifact_header(
+    pinned_seq: u64,
+    base_last_commit_seq: u64,
+    base_out_of_band_epoch: u64,
+    vault_id_sha256: &[u8; 32],
+    layout: &SourceCensusArtifactLayout,
+    payload_sha256: &[u8; 32],
+) -> StorageResult<[u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES]> {
+    let mut header = [0_u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES];
+    header[0..16].copy_from_slice(CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAGIC);
+    header[16..20].copy_from_slice(&CALYX_GC_SOURCE_CENSUS_ARTIFACT_VERSION.to_le_bytes());
+    header[20..24].copy_from_slice(
+        &u32::try_from(CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES)
+            .map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census artifact header length exceeds u32",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    header[24..32].copy_from_slice(&pinned_seq.to_le_bytes());
+    header[32..40].copy_from_slice(&base_last_commit_seq.to_le_bytes());
+    header[40..48].copy_from_slice(&layout.rows.to_le_bytes());
+    header[48..52].copy_from_slice(
+        &u32::try_from(layout.sections.len())
+            .map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census artifact column-family count exceeds u32",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    header[52..56].copy_from_slice(
+        &u32::try_from(CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES)
+            .map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census artifact directory width exceeds u32",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    header[56..60].copy_from_slice(
+        &u32::try_from(CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES)
+            .map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census artifact range width exceeds u32",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    header[64..72].copy_from_slice(
+        &u64::try_from(layout.file_len)
+            .map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census artifact file length exceeds u64",
+                )
+            })?
+            .to_le_bytes(),
+    );
+    header[72..104].copy_from_slice(payload_sha256);
+    header[104..112].copy_from_slice(&base_out_of_band_epoch.to_le_bytes());
+    header[112..144].copy_from_slice(vault_id_sha256);
+    let header_sha256: [u8; 32] = Sha256::digest(header).into();
+    header[144..176].copy_from_slice(&header_sha256);
+    Ok(header)
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "stream, release, map, pointer publication, and physical readback form one unambiguous commit boundary"
+)]
+fn publish_source_census_artifact(
+    vault: &SynapseCalyxVault,
+    pinned_seq: u64,
+    base_last_commit_seq: u64,
+    base_out_of_band_epoch: u64,
+    referenced: DerivedSourceReferences,
+) -> StorageResult<MappedDerivedSourceReferences> {
+    let layout = source_census_artifact_layout(&referenced)?;
+    let artifact_id = CALYX_GC_SOURCE_CENSUS_NEXT_ARTIFACT_ID.fetch_add(1, Ordering::Relaxed);
+    let file_name = format!(
+        "{CALYX_GC_SOURCE_CENSUS_ARTIFACT_PREFIX}{pinned_seq:020}-{:010}-{artifact_id:020}{CALYX_GC_SOURCE_CENSUS_ARTIFACT_SUFFIX}",
+        std::process::id()
+    );
+    let artifact_dir = source_census_artifact_dir(vault);
+    let artifact_path = artifact_dir.join(&file_name);
+    let vault_id_sha256 = source_census_vault_id_sha256(vault);
+    let zero_header = [0_u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES];
+    let mut completed_payload_sha256 = None;
+    durable_artifact::publish_immutable_with(
+        &artifact_path,
+        CALYX_GC_SOURCE_CENSUS_ARTIFACT_LABEL,
+        |file| {
+            file.write_all(&zero_header)?;
+            let mut hasher = Sha256::new();
+            for section in &layout.sections {
+                let mut directory = [0_u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES];
+                let cf_name_len = u32::try_from(section.cf_name.len()).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "source-census column-family name length exceeds u32 for {}",
+                            section.cf_name
+                        ),
+                    )
+                })?;
+                directory[0..8].copy_from_slice(&(section.name_offset as u64).to_le_bytes());
+                directory[8..12].copy_from_slice(&cf_name_len.to_le_bytes());
+                directory[16..24].copy_from_slice(&(section.rows as u64).to_le_bytes());
+                directory[24..32].copy_from_slice(&(section.ranges_offset as u64).to_le_bytes());
+                directory[32..40].copy_from_slice(&(section.data_offset as u64).to_le_bytes());
+                directory[40..48].copy_from_slice(&(section.data_len as u64).to_le_bytes());
+                write_hashed_artifact_bytes(file, &mut hasher, &directory)?;
+            }
+            for section in &layout.sections {
+                write_hashed_artifact_bytes(file, &mut hasher, section.cf_name.as_bytes())?;
+            }
+            for section in &layout.sections {
+                let keys = &referenced[&section.cf_name];
+                let mut data_offset = 0_u32;
+                for range in &keys.ranges {
+                    let key = packed_source_reference_key(&keys.chunks, *range);
+                    let key_len = u16::try_from(key.len()).map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "source-census key length {} exceeds u16 for {}",
+                                key.len(),
+                                section.cf_name
+                            ),
+                        )
+                    })?;
+                    let mut encoded = [0_u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES];
+                    encoded[0..4].copy_from_slice(&data_offset.to_le_bytes());
+                    encoded[4..6].copy_from_slice(&key_len.to_le_bytes());
+                    write_hashed_artifact_bytes(file, &mut hasher, &encoded)?;
+                    data_offset = data_offset.checked_add(u32::from(key_len)).ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "source-census key offset overflowed u32 for {}",
+                                section.cf_name
+                            ),
+                        )
+                    })?;
+                }
+                let planned_data_len = u32::try_from(section.data_len).map_err(|_| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "source-census planned key bytes exceed u32 for {}",
+                            section.cf_name
+                        ),
+                    )
+                })?;
+                if data_offset != planned_data_len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "source-census planned key bytes {} differ from encoded {} for {}",
+                            section.data_len, data_offset, section.cf_name
+                        ),
+                    ));
+                }
+                for range in &keys.ranges {
+                    write_hashed_artifact_bytes(
+                        file,
+                        &mut hasher,
+                        packed_source_reference_key(&keys.chunks, *range),
+                    )?;
+                }
+            }
+            let payload_sha256: [u8; 32] = hasher.finalize().into();
+            let header = encode_source_census_artifact_header(
+                pinned_seq,
+                base_last_commit_seq,
+                base_out_of_band_epoch,
+                &vault_id_sha256,
+                &layout,
+                &payload_sha256,
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header)?;
+            completed_payload_sha256 = Some(payload_sha256);
+            Ok(())
+        },
+    )
+    .map_err(|source| {
+        let source = SynapseCalyxError::from_calyx(
+            "publish immutable mapped source-census generation",
+            &source,
+        );
+        calyx_write_failed(
+            CALYX_GC_CF,
+            "publish immutable mapped source-census generation",
+            &source,
+        )
+    })?;
+    if completed_payload_sha256.is_none() {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_WRITE_INCOMPLETE: durable publisher returned without the writer completing",
+        ));
+    }
+    let heap_metrics = derived_source_reference_metrics(&referenced)?;
+    drop(referenced);
+    let release = synapse_calyx::release_process_memory("storage_gc_source_census_mapped")
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "release heap source census before validating its mapped generation",
+                &source,
+            )
+        })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_GC_SOURCE_CENSUS_HEAP_RELEASED",
+        baseline_rows = heap_metrics.rows,
+        packed_key_capacity_bytes = heap_metrics.key_capacity_bytes,
+        range_index_capacity_bytes = heap_metrics.range_capacity_bytes,
+        private_bytes_before = release.private_bytes_before,
+        private_bytes_after = release.private_bytes_after,
+        private_bytes_reclaimed = release.private_bytes_reclaimed,
+        release_elapsed_us = release.elapsed_us,
+        "destroyed and released the corpus-sized heap census before touching the read-only mapping"
+    );
+    let mapped = open_source_census_artifact(&artifact_path, &vault_id_sha256)?;
+    durable_artifact::publish_current(
+        &source_census_current_path(vault),
+        format!("{file_name}\n").as_bytes(),
+        CALYX_GC_SOURCE_CENSUS_ARTIFACT_LABEL,
+    )
+    .map_err(|source| {
+        let source =
+            SynapseCalyxError::from_calyx("publish current mapped source-census pointer", &source);
+        calyx_write_failed(
+            CALYX_GC_CF,
+            "publish current mapped source-census pointer",
+            &source,
+        )
+    })?;
+    let current_readback = fs::read_to_string(source_census_current_path(vault)).map_err(|source| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CURRENT_READBACK_FAILED: read CURRENT after publish failed: {source}"
+            ),
+        )
+    })?;
+    if current_readback != format!("{file_name}\n") {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CURRENT_READBACK_MISMATCH: expected {file_name:?}, got {:?}",
+                current_readback.trim_end()
+            ),
+        ));
+    }
+    cleanup_obsolete_source_census_artifacts(&artifact_dir, &file_name);
+    tracing::info!(
+        code = "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_PUBLISHED",
+        path = %artifact_path.display(),
+        pinned_seq,
+        base_last_commit_seq,
+        base_out_of_band_epoch,
+        rows = layout.rows,
+        column_families = layout.sections.len(),
+        file_bytes = layout.file_len,
+        "published and independently reopened the immutable mapped source-census generation"
+    );
+    Ok(mapped)
+}
+
+fn cleanup_obsolete_source_census_artifacts(artifact_dir: &Path, current_name: &str) {
+    let entries = match fs::read_dir(artifact_dir) {
+        Ok(entries) => entries,
+        Err(source) => {
+            tracing::error!(
+                code = "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CLEANUP_READ_FAILED",
+                path = %artifact_dir.display(),
+                error = %source,
+                "could not enumerate obsolete source-census generations after a successful publication"
+            );
+            return;
+        }
+    };
+    let temp_prefix = format!(".{CALYX_GC_SOURCE_CENSUS_ARTIFACT_PREFIX}");
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(source) => {
+                tracing::error!(
+                    code = "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CLEANUP_ENTRY_FAILED",
+                    path = %artifact_dir.display(),
+                    error = %source,
+                    "could not inspect one obsolete source-census generation"
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let generation = name.starts_with(CALYX_GC_SOURCE_CENSUS_ARTIFACT_PREFIX)
+            && name.ends_with(CALYX_GC_SOURCE_CENSUS_ARTIFACT_SUFFIX);
+        let unpublished_temp = name.starts_with(&temp_prefix)
+            && Path::new(name)
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("tmp"));
+        if name == current_name || (!generation && !unpublished_temp) {
+            continue;
+        }
+        let path = entry.path();
+        if let Err(source) =
+            durable_artifact::remove_obsolete(&path, CALYX_GC_SOURCE_CENSUS_ARTIFACT_LABEL)
+        {
+            tracing::error!(
+                code = "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CLEANUP_REMOVE_FAILED",
+                path = %path.display(),
+                error_code = source.code,
+                error = %source.message,
+                "could not remove one obsolete source-census generation; the current pointer remains authoritative and the next publication will retry cleanup"
+            );
+        }
+    }
+}
+
+fn validate_artifact_range(
+    file_len: usize,
+    offset: u64,
+    len: u64,
+    field: &str,
+) -> StorageResult<(usize, usize)> {
+    let offset = usize::try_from(offset).map_err(|_| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!("STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: {field} offset exceeds usize"),
+        )
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!("STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: {field} length exceeds usize"),
+        )
+    })?;
+    let end = checked_artifact_add(offset, len, "validated mapped range")?;
+    if end > file_len {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_BOUNDS: {field} offset={offset} len={len} exceeds file_len={file_len}"
+            ),
+        ));
+    }
+    Ok((offset, len))
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "the immutable format is validated in one linear fail-closed decoder"
+)]
+fn open_source_census_artifact(
+    path: &Path,
+    expected_vault_id_sha256: &[u8; 32],
+) -> StorageResult<MappedDerivedSourceReferences> {
+    let artifact = MmapColumn::open(path).map_err(|source| {
+        let source = SynapseCalyxError::from_calyx("memory-map source-census generation", &source);
+        calyx_write_failed(CALYX_GC_CF, "memory-map source-census generation", &source)
+    })?;
+    let bytes = artifact.as_bytes();
+    if bytes.len() < CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES
+        || bytes.get(0..16) != Some(CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAGIC.as_slice())
+        || read_artifact_u32(bytes, 16) != CALYX_GC_SOURCE_CENSUS_ARTIFACT_VERSION
+        || read_artifact_u32(bytes, 20) != CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES_U32
+        || read_artifact_u32(bytes, 52) != CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES_U32
+        || read_artifact_u32(bytes, 56) != CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES_U32
+        || !bytes
+            .get(60..64)
+            .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0))
+        || !bytes
+            .get(176..CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES)
+            .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0))
+    {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_INVALID: {} has an unknown or truncated format; remediation=preserve the file and rebuild the derived census from authoritative Base rows",
+                path.display()
+            ),
+        ));
+    }
+    let mut header_for_hash = [0_u8; CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES];
+    header_for_hash.copy_from_slice(&bytes[..CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES]);
+    header_for_hash[144..176].fill(0);
+    let actual_header_sha256 = Sha256::digest(header_for_hash);
+    let expected_header_sha256 = &bytes[144..176];
+    if expected_header_sha256 != actual_header_sha256.as_slice() {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_HASH_MISMATCH: path={} expected={} actual={}; remediation=preserve the corrupt artifact and rebuild from authoritative Base rows",
+                path.display(),
+                constellations::hex_encode(expected_header_sha256),
+                constellations::hex_encode(&actual_header_sha256)
+            ),
+        ));
+    }
+    let artifact_vault_id_sha256 = &bytes[112..144];
+    if artifact_vault_id_sha256 != expected_vault_id_sha256 {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_VAULT_MISMATCH: path={} artifact_vault_id_sha256={} live_vault_id_sha256={}; remediation=preserve the foreign generation and rebuild from this vault's authoritative Base rows",
+                path.display(),
+                constellations::hex_encode(artifact_vault_id_sha256),
+                constellations::hex_encode(expected_vault_id_sha256)
+            ),
+        ));
+    }
+    let declared_file_len = usize::try_from(read_artifact_u64(bytes, 64)).map_err(|_| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            "source-census declared file length exceeds usize",
+        )
+    })?;
+    if declared_file_len != bytes.len() {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_LENGTH_MISMATCH: path={} declared={} actual={}",
+                path.display(),
+                declared_file_len,
+                bytes.len()
+            ),
+        ));
+    }
+    let expected_payload_sha256 = bytes.get(72..104).ok_or_else(|| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            "source-census payload digest is outside the mapped header",
+        )
+    })?;
+    let actual_payload_sha256 = Sha256::digest(
+        bytes
+            .get(CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES..)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census payload begins outside the mapped file",
+                )
+            })?,
+    );
+    if expected_payload_sha256 != actual_payload_sha256.as_slice() {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_HASH_MISMATCH: path={} expected={} actual={}; remediation=preserve the corrupt artifact and rebuild from authoritative Base rows",
+                path.display(),
+                constellations::hex_encode(expected_payload_sha256),
+                constellations::hex_encode(&actual_payload_sha256)
+            ),
+        ));
+    }
+    let pinned_seq = read_artifact_u64(bytes, 24);
+    let base_last_commit_seq = read_artifact_u64(bytes, 32);
+    let base_out_of_band_epoch = read_artifact_u64(bytes, 104);
+    if base_last_commit_seq > pinned_seq {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_WATERMARK_INVALID: path={} base_last_commit_seq={} pinned_seq={}",
+                path.display(),
+                base_last_commit_seq,
+                pinned_seq
+            ),
+        ));
+    }
+    let declared_rows = read_artifact_u64(bytes, 40);
+    let cf_count = usize::try_from(read_artifact_u32(bytes, 48)).map_err(|_| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            "source-census column-family count exceeds usize",
+        )
+    })?;
+    if cf_count > CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAX_CFS {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CF_BOUND: path={} column_families={} max={}",
+                path.display(),
+                cf_count,
+                CALYX_GC_SOURCE_CENSUS_ARTIFACT_MAX_CFS
+            ),
+        ));
+    }
+    let directory_len = cf_count
+        .checked_mul(CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                "source-census mapped directory length overflowed usize",
+            )
+        })?;
+    validate_artifact_range(
+        bytes.len(),
+        CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES as u64,
+        directory_len as u64,
+        "column-family directory",
+    )?;
+    let names_offset = checked_artifact_add(
+        CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES,
+        directory_len,
+        "mapped column-family names offset",
+    )?;
+    let mut total_name_bytes = 0_usize;
+    for index in 0..cf_count {
+        let directory_offset = CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES
+            + (index * CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES);
+        total_name_bytes = checked_artifact_add(
+            total_name_bytes,
+            usize::try_from(read_artifact_u32(bytes, directory_offset + 8)).map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census column-family name length exceeds usize",
+                )
+            })?,
+            "mapped column-family names length",
+        )?;
+    }
+    let mut expected_name_offset = names_offset;
+    let mut expected_section_offset =
+        checked_artifact_add(names_offset, total_name_bytes, "mapped section start")?;
+    let mut sections = BTreeMap::new();
+    let mut rows = 0_u64;
+    let mut key_bytes = 0_u64;
+    let mut previous_cf_name: Option<String> = None;
+    for index in 0..cf_count {
+        let directory_offset = CALYX_GC_SOURCE_CENSUS_ARTIFACT_HEADER_BYTES
+            + (index * CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_BYTES);
+        if !bytes
+            .get(directory_offset + 12..directory_offset + 16)
+            .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0))
+        {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_DIRECTORY_RESERVED: path={} index={} contains nonzero reserved bytes",
+                    path.display(),
+                    index
+                ),
+            ));
+        }
+        let (name_offset, name_len) = validate_artifact_range(
+            bytes.len(),
+            read_artifact_u64(bytes, directory_offset),
+            u64::from(read_artifact_u32(bytes, directory_offset + 8)),
+            "column-family name",
+        )?;
+        if name_offset != expected_name_offset {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_LAYOUT: path={} index={} name_offset={} expected={expected_name_offset}",
+                    path.display(),
+                    index,
+                    name_offset
+                ),
+            ));
+        }
+        expected_name_offset =
+            checked_artifact_add(expected_name_offset, name_len, "next mapped name offset")?;
+        let cf_name = std::str::from_utf8(&bytes[name_offset..name_offset + name_len])
+            .map_err(|source| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CF_UTF8: path={} index={} error={source}",
+                        path.display(),
+                        index
+                    ),
+                )
+            })?
+            .to_owned();
+        if cf_name.is_empty()
+            || previous_cf_name
+                .as_ref()
+                .is_some_and(|previous| previous >= &cf_name)
+        {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_CF_ORDER: path={} index={} cf={cf_name:?}",
+                    path.display(),
+                    index
+                ),
+            ));
+        }
+        previous_cf_name = Some(cf_name.clone());
+        let section_rows_u64 = read_artifact_u64(bytes, directory_offset + 16);
+        let section_rows = usize::try_from(section_rows_u64).map_err(|_| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!("source-census row count exceeds usize for {cf_name}"),
+            )
+        })?;
+        let ranges_len = section_rows
+            .checked_mul(CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!("source-census range length overflowed for {cf_name}"),
+                )
+            })?;
+        let (ranges_offset, _) = validate_artifact_range(
+            bytes.len(),
+            read_artifact_u64(bytes, directory_offset + 24),
+            ranges_len as u64,
+            "source-key ranges",
+        )?;
+        if ranges_offset != expected_section_offset {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_LAYOUT: path={} cf={} ranges_offset={} expected={expected_section_offset}",
+                    path.display(),
+                    cf_name,
+                    ranges_offset
+                ),
+            ));
+        }
+        let (data_offset, data_len) = validate_artifact_range(
+            bytes.len(),
+            read_artifact_u64(bytes, directory_offset + 32),
+            read_artifact_u64(bytes, directory_offset + 40),
+            "source-key bytes",
+        )?;
+        let expected_data_offset =
+            checked_artifact_add(ranges_offset, ranges_len, "mapped key data offset")?;
+        if data_offset != expected_data_offset {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_LAYOUT: path={} cf={} data_offset={} expected={expected_data_offset}",
+                    path.display(),
+                    cf_name,
+                    data_offset
+                ),
+            ));
+        }
+        expected_section_offset =
+            checked_artifact_add(data_offset, data_len, "next mapped section offset")?;
+        let mut previous_key: Option<&[u8]> = None;
+        let mut expected_key_offset = 0_usize;
+        for row in 0..section_rows {
+            let range_offset = ranges_offset + (row * CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES);
+            let key_offset =
+                usize::try_from(read_artifact_u32(bytes, range_offset)).map_err(|_| {
+                    calyx_write_failed_detail(
+                        CALYX_GC_CF,
+                        format!("source-census key offset exceeds usize for {cf_name}"),
+                    )
+                })?;
+            let key_len = usize::from(read_artifact_u16(bytes, range_offset + 4));
+            let reserved_zero = bytes
+                .get(range_offset + 6..range_offset + 8)
+                .is_some_and(|reserved| reserved.iter().all(|byte| *byte == 0));
+            if key_len == 0 || key_offset != expected_key_offset || !reserved_zero {
+                return Err(calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_INVALID: path={} cf={} row={} key_offset={} expected_offset={} key_len={} reserved_zero={reserved_zero}",
+                        path.display(),
+                        cf_name,
+                        row,
+                        key_offset,
+                        expected_key_offset,
+                        key_len
+                    ),
+                ));
+            }
+            let key_end = checked_artifact_add(key_offset, key_len, "mapped key end")?;
+            if key_end > data_len {
+                return Err(calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_INVALID: path={} cf={} row={} key_end={} data_len={}",
+                        path.display(),
+                        cf_name,
+                        row,
+                        key_end,
+                        data_len
+                    ),
+                ));
+            }
+            let key = &bytes[data_offset + key_offset..data_offset + key_end];
+            if previous_key.is_some_and(|previous| previous >= key) {
+                return Err(calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_KEY_ORDER: path={} cf={} row={}",
+                        path.display(),
+                        cf_name,
+                        row
+                    ),
+                ));
+            }
+            previous_key = Some(key);
+            expected_key_offset = key_end;
+        }
+        if expected_key_offset != data_len {
+            return Err(calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!(
+                    "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_DATA_LENGTH: path={} cf={} indexed={} data_len={}",
+                    path.display(),
+                    cf_name,
+                    expected_key_offset,
+                    data_len
+                ),
+            ));
+        }
+        rows = rows.checked_add(section_rows_u64).ok_or_else(|| {
+            calyx_write_failed_detail(CALYX_GC_CF, "source-census mapped rows overflowed u64")
+        })?;
+        key_bytes = key_bytes
+            .checked_add(u64::try_from(data_len).map_err(|_| {
+                calyx_write_failed_detail(CALYX_GC_CF, "source-census mapped key bytes exceed u64")
+            })?)
+            .ok_or_else(|| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "source-census mapped key bytes overflowed u64",
+                )
+            })?;
+        sections.insert(
+            cf_name,
+            MappedSourceReferenceSection {
+                rows: section_rows,
+                ranges_offset,
+                data_offset,
+            },
+        );
+    }
+    if rows != declared_rows {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_ROW_COUNT: path={} declared={} decoded={rows}",
+                path.display(),
+                declared_rows
+            ),
+        ));
+    }
+    if expected_section_offset != bytes.len() {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_LAYOUT: path={} decoded_end={} file_len={}",
+                path.display(),
+                expected_section_offset,
+                bytes.len()
+            ),
+        ));
+    }
+    let range_bytes = rows
+        .checked_mul(CALYX_GC_SOURCE_CENSUS_ARTIFACT_RANGE_BYTES as u64)
+        .ok_or_else(|| {
+            calyx_write_failed_detail(CALYX_GC_CF, "mapped source-census range bytes overflowed")
+        })?;
+    Ok(MappedDerivedSourceReferences {
+        artifact,
+        pinned_seq,
+        base_last_commit_seq,
+        base_out_of_band_epoch,
+        sections,
+        metrics: DerivedSourceReferenceMetrics {
+            rows,
+            key_bytes,
+            key_capacity_bytes: key_bytes,
+            chunks: u64::try_from(cf_count).map_err(|_| {
+                calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    "mapped source-census section count exceeds u64",
+                )
+            })?,
+            range_bytes,
+            range_capacity_bytes: range_bytes,
+        },
+    })
+}
+
+fn read_current_source_census_artifact(
+    vault: &SynapseCalyxVault,
+) -> StorageResult<Option<MappedDerivedSourceReferences>> {
+    let current_path = source_census_current_path(vault);
+    if !current_path.exists() {
+        return Ok(None);
+    }
+    let pointer_file = fs::read_to_string(&current_path).map_err(|source| {
+        calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CURRENT_READ_FAILED: path={} error={source}",
+                current_path.display()
+            ),
+        )
+    })?;
+    let Some(pointer) = pointer_file.strip_suffix('\n') else {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CURRENT_INVALID: path={} pointer={pointer_file:?}; remediation=preserve CURRENT and its generation, then rebuild from authoritative Base rows",
+                current_path.display()
+            ),
+        ));
+    };
+    if pointer.is_empty()
+        || pointer.len() > 255
+        || pointer.contains(['\r', '\n'])
+        || !pointer.starts_with(CALYX_GC_SOURCE_CENSUS_ARTIFACT_PREFIX)
+        || !pointer.ends_with(CALYX_GC_SOURCE_CENSUS_ARTIFACT_SUFFIX)
+        || Path::new(pointer)
+            .file_name()
+            .and_then(|name| name.to_str())
+            != Some(pointer)
+    {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_CURRENT_INVALID: path={} pointer={pointer:?}; remediation=preserve CURRENT and its generation, then rebuild from authoritative Base rows",
+                current_path.display()
+            ),
+        ));
+    }
+    let vault_id_sha256 = source_census_vault_id_sha256(vault);
+    open_source_census_artifact(
+        &source_census_artifact_dir(vault).join(pointer),
+        &vault_id_sha256,
+    )
+    .map(Some)
 }
 
 /// Lease lifetime for the pinned `Base` census snapshot (#2058).
@@ -14870,6 +16034,11 @@ fn refresh_derived_source_references(
     vault: &SynapseCalyxVault,
     cache: &mut Option<CalyxGcSourceCensusCache>,
 ) -> StorageResult<gc::DerivedSourceCensus> {
+    // Sample before pinning so an out-of-band Base replacement anywhere from
+    // this boundary through the complete pinned walk invalidates the rebuild.
+    // Ordinary MVCC commits are allowed: the snapshot sequence, not a quiet
+    // writer window, defines the exact view.
+    let base_signal_before_pin = vault.cf_change_signal(ColumnFamily::Base);
     let reader = CalyxPinnedReader::pin(
         vault,
         CALYX_GC_CF,
@@ -14878,12 +16047,93 @@ fn refresh_derived_source_references(
     )?;
 
     let Some(mut previous) = cache.take() else {
+        if let Some(baseline) = read_current_source_census_artifact(vault)? {
+            let (live_base_last_commit_seq, live_base_out_of_band_epoch) =
+                vault.cf_change_signal(ColumnFamily::Base);
+            if live_base_last_commit_seq < baseline.base_last_commit_seq {
+                return Err(calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_SEQUENCE_INVERTED: artifact_base_last_commit_seq={} live_base_last_commit_seq={live_base_last_commit_seq}; remediation=repair the vault sequence regression before GC",
+                        baseline.base_last_commit_seq
+                    ),
+                ));
+            }
+            if reader.pinned_seq() < baseline.pinned_seq {
+                return Err(calyx_write_failed_detail(
+                    CALYX_GC_CF,
+                    format!(
+                        "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_FUTURE: artifact_pinned_seq={} reader_pinned_seq={}; remediation=repair the vault/artifact sequence inversion before GC",
+                        baseline.pinned_seq,
+                        reader.pinned_seq()
+                    ),
+                ));
+            }
+            if live_base_last_commit_seq <= baseline.pinned_seq
+                && live_base_out_of_band_epoch == baseline.base_out_of_band_epoch
+            {
+                let artifact_pinned_seq = baseline.pinned_seq;
+                let current_name = baseline
+                    .artifact
+                    .path()
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .ok_or_else(|| {
+                        calyx_write_failed_detail(
+                            CALYX_GC_CF,
+                            format!(
+                                "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_NAME_INVALID: mapped path {} has no UTF-8 filename",
+                                baseline.artifact.path().display()
+                            ),
+                        )
+                    })?
+                    .to_owned();
+                let index = DerivedSourceReferenceIndex {
+                    baseline,
+                    delta: BTreeMap::new(),
+                };
+                let census = derived_source_census_from_index(
+                    &index,
+                    DerivedSourceCensusProvenance {
+                        mode: CALYX_GC_SOURCE_CENSUS_MAPPED_REUSE,
+                        pinned_seq: reader.pinned_seq(),
+                        previous_pinned_seq: Some(artifact_pinned_seq),
+                        pages: 0,
+                        base_rows_visited: 0,
+                        changed_base_keys: 0,
+                        rebase_reason: None,
+                    },
+                )?;
+                emit_derived_source_census(&index, census)?;
+                cleanup_obsolete_source_census_artifacts(
+                    &source_census_artifact_dir(vault),
+                    &current_name,
+                );
+                *cache = Some(CalyxGcSourceCensusCache {
+                    pinned_seq: reader.pinned_seq(),
+                    referenced: index,
+                });
+                return Ok(census);
+            }
+            tracing::info!(
+                code = "STORAGE_CALYX_GC_SOURCE_CENSUS_ARTIFACT_STALE",
+                artifact_path = %baseline.artifact.path().display(),
+                artifact_pinned_seq = baseline.pinned_seq,
+                live_base_last_commit_seq,
+                artifact_base_out_of_band_epoch = baseline.base_out_of_band_epoch,
+                live_base_out_of_band_epoch,
+                "the mapped source census predates a Base commit or physical content transition; rebuilding from the authoritative pinned snapshot"
+            );
+            drop(baseline);
+        }
         let (rebuilt, census) = rebuild_derived_source_references(
+            vault,
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_BASELINE,
             None,
             0,
             None,
+            base_signal_before_pin.1,
         )?;
         *cache = Some(rebuilt);
         return Ok(census);
@@ -14900,6 +16150,31 @@ fn refresh_derived_source_references(
         );
         *cache = Some(previous);
         return Err(error);
+    }
+    if base_signal_before_pin.1 != previous.referenced.baseline.base_out_of_band_epoch {
+        tracing::warn!(
+            code = "STORAGE_CALYX_GC_SOURCE_CENSUS_OUT_OF_BAND_REBASE_REQUIRED",
+            previous_pinned_seq,
+            current_pinned_seq = reader.pinned_seq(),
+            previous_base_out_of_band_epoch = previous.referenced.baseline.base_out_of_band_epoch,
+            current_base_out_of_band_epoch = base_signal_before_pin.1,
+            "Base physical content changed outside a commit; rebuilding exact reachability from the current pinned snapshot"
+        );
+        release_derived_source_references_before_rebase(
+            previous,
+            CALYX_GC_SOURCE_CENSUS_REBASE_OUT_OF_BAND,
+        )?;
+        let (rebuilt, census) = rebuild_derived_source_references(
+            vault,
+            &reader,
+            CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
+            Some(previous_pinned_seq),
+            0,
+            Some(CALYX_GC_SOURCE_CENSUS_REBASE_OUT_OF_BAND),
+            base_signal_before_pin.1,
+        )?;
+        *cache = Some(rebuilt);
+        return Ok(census);
     }
     let history_floor = vault.changed_key_history_floor();
     if previous_pinned_seq < history_floor {
@@ -14927,11 +16202,13 @@ fn refresh_derived_source_references(
             CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP,
         )?;
         let (rebuilt, census) = rebuild_derived_source_references(
+            vault,
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
             Some(previous_pinned_seq),
             0,
             Some(CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP),
+            base_signal_before_pin.1,
         )?;
         *cache = Some(rebuilt);
         return Ok(census);
@@ -14985,11 +16262,13 @@ fn refresh_derived_source_references(
                 CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE,
             )?;
             let (rebuilt, census) = rebuild_derived_source_references(
+                vault,
                 &reader,
                 CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
                 Some(previous_pinned_seq),
                 changed_base_keys,
                 Some(CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE),
+                base_signal_before_pin.1,
             )?;
             *cache = Some(rebuilt);
             return Ok(census);
@@ -15017,11 +16296,13 @@ fn refresh_derived_source_references(
             CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND,
         )?;
         let (rebuilt, census) = rebuild_derived_source_references(
+            vault,
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
             Some(previous_pinned_seq),
             changed_base_keys,
             Some(CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND),
+            base_signal_before_pin.1,
         )?;
         *cache = Some(rebuilt);
         return Ok(census);
@@ -15056,7 +16337,7 @@ fn release_derived_source_references_before_rebase(
     reason: &'static str,
 ) -> StorageResult<()> {
     let previous_pinned_seq = previous.pinned_seq;
-    let metrics = derived_source_reference_metrics(&previous.referenced.baseline)?;
+    let metrics = previous.referenced.baseline.metrics;
     let delta_reference_rows = previous.referenced.delta_reference_count();
     drop(previous);
     let release = synapse_calyx::release_process_memory("storage_gc_source_census_rebase")
@@ -15085,11 +16366,13 @@ fn release_derived_source_references_before_rebase(
 }
 
 fn rebuild_derived_source_references(
+    vault: &SynapseCalyxVault,
     reader: &CalyxPinnedReader<'_>,
     mode: &'static str,
     previous_pinned_seq: Option<u64>,
     changed_base_keys: u64,
     rebase_reason: Option<&'static str>,
+    expected_base_out_of_band_epoch: u64,
 ) -> StorageResult<(CalyxGcSourceCensusCache, gc::DerivedSourceCensus)> {
     let mut referenced = DerivedSourceReferences::new();
     let walk = walk_cf_pages_pinned(reader, ColumnFamily::Base, |_key, value| {
@@ -15109,8 +16392,41 @@ fn rebuild_derived_source_references(
             )
         })?;
     }
+    let (live_base_last_commit_seq, live_base_out_of_band_epoch) =
+        vault.cf_change_signal(ColumnFamily::Base);
+    if live_base_out_of_band_epoch != expected_base_out_of_band_epoch {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_OUT_OF_BAND_CHANGE: pinned_seq={} expected_base_out_of_band_epoch={expected_base_out_of_band_epoch} live_base_out_of_band_epoch={live_base_out_of_band_epoch}; refusing to publish across a physical Base replacement; remediation=allow the active Base compaction/retirement to complete before retrying GC",
+                walk.pinned_seq,
+            ),
+        ));
+    }
+    // A writer may publish a later Base signal while this pinned walk is in
+    // progress. That is expected and cannot enter the pinned snapshot. Clamp
+    // the diagnostic watermark to the served sequence instead of reintroducing
+    // the impossible whole-walk quiescence requirement.
+    let base_last_commit_seq = live_base_last_commit_seq.min(walk.pinned_seq);
+    let baseline = publish_source_census_artifact(
+        vault,
+        walk.pinned_seq,
+        base_last_commit_seq,
+        live_base_out_of_band_epoch,
+        referenced,
+    )?;
+    let base_out_of_band_epoch_after_publish = vault.cf_change_signal(ColumnFamily::Base).1;
+    if base_out_of_band_epoch_after_publish != expected_base_out_of_band_epoch {
+        return Err(calyx_write_failed_detail(
+            CALYX_GC_CF,
+            format!(
+                "STORAGE_CALYX_GC_SOURCE_CENSUS_OUT_OF_BAND_CHANGE: pinned_seq={} expected_base_out_of_band_epoch={expected_base_out_of_band_epoch} post_publish_base_out_of_band_epoch={base_out_of_band_epoch_after_publish}; the published generation is stale and this GC pass will not adjudicate deletion; remediation=allow the active Base compaction/retirement to complete before retrying GC",
+                walk.pinned_seq,
+            ),
+        ));
+    }
     let index = DerivedSourceReferenceIndex {
-        baseline: referenced,
+        baseline,
         delta: BTreeMap::new(),
     };
     let census = derived_source_census_from_index(
@@ -15164,7 +16480,7 @@ fn emit_derived_source_census(
     referenced: &DerivedSourceReferenceIndex,
     census: gc::DerivedSourceCensus,
 ) -> StorageResult<()> {
-    let packed = derived_source_reference_metrics(&referenced.baseline)?;
+    let packed = referenced.baseline.metrics;
     let delta_reference_rows = calyx_len_to_u64(
         CALYX_GC_CF,
         "Calyx GC delta protected source rows",
@@ -15203,6 +16519,10 @@ fn emit_derived_source_census(
         packed_key_chunks = packed.chunks,
         range_index_bytes = packed.range_bytes,
         range_index_capacity_bytes = packed.range_capacity_bytes,
+        mapped_artifact_path = %referenced.baseline.artifact.path().display(),
+        mapped_artifact_bytes = referenced.baseline.artifact.file_len(),
+        mapped_artifact_pinned_seq = referenced.baseline.pinned_seq,
+        mapped_artifact_base_last_commit_seq = referenced.baseline.base_last_commit_seq,
         delta_reference_rows,
         delta_key_bytes,
         delta_reference_bound = CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES,

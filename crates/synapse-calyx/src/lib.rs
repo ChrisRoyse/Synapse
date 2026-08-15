@@ -5923,6 +5923,12 @@ impl SynapseCalyxVault {
         self.vault.cx_id_for_input(input_bytes, panel_version)
     }
 
+    /// Durable root that owns this opened vault and its derived generations.
+    #[must_use]
+    pub fn vault_dir(&self) -> &Path {
+        &self.config.vault_dir
+    }
+
     /// Writes one content-addressed observation through Aster's native
     /// constellation ingestion path.
     ///

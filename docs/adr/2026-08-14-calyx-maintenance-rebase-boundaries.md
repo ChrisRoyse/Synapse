@@ -72,6 +72,15 @@ fail-closed audit surface unusable. Silently skipping it would make the audit
 answer incomplete; a generic delete operation would weaken the authority the
 codec boundary was added to protect.
 
+A fresh installed-daemon memory census then isolated the remaining steady-state
+growth. The watcher queue was empty and physically bounded. Retention GC instead
+kept 1,681,542 exact source keys in a private heap arena for the whole process,
+raising private commit from roughly 830 MiB to 960 MiB. The set is necessary:
+it is the deletion-safety authority for every actionable source family. The
+ownership was wrong, however. An immutable exact baseline is cold index data,
+not mutable process state, and Windows can page file-backed mapped data without
+retaining its entire corpus as private commit.
+
 ## Decision
 
 Incremental maintenance state is an optimization over authoritative rows, never
@@ -115,6 +124,11 @@ the authority.
    is not reclamation: unreachable duplicate key bytes remain resident. The
    in-place destination is required never to advance beyond unread source bytes,
    avoiding a second corpus-sized allocation while preserving exact lookup.
+   Variable-length keys never straddle the fixed-size arena chunks, so every
+   retained chunk is truncated to the exact maximum end addressed by its
+   rewritten ranges. Publication is admitted only when the sum of physical
+   chunk lengths equals the sum of addressable key lengths; unreachable chunk
+   tails are neither retained nor serialized as implicit padding.
 9. Search-generation status reads the manifest, vault sequence, exact-panel
    content watermark, and changed-key delta from one panel-pinned snapshot.
    Panel membership uses the hash-verified immutable sidecar as its baseline,
@@ -146,6 +160,29 @@ the authority.
     success is followed by separate exact reads proving source absence and the
     repair row's bytes. Unknown malformed rows remain hard errors and have no
     deletion route.
+13. The exact GC source-census baseline is published as an immutable file-backed
+    generation under the vault. Its header binds the pinned sequence, Base
+    commit watermark, row count, canonical directory/range widths, file length,
+    Base out-of-band epoch, vault identity digest, and SHA-256 of every payload
+    byte; a second SHA-256 binds all header metadata. Publication streams from
+    the existing builder, fsyncs and atomically names the generation,
+    destroys/releases the heap arena, validates the read-only mapping in one
+    linear pass, then
+    atomically publishes and rereads `CURRENT`. Serving revalidates the complete
+    format, zeroed reserved fields, exact layout/pointer form, strict CF/key
+    ordering, bounds, checksum, and live Base watermark. It also binds the Base
+    out-of-band epoch: physical Base replacement during a pinned build refuses
+    acceptance and deletion authority (even if the immutable generation was
+    completely named just before the final epoch read), while ordinary later
+    MVCC commits remain valid concurrent work and are excluded by the pinned
+    sequence instead of forcing a zero-write window. Only the already-bounded
+    additive delta remains in private heap.
+    Missing or stale state causes an exact pinned rebuild; corrupt, future, or
+    sequence-inverted state is a hard error and never reaches deletion
+    adjudication. Obsolete owned generations and crash temps are removed after a
+    successful current-pointer readback; cleanup failure is named and retried by
+    the next publication/reuse without making a known-published generation
+    ambiguous.
 
 ## Consequences
 
@@ -166,7 +203,9 @@ the authority.
 - Large progressing panel scans remain one coherent MVCC instant without using
   an unbounded lease; stalled/abandoned readers still expire.
 - Duplicate references no longer leave their raw key bytes resident in the
-  long-lived GC cache after their index entries are removed.
+  long-lived GC cache after their index entries are removed. Variable-length
+  chunk-boundary tails are also removed, and exact physical-versus-addressable
+  byte equality is checked before the artifact writer can run.
 - Panel membership stays current under bounded routine ingest without a global
   Base scan or a rebuild for every event, while over-bound/unprovable deltas
   still refuse instead of serving an incomplete membership set.
@@ -179,6 +218,9 @@ the authority.
 - Older/restored vaults can remove the one positively identified #1540 probe
   without teaching audit readers to omit corruption or exposing a general raw
   delete surface. The repair itself remains a canonical, queryable audit fact.
+- Idle GC no longer charges the complete exact protection corpus to private
+  process commit. Cold baseline pages are file-backed and pageable, while exact
+  binary-search membership and fail-closed corruption behavior remain intact.
 
 ## Research basis
 
@@ -203,3 +245,12 @@ the authority.
 - [RocksDB transactions](https://github.com/facebook/rocksdb/wiki/Transactions): optimistic and pessimistic transactions detect conflicting writes and leave failed transactions unapplied, supporting revision-guarded destructive maintenance.
 - [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations): a write batch applies its contained updates atomically, supporting one commit for the exact delete and its canonical audit record.
 - [RocksDB online verification](https://github.com/facebook/rocksdb/wiki/Online-Verification): per-key checksums and independent verification reads complement commit status when stored bytes are the authority.
+- [RocksDB MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST): immutable generations plus a synced current pointer recover one complete version; atomic groups are never partially applied.
+- [RocksDB checksums](https://github.com/facebook/rocksdb/wiki/Basic-Operations): stored data carries checksums and read-time verification reports corruption instead of serving unchecked bytes.
+- [Microsoft Windows working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set): file-backed mapped pages are pageable and may be trimmed independently from process-private allocations.
+- [Microsoft cache/memory guidance](https://learn.microsoft.com/en-us/windows-server/administration/performance-tuning/subsystem/cache-memory-management/troubleshoot): random-access file hints can retain excessive mapped pages, so the census uses the ordinary read-only mapping path without that hint.
+- [`memmap2::Mmap`](https://docs.rs/memmap2/latest/memmap2/struct.Mmap.html): a read-only mapping is released on drop and requires the backing file to remain immutable for safety.
+- [Git pack/index format](https://git-scm.com/docs/gitformat-pack): production
+  packed indexes declare exact counts and offsets and bind their complete
+  content with checksums; this supports treating encoded lengths and sorted
+  ranges as format invariants rather than accepting unaddressed bytes.
