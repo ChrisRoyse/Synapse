@@ -4,7 +4,7 @@ pub(crate) mod host_transition;
 pub(crate) mod hygiene;
 mod launchd_service;
 mod model;
-mod policy;
+pub(crate) mod policy;
 mod response;
 mod routing;
 mod setup;

@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use synapse_storage::{
+    RevisionGuard,
     action_log::{
         ACTION_LOG_KEY_LEN, ActionLogRowDiagnostic, ActionLogRowKind, COMMAND_AUDIT_ROW_KIND,
         diagnostic_for_invalid_row, validate_action_log_row,
@@ -34,20 +35,61 @@ static COMMAND_AUDIT_SEQ: AtomicU32 = AtomicU32::new(0);
 #[derive(Default)]
 struct CommandAuditIntegrityFailures {
     count: usize,
-    examples: Vec<ActionLogRowDiagnostic>,
+    examples: Vec<CommandAuditIntegrityFailure>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct CommandAuditIntegrityFailure {
+    #[serde(flatten)]
+    diagnostic: ActionLogRowDiagnostic,
+    physical_revision_sha256: Option<String>,
+    revision_readback_error: Option<String>,
 }
 
 impl CommandAuditIntegrityFailures {
     fn observe(
         &mut self,
+        db: &synapse_storage::Db,
         key: &[u8],
         value: &[u8],
         error: &synapse_storage::action_log::ActionLogCodecError,
     ) {
         self.count = self.count.saturating_add(1);
         if self.examples.len() < COMMAND_AUDIT_INTEGRITY_EXAMPLE_LIMIT {
-            self.examples
-                .push(diagnostic_for_invalid_row(key, value, error));
+            let diagnostic = diagnostic_for_invalid_row(key, value, error);
+            let (physical_revision_sha256, revision_readback_error) = match db
+                .get_cf_revisioned(cf::CF_ACTION_LOG, key)
+            {
+                Ok(Some(physical)) => (Some(revision_sha256_text(&physical.revision_sha256)), None),
+                Ok(None) => (
+                    None,
+                    Some("physical row became absent during exact revision readback".to_owned()),
+                ),
+                Err(read_error) => (
+                    None,
+                    Some(format!(
+                        "exact physical revision readback failed code={} detail={read_error}",
+                        read_error.code()
+                    )),
+                ),
+            };
+            tracing::error!(
+                code = "COMMAND_AUDIT_INTEGRITY_FAILURE",
+                failure_code = diagnostic.failure_code,
+                key_len_bytes = diagnostic.key_len_bytes,
+                key_sha256 = %diagnostic.key_sha256,
+                value_len_bytes = diagnostic.value_len_bytes,
+                value_sha256 = %diagnostic.value_sha256,
+                physical_revision_sha256 = physical_revision_sha256.as_deref(),
+                revision_readback_error = revision_readback_error.as_deref(),
+                failure_detail = %diagnostic.failure_detail,
+                "audit read found an invalid CF_ACTION_LOG row and will fail closed"
+            );
+            self.examples.push(CommandAuditIntegrityFailure {
+                diagnostic,
+                physical_revision_sha256,
+                revision_readback_error,
+            });
         }
     }
 
@@ -83,7 +125,7 @@ impl CommandAuditIntegrityFailures {
                 "failures_omitted": failures_omitted,
                 "raw_key_value_omitted": true,
                 "page_complete": false,
-                "remediation": "stop trusting audit output; identify each row by its key/value SHA-256, restore or revision-guard repair the exact physical row to the schema_version=1 action-log codec, then rerun the complete bounded query",
+                "remediation": "stop trusting audit output; use audit operation=repair_legacy_probe_row only for a positively identified #1540 synthetic row, passing the exact hashes, lengths, and physical revision from this error; otherwise preserve the row and investigate its writer before any mutation",
             })),
         ))
     }
@@ -162,6 +204,31 @@ pub(crate) struct CommandAuditQueryParams {
     pub status: Option<String>,
     pub error_code: Option<String>,
     pub row_kind: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CommandAuditLegacyProbeRepairParams {
+    pub key_len_bytes: u64,
+    pub key_sha256: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
+    pub expected_revision_sha256: String,
+    pub reason: String,
+    pub actor_session_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct CommandAuditLegacyProbeRepairResponse {
+    pub source_of_truth: &'static str,
+    pub legacy_marker: String,
+    pub previous_key_len_bytes: u64,
+    pub previous_key_sha256: String,
+    pub previous_value_len_bytes: u64,
+    pub previous_value_sha256: String,
+    pub previous_revision_sha256: String,
+    pub source_row_absent: bool,
+    pub committed_seq: Option<u64>,
+    pub repair_audit: CommandAuditRowReadback,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -293,6 +360,7 @@ impl SynapseService {
     }
 
     pub(crate) fn command_audit_snapshot(&self) -> Result<CommandAuditSnapshot, ErrorData> {
+        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while reading command audit")
@@ -307,7 +375,7 @@ impl SynapseService {
             let validated = match validate_action_log_row(&key, &value) {
                 Ok(validated) => validated,
                 Err(error) => {
-                    integrity_failures.observe(&key, &value, &error);
+                    integrity_failures.observe(&db, &key, &value, &error);
                     continue;
                 }
             };
@@ -382,6 +450,7 @@ impl SynapseService {
         };
         let start_key_hex = (!start_key.is_empty()).then(|| hex_encode(&start_key));
 
+        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error("reflex runtime lock poisoned while querying action audit")
@@ -418,7 +487,7 @@ impl SynapseService {
                 let validated = match validate_action_log_row(&key, &value) {
                     Ok(validated) => validated,
                     Err(error) => {
-                        integrity_failures.observe(&key, &value, &error);
+                        integrity_failures.observe(&db, &key, &value, &error);
                         continue;
                     }
                 };
@@ -485,6 +554,302 @@ impl SynapseService {
         })
     }
 
+    pub(crate) fn command_audit_repair_legacy_probe_row(
+        &self,
+        params: CommandAuditLegacyProbeRepairParams,
+    ) -> Result<CommandAuditLegacyProbeRepairResponse, ErrorData> {
+        validate_sha256_text(&params.key_sha256, "key_sha256")?;
+        validate_sha256_text(&params.value_sha256, "value_sha256")?;
+        let expected_revision =
+            parse_sha256_text(&params.expected_revision_sha256, "expected_revision_sha256")?;
+        if params.key_len_bytes == 0 || params.key_len_bytes > 512 {
+            return Err(command_audit_params_error(
+                "repair_legacy_probe_row key_len_bytes must be between 1 and 512",
+            ));
+        }
+        if params.value_len_bytes == 0 || params.value_len_bytes > 1_048_576 {
+            return Err(command_audit_params_error(
+                "repair_legacy_probe_row value_len_bytes must be between 1 and 1048576",
+            ));
+        }
+        let reason = params.reason.trim();
+        if reason.is_empty() || reason.chars().count() > 512 {
+            return Err(command_audit_params_error(
+                "repair_legacy_probe_row reason must contain 1..=512 characters",
+            ));
+        }
+
+        let db = self.m3_storage()?;
+        let rows = db
+            .scan_cf_tail(cf::CF_ACTION_LOG, COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let mut matches = rows
+            .into_iter()
+            .filter(|(key, _value)| sha256_hex(key) == params.key_sha256)
+            .collect::<Vec<_>>();
+        if matches.len() != 1 {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                format!(
+                    "COMMAND_AUDIT_LEGACY_REPAIR_IDENTITY_UNRESOLVED: expected exactly one live row with key_sha256={} in the bounded {}-row CF_ACTION_LOG tail, found {}; no mutation occurred; remediation=rerun command_query for a fresh exact integrity diagnostic and investigate any omitted failure before retrying",
+                    params.key_sha256,
+                    COMMAND_AUDIT_QUERY_MAX_SCAN_LIMIT,
+                    matches.len()
+                ),
+            ));
+        }
+        let (legacy_key, legacy_value) = matches.pop().ok_or_else(|| {
+            command_audit_internal_error(
+                "legacy repair identity selection became empty after exact cardinality validation",
+            )
+        })?;
+        if legacy_key.len() as u64 != params.key_len_bytes
+            || legacy_value.len() as u64 != params.value_len_bytes
+            || sha256_hex(&legacy_value) != params.value_sha256
+        {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "COMMAND_AUDIT_LEGACY_REPAIR_CONTENT_MISMATCH: expected key_len={} value_len={} value_sha256={}, actual key_len={} value_len={} value_sha256={}; no mutation occurred; remediation=use one fresh command_query diagnostic without changing any field",
+                    params.key_len_bytes,
+                    params.value_len_bytes,
+                    params.value_sha256,
+                    legacy_key.len(),
+                    legacy_value.len(),
+                    sha256_hex(&legacy_value)
+                ),
+            ));
+        }
+        let legacy_marker = validate_issue1540_probe_row(&legacy_key, &legacy_value)?;
+        let physical = db
+            .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .ok_or_else(|| {
+                mcp_error(
+                    synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                    "COMMAND_AUDIT_LEGACY_REPAIR_ROW_DISAPPEARED: exact physical row became absent before revision guard acquisition; no mutation occurred",
+                )
+            })?;
+        if physical.value.as_deref() != Some(legacy_value.as_slice()) {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                "COMMAND_AUDIT_LEGACY_REPAIR_LOGICAL_READBACK_MISMATCH: exact revisioned value differs from the bounded scan result; no mutation occurred",
+            ));
+        }
+        if physical.revision_sha256 != expected_revision {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                format!(
+                    "COMMAND_AUDIT_LEGACY_REPAIR_REVISION_MISMATCH: expected_revision_sha256={} actual_revision_sha256={}; no mutation occurred; remediation=rerun command_query and use its fresh exact physical revision",
+                    params.expected_revision_sha256,
+                    revision_sha256_text(&physical.revision_sha256)
+                ),
+            ));
+        }
+
+        let (repair_ts_ns, repair_seq) = next_command_audit_key_parts();
+        let repair_key = command_audit_key(repair_ts_ns, repair_seq);
+        let repair_key_hex = hex_encode(&repair_key);
+        let mut audit_context = self.current_action_audit_context()?;
+        audit_context.session_id = params.actor_session_id.clone();
+        let payload = json!({
+            "legacy_marker": legacy_marker,
+            "key_len_bytes": params.key_len_bytes,
+            "key_sha256": params.key_sha256,
+            "value_len_bytes": params.value_len_bytes,
+            "value_sha256": params.value_sha256,
+            "previous_revision_sha256": params.expected_revision_sha256,
+            "reason": reason,
+        });
+        let payload_bytes = synapse_storage::encode_json(&payload).map_err(|error| {
+            command_audit_internal_error(format!("legacy repair payload encode failed: {error}"))
+        })?;
+        let repair_record = json!({
+            "schema_version": COMMAND_AUDIT_SCHEMA_VERSION,
+            "row_kind": COMMAND_AUDIT_ROW_KIND,
+            "audit_id": format!("{repair_ts_ns:020}-{repair_seq:010}"),
+            "ts_ns": repair_ts_ns,
+            "seq": repair_seq,
+            "phase": "final",
+            "actor": {
+                "channel": "mcp",
+                "tool": "audit",
+                "session_id": params.actor_session_id,
+            },
+            "audit_context": audit_context,
+            "tool": "audit",
+            "verb": "repair_legacy_probe_row",
+            "channel": "mcp",
+            "target_session_id": Value::Null,
+            "target": Value::Null,
+            "payload_sha256": sha256_hex(&payload_bytes),
+            "payload_bytes": payload_bytes.len(),
+            "payload_bounded": payload,
+            "payload_truncated": false,
+            "payload_hash_scope": "redacted_payload",
+            "redacted": false,
+            "redactions": [],
+            "before": {
+                "source_row_present": true,
+                "key_sha256": params.key_sha256,
+                "value_sha256": params.value_sha256,
+                "physical_revision_sha256": params.expected_revision_sha256,
+            },
+            "after": {
+                "source_row_present": false,
+            },
+            "outcome": "ok",
+            "error_code": Value::Null,
+            "error": Value::Null,
+            "source_of_truth": {
+                "cf_name": cf::CF_ACTION_LOG,
+                "row_kind": COMMAND_AUDIT_ROW_KIND,
+                "retention": "24h",
+                "key_hex": repair_key_hex,
+                "repaired_legacy_key_sha256": params.key_sha256,
+            },
+        });
+        let repair_value = synapse_storage::encode_json(&repair_record).map_err(|error| {
+            command_audit_internal_error(format!("legacy repair audit encode failed: {error}"))
+        })?;
+
+        let outcome = db.mutate_batch_if_revisions_pressure_bypass(
+            cf::CF_ACTION_LOG,
+            [
+                RevisionGuard::new(legacy_key.clone(), Some(expected_revision)),
+                RevisionGuard::new(repair_key.clone(), None),
+            ],
+            [legacy_key.clone()],
+            [(repair_key.clone(), repair_value.clone())],
+        );
+        let committed_seq = match outcome {
+            Ok(outcome) if outcome.applied => Some(outcome.committed_seq),
+            Ok(outcome) => {
+                return Err(mcp_error(
+                    synapse_core::error_codes::STORAGE_WRITE_FAILED,
+                    format!(
+                        "COMMAND_AUDIT_LEGACY_REPAIR_CONFLICT: conflict_guard_index={:?} expected_revision_sha256={} actual_revision_sha256={}; no repair was applied; remediation=rerun command_query and rebase on the current exact row",
+                        outcome
+                            .conflict
+                            .as_ref()
+                            .map(|conflict| conflict.guard_index),
+                        outcome
+                            .conflict
+                            .as_ref()
+                            .and_then(|conflict| conflict.expected_revision_sha256)
+                            .map_or_else(
+                                || "absent".to_owned(),
+                                |value| revision_sha256_text(&value)
+                            ),
+                        outcome
+                            .conflict
+                            .as_ref()
+                            .and_then(|conflict| conflict.actual_revision_sha256)
+                            .map_or_else(
+                                || "absent".to_owned(),
+                                |value| revision_sha256_text(&value)
+                            ),
+                    ),
+                ));
+            }
+            Err(error) => {
+                let legacy_after = db
+                    .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
+                    .map_err(|read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "COMMAND_AUDIT_LEGACY_REPAIR_COMMIT_AMBIGUOUS: commit failed ({error}) and source-row readback failed ({read_error})"
+                            ),
+                        )
+                    })?;
+                let repair_after = db
+                    .get_cf(cf::CF_ACTION_LOG, &repair_key)
+                    .map_err(|read_error| {
+                        mcp_error(
+                            read_error.code(),
+                            format!(
+                                "COMMAND_AUDIT_LEGACY_REPAIR_COMMIT_AMBIGUOUS: commit failed ({error}) and repair-audit readback failed ({read_error})"
+                            ),
+                        )
+                    })?;
+                if legacy_after.is_none()
+                    && repair_after.as_deref() == Some(repair_value.as_slice())
+                {
+                    tracing::warn!(
+                        code = "COMMAND_AUDIT_LEGACY_REPAIR_AMBIGUOUS_COMMIT_RECONCILED",
+                        legacy_key_sha256 = %params.key_sha256,
+                        repair_key_hex = %repair_key_hex,
+                        "separate exact physical readback proved the guarded repair committed"
+                    );
+                    None
+                } else {
+                    return Err(mcp_error(
+                        error.code(),
+                        format!(
+                            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_COMMITTED: guarded atomic repair failed: {error}; exact source/repair readback did not prove the requested state"
+                        ),
+                    ));
+                }
+            }
+        };
+
+        let source_row_absent = db
+            .get_cf_revisioned(cf::CF_ACTION_LOG, &legacy_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .is_none();
+        if !source_row_absent {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                "COMMAND_AUDIT_LEGACY_REPAIR_DELETE_READBACK_FAILED: guarded commit returned applied but the exact legacy row remains present",
+            ));
+        }
+        let repair_readback = db
+            .get_cf(cf::CF_ACTION_LOG, &repair_key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .ok_or_else(|| {
+                mcp_error(
+                    synapse_core::error_codes::STORAGE_CORRUPTED,
+                    "COMMAND_AUDIT_LEGACY_REPAIR_AUDIT_READBACK_MISSING: exact canonical repair audit row is absent after commit",
+                )
+            })?;
+        if repair_readback != repair_value {
+            return Err(mcp_error(
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                "COMMAND_AUDIT_LEGACY_REPAIR_AUDIT_READBACK_MISMATCH: exact canonical repair audit bytes differ after commit",
+            ));
+        }
+        let repair_audit = CommandAuditRowReadback {
+            cf_name: cf::CF_ACTION_LOG,
+            key_hex: repair_key_hex,
+            value_len_bytes: repair_readback.len() as u64,
+            value_sha256: sha256_hex(&repair_readback),
+        };
+        tracing::warn!(
+            code = "COMMAND_AUDIT_LEGACY_PROBE_ROW_REPAIRED",
+            legacy_marker,
+            legacy_key_sha256 = %params.key_sha256,
+            legacy_value_sha256 = %params.value_sha256,
+            previous_revision_sha256 = %params.expected_revision_sha256,
+            repair_key_hex = %repair_audit.key_hex,
+            repair_value_sha256 = %repair_audit.value_sha256,
+            committed_seq,
+            "exact revision-guarded #1540 probe cleanup committed with separate physical readback"
+        );
+        Ok(CommandAuditLegacyProbeRepairResponse {
+            source_of_truth: "CF_ACTION_LOG exact legacy-row absence + canonical repair audit row",
+            legacy_marker,
+            previous_key_len_bytes: params.key_len_bytes,
+            previous_key_sha256: params.key_sha256,
+            previous_value_len_bytes: params.value_len_bytes,
+            previous_value_sha256: params.value_sha256,
+            previous_revision_sha256: params.expected_revision_sha256,
+            source_row_absent,
+            committed_seq,
+            repair_audit,
+        })
+    }
+
     /// Newest-first bounded tail scan of `CF_ACTION_LOG` for the unwindowed
     /// default (#1550). Reuses the reverse-tail primitive already backing
     /// `command_audit_snapshot`, walks the most recent `scan_limit` rows from
@@ -497,6 +862,7 @@ impl SynapseService {
         scan_limit: usize,
         filters: CommandAuditQueryFilters,
     ) -> Result<CommandAuditQueryResponse, ErrorData> {
+        let db = self.m3_storage()?;
         let runtime = self.reflex_runtime()?;
         let runtime = runtime.lock().map_err(|_error| {
             command_audit_internal_error(
@@ -522,7 +888,7 @@ impl SynapseService {
             let validated = match validate_action_log_row(&key, &value) {
                 Ok(validated) => validated,
                 Err(error) => {
-                    integrity_failures.observe(&key, &value, &error);
+                    integrity_failures.observe(&db, &key, &value, &error);
                     continue;
                 }
             };
@@ -1000,6 +1366,99 @@ fn normalize_row_kind_filter(value: Option<&str>) -> Result<Option<String>, Erro
             "audit query row_kind must be all, command_audit, or action_audit",
         )),
     }
+}
+
+fn validate_sha256_text(value: &str, field: &'static str) -> Result<(), ErrorData> {
+    parse_sha256_text(value, field).map(|_digest| ())
+}
+
+fn parse_sha256_text(value: &str, field: &'static str) -> Result<[u8; 32], ErrorData> {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return Err(command_audit_params_error(format!(
+            "repair_legacy_probe_row {field} must use sha256:<64 lowercase hex>"
+        )));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(command_audit_params_error(format!(
+            "repair_legacy_probe_row {field} must use sha256:<64 lowercase hex>"
+        )));
+    }
+    let decoded = decode_hex(hex).map_err(command_audit_params_error)?;
+    decoded.try_into().map_err(|_error| {
+        command_audit_params_error(format!(
+            "repair_legacy_probe_row {field} must decode to exactly 32 bytes"
+        ))
+    })
+}
+
+fn revision_sha256_text(revision: &[u8; 32]) -> String {
+    format!("sha256:{}", hex_encode(revision))
+}
+
+fn validate_issue1540_probe_row(key: &[u8], value: &[u8]) -> Result<String, ErrorData> {
+    let key_text = std::str::from_utf8(key).map_err(|_error| {
+        mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: noncanonical key is not UTF-8; no mutation occurred",
+        )
+    })?;
+    let prefix = if key_text.starts_with("issue1540-final-redaction-") {
+        "issue1540-final-redaction"
+    } else if key_text.starts_with("issue1540-redaction-") {
+        "issue1540-redaction"
+    } else {
+        return Err(mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: key does not carry either exact #1540 probe prefix; no mutation occurred",
+        ));
+    };
+    if !key_text.ends_with(":00000000000000000000") {
+        return Err(mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: key does not carry the exact one-row prefix_index suffix emitted by storage_put_probe_rows; no mutation occurred",
+        ));
+    }
+    let record = serde_json::from_slice::<Value>(value).map_err(|error| {
+        mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            format!(
+                "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: value is not JSON (line {} column {}); no mutation occurred",
+                error.line(),
+                error.column()
+            ),
+        )
+    })?;
+    let marker = record
+        .get("error_code")
+        .and_then(Value::as_str)
+        .filter(|marker| {
+            matches!(
+                *marker,
+                "ISSUE1540_SYNTHETIC" | "ISSUE1540_FINAL_SYNTHETIC"
+            )
+        })
+        .ok_or_else(|| {
+            mcp_error(
+                synapse_core::error_codes::STORAGE_CORRUPTED,
+                "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: error_code is not an exact #1540 synthetic marker; no mutation occurred",
+            )
+        })?;
+    let exact_envelope = record.get("schema_version").and_then(Value::as_u64) == Some(1)
+        && record.get("row_kind").and_then(Value::as_str) == Some(COMMAND_AUDIT_ROW_KIND)
+        && record.get("ts_ns").and_then(Value::as_u64) == Some(0)
+        && record.get("seq").and_then(Value::as_u64) == Some(0)
+        && record.get("probe_id").and_then(Value::as_str) == Some(key_text);
+    if !exact_envelope {
+        return Err(mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: JSON does not match the exact schema_version/row_kind/ts_ns/seq/probe_id envelope emitted by the #1540 probe writer; no mutation occurred",
+        ));
+    }
+    Ok(format!("{prefix}/{marker}"))
 }
 
 fn key_after(key: &[u8]) -> Vec<u8> {

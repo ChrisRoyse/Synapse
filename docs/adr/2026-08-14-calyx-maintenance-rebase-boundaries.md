@@ -63,6 +63,15 @@ already entered maintenance admission. Invalid input could therefore consume
 queue time and delay its actionable error even though it required no vault
 state.
 
+The capability audit also found a historical `CF_ACTION_LOG` row written by the
+removed #1540 redaction probe. Central codec enforcement now prevents any
+producer from writing that shape and every audit reader correctly refuses it,
+but an older or restored vault can retain the exact probe indefinitely. Without
+a content-specific migration, one known diagnostic row makes the entire
+fail-closed audit surface unusable. Silently skipping it would make the audit
+answer incomplete; a generic delete operation would weaken the authority the
+codec boundary was added to protect.
+
 ## Decision
 
 Incremental maintenance state is an optimization over authoritative rows, never
@@ -127,6 +136,16 @@ the authority.
     read so non-MCP callers retain the same invariant. Invalid input never opens
     storage, acquires the exclusive lane, allocates a corpus, or changes a
     bound, and preserves its exact named error and remediation.
+12. A retained #1540 probe row is repaired only through a maintenance-gated,
+    content-specific migration. The caller must re-submit the diagnostic's
+    exact key/value lengths and SHA-256 identities plus the physical envelope
+    revision. The migration then validates the exact historical key prefix,
+    suffix, JSON marker, schema, row kind, timestamp, sequence, and `probe_id`.
+    It atomically deletes that one revision and writes a canonical repair audit
+    row under an absent-key guard. A conflict or mismatch performs no mutation;
+    success is followed by separate exact reads proving source absence and the
+    repair row's bytes. Unknown malformed rows remain hard errors and have no
+    deletion route.
 
 ## Consequences
 
@@ -157,6 +176,9 @@ the authority.
   accumulated committed pages of unrelated completed phases.
 - Structurally invalid drift requests fail at the public admission boundary
   instead of waiting behind unrelated whole-vault maintenance.
+- Older/restored vaults can remove the one positively identified #1540 probe
+  without teaching audit readers to omit corruption or exposing a general raw
+  delete surface. The repair itself remains a canonical, queryable audit fact.
 
 ## Research basis
 
@@ -178,3 +200,6 @@ the authority.
 - [Materialize isolation levels](https://materialize.com/docs/reference/isolation-level/): readers are served the freshest consistent snapshot and fail or wait when no qualifying consistent view exists.
 - [Tower HTTP request validation](https://docs.rs/tower-http/latest/tower_http/validate_request/): validation middleware rejects an invalid request before allowing it through to the wrapped service.
 - [Model Context Protocol tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools): servers must validate tool inputs, and out-of-range values are tool execution errors with actionable feedback.
+- [RocksDB transactions](https://github.com/facebook/rocksdb/wiki/Transactions): optimistic and pessimistic transactions detect conflicting writes and leave failed transactions unapplied, supporting revision-guarded destructive maintenance.
+- [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations): a write batch applies its contained updates atomically, supporting one commit for the exact delete and its canonical audit record.
+- [RocksDB online verification](https://github.com/facebook/rocksdb/wiki/Online-Verification): per-key checksums and independent verification reads complement commit status when stored bytes are the authority.

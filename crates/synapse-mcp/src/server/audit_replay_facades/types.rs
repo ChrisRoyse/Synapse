@@ -21,6 +21,7 @@ use super::{
 #[serde(rename_all = "snake_case")]
 pub enum AuditOperation {
     CommandQuery,
+    RepairLegacyProbeRow,
     LifecycleEvents,
     LifecycleExits,
     ProfileIntelligence,
@@ -33,6 +34,7 @@ impl AuditOperation {
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::CommandQuery => "command_query",
+            Self::RepairLegacyProbeRow => "repair_legacy_probe_row",
             Self::LifecycleEvents => "lifecycle_events",
             Self::LifecycleExits => "lifecycle_exits",
             Self::ProfileIntelligence => "profile_intelligence",
@@ -45,6 +47,7 @@ impl AuditOperation {
     pub(super) fn parse(raw: &str) -> Result<Self, ErrorData> {
         match raw {
             "command_query" => Ok(Self::CommandQuery),
+            "repair_legacy_probe_row" => Ok(Self::RepairLegacyProbeRow),
             "lifecycle_events" => Ok(Self::LifecycleEvents),
             "lifecycle_exits" => Ok(Self::LifecycleExits),
             "profile_intelligence" => Ok(Self::ProfileIntelligence),
@@ -56,6 +59,7 @@ impl AuditOperation {
                 other,
                 &[
                     "command_query",
+                    "repair_legacy_probe_row",
                     "lifecycle_events",
                     "lifecycle_exits",
                     "profile_intelligence",
@@ -121,6 +125,8 @@ pub struct AuditParams {
     #[serde(default)]
     pub command_query: Option<AuditCommandQueryParams>,
     #[serde(default)]
+    pub repair_legacy_probe_row: Option<AuditLegacyProbeRepairParams>,
+    #[serde(default)]
     pub lifecycle_events: Option<AuditLifecycleTailParams>,
     #[serde(default)]
     pub lifecycle_exits: Option<AuditLifecycleTailParams>,
@@ -156,6 +162,7 @@ fn audit_operation_schema(_: &mut SchemaGenerator) -> Schema {
         "type": "string",
         "enum": [
             "command_query",
+            "repair_legacy_probe_row",
             "lifecycle_events",
             "lifecycle_exits",
             "profile_intelligence",
@@ -204,6 +211,18 @@ pub struct AuditCommandQueryParams {
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_kind: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLegacyProbeRepairParams {
+    pub key_len_bytes: u64,
+    pub key_sha256: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
+    pub expected_revision_sha256: String,
+    #[schemars(length(min = 1, max = 512))]
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema)]
@@ -286,6 +305,8 @@ pub struct AuditResponse {
     pub readback_source_of_truth: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_query: Option<AuditCommandQueryResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair_legacy_probe_row: Option<AuditLegacyProbeRepairResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lifecycle_events: Option<AuditLifecycleTailResponse>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -465,6 +486,31 @@ pub struct AuditCommandQueryRowSummary {
     pub error_code: Option<String>,
     pub payload_sha256: Option<String>,
     pub payload_truncated: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditLegacyProbeRepairResponse {
+    pub source_of_truth: String,
+    pub legacy_marker: String,
+    pub previous_key_len_bytes: u64,
+    pub previous_key_sha256: String,
+    pub previous_value_len_bytes: u64,
+    pub previous_value_sha256: String,
+    pub previous_revision_sha256: String,
+    pub source_row_absent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub committed_seq: Option<u64>,
+    pub repair_audit: AuditRepairRowReadback,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AuditRepairRowReadback {
+    pub cf_name: String,
+    pub key_hex: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]

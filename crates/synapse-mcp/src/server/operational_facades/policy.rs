@@ -92,7 +92,7 @@ pub(super) fn require_storage_operation_authority(
     }
 }
 
-pub(super) fn require_maintenance_profile(
+pub(crate) fn require_maintenance_profile(
     service: &SynapseService,
     request_context: &RequestContext<RoleServer>,
     tool: &'static str,

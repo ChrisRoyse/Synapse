@@ -2954,6 +2954,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 "narrow the time/tool/status filters or inspect CF_ACTION_LOG health",
             ),
             op(
+                "repair_legacy_probe_row",
+                true,
+                false,
+                "one exact #1540 synthetic CF_ACTION_LOG row guarded by its physical revision plus one canonical repair audit row in the same atomic commit",
+                Some("exact source-row absence + canonical repair-audit key/value hash readback"),
+                error_codes::STORAGE_WRITE_FAILED,
+                "enter an explicit maintenance profile and pass the unchanged hashes, lengths, and physical revision from a fresh command_query integrity error",
+            ),
+            op(
                 "lifecycle_events",
                 false,
                 false,

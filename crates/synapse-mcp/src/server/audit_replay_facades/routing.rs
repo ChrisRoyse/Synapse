@@ -10,7 +10,10 @@ use crate::{
     },
     server::{
         ErrorData, Json, Parameters, SynapseService,
-        command_audit::{CommandAuditInput, command_audit_error_from_error_data},
+        command_audit::{
+            CommandAuditInput, CommandAuditLegacyProbeRepairParams,
+            command_audit_error_from_error_data,
+        },
         context::mcp_session_id_from_request_context,
         tool, tool_router,
     },
@@ -25,9 +28,9 @@ use super::{
     lifecycle::{lifecycle_path, read_lifecycle_tail},
     response::{audit_response, replay_response},
     types::{
-        AuditLedgerEntryReadback, AuditOperation, AuditParams, AuditReproduceResponse,
-        AuditResponse, AuditVerifyChainResponse, ReplayArtifactInspectParams, ReplayOperation,
-        ReplayParams, ReplayResponse,
+        AuditLedgerEntryReadback, AuditLegacyProbeRepairResponse, AuditOperation, AuditParams,
+        AuditRepairRowReadback, AuditReproduceResponse, AuditResponse, AuditVerifyChainResponse,
+        ReplayArtifactInspectParams, ReplayOperation, ReplayParams, ReplayResponse,
     },
     validation::{validate_audit_params, validate_replay_params},
 };
@@ -38,11 +41,12 @@ const LEDGER_SOT: &str =
 #[tool_router(router = audit_replay_facade_tool_router, vis = "pub(in crate::server)")]
 impl SynapseService {
     #[tool(
-        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging); lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain, then verifies every raw_commitment Merkle cohort seal against the physical commitment CF (full or an incremental Ledger from_seq/to_seq window, with optional read_seq entry readback), and returns a fail-closed intact/broken/corrupt verdict plus the unsealed checkpoint-tail count; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
+        description = "Public audit facade for the <=40 MCP surface. operation=command_query reads bounded CF_ACTION_LOG metadata without raw payloads (default is newest-first: with no start_key_hex/start_ts_ns it returns the most recent matches as a complete page and reports has_older + oldest_returned_ts_ns; supplying start_ts_ns or start_key_hex switches to forward paging) and fails closed with bounded key/value hash, length, and physical-revision diagnostics for every invalid row; repair_legacy_probe_row is an explicit maintenance-only, exact revision-guarded cleanup for positively identified #1540 synthetic envelopes and atomically appends a canonical repair audit row; lifecycle_events/lifecycle_exits read sanitized daemon JSONL ledgers; profile_intelligence summarizes profile-linked audit rows; export_bundle writes a redacted local bundle only with explicit consent; verify_chain re-walks and re-hashes the CF_LEDGER provenance hash chain, then verifies every raw_commitment Merkle cohort seal against the physical commitment CF (full or an incremental Ledger from_seq/to_seq window, with optional read_seq entry readback), and returns a fail-closed intact/broken/corrupt verdict plus the unsealed checkpoint-tail count; reproduce re-derives a record's recorded provenance binding by cx_id and bounds drift to a genuine ledger entry. Each operation requires exactly its matching payload object (pass verify_chain:{} for a full-chain verify)."
     )]
     pub async fn audit(
         &self,
         params: Parameters<AuditParams>,
+        request_context: RequestContext<RoleServer>,
     ) -> Result<Json<AuditResponse>, ErrorData> {
         let operation = validate_audit_params(&params.0)?;
         tracing::info!(
@@ -68,6 +72,66 @@ impl SynapseService {
                         sanitized.scanned_rows, sanitized.returned_count
                     ),
                     |out| out.command_query = Some(sanitized),
+                )))
+            }
+            AuditOperation::RepairLegacyProbeRow => {
+                let spec = params
+                    .0
+                    .repair_legacy_probe_row
+                    .ok_or_else(|| missing_spec(AUDIT_TOOL, operation.as_str(), AUDIT_SOT))?;
+                crate::server::operational_facades::policy::require_maintenance_profile(
+                    self,
+                    &request_context,
+                    AUDIT_TOOL,
+                    operation.as_str(),
+                    &spec.key_sha256,
+                    AUDIT_SOT,
+                )?;
+                self.require_m3_permissions(
+                    AUDIT_TOOL,
+                    &crate::m3::permissions::required([
+                        crate::m3::permissions::Permission::ReadStorage,
+                        crate::m3::permissions::Permission::WriteStorage,
+                    ]),
+                )?;
+                let actor_session_id = mcp_session_id_from_request_context(&request_context)?;
+                let repaired = self.command_audit_repair_legacy_probe_row(
+                    CommandAuditLegacyProbeRepairParams {
+                        key_len_bytes: spec.key_len_bytes,
+                        key_sha256: spec.key_sha256,
+                        value_len_bytes: spec.value_len_bytes,
+                        value_sha256: spec.value_sha256,
+                        expected_revision_sha256: spec.expected_revision_sha256,
+                        reason: spec.reason,
+                        actor_session_id,
+                    },
+                )?;
+                let response = AuditLegacyProbeRepairResponse {
+                    source_of_truth: repaired.source_of_truth.to_owned(),
+                    legacy_marker: repaired.legacy_marker,
+                    previous_key_len_bytes: repaired.previous_key_len_bytes,
+                    previous_key_sha256: repaired.previous_key_sha256,
+                    previous_value_len_bytes: repaired.previous_value_len_bytes,
+                    previous_value_sha256: repaired.previous_value_sha256,
+                    previous_revision_sha256: repaired.previous_revision_sha256,
+                    source_row_absent: repaired.source_row_absent,
+                    committed_seq: repaired.committed_seq,
+                    repair_audit: AuditRepairRowReadback {
+                        cf_name: repaired.repair_audit.cf_name.to_owned(),
+                        key_hex: repaired.repair_audit.key_hex,
+                        value_len_bytes: repaired.repair_audit.value_len_bytes,
+                        value_sha256: repaired.repair_audit.value_sha256,
+                    },
+                };
+                Ok(Json(audit_response(
+                    operation,
+                    format!(
+                        "CF_ACTION_LOG legacy_key_sha256={} source_row_absent={} repair_key_hex={}",
+                        response.previous_key_sha256,
+                        response.source_row_absent,
+                        response.repair_audit.key_hex
+                    ),
+                    |out| out.repair_legacy_probe_row = Some(response),
                 )))
             }
             AuditOperation::LifecycleEvents => {

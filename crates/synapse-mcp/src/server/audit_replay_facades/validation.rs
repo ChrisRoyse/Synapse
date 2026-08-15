@@ -20,6 +20,10 @@ pub(super) fn validate_audit_params(params: &AuditParams) -> Result<AuditOperati
         operation.as_str(),
         &[
             ("command_query", params.command_query.is_some()),
+            (
+                "repair_legacy_probe_row",
+                params.repair_legacy_probe_row.is_some(),
+            ),
             ("lifecycle_events", params.lifecycle_events.is_some()),
             ("lifecycle_exits", params.lifecycle_exits.is_some()),
             (
