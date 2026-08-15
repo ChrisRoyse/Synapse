@@ -4,7 +4,7 @@
 //! The observation itself — what is read, what a row claims, row identity, the
 //! refresh/dedup rule and the bounds — lives in
 //! [`synapse_reflex::process_topology`], next to the `CF_PROCESS_HISTORY` writer
-//! it feeds and reachable from an FSV harness. This module owns only the parts
+//! it feeds. This module owns only the parts
 //! that need the daemon: the tick schedule, the blocking-pool hop, the
 //! reflex-runtime lock discipline, and shutdown.
 //!
@@ -24,35 +24,13 @@ use crate::server::SynapseService;
 pub const PROCESS_TOPOLOGY_INTERVAL_ENV: &str = "SYNAPSE_PROCESS_TOPOLOGY_INTERVAL_SECS";
 pub const PROCESS_TOPOLOGY_STARTUP_DELAY_ENV: &str = "SYNAPSE_PROCESS_TOPOLOGY_STARTUP_DELAY_SECS";
 
-/// The observer is **off by default**, and that is a deliberate refusal rather
-/// than a soft rollout.
-///
-/// The writer was manually verified end to end: a real `pwsh -> cmd -> ping`
-/// chain was observed, recorded with the #2089 reuse guard, and the process lane
-/// derived 483 edges over 98 distinct parent nodes from physically-read rows —
-/// against a launch-only baseline of a single hub.
-///
-/// What it cannot yet do is *publish*. `drive_agent_spawn_graph` measures
-/// structural signatures over the fused graph, and on a real 495-node process
-/// forest `eigenvector_centrality` refuses with
-/// `CALYX_SPECTRAL_NOT_CONVERGED` — and not marginally: manual FSV recorded
-/// `required_max_iter>65536` against the frozen `eigenvector_max_iter = 256`,
-/// i.e. no iteration budget reaches the
-/// frozen `tol = 1e-6` on that shape. Until that is resolved, turning this
-/// observer on by default would take the daemon's derived-state tick from
-/// succeeding on every pass to failing on every pass, five minutes apart, for
-/// the life of the process — trading a lane that measures too little for a
-/// subsystem that measures nothing.
-///
-/// So it stays off, loudly, with the reason named at boot, and is enabled by
-/// setting [`PROCESS_TOPOLOGY_INTERVAL_ENV`] to a non-zero number of seconds.
-/// 120 is the interval the FSV exercised.
-pub const DEFAULT_PROCESS_TOPOLOGY_INTERVAL_SECS: u64 = 0;
+/// The bounded default cadence manually exercised by #2097. The #2130 solver
+/// repair makes the real forest publishable, so a normal daemon now records the
+/// host topology needed by `syn-graphpos-process-v1` without an opt-in override.
+/// Setting [`PROCESS_TOPOLOGY_INTERVAL_ENV`] to zero remains an explicit local
+/// disable for diagnosis.
+pub const DEFAULT_PROCESS_TOPOLOGY_INTERVAL_SECS: u64 = 120;
 pub const DEFAULT_PROCESS_TOPOLOGY_STARTUP_DELAY_SECS: u64 = 20;
-/// The blocker that keeps the default at zero, named in the boot log so the
-/// state is diagnosable without reading this file.
-const PROCESS_TOPOLOGY_BLOCKED_BY: &str = "the fused graph's structural-signature pass cannot converge on a real process forest \
-     (CALYX_SPECTRAL_NOT_CONVERGED, required_max_iter>65536 vs frozen 256)";
 
 /// Run one observation tick against the daemon's reflex runtime.
 ///
@@ -101,11 +79,10 @@ pub(crate) fn spawn_periodic_process_topology_observer(
     if interval_secs == 0 {
         tracing::info!(
             code = "PROCESS_TOPOLOGY_PERIODIC_DISABLED",
-            blocked_by = PROCESS_TOPOLOGY_BLOCKED_BY,
             enable_with = PROCESS_TOPOLOGY_INTERVAL_ENV,
-            "periodic process topology observation is off, so CF_PROCESS_HISTORY has only its \
-             act_launch writer and the process graph lane can derive nothing but a star centred \
-             on this daemon's pid"
+            "periodic process topology observation was explicitly disabled, so \
+             CF_PROCESS_HISTORY has only its act_launch writer and the process graph lane can \
+             derive nothing but a star centred on this daemon's pid"
         );
         return Ok(None);
     }

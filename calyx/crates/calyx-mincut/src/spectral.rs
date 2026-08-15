@@ -68,14 +68,24 @@ impl SpectralCache {
 
 #[derive(Clone, Debug, PartialEq, Error)]
 pub enum SpectralError {
+    #[error(
+        "CALYX_SPECTRAL_ITERATION_BUDGET_INVALID: max_iter must be greater than zero; got {max_iter}"
+    )]
+    InvalidIterationBudget { max_iter: usize },
+    #[error(
+        "CALYX_SPECTRAL_TOLERANCE_INVALID: tol must be finite and greater than zero; got {tol:e}"
+    )]
+    InvalidTolerance { tol: f32 },
     /// The shifted power iteration exhausted its budget on one connected
-    /// component, reported with the residual it actually reached so the failure
-    /// says *how far off* it was rather than only that it stopped.
+    /// component. `residual` is the normalized eigenpair residual
+    /// `||Bx - mu*x||_2 / |mu|` for `B = I + A_c / scale_c`, reported so the
+    /// failure says *how far off* the candidate was rather than only that it
+    /// stopped.
     #[error(
         "CALYX_SPECTRAL_NOT_CONVERGED: spectral iteration did not converge after {iterations} \
-         iterations: residual {residual:e} still exceeds tol {tol:e} on the {component_nodes}-node \
-         connected component (component {component_index} of {components}, over {nodes} nodes) \
-         whose adjacency spectral radius is {component_radius:e}"
+         iterations: normalized eigenpair residual {residual:e} still exceeds tol {tol:e} on the \
+         {component_nodes}-node connected component (component {component_index} of {components}, \
+         over {nodes} nodes) whose adjacency spectral radius is {component_radius:e}"
     )]
     NotConverged {
         iterations: usize,
@@ -127,6 +137,8 @@ pub enum SpectralError {
 impl SpectralError {
     pub const fn code(&self) -> &'static str {
         match self {
+            Self::InvalidIterationBudget { .. } => "CALYX_SPECTRAL_ITERATION_BUDGET_INVALID",
+            Self::InvalidTolerance { .. } => "CALYX_SPECTRAL_TOLERANCE_INVALID",
             Self::NotConverged { .. } => "CALYX_SPECTRAL_NOT_CONVERGED",
             Self::KrylovIncomplete { .. } => "CALYX_SPECTRAL_KRYLOV_INCOMPLETE",
             Self::JacobiNotConverged { .. } => "CALYX_SPECTRAL_JACOBI_NOT_CONVERGED",
@@ -202,6 +214,12 @@ pub fn eigenvector_centrality(
     max_iter: usize,
     tol: f32,
 ) -> SpectralResult<Vec<(NodeId, f32)>> {
+    if max_iter == 0 {
+        return Err(SpectralError::InvalidIterationBudget { max_iter });
+    }
+    if !tol.is_finite() || tol <= 0.0 {
+        return Err(SpectralError::InvalidTolerance { tol });
+    }
     ensure_min_nodes(graph, 2)?;
     let sparse = SymmetricSparseGraph::from_assoc(graph);
     let n = sparse.len();
@@ -437,15 +455,23 @@ impl SymmetricSparseGraph {
 
     /// `(I + A_c / scale) v` for one component, in component-local index order.
     ///
+    /// The persisted graph remains `f32`, but the iterative kernel is `f64`.
+    /// A `1e-6` acceptance tolerance cannot be certified by repeatedly
+    /// accumulating and normalizing in a format whose machine epsilon is
+    /// already about `1.2e-7`: on a few hundred coordinates, roundoff in the
+    /// old successive-vector distance plateaued above the tolerance forever.
+    /// Widening only the bounded component-local work vectors avoids that
+    /// numerical floor without widening persisted rows or public scores.
+    ///
     /// `local_of` maps a global node index to its position in `nodes`; entries
     /// outside the component are never read, because no edge leaves it.
     fn component_mat_vec(
         &self,
         nodes: &[usize],
         local_of: &[usize],
-        scale: f32,
-        vector: &[f32],
-    ) -> Vec<f32> {
+        scale: f64,
+        vector: &[f64],
+    ) -> Vec<f64> {
         let inverse_scale = scale.recip();
         nodes
             .par_iter()
@@ -454,7 +480,7 @@ impl SymmetricSparseGraph {
                 self.adjacency[*global_index].iter().fold(
                     vector[local_index],
                     |acc, (col_index, weight)| {
-                        acc + weight * inverse_scale * vector[local_of[*col_index]]
+                        acc + f64::from(*weight) * inverse_scale * vector[local_of[*col_index]]
                     },
                 )
             })
@@ -468,11 +494,16 @@ impl SymmetricSparseGraph {
     /// and no edge leaves a connected component, so a node's full stored degree
     /// *is* its within-component row sum. This is the scale the shift is
     /// measured against; see [`Self::component_perron`] for why that matters.
-    fn component_scale(&self, nodes: &[usize]) -> f32 {
+    fn component_scale(&self, nodes: &[usize]) -> f64 {
         nodes
             .iter()
-            .map(|global_index| self.degree[*global_index])
-            .fold(0.0_f32, f32::max)
+            .map(|global_index| {
+                self.adjacency[*global_index]
+                    .iter()
+                    .map(|(_, weight)| f64::from(*weight))
+                    .sum::<f64>()
+            })
+            .fold(0.0_f64, f64::max)
     }
 
     /// Shifted power iteration restricted to one connected component, on
@@ -535,14 +566,14 @@ impl SymmetricSparseGraph {
     ) -> std::result::Result<ComponentSpectrum, ComponentDivergence> {
         let size = nodes.len();
         let scale = self.component_scale(nodes);
-        let unit = vec![1.0 / (size as f32).sqrt(); size];
+        let unit = vec![1.0 / (size as f64).sqrt(); size];
         if !scale.is_finite() || scale <= 0.0 {
             // An edgeless component: `A_c` is the zero block, every vector is an
             // eigenvector, and the radius is exactly zero. There is nothing to
             // iterate towards and no scale to divide by, so answer in closed
             // form rather than dividing by zero to rediscover it.
             return Ok(ComponentSpectrum {
-                vector: unit,
+                vector: unit.into_iter().map(|value| value as f32).collect(),
                 radius: 0.0,
             });
         }
@@ -551,11 +582,12 @@ impl SymmetricSparseGraph {
             local_of[global_index] = local_index;
         }
         let mut current = unit;
-        let mut residual = f32::INFINITY;
+        let mut product = self.component_mat_vec(nodes, &local_of, scale, &current);
+        let mut residual = f64::INFINITY;
+        let mut shifted_rayleigh = 0.0_f64;
         for step in 1..=max_iter {
-            let mut next = self.component_mat_vec(nodes, &local_of, scale, &current);
-            let norm = next.iter().map(|value| value * value).sum::<f32>().sqrt();
-            if !norm.is_finite() || norm <= EIGEN_EPS {
+            let norm = l2_norm_f64(&product);
+            if !norm.is_finite() || norm <= f64::from(EIGEN_EPS) {
                 // `I + A_c / scale` has a unit diagonal and non-negative
                 // off-diagonal entries, so a non-negative unit input cannot map
                 // to zero; a zero norm here is a corrupt weight, not a spectral
@@ -566,38 +598,35 @@ impl SymmetricSparseGraph {
                     radius: 0.0,
                 });
             }
+            let mut next = product;
             for value in &mut next {
                 *value /= norm;
             }
-            residual = l2_distance(&next, &current);
+            let next_product = self.component_mat_vec(nodes, &local_of, scale, &next);
+            let (next_rayleigh, next_residual) = eigenpair_residual_f64(&next_product, &next);
+            if !next_rayleigh.is_finite() || !next_residual.is_finite() {
+                return Err(ComponentDivergence {
+                    iterations: step,
+                    residual: f32::INFINITY,
+                    radius: 0.0,
+                });
+            }
             current = next;
-            if residual < tol {
+            product = next_product;
+            shifted_rayleigh = next_rayleigh;
+            residual = next_residual;
+            if residual < f64::from(tol) {
                 return Ok(ComponentSpectrum {
-                    radius: self.component_radius(nodes, &local_of, scale, &current),
-                    vector: current,
+                    radius: unshifted_radius(shifted_rayleigh, scale) as f32,
+                    vector: current.into_iter().map(|value| value as f32).collect(),
                 });
             }
         }
-        let radius = self.component_radius(nodes, &local_of, scale, &current);
         Err(ComponentDivergence {
             iterations: max_iter,
-            residual,
-            radius,
+            residual: residual as f32,
+            radius: unshifted_radius(shifted_rayleigh, scale) as f32,
         })
-    }
-
-    /// Undoes the shift and the scaling to recover the component's adjacency
-    /// spectral radius from a unit iterate: the iteration runs on
-    /// `I + A_c / scale`, so `rho = (rayleigh - 1) * scale`.
-    fn component_radius(
-        &self,
-        nodes: &[usize],
-        local_of: &[usize],
-        scale: f32,
-        vector: &[f32],
-    ) -> f32 {
-        let product = self.component_mat_vec(nodes, local_of, scale, vector);
-        ((rayleigh(&product, vector) - 1.0) * scale).max(0.0)
     }
 
     fn shifted_laplacian_mat_vec(&self, vector: &[f32], shift: f32) -> Vec<f32> {
@@ -664,17 +693,34 @@ fn dot(left: &[f32], right: &[f32]) -> f32 {
     left.iter().zip(right).map(|(a, b)| a * b).sum()
 }
 
-/// Rayleigh quotient `v.Mv` for an already unit-normalized `v`.
-fn rayleigh(product: &[f32], vector: &[f32]) -> f32 {
-    dot(product, vector)
+/// Relative backward-error certificate for a unit vector and its product.
+/// The positive Perron candidate makes `mu` positive; the absolute value keeps
+/// the helper correct if its scope widens.
+fn eigenpair_residual_f64(product: &[f64], vector: &[f64]) -> (f64, f64) {
+    let mu = product
+        .iter()
+        .zip(vector)
+        .map(|(product_value, vector_value)| product_value * vector_value)
+        .sum::<f64>();
+    let residual = product
+        .iter()
+        .zip(vector)
+        .map(|(product_value, vector_value)| {
+            let delta = product_value - mu * vector_value;
+            delta * delta
+        })
+        .sum::<f64>()
+        .sqrt();
+    (mu, residual / mu.abs().max(f64::MIN_POSITIVE))
 }
 
-fn l2_distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(a, b)| (a - b).powi(2))
-        .sum::<f32>()
-        .sqrt()
+fn l2_norm_f64(vector: &[f64]) -> f64 {
+    vector.iter().map(|value| value * value).sum::<f64>().sqrt()
+}
+
+/// Undo `B = I + A_c / scale_c`: `rho(A_c) = (mu(B) - 1) * scale_c`.
+fn unshifted_radius(shifted_rayleigh: f64, scale: f64) -> f64 {
+    ((shifted_rayleigh - 1.0) * scale).max(0.0)
 }
 
 fn clean_zero(value: f32) -> f32 {
