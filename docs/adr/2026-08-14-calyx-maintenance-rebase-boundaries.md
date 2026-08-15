@@ -14,6 +14,11 @@ Two unattended derived-state owners could enter permanent retry loops:
   incomplete ambient session that later resumed and acquired more transcript
   rows.
 
+The retention owner also existed twice per vault: periodic maintenance retained
+one complete reachability census while every explicit MCP GC call constructed a
+second runner and rebuilt the same corpus-sized census. The duplicate ownership,
+not an absent memory limit, raised process-private commit above 1 GiB.
+
 Neither condition can be repaired incrementally. The first lacks the historical
 facts needed to prove a delta. The second would require changing already
 published immutable points. Retrying the same operation every 15 seconds did no
@@ -37,6 +42,14 @@ the authority.
    failed replacement builds remain hard errors with named diagnostics. No
    partial cache, stale rollup, mutable-point rewrite, or global fallback is
    served.
+4. Each opened vault owns exactly one shared GC runner. Scheduled and explicit
+   MCP passes use that authority's serialized census and pressure state. Exact
+   source ranges use a validated 64-bit representation; construction reserves
+   bounded blocks and discards excess capacity after publication.
+5. A full census rebase destroys and releases its superseded baseline before
+   allocating the replacement. A failed replacement leaves the cache absent,
+   so the next pass must rebuild authoritative state instead of serving stale
+   reachability.
 
 ## Consequences
 
@@ -47,6 +60,9 @@ the authority.
   not an endless full-corpus retry loop.
 - Committed private memory is measured independently from working set; both are
   recorded during manual verification.
+- Periodic and operator GC can no longer retain two copies of the exact Base
+  reachability index, and rebase peak memory no longer includes old + new
+  baselines simultaneously.
 
 ## Research basis
 
@@ -54,3 +70,5 @@ the authority.
 - [etcd maintenance](https://etcd.io/docs/v3.7/op-guide/maintenance/): compacted history is intentionally unavailable and physical storage reclamation is a separate maintenance concern.
 - [RocksDB TTL behavior](https://github.com/facebook/rocksdb/wiki/RocksDB-FAQ): logical expiry does not guarantee prompt physical removal; expired keys are removed when compaction processes them.
 - [Microsoft `PROCESS_MEMORY_COUNTERS_EX`](https://learn.microsoft.com/en-us/windows/win32/api/psapi/ns-psapi-process_memory_counters_ex): `PrivateUsage` is process commit charge, distinct from current working set.
+- [Rust `Arc`](https://doc.rust-lang.org/std/sync/struct.Arc.html) and [`Mutex`](https://doc.rust-lang.org/std/sync/struct.Mutex.html): shared ownership points clones at one allocation, while synchronized interior mutability gives one-at-a-time access to the protected state.
+- [Rust `Vec`](https://doc.rust-lang.org/std/vec/struct.Vec.html): vectors do not shrink automatically; capacity is observable, and `shrink_to_fit` explicitly requests release of unused backing capacity.

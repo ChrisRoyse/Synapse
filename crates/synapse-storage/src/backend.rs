@@ -1234,6 +1234,10 @@ pub trait StorageBackend: Send + Sync {
 pub struct CalyxBackend {
     path: PathBuf,
     vault: Arc<CalyxVaultRuntime>,
+    /// One GC authority per opened vault. Scheduled maintenance and explicit
+    /// MCP GC calls share its exact reachability census and pressure state;
+    /// constructing a second runner would duplicate a corpus-sized index.
+    gc_runner: Arc<CalyxGcRunner>,
     pressure: Arc<pressure::PressureState>,
     anchor_carry_lineage: Mutex<AnchorCarryLineageCache>,
     storage_snapshots: Mutex<BTreeMap<u64, PinnedStorageSnapshot>>,
@@ -2407,9 +2411,12 @@ impl CalyxBackend {
         // must not publish a backend whose newly materialized physical files
         // already exceed the same source ceiling the page readers enforce.
         prepare_calyx_open_fanout(&vault, path, "after_ordered_key_migration")?;
+        let vault = Arc::new(CalyxVaultRuntime::new(vault));
+        let gc_runner = Arc::new(CalyxGcRunner::new(Arc::clone(&vault)));
         Ok(Self {
             path: path.to_path_buf(),
-            vault: Arc::new(CalyxVaultRuntime::new(vault)),
+            vault,
+            gc_runner,
             pressure: Arc::new(pressure::PressureState::default()),
             anchor_carry_lineage: Mutex::new(BTreeMap::new()),
             storage_snapshots: Mutex::new(BTreeMap::new()),
@@ -3098,20 +3105,19 @@ impl SnapshotVersionGcPressure {
 struct CalyxGcRunner {
     vault: Arc<CalyxVaultRuntime>,
     snapshot_version_gc: Mutex<SnapshotVersionGcPressure>,
-    /// Exact derived-source reachability owned by this long-lived maintenance
-    /// runner. Operator-requested GC creates a fresh runner and therefore
-    /// performs the explicit full rebuild promised by the tool contract.
+    /// Exact derived-source reachability owned by the vault's single GC
+    /// authority. Scheduled and operator-triggered passes serialize through
+    /// this same cache, so the process never retains or rebuilds two copies of
+    /// the corpus-sized protection set.
     source_census: Mutex<Option<CalyxGcSourceCensusCache>>,
-    retain_source_census: bool,
 }
 
 impl CalyxGcRunner {
-    fn new(vault: Arc<CalyxVaultRuntime>, retain_source_census: bool) -> Self {
+    fn new(vault: Arc<CalyxVaultRuntime>) -> Self {
         Self {
             vault,
             snapshot_version_gc: Mutex::new(SnapshotVersionGcPressure::default()),
             source_census: Mutex::new(None),
-            retain_source_census,
         }
     }
 
@@ -3271,57 +3277,10 @@ impl CalyxGcRunner {
     }
 
     fn run_with_budgets(&self, budgets: &[CalyxGcBudget]) -> StorageResult<gc::GcReport> {
-        let gc_result = self
-            .vault
+        self.vault
             .with_vault(CALYX_GC_CF, "run Calyx GC", true, |vault| {
                 run_calyx_gc_budgets(vault, budgets, &self.source_census)
-            });
-        if self.retain_source_census {
-            return gc_result;
-        }
-        let release_result = self.release_one_shot_source_census();
-        match (gc_result, release_result) {
-            (Ok(report), Ok(())) => Ok(report),
-            (Err(gc_error), Ok(())) => Err(gc_error),
-            (Ok(_report), Err(release_error)) => Err(release_error),
-            (Err(gc_error), Err(release_error)) => Err(calyx_write_failed_detail(
-                CALYX_GC_CF,
-                format!(
-                    "STORAGE_CALYX_GC_AND_ONE_SHOT_CENSUS_RELEASE_FAILED: GC failed with {gc_error}; releasing its one-shot exact source census also failed with {release_error}; remediation=repair both independently reported failures before retrying"
-                ),
-            )),
-        }
-    }
-
-    fn release_one_shot_source_census(&self) -> StorageResult<()> {
-        let mut cache = self.source_census.lock().map_err(|poisoned| {
-            calyx_write_failed_detail(
-                CALYX_GC_CF,
-                format!(
-                    "STORAGE_CALYX_GC_ONE_SHOT_CENSUS_CACHE_POISONED: could not destroy the operator GC census after use: {poisoned}; remediation=inspect the earlier panic and restart the daemon after repair"
-                ),
-            )
-        })?;
-        let had_census = cache.take().is_some();
-        drop(cache);
-        let release = synapse_calyx::release_process_memory("storage_gc_one_shot_census_complete")
-            .map_err(|source| {
-                calyx_write_failed(
-                    CALYX_GC_CF,
-                    "release the destroyed one-shot source census",
-                    &source,
-                )
-            })?;
-        tracing::info!(
-            code = "STORAGE_CALYX_GC_ONE_SHOT_CENSUS_RELEASED",
-            had_census,
-            private_bytes_before = release.private_bytes_before,
-            private_bytes_after = release.private_bytes_after,
-            private_bytes_reclaimed = release.private_bytes_reclaimed,
-            release_elapsed_us = release.elapsed_us,
-            "destroyed the explicit operator GC source census and returned its allocator pages"
-        );
-        Ok(())
+            })
     }
 }
 
@@ -4145,11 +4104,11 @@ impl StorageBackend for CalyxBackend {
     /// reclamation included (#2122) — an on-demand "run GC now" that quietly
     /// omitted half of what the scheduled one does would make the two
     /// indistinguishable in the readback and different in effect. The only
-    /// difference is that this constructs a fresh runner, so the pass starts at
-    /// the unescalated base budget rather than inheriting the periodic tick's
-    /// memory-pressure state.
+    /// explicit call joins the vault's single GC authority, so it observes the
+    /// same exact delta baseline and memory-pressure state as the scheduled
+    /// tick instead of allocating a second corpus-sized census.
     fn run_gc_once(&self) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault), false).run_full_once()
+        self.gc_runner.run_full_once()
     }
 
     fn run_gc_once_with_row_caps(
@@ -4158,17 +4117,14 @@ impl StorageBackend for CalyxBackend {
         soft_cap_rows: u64,
         hard_cap_rows: u64,
     ) -> StorageResult<gc::GcReport> {
-        CalyxGcRunner::new(Arc::clone(&self.vault), false).run_full_once_with_row_cap(
-            cf_name,
-            soft_cap_rows,
-            hard_cap_rows,
-        )
+        self.gc_runner
+            .run_full_once_with_row_cap(cf_name, soft_cap_rows, hard_cap_rows)
     }
 
     fn spawn_gc_task(&self) -> StorageResult<gc::GcTask> {
         let config = gc::GcConfig::from_retention_defaults();
         gc::spawn_runner(
-            Arc::new(CalyxGcRunner::new(Arc::clone(&self.vault), true)),
+            self.gc_runner.clone(),
             config.interval(),
             gc::MaintenanceTaskKind::GarbageCollection,
         )
@@ -14187,13 +14143,63 @@ fn calyx_gc_budget(
 /// million references, so the ownership shape matters more than lookup's
 /// constant factor.
 #[derive(Clone, Copy, Debug)]
-struct PackedSourceReferenceRange {
-    chunk: u32,
-    start: u32,
-    end: u32,
+struct PackedSourceReferenceRange(u64);
+
+const PACKED_SOURCE_REFERENCE_LENGTH_BITS: u32 = 16;
+const PACKED_SOURCE_REFERENCE_START_BITS: u32 = 20;
+const PACKED_SOURCE_REFERENCE_CHUNK_BITS: u32 =
+    u64::BITS - PACKED_SOURCE_REFERENCE_LENGTH_BITS - PACKED_SOURCE_REFERENCE_START_BITS;
+const PACKED_SOURCE_REFERENCE_LENGTH_MASK: u64 = (1_u64 << PACKED_SOURCE_REFERENCE_LENGTH_BITS) - 1;
+const PACKED_SOURCE_REFERENCE_START_MASK: u64 = (1_u64 << PACKED_SOURCE_REFERENCE_START_BITS) - 1;
+const PACKED_SOURCE_REFERENCE_CHUNK_MASK: u64 = (1_u64 << PACKED_SOURCE_REFERENCE_CHUNK_BITS) - 1;
+
+impl PackedSourceReferenceRange {
+    fn new(cf_name: &str, chunk: usize, start: usize, len: usize) -> Result<Self, String> {
+        let chunk = u64::try_from(chunk)
+            .map_err(|_| format!("source-reference chunk index for {cf_name} does not fit u64"))?;
+        let start = u64::try_from(start)
+            .map_err(|_| format!("source-reference chunk offset for {cf_name} does not fit u64"))?;
+        let len = u64::try_from(len)
+            .map_err(|_| format!("source-reference key length for {cf_name} does not fit u64"))?;
+        if chunk > PACKED_SOURCE_REFERENCE_CHUNK_MASK {
+            return Err(format!(
+                "source-reference arena for {cf_name} requires chunk index {chunk}, exceeding the {PACKED_SOURCE_REFERENCE_CHUNK_BITS}-bit exact packed representation"
+            ));
+        }
+        if start > PACKED_SOURCE_REFERENCE_START_MASK {
+            return Err(format!(
+                "source-reference chunk offset for {cf_name} is {start}, exceeding the {PACKED_SOURCE_REFERENCE_START_BITS}-bit exact packed representation"
+            ));
+        }
+        if len == 0 || len > PACKED_SOURCE_REFERENCE_LENGTH_MASK {
+            return Err(format!(
+                "source-reference key length for {cf_name} is {len}, outside the exact 1..={PACKED_SOURCE_REFERENCE_LENGTH_MASK} byte storage envelope"
+            ));
+        }
+        Ok(Self(
+            (chunk << (PACKED_SOURCE_REFERENCE_START_BITS + PACKED_SOURCE_REFERENCE_LENGTH_BITS))
+                | (start << PACKED_SOURCE_REFERENCE_LENGTH_BITS)
+                | len,
+        ))
+    }
+
+    const fn chunk(self) -> usize {
+        ((self.0 >> (PACKED_SOURCE_REFERENCE_START_BITS + PACKED_SOURCE_REFERENCE_LENGTH_BITS))
+            & PACKED_SOURCE_REFERENCE_CHUNK_MASK) as usize
+    }
+
+    const fn start(self) -> usize {
+        ((self.0 >> PACKED_SOURCE_REFERENCE_LENGTH_BITS) & PACKED_SOURCE_REFERENCE_START_MASK)
+            as usize
+    }
+
+    const fn end(self) -> usize {
+        self.start() + (self.0 & PACKED_SOURCE_REFERENCE_LENGTH_MASK) as usize
+    }
 }
 
 const PACKED_SOURCE_REFERENCE_CHUNK_BYTES: usize = 1024 * 1024;
+const PACKED_SOURCE_REFERENCE_RANGE_RESERVE_ROWS: usize = 65_536;
 
 /// Exact source-key membership backed by bounded byte chunks plus compact
 /// ranges.
@@ -14215,15 +14221,15 @@ struct PackedSourceReferenceKeys {
 
 impl PackedSourceReferenceKeys {
     fn push(&mut self, cf_name: &str, key: &[u8]) -> Result<(), String> {
-        let key_len = u32::try_from(key.len()).map_err(|_| {
-            format!(
-                "one source-reference key for {cf_name} requires {} bytes, exceeding the u32 per-chunk offset representation",
-                key.len()
-            )
-        })?;
-        self.ranges.try_reserve(1).map_err(|source| {
-            format!("reserve one exact source-reference range for {cf_name} failed: {source}")
-        })?;
+        if self.ranges.len() == self.ranges.capacity() {
+            self.ranges
+                .try_reserve_exact(PACKED_SOURCE_REFERENCE_RANGE_RESERVE_ROWS)
+                .map_err(|source| {
+                    format!(
+                        "reserve the next bounded block of {PACKED_SOURCE_REFERENCE_RANGE_RESERVE_ROWS} exact source-reference ranges for {cf_name} failed: {source}"
+                    )
+                })?;
+        }
 
         let needs_chunk = self
             .chunks
@@ -14243,32 +14249,15 @@ impl PackedSourceReferenceKeys {
             self.chunks.push(chunk);
         }
 
-        let chunk_index = u32::try_from(self.chunks.len() - 1).map_err(|_| {
-            format!(
-                "source-reference arena for {cf_name} exceeds the u32 chunk-index representation"
-            )
-        })?;
+        let chunk_index = self.chunks.len() - 1;
         let chunk = self
             .chunks
             .last_mut()
             .ok_or_else(|| format!("source-reference chunk allocation vanished for {cf_name}"))?;
-        let start = u32::try_from(chunk.len()).map_err(|_| {
-            format!(
-                "source-reference chunk for {cf_name} already exceeds the u32 offset representation"
-            )
-        })?;
-        let end = start.checked_add(key_len).ok_or_else(|| {
-            format!(
-                "source-reference chunk offset overflowed u32 while appending a {}-byte key for {cf_name}",
-                key.len()
-            )
-        })?;
+        let start = chunk.len();
+        let range = PackedSourceReferenceRange::new(cf_name, chunk_index, start, key.len())?;
         chunk.extend_from_slice(key);
-        self.ranges.push(PackedSourceReferenceRange {
-            chunk: chunk_index,
-            start,
-            end,
-        });
+        self.ranges.push(range);
         Ok(())
     }
 
@@ -14282,6 +14271,11 @@ impl PackedSourceReferenceKeys {
             packed_source_reference_key(chunks, *left)
                 == packed_source_reference_key(chunks, *right)
         });
+        self.ranges.shrink_to_fit();
+        for chunk in &mut self.chunks {
+            chunk.shrink_to_fit();
+        }
+        self.chunks.shrink_to_fit();
     }
 
     fn contains(&self, key: &[u8]) -> bool {
@@ -14316,7 +14310,7 @@ impl PackedSourceReferenceKeys {
 }
 
 fn packed_source_reference_key(chunks: &[Vec<u8>], range: PackedSourceReferenceRange) -> &[u8] {
-    &chunks[range.chunk as usize][range.start as usize..range.end as usize]
+    &chunks[range.chunk()][range.start()..range.end()]
 }
 
 /// Source column family -> exact source row keys a live derived constellation
@@ -14767,7 +14761,7 @@ fn refresh_derived_source_references(
         CALYX_GC_SOURCE_CENSUS_LEASE_MS,
     )?;
 
-    let Some(previous) = cache.as_mut() else {
+    let Some(mut previous) = cache.take() else {
         let (rebuilt, census) = rebuild_derived_source_references(
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_BASELINE,
@@ -14781,13 +14775,15 @@ fn refresh_derived_source_references(
 
     let previous_pinned_seq = previous.pinned_seq;
     if reader.pinned_seq() < previous_pinned_seq {
-        return Err(calyx_write_failed_detail(
+        let error = calyx_write_failed_detail(
             CALYX_GC_CF,
             format!(
                 "STORAGE_CALYX_GC_SOURCE_CENSUS_SEQUENCE_INVERTED: previous_pinned_seq={previous_pinned_seq} current_pinned_seq={}; refusing to apply an inverted reachability delta; remediation=repair the vault sequence regression before retrying",
                 reader.pinned_seq()
             ),
-        ));
+        );
+        *cache = Some(previous);
+        return Err(error);
     }
     let history_floor = vault.changed_key_history_floor();
     if previous_pinned_seq < history_floor {
@@ -14810,6 +14806,10 @@ fn refresh_derived_source_references(
             changed_key_history_floor = history_floor,
             "the cached reachability baseline predates retained Base change history; rebuilding from the authoritative pinned snapshot"
         );
+        release_derived_source_references_before_rebase(
+            previous,
+            CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP,
+        )?;
         let (rebuilt, census) = rebuild_derived_source_references(
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
@@ -14817,7 +14817,7 @@ fn refresh_derived_source_references(
             0,
             Some(CALYX_GC_SOURCE_CENSUS_REBASE_HISTORY_GAP),
         )?;
-        *previous = rebuilt;
+        *cache = Some(rebuilt);
         return Ok(census);
     }
     let changed_keys = vault
@@ -14849,6 +14849,7 @@ fn refresh_derived_source_references(
             },
         )?;
         emit_derived_source_census(&previous.referenced, census)?;
+        *cache = Some(previous);
         return Ok(census);
     }
 
@@ -14863,6 +14864,10 @@ fn refresh_derived_source_references(
                 )
             })?
         else {
+            release_derived_source_references_before_rebase(
+                previous,
+                CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE,
+            )?;
             let (rebuilt, census) = rebuild_derived_source_references(
                 &reader,
                 CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
@@ -14870,7 +14875,7 @@ fn refresh_derived_source_references(
                 changed_base_keys,
                 Some(CALYX_GC_SOURCE_CENSUS_REBASE_TOMBSTONE),
             )?;
-            *previous = rebuilt;
+            *cache = Some(rebuilt);
             return Ok(census);
         };
         if let Some((source_cf, source_key)) =
@@ -14891,6 +14896,10 @@ fn refresh_derived_source_references(
     }
 
     if previous.referenced.delta_reference_count() >= CALYX_GC_SOURCE_CENSUS_MAX_DELTA_REFERENCES {
+        release_derived_source_references_before_rebase(
+            previous,
+            CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND,
+        )?;
         let (rebuilt, census) = rebuild_derived_source_references(
             &reader,
             CALYX_GC_SOURCE_CENSUS_FULL_REBASE,
@@ -14898,7 +14907,7 @@ fn refresh_derived_source_references(
             changed_base_keys,
             Some(CALYX_GC_SOURCE_CENSUS_REBASE_DELTA_BOUND),
         )?;
-        *previous = rebuilt;
+        *cache = Some(rebuilt);
         return Ok(census);
     }
 
@@ -14916,7 +14925,47 @@ fn refresh_derived_source_references(
         },
     )?;
     emit_derived_source_census(&previous.referenced, census)?;
+    *cache = Some(previous);
     Ok(census)
+}
+
+/// Destroys the superseded corpus-sized census before allocating its
+/// replacement. Keeping both exact indexes alive during a rebase doubles the
+/// largest GC allocation and can exceed the daemon's whole-process memory
+/// doctrine even though only one index is authoritative. A rebuild failure
+/// therefore leaves the cache absent (and fails the pass); the next pass starts
+/// from a full authoritative baseline rather than falling back to stale state.
+fn release_derived_source_references_before_rebase(
+    previous: CalyxGcSourceCensusCache,
+    reason: &'static str,
+) -> StorageResult<()> {
+    let previous_pinned_seq = previous.pinned_seq;
+    let metrics = derived_source_reference_metrics(&previous.referenced.baseline)?;
+    let delta_reference_rows = previous.referenced.delta_reference_count();
+    drop(previous);
+    let release = synapse_calyx::release_process_memory("storage_gc_source_census_rebase")
+        .map_err(|source| {
+            calyx_write_failed(
+                CALYX_GC_CF,
+                "release the superseded source census before an exact rebase",
+                &source,
+            )
+        })?;
+    tracing::info!(
+        code = "STORAGE_CALYX_GC_SOURCE_CENSUS_RELEASED_BEFORE_REBASE",
+        reason,
+        previous_pinned_seq,
+        baseline_rows = metrics.rows,
+        packed_key_capacity_bytes = metrics.key_capacity_bytes,
+        range_index_capacity_bytes = metrics.range_capacity_bytes,
+        delta_reference_rows,
+        private_bytes_before = release.private_bytes_before,
+        private_bytes_after = release.private_bytes_after,
+        private_bytes_reclaimed = release.private_bytes_reclaimed,
+        release_elapsed_us = release.elapsed_us,
+        "destroyed the superseded exact source census before allocating its replacement"
+    );
+    Ok(())
 }
 
 fn rebuild_derived_source_references(
