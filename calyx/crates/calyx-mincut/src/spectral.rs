@@ -15,6 +15,9 @@ pub type SpectralResult<T> = std::result::Result<T, SpectralError>;
 const EIGEN_EPS: f32 = 1.0e-6;
 const DEFAULT_EIGEN_MAX_ITER: usize = 64;
 const MIN_LANCZOS_DIM: usize = 32;
+const MIN_PERRON_RITZ_DIM: usize = 8;
+const PERRON_RITZ_DIM_STEP: usize = 16;
+const PROJECTED_JACOBI_ROTATIONS_PER_ENTRY: usize = 32;
 /// Power used by the component-local infinity-norm spectral-radius bound.
 /// Eight sparse mat-vecs are negligible beside the 256-step solve, while the
 /// eighth root removes most of the max-degree bound's irregular-graph slack.
@@ -80,17 +83,16 @@ pub enum SpectralError {
         "CALYX_SPECTRAL_TOLERANCE_INVALID: tol must be finite and greater than zero; got {tol:e}"
     )]
     InvalidTolerance { tol: f32 },
-    /// The shifted power iteration exhausted its budget on one connected
-    /// component. `residual` is the normalized eigenpair residual
-    /// `||Bx - mu*x||_2 / |mu|` for `B = I + A_c / scale_c`, reported so the
-    /// failure says *how far off* the candidate was rather than only that it
-    /// stopped.
+    /// The residual-certified component Krylov solve exhausted its basis
+    /// budget. `residual` is the normalized eigenpair residual
+    /// `||A_c x - lambda*x||_2 / |lambda|`, reported so the failure says *how
+    /// far off* the candidate was rather than only that it stopped.
     #[error(
-        "CALYX_SPECTRAL_NOT_CONVERGED: spectral iteration did not converge after {iterations} \
-         iterations: normalized eigenpair residual {residual:e} still exceeds tol {tol:e} on the \
+        "CALYX_SPECTRAL_NOT_CONVERGED: spectral Krylov solve did not converge after {iterations} \
+         basis vectors: normalized eigenpair residual {residual:e} still exceeds tol {tol:e} on the \
          {component_nodes}-node connected component (component {component_index} of {components}, \
-         over {nodes} nodes) whose adjacency spectral radius is {component_radius:e} and shift \
-         scale is {component_shift_scale:e}"
+         over {nodes} nodes) whose adjacency spectral radius is {component_radius:e} and \
+         normalization scale is {component_shift_scale:e}"
     )]
     NotConverged {
         iterations: usize,
@@ -155,16 +157,15 @@ impl SpectralError {
     }
 }
 
-/// Eigenvector centrality by shifted power iteration, computed **one connected
-/// component at a time** and shifted by **each component's own spectral scale**
-/// (#2076, #2081).
+/// Eigenvector centrality by a residual-certified symmetric Krylov solve,
+/// computed **one connected component at a time** and normalized by **each
+/// component's own spectral scale** (#2076, #2081, #2130).
 ///
-/// Two independent properties of this vault's graphs each defeat the textbook
-/// `A + I` global iteration, and each is addressed at its own root: the
-/// component decomposition below, and the scale-commensurate shift documented
-/// on [`SymmetricSparseGraph::component_perron`]. Neither changes the value
-/// computed — a shift and a positive scaling of a symmetric block leave every
-/// eigenvector fixed — only whether a finite iteration budget can reach it.
+/// The component decomposition makes the requested Perron vector well-defined.
+/// The component-local normalization keeps the sparse operator numerically
+/// commensurate. The Krylov/Rayleigh-Ritz solve avoids the fixed spectral-gap
+/// dependency of power iteration: connectedness makes the Perron root simple,
+/// but it does not put a lower bound on its separation from the next root.
 ///
 /// # Why per component, and not one global power iteration
 ///
@@ -185,20 +186,15 @@ impl SpectralError {
 /// the same `A + I` shift this one does, for the same negative-eigenvalue
 /// reason, and raises rather than guess.
 ///
-/// Note what reducibility on its own does **not** explain, because the
-/// distinction is what sent #2081's first diagnosis to the wrong remedy. This
-/// block is symmetric, and for a symmetric matrix a *tie* among dominant
-/// eigenvalues does not stop the successive-iterate residual from decaying: the
-/// iterate still converges, to a fixed member of the dominant eigenspace, at the
-/// rate set by the next *distinct* eigenvalue. Reducibility corrupts the answer;
-/// it does not by itself exhaust the budget. What exhausts the budget is the
-/// scale mismatch documented on
-/// [`SymmetricSparseGraph::component_perron`], which reducibility then
-/// multiplies across every component at once.
+/// Reducibility and convergence are separate contracts. Component-local
+/// normalization fixed #2081's edge-weight-unit pathology, but #2130 later
+/// proved that even a tightly scaled connected block can defeat a fixed power
+/// budget when its two leading roots are close. The component solve below
+/// therefore uses Rayleigh-Ritz extraction over the retained Krylov space rather
+/// than discarding every prior direction as power iteration does.
 ///
-/// Restricted to one component the adjacency block *is* irreducible, the Perron
-/// root is simple and strictly positive, and the iteration converges at the
-/// component's own gap. Components are then placed on one scale by their
+/// Restricted to one component the adjacency block *is* irreducible and its
+/// Perron root is simple and strictly positive. Components are then placed on one scale by their
 /// adjacency spectral radius, which is the only quantity the eigenproblem
 /// supplies for comparing them: a component's unit Perron vector is scaled by
 /// its radius before [`ranked_scores`] normalizes globally. On a connected
@@ -234,24 +230,28 @@ pub fn eigenvector_centrality(
     let mut max_radius = 0.0_f32;
 
     for (component_index, nodes) in components.iter().enumerate() {
-        let spectrum = sparse.component_perron(nodes, max_iter, tol).map_err(
-            |ComponentDivergence {
-                 iterations,
-                 residual,
-                 radius,
-                 shift_scale,
-             }| SpectralError::NotConverged {
-                iterations,
-                residual,
-                tol,
-                nodes: n,
-                components: components.len(),
-                component_index,
-                component_nodes: nodes.len(),
-                component_radius: radius,
-                component_shift_scale: shift_scale,
-            },
-        )?;
+        let spectrum =
+            sparse
+                .component_perron(nodes, max_iter, tol)
+                .map_err(|error| match error {
+                    ComponentPerronError::Diverged(ComponentDivergence {
+                        iterations,
+                        residual,
+                        radius,
+                        shift_scale,
+                    }) => SpectralError::NotConverged {
+                        iterations,
+                        residual,
+                        tol,
+                        nodes: n,
+                        components: components.len(),
+                        component_index,
+                        component_nodes: nodes.len(),
+                        component_radius: radius,
+                        component_shift_scale: shift_scale,
+                    },
+                    ComponentPerronError::Spectral(error) => error,
+                })?;
         max_radius = max_radius.max(spectrum.radius);
         for (local, global) in nodes.iter().copied().enumerate() {
             combined[global] = spectrum.vector[local] * spectrum.radius;
@@ -400,6 +400,23 @@ struct ComponentDivergence {
     shift_scale: f32,
 }
 
+enum ComponentPerronError {
+    Diverged(ComponentDivergence),
+    Spectral(SpectralError),
+}
+
+impl From<ComponentDivergence> for ComponentPerronError {
+    fn from(value: ComponentDivergence) -> Self {
+        Self::Diverged(value)
+    }
+}
+
+impl From<SpectralError> for ComponentPerronError {
+    fn from(value: SpectralError) -> Self {
+        Self::Spectral(value)
+    }
+}
+
 struct SymmetricSparseGraph {
     adjacency: Vec<Vec<(usize, f32)>>,
     degree: Vec<f32>,
@@ -462,7 +479,7 @@ impl SymmetricSparseGraph {
         components
     }
 
-    /// `(I + A_c / scale) v` for one component, in component-local index order.
+    /// `(A_c / scale) v` for one component, in component-local index order.
     ///
     /// The persisted graph remains `f32`, but the iterative kernel is `f64`.
     /// A `1e-6` acceptance tolerance cannot be certified by repeatedly
@@ -474,7 +491,7 @@ impl SymmetricSparseGraph {
     ///
     /// `local_of` maps a global node index to its position in `nodes`; entries
     /// outside the component are never read, because no edge leaves it.
-    fn component_mat_vec(
+    fn component_scaled_adjacency_mat_vec(
         &self,
         nodes: &[usize],
         local_of: &[usize],
@@ -484,14 +501,13 @@ impl SymmetricSparseGraph {
         let inverse_scale = scale.recip();
         nodes
             .par_iter()
-            .enumerate()
-            .map(|(local_index, global_index)| {
-                self.adjacency[*global_index].iter().fold(
-                    vector[local_index],
-                    |acc, (col_index, weight)| {
-                        acc + f64::from(*weight) * inverse_scale * vector[local_of[*col_index]]
-                    },
-                )
+            .map(|global_index| {
+                self.adjacency[*global_index]
+                    .iter()
+                    .map(|(col_index, weight)| {
+                        f64::from(*weight) * inverse_scale * vector[local_of[*col_index]]
+                    })
+                    .sum()
             })
             .collect()
     }
@@ -547,9 +563,8 @@ impl SymmetricSparseGraph {
         gershgorin * powered_norm.powf(1.0 / COMPONENT_SCALE_POWER as f64)
     }
 
-    /// Shifted power iteration restricted to one connected component, on
-    /// `I + A_c / scale_c` where `scale_c` is the component's own eighth-power
-    /// infinity-norm radius bound (#2081, #2130).
+    /// Residual-certified full-reorthogonalized Arnoldi/Lanczos solve restricted
+    /// to one connected symmetric component.
     ///
     /// # Why the block is restricted to one component
     ///
@@ -558,55 +573,39 @@ impl SymmetricSparseGraph {
     /// the two guarantees the global iteration forfeits on a disconnected
     /// graph.
     ///
-    /// # Why the shift is `scale_c`, and not the fixed `1` it used to be
+    /// # Why this is a Krylov/Rayleigh-Ritz solve, not power iteration
     ///
-    /// Shifting a symmetric non-negative block by *any* positive multiple of
-    /// the identity leaves every eigenvector untouched and moves the Perron
-    /// root to the top of the spectrum by modulus, which is the only thing the
-    /// shift is for: it defeats the bipartite case `lambda_min = -lambda_1`,
-    /// where an unshifted iteration oscillates forever. NetworkX adopted `A + I`
-    /// for exactly that reason and says in the same breath that *"adding other
-    /// multiples of the identity to A will also work, but A+I is cheap to
-    /// implement and sufficient"* (networkx/networkx#1704). The unstated premise
-    /// is that `A` is an **unweighted** adjacency, where every non-zero entry is
-    /// `1`, so `rho(A) >= 1` and a shift of `1` is commensurate with the
-    /// spectrum it is shifting.
+    /// Power iteration's contraction factor is the ratio of the two leading
+    /// eigenvalue magnitudes. Connectedness makes the Perron root simple but
+    /// places no lower bound on that spectral gap, so no fixed step count can
+    /// make the old iteration operational for every real connected graph. The
+    /// live 1,184-node agent component in #2130 reached only `4.1e-6` residual
+    /// after its frozen 256 steps despite a tight normalization scale.
     ///
-    /// That premise does not hold here. [`crate::build_transition_graph`]
-    /// rescales every edge weight to `count / max_pair_count`, so a single
-    /// heavily-observed transition pair anywhere in the graph divides every
-    /// *other* edge weight — and hence every other component's spectral radius —
-    /// by an arbitrary data-dependent factor. Against a fixed shift of `1` the
-    /// contraction ratio of a depth-1 star then degrades to
-    /// `1 / (1 + sqrt(k) / max_pair_count)`, which tends to 1. The graph's
-    /// *shape* is unchanged and so is the centrality it defines; only the
-    /// solver's ability to reach it decays. Measured on the frozen
-    /// `max_iter = 256`, `tol = 1e-6` budget, an 8-leaf star sharing a graph with
-    /// one dyad observed 256 times needed more than 256 iterations and refused
-    /// with `CALYX_SPECTRAL_NOT_CONVERGED` — a refusal caused entirely by the
-    /// units of an unrelated edge. The live app lane already runs at
-    /// `max_pair_count = 2533` and a minimum edge weight of `3.9e-4`.
+    /// A Krylov subspace retains all generated directions and extracts the
+    /// largest *algebraic* Ritz pair of the symmetric adjacency. Targeting the
+    /// largest algebraic value removes the bipartite `+rho/-rho` modulus tie
+    /// without an identity shift. Full double-precision reorthogonalization
+    /// keeps the projected operator trustworthy; every proposed Ritz vector is
+    /// checked against the original sparse operator and is returned only when
+    /// its relative eigenpair residual satisfies the caller's exact tolerance.
     ///
-    /// Taking the shift from a block-local matrix-norm bound
-    /// `scale_c = ||A_c^8||_inf^(1/8) >= rho(A_c)` makes the contraction ratio
-    /// `(scale_c + lambda_2) / (scale_c + lambda_1)`, which is invariant under
-    /// any global rescaling of the weights: it depends on the component's shape
-    /// alone. Unlike the one-hop max-degree/Gershgorin bound, the eighth-power
-    /// bound does not make a high-degree process-tree hub impose an arbitrarily
-    /// oversized shift. Equivalently, and as implemented, the block is divided
-    /// by `scale_c` first — putting its spectrum in `[-1, 1]` — and then shifted
-    /// by the same cheap `1`.
+    /// The block is divided by
+    /// `scale_c = ||A_c^8||_inf^(1/8) >= rho(A_c)` before projection. That
+    /// normalization is invariant to global edge-weight units and bounds every
+    /// operator product; it no longer controls convergence by acting as a
+    /// shift. The physical adjacency radius is recovered by multiplication.
     ///
-    /// The returned pair is mathematically identical either way: a shift and a
-    /// positive scaling of a symmetric matrix change no eigenvector, and the
-    /// radius is recovered by undoing both. Only the number of iterations
-    /// needed to reach it changes.
+    /// `max_iter` is a strict Krylov-basis ceiling. Memory is
+    /// `O(component_nodes * min(component_nodes, max_iter))`, bounded by the
+    /// same public parameter that bounds sparse operator evaluations. Exhaustion
+    /// returns the actual residual and never publishes a partial component.
     fn component_perron(
         &self,
         nodes: &[usize],
         max_iter: usize,
         tol: f32,
-    ) -> std::result::Result<ComponentSpectrum, ComponentDivergence> {
+    ) -> std::result::Result<ComponentSpectrum, ComponentPerronError> {
         let size = nodes.len();
         let mut local_of = vec![0_usize; self.len()];
         for (local_index, global_index) in nodes.iter().copied().enumerate() {
@@ -630,57 +629,111 @@ impl SymmetricSparseGraph {
                 residual: f32::INFINITY,
                 radius: 0.0,
                 shift_scale: scale as f32,
-            });
-        }
-        let mut current = unit;
-        let mut product = self.component_mat_vec(nodes, &local_of, scale, &current);
-        let mut residual = f64::INFINITY;
-        let mut shifted_rayleigh = 0.0_f64;
-        for step in 1..=max_iter {
-            let norm = l2_norm_f64(&product);
-            if !norm.is_finite() || norm <= f64::from(EIGEN_EPS) {
-                // `I + A_c / scale` has a unit diagonal and non-negative
-                // off-diagonal entries, so a non-negative unit input cannot map
-                // to zero; a zero norm here is a corrupt weight, not a spectral
-                // property.
-                return Err(ComponentDivergence {
-                    iterations: step,
-                    residual: f32::INFINITY,
-                    radius: 0.0,
-                    shift_scale: scale as f32,
-                });
             }
+            .into());
+        }
+
+        let budget = size.min(max_iter);
+        let mut basis = vec![unit];
+        let mut products = Vec::<Vec<f64>>::with_capacity(budget);
+        let mut residual = f64::INFINITY;
+        let mut normalized_radius = 0.0_f64;
+
+        loop {
+            let current_index = products.len();
+            let product = self.component_scaled_adjacency_mat_vec(
+                nodes,
+                &local_of,
+                scale,
+                &basis[current_index],
+            );
+            validate_f64_operator_product(size, &product)?;
+            products.push(product.clone());
+
+            let dim = basis.len();
+            let check_ritz = dim == 1
+                || dim == 2
+                || dim == 4
+                || (dim >= MIN_PERRON_RITZ_DIM
+                    && (dim == budget || dim.is_multiple_of(PERRON_RITZ_DIM_STEP)));
+            if check_ritz {
+                let (ritz_value, ritz_coefficients) =
+                    projected_largest_ritz_pair(&basis, &products, f64::from(tol))?;
+                let mut candidate = expand_ritz_vector_f64(&basis, &ritz_coefficients);
+                normalize_f64(&mut candidate)?;
+                let candidate_product =
+                    self.component_scaled_adjacency_mat_vec(nodes, &local_of, scale, &candidate);
+                validate_f64_operator_product(size, &candidate_product)?;
+                let (rayleigh, candidate_residual) =
+                    eigenpair_residual_f64(&candidate_product, &candidate);
+                if !ritz_value.is_finite()
+                    || !rayleigh.is_finite()
+                    || rayleigh <= 0.0
+                    || !candidate_residual.is_finite()
+                {
+                    return Err(ComponentDivergence {
+                        iterations: dim,
+                        residual: f32::INFINITY,
+                        radius: 0.0,
+                        shift_scale: scale as f32,
+                    }
+                    .into());
+                }
+                normalized_radius = rayleigh;
+                residual = candidate_residual;
+                if residual < f64::from(tol) {
+                    return Ok(ComponentSpectrum {
+                        radius: (normalized_radius * scale) as f32,
+                        vector: candidate.into_iter().map(|value| value as f32).collect(),
+                    });
+                }
+            }
+
+            if dim == budget {
+                break;
+            }
+
             let mut next = product;
+            reorthogonalize_f64(&mut next, &basis);
+            reorthogonalize_f64(&mut next, &basis);
+            let norm = l2_norm_f64(&next);
+            if !norm.is_finite() {
+                return Err(ComponentDivergence {
+                    iterations: dim,
+                    residual: f32::INFINITY,
+                    radius: (normalized_radius * scale) as f32,
+                    shift_scale: scale as f32,
+                }
+                .into());
+            }
+            if norm <= f64::EPSILON * (size as f64).sqrt() {
+                if !check_ritz {
+                    let (_, ritz_coefficients) =
+                        projected_largest_ritz_pair(&basis, &products, f64::from(tol))?;
+                    let mut candidate = expand_ritz_vector_f64(&basis, &ritz_coefficients);
+                    normalize_f64(&mut candidate)?;
+                    let candidate_product = self
+                        .component_scaled_adjacency_mat_vec(nodes, &local_of, scale, &candidate);
+                    let (rayleigh, candidate_residual) =
+                        eigenpair_residual_f64(&candidate_product, &candidate);
+                    normalized_radius = rayleigh;
+                    residual = candidate_residual;
+                }
+                break;
+            }
             for value in &mut next {
                 *value /= norm;
             }
-            let next_product = self.component_mat_vec(nodes, &local_of, scale, &next);
-            let (next_rayleigh, next_residual) = eigenpair_residual_f64(&next_product, &next);
-            if !next_rayleigh.is_finite() || !next_residual.is_finite() {
-                return Err(ComponentDivergence {
-                    iterations: step,
-                    residual: f32::INFINITY,
-                    radius: 0.0,
-                    shift_scale: scale as f32,
-                });
-            }
-            current = next;
-            product = next_product;
-            shifted_rayleigh = next_rayleigh;
-            residual = next_residual;
-            if residual < f64::from(tol) {
-                return Ok(ComponentSpectrum {
-                    radius: unshifted_radius(shifted_rayleigh, scale) as f32,
-                    vector: current.into_iter().map(|value| value as f32).collect(),
-                });
-            }
+            basis.push(next);
         }
+
         Err(ComponentDivergence {
-            iterations: max_iter,
+            iterations: basis.len(),
             residual: residual as f32,
-            radius: unshifted_radius(shifted_rayleigh, scale) as f32,
+            radius: (normalized_radius * scale) as f32,
             shift_scale: scale as f32,
-        })
+        }
+        .into())
     }
 
     fn shifted_laplacian_mat_vec(&self, vector: &[f32], shift: f32) -> Vec<f32> {
@@ -696,6 +749,181 @@ impl SymmetricSparseGraph {
             })
             .collect()
     }
+}
+
+fn validate_f64_operator_product(expected: usize, product: &[f64]) -> SpectralResult<()> {
+    let non_finite = product.iter().filter(|value| !value.is_finite()).count();
+    if product.len() != expected || non_finite != 0 {
+        return Err(SpectralError::InvalidOperator {
+            expected,
+            actual: product.len(),
+            non_finite,
+        });
+    }
+    Ok(())
+}
+
+fn reorthogonalize_f64(vector: &mut [f64], basis: &[Vec<f64>]) {
+    for basis_vector in basis {
+        let projection = dot_f64(vector, basis_vector);
+        for (value, basis_value) in vector.iter_mut().zip(basis_vector) {
+            *value -= projection * basis_value;
+        }
+    }
+}
+
+fn normalize_f64(vector: &mut [f64]) -> SpectralResult<()> {
+    let norm = l2_norm_f64(vector);
+    if !norm.is_finite() || norm <= f64::MIN_POSITIVE {
+        return Err(SpectralError::SingularMatrix);
+    }
+    for value in vector {
+        *value /= norm;
+    }
+    Ok(())
+}
+
+fn dot_f64(left: &[f64], right: &[f64]) -> f64 {
+    left.iter().zip(right).map(|(a, b)| a * b).sum()
+}
+
+fn projected_largest_ritz_pair(
+    basis: &[Vec<f64>],
+    products: &[Vec<f64>],
+    requested_tol: f64,
+) -> SpectralResult<(f64, Vec<f64>)> {
+    let dim = basis.len();
+    if dim == 0 || products.len() != dim {
+        return Err(SpectralError::InvalidOperator {
+            expected: dim,
+            actual: products.len(),
+            non_finite: 0,
+        });
+    }
+    let mut projected = vec![vec![0.0_f64; dim]; dim];
+    for row in 0..dim {
+        for col in row..dim {
+            let forward = dot_f64(&basis[row], &products[col]);
+            let reverse = dot_f64(&basis[col], &products[row]);
+            let value = 0.5 * (forward + reverse);
+            if !value.is_finite() {
+                return Err(SpectralError::InvalidOperator {
+                    expected: dim,
+                    actual: dim,
+                    non_finite: 1,
+                });
+            }
+            projected[row][col] = value;
+            projected[col][row] = value;
+        }
+    }
+    projected_symmetric_largest_f64(projected, requested_tol)
+}
+
+fn projected_symmetric_largest_f64(
+    mut matrix: Vec<Vec<f64>>,
+    requested_tol: f64,
+) -> SpectralResult<(f64, Vec<f64>)> {
+    let dim = matrix.len();
+    if dim == 1 {
+        return Ok((matrix[0][0], vec![1.0]));
+    }
+    let mut vectors = identity_f64(dim);
+    let matrix_scale = matrix
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max)
+        .max(f64::MIN_POSITIVE);
+    let jacobi_tol = (requested_tol * 0.01).max(f64::EPSILON * dim as f64 * 32.0) * matrix_scale;
+    let max_rotations = dim
+        .saturating_mul(dim)
+        .saturating_mul(PROJECTED_JACOBI_ROTATIONS_PER_ENTRY);
+    let mut final_offdiag = f64::INFINITY;
+    let mut rotations = 0_usize;
+    while rotations < max_rotations {
+        let Some((p, q, offdiag)) = max_offdiag_f64(&matrix) else {
+            break;
+        };
+        final_offdiag = offdiag.abs();
+        if final_offdiag <= jacobi_tol {
+            break;
+        }
+        rotate_symmetric_f64(&mut matrix, &mut vectors, p, q);
+        rotations += 1;
+    }
+    if final_offdiag > jacobi_tol {
+        return Err(SpectralError::JacobiNotConverged {
+            iterations: rotations,
+            residual: final_offdiag as f32,
+            tol: jacobi_tol as f32,
+            dim,
+        });
+    }
+    let largest = (0..dim)
+        .max_by(|left, right| matrix[*left][*left].total_cmp(&matrix[*right][*right]))
+        .ok_or(SpectralError::SingularMatrix)?;
+    let mut eigenvector = vectors.iter().map(|row| row[largest]).collect::<Vec<_>>();
+    normalize_f64(&mut eigenvector)?;
+    Ok((matrix[largest][largest], eigenvector))
+}
+
+fn identity_f64(dim: usize) -> Vec<Vec<f64>> {
+    let mut identity = vec![vec![0.0_f64; dim]; dim];
+    for (index, row) in identity.iter_mut().enumerate() {
+        row[index] = 1.0;
+    }
+    identity
+}
+
+fn max_offdiag_f64(matrix: &[Vec<f64>]) -> Option<(usize, usize, f64)> {
+    let mut best = None::<(usize, usize, f64)>;
+    for (row, values) in matrix.iter().enumerate() {
+        for (col, value) in values.iter().copied().enumerate().skip(row + 1) {
+            if best.is_none_or(|(_, _, current)| value.abs() > current.abs()) {
+                best = Some((row, col, value));
+            }
+        }
+    }
+    best
+}
+
+fn rotate_symmetric_f64(matrix: &mut [Vec<f64>], vectors: &mut [Vec<f64>], p: usize, q: usize) {
+    let theta = 0.5 * (2.0 * matrix[p][q]).atan2(matrix[q][q] - matrix[p][p]);
+    let (sin, cos) = theta.sin_cos();
+    for row in matrix.iter_mut() {
+        let prior_p = row[p];
+        let prior_q = row[q];
+        row[p] = cos * prior_p - sin * prior_q;
+        row[q] = sin * prior_p + cos * prior_q;
+    }
+    let (before_q, from_q) = matrix.split_at_mut(q);
+    let row_p = &mut before_q[p];
+    let row_q = &mut from_q[0];
+    for (value_p, value_q) in row_p.iter_mut().zip(row_q.iter_mut()) {
+        let prior_p = *value_p;
+        let prior_q = *value_q;
+        *value_p = cos * prior_p - sin * prior_q;
+        *value_q = sin * prior_p + cos * prior_q;
+    }
+    matrix[p][q] = 0.0;
+    matrix[q][p] = 0.0;
+    for row in vectors {
+        let prior_p = row[p];
+        let prior_q = row[q];
+        row[p] = cos * prior_p - sin * prior_q;
+        row[q] = sin * prior_p + cos * prior_q;
+    }
+}
+
+fn expand_ritz_vector_f64(basis: &[Vec<f64>], coefficients: &[f64]) -> Vec<f64> {
+    let mut expanded = vec![0.0_f64; basis.first().map_or(0, Vec::len)];
+    for (basis_vector, coefficient) in basis.iter().zip(coefficients) {
+        for (value, basis_value) in expanded.iter_mut().zip(basis_vector) {
+            *value += coefficient * basis_value;
+        }
+    }
+    expanded
 }
 
 fn insert_max(row: &mut BTreeMap<usize, f32>, col: usize, weight: f32) {
@@ -770,11 +998,6 @@ fn eigenpair_residual_f64(product: &[f64], vector: &[f64]) -> (f64, f64) {
 
 fn l2_norm_f64(vector: &[f64]) -> f64 {
     vector.iter().map(|value| value * value).sum::<f64>().sqrt()
-}
-
-/// Undo `B = I + A_c / scale_c`: `rho(A_c) = (mu(B) - 1) * scale_c`.
-fn unshifted_radius(shifted_rayleigh: f64, scale: f64) -> f64 {
-    ((shifted_rayleigh - 1.0) * scale).max(0.0)
 }
 
 fn clean_zero(value: f32) -> f32 {
