@@ -719,6 +719,7 @@ pub struct HygieneDriftResponse {
 pub struct HygieneKernelParams {
     pub panel_version: u32,
     /// Dense semantic-lens slot the kernel was selected on.
+    #[schemars(range(max = 65535))]
     pub content_slot: u32,
     /// Grounded outcome domain (anchor-kind label). Omit for the panel-default
     /// kernel written by a single `storage.intelligence kernel` build.
@@ -731,13 +732,17 @@ pub struct HygieneKernelParams {
 #[serde(deny_unknown_fields)]
 pub struct HygieneKernelRebuildParams {
     pub panel_version: u32,
+    #[schemars(range(max = 65535))]
     pub content_slot: u32,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 20000))]
     pub max_records: Option<u32>,
     /// Kernel-only recall gate ratio; an ungrounded kernel is refused, not served.
     #[serde(default)]
+    #[schemars(range(min = 0, max = 1))]
     pub min_recall_ratio: Option<f32>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 64))]
     pub max_domains: Option<u32>,
 }
 
@@ -1007,10 +1012,11 @@ pub fn run_kernel(
     db: &Db,
     params: &HygieneKernelParams,
 ) -> Result<HygieneKernelResponse, ErrorData> {
+    let content_slot = kernel_content_slot(params.content_slot)?;
     let report = db
         .domain_kernel_health_intelligence(
             params.panel_version,
-            clamp_slot(params.content_slot),
+            content_slot,
             params.anchor_kind.as_deref(),
         )
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -1052,16 +1058,29 @@ pub fn run_kernel_rebuild(
     db: &Db,
     params: &HygieneKernelRebuildParams,
 ) -> Result<HygieneKernelRebuildResponse, ErrorData> {
-    let mut spec = synapse_calyx::SynapseCalyxKernelRebuildParams::new(
-        params.panel_version,
-        clamp_slot(params.content_slot),
-    );
-    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    let content_slot = kernel_content_slot(params.content_slot)?;
+    let mut spec =
+        synapse_calyx::SynapseCalyxKernelRebuildParams::new(params.panel_version, content_slot);
+    spec.max_records = kernel_rebuild_max_records(params.max_records)?;
     if let Some(min_recall_ratio) = params.min_recall_ratio {
+        if !min_recall_ratio.is_finite() || !(0.0..=1.0).contains(&min_recall_ratio) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "hygiene kernel_rebuild min_recall_ratio={min_recall_ratio} must be finite and within 0..=1"
+                ),
+            ));
+        }
         spec.min_recall_ratio = min_recall_ratio;
     }
     if let Some(max_domains) = params.max_domains {
-        spec.max_domains = max_domains.max(1) as usize;
+        if !(1..=64).contains(&max_domains) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("hygiene kernel_rebuild max_domains={max_domains} is outside 1..=64"),
+            ));
+        }
+        spec.max_domains = max_domains as usize;
     }
     let report = db
         .rebuild_domain_kernels_intelligence(&spec)
@@ -1096,6 +1115,30 @@ pub fn run_kernel_rebuild(
         artifacts_persisted: report.artifacts_persisted as u64,
         kernel_cf_rows_after: report.kernel_cf_rows_after as u64,
     })
+}
+
+fn kernel_content_slot(slot: u32) -> Result<u16, ErrorData> {
+    u16::try_from(slot).map_err(|_| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "hygiene kernel content_slot={slot} exceeds the physical u16 slot ceiling 65535"
+            ),
+        )
+    })
+}
+
+fn kernel_rebuild_max_records(requested: Option<u32>) -> Result<usize, ErrorData> {
+    let value = requested.unwrap_or(MAX_INTELLIGENCE_HYGIENE_RECORDS);
+    if !(1..=MAX_INTELLIGENCE_HYGIENE_RECORDS).contains(&value) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "hygiene kernel_rebuild max_records={value} is outside 1..={MAX_INTELLIGENCE_HYGIENE_RECORDS}"
+            ),
+        ));
+    }
+    Ok(value as usize)
 }
 
 /// Calibrates the Ward guard profile from the vault's adjudicated corpus and
