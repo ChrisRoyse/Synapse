@@ -226,6 +226,7 @@ pub(super) fn process_unexpected_fields(
         .as_deref()
         .or_else(|| params.process_name_contains.as_deref())
         .or_else(|| params.command_line_contains.as_deref())
+        .or_else(|| params.ownership_token.as_deref())
         .map(str::to_owned)
         .or_else(|| params.pid.map(|pid| pid.to_string()))
         .unwrap_or_else(|| operation.as_str().to_owned());
@@ -404,6 +405,12 @@ pub(super) fn process_launch_params(params: ProcessParams) -> Result<ActLaunchPa
     if params.include_command_line.is_some() {
         unexpected.push("include_command_line");
     }
+    if params.ownership_token.is_some() {
+        unexpected.push("ownership_token");
+    }
+    if params.expected_revision.is_some() {
+        unexpected.push("expected_revision");
+    }
     process_unexpected_fields(ProcessOperation::Launch, &params, &unexpected)?;
     let target = require_process_text(
         ProcessOperation::Launch,
@@ -427,6 +434,151 @@ pub(super) fn process_launch_params(params: ProcessParams) -> Result<ActLaunchPa
         desktop: params.desktop,
         output: params.output,
     })
+}
+
+pub(super) fn process_cdp_profile_status_token(
+    params: &ProcessParams,
+) -> Result<Option<String>, ErrorData> {
+    let mut unexpected = Vec::new();
+    if params.target.is_some() {
+        unexpected.push("target");
+    }
+    if params.args.is_some() {
+        unexpected.push("args");
+    }
+    if params.working_dir.is_some() {
+        unexpected.push("working_dir");
+    }
+    if params.env.is_some() {
+        unexpected.push("env");
+    }
+    if params.wait_for_window_title_regex.is_some() {
+        unexpected.push("wait_for_window_title_regex");
+    }
+    if params.timeout_ms.is_some() {
+        unexpected.push("timeout_ms");
+    }
+    if params.idempotency_key.is_some() {
+        unexpected.push("idempotency_key");
+    }
+    if params.cdp_debug.is_some() {
+        unexpected.push("cdp_debug");
+    }
+    if params.force_renderer_accessibility.is_some() {
+        unexpected.push("force_renderer_accessibility");
+    }
+    if params.windows_console_window_state.is_some() {
+        unexpected.push("windows_console_window_state");
+    }
+    if params.desktop.is_some() {
+        unexpected.push("desktop");
+    }
+    if params.output.is_some() {
+        unexpected.push("output");
+    }
+    if params.pid.is_some() {
+        unexpected.push("pid");
+    }
+    if params.process_name_contains.is_some() {
+        unexpected.push("process_name_contains");
+    }
+    if params.command_line_contains.is_some() {
+        unexpected.push("command_line_contains");
+    }
+    if params.limit.is_some() {
+        unexpected.push("limit");
+    }
+    if params.include_command_line.is_some() {
+        unexpected.push("include_command_line");
+    }
+    if params.expected_revision.is_some() {
+        unexpected.push("expected_revision");
+    }
+    process_unexpected_fields(ProcessOperation::CdpProfileStatus, params, &unexpected)?;
+    if params
+        .ownership_token
+        .as_deref()
+        .is_some_and(|token| token.trim().is_empty())
+    {
+        return Err(process_facade_error(
+            ProcessOperation::CdpProfileStatus,
+            "ownership_token",
+            "process cdp_profile_status ownership_token must be non-empty when supplied",
+            "omit ownership_token for a full census or provide the exact token directory name",
+        ));
+    }
+    Ok(params.ownership_token.clone())
+}
+
+pub(super) fn process_cdp_profile_repair_params(
+    params: &ProcessParams,
+) -> Result<(String, String), ErrorData> {
+    let mut unexpected = Vec::new();
+    if params.target.is_some() {
+        unexpected.push("target");
+    }
+    if params.args.is_some() {
+        unexpected.push("args");
+    }
+    if params.working_dir.is_some() {
+        unexpected.push("working_dir");
+    }
+    if params.env.is_some() {
+        unexpected.push("env");
+    }
+    if params.wait_for_window_title_regex.is_some() {
+        unexpected.push("wait_for_window_title_regex");
+    }
+    if params.timeout_ms.is_some() {
+        unexpected.push("timeout_ms");
+    }
+    if params.idempotency_key.is_some() {
+        unexpected.push("idempotency_key");
+    }
+    if params.cdp_debug.is_some() {
+        unexpected.push("cdp_debug");
+    }
+    if params.force_renderer_accessibility.is_some() {
+        unexpected.push("force_renderer_accessibility");
+    }
+    if params.windows_console_window_state.is_some() {
+        unexpected.push("windows_console_window_state");
+    }
+    if params.desktop.is_some() {
+        unexpected.push("desktop");
+    }
+    if params.output.is_some() {
+        unexpected.push("output");
+    }
+    if params.pid.is_some() {
+        unexpected.push("pid");
+    }
+    if params.process_name_contains.is_some() {
+        unexpected.push("process_name_contains");
+    }
+    if params.command_line_contains.is_some() {
+        unexpected.push("command_line_contains");
+    }
+    if params.limit.is_some() {
+        unexpected.push("limit");
+    }
+    if params.include_command_line.is_some() {
+        unexpected.push("include_command_line");
+    }
+    process_unexpected_fields(ProcessOperation::CdpProfileRepair, params, &unexpected)?;
+    let token = require_process_text(
+        ProcessOperation::CdpProfileRepair,
+        params.ownership_token.clone(),
+        "ownership_token",
+        ProcessOperation::CdpProfileRepair.as_str(),
+    )?;
+    let revision = require_process_text(
+        ProcessOperation::CdpProfileRepair,
+        params.expected_revision.clone(),
+        "expected_revision",
+        &token,
+    )?;
+    Ok((token, revision))
 }
 
 pub(super) fn validate_process_query_params(
@@ -470,6 +622,12 @@ pub(super) fn validate_process_query_params(
     if params.output.is_some() {
         unexpected.push("output");
     }
+    if params.ownership_token.is_some() {
+        unexpected.push("ownership_token");
+    }
+    if params.expected_revision.is_some() {
+        unexpected.push("expected_revision");
+    }
     process_unexpected_fields(operation, params, &unexpected)?;
 
     for (field, value) in [
@@ -498,12 +656,20 @@ pub(super) fn validate_process_query_params(
     let limit = params.limit.unwrap_or(match operation {
         ProcessOperation::List => PROCESS_LIST_DEFAULT_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_DEFAULT_LIMIT,
-        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
+        ProcessOperation::Launch
+        | ProcessOperation::CdpProfileStatus
+        | ProcessOperation::CdpProfileRepair => {
+            unreachable!("operation is not a process table query")
+        }
     });
     let max_limit = match operation {
         ProcessOperation::List => PROCESS_LIST_MAX_LIMIT,
         ProcessOperation::History => PROCESS_HISTORY_MAX_LIMIT,
-        ProcessOperation::Launch => unreachable!("launch is not a query operation"),
+        ProcessOperation::Launch
+        | ProcessOperation::CdpProfileStatus
+        | ProcessOperation::CdpProfileRepair => {
+            unreachable!("operation is not a process table query")
+        }
     };
     if limit == 0 || limit > max_limit {
         return Err(process_facade_error(

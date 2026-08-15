@@ -1129,6 +1129,26 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PARAMS_INVALID,
                 "read the launch pid/target from CF_PROCESS_HISTORY or filter by a known pid",
             ),
+            op(
+                "cdp_profile_status",
+                false,
+                false,
+                "%TEMP%\\synapse-cdp-profiles physical tree + immutable sibling ownership ledger + live OS process identities",
+                None,
+                error_codes::TOOL_PARAMS_INVALID,
+                "provide an exact ownership_token for a repair-grade tree revision, or omit it for a compact complete census",
+            ),
+            op(
+                "cdp_profile_repair",
+                true,
+                true,
+                "%TEMP%\\synapse-cdp-profiles physical tree + immutable sibling ownership ledger + live OS process identities",
+                Some(
+                    "exact directory/owner rows absent after deletion plus a fresh status readback",
+                ),
+                error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+                "hold the maintenance profile and pass the exact ownership_token plus revision returned by cdp_profile_status; live, reused-PID, owned, marked, malformed, or drifted state is never deleted",
+            ),
         ],
     ),
     facade_contract(

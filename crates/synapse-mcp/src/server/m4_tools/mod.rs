@@ -63,8 +63,7 @@ pub(crate) const AGENT_SPAWN_MANIFEST_FILENAME: &str = "spawn-manifest.json";
 pub(crate) const AGENT_SPAWN_MANIFEST_VERSION: u32 = 1;
 const CODEX_APP_SERVER_RUNNER_SCRIPT: &str = include_str!("../codex_app_server_runner.ps1");
 const SHELL_FACADE_SOURCE_OF_TRUTH: &str = "%LOCALAPPDATA%\\Synapse\\shell-jobs + %LOCALAPPDATA%\\Synapse\\shell-sessions + daemon-tool-events.jsonl";
-const PROCESS_FACADE_SOURCE_OF_TRUTH: &str =
-    "live OS process table + CF_PROCESS_HISTORY + %LOCALAPPDATA%\\Synapse\\process-output\\sha256";
+const PROCESS_FACADE_SOURCE_OF_TRUTH: &str = "live OS process table + CF_PROCESS_HISTORY + %LOCALAPPDATA%\\Synapse\\process-output\\sha256 + %TEMP%\\synapse-cdp-profiles\\.ownership";
 const PROCESS_LIST_DEFAULT_LIMIT: usize = 100;
 const PROCESS_LIST_MAX_LIMIT: usize = 1000;
 const PROCESS_HISTORY_DEFAULT_LIMIT: usize = 20;
@@ -703,7 +702,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows for launch readback."
+        description = "Facade for process capability. operation=list reads the live OS process table; launch delegates to the audited process launcher and records CF_PROCESS_HISTORY; history reads decoded CF_PROCESS_HISTORY rows; cdp_profile_status reads the physical profile tree, external ownership ledger, and process identities; cdp_profile_repair is maintenance-gated and deletes only an exact revision-matched unowned orphan."
     )]
     pub async fn process(
         &self,
@@ -727,6 +726,8 @@ impl SynapseService {
                     launch: None,
                     processes: Some(response),
                     history: None,
+                    cdp_profile_status: None,
+                    cdp_profile_repair: None,
                 }))
             }
             ProcessOperation::Launch => {
@@ -750,6 +751,8 @@ impl SynapseService {
                     launch: Some(response),
                     processes: None,
                     history: None,
+                    cdp_profile_status: None,
+                    cdp_profile_repair: None,
                 }))
             }
             ProcessOperation::History => {
@@ -760,6 +763,42 @@ impl SynapseService {
                     launch: None,
                     processes: None,
                     history: Some(response),
+                    cdp_profile_status: None,
+                    cdp_profile_repair: None,
+                }))
+            }
+            ProcessOperation::CdpProfileStatus => {
+                let token = process_cdp_profile_status_token(&params)?;
+                let response = crate::m4::cdp_profile_status(token.as_deref());
+                Ok(Json(ProcessFacadeResponse {
+                    operation,
+                    source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    launch: None,
+                    processes: None,
+                    history: None,
+                    cdp_profile_status: Some(response),
+                    cdp_profile_repair: None,
+                }))
+            }
+            ProcessOperation::CdpProfileRepair => {
+                let (token, revision) = process_cdp_profile_repair_params(&params)?;
+                crate::server::operational_facades::policy::require_maintenance_profile(
+                    self,
+                    &request_context,
+                    "process",
+                    "cdp_profile_repair",
+                    &token,
+                    PROCESS_FACADE_SOURCE_OF_TRUTH,
+                )?;
+                let response = crate::m4::repair_unowned_cdp_profile(&token, &revision)?;
+                Ok(Json(ProcessFacadeResponse {
+                    operation,
+                    source_of_truth: PROCESS_FACADE_SOURCE_OF_TRUTH.to_owned(),
+                    launch: None,
+                    processes: None,
+                    history: None,
+                    cdp_profile_status: None,
+                    cdp_profile_repair: Some(response),
                 }))
             }
         }

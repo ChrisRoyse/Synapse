@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fs::{self, OpenOptions},
     future::Future,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -10168,9 +10168,1281 @@ fn attest_cdp_listener(
 }
 
 const CDP_PROFILE_OWNERSHIP_MARKER: &str = ".synapse-cdp-profile-owner.json";
+const CDP_PROFILE_OWNERSHIP_RECORD_DIR: &str = ".ownership";
+const CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA: &str = "synapse-cdp-profile-owner/v2";
+const CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES: u64 = 4096;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CdpProfileOwnershipRecordPhase {
+    Pending,
+    Active,
+}
+
+impl CdpProfileOwnershipRecordPhase {
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Pending => "pending.json",
+            Self::Active => "active.json",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdpProfileDirectoryIdentity {
+    pub platform: String,
+    pub volume_id: u64,
+    pub file_id_hex: String,
+    pub created_100ns: u64,
+    pub canonical_path_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CdpProfileOwnershipRecord {
+    schema: String,
+    phase: CdpProfileOwnershipRecordPhase,
+    ownership_token: String,
+    user_data_dir: String,
+    launcher_pid: u32,
+    launcher_process_creation_time_100ns: u64,
+    created_at: String,
+    directory_identity: Option<CdpProfileDirectoryIdentity>,
+}
+
+fn cdp_profile_root() -> PathBuf {
+    std::env::temp_dir().join("synapse-cdp-profiles")
+}
+
+fn cdp_profile_ownership_record_root() -> PathBuf {
+    cdp_profile_root().join(CDP_PROFILE_OWNERSHIP_RECORD_DIR)
+}
+
+fn cdp_profile_ownership_record_path(
+    token: &str,
+    phase: CdpProfileOwnershipRecordPhase,
+) -> PathBuf {
+    cdp_profile_ownership_record_root().join(format!("{token}.{}", phase.suffix()))
+}
+
+fn parse_cdp_profile_token(token: &str) -> Result<(u32, u64, u128), String> {
+    if token.is_empty()
+        || token.len() > 160
+        || token.contains(['/', '\\'])
+        || token == "."
+        || token == ".."
+    {
+        return Err(format!("invalid CDP profile ownership token {token:?}"));
+    }
+    let mut parts = token.split('-');
+    let pid = parts
+        .next()
+        .ok_or_else(|| format!("CDP profile token {token:?} has no launcher pid"))?
+        .parse::<u32>()
+        .map_err(|error| {
+            format!("CDP profile token {token:?} has invalid launcher pid: {error}")
+        })?;
+    let sequence = parts
+        .next()
+        .ok_or_else(|| format!("CDP profile token {token:?} has no sequence"))?
+        .parse::<u64>()
+        .map_err(|error| format!("CDP profile token {token:?} has invalid sequence: {error}"))?;
+    let created_nanos = u128::from_str_radix(
+        parts
+            .next()
+            .ok_or_else(|| format!("CDP profile token {token:?} has no creation time"))?,
+        16,
+    )
+    .map_err(|error| format!("CDP profile token {token:?} has invalid creation time: {error}"))?;
+    if parts.next().is_some() || pid == 0 || created_nanos == 0 {
+        return Err(format!(
+            "CDP profile token {token:?} does not have the exact pid-sequence-unix_nanos shape"
+        ));
+    }
+    Ok((pid, sequence, created_nanos))
+}
+
+fn validate_cdp_profile_record_root(create: bool) -> Result<PathBuf, String> {
+    let profile_root = cdp_profile_root();
+    let record_root = cdp_profile_ownership_record_root();
+    if create {
+        fs::create_dir_all(&record_root).map_err(|error| {
+            format!(
+                "create durable CDP profile owner root {} failed: {error}",
+                record_root.display()
+            )
+        })?;
+    }
+    for path in [&profile_root, &record_root] {
+        match fs::symlink_metadata(path) {
+            Ok(metadata)
+                if metadata.is_dir()
+                    && !metadata.file_type().is_symlink()
+                    && !metadata_is_windows_reparse_point(&metadata) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "durable CDP profile ownership path {} is not a real directory",
+                    path.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && !create => {}
+            Err(error) => {
+                return Err(format!(
+                    "inspect durable CDP profile ownership path {} failed: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Ok(record_root)
+}
+
+#[cfg(windows)]
+fn metadata_is_windows_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+    metadata.file_attributes() & 0x0000_0400 != 0
+}
+
+#[cfg(not(windows))]
+fn metadata_is_windows_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
+    use std::{
+        os::windows::{fs::OpenOptionsExt as _, io::AsRawHandle as _},
+        time::UNIX_EPOCH,
+    };
+    use windows::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_INFO,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo,
+            GetFileInformationByHandleEx,
+        },
+    };
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode((FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE).0)
+        .custom_flags((FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT).0)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "open CDP profile directory {} failed: {error}",
+                path.display()
+            )
+        })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect CDP profile directory {} failed: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+    {
+        return Err(format!(
+            "CDP profile path {} is not a real non-reparse directory",
+            path.display()
+        ));
+    }
+    let mut file_id = FILE_ID_INFO::default();
+    let buffer_size = u32::try_from(std::mem::size_of::<FILE_ID_INFO>())
+        .map_err(|_| "FILE_ID_INFO size does not fit u32".to_owned())?;
+    // SAFETY: `file` retains a valid directory handle for the call and the
+    // output buffer is initialized writable storage of the declared size.
+    unsafe {
+        GetFileInformationByHandleEx(
+            HANDLE(file.as_raw_handle()),
+            FileIdInfo,
+            std::ptr::from_mut(&mut file_id).cast(),
+            buffer_size,
+        )
+    }
+    .map_err(|error| format!("read FILE_ID_INFO for {} failed: {error}", path.display()))?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "canonicalize CDP profile {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let created_100ns = metadata
+        .created()
+        .map_err(|error| {
+            format!(
+                "read CDP profile creation time {} failed: {error}",
+                path.display()
+            )
+        })?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("CDP profile creation time predates UNIX epoch: {error}"))?
+        .as_nanos()
+        / 100;
+    Ok(CdpProfileDirectoryIdentity {
+        platform: "windows_file_id_128".to_owned(),
+        volume_id: file_id.VolumeSerialNumber,
+        file_id_hex: hex_encode_lower(&file_id.FileId.Identifier),
+        created_100ns: u64::try_from(created_100ns).unwrap_or(u64::MAX),
+        canonical_path_sha256: sha256_hex(canonical.to_string_lossy().as_bytes()),
+    })
+}
+
+#[cfg(unix)]
+fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        format!(
+            "inspect CDP profile directory {} failed: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "CDP profile path {} is not a real directory",
+            path.display()
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        format!(
+            "canonicalize CDP profile {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let created_100ns = metadata
+        .ctime()
+        .saturating_mul(10_000_000)
+        .saturating_add(metadata.ctime_nsec().div_euclid(100));
+    Ok(CdpProfileDirectoryIdentity {
+        platform: "unix_device_inode".to_owned(),
+        volume_id: metadata.dev(),
+        file_id_hex: format!("{:032x}", metadata.ino()),
+        created_100ns: u64::try_from(created_100ns).unwrap_or(0),
+        canonical_path_sha256: sha256_hex(canonical.to_string_lossy().as_bytes()),
+    })
+}
+
+#[cfg(not(any(windows, unix)))]
+fn cdp_profile_directory_identity(path: &Path) -> Result<CdpProfileDirectoryIdentity, String> {
+    Err(format!(
+        "CDP profile directory identity is unsupported on this platform for {}",
+        path.display()
+    ))
+}
+
+fn validate_cdp_profile_ownership_record(
+    record: &CdpProfileOwnershipRecord,
+    expected_phase: CdpProfileOwnershipRecordPhase,
+) -> Result<(), String> {
+    if record.schema != CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA
+        || record.phase != expected_phase
+        || record.ownership_token.is_empty()
+    {
+        return Err(format!(
+            "CDP profile owner record header mismatch schema={:?} phase={:?} token={:?}",
+            record.schema, record.phase, record.ownership_token
+        ));
+    }
+    let (token_pid, _sequence, _created_nanos) = parse_cdp_profile_token(&record.ownership_token)?;
+    if token_pid != record.launcher_pid || record.launcher_process_creation_time_100ns == 0 {
+        return Err(format!(
+            "CDP profile owner record process identity mismatch token_pid={token_pid} launcher_pid={} launcher_creation={}",
+            record.launcher_pid, record.launcher_process_creation_time_100ns
+        ));
+    }
+    let expected_path = cdp_profile_root().join(&record.ownership_token);
+    if Path::new(&record.user_data_dir) != expected_path {
+        return Err(format!(
+            "CDP profile owner record path mismatch actual={} expected={}",
+            record.user_data_dir,
+            expected_path.display()
+        ));
+    }
+    if chrono::DateTime::parse_from_rfc3339(&record.created_at).is_err() {
+        return Err(format!(
+            "CDP profile owner record created_at is not RFC3339: {:?}",
+            record.created_at
+        ));
+    }
+    match (expected_phase, record.directory_identity.as_ref()) {
+        (CdpProfileOwnershipRecordPhase::Pending, None)
+        | (CdpProfileOwnershipRecordPhase::Active, Some(_)) => Ok(()),
+        _ => Err(format!(
+            "CDP profile owner record phase={expected_phase:?} has contradictory directory_identity presence={} ",
+            record.directory_identity.is_some()
+        )),
+    }
+}
+
+fn read_cdp_profile_ownership_record(
+    token: &str,
+    phase: CdpProfileOwnershipRecordPhase,
+) -> Result<Option<(CdpProfileOwnershipRecord, Vec<u8>)>, String> {
+    let path = cdp_profile_ownership_record_path(token, phase);
+    let path_metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect CDP profile ownership record path {} failed: {error}",
+                path.display()
+            ));
+        }
+    };
+    if !path_metadata.is_file()
+        || path_metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&path_metadata)
+    {
+        return Err(format!(
+            "CDP profile ownership record path {} is not a real file",
+            path.display()
+        ));
+    }
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+        OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(&path)
+    };
+    #[cfg(not(windows))]
+    let mut file = match OpenOptions::new().read(true).open(&path) {
+        Ok(file) => Ok(file),
+        Err(error) => Err(error),
+    };
+    let mut file = file.map_err(|error| {
+        format!(
+            "open CDP profile ownership record {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "inspect CDP profile ownership record {} failed: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata_is_windows_reparse_point(&metadata)
+        || metadata.len() > CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES
+    {
+        return Err(format!(
+            "CDP profile ownership record {} is not a real bounded file (bytes={})",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle as _;
+        use windows::Win32::{
+            Foundation::HANDLE,
+            Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle},
+        };
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: `file` owns a valid immutable-record handle for the call and
+        // the output buffer is initialized writable storage.
+        unsafe {
+            GetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                std::ptr::from_mut(&mut information),
+            )
+        }
+        .map_err(|error| {
+            format!(
+                "read CDP profile ownership record link count {} failed: {error}",
+                path.display()
+            )
+        })?;
+        if information.nNumberOfLinks != 1 {
+            return Err(format!(
+                "CDP profile ownership record {} has {} hard links; immutable authority requires one",
+                path.display(),
+                information.nNumberOfLinks
+            ));
+        }
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(metadata.len()).unwrap_or(0));
+    file.read_to_end(&mut bytes).map_err(|error| {
+        format!(
+            "read CDP profile ownership record {} failed: {error}",
+            path.display()
+        )
+    })?;
+    let record: CdpProfileOwnershipRecord = serde_json::from_slice(&bytes).map_err(|error| {
+        format!(
+            "decode CDP profile ownership record {} failed: {error}",
+            path.display()
+        )
+    })?;
+    validate_cdp_profile_ownership_record(&record, phase)?;
+    if record.ownership_token != token {
+        return Err(format!(
+            "CDP profile ownership record {} token {:?} does not match filename token {token:?}",
+            path.display(),
+            record.ownership_token
+        ));
+    }
+    Ok(Some((record, bytes)))
+}
+
+#[cfg(windows)]
+fn commit_new_cdp_profile_owner_file(staging: &Path, final_path: &Path) -> io::Result<()> {
+    use windows::{
+        Win32::Storage::FileSystem::{MOVEFILE_WRITE_THROUGH, MoveFileExW},
+        core::PCWSTR,
+    };
+    let staging_wide = path_to_nul_terminated_wide(staging);
+    let final_wide = path_to_nul_terminated_wide(final_path);
+    // SAFETY: both path buffers are NUL-terminated and remain live for the call.
+    unsafe {
+        MoveFileExW(
+            PCWSTR(staging_wide.as_ptr()),
+            PCWSTR(final_wide.as_ptr()),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    }
+    .map_err(|error| io::Error::from_raw_os_error(win32_error_low_code(&error) as i32))
+}
+
+#[cfg(not(windows))]
+fn commit_new_cdp_profile_owner_file(staging: &Path, final_path: &Path) -> io::Result<()> {
+    fs::hard_link(staging, final_path)?;
+    fs::remove_file(staging)?;
+    let parent = final_path
+        .parent()
+        .ok_or_else(|| io::Error::other("CDP profile owner path has no parent"))?;
+    sync_directory_entry_parent(parent)
+}
+
+fn persist_cdp_profile_ownership_record(
+    record: &CdpProfileOwnershipRecord,
+) -> Result<Vec<u8>, String> {
+    validate_cdp_profile_ownership_record(record, record.phase)?;
+    let record_root = validate_cdp_profile_record_root(true)?;
+    let final_path = cdp_profile_ownership_record_path(&record.ownership_token, record.phase);
+    let staging_path = record_root.join(format!(
+        ".{}.{}.tmp.{}",
+        record.ownership_token,
+        record.phase.suffix(),
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(record)
+        .map_err(|error| format!("encode CDP profile ownership record failed: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES {
+        return Err(format!(
+            "encoded CDP profile ownership record exceeds {CDP_PROFILE_OWNERSHIP_RECORD_MAX_BYTES} bytes"
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging_path)
+        .map_err(|error| {
+            format!(
+                "create CDP profile owner staging file {} failed: {error}",
+                staging_path.display()
+            )
+        })?;
+    file.write_all(&bytes).map_err(|error| {
+        format!(
+            "write CDP profile owner staging file {} failed: {error}",
+            staging_path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "flush CDP profile owner staging file {} failed: {error}",
+            staging_path.display()
+        )
+    })?;
+    drop(file);
+    commit_new_cdp_profile_owner_file(&staging_path, &final_path).map_err(|error| {
+        format!(
+            "commit immutable CDP profile ownership record {} failed: {error}",
+            final_path.display()
+        )
+    })?;
+    let Some((readback, readback_bytes)) =
+        read_cdp_profile_ownership_record(&record.ownership_token, record.phase)?
+    else {
+        return Err(format!(
+            "CDP profile ownership record disappeared after commit: {}",
+            final_path.display()
+        ));
+    };
+    if readback != *record || readback_bytes != bytes {
+        return Err(format!(
+            "CDP profile ownership record readback mismatch at {}",
+            final_path.display()
+        ));
+    }
+    Ok(readback_bytes)
+}
+
+fn cdp_profile_prepare_lock() -> &'static Mutex<()> {
+    static PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    PREPARE_LOCK.get_or_init(|| Mutex::new(()))
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdpProfileTreeMeasurement {
+    pub directory_count: u64,
+    pub file_count: u64,
+    pub total_file_bytes: u64,
+    pub metadata_sha256: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdpProfileStatusEntry {
+    pub ownership_token: String,
+    pub user_data_dir: String,
+    pub state: String,
+    pub revision: String,
+    pub directory_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory_identity: Option<CdpProfileDirectoryIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<CdpProfileTreeMeasurement>,
+    pub external_owner_present: bool,
+    pub pending_owner_present: bool,
+    pub legacy_marker_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_expected_creation_time_100ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launcher_actual_creation_time_100ns: Option<u64>,
+    pub live_user_pids: Vec<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdpProfileStatusResponse {
+    pub source_of_truth: String,
+    pub profile_root: String,
+    pub ownership_record_root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ownership_token_filter: Option<String>,
+    pub entry_count: usize,
+    pub entries: Vec<CdpProfileStatusEntry>,
+    pub failures: Vec<String>,
+    pub revision: String,
+}
+
+#[derive(Clone, Debug, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CdpProfileRepairResponse {
+    pub source_of_truth: String,
+    pub ownership_token: String,
+    pub accepted_revision: String,
+    pub before: CdpProfileStatusEntry,
+    pub directory_present_after: bool,
+    pub external_owner_present_after: bool,
+    pub pending_owner_present_after: bool,
+    pub legacy_marker_present_after: bool,
+    pub status_after_revision: String,
+}
+
+fn cdp_profile_paths_equivalent(left: &Path, right: &Path) -> bool {
+    let left = fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .replace('/', "\\")
+            .eq_ignore_ascii_case(&right.to_string_lossy().replace('/', "\\"))
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
+
+fn cdp_profile_live_user_pids(user_data_dir: &Path) -> Vec<u32> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let mut pids = BTreeSet::new();
+    for (pid, process) in system.processes() {
+        let args = process.cmd();
+        let mut index = 0usize;
+        while index < args.len() {
+            let arg = args[index].to_string_lossy();
+            let matches_profile = if let Some(value) = arg.strip_prefix("--user-data-dir=") {
+                cdp_profile_paths_equivalent(Path::new(value), user_data_dir)
+            } else if arg == "--user-data-dir" {
+                args.get(index + 1).is_some_and(|value| {
+                    cdp_profile_paths_equivalent(
+                        Path::new(value.to_string_lossy().as_ref()),
+                        user_data_dir,
+                    )
+                })
+            } else {
+                false
+            };
+            if matches_profile {
+                pids.insert(pid.as_u32());
+                break;
+            }
+            index = index.saturating_add(1);
+        }
+    }
+    pids.into_iter().collect()
+}
+
+fn cdp_profile_tree_measurement(path: &Path) -> Result<CdpProfileTreeMeasurement, String> {
+    let mut stack = vec![path.to_path_buf()];
+    let mut rows = Vec::new();
+    let mut directory_count = 0u64;
+    let mut file_count = 0u64;
+    let mut total_file_bytes = 0u64;
+    while let Some(directory) = stack.pop() {
+        directory_count = directory_count.saturating_add(1);
+        let entries = fs::read_dir(&directory).map_err(|error| {
+            format!(
+                "enumerate CDP profile tree directory {} failed: {error}",
+                directory.display()
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                format!(
+                    "read CDP profile tree entry beneath {} failed: {error}",
+                    directory.display()
+                )
+            })?;
+            let entry_path = entry.path();
+            let metadata = fs::symlink_metadata(&entry_path).map_err(|error| {
+                format!(
+                    "inspect CDP profile tree entry {} failed: {error}",
+                    entry_path.display()
+                )
+            })?;
+            if metadata.file_type().is_symlink() || metadata_is_windows_reparse_point(&metadata) {
+                return Err(format!(
+                    "CDP profile tree contains a symlink/reparse entry: {}",
+                    entry_path.display()
+                ));
+            }
+            let relative = entry_path.strip_prefix(path).map_err(|error| {
+                format!(
+                    "CDP profile tree path {} escaped root {}: {error}",
+                    entry_path.display(),
+                    path.display()
+                )
+            })?;
+            let modified_100ns = metadata
+                .modified()
+                .ok()
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos() / 100)
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            if metadata.is_dir() {
+                rows.push(format!(
+                    "d\0{}\0{modified_100ns}",
+                    relative.to_string_lossy()
+                ));
+                stack.push(entry_path);
+            } else if metadata.is_file() {
+                file_count = file_count.saturating_add(1);
+                total_file_bytes = total_file_bytes.saturating_add(metadata.len());
+                rows.push(format!(
+                    "f\0{}\0{}\0{modified_100ns}",
+                    relative.to_string_lossy(),
+                    metadata.len()
+                ));
+            } else {
+                return Err(format!(
+                    "CDP profile tree contains an unsupported filesystem entry: {}",
+                    entry_path.display()
+                ));
+            }
+        }
+    }
+    rows.sort_unstable();
+    let metadata_sha256 = sha256_hex(rows.join("\n").as_bytes());
+    Ok(CdpProfileTreeMeasurement {
+        directory_count,
+        file_count,
+        total_file_bytes,
+        metadata_sha256,
+    })
+}
+
+fn cdp_profile_record_tokens() -> Result<BTreeSet<String>, Vec<String>> {
+    let root = cdp_profile_ownership_record_root();
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(vec![format!(
+                "enumerate CDP profile ownership records {} failed: {error}",
+                root.display()
+            )]);
+        }
+    };
+    let mut tokens = BTreeSet::new();
+    let mut failures = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                failures.push(format!(
+                    "read CDP profile owner directory entry failed: {error}"
+                ));
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            failures.push(format!(
+                "CDP profile owner filename is not Unicode: {}",
+                entry.path().display()
+            ));
+            continue;
+        };
+        let token = name
+            .strip_suffix(".active.json")
+            .or_else(|| name.strip_suffix(".pending.json"));
+        let Some(token) = token else {
+            failures.push(format!(
+                "unexpected CDP profile ownership ledger entry: {}",
+                entry.path().display()
+            ));
+            continue;
+        };
+        match parse_cdp_profile_token(token) {
+            Ok((_pid, _sequence, _created_nanos)) => {
+                tokens.insert(token.to_owned());
+            }
+            Err(error) => failures.push(error),
+        }
+    }
+    if failures.is_empty() {
+        Ok(tokens)
+    } else {
+        Err(failures)
+    }
+}
+
+fn cdp_profile_status_internal(ownership_token_filter: Option<&str>) -> CdpProfileStatusResponse {
+    let profile_root = cdp_profile_root();
+    let ownership_record_root = cdp_profile_ownership_record_root();
+    let mut failures = Vec::new();
+    let mut tokens = BTreeSet::new();
+    if let Some(token) = ownership_token_filter {
+        match parse_cdp_profile_token(token) {
+            Ok((_pid, _sequence, _created_nanos)) => {
+                tokens.insert(token.to_owned());
+            }
+            Err(error) => failures.push(error),
+        }
+    } else {
+        match fs::read_dir(&profile_root) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) if entry.file_name() == CDP_PROFILE_OWNERSHIP_RECORD_DIR => {}
+                        Ok(entry) => match entry.file_name().to_str() {
+                            Some(token) => {
+                                tokens.insert(token.to_owned());
+                            }
+                            None => failures.push(format!(
+                                "CDP profile directory token is not Unicode: {}",
+                                entry.path().display()
+                            )),
+                        },
+                        Err(error) => failures.push(format!(
+                            "read CDP profile root directory entry failed: {error}"
+                        )),
+                    }
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!(
+                "enumerate CDP profile root {} failed: {error}",
+                profile_root.display()
+            )),
+        }
+        match cdp_profile_record_tokens() {
+            Ok(record_tokens) => tokens.extend(record_tokens),
+            Err(record_failures) => failures.extend(record_failures),
+        }
+    }
+    let mut status_entries = Vec::new();
+    for token in tokens {
+        let path = profile_root.join(&token);
+        let directory_present = path.exists();
+        let active =
+            match read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
+            {
+                Ok(value) => value,
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+        let pending = match read_cdp_profile_ownership_record(
+            &token,
+            CdpProfileOwnershipRecordPhase::Pending,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(error);
+                None
+            }
+        };
+        if !directory_present && active.is_none() && pending.is_none() {
+            continue;
+        }
+        let directory_identity = if directory_present {
+            match cdp_profile_directory_identity(&path) {
+                Ok(identity) => Some(identity),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let tree = if directory_present && ownership_token_filter.is_some() {
+            match cdp_profile_tree_measurement(&path) {
+                Ok(tree) => Some(tree),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
+        let marker_bytes = if directory_present {
+            match fs::read(&marker_path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    failures.push(format!(
+                        "read legacy marker {} failed: {error}",
+                        marker_path.display()
+                    ));
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let live_user_pids = if directory_present {
+            cdp_profile_live_user_pids(&path)
+        } else {
+            Vec::new()
+        };
+        let mut launcher_pid = None;
+        let mut expected_creation = None;
+        let mut actual_creation = None;
+        let mut detail = None;
+        let state = if let Some((record, _bytes)) = active.as_ref() {
+            launcher_pid = Some(record.launcher_pid);
+            expected_creation = Some(record.launcher_process_creation_time_100ns);
+            actual_creation = synapse_a11y::inspect_process_creation_time_100ns(record.launcher_pid)
+                .ok()
+                .flatten();
+            if !directory_present {
+                "external_owner_without_profile"
+            } else if record.directory_identity.as_ref() != directory_identity.as_ref() {
+                detail = Some("external owner directory identity does not match physical path".to_owned());
+                "external_identity_mismatch"
+            } else {
+                match cdp_launcher_generation_state(
+                    record.launcher_pid,
+                    record.launcher_process_creation_time_100ns,
+                ) {
+                    CdpLauncherGenerationState::Live => "external_owned_live",
+                    CdpLauncherGenerationState::Absent => "external_owned_stale",
+                    CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
+                        actual_creation = Some(actual);
+                        "external_owner_pid_reused"
+                    }
+                    CdpLauncherGenerationState::Unreadable(error) => {
+                        detail = Some(error);
+                        "external_owner_unreadable"
+                    }
+                }
+            }
+        } else if let Some((record, _bytes)) = pending.as_ref() {
+            launcher_pid = Some(record.launcher_pid);
+            expected_creation = Some(record.launcher_process_creation_time_100ns);
+            actual_creation = synapse_a11y::inspect_process_creation_time_100ns(record.launcher_pid)
+                .ok()
+                .flatten();
+            if directory_present {
+                match cdp_launcher_generation_state(
+                    record.launcher_pid,
+                    record.launcher_process_creation_time_100ns,
+                ) {
+                    CdpLauncherGenerationState::Live => "pending_owner_live",
+                    CdpLauncherGenerationState::Absent if tree.as_ref().is_some_and(|tree| tree.file_count == 0 && tree.directory_count == 1) => "pending_owner_stale_empty",
+                    CdpLauncherGenerationState::Absent => "pending_owner_stale_nonempty",
+                    CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
+                        actual_creation = Some(actual);
+                        "pending_owner_pid_reused"
+                    }
+                    CdpLauncherGenerationState::Unreadable(error) => {
+                        detail = Some(error);
+                        "pending_owner_unreadable"
+                    }
+                }
+            } else {
+                "pending_owner_without_profile"
+            }
+        } else if let Some(bytes) = marker_bytes.as_ref() {
+            match serde_json::from_slice::<Value>(bytes) {
+                Ok(marker) => {
+                    let schema = marker.get("schema").and_then(Value::as_str);
+                    let marker_token = marker.get("ownership_token").and_then(Value::as_str);
+                    launcher_pid = marker
+                        .get("launcher_pid")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok());
+                    expected_creation = marker
+                        .get("launcher_process_creation_time_100ns")
+                        .and_then(Value::as_u64);
+                    if schema != Some("synapse-cdp-profile-owner/v1")
+                        || marker_token != Some(token.as_str())
+                        || launcher_pid.is_none()
+                        || expected_creation.is_none()
+                    {
+                        detail = Some(format!(
+                            "legacy marker mismatch schema={schema:?} token={marker_token:?} pid={launcher_pid:?} creation={expected_creation:?}"
+                        ));
+                        "legacy_marker_invalid"
+                    } else {
+                        let pid = launcher_pid.unwrap_or_default();
+                        let expected = expected_creation.unwrap_or_default();
+                        actual_creation = synapse_a11y::inspect_process_creation_time_100ns(pid)
+                            .ok()
+                            .flatten();
+                        match cdp_launcher_generation_state(pid, expected) {
+                            CdpLauncherGenerationState::Live => "legacy_owned_live",
+                            CdpLauncherGenerationState::Absent => "legacy_owned_stale",
+                            CdpLauncherGenerationState::PidReused { actual_creation: actual } => {
+                                actual_creation = Some(actual);
+                                "legacy_owner_pid_reused"
+                            }
+                            CdpLauncherGenerationState::Unreadable(error) => {
+                                detail = Some(error);
+                                "legacy_owner_unreadable"
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    detail = Some(format!("decode legacy ownership marker failed: {error}"));
+                    "legacy_marker_invalid"
+                }
+            }
+        } else {
+            match parse_cdp_profile_token(&token) {
+                Ok((token_pid, _sequence, _created_nanos)) => {
+                    launcher_pid = Some(token_pid);
+                    actual_creation = synapse_a11y::inspect_process_creation_time_100ns(token_pid)
+                        .ok()
+                        .flatten();
+                    if !live_user_pids.is_empty() {
+                        "unowned_profile_in_use"
+                    } else if process_exists(token_pid) {
+                        "unowned_creator_pid_live"
+                    } else {
+                        "unowned_orphan"
+                    }
+                }
+                Err(error) => {
+                    detail = Some(error);
+                    "unowned_token_invalid"
+                }
+            }
+        }
+        .to_owned();
+        let revision_material = json!({
+            "ownership_token": token,
+            "user_data_dir": path,
+            "state": state,
+            "directory_present": directory_present,
+            "directory_identity": directory_identity,
+            "tree": tree,
+            "active_owner_sha256": active.as_ref().map(|(_record, bytes)| sha256_hex(bytes)),
+            "pending_owner_sha256": pending.as_ref().map(|(_record, bytes)| sha256_hex(bytes)),
+            "legacy_marker_sha256": marker_bytes.as_ref().map(|bytes| sha256_hex(bytes)),
+            "launcher_pid": launcher_pid,
+            "launcher_expected_creation_time_100ns": expected_creation,
+            "launcher_actual_creation_time_100ns": actual_creation,
+            "live_user_pids": live_user_pids,
+            "detail": detail,
+        });
+        let revision = serde_json::to_vec(&revision_material)
+            .map(|bytes| sha256_hex(&bytes))
+            .unwrap_or_else(|error| format!("revision_encode_failed:{error}"));
+        status_entries.push(CdpProfileStatusEntry {
+            ownership_token: token,
+            user_data_dir: path.display().to_string(),
+            state,
+            revision,
+            directory_present,
+            directory_identity,
+            tree,
+            external_owner_present: active.is_some(),
+            pending_owner_present: pending.is_some(),
+            legacy_marker_present: marker_bytes.is_some(),
+            launcher_pid,
+            launcher_expected_creation_time_100ns: expected_creation,
+            launcher_actual_creation_time_100ns: actual_creation,
+            live_user_pids,
+            detail,
+        });
+    }
+    status_entries.sort_by(|left, right| left.ownership_token.cmp(&right.ownership_token));
+    failures.sort();
+    let root_revision_material = json!({
+        "entries": status_entries.iter().map(|entry| (&entry.ownership_token, &entry.revision)).collect::<Vec<_>>(),
+        "failures": failures,
+    });
+    let revision = serde_json::to_vec(&root_revision_material)
+        .map(|bytes| sha256_hex(&bytes))
+        .unwrap_or_else(|error| format!("root_revision_encode_failed:{error}"));
+    CdpProfileStatusResponse {
+        source_of_truth: "physical %TEMP%\\synapse-cdp-profiles tree + sibling .ownership ledger + live OS process table".to_owned(),
+        profile_root: profile_root.display().to_string(),
+        ownership_record_root: ownership_record_root.display().to_string(),
+        ownership_token_filter: ownership_token_filter.map(str::to_owned),
+        entry_count: status_entries.len(),
+        entries: status_entries,
+        failures,
+        revision,
+    }
+}
+
+#[must_use]
+pub fn cdp_profile_status(ownership_token_filter: Option<&str>) -> CdpProfileStatusResponse {
+    let _guard = match cdp_profile_prepare_lock().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return CdpProfileStatusResponse {
+                source_of_truth: "physical %TEMP%\\synapse-cdp-profiles tree + sibling .ownership ledger + live OS process table".to_owned(),
+                profile_root: cdp_profile_root().display().to_string(),
+                ownership_record_root: cdp_profile_ownership_record_root().display().to_string(),
+                ownership_token_filter: ownership_token_filter.map(str::to_owned),
+                entry_count: 0,
+                entries: Vec::new(),
+                failures: vec!["CDP profile ownership lock is poisoned".to_owned()],
+                revision: sha256_hex(b"cdp_profile_ownership_lock_poisoned"),
+            };
+        }
+    };
+    cdp_profile_status_internal(ownership_token_filter)
+}
+
+pub fn repair_unowned_cdp_profile(
+    ownership_token: &str,
+    expected_revision: &str,
+) -> Result<CdpProfileRepairResponse, ErrorData> {
+    parse_cdp_profile_token(ownership_token).map_err(|error| {
+        cdp_reconciliation_error(
+            "cdp_profile_repair_token_invalid",
+            &cdp_profile_root().join(ownership_token),
+            error,
+        )
+    })?;
+    if expected_revision.len() != 64
+        || !expected_revision
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_revision_invalid",
+            &cdp_profile_root().join(ownership_token),
+            "expected_revision must be one 64-character SHA-256 hex value".to_owned(),
+        ));
+    }
+    let _guard = cdp_profile_prepare_lock().lock().map_err(|_error| {
+        cdp_reconciliation_error(
+            "cdp_profile_repair_lock_poisoned",
+            &cdp_profile_root().join(ownership_token),
+            "CDP profile ownership lock is poisoned".to_owned(),
+        )
+    })?;
+    let status_before = cdp_profile_status_internal(Some(ownership_token));
+    if !status_before.failures.is_empty() {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_status_failed",
+            &cdp_profile_root().join(ownership_token),
+            serde_json::to_string(&status_before.failures)
+                .unwrap_or_else(|error| format!("failure render failed: {error}")),
+        ));
+    }
+    let Some(before) = status_before.entries.into_iter().next() else {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_target_absent",
+            &cdp_profile_root().join(ownership_token),
+            "the exact CDP profile token is absent; no mutation was attempted".to_owned(),
+        ));
+    };
+    if before.revision != expected_revision {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_revision_mismatch",
+            Path::new(&before.user_data_dir),
+            format!(
+                "expected_revision={expected_revision} actual_revision={}",
+                before.revision
+            ),
+        ));
+    }
+    if before.state != "unowned_orphan"
+        || before.external_owner_present
+        || before.pending_owner_present
+        || before.legacy_marker_present
+        || !before.live_user_pids.is_empty()
+    {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_target_not_unowned_orphan",
+            Path::new(&before.user_data_dir),
+            format!(
+                "state={} external_owner={} pending_owner={} legacy_marker={} live_user_pids={:?}",
+                before.state,
+                before.external_owner_present,
+                before.pending_owner_present,
+                before.legacy_marker_present,
+                before.live_user_pids
+            ),
+        ));
+    }
+    let target = cdp_profile_root().join(ownership_token);
+    let identity_now = cdp_profile_directory_identity(&target).map_err(|error| {
+        cdp_reconciliation_error("cdp_profile_repair_identity_unreadable", &target, error)
+    })?;
+    if before.directory_identity.as_ref() != Some(&identity_now) {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_identity_changed",
+            &target,
+            format!(
+                "status_identity={:?} trigger_identity={identity_now:?}",
+                before.directory_identity
+            ),
+        ));
+    }
+    let boundary_status = cdp_profile_status_internal(Some(ownership_token));
+    let boundary_entry = boundary_status.entries.first();
+    if !boundary_status.failures.is_empty()
+        || boundary_entry.map(|entry| entry.revision.as_str()) != Some(expected_revision)
+        || boundary_entry.map(|entry| entry.state.as_str()) != Some("unowned_orphan")
+    {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_mutation_boundary_drift",
+            &target,
+            format!(
+                "expected_revision={expected_revision} boundary_revision={:?} boundary_state={:?} failures={:?}",
+                boundary_entry.map(|entry| entry.revision.as_str()),
+                boundary_entry.map(|entry| entry.state.as_str()),
+                boundary_status.failures
+            ),
+        ));
+    }
+    let (token_pid, _sequence, _created_nanos) =
+        parse_cdp_profile_token(ownership_token).map_err(|error| {
+            cdp_reconciliation_error("cdp_profile_repair_token_invalid", &target, error)
+        })?;
+    let live_user_pids = cdp_profile_live_user_pids(&target);
+    if process_exists(token_pid) || !live_user_pids.is_empty() {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_live_owner_at_mutation_boundary",
+            &target,
+            format!(
+                "token_pid={token_pid} token_pid_live={} live_user_pids={live_user_pids:?}",
+                process_exists(token_pid)
+            ),
+        ));
+    }
+    fs::remove_dir_all(&target).map_err(|error| {
+        cdp_reconciliation_error(
+            "cdp_profile_repair_delete_failed",
+            &target,
+            error.to_string(),
+        )
+    })?;
+    let status_after = cdp_profile_status_internal(Some(ownership_token));
+    let directory_present_after = target.exists();
+    let external_owner_present_after =
+        cdp_profile_ownership_record_path(ownership_token, CdpProfileOwnershipRecordPhase::Active)
+            .exists();
+    let pending_owner_present_after =
+        cdp_profile_ownership_record_path(ownership_token, CdpProfileOwnershipRecordPhase::Pending)
+            .exists();
+    let legacy_marker_present_after = target.join(CDP_PROFILE_OWNERSHIP_MARKER).exists();
+    if directory_present_after
+        || external_owner_present_after
+        || pending_owner_present_after
+        || legacy_marker_present_after
+        || !status_after.failures.is_empty()
+        || !status_after.entries.is_empty()
+    {
+        return Err(cdp_reconciliation_error(
+            "cdp_profile_repair_readback_failed",
+            &target,
+            format!(
+                "directory_present={directory_present_after} external_owner_present={external_owner_present_after} pending_owner_present={pending_owner_present_after} legacy_marker_present={legacy_marker_present_after} status_entries={} status_failures={:?}",
+                status_after.entries.len(),
+                status_after.failures
+            ),
+        ));
+    }
+    tracing::info!(
+        code = "M4_ACT_LAUNCH_CDP_ORPHAN_REPAIRED",
+        ownership_token,
+        expected_revision,
+        user_data_dir = %target.display(),
+        before_files = before.tree.as_ref().map_or(0, |tree| tree.file_count),
+        before_bytes = before.tree.as_ref().map_or(0, |tree| tree.total_file_bytes),
+        "readback=profile_filesystem+external_owner_ledger after=exact_unowned_orphan_absent"
+    );
+    Ok(CdpProfileRepairResponse {
+        source_of_truth: status_after.source_of_truth,
+        ownership_token: ownership_token.to_owned(),
+        accepted_revision: expected_revision.to_owned(),
+        before,
+        directory_present_after,
+        external_owner_present_after,
+        pending_owner_present_after,
+        legacy_marker_present_after,
+        status_after_revision: status_after.revision,
+    })
+}
 
 fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
-    let profile_root = std::env::temp_dir().join("synapse-cdp-profiles");
+    let profile_root = cdp_profile_root();
+    validate_cdp_profile_record_root(false).map_err(|error| {
+        cdp_reconciliation_error(
+            "cdp_profile_reconciliation_owner_root_invalid",
+            &profile_root,
+            error,
+        )
+    })?;
     let entries = match fs::read_dir(&profile_root) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -10182,6 +11454,64 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
             ));
         }
     };
+    let owner_tokens = cdp_profile_record_tokens().map_err(|failures| {
+        cdp_reconciliation_error(
+            "cdp_profile_reconciliation_owner_ledger_invalid",
+            &cdp_profile_ownership_record_root(),
+            serde_json::to_string(&failures)
+                .unwrap_or_else(|error| format!("failure render failed: {error}")),
+        )
+    })?;
+    for token in owner_tokens {
+        let profile_path = profile_root.join(&token);
+        if profile_path.exists() {
+            continue;
+        }
+        let active =
+            read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_owner_without_profile_invalid",
+                        &profile_path,
+                        error,
+                    )
+                })?;
+        let pending =
+            read_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Pending)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_pending_without_profile_invalid",
+                        &profile_path,
+                        error,
+                    )
+                })?;
+        if active.is_some() {
+            remove_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Active)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_owner_without_profile_delete_failed",
+                        &profile_path,
+                        error,
+                    )
+                })?;
+        }
+        if pending.is_some() {
+            remove_cdp_profile_ownership_record(&token, CdpProfileOwnershipRecordPhase::Pending)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_pending_without_profile_delete_failed",
+                        &profile_path,
+                        error,
+                    )
+                })?;
+        }
+        tracing::info!(
+            code = "M4_ACT_LAUNCH_CDP_OWNER_WITHOUT_PROFILE_RECLAIMED",
+            ownership_token = token,
+            user_data_dir = %profile_path.display(),
+            "readback=external_owner_ledger+profile_filesystem after=owner_rows_absent_profile_absent"
+        );
+    }
     for entry in entries {
         let entry = entry.map_err(|error| {
             cdp_reconciliation_error(
@@ -10191,6 +11521,9 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
             )
         })?;
         let path = entry.path();
+        if entry.file_name() == CDP_PROFILE_OWNERSHIP_RECORD_DIR {
+            continue;
+        }
         let metadata = fs::symlink_metadata(&path).map_err(|error| {
             cdp_reconciliation_error(
                 "cdp_profile_reconciliation_metadata_failed",
@@ -10198,7 +11531,10 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
                 error.to_string(),
             )
         })?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink()
+            || metadata_is_windows_reparse_point(&metadata)
+            || !metadata.is_dir()
+        {
             return Err(cdp_reconciliation_error(
                 "cdp_profile_reconciliation_unsafe_entry",
                 &path,
@@ -10212,14 +11548,176 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
                 "directory name is not valid Unicode".to_owned(),
             ));
         };
-        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
-        let bytes = fs::read(&marker_path).map_err(|error| {
-            cdp_reconciliation_error(
-                "cdp_profile_reconciliation_marker_unreadable",
-                &path,
-                format!("read {}: {error}", marker_path.display()),
-            )
+        parse_cdp_profile_token(token).map_err(|error| {
+            cdp_reconciliation_error("cdp_profile_reconciliation_token_invalid", &path, error)
         })?;
+        let active_record =
+            read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_external_owner_invalid",
+                        &path,
+                        error,
+                    )
+                })?;
+        if let Some((record, _bytes)) = active_record {
+            let expected_identity = record.directory_identity.as_ref().ok_or_else(|| {
+                cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_external_identity_missing",
+                    &path,
+                    "active owner record has no directory identity".to_owned(),
+                )
+            })?;
+            let actual_identity = cdp_profile_directory_identity(&path).map_err(|error| {
+                cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_directory_identity_unreadable",
+                    &path,
+                    error,
+                )
+            })?;
+            if &actual_identity != expected_identity {
+                return Err(cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_directory_identity_mismatch",
+                    &path,
+                    format!("expected={expected_identity:?} actual={actual_identity:?}"),
+                ));
+            }
+            match cdp_launcher_generation_state(
+                record.launcher_pid,
+                record.launcher_process_creation_time_100ns,
+            ) {
+                CdpLauncherGenerationState::Live => continue,
+                CdpLauncherGenerationState::Absent => {
+                    let readback = cleanup_cdp_profile(
+                        &path,
+                        CdpProfileOwnership::SynapseEphemeral,
+                        Some(token),
+                    );
+                    if readback.failed {
+                        return Err(cdp_reconciliation_error(
+                            "cdp_profile_reconciliation_delete_failed",
+                            &path,
+                            serde_json::to_string(&readback).unwrap_or_else(|error| {
+                                format!("readback serialization failed: {error}")
+                            }),
+                        ));
+                    }
+                    tracing::info!(
+                        code = "M4_ACT_LAUNCH_CDP_STALE_PROFILE_RECLAIMED",
+                        user_data_dir = %path.display(),
+                        launcher_pid = record.launcher_pid,
+                        launcher_creation = record.launcher_process_creation_time_100ns,
+                        authority = "external_owner_v2",
+                        "readback=profile_filesystem+external_owner after=stale_owned_profile_absent"
+                    );
+                    continue;
+                }
+                CdpLauncherGenerationState::PidReused { actual_creation } => {
+                    return Err(cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_launcher_pid_reused",
+                        &path,
+                        format!(
+                            "launcher pid={} expected_creation={} actual_creation={actual_creation}",
+                            record.launcher_pid, record.launcher_process_creation_time_100ns
+                        ),
+                    ));
+                }
+                CdpLauncherGenerationState::Unreadable(error) => {
+                    return Err(cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_generation_unreadable",
+                        &path,
+                        error,
+                    ));
+                }
+            }
+        }
+        let pending_record =
+            read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
+                .map_err(|error| {
+                    cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_pending_owner_invalid",
+                        &path,
+                        error,
+                    )
+                })?;
+        if let Some((record, _bytes)) = pending_record {
+            match cdp_launcher_generation_state(
+                record.launcher_pid,
+                record.launcher_process_creation_time_100ns,
+            ) {
+                CdpLauncherGenerationState::Live => continue,
+                CdpLauncherGenerationState::Absent => {
+                    let mut contents = fs::read_dir(&path).map_err(|error| {
+                        cdp_reconciliation_error(
+                            "cdp_profile_reconciliation_pending_directory_unreadable",
+                            &path,
+                            error.to_string(),
+                        )
+                    })?;
+                    if contents.next().is_some() {
+                        return Err(cdp_reconciliation_error(
+                            "cdp_profile_reconciliation_pending_directory_not_empty",
+                            &path,
+                            "a pending owner may be reclaimed only before browser mutation; the directory contains bytes".to_owned(),
+                        ));
+                    }
+                    let readback = cleanup_cdp_profile(
+                        &path,
+                        CdpProfileOwnership::SynapseEphemeral,
+                        Some(token),
+                    );
+                    if readback.failed {
+                        return Err(cdp_reconciliation_error(
+                            "cdp_profile_reconciliation_pending_delete_failed",
+                            &path,
+                            serde_json::to_string(&readback).unwrap_or_else(|error| {
+                                format!("readback serialization failed: {error}")
+                            }),
+                        ));
+                    }
+                    continue;
+                }
+                CdpLauncherGenerationState::PidReused { actual_creation } => {
+                    return Err(cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_pending_launcher_pid_reused",
+                        &path,
+                        format!(
+                            "launcher pid={} expected_creation={} actual_creation={actual_creation}",
+                            record.launcher_pid, record.launcher_process_creation_time_100ns
+                        ),
+                    ));
+                }
+                CdpLauncherGenerationState::Unreadable(error) => {
+                    return Err(cdp_reconciliation_error(
+                        "cdp_profile_reconciliation_pending_generation_unreadable",
+                        &path,
+                        error,
+                    ));
+                }
+            }
+        }
+        let marker_path = path.join(CDP_PROFILE_OWNERSHIP_MARKER);
+        let bytes = match fs::read(&marker_path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                tracing::error!(
+                    code = error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
+                    reason = "cdp_profile_unowned_orphan_retained",
+                    user_data_dir = %path.display(),
+                    ownership_token = token,
+                    remediation = "call process operation=cdp_profile_status, acquire the maintenance profile, then call process operation=cdp_profile_repair with this exact token and revision",
+                    "unowned legacy CDP profile is outside the durable ownership ledger; retained without blocking unrelated launch"
+                );
+                continue;
+            }
+            Err(error) => {
+                return Err(cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_marker_unreadable",
+                    &path,
+                    format!("read {}: {error}", marker_path.display()),
+                ));
+            }
+        };
         if bytes.len() > 4096 {
             return Err(cdp_reconciliation_error(
                 "cdp_profile_reconciliation_marker_oversize",
@@ -10258,29 +11756,25 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
         }
         let launcher_pid = launcher_pid.unwrap_or_default();
         let launcher_creation = launcher_creation.unwrap_or_default();
-        let generation_live = match synapse_a11y::inspect_process_creation_time_100ns(launcher_pid)
-        {
-            Ok(Some(actual)) => actual == launcher_creation,
-            Ok(None) => {
+        match cdp_launcher_generation_state(launcher_pid, launcher_creation) {
+            CdpLauncherGenerationState::Live => continue,
+            CdpLauncherGenerationState::Absent => {}
+            CdpLauncherGenerationState::PidReused { actual_creation } => {
                 return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_generation_missing",
-                    &path,
-                    format!("launcher pid={launcher_pid} returned no process generation"),
-                ));
-            }
-            Err(_error) if !process_exists(launcher_pid) => false,
-            Err(error) => {
-                return Err(cdp_reconciliation_error(
-                    "cdp_profile_reconciliation_generation_unreadable",
+                    "cdp_profile_reconciliation_launcher_pid_reused",
                     &path,
                     format!(
-                        "launcher pid={launcher_pid} remains live but identity read failed: {error}"
+                        "legacy launcher pid={launcher_pid} expected_creation={launcher_creation} actual_creation={actual_creation}"
                     ),
                 ));
             }
-        };
-        if generation_live {
-            continue;
+            CdpLauncherGenerationState::Unreadable(error) => {
+                return Err(cdp_reconciliation_error(
+                    "cdp_profile_reconciliation_generation_unreadable",
+                    &path,
+                    error,
+                ));
+            }
         }
         let readback =
             cleanup_cdp_profile(&path, CdpProfileOwnership::SynapseEphemeral, Some(token));
@@ -10303,6 +11797,32 @@ fn reconcile_stale_cdp_profiles() -> Result<(), ErrorData> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+enum CdpLauncherGenerationState {
+    Live,
+    Absent,
+    PidReused { actual_creation: u64 },
+    Unreadable(String),
+}
+
+fn cdp_launcher_generation_state(
+    launcher_pid: u32,
+    expected_creation: u64,
+) -> CdpLauncherGenerationState {
+    match synapse_a11y::inspect_process_creation_time_100ns(launcher_pid) {
+        Ok(Some(actual)) if actual == expected_creation => CdpLauncherGenerationState::Live,
+        Ok(Some(actual_creation)) => CdpLauncherGenerationState::PidReused { actual_creation },
+        Ok(None) if !process_exists(launcher_pid) => CdpLauncherGenerationState::Absent,
+        Ok(None) => CdpLauncherGenerationState::Unreadable(format!(
+            "launcher pid={launcher_pid} remains live but returned no process generation"
+        )),
+        Err(_error) if !process_exists(launcher_pid) => CdpLauncherGenerationState::Absent,
+        Err(error) => CdpLauncherGenerationState::Unreadable(format!(
+            "launcher pid={launcher_pid} remains live but identity read failed: {error}"
+        )),
+    }
+}
+
 fn cdp_reconciliation_error(reason: &'static str, path: &Path, detail: String) -> ErrorData {
     launch_tool_error(
         error_codes::ACTION_LAUNCH_CDP_CLEANUP_FAILED,
@@ -10321,9 +11841,7 @@ fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), Error
     if launch.profile_ownership == CdpProfileOwnership::CallerManagedStable {
         return Ok(());
     }
-    static PREPARE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let _prepare_guard = PREPARE_LOCK
-        .get_or_init(|| Mutex::new(()))
+    let _prepare_guard = cdp_profile_prepare_lock()
         .lock()
         .map_err(|_error| {
             launch_tool_error(
@@ -10378,7 +11896,7 @@ fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), Error
                     }),
                 )
             })?;
-    let expected_parent = std::env::temp_dir().join("synapse-cdp-profiles");
+    let expected_parent = cdp_profile_root();
     if launch.user_data_dir.parent() != Some(expected_parent.as_path())
         || launch
             .user_data_dir
@@ -10399,7 +11917,7 @@ fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), Error
             }),
         ));
     }
-    fs::create_dir_all(&expected_parent).map_err(|error| {
+    validate_cdp_profile_record_root(true).map_err(|error| {
         launch_tool_error(
             error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
             format!("act_launch could not create CDP profile root: {error}"),
@@ -10407,13 +11925,40 @@ fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), Error
                 "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
                 "reason": "ephemeral_profile_root_create_failed",
                 "profile_root": expected_parent,
-                "source_error": error.to_string(),
+                "source_error": error,
                 "remediation": "repair permissions or filesystem state for the OS temp synapse-cdp-profiles directory",
             }),
         )
     })?;
-    fs::create_dir(&launch.user_data_dir).map_err(|error| {
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let pending_record = CdpProfileOwnershipRecord {
+        schema: CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA.to_owned(),
+        phase: CdpProfileOwnershipRecordPhase::Pending,
+        ownership_token: token.to_owned(),
+        user_data_dir: launch.user_data_dir.display().to_string(),
+        launcher_pid: std::process::id(),
+        launcher_process_creation_time_100ns,
+        created_at: created_at.clone(),
+        directory_identity: None,
+    };
+    persist_cdp_profile_ownership_record(&pending_record).map_err(|error| {
         launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            format!("act_launch could not durably reserve CDP profile ownership: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_pending_owner_write_failed",
+                "ownership_token": token,
+                "user_data_dir": launch.user_data_dir,
+                "source_error": error,
+                "remediation": "repair the durable ownership ledger beneath the OS temp synapse-cdp-profiles root; no profile directory or browser was created",
+            }),
+        )
+    })?;
+    if let Err(error) = fs::create_dir(&launch.user_data_dir) {
+        let pending_cleanup =
+            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
+        return Err(launch_tool_error(
             error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
             format!("act_launch could not exclusively create its CDP profile: {error}"),
             json!({
@@ -10421,54 +11966,124 @@ fn prepare_cdp_profile_for_spawn(launch: &ChromiumCdpLaunch) -> Result<(), Error
                 "reason": "ephemeral_profile_create_new_failed",
                 "user_data_dir": launch.user_data_dir,
                 "source_error": error.to_string(),
+                "pending_owner_cleanup": pending_cleanup,
                 "remediation": "inspect the exact path for a collision or filesystem failure; Synapse never reuses an ephemeral profile directory",
             }),
-        )
-    })?;
-    let marker_path = launch.user_data_dir.join(CDP_PROFILE_OWNERSHIP_MARKER);
-    let marker_bytes = serde_json::to_vec_pretty(&json!({
-        "schema": "synapse-cdp-profile-owner/v1",
-        "ownership_token": token,
-        "launcher_pid": std::process::id(),
-        "launcher_process_creation_time_100ns": launcher_process_creation_time_100ns,
-        "created_at": chrono::Utc::now().to_rfc3339(),
-    }))
-    .map_err(|error| {
-        launch_tool_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!("act_launch could not encode CDP ownership marker: {error}"),
-            json!({
-                "code": error_codes::TOOL_INTERNAL_ERROR,
-                "reason": "ephemeral_profile_marker_encode_failed",
-                "user_data_dir": launch.user_data_dir,
-            }),
-        )
-    })?;
-    let marker_result = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker_path)
-        .and_then(|mut file| {
-            file.write_all(&marker_bytes)?;
-            file.sync_all()
-        });
-    if let Err(error) = marker_result {
-        let cleanup = fs::remove_dir(&launch.user_data_dir);
+        ));
+    }
+    let directory_identity = match cdp_profile_directory_identity(&launch.user_data_dir) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let empty_directory_cleanup = fs::remove_dir(&launch.user_data_dir)
+                .map(|()| "removed".to_owned())
+                .map_err(|cleanup_error| cleanup_error.to_string());
+            let pending_owner_cleanup =
+                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
+            return Err(launch_tool_error(
+                error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                format!("act_launch could not bind its CDP profile directory identity: {error}"),
+                json!({
+                    "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                    "reason": "ephemeral_profile_directory_identity_unreadable",
+                    "user_data_dir": launch.user_data_dir,
+                    "source_error": error,
+                    "empty_directory_cleanup": empty_directory_cleanup,
+                    "pending_owner_cleanup": pending_owner_cleanup,
+                    "remediation": "repair filesystem identity-query access; no browser was spawned and exact empty-profile cleanup was attempted",
+                }),
+            ));
+        }
+    };
+    let active_record = CdpProfileOwnershipRecord {
+        schema: CDP_PROFILE_OWNERSHIP_RECORD_SCHEMA.to_owned(),
+        phase: CdpProfileOwnershipRecordPhase::Active,
+        ownership_token: token.to_owned(),
+        user_data_dir: launch.user_data_dir.display().to_string(),
+        launcher_pid: std::process::id(),
+        launcher_process_creation_time_100ns,
+        created_at,
+        directory_identity: Some(directory_identity),
+    };
+    if let Err(error) = persist_cdp_profile_ownership_record(&active_record) {
+        let empty_directory_cleanup = fs::remove_dir(&launch.user_data_dir)
+            .map(|()| "removed".to_owned())
+            .map_err(|cleanup_error| cleanup_error.to_string());
+        let pending_owner_cleanup =
+            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending);
+        let active_owner_cleanup =
+            remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active);
         return Err(launch_tool_error(
             error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-            format!("act_launch could not durably create CDP ownership marker: {error}"),
+            format!("act_launch could not activate durable CDP profile ownership: {error}"),
             json!({
                 "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
-                "reason": "ephemeral_profile_marker_write_failed",
-                "marker_path": marker_path,
-                "source_error": error.to_string(),
-                "empty_directory_cleanup": cleanup.map(|()| "removed").map_err(|cleanup_error| cleanup_error.to_string()),
-                "remediation": "repair filesystem durability/permissions for the OS temp directory; no browser was spawned",
+                "reason": "ephemeral_profile_active_owner_write_failed",
+                "user_data_dir": launch.user_data_dir,
+                "source_error": error,
+                "empty_directory_cleanup": empty_directory_cleanup,
+                "pending_owner_cleanup": pending_owner_cleanup,
+                "active_owner_cleanup": active_owner_cleanup,
+                "remediation": "repair the durable ownership ledger; no browser was spawned and exact empty-profile cleanup was attempted",
+            }),
+        ));
+    }
+    if let Err(error) =
+        remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
+    {
+        let cleanup = cleanup_cdp_profile(
+            &launch.user_data_dir,
+            CdpProfileOwnership::SynapseEphemeral,
+            Some(token),
+        );
+        return Err(launch_tool_error(
+            error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+            format!("act_launch could not resolve its pending CDP ownership record: {error}"),
+            json!({
+                "code": error_codes::ACTION_LAUNCH_CDP_CONFIG_INVALID,
+                "reason": "ephemeral_profile_pending_owner_resolve_failed",
+                "user_data_dir": launch.user_data_dir,
+                "active_owner_path": cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active),
+                "pending_owner_path": cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending),
+                "source_error": error,
+                "exact_resource_cleanup": cleanup,
+                "remediation": "inspect the exact active/pending immutable owner rows and cleanup readback; no browser was spawned",
             }),
         ));
     }
     Ok(())
 }
+
+fn remove_cdp_profile_ownership_record(
+    token: &str,
+    phase: CdpProfileOwnershipRecordPhase,
+) -> Result<String, String> {
+    let path = cdp_profile_ownership_record_path(token, phase);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok("already_absent".to_owned());
+        }
+        Err(error) => {
+            return Err(format!(
+                "remove CDP profile ownership record {} failed: {error}",
+                path.display()
+            ));
+        }
+    }
+    if path.exists() {
+        return Err(format!(
+            "CDP profile ownership record still exists after removal: {}",
+            path.display()
+        ));
+    }
+    Ok("removed".to_owned())
+}
+
+// The v1 in-profile marker writer intentionally no longer exists. Chrome owns
+// every byte below --user-data-dir, so no byte there can be the sole durable
+// deletion authority. New launches publish immutable pending+active records in
+// the sibling .ownership ledger before Chrome is spawned. The legacy marker is
+// read only for safe migration/reconciliation of profiles created by old builds.
 
 fn publish_launched_cdp(
     launch: &ChromiumCdpLaunch,
@@ -10517,7 +12132,13 @@ pub(crate) struct CdpLaunchCleanupReadback {
     pub registry_evicted: bool,
     pub registration_present_after: bool,
     pub profile_ownership: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_source: Option<String>,
     pub user_data_dir: String,
+    pub external_owner_present_before: bool,
+    pub pending_owner_present_before: bool,
+    pub external_owner_present_after: bool,
+    pub pending_owner_present_after: bool,
     pub profile_existed_before: bool,
     pub profile_deletion_attempted: bool,
     pub profile_exists_after: bool,
@@ -10697,10 +12318,9 @@ fn cleanup_cdp_profile(
         profile_exists_after: profile_existed_before,
         ..CdpLaunchCleanupReadback::default()
     };
-    if profile_ownership == CdpProfileOwnership::CallerManagedStable || !profile_existed_before {
+    if profile_ownership == CdpProfileOwnership::CallerManagedStable {
         return readback;
     }
-    readback.profile_deletion_attempted = true;
     let Some(token) = ownership_token else {
         readback
             .errors
@@ -10708,7 +12328,7 @@ fn cleanup_cdp_profile(
         readback.failed = true;
         return readback;
     };
-    let expected_parent = std::env::temp_dir().join("synapse-cdp-profiles");
+    let expected_parent = cdp_profile_root();
     if user_data_dir.parent() != Some(expected_parent.as_path())
         || user_data_dir.file_name().and_then(|value| value.to_str()) != Some(token)
     {
@@ -10720,10 +12340,111 @@ fn cleanup_cdp_profile(
         readback.failed = true;
         return readback;
     }
+    let active_record =
+        match read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active) {
+            Ok(value) => value,
+            Err(error) => {
+                readback.errors.push(error);
+                readback.failed = true;
+                return readback;
+            }
+        };
+    let pending_record =
+        match read_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending) {
+            Ok(value) => value,
+            Err(error) => {
+                readback.errors.push(error);
+                readback.failed = true;
+                return readback;
+            }
+        };
+    readback.external_owner_present_before = active_record.is_some();
+    readback.pending_owner_present_before = pending_record.is_some();
+    if !profile_existed_before {
+        if active_record.is_some()
+            && let Err(error) =
+                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
+        {
+            readback.errors.push(error);
+        }
+        if pending_record.is_some()
+            && let Err(error) =
+                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
+        {
+            readback.errors.push(error);
+        }
+        readback.external_owner_present_after =
+            cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active)
+                .exists();
+        readback.pending_owner_present_after =
+            cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending)
+                .exists();
+        readback.failed = !readback.errors.is_empty()
+            || readback.external_owner_present_after
+            || readback.pending_owner_present_after;
+        return readback;
+    }
+    let external_authority = if let Some((record, _bytes)) = active_record.as_ref() {
+        let Some(expected_identity) = record.directory_identity.as_ref() else {
+            readback
+                .errors
+                .push("active CDP profile owner record has no directory identity".to_owned());
+            readback.failed = true;
+            return readback;
+        };
+        match cdp_profile_directory_identity(user_data_dir) {
+            Ok(actual_identity) if &actual_identity == expected_identity => {
+                readback.authority_source = Some("external_owner_v2".to_owned());
+                true
+            }
+            Ok(actual_identity) => {
+                readback.errors.push(format!(
+                    "refused recursive profile deletion: external owner directory identity mismatch expected={expected_identity:?} actual={actual_identity:?}"
+                ));
+                readback.failed = true;
+                return readback;
+            }
+            Err(error) => {
+                readback.errors.push(format!(
+                    "refused recursive profile deletion: read external owner directory identity: {error}"
+                ));
+                readback.failed = true;
+                return readback;
+            }
+        }
+    } else if pending_record.is_some() {
+        match fs::read_dir(user_data_dir) {
+            Ok(mut entries) => {
+                if entries.next().is_some() {
+                    readback.errors.push(
+                        "refused recursive profile deletion: pending owner directory is not empty"
+                            .to_owned(),
+                    );
+                    readback.failed = true;
+                    return readback;
+                }
+                readback.authority_source = Some("external_pending_owner_v2_empty".to_owned());
+                true
+            }
+            Err(error) => {
+                readback.errors.push(format!(
+                    "refused recursive profile deletion: inspect pending owner directory: {error}"
+                ));
+                readback.failed = true;
+                return readback;
+            }
+        }
+    } else {
+        false
+    };
+    readback.profile_deletion_attempted = true;
     match fs::symlink_metadata(user_data_dir) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || metadata_is_windows_reparse_point(&metadata) =>
+        {
             readback.errors.push(format!(
-                "refused recursive profile deletion: {} is a symlink",
+                "refused recursive profile deletion: {} is a symlink or reparse point",
                 user_data_dir.display()
             ));
         }
@@ -10732,6 +12453,16 @@ fn cleanup_cdp_profile(
                 "refused recursive profile deletion: {} is not a directory",
                 user_data_dir.display()
             ));
+        }
+        Ok(_) if external_authority => {
+            if let Err(error) = fs::remove_dir_all(user_data_dir)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                readback.errors.push(format!(
+                    "remove exact externally-owned CDP profile {}: {error}",
+                    user_data_dir.display()
+                ));
+            }
         }
         Ok(_) => {
             let marker_path = user_data_dir.join(CDP_PROFILE_OWNERSHIP_MARKER);
@@ -10757,6 +12488,7 @@ fn cleanup_cdp_profile(
                             marker_path.display()
                         ));
                     }
+                    readback.authority_source = Some("legacy_in_profile_marker_v1".to_owned());
                     Ok(())
                 });
             match marker_result {
@@ -10784,6 +12516,29 @@ fn cleanup_cdp_profile(
         readback.errors.push(format!(
             "CDP profile still exists after cleanup: {}",
             user_data_dir.display()
+        ));
+    } else {
+        if active_record.is_some()
+            && let Err(error) =
+                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Active)
+        {
+            readback.errors.push(error);
+        }
+        if pending_record.is_some()
+            && let Err(error) =
+                remove_cdp_profile_ownership_record(token, CdpProfileOwnershipRecordPhase::Pending)
+        {
+            readback.errors.push(error);
+        }
+    }
+    readback.external_owner_present_after =
+        cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Active).exists();
+    readback.pending_owner_present_after =
+        cdp_profile_ownership_record_path(token, CdpProfileOwnershipRecordPhase::Pending).exists();
+    if readback.external_owner_present_after || readback.pending_owner_present_after {
+        readback.errors.push(format!(
+            "CDP profile ownership records remain after cleanup: active={} pending={}",
+            readback.external_owner_present_after, readback.pending_owner_present_after
         ));
     }
     readback.failed = !readback.errors.is_empty();

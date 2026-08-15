@@ -225,6 +225,8 @@ pub enum ProcessOperation {
     List,
     Launch,
     History,
+    CdpProfileStatus,
+    CdpProfileRepair,
 }
 
 impl ProcessOperation {
@@ -234,6 +236,8 @@ impl ProcessOperation {
             Self::List => "list",
             Self::Launch => "launch",
             Self::History => "history",
+            Self::CdpProfileStatus => "cdp_profile_status",
+            Self::CdpProfileRepair => "cdp_profile_repair",
         }
     }
 }
@@ -284,6 +288,16 @@ pub struct ProcessParams {
     #[serde(default)]
     #[schemars(default)]
     pub include_command_line: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Exact pid-sequence-unix_nanos CDP profile ownership token for status/repair."
+    )]
+    pub ownership_token: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Exact entry revision returned by cdp_profile_status; required by cdp_profile_repair."
+    )]
+    pub expected_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -297,6 +311,10 @@ pub struct ProcessFacadeResponse {
     pub processes: Option<ProcessListResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub history: Option<ProcessHistoryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_profile_status: Option<crate::m4::CdpProfileStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cdp_profile_repair: Option<crate::m4::CdpProfileRepairResponse>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
