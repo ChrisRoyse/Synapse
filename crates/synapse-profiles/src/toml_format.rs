@@ -107,6 +107,8 @@ impl RawProfile {
             metadata: self.metadata,
             event_extensions: self.event_extensions,
         };
+        let (compiled_title_regexes, compiled_hud_parsers) =
+            compile_profile_runtime_plans(&path, &profile)?;
         let mouse_velocity_profile_default = match (
             self.mouse_velocity_profile_default,
             self.mouse_curve_default,
@@ -131,6 +133,8 @@ impl RawProfile {
 
         Ok(LoadedProfile {
             profile,
+            compiled_title_regexes,
+            compiled_hud_parsers,
             schema_version: self.schema_version,
             defaults: ProfileDefaults {
                 mouse_velocity_profile_default,
@@ -144,6 +148,51 @@ impl RawProfile {
             modified,
         })
     }
+}
+
+fn compile_profile_runtime_plans(
+    path: &Path,
+    profile: &Profile,
+) -> Result<
+    (
+        Vec<Option<regex::Regex>>,
+        Vec<synapse_core::CompiledHudParser>,
+    ),
+    ProfileError,
+> {
+    let title_regexes = profile
+        .matches
+        .iter()
+        .map(|profile_match| {
+            profile_match
+                .title_regex
+                .as_deref()
+                .map(regex::Regex::new)
+                .transpose()
+                .map_err(|source| ProfileError::Parse {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "accepted profile title_regex could not be compiled: {source}"
+                    ),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let hud_parsers = profile
+        .hud
+        .iter()
+        .map(|field| {
+            synapse_core::CompiledHudParser::compile(&field.parser).map_err(|source| {
+                ProfileError::Parse {
+                    path: path.to_path_buf(),
+                    message: format!(
+                        "HUD field {:?} parser could not be compiled: {source}",
+                        field.name
+                    ),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((title_regexes, hud_parsers))
 }
 
 #[derive(Debug, Deserialize)]

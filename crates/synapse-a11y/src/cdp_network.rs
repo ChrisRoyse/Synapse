@@ -472,6 +472,18 @@ pub struct CdpFetchRouteRule {
     pub action: CdpFetchRouteAction,
 }
 
+#[derive(Clone, Debug)]
+struct CompiledCdpFetchRouteRule {
+    rule: CdpFetchRouteRule,
+    url_matcher: CdpFetchRouteUrlMatcher,
+}
+
+#[derive(Clone, Debug)]
+enum CdpFetchRouteUrlMatcher {
+    Glob,
+    Regex(Regex),
+}
+
 struct RingBuffer {
     entries: VecDeque<CdpNetworkEntry>,
     capacity: usize,
@@ -780,7 +792,7 @@ struct FetchInterceptionSlot {
     target_id: String,
     armed_at_unix_ms: u64,
     patterns: Vec<CdpFetchInterceptionPattern>,
-    rules: Arc<Mutex<Vec<CdpFetchRouteRule>>>,
+    rules: Arc<Mutex<Vec<CompiledCdpFetchRouteRule>>>,
     counters: Arc<Mutex<FetchInterceptionCounters>>,
     page: Page,
     _browser: Browser,
@@ -1642,7 +1654,10 @@ pub fn fetch_interception_status(target_id: &str) -> Option<CdpFetchInterception
 #[must_use]
 pub fn fetch_route_rules(target_id: &str) -> Option<Vec<CdpFetchRouteRule>> {
     let slot = lookup_fetch_live(target_id.trim())?;
-    slot.rules.lock().ok().map(|rules| rules.clone())
+    slot.rules
+        .lock()
+        .ok()
+        .map(|rules| rules.iter().map(|rule| rule.rule.clone()).collect())
 }
 
 /// Adds or replaces a Fetch route rule for an active interception target.
@@ -1652,7 +1667,7 @@ pub fn fetch_route_add(
 ) -> A11yResult<CdpFetchInterceptionStatus> {
     require_durable_browser_mutation_owners_enabled("Fetch route install")?;
     let target_id = target_id.trim();
-    validate_fetch_route_rule(&rule)?;
+    let rule = compile_fetch_route_rule(rule)?;
     let slot = lookup_fetch_live(target_id).ok_or_else(|| A11yError::CdpAttachFailed {
         detail: format!("Fetch interception for target {target_id} is not armed"),
     })?;
@@ -1661,7 +1676,10 @@ pub fn fetch_route_add(
             detail: "Fetch route registry lock is poisoned".to_owned(),
         })?;
         require_durable_browser_mutation_owners_enabled("Fetch route registration")?;
-        if let Some(existing) = rules.iter_mut().find(|existing| existing.id == rule.id) {
+        if let Some(existing) = rules
+            .iter_mut()
+            .find(|existing| existing.rule.id == rule.rule.id)
+        {
             *existing = rule;
         } else {
             rules.push(rule);
@@ -1681,7 +1699,7 @@ pub fn fetch_route_remove(target_id: &str, route_id: &str) -> A11yResult<bool> {
         detail: "Fetch route registry lock is poisoned".to_owned(),
     })?;
     let before = rules.len();
-    rules.retain(|rule| rule.id != route_id);
+    rules.retain(|rule| rule.rule.id != route_id);
     Ok(rules.len() != before)
 }
 
@@ -2439,16 +2457,20 @@ fn validate_user_agent(value: &str) -> A11yResult<()> {
 
 fn fetch_route_match(
     event: &FetchEventRequestPaused,
-    rules: &[CdpFetchRouteRule],
+    rules: &[CompiledCdpFetchRouteRule],
 ) -> Option<CdpFetchRouteRule> {
     rules
         .iter()
         .find(|rule| fetch_route_rule_matches(event, rule))
-        .cloned()
+        .map(|rule| rule.rule.clone())
 }
 
-fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRouteRule) -> bool {
-    if !fetch_route_url_matches(&event.request.url, rule) {
+fn fetch_route_rule_matches(
+    event: &FetchEventRequestPaused,
+    compiled: &CompiledCdpFetchRouteRule,
+) -> bool {
+    let rule = &compiled.rule;
+    if !fetch_route_url_matches(&event.request.url, compiled) {
         return false;
     }
     if let Some(method) = rule.method.as_deref()
@@ -2464,12 +2486,11 @@ fn fetch_route_rule_matches(event: &FetchEventRequestPaused, rule: &CdpFetchRout
     true
 }
 
-fn fetch_route_url_matches(url: &str, rule: &CdpFetchRouteRule) -> bool {
-    match rule.match_kind {
-        CdpFetchRouteMatchKind::Glob => glob_matches(&rule.url, url),
-        CdpFetchRouteMatchKind::Regex => {
-            Regex::new(&rule.url).is_ok_and(|regex| regex.is_match(url))
-        }
+fn fetch_route_url_matches(url: &str, compiled: &CompiledCdpFetchRouteRule) -> bool {
+    let rule = &compiled.rule;
+    match &compiled.url_matcher {
+        CdpFetchRouteUrlMatcher::Glob => glob_matches(&rule.url, url),
+        CdpFetchRouteUrlMatcher::Regex(regex) => regex.is_match(url),
     }
 }
 
@@ -2599,11 +2620,6 @@ fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
             detail: "Fetch route url must not contain NUL".to_owned(),
         });
     }
-    if matches!(rule.match_kind, CdpFetchRouteMatchKind::Regex) {
-        Regex::new(&rule.url).map_err(|error| A11yError::CdpAttachFailed {
-            detail: format!("Fetch route regex url is invalid: {error}"),
-        })?;
-    }
     if let Some(method) = rule.method.as_deref() {
         validate_http_method(method)?;
     }
@@ -2618,6 +2634,21 @@ fn validate_fetch_route_rule(rule: &CdpFetchRouteRule) -> A11yResult<()> {
         }
     }
     Ok(())
+}
+
+fn compile_fetch_route_rule(rule: CdpFetchRouteRule) -> A11yResult<CompiledCdpFetchRouteRule> {
+    validate_fetch_route_rule(&rule)?;
+    let url_matcher = match rule.match_kind {
+        CdpFetchRouteMatchKind::Glob => CdpFetchRouteUrlMatcher::Glob,
+        CdpFetchRouteMatchKind::Regex => {
+            CdpFetchRouteUrlMatcher::Regex(Regex::new(&rule.url).map_err(|error| {
+                A11yError::CdpAttachFailed {
+                    detail: format!("Fetch route regex url is invalid: {error}"),
+                }
+            })?)
+        }
+    };
+    Ok(CompiledCdpFetchRouteRule { rule, url_matcher })
 }
 
 fn validate_fetch_route_fulfill(fulfill: &CdpFetchRouteFulfill) -> A11yResult<()> {

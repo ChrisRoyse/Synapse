@@ -9163,10 +9163,25 @@ pub(crate) fn validate_launch_authorized(
     config: &M4ServiceConfig,
     params: &ActLaunchParams,
 ) -> Result<String, ErrorData> {
-    validate_launch_params(params)?;
+    Ok(validate_launch_authorized_plan(config, params)?.matched_pattern)
+}
+
+struct ValidatedLaunchAuthorization {
+    matched_pattern: String,
+    wait_regex: Option<regex::Regex>,
+}
+
+fn validate_launch_authorized_plan(
+    config: &M4ServiceConfig,
+    params: &ActLaunchParams,
+) -> Result<ValidatedLaunchAuthorization, ErrorData> {
+    let wait_regex = validate_launch_params(params)?;
     let command_line = launch_command_line(params)?;
     if let Some(matched_pattern) = config.launch_match(&command_line) {
-        return Ok(matched_pattern.to_owned());
+        return Ok(ValidatedLaunchAuthorization {
+            matched_pattern: matched_pattern.to_owned(),
+            wait_regex,
+        });
     }
     let reason = if config.allow_launch_count() == 0 {
         "no_allow_launch_policy"
@@ -9259,7 +9274,9 @@ pub(crate) async fn launch_for_session_with_boundary(
     session_id: Option<&str>,
     boundary: &PhysicalMutationBoundary<'_>,
 ) -> Result<ActLaunchOutcome, ErrorData> {
-    let matched_pattern = validate_launch_authorized(config, &params)?;
+    let authorization = validate_launch_authorized_plan(config, &params)?;
+    let matched_pattern = authorization.matched_pattern;
+    let wait_regex = authorization.wait_regex;
     if matches!(params.output, Some(ActLaunchOutput::Capture { .. })) && session_id.is_none() {
         return Err(launch_tool_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -9284,18 +9301,6 @@ pub(crate) async fn launch_for_session_with_boundary(
         ));
     }
     let command_line = launch_command_line(&params)?;
-    let wait_regex = params
-        .wait_for_window_title_regex
-        .as_ref()
-        .map(|pattern| {
-            regex::Regex::new(pattern).map_err(|error| {
-                mcp_error(
-                    error_codes::TOOL_PARAMS_INVALID,
-                    format!("act_launch wait_for_window_title_regex is invalid: {error}"),
-                )
-            })
-        })
-        .transpose()?;
     // #684: make a CDP debug port reachable for Synapse-launched Chromium so
     // observe/find can read the page DOM without manual flags. Augment the spawn
     // command only (policy already matched the original command above).
@@ -13179,7 +13184,7 @@ fn validate_run_shell_idempotency_key(key: &str) -> Result<(), ErrorData> {
     Ok(())
 }
 
-fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
+fn validate_launch_params(params: &ActLaunchParams) -> Result<Option<regex::Regex>, ErrorData> {
     if params.target.trim().is_empty() {
         return Err(mcp_error(
             error_codes::TOOL_PARAMS_INVALID,
@@ -13192,14 +13197,18 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
             "act_launch timeout_ms must be >= 1",
         ));
     }
-    if let Some(pattern) = &params.wait_for_window_title_regex {
-        regex::Regex::new(pattern).map_err(|error| {
-            mcp_error(
-                error_codes::TOOL_PARAMS_INVALID,
-                format!("act_launch wait_for_window_title_regex is invalid: {error}"),
-            )
-        })?;
-    }
+    let wait_regex = params
+        .wait_for_window_title_regex
+        .as_ref()
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                mcp_error(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("act_launch wait_for_window_title_regex is invalid: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     if let Some(ActLaunchOutput::Capture {
         max_bytes_per_stream,
     }) = &params.output
@@ -13224,7 +13233,7 @@ fn validate_launch_params(params: &ActLaunchParams) -> Result<(), ErrorData> {
     validate_launch_desktop_option(params)?;
     validate_shared_tabbed_desktop_launch_target(params)?;
     validate_chromium_debug_launch_policy(params)?;
-    Ok(())
+    Ok(wait_regex)
 }
 
 fn validate_launch_desktop_option(params: &ActLaunchParams) -> Result<(), ErrorData> {

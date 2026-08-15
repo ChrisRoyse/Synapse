@@ -1,4 +1,3 @@
-use regex::Regex;
 use synapse_core::{ProfileId, ProfileMatch};
 use tracing::instrument;
 
@@ -38,7 +37,7 @@ pub fn resolve_active_profile(
         .iter()
         .enumerate()
         .filter_map(|(index, loaded)| {
-            best_rank(&loaded.profile.matches, foreground).map(|rank| (loaded, rank, index))
+            best_rank(loaded, foreground).map(|rank| (loaded, rank, index))
         })
         .max_by(
             |(left, left_rank, left_index), (right, right_rank, right_index)| {
@@ -56,14 +55,33 @@ pub fn resolve_active_profile(
         })
 }
 
-fn best_rank(matches: &[ProfileMatch], foreground: &ForegroundWindow) -> Option<MatchRank> {
-    matches
+fn best_rank(loaded: &LoadedProfile, foreground: &ForegroundWindow) -> Option<MatchRank> {
+    if loaded.profile.matches.len() != loaded.compiled_title_regexes.len() {
+        tracing::error!(
+            code = "PROFILE_COMPILED_MATCH_CARDINALITY_MISMATCH",
+            profile_id = %loaded.profile.id,
+            match_count = loaded.profile.matches.len(),
+            compiled_match_count = loaded.compiled_title_regexes.len(),
+            "profile resolution failed closed because accepted match state is internally inconsistent"
+        );
+        return None;
+    }
+    loaded
+        .profile
+        .matches
         .iter()
-        .filter_map(|candidate| candidate_rank(candidate, foreground))
+        .zip(&loaded.compiled_title_regexes)
+        .filter_map(|(candidate, title_regex)| {
+            candidate_rank(candidate, title_regex.as_ref(), foreground)
+        })
         .max()
 }
 
-fn candidate_rank(candidate: &ProfileMatch, foreground: &ForegroundWindow) -> Option<MatchRank> {
+fn candidate_rank(
+    candidate: &ProfileMatch,
+    title_regex: Option<&regex::Regex>,
+    foreground: &ForegroundWindow,
+) -> Option<MatchRank> {
     let mut rank = if let Some(expected) = candidate.exe.as_deref() {
         let actual = foreground.exe.as_deref()?;
         if !expected.eq_ignore_ascii_case(actual) {
@@ -74,11 +92,9 @@ fn candidate_rank(candidate: &ProfileMatch, foreground: &ForegroundWindow) -> Op
         None
     };
 
-    if let Some(pattern) = candidate.title_regex.as_deref() {
+    if candidate.title_regex.is_some() {
         let title = foreground.title.as_deref()?;
-        let Ok(regex) = Regex::new(pattern) else {
-            return None;
-        };
+        let regex = title_regex?;
         if !regex.is_match(title) {
             return None;
         }

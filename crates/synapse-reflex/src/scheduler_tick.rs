@@ -7,15 +7,18 @@ use std::{
 use chrono::Utc;
 use serde_json::json;
 use synapse_core::{
-    Action, Event, EventSource, ReflexId, ReflexLifetime, ReflexState, SCHEMA_VERSION,
-    StoredReflexAudit, error_codes,
+    Action, Event, EventSource, ReflexId, ReflexState, SCHEMA_VERSION, StoredReflexAudit,
+    error_codes,
 };
 use uuid::Uuid;
 
 use super::{
-    REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, SchedulerTrigger, TickSample,
+    REFLEX_TICK_LATE_KIND, RuntimeState, ScheduledReflexDriver, TickSample,
     scheduler_combo::{dispatch_reflex_action, step_active_combos},
-    scheduler_loop::{TickLateSignal, advance_pending_terminal_lifecycles},
+    scheduler_loop::{
+        RuntimeLifetimeFilter, RuntimeSchedulerTrigger, TickLateSignal,
+        advance_pending_terminal_lifecycles,
+    },
     scheduler_stateful::step_stateful_controllers,
 };
 use crate::{
@@ -202,12 +205,13 @@ fn collect_triggered_reflexes(
         if !controls.get(index).is_some_and(|control| control.active) {
             continue;
         }
-        let reflex = &runtime.reflexes[index].reflex;
+        let runtime_reflex = &runtime.reflexes[index];
+        let reflex = &runtime_reflex.reflex;
         if !matches!(reflex.driver, ScheduledReflexDriver::Actions) {
             continue;
         }
-        match &reflex.trigger {
-            SchedulerTrigger::EveryTick => {
+        match &runtime_reflex.trigger {
+            RuntimeSchedulerTrigger::EveryTick => {
                 triggered.push(TriggeredReflex {
                     reflex_index: index,
                     reflex_id: reflex.reflex_id.clone(),
@@ -215,7 +219,7 @@ fn collect_triggered_reflexes(
                     trigger_event: None,
                 });
             }
-            SchedulerTrigger::OnEvent(filter) => {
+            RuntimeSchedulerTrigger::OnEvent(filter) => {
                 let mut accepted_this_tick = false;
                 let mut same_tick_suppression = DebounceSuppression::default();
                 let mut window_suppression = DebounceSuppression::default();
@@ -322,7 +326,7 @@ fn until_event_lifetime_expired(
     if !matches!(reflex.driver, ScheduledReflexDriver::Actions) {
         return None;
     }
-    let ReflexLifetime::UntilEvent { filter } = &reflex.lifetime else {
+    let RuntimeLifetimeFilter::UntilEvent(filter) = &runtime.reflexes[index].lifetime_filter else {
         return None;
     };
     events

@@ -8,6 +8,8 @@ pub mod routines;
 pub mod types;
 pub mod win32_hwnd;
 
+pub use filter::{CompiledDataPredicate, CompiledEventFilter};
+
 pub use defaults::{DEFAULT_AIM_TRACK_EMA_ALPHA, SCHEMA_VERSION};
 pub use types::{
     AGENT_EVENT_MAX_ID_CHARS, AGENT_EVENT_MAX_REASON_CHARS, AGENT_EVENT_RECORD_VERSION,
@@ -20,9 +22,9 @@ pub use types::{
     CalyxMathDispatchOperation, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus,
     CalyxTuningKnobEnforcement, CalyxTuningKnobStatus, CaptureRuntimeReadback, CdpCapability,
     CdpDiagnostics, CdpStatus, ChromeBridgeDetail, ClipboardSummary, ComboInput, ComboStep,
-    CostBreakdown, CostOutcome, DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate, DetectedEntity,
-    Detection, DetectionBatch, DirectionEstimate, EVENT_FILTER_MAX_DEPTH, ElementId,
-    ElementIdParseError, ElementIdParts, EntityId, Event, EventExtension, EventFilter,
+    CompiledHudParser, CostBreakdown, CostOutcome, DEFAULT_HUD_CONFIDENCE_THRESHOLD, DataPredicate,
+    DetectedEntity, Detection, DetectionBatch, DirectionEstimate, EVENT_FILTER_MAX_DEPTH,
+    ElementId, ElementIdParseError, ElementIdParts, EntityId, Event, EventExtension, EventFilter,
     EventFilterValidationError, EventRef, EventSource, EventSummary, FocusedElement,
     ForbiddenRawDataKind, ForegroundContext, FsEvent, FsEventKind, GamepadController,
     GamepadReport, GenAiAttributes, GenAiOperationName, Health, HudExtractor, HudField,

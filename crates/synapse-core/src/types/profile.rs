@@ -183,6 +183,64 @@ pub enum HudParser {
     },
 }
 
+/// Runtime HUD parser compiled once when a profile is accepted.
+///
+/// This type is intentionally not serialized: it is a bounded derivative of
+/// the retained profile and keeps regex construction off the observation/frame
+/// path.
+#[derive(Clone, Debug)]
+pub enum CompiledHudParser {
+    Number,
+    BoundedInteger {
+        min: u32,
+        max: u32,
+        default_on_no_text: Option<u32>,
+    },
+    FractionNumerator,
+    FractionDenominator,
+    Regex {
+        pattern: String,
+        regex: regex::Regex,
+        group: u32,
+    },
+    Enum {
+        mapping: BTreeMap<String, String>,
+    },
+}
+
+impl CompiledHudParser {
+    /// Compiles one retained HUD parser at the profile acceptance boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns the regex parser error without producing a partial runtime
+    /// parser.
+    pub fn compile(parser: &HudParser) -> Result<Self, regex::Error> {
+        match parser {
+            HudParser::Number => Ok(Self::Number),
+            HudParser::BoundedInteger {
+                min,
+                max,
+                default_on_no_text,
+            } => Ok(Self::BoundedInteger {
+                min: *min,
+                max: *max,
+                default_on_no_text: *default_on_no_text,
+            }),
+            HudParser::FractionNumerator => Ok(Self::FractionNumerator),
+            HudParser::FractionDenominator => Ok(Self::FractionDenominator),
+            HudParser::Regex { pattern, group } => Ok(Self::Regex {
+                pattern: pattern.clone(),
+                regex: regex::Regex::new(pattern)?,
+                group: *group,
+            }),
+            HudParser::Enum { mapping } => Ok(Self::Enum {
+                mapping: mapping.clone(),
+            }),
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileBackends {

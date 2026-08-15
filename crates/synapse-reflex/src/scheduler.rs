@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 use chrono::Utc;
 use synapse_action::ActionHandle;
 use synapse_core::{
-    Action, EventFilter, ReflexId, ReflexLifetime, ReflexStatus, StoredAuditContext,
+    Action, CompiledEventFilter, EventFilter, ReflexId, ReflexLifetime, ReflexStatus,
+    StoredAuditContext,
 };
 use synapse_storage::Db;
 
@@ -29,12 +30,12 @@ use crate::{
 };
 pub use scheduler_handle::SchedulerHandle;
 use scheduler_loop::{
-    ReflexControl, RuntimeReflex, RuntimeState, aim_track_states, combo_states, hold_button_states,
-    hold_move_states, lock_controls, mark_reflex_action_denied, mark_reflex_active_if_starved,
-    mark_reflex_combo_completed, mark_reflex_error, mark_reflex_fired,
-    mark_reflex_lifetime_expired, mark_reflex_path_follow_completed, mark_reflex_starved,
-    mark_reflex_track_lost, path_follow_states, run_scheduler_thread,
-    status_for_reflex_with_history,
+    ReflexControl, RuntimeLifetimeFilter, RuntimeReflex, RuntimeSchedulerTrigger, RuntimeState,
+    aim_track_states, combo_states, hold_button_states, hold_move_states, lock_controls,
+    mark_reflex_action_denied, mark_reflex_active_if_starved, mark_reflex_combo_completed,
+    mark_reflex_error, mark_reflex_fired, mark_reflex_lifetime_expired,
+    mark_reflex_path_follow_completed, mark_reflex_starved, mark_reflex_track_lost,
+    path_follow_states, run_scheduler_thread, status_for_reflex_with_history,
 };
 
 pub const MAX_SCHEDULED_REFLEXES: usize = 32;
@@ -606,7 +607,7 @@ impl ReflexScheduler {
         let hold_button_states = hold_button_states(&reflexes)?;
         let combo_states = combo_states(&reflexes);
         let path_follow_states = path_follow_states(&reflexes)?;
-        let (reflexes, on_event_states, starvation_states) = runtime_reflex_state(reflexes);
+        let (reflexes, on_event_states, starvation_states) = runtime_reflex_state(reflexes)?;
 
         let runtime = RuntimeState {
             event_bus,
@@ -662,27 +663,60 @@ impl ReflexScheduler {
 
 fn runtime_reflex_state(
     reflexes: Vec<ScheduledReflex>,
-) -> (
+) -> ReflexResult<(
     Vec<RuntimeReflex>,
     Vec<OnEventState>,
     Vec<crate::conflict::StarvationState>,
-) {
+)> {
     let count = reflexes.len();
     let reflexes = reflexes
         .into_iter()
         .enumerate()
-        .map(|(registration_order, reflex)| RuntimeReflex {
-            registration_order,
-            reflex,
+        .map(|(registration_order, reflex)| {
+            let trigger = match &reflex.trigger {
+                SchedulerTrigger::EveryTick => RuntimeSchedulerTrigger::EveryTick,
+                SchedulerTrigger::OnEvent(filter) => {
+                    RuntimeSchedulerTrigger::OnEvent(CompiledEventFilter::compile(filter).map_err(
+                        |error| ReflexError::FilterInvalid {
+                            detail: format!(
+                                "reflex {:?} trigger filter compilation failed: {error}",
+                                reflex.reflex_id
+                            ),
+                        },
+                    )?)
+                }
+            };
+            let lifetime_filter = match &reflex.lifetime {
+                ReflexLifetime::UntilEvent { filter } => RuntimeLifetimeFilter::UntilEvent(
+                    CompiledEventFilter::compile(filter).map_err(|error| {
+                        ReflexError::FilterInvalid {
+                            detail: format!(
+                                "reflex {:?} lifetime filter compilation failed: {error}",
+                                reflex.reflex_id
+                            ),
+                        }
+                    })?,
+                ),
+                ReflexLifetime::OneShot
+                | ReflexLifetime::Duration { .. }
+                | ReflexLifetime::UntilCancelled
+                | ReflexLifetime::UntilDeadline { .. } => RuntimeLifetimeFilter::NotEvent,
+            };
+            Ok(RuntimeReflex {
+                registration_order,
+                reflex,
+                trigger,
+                lifetime_filter,
+            })
         })
-        .collect();
-    (
+        .collect::<ReflexResult<Vec<_>>>()?;
+    Ok((
         reflexes,
         (0..count).map(|_| OnEventState::default()).collect(),
         (0..count)
             .map(|_| crate::conflict::StarvationState::default())
             .collect(),
-    )
+    ))
 }
 
 fn initial_statuses(

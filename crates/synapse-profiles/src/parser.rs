@@ -7,8 +7,8 @@ use std::{
 
 use regex::Regex;
 use synapse_core::{
-    Backend, HudRegion, OcrBackend, PerceptionMode, Profile, ProfileCaptureTarget, ProfileMatch,
-    ProfileUseScope,
+    Backend, CompiledHudParser, HudRegion, OcrBackend, PerceptionMode, Profile,
+    ProfileCaptureTarget, ProfileMatch, ProfileUseScope,
 };
 use tracing::instrument;
 
@@ -27,13 +27,25 @@ pub struct ProfileDefaults {
     pub keyboard_dynamics_default: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub struct LoadedProfile {
     pub profile: Profile,
+    pub compiled_title_regexes: Vec<Option<Regex>>,
+    pub compiled_hud_parsers: Vec<CompiledHudParser>,
     pub schema_version: u32,
     pub defaults: ProfileDefaults,
     pub source_path: PathBuf,
     pub modified: SystemTime,
+}
+
+impl PartialEq for LoadedProfile {
+    fn eq(&self, other: &Self) -> bool {
+        self.profile == other.profile
+            && self.schema_version == other.schema_version
+            && self.defaults == other.defaults
+            && self.source_path == other.source_path
+            && self.modified == other.modified
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

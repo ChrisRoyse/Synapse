@@ -9,7 +9,9 @@ use std::{
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
-use synapse_core::{Event, EventFilter, SubscriptionId, error_codes, new_subscription_id};
+use synapse_core::{
+    CompiledEventFilter, Event, EventFilter, SubscriptionId, error_codes, new_subscription_id,
+};
 use thiserror::Error;
 
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 4096;
@@ -68,7 +70,7 @@ impl Default for EventBusInner {
 #[derive(Debug)]
 struct Subscriber {
     id: SubscriptionId,
-    filter: EventFilter,
+    filter: CompiledEventFilter,
     kinds: BTreeSet<String>,
     sender: Sender<Event>,
     receiver: Receiver<Event>,
@@ -135,11 +137,11 @@ impl EventBus {
         kinds: Vec<String>,
         snapshot_first: bool,
     ) -> EventBusResult<SubscriberHandle> {
-        filter
-            .validate()
-            .map_err(|error| EventBusError::FilterInvalid {
+        let filter = CompiledEventFilter::compile_owned(filter).map_err(|error| {
+            EventBusError::FilterInvalid {
                 detail: error.to_string(),
-            })?;
+            }
+        })?;
 
         let _guard = self.lock_updates();
         let current = self.inner.subscribers.load_full();

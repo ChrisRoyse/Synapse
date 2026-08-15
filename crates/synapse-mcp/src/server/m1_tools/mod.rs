@@ -83,8 +83,8 @@ use sha2::{Digest as _, Sha256};
 use synapse_action::{BackendResolutionPolicy, ResolvedBackend, VigemBackend};
 use synapse_core::{
     ForegroundContext, HudFieldError, HudReadings, InputBackendCapability, InputBackendDiagnostics,
-    OcrResult, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Profile, Rect, SuspectedInjectionAnnotation,
-    error_codes, types::TimelineActor,
+    OcrResult, PERCEIVED_TEXT_UNTRUSTED_NOTICE, Rect, SuspectedInjectionAnnotation, error_codes,
+    types::TimelineActor,
 };
 use synapse_perception::ObservationAssembler;
 #[cfg(windows)]
@@ -18285,9 +18285,11 @@ impl SynapseService {
                     );
                     return;
                 };
-                match runtime.profile(&profile_id) {
-                    Ok(Some(profile)) => {
-                        if let Err(error) = self.apply_m1_runtime_config_for_profile(&profile) {
+                match runtime.loaded_profile(&profile_id) {
+                    Ok(Some(loaded)) => {
+                        if let Err(error) =
+                            self.apply_m1_runtime_config_for_profile(&loaded.profile)
+                        {
                             tracing::warn!(
                                 code = "PROFILE_M1_RUNTIME_CONFIG_FAILED",
                                 profile_id = %profile_id,
@@ -18300,7 +18302,7 @@ impl SynapseService {
                             input.capture_runtime = Some(state.capture_runtime_readback());
                         }
                         if include_hud {
-                            populate_profile_hud(input, &profile, runtime.profile_dir());
+                            populate_profile_hud(input, &loaded, runtime.profile_dir());
                         }
                     }
                     Ok(None) => {
@@ -19473,13 +19475,38 @@ fn vigem_capability() -> InputBackendCapability {
 #[cfg(windows)]
 fn populate_profile_hud(
     input: &mut synapse_perception::ObservationInput,
-    profile: &Profile,
+    loaded: &synapse_profiles::LoadedProfile,
     profile_dir: &Path,
 ) {
-    for field in &profile.hud {
+    if loaded.profile.hud.len() != loaded.compiled_hud_parsers.len() {
+        tracing::error!(
+            code = "PROFILE_HUD_COMPILED_PARSER_CARDINALITY_MISMATCH",
+            profile_id = %loaded.profile.id,
+            field_count = loaded.profile.hud.len(),
+            compiled_parser_count = loaded.compiled_hud_parsers.len(),
+            "refusing HUD extraction because accepted profile/parser state is internally inconsistent"
+        );
+        for field in &loaded.profile.hud {
+            input.hud.by_name.remove(&field.name);
+            record_hud_error(
+                &mut input.hud,
+                &field.name,
+                error_codes::HUD_EXTRACTION_FAILED,
+                format!(
+                    "compiled HUD parser cardinality mismatch for profile {:?}: fields={} parsers={}",
+                    loaded.profile.id,
+                    loaded.profile.hud.len(),
+                    loaded.compiled_hud_parsers.len()
+                ),
+            );
+        }
+        return;
+    }
+    for (field, parser) in loaded.profile.hud.iter().zip(&loaded.compiled_hud_parsers) {
         input.hud.by_name.remove(&field.name);
         input.hud.errors.remove(&field.name);
-        match extract_profile_hud_field(field, input.foreground.window_bounds, profile_dir) {
+        match extract_profile_hud_field(field, parser, input.foreground.window_bounds, profile_dir)
+        {
             Ok(reading) => {
                 input.hud.by_name.insert(field.name.clone(), reading);
             }
@@ -19493,10 +19520,10 @@ fn populate_profile_hud(
 #[cfg(not(windows))]
 fn populate_profile_hud(
     input: &mut synapse_perception::ObservationInput,
-    profile: &Profile,
+    loaded: &synapse_profiles::LoadedProfile,
     _profile_dir: &std::path::Path,
 ) {
-    for field in &profile.hud {
+    for field in &loaded.profile.hud {
         input.hud.by_name.remove(&field.name);
         input.hud.errors.remove(&field.name);
         record_hud_error(
@@ -19511,6 +19538,7 @@ fn populate_profile_hud(
 #[cfg(windows)]
 fn extract_profile_hud_field(
     field: &HudFieldSpec,
+    parser: &synapse_core::CompiledHudParser,
     window_bounds: Rect,
     profile_dir: &Path,
 ) -> PerceptionResult<HudReading> {
@@ -19520,12 +19548,13 @@ fn extract_profile_hud_field(
         HudExtractor::ColorRatio {
             sample_points: _,
             mapping,
-        } => color_ratio_reading(field, screen_region, &region_image, mapping),
+        } => color_ratio_reading(field, parser, screen_region, &region_image, mapping),
         HudExtractor::TemplateMatch { templates } => {
             let loaded_templates = load_templates(&field.name, templates, profile_dir)?;
             let provider = SystemOcrProvider;
             extract_field(&FieldExtractionRequest {
                 field,
+                parser,
                 screen_region,
                 region_image: &region_image,
                 templates: &loaded_templates,
@@ -19538,6 +19567,7 @@ fn extract_profile_hud_field(
             let provider = HudTextProvider;
             extract_field(&FieldExtractionRequest {
                 field,
+                parser,
                 screen_region,
                 region_image: &region_image,
                 templates: &[],
@@ -19663,6 +19693,7 @@ fn bgra_to_gray(width: u32, height: u32, bytes: &[u8]) -> PerceptionResult<GrayI
 #[cfg(windows)]
 fn color_ratio_reading(
     field: &HudFieldSpec,
+    parser: &synapse_core::CompiledHudParser,
     screen_region: Rect,
     region_image: &GrayImage,
     mapping: &str,
@@ -19675,7 +19706,7 @@ fn color_ratio_reading(
     }
     let score = gray_luma_stddev_0_1(region_image);
     let raw_text = format!("{score:.6}");
-    let parsed = parse_hud_text(&field.parser, &raw_text)?;
+    let parsed = parse_hud_text(parser, &raw_text)?;
     Ok(HudReading {
         raw_text: format!(
             "{raw_text} region={}x{}@{},{}",

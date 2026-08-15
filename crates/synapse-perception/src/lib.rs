@@ -7,7 +7,8 @@ mod template_match;
 
 pub use error::{PerceptionError, PerceptionResult};
 pub use event_extensions::{
-    evaluate_event_extensions, validate_event_extension, validate_event_extensions,
+    CompiledEventExtension, compile_event_extensions, evaluate_event_extensions,
+    validate_event_extension, validate_event_extensions,
 };
 pub use hud::{
     ExtractionSource, FieldExtraction, FieldExtractionRequest, HudAnchor, HudAnchorRegion,

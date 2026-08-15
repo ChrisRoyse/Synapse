@@ -347,7 +347,15 @@ impl ChromeDebuggerBridgeError {
 }
 
 fn external_chrome_surface_hint() -> String {
-    let rows = external_chrome_popup_risks();
+    let rows = match external_chrome_popup_risks() {
+        Ok(rows) => rows,
+        Err(error) => {
+            return format!(
+                " external_chrome_process_scan_error={} remediation=inspect_daemon_log_code_CHROME_PROCESS_RISK_SCAN_FAILED",
+                quote_detail_value(&error)
+            );
+        }
+    };
     if rows.is_empty() {
         return String::new();
     }
@@ -357,12 +365,12 @@ fn external_chrome_surface_hint() -> String {
     )
 }
 
-fn external_chrome_popup_risks() -> Vec<String> {
+fn external_chrome_popup_risks() -> Result<Vec<String>, String> {
     let mut rows = chrome_profile_scan().scan.external_profile_surfaces;
-    rows.extend(external_chrome_native_messaging_processes());
+    rows.extend(chrome_process_risk_scan()?.native_messaging_processes);
     rows.sort();
     rows.dedup();
-    rows
+    Ok(rows)
 }
 
 fn synapse_chrome_self_profile_surfaces() -> Vec<String> {
@@ -956,43 +964,277 @@ struct SynapseChromeSelfPolicyShieldStatus {
 }
 
 #[cfg(windows)]
-fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldStatus {
+struct ChromePolicyShieldCache {
+    status: SynapseChromeSelfPolicyShieldStatus,
+    watched_subkey: String,
+    key_address: usize,
+    event_address: usize,
+    generation: u64,
+}
+
+#[cfg(windows)]
+impl Drop for ChromePolicyShieldCache {
+    fn drop(&mut self) {
+        use windows::Win32::{
+            Foundation::{CloseHandle, HANDLE},
+            System::Registry::{HKEY, RegCloseKey},
+        };
+
+        let key = HKEY(self.key_address as *mut core::ffi::c_void);
+        let event = HANDLE(self.event_address as *mut core::ffi::c_void);
+        let close_key_status = unsafe { RegCloseKey(key) };
+        if close_key_status != windows::Win32::Foundation::ERROR_SUCCESS {
+            tracing::warn!(
+                code = "CHROME_POLICY_WATCH_REGCLOSE_FAILED",
+                status = close_key_status.0,
+                watched_subkey = %self.watched_subkey,
+                "failed to close the Chrome policy registry notification key"
+            );
+        }
+        if let Err(error) = unsafe { CloseHandle(event) } {
+            tracing::warn!(
+                code = "CHROME_POLICY_WATCH_EVENT_CLOSE_FAILED",
+                detail = %error,
+                watched_subkey = %self.watched_subkey,
+                "failed to close the Chrome policy registry notification event"
+            );
+        }
+    }
+}
+
+#[cfg(windows)]
+fn load_chrome_policy_shield_cache(generation: u64) -> Result<ChromePolicyShieldCache, String> {
+    use windows::{
+        Win32::{
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
+            System::{
+                Registry::{
+                    HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET,
+                    REG_NOTIFY_CHANGE_SECURITY, RegCloseKey, RegNotifyChangeKeyValue,
+                    RegOpenKeyExW,
+                },
+                Threading::CreateEventW,
+            },
+        },
+        core::PCWSTR,
+    };
+
+    const WATCH_CANDIDATES: &[&str] = &[
+        r"Software\Policies\Google\Chrome",
+        r"Software\Policies\Google",
+        r"Software\Policies",
+        r"Software",
+    ];
+    let mut watched = None;
+    for candidate in WATCH_CANDIDATES {
+        let candidate_wide = wide_null(candidate);
+        let mut key = HKEY::default();
+        let status = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                PCWSTR(candidate_wide.as_ptr()),
+                None,
+                KEY_NOTIFY,
+                &raw mut key,
+            )
+        };
+        if status == ERROR_SUCCESS {
+            watched = Some(((*candidate).to_owned(), key));
+            break;
+        }
+        if status != ERROR_FILE_NOT_FOUND {
+            return Err(format!(
+                "code=CHROME_POLICY_WATCH_REGOPEN_FAILED watched_candidate={} status={} remediation=repair_HKCU_registry_read_notify_access_and_restart_the_repo_built_synapse_daemon",
+                quote_detail_value(candidate),
+                status.0
+            ));
+        }
+    }
+    let Some((watched_subkey, key)) = watched else {
+        return Err(
+            "code=CHROME_POLICY_WATCH_NO_EXISTING_ANCESTOR remediation=repair_the_current_user_Software_registry_hive_and_restart_the_repo_built_synapse_daemon"
+                .to_owned(),
+        );
+    };
+    let event = match unsafe { CreateEventW(None, true, false, None) } {
+        Ok(event) => event,
+        Err(error) => {
+            let close_status = unsafe { RegCloseKey(key) };
+            if close_status != ERROR_SUCCESS {
+                tracing::warn!(
+                    code = "CHROME_POLICY_WATCH_REGCLOSE_AFTER_EVENT_FAILURE_FAILED",
+                    status = close_status.0,
+                    "failed to close registry key after Chrome policy event creation failed"
+                );
+            }
+            return Err(format!(
+                "code=CHROME_POLICY_WATCH_EVENT_CREATE_FAILED detail={} remediation=inspect_Windows_event_handle_capacity_and_restart_the_repo_built_synapse_daemon",
+                quote_detail_value(&error.to_string())
+            ));
+        }
+    };
+    let notify_status = unsafe {
+        RegNotifyChangeKeyValue(
+            key,
+            true,
+            REG_NOTIFY_CHANGE_LAST_SET | REG_NOTIFY_CHANGE_SECURITY,
+            Some(event),
+            true,
+        )
+    };
+    if notify_status != ERROR_SUCCESS {
+        let close_key_status = unsafe { RegCloseKey(key) };
+        if close_key_status != ERROR_SUCCESS {
+            tracing::warn!(
+                code = "CHROME_POLICY_WATCH_REGCLOSE_AFTER_ARM_FAILURE_FAILED",
+                status = close_key_status.0,
+                "failed to close registry key after Chrome policy notification setup failed"
+            );
+        }
+        if let Err(error) = unsafe { windows::Win32::Foundation::CloseHandle(event) } {
+            tracing::warn!(
+                code = "CHROME_POLICY_WATCH_EVENT_CLOSE_AFTER_ARM_FAILURE_FAILED",
+                detail = %error,
+                "failed to close event after Chrome policy notification setup failed"
+            );
+        }
+        return Err(format!(
+            "code=CHROME_POLICY_WATCH_ARM_FAILED watched_subkey={} status={} remediation=repair_HKCU_registry_notify_access_and_restart_the_repo_built_synapse_daemon",
+            quote_detail_value(&watched_subkey),
+            notify_status.0
+        ));
+    }
+    let status = match read_synapse_chrome_self_policy_shield_status() {
+        Ok(status) => status,
+        Err(error) => {
+            let close_key_status = unsafe { RegCloseKey(key) };
+            if close_key_status != ERROR_SUCCESS {
+                tracing::warn!(
+                    code = "CHROME_POLICY_WATCH_REGCLOSE_AFTER_READ_FAILURE_FAILED",
+                    status = close_key_status.0,
+                    "failed to close registry key after Chrome policy Source-of-Truth read failed"
+                );
+            }
+            if let Err(close_error) = unsafe { windows::Win32::Foundation::CloseHandle(event) } {
+                tracing::warn!(
+                    code = "CHROME_POLICY_WATCH_EVENT_CLOSE_AFTER_READ_FAILURE_FAILED",
+                    detail = %close_error,
+                    "failed to close event after Chrome policy Source-of-Truth read failed"
+                );
+            }
+            return Err(error);
+        }
+    };
+    tracing::debug!(
+        code = "CHROME_POLICY_WATCH_ARMED",
+        generation,
+        watched_subkey = %watched_subkey,
+        policy_shield_present = status.present,
+        "armed change-driven Chrome policy cache invalidation"
+    );
+    Ok(ChromePolicyShieldCache {
+        status,
+        watched_subkey,
+        key_address: key.0 as usize,
+        event_address: event.0 as usize,
+        generation,
+    })
+}
+
+#[cfg(windows)]
+fn synapse_chrome_self_policy_shield_status() -> Result<SynapseChromeSelfPolicyShieldStatus, String>
+{
+    use windows::Win32::{
+        Foundation::{WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+        System::Threading::WaitForSingleObject,
+    };
+
+    static CACHE: OnceLock<Mutex<ChromePolicyShieldCache>> = OnceLock::new();
+    if CACHE.get().is_none() {
+        let initial = load_chrome_policy_shield_cache(1)?;
+        let _ = CACHE.set(Mutex::new(initial));
+    }
+    let cache = CACHE.get().ok_or_else(|| {
+        "code=CHROME_POLICY_CACHE_INITIALIZATION_RACE remediation=restart_the_repo_built_synapse_daemon"
+            .to_owned()
+    })?;
+    let mut cache = cache.lock().map_err(|error| {
+        format!(
+            "code=CHROME_POLICY_CACHE_LOCK_POISONED detail={} remediation=restart_the_repo_built_synapse_daemon_and_inspect_the_preceding_panic",
+            quote_detail_value(&error.to_string())
+        )
+    })?;
+    let event = windows::Win32::Foundation::HANDLE(cache.event_address as *mut core::ffi::c_void);
+    let wait = unsafe { WaitForSingleObject(event, 0) };
+    if wait == WAIT_OBJECT_0 {
+        let generation = cache.generation.checked_add(1).ok_or_else(|| {
+            "code=CHROME_POLICY_CACHE_GENERATION_OVERFLOW remediation=restart_the_repo_built_synapse_daemon"
+                .to_owned()
+        })?;
+        let refreshed = load_chrome_policy_shield_cache(generation)?;
+        *cache = refreshed;
+    } else if wait == WAIT_FAILED {
+        let detail = std::io::Error::last_os_error().to_string();
+        return Err(format!(
+            "code=CHROME_POLICY_WATCH_WAIT_FAILED watched_subkey={} generation={} detail={} remediation=inspect_Windows_event_handle_state_and_restart_the_repo_built_synapse_daemon",
+            quote_detail_value(&cache.watched_subkey),
+            cache.generation,
+            quote_detail_value(&detail)
+        ));
+    } else if wait != WAIT_TIMEOUT {
+        return Err(format!(
+            "code=CHROME_POLICY_WATCH_WAIT_UNEXPECTED watched_subkey={} generation={} wait_code={} remediation=inspect_Windows_wait_state_and_restart_the_repo_built_synapse_daemon",
+            quote_detail_value(&cache.watched_subkey),
+            cache.generation,
+            wait.0
+        ));
+    }
+    let mut status = cache.status.clone();
+    status.detail.push_str(&format!(
+        " policy_cache=change_driven registry_watch_generation={} registry_watched_subkey={}",
+        cache.generation,
+        quote_detail_value(&cache.watched_subkey)
+    ));
+    Ok(status)
+}
+
+#[cfg(windows)]
+fn read_synapse_chrome_self_policy_shield_status()
+-> Result<SynapseChromeSelfPolicyShieldStatus, String> {
     let policy_write_access =
         chrome_policy_set_value_access_status(r"Software\Policies\Google\Chrome");
     let Some(raw) =
-        read_hkcu_registry_string(r"Software\Policies\Google\Chrome", "ExtensionSettings")
+        read_hkcu_registry_string(r"Software\Policies\Google\Chrome", "ExtensionSettings")?
     else {
-        return SynapseChromeSelfPolicyShieldStatus {
+        return Ok(SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_missing_or_unreadable {policy_write_access}"
+                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_missing {policy_write_access}"
             ),
-        };
+        });
     };
     if raw.trim().is_empty() {
-        return SynapseChromeSelfPolicyShieldStatus {
+        return Ok(SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
                 "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=value_empty {policy_write_access}"
             ),
-        };
+        });
     }
-    let Ok(parsed) = serde_json::from_str::<Value>(&raw) else {
-        return SynapseChromeSelfPolicyShieldStatus {
-            present: false,
-            detail: format!(
-                "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=parse_error raw_len={} {policy_write_access}",
-                raw.len(),
-            ),
-        };
-    };
+    let parsed = serde_json::from_str::<Value>(&raw).map_err(|error| {
+        format!(
+            "code=CHROME_SELF_POLICY_SHIELD_JSON_INVALID raw_len={} detail={} remediation=repair_HKCU_Software_Policies_Google_Chrome_ExtensionSettings_JSON",
+            raw.len(),
+            quote_detail_value(&error.to_string())
+        )
+    })?;
     let Some(entry) = parsed.get(EXTENSION_ID) else {
-        return SynapseChromeSelfPolicyShieldStatus {
+        return Ok(SynapseChromeSelfPolicyShieldStatus {
             present: false,
             detail: format!(
                 "synapse_chrome_self_policy_shield_present=false policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings reason=self_entry_missing {policy_write_access}"
             ),
-        };
+        });
     };
     let blocked = entry
         .get("blocked_permissions")
@@ -1011,7 +1253,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
     let marker_matches = entry.get("blocked_install_message").and_then(Value::as_str)
         == Some(SYNAPSE_CHROME_BLOCKED_INSTALL_MESSAGE);
     let present = has_native_messaging && marker_matches;
-    SynapseChromeSelfPolicyShieldStatus {
+    Ok(SynapseChromeSelfPolicyShieldStatus {
         present,
         detail: format!(
             "synapse_chrome_self_policy_shield_present={} policy_hive=HKCU policy_path=Software\\Policies\\Google\\Chrome value=ExtensionSettings blocked_permissions={} marker_matches={} reason={} {policy_write_access}",
@@ -1028,7 +1270,7 @@ fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldSt
                 "self_entry_incomplete"
             }
         ),
-    }
+    })
 }
 
 #[cfg(windows)]
@@ -1075,18 +1317,19 @@ fn chrome_policy_set_value_access_status(_subkey: &str) -> String {
 }
 
 #[cfg(not(windows))]
-fn synapse_chrome_self_policy_shield_status() -> SynapseChromeSelfPolicyShieldStatus {
-    SynapseChromeSelfPolicyShieldStatus {
+fn synapse_chrome_self_policy_shield_status() -> Result<SynapseChromeSelfPolicyShieldStatus, String>
+{
+    Ok(SynapseChromeSelfPolicyShieldStatus {
         present: false,
         detail: "synapse_chrome_self_policy_shield_present=false reason=non_windows".to_owned(),
-    }
+    })
 }
 
 #[cfg(windows)]
-fn read_hkcu_registry_string(subkey: &str, value_name: &str) -> Option<String> {
+fn read_hkcu_registry_string(subkey: &str, value_name: &str) -> Result<Option<String>, String> {
     use windows::{
         Win32::{
-            Foundation::ERROR_SUCCESS,
+            Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS},
             System::Registry::{
                 HKEY_CURRENT_USER, REG_VALUE_TYPE, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
                 RegGetValueW,
@@ -1111,8 +1354,19 @@ fn read_hkcu_registry_string(subkey: &str, value_name: &str) -> Option<String> {
             Some(&raw mut byte_len),
         )
     };
-    if status != ERROR_SUCCESS || byte_len == 0 {
-        return None;
+    if status == ERROR_FILE_NOT_FOUND {
+        return Ok(None);
+    }
+    if status != ERROR_SUCCESS {
+        return Err(format!(
+            "code=CHROME_SELF_POLICY_SHIELD_REGISTRY_SIZE_READ_FAILED subkey={} value={} status={} remediation=repair_the_Chrome_ExtensionSettings_registry_value_and_read_permissions",
+            quote_detail_value(subkey),
+            quote_detail_value(value_name),
+            status.0
+        ));
+    }
+    if byte_len == 0 {
+        return Ok(Some(String::new()));
     }
 
     let mut buffer = vec![0_u16; (byte_len as usize).div_ceil(2)];
@@ -1128,12 +1382,13 @@ fn read_hkcu_registry_string(subkey: &str, value_name: &str) -> Option<String> {
         )
     };
     if status != ERROR_SUCCESS {
-        tracing::warn!(
-            code = "CHROME_SELF_POLICY_SHIELD_REGISTRY_READ_FAILED",
-            status = status.0,
-            "failed to read Chrome ExtensionSettings policy value"
-        );
-        return None;
+        return Err(format!(
+            "code=CHROME_SELF_POLICY_SHIELD_REGISTRY_VALUE_READ_FAILED subkey={} value={} status={} expected_bytes={} remediation=repair_the_Chrome_ExtensionSettings_registry_value_and_read_permissions",
+            quote_detail_value(subkey),
+            quote_detail_value(value_name),
+            status.0,
+            byte_len
+        ));
     }
 
     let units = (byte_len as usize).div_ceil(2).min(buffer.len());
@@ -1142,7 +1397,7 @@ fn read_hkcu_registry_string(subkey: &str, value_name: &str) -> Option<String> {
         .iter()
         .position(|unit| *unit == 0)
         .unwrap_or(buffer.len());
-    Some(String::from_utf16_lossy(&buffer[..nul]))
+    Ok(Some(String::from_utf16_lossy(&buffer[..nul])))
 }
 
 #[cfg(windows)]
@@ -1200,7 +1455,6 @@ fn ensure_normal_bridge_external_popup_suppressed(
 ) -> Result<(), ChromeDebuggerBridgeError> {
     let self_risks = synapse_chrome_self_profile_surfaces();
     let self_active_risks = synapse_chrome_self_active_popup_risks(&self_risks);
-    let self_policy_shield = synapse_chrome_self_policy_shield_status();
     if !self_active_risks.is_empty() {
         tracing::error!(
             code = "CHROME_SELF_POPUP_RISK_WARNING",
@@ -1218,7 +1472,26 @@ fn ensure_normal_bridge_external_popup_suppressed(
             ),
         });
     }
-    if !self_risks.is_empty() && !self_policy_shield.present {
+    if self_risks.is_empty() {
+        return Ok(());
+    }
+    let self_policy_shield = synapse_chrome_self_policy_shield_status().map_err(|error| {
+        tracing::error!(
+            code = "CHROME_SELF_POLICY_SHIELD_READ_FAILED",
+            hwnd,
+            command_kind,
+            detail = %error,
+            "normal Chrome bridge failed closed because its change-driven policy Source of Truth could not be read"
+        );
+        ChromeDebuggerBridgeError {
+            code: error_codes::A11Y_CDP_DEBUGGER_WARNING_UNSUPPRESSED,
+            detail: format!(
+                "normal Synapse Chrome Bridge refused command {command_kind:?} before queueing any Chrome tabs/scripting command; hwnd={hwnd} reason=Chrome self-policy Source of Truth unavailable detail={} remediation=inspect_daemon_log_code_CHROME_SELF_POLICY_SHIELD_READ_FAILED_and_repair_the_named_registry_state",
+                quote_detail_value(&error)
+            ),
+        }
+    })?;
+    if !self_policy_shield.present {
         // Chromium keeps removed permissions in the granted set after an
         // extension update. Granted-only residue is diagnostic; active/manifest
         // permissions and the live runtime debugger API readback are the popup
@@ -1442,15 +1715,85 @@ fn format_disable_reasons(disable_reasons: &[u64]) -> String {
     }
 }
 
-fn external_chrome_native_messaging_processes() -> Vec<String> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
+#[derive(Debug)]
+struct ChromeProcessRiskScanner {
+    system: sysinfo::System,
+    generation: u64,
+}
 
-    let mut system = System::new();
-    system.refresh_processes_specifics(
+#[derive(Debug)]
+struct ChromeProcessRiskScan {
+    native_messaging_processes: Vec<String>,
+    layout_infobar_processes: Vec<String>,
+    detail: String,
+}
+
+fn chrome_process_risk_scanner() -> &'static Mutex<ChromeProcessRiskScanner> {
+    static SCANNER: OnceLock<Mutex<ChromeProcessRiskScanner>> = OnceLock::new();
+    SCANNER.get_or_init(|| {
+        Mutex::new(ChromeProcessRiskScanner {
+            system: sysinfo::System::new(),
+            generation: 0,
+        })
+    })
+}
+
+fn chrome_process_risk_scan() -> Result<ChromeProcessRiskScan, String> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+
+    let started = Instant::now();
+    let mut scanner = chrome_process_risk_scanner().lock().map_err(|error| {
+        format!(
+            "code=CHROME_PROCESS_RISK_SCAN_LOCK_POISONED detail={} remediation=restart_the_repo_built_synapse_daemon_and_inspect_the_preceding_panic",
+            quote_detail_value(&error.to_string())
+        )
+    })?;
+    let refreshed_count = scanner.system.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::everything(),
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .without_tasks(),
     );
+    scanner.generation = scanner.generation.checked_add(1).ok_or_else(|| {
+        "code=CHROME_PROCESS_RISK_SCAN_GENERATION_OVERFLOW remediation=restart_the_repo_built_synapse_daemon"
+            .to_owned()
+    })?;
+    let generation = scanner.generation;
+    let process_count = scanner.system.processes().len();
+    let empty_cmd_count = scanner
+        .system
+        .processes()
+        .values()
+        .filter(|process| process.cmd().is_empty())
+        .count();
+    let native_messaging_processes = external_chrome_native_messaging_processes(&scanner.system);
+    let layout_infobar_processes = external_chrome_layout_infobar_processes(&scanner.system);
+    let elapsed_us = started.elapsed().as_micros();
+    let detail = format!(
+        "chrome_process_risk_scan_status=ok scan_generation={generation} refresh_kind=pid_parent_name_start_cmd_only tasks=false refreshed_process_count={refreshed_count} retained_process_count={process_count} empty_cmd_count={empty_cmd_count} native_messaging_risk_count={} layout_infobar_risk_count={} elapsed_us={elapsed_us}",
+        native_messaging_processes.len(),
+        layout_infobar_processes.len()
+    );
+    tracing::debug!(
+        code = "CHROME_PROCESS_RISK_SCAN_COMPLETED",
+        generation,
+        refreshed_count,
+        process_count,
+        empty_cmd_count,
+        native_messaging_risk_count = native_messaging_processes.len(),
+        layout_infobar_risk_count = layout_infobar_processes.len(),
+        elapsed_us,
+        "refreshed the persistent minimal Chrome process-risk snapshot"
+    );
+    Ok(ChromeProcessRiskScan {
+        native_messaging_processes,
+        layout_infobar_processes,
+        detail,
+    })
+}
+
+fn external_chrome_native_messaging_processes(system: &sysinfo::System) -> Vec<String> {
     system
         .processes()
         .iter()
@@ -1486,15 +1829,7 @@ fn external_chrome_native_messaging_processes() -> Vec<String> {
         .collect()
 }
 
-fn external_chrome_layout_infobar_processes() -> Vec<String> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System};
-
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::All,
-        true,
-        ProcessRefreshKind::everything(),
-    );
+fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<String> {
     system
         .processes()
         .iter()
@@ -1542,7 +1877,7 @@ fn external_chrome_layout_infobar_processes() -> Vec<String> {
             let user_data_dir_state = chrome_user_data_dir_state_label(user_data_dir.as_deref());
             let user_data_dir_display = user_data_dir
                 .as_deref().map_or_else(|| "<missing>".to_owned(), quote_detail_value);
-            let parent_chain = chrome_process_parent_chain(&system, process.parent());
+            let parent_chain = chrome_process_parent_chain(system, process.parent());
             let owner_hint = chrome_layout_infobar_owner_hint(
                 &command_line,
                 user_data_dir.as_deref(),
@@ -6433,12 +6768,31 @@ pub async fn drain_mutation_command_owners(
 
 pub fn health_subsystem() -> SubsystemHealth {
     let profile_scan = chrome_profile_scan();
+    let process_scan = match chrome_process_risk_scan() {
+        Ok(scan) => scan,
+        Err(error) => {
+            tracing::error!(
+                code = "CHROME_PROCESS_RISK_SCAN_FAILED",
+                detail = %error,
+                "Chrome bridge health failed closed because the physical process Source of Truth could not be scanned"
+            );
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!(
+                    "chrome_process_risk_scan_status=error detail={} remediation=inspect_daemon_log_code_CHROME_PROCESS_RISK_SCAN_FAILED_and_restart_the_repo_built_synapse_daemon {}",
+                    quote_detail_value(&error),
+                    profile_scan.install_state().detail
+                )),
+                ..SubsystemHealth::default()
+            };
+        }
+    };
     let mut popup_risks = profile_scan.scan.external_profile_surfaces.clone();
-    popup_risks.extend(external_chrome_native_messaging_processes());
+    popup_risks.extend(process_scan.native_messaging_processes.iter().cloned());
     popup_risks.sort();
     popup_risks.dedup();
     let self_profile_risks = profile_scan.scan.self_profile_surfaces.clone();
-    let layout_infobar_risks = external_chrome_layout_infobar_processes();
+    let layout_infobar_risks = process_scan.layout_infobar_processes;
     let profile_install_state = profile_scan.install_state();
     let snapshot = match bridge().inner.try_lock() {
         Ok(inner) => {
@@ -6479,7 +6833,26 @@ pub fn health_subsystem() -> SubsystemHealth {
             };
         }
     };
-    let self_policy_shield = synapse_chrome_self_policy_shield_status();
+    let self_policy_shield = match synapse_chrome_self_policy_shield_status() {
+        Ok(status) => status,
+        Err(error) => {
+            tracing::error!(
+                code = "CHROME_SELF_POLICY_SHIELD_READ_FAILED",
+                detail = %error,
+                "Chrome bridge health failed closed because its policy Source of Truth could not be read"
+            );
+            return SubsystemHealth {
+                status: "error".to_owned(),
+                detail: Some(format!(
+                    "chrome_self_policy_shield_status=error detail={} remediation=inspect_daemon_log_code_CHROME_SELF_POLICY_SHIELD_READ_FAILED_and_repair_the_named_registry_state {} {}",
+                    quote_detail_value(&error),
+                    process_scan.detail,
+                    profile_install_state.detail
+                )),
+                ..SubsystemHealth::default()
+            };
+        }
+    };
     chrome_bridge_health_from_snapshot_with_self_policy(
         snapshot.0.as_ref(),
         snapshot.1,
@@ -6490,6 +6863,7 @@ pub fn health_subsystem() -> SubsystemHealth {
         &layout_infobar_risks,
         &self_policy_shield,
         &profile_install_state,
+        &process_scan.detail,
     )
 }
 
@@ -6504,6 +6878,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     layout_infobar_risks: &[String],
     self_policy_shield: &SynapseChromeSelfPolicyShieldStatus,
     profile_install_state: &SynapseChromeProfileInstallState,
+    process_scan_detail: &str,
 ) -> SubsystemHealth {
     let layout_warning = external_chrome_layout_infobar_warning(layout_infobar_risks);
     let self_permission_warning =
@@ -6516,7 +6891,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
         return SubsystemHealth {
             status: "unavailable".to_owned(),
             detail: Some(format!(
-                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} {} install_guidance={}",
+                "tab_control_available=false reason=no_active_chrome_bridge_host host_count={} queued_count={} pending_count={} expected_extension_id={} endpoint={} repair_guidance={} {} {} {} {} {} {} install_guidance={}",
                 host_count,
                 queued_count,
                 pending_count,
@@ -6528,6 +6903,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
                 self_policy_shield.detail,
                 profile_install_state.detail,
                 layout_warning,
+                process_scan_detail,
                 INSTALL_GUIDANCE
             )),
             ..SubsystemHealth::default()
@@ -6614,7 +6990,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
     SubsystemHealth {
         status: status.to_owned(),
         detail: Some(format!(
-            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} extension_startup_readback={} {} {} {} {} {} install_guidance={}",
+            "tab_control_available={} extension_stale={} extension_stale_reasons={} active_host_id={} host_count={} origin={} extension_id={} expected_extension_id={} extension_version={} extension_protocol_version={} extension_build_id={} expected_extension_build_id={} extension_declared_build_sha256={} expected_extension_declared_build_sha256={} extension_service_worker_sha256={} expected_extension_service_worker_sha256={} expected_extension_service_worker_path={} extension_service_worker_sha256_status={} extension_service_worker_sha256_source={} extension_service_worker_byte_length={} extension_service_worker_sha256_error={} extension_debugger_api_available={} expected_extension_debugger_api_available=false extension_capabilities={} required_extension_capabilities={} endpoint={} transport={} pid={} parent_window={} registered_unix_ms={} last_seen_unix_ms={} queued_count={} pending_count={} last_disconnect_detail={} last_detach_reason={} extension_user_agent={} bridge_popup_risk_suppression={} extension_startup_readback={} {} {} {} {} {} {} install_guidance={}",
             tab_control_available,
             extension_stale,
             extension_stale_reasons,
@@ -6657,6 +7033,7 @@ fn chrome_bridge_health_from_snapshot_with_self_policy(
             self_policy_shield.detail,
             profile_install_state.detail,
             layout_warning,
+            process_scan_detail,
             INSTALL_GUIDANCE
         )),
         ..SubsystemHealth::default()

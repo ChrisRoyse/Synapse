@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use serde_json::json;
-use synapse_core::{Event, EventSource, ReflexId, ReflexLifetime, error_codes};
+use synapse_core::{
+    CompiledEventFilter, Event, EventSource, ReflexId, ReflexLifetime, error_codes,
+};
 
 use crate::{EventBus, ReflexError, ReflexResult};
 
@@ -42,8 +44,15 @@ impl HoldReleaseReason {
 #[derive(Clone, Debug)]
 pub struct HoldLifetimeTracker {
     lifetime: ReflexLifetime,
+    event_filter: HoldLifetimeEventFilter,
     elapsed: Duration,
     safety_cap: Option<Duration>,
+}
+
+#[derive(Clone, Debug)]
+enum HoldLifetimeEventFilter {
+    NotEvent,
+    UntilEvent(CompiledEventFilter),
 }
 
 impl HoldLifetimeTracker {
@@ -55,8 +64,22 @@ impl HoldLifetimeTracker {
     /// invalid event filter.
     pub fn new(lifetime: ReflexLifetime, safety_cap: Option<Duration>) -> ReflexResult<Self> {
         validate_lifetime(&lifetime)?;
+        let event_filter = match &lifetime {
+            ReflexLifetime::UntilEvent { filter } => {
+                HoldLifetimeEventFilter::UntilEvent(CompiledEventFilter::compile(filter).map_err(
+                    |error| ReflexError::FilterInvalid {
+                        detail: format!("hold lifetime filter compilation failed: {error}"),
+                    },
+                )?)
+            }
+            ReflexLifetime::OneShot
+            | ReflexLifetime::Duration { .. }
+            | ReflexLifetime::UntilCancelled
+            | ReflexLifetime::UntilDeadline { .. } => HoldLifetimeEventFilter::NotEvent,
+        };
         Ok(Self {
             lifetime,
+            event_filter,
             elapsed: Duration::ZERO,
             safety_cap,
         })
@@ -94,16 +117,25 @@ impl HoldLifetimeTracker {
             {
                 Some(HoldReleaseReason::Deadline)
             }
-            ReflexLifetime::UntilEvent { filter }
-                if context.events.iter().any(|event| filter.matches(event)) =>
-            {
-                Some(HoldReleaseReason::Event)
-            }
+            ReflexLifetime::UntilEvent { .. } => match &self.event_filter {
+                HoldLifetimeEventFilter::UntilEvent(filter)
+                    if context.events.iter().any(|event| filter.matches(event)) =>
+                {
+                    Some(HoldReleaseReason::Event)
+                }
+                HoldLifetimeEventFilter::UntilEvent(_) => None,
+                HoldLifetimeEventFilter::NotEvent => {
+                    tracing::error!(
+                        code = "REFLEX_LIFETIME_COMPILED_FILTER_INVARIANT_BROKEN",
+                        "held reflex failed closed because its retained UntilEvent lifetime and acceptance-bound compiled filter diverged"
+                    );
+                    Some(HoldReleaseReason::Cancelled)
+                }
+            },
             ReflexLifetime::UntilCancelled
             | ReflexLifetime::OneShot
             | ReflexLifetime::Duration { .. }
-            | ReflexLifetime::UntilDeadline { .. }
-            | ReflexLifetime::UntilEvent { .. } => None,
+            | ReflexLifetime::UntilDeadline { .. } => None,
         }
     }
 }

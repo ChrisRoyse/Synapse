@@ -1,8 +1,8 @@
-use std::time::Instant;
+use std::{sync::LazyLock, time::Instant};
 
 use image::GrayImage;
 use regex::Regex;
-use synapse_core::{HudExtractor, HudFieldSpec, HudParser, HudReading, HudValue, Rect};
+use synapse_core::{CompiledHudParser, HudExtractor, HudFieldSpec, HudReading, HudValue, Rect};
 
 use crate::{
     HudTemplate, OcrProvider, PerceptionError, PerceptionResult, TemplateCounterConfig,
@@ -13,6 +13,10 @@ use crate::{
 const NUMBER_PATTERN: &str = r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)";
 const FRACTION_PATTERN: &str =
     r"(?P<num>[-+]?(?:\d+(?:\.\d*)?|\.\d+))\s*/\s*(?P<den>[-+]?(?:\d+(?:\.\d*)?|\.\d+))";
+static NUMBER_REGEX: LazyLock<Result<Regex, String>> =
+    LazyLock::new(|| Regex::new(NUMBER_PATTERN).map_err(|error| error.to_string()));
+static FRACTION_REGEX: LazyLock<Result<Regex, String>> =
+    LazyLock::new(|| Regex::new(FRACTION_PATTERN).map_err(|error| error.to_string()));
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ExtractionSource {
@@ -33,6 +37,7 @@ pub struct FieldExtraction {
 
 pub struct FieldExtractionRequest<'a> {
     pub field: &'a HudFieldSpec,
+    pub parser: &'a CompiledHudParser,
     pub screen_region: Rect,
     pub region_image: &'a GrayImage,
     pub templates: &'a [HudTemplate],
@@ -79,21 +84,29 @@ pub fn extract_field(request: &FieldExtractionRequest<'_>) -> PerceptionResult<F
 ///
 /// Returns `HUD_EXTRACTION_FAILED` when the parser cannot produce a value from
 /// the supplied text or when a profile-provided regex is invalid.
-pub fn parse_hud_text(parser: &HudParser, raw_text: &str) -> PerceptionResult<HudValue> {
+pub fn parse_hud_text(parser: &CompiledHudParser, raw_text: &str) -> PerceptionResult<HudValue> {
     let text = raw_text.trim();
     if text.is_empty() {
         return Err(hud_error("HUD OCR text was empty after trimming"));
     }
 
     match parser {
-        HudParser::Number => parse_number(text).map(HudValue::Number),
-        HudParser::BoundedInteger { min, max, .. } => {
+        CompiledHudParser::Number => parse_number(text).map(HudValue::Number),
+        CompiledHudParser::BoundedInteger { min, max, .. } => {
             parse_bounded_integer(text, *min, *max).map(HudValue::Number)
         }
-        HudParser::FractionNumerator => parse_fraction_part(text, "num").map(HudValue::Number),
-        HudParser::FractionDenominator => parse_fraction_part(text, "den").map(HudValue::Number),
-        HudParser::Regex { pattern, group } => parse_regex_group(pattern, *group, text),
-        HudParser::Enum { mapping } => mapping
+        CompiledHudParser::FractionNumerator => {
+            parse_fraction_part(text, "num").map(HudValue::Number)
+        }
+        CompiledHudParser::FractionDenominator => {
+            parse_fraction_part(text, "den").map(HudValue::Number)
+        }
+        CompiledHudParser::Regex {
+            pattern,
+            regex,
+            group,
+        } => parse_regex_group(pattern, regex, *group, text),
+        CompiledHudParser::Enum { mapping } => mapping
             .get(text)
             .cloned()
             .map(HudValue::Enum)
@@ -209,7 +222,7 @@ fn ocr_reading(
         )));
     }
 
-    let parsed = parse_hud_text(&request.field.parser, &text)?;
+    let parsed = parse_hud_text(request.parser, &text)?;
     let raw_text = match source {
         ExtractionSource::Ocr | ExtractionSource::OcrFallback => text.clone(),
         ExtractionSource::TemplateMatch => unreachable!("template extraction does not call OCR"),
@@ -228,7 +241,7 @@ fn ocr_reading(
 fn default_ocr_reading_for_no_text(
     request: &FieldExtractionRequest<'_>,
 ) -> PerceptionResult<OcrReading> {
-    let Some(parsed) = parser_no_text_default(&request.field.parser)? else {
+    let Some(parsed) = parser_no_text_default(request.parser)? else {
         return Err(hud_error(format!(
             "HUD OCR returned no text for field {:?}",
             request.field.name
@@ -274,8 +287,11 @@ fn min_word_confidence(regions: &[TextRegion]) -> f32 {
 }
 
 fn parse_number(text: &str) -> PerceptionResult<f64> {
-    let number_regex = Regex::new(NUMBER_PATTERN)
-        .map_err(|err| hud_error(format!("internal HUD number regex is invalid: {err}")))?;
+    let number_regex = NUMBER_REGEX.as_ref().map_err(|error| {
+        hud_error(format!(
+            "internal HUD number regex initialization failed: {error}"
+        ))
+    })?;
     let value = number_regex
         .find(text)
         .ok_or_else(|| hud_error(format!("HUD number parser found no number in {text:?}")))?
@@ -311,9 +327,9 @@ fn parse_bounded_integer(text: &str, min: u32, max: u32) -> PerceptionResult<f64
     Ok(f64::from(integer))
 }
 
-fn parser_no_text_default(parser: &HudParser) -> PerceptionResult<Option<HudValue>> {
+fn parser_no_text_default(parser: &CompiledHudParser) -> PerceptionResult<Option<HudValue>> {
     match parser {
-        HudParser::BoundedInteger {
+        CompiledHudParser::BoundedInteger {
             min,
             max,
             default_on_no_text: Some(default),
@@ -340,8 +356,11 @@ fn validate_bounded_integer_range(min: u32, max: u32) -> PerceptionResult<()> {
 }
 
 fn parse_fraction_part(text: &str, part: &'static str) -> PerceptionResult<f64> {
-    let fraction_regex = Regex::new(FRACTION_PATTERN)
-        .map_err(|err| hud_error(format!("internal HUD fraction regex is invalid: {err}")))?;
+    let fraction_regex = FRACTION_REGEX.as_ref().map_err(|error| {
+        hud_error(format!(
+            "internal HUD fraction regex initialization failed: {error}"
+        ))
+    })?;
     let captures = fraction_regex
         .captures(text)
         .ok_or_else(|| hud_error(format!("HUD fraction parser found no fraction in {text:?}")))?;
@@ -356,15 +375,17 @@ fn parse_fraction_part(text: &str, part: &'static str) -> PerceptionResult<f64> 
     })
 }
 
-fn parse_regex_group(pattern: &str, group: u32, text: &str) -> PerceptionResult<HudValue> {
-    let regex = Regex::new(pattern).map_err(|err| {
+fn parse_regex_group(
+    pattern: &str,
+    regex: &Regex,
+    group: u32,
+    text: &str,
+) -> PerceptionResult<HudValue> {
+    let captures = regex.captures(text).ok_or_else(|| {
         hud_error(format!(
-            "HUD regex parser pattern {pattern:?} is invalid: {err}"
+            "HUD regex parser pattern {pattern:?} found no match in {text:?}"
         ))
     })?;
-    let captures = regex
-        .captures(text)
-        .ok_or_else(|| hud_error(format!("HUD regex parser found no match in {text:?}")))?;
     let group_index = usize::try_from(group)
         .map_err(|_err| hud_error(format!("HUD regex group {group} does not fit usize")))?;
     let value = captures

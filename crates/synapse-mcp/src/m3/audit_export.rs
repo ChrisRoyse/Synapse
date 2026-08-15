@@ -6,7 +6,6 @@ use std::{
 };
 
 use chrono::Utc;
-use regex::Regex;
 use rmcp::{ErrorData, model::ErrorCode, schemars::JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -676,12 +675,21 @@ fn path_like_string(value: &str) -> bool {
 }
 
 fn looks_like_windows_path(value: &str) -> bool {
-    Regex::new(r"(?i)[a-z]:\\|\\\\|\\users\\").is_ok_and(|regex| regex.is_match(value))
+    let lower = value.to_ascii_lowercase();
+    lower.contains(r"\\")
+        || lower.contains(r"\users\")
+        || lower.as_bytes().windows(3).any(|window| {
+            window[0].is_ascii_alphabetic() && window[1] == b':' && window[2] == b'\\'
+        })
 }
 
 fn looks_like_unix_path(value: &str) -> bool {
-    Regex::new(r"(^|\s)/(home|users|tmp|var|opt|mnt|volume)/")
-        .is_ok_and(|regex| regex.is_match(value))
+    const ROOTS: &[&str] = &[
+        "/home/", "/users/", "/tmp/", "/var/", "/opt/", "/mnt/", "/volume/",
+    ];
+    value
+        .split_whitespace()
+        .any(|token| ROOTS.iter().any(|root| token.starts_with(root)))
 }
 
 fn write_bundle_files(

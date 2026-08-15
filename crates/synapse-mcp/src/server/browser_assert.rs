@@ -383,6 +383,8 @@ struct NormalizedBrowserAssertParams {
     locator: BrowserAssertLocator,
     matcher: BrowserAssertMatcher,
     expected_text: Option<String>,
+    expected_text_match_value: Option<String>,
+    expected_text_regex: Option<Regex>,
     expected_value: Option<String>,
     expected_bool: Option<bool>,
     expected_count: Option<usize>,
@@ -1448,18 +1450,53 @@ fn validate_browser_assert_params(
         1
     };
     let limit = params.locator.limit.unwrap_or(default_limit).clamp(1, 500);
+    let text_match = params.text_match.unwrap_or_default();
+    let should_normalize_whitespace = params.normalize_whitespace.unwrap_or(true);
+    let expected_text_match_value = params.expected_text.as_deref().map(|expected| {
+        if should_normalize_whitespace {
+            normalize_whitespace(expected)
+        } else {
+            expected.to_owned()
+        }
+    });
+    let expected_text_regex = if matches!(
+        (params.matcher, text_match),
+        (
+            BrowserAssertMatcher::ToHaveText,
+            BrowserAssertTextMatch::Regex
+        )
+    ) {
+        let pattern = expected_text_match_value.as_deref().ok_or_else(|| {
+            mcp_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                format!(
+                    "{ASSERT_TOOL} normalized regex matcher is missing validated expected_text"
+                ),
+            )
+        })?;
+        Some(Regex::new(pattern).map_err(|error| {
+            mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("{ASSERT_TOOL} expected_text regex is invalid: {error}"),
+            )
+        })?)
+    } else {
+        None
+    };
 
     Ok(NormalizedBrowserAssertParams {
         locator: params.locator.clone(),
         matcher: params.matcher,
         expected_text: params.expected_text.clone(),
+        expected_text_match_value,
+        expected_text_regex,
         expected_value: params.expected_value.clone(),
         expected_bool: params.expected_bool,
         expected_count: params.expected_count,
         attribute_name: params.attribute_name.clone(),
         expected_attribute_value: params.expected_attribute_value.clone(),
-        text_match: params.text_match.unwrap_or_default(),
-        normalize_whitespace: params.normalize_whitespace.unwrap_or(true),
+        text_match,
+        normalize_whitespace: should_normalize_whitespace,
         negate: params.negate.unwrap_or(false),
         timeout_ms,
         interval_ms,
@@ -2344,10 +2381,12 @@ fn assert_element_poll(
             )
         }
         BrowserAssertMatcher::ToHaveText => {
-            let expected_raw = params.expected_text.as_deref().ok_or_else(|| {
+            let expected_text = params.expected_text_match_value.as_deref().ok_or_else(|| {
                 mcp_error(
                     error_codes::TOOL_INTERNAL_ERROR,
-                    format!("{ASSERT_TOOL} to_have_text poll missing validated expected_text"),
+                    format!(
+                        "{ASSERT_TOOL} to_have_text poll missing normalized validated expected_text"
+                    ),
                 )
             })?;
             let actual_text = if params.normalize_whitespace {
@@ -2355,12 +2394,12 @@ fn assert_element_poll(
             } else {
                 state.text.clone()
             };
-            let expected_text = if params.normalize_whitespace {
-                normalize_whitespace(expected_raw)
-            } else {
-                expected_raw.to_owned()
-            };
-            let matched = text_matches(&actual_text, &expected_text, params.text_match);
+            let matched = text_matches(
+                &actual_text,
+                expected_text,
+                params.text_match,
+                params.expected_text_regex.as_ref(),
+            )?;
             (
                 matched,
                 json!({"text": actual_text, "tag_name": state.tag_name}),
@@ -2458,13 +2497,25 @@ fn assertion_passes_without_element(params: &NormalizedBrowserAssertParams) -> b
     }
 }
 
-fn text_matches(actual: &str, expected: &str, mode: BrowserAssertTextMatch) -> bool {
+fn text_matches(
+    actual: &str,
+    expected: &str,
+    mode: BrowserAssertTextMatch,
+    expected_regex: Option<&Regex>,
+) -> Result<bool, ErrorData> {
     match mode {
-        BrowserAssertTextMatch::Exact => actual == expected,
-        BrowserAssertTextMatch::Contains => actual.contains(expected),
-        BrowserAssertTextMatch::Regex => {
-            Regex::new(expected).is_ok_and(|regex| regex.is_match(actual))
-        }
+        BrowserAssertTextMatch::Exact => Ok(actual == expected),
+        BrowserAssertTextMatch::Contains => Ok(actual.contains(expected)),
+        BrowserAssertTextMatch::Regex => expected_regex
+            .map(|regex| regex.is_match(actual))
+            .ok_or_else(|| {
+                mcp_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!(
+                        "{ASSERT_TOOL} regex matcher reached polling without its acceptance-bound compiled regex"
+                    ),
+                )
+            }),
     }
 }
 

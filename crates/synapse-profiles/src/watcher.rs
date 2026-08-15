@@ -201,6 +201,12 @@ impl ProfileRuntime {
             .map(|loaded| loaded.profile.clone()))
     }
 
+    #[instrument(skip_all, fields(profile_id = profile_id))]
+    pub fn loaded_profile(&self, profile_id: &str) -> Result<Option<LoadedProfile>, ProfileError> {
+        let state = self.state.read().map_err(|_| ProfileError::StatePoisoned)?;
+        Ok(state.profiles.get(profile_id).cloned())
+    }
+
     #[instrument(skip_all)]
     pub fn loaded_profiles(&self) -> Result<Vec<LoadedProfile>, ProfileError> {
         let state = self.state.read().map_err(|_| ProfileError::StatePoisoned)?;

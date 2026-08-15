@@ -11,8 +11,8 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use synapse_action::ActionHandle;
 use synapse_core::{
-    ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION, StoredAuditContext,
-    StoredReflexAudit, error_codes,
+    CompiledEventFilter, ReflexLifetime, ReflexState, ReflexStatus, SCHEMA_VERSION,
+    StoredAuditContext, StoredReflexAudit, error_codes,
 };
 use uuid::Uuid;
 
@@ -41,6 +41,20 @@ const REFLEX_FIRES_METRIC: &str = "reflex_fires_total";
 pub(super) struct RuntimeReflex {
     pub(super) registration_order: usize,
     pub(super) reflex: ScheduledReflex,
+    pub(super) trigger: RuntimeSchedulerTrigger,
+    pub(super) lifetime_filter: RuntimeLifetimeFilter,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum RuntimeSchedulerTrigger {
+    EveryTick,
+    OnEvent(CompiledEventFilter),
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum RuntimeLifetimeFilter {
+    NotEvent,
+    UntilEvent(CompiledEventFilter),
 }
 
 #[derive(Clone, Debug)]
