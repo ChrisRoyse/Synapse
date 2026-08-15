@@ -3771,14 +3771,14 @@ pub fn read_storage_snapshot(
         return Err(mcp_error_with_remediation(
             error_codes::TOOL_PARAMS_INVALID,
             "storage operation=snapshot_read requires a non-empty cf_name".to_owned(),
-            "pass one logical CF name from the closed Synapse storage catalog",
+            "pass one logical Synapse CF or native Calyx CF name from the closed catalogs",
         ));
     }
     let readback = db
         .read_calyx_storage_snapshot(params.lease_id, cf_name, &key)
         .map_err(|error| storage_mcp_error(&error))?;
     Ok(StorageSnapshotReadResponse {
-        source_of_truth: "exact logical CF row resolved through the retained Aster MVCC snapshot"
+        source_of_truth: "exact addressed CF row resolved through the retained Aster MVCC snapshot"
             .to_owned(),
         redaction_policy: STORAGE_SNAPSHOT_READ_REDACTION_POLICY.to_owned(),
         lease_id: readback.lease_id,

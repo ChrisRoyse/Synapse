@@ -1270,7 +1270,8 @@ pub struct CalyxStorageSnapshotLease {
     pub active_lease_count: u64,
 }
 
-/// Metadata-only readback of one logical Synapse row through an Aster snapshot.
+/// Metadata-only readback of one logical Synapse or native Calyx row through
+/// an Aster snapshot.
 ///
 /// Payload bytes stay behind their typed MCP owners. Length and SHA-256 prove
 /// exact historical identity without turning this engine-level capability into
@@ -3867,7 +3868,7 @@ impl StorageBackend for CalyxBackend {
                 detail: "SYNAPSE_CALYX_SNAPSHOT_LEASE_ID_INVALID: lease_id must be nonzero; remediation=pass the exact lease_id returned by snapshot_open".to_owned(),
             });
         }
-        self.with_vault(cf_name, "read logical row through Calyx MVCC snapshot", false, |vault| {
+        self.with_vault(cf_name, "read addressed row through Calyx MVCC snapshot", false, |vault| {
             let now_ms = calyx_clock_now_for_read(vault, cf_name)?;
             let pinned = {
                 let mut snapshots = self.lock_storage_snapshots()?;
@@ -3893,13 +3894,8 @@ impl StorageBackend for CalyxBackend {
                 }
                 pinned
             };
-            let collection_id = calyx_collection_id_for_cf_read(cf_name)?;
-            let physical_key = encode_calyx_key_for_read(cf_name, collection_id, key)?;
-            let physical = vault
-                .read_cf_snapshot(pinned.snapshot, ColumnFamily::Kv, &physical_key)
-                .map_err(|source| {
-                    calyx_read_failed(cf_name, "read Calyx KV row at pinned snapshot", &source)
-                })?;
+            let (physical, native_calyx_row) =
+                read_calyx_storage_snapshot_target(vault, pinned, cf_name, key)?;
             let expires_at_unix_ms = pinned.snapshot.lease().expires_at();
             let current_seq = vault.latest_seq();
             let Some(physical) = physical else {
@@ -3919,6 +3915,11 @@ impl StorageBackend for CalyxBackend {
                     payload_sha256: None,
                 });
             };
+            if native_calyx_row {
+                return Ok(native_snapshot_readback(
+                    lease_id, pinned, current_seq, cf_name, &physical,
+                ));
+            }
             let envelope = decode_calyx_value_raw(&physical).map_err(|detail| {
                 tracing::error!(
                     code = error_codes::STORAGE_READ_FAILED,
@@ -14000,6 +14001,91 @@ fn calyx_collection_id_for_cf(cf_name: &str) -> Option<u64> {
         }
     }
     None
+}
+
+enum CalyxStorageSnapshotTarget {
+    SynapseKv { physical_key: Vec<u8> },
+    Native { cf: ColumnFamily },
+}
+
+fn calyx_storage_snapshot_target(
+    cf_name: &str,
+    key: &[u8],
+) -> StorageResult<CalyxStorageSnapshotTarget> {
+    if let Some(collection_id) = calyx_collection_id_for_cf(cf_name) {
+        return Ok(CalyxStorageSnapshotTarget::SynapseKv {
+            physical_key: encode_calyx_key_for_read(cf_name, collection_id, key)?,
+        });
+    }
+
+    let normalized = cf_name.to_ascii_lowercase();
+    let native_cf = ColumnFamily::from_name(&normalized).filter(|cf| cf.name() == normalized);
+    native_cf.map_or_else(
+        || {
+            tracing::error!(
+                code = "SYNAPSE_CALYX_SNAPSHOT_CF_UNKNOWN",
+                requested_cf = cf_name,
+                "snapshot point-read rejected a name outside both closed CF catalogs"
+            );
+            Err(StorageError::ReadFailed {
+                cf_name: cf_name.to_owned(),
+                detail: format!(
+                    "SYNAPSE_CALYX_SNAPSHOT_CF_UNKNOWN: cf_name={cf_name:?} is neither a logical Synapse collection nor a native Calyx column family; remediation=pass an exact logical CF name or a native Calyx family name such as Graph"
+                ),
+            })
+        },
+        |cf| Ok(CalyxStorageSnapshotTarget::Native { cf }),
+    )
+}
+
+fn read_calyx_storage_snapshot_target(
+    vault: &SynapseCalyxVault,
+    pinned: PinnedStorageSnapshot,
+    cf_name: &str,
+    key: &[u8],
+) -> StorageResult<(Option<Vec<u8>>, bool)> {
+    match calyx_storage_snapshot_target(cf_name, key)? {
+        CalyxStorageSnapshotTarget::SynapseKv { physical_key } => vault
+            .read_cf_snapshot(pinned.snapshot, ColumnFamily::Kv, &physical_key)
+            .map(|physical| (physical, false))
+            .map_err(|source| {
+                calyx_read_failed(cf_name, "read Calyx KV row at pinned snapshot", &source)
+            }),
+        CalyxStorageSnapshotTarget::Native { cf } => vault
+            .read_cf_snapshot(pinned.snapshot, cf, key)
+            .map(|physical| (physical, true))
+            .map_err(|source| {
+                calyx_read_failed(
+                    cf_name,
+                    "read native Calyx CF row at pinned snapshot",
+                    &source,
+                )
+            }),
+    }
+}
+
+fn native_snapshot_readback(
+    lease_id: u64,
+    pinned: PinnedStorageSnapshot,
+    current_seq: u64,
+    cf_name: &str,
+    physical: &[u8],
+) -> CalyxStorageSnapshotReadback {
+    CalyxStorageSnapshotReadback {
+        lease_id,
+        snapshot_seq: pinned.snapshot.seq(),
+        current_seq,
+        opened_at_unix_ms: pinned.opened_at_unix_ms,
+        expires_at_unix_ms: pinned.snapshot.lease().expires_at(),
+        cf_name: cf_name.to_owned(),
+        physical_present: true,
+        logical_present: true,
+        expired_at_snapshot: false,
+        written_at_unix_ms: None,
+        retention_expires_at_unix_ms: None,
+        payload_len_bytes: Some(u64::try_from(physical.len()).unwrap_or(u64::MAX)),
+        payload_sha256: Some(sha256_hex(physical)),
+    }
 }
 
 fn calyx_collection_id_for_cf_read(cf_name: &str) -> StorageResult<u64> {
