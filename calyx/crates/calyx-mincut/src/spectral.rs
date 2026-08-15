@@ -15,6 +15,10 @@ pub type SpectralResult<T> = std::result::Result<T, SpectralError>;
 const EIGEN_EPS: f32 = 1.0e-6;
 const DEFAULT_EIGEN_MAX_ITER: usize = 64;
 const MIN_LANCZOS_DIM: usize = 32;
+/// Power used by the component-local infinity-norm spectral-radius bound.
+/// Eight sparse mat-vecs are negligible beside the 256-step solve, while the
+/// eighth root removes most of the max-degree bound's irregular-graph slack.
+const COMPONENT_SCALE_POWER: usize = 8;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EigenPair {
@@ -85,7 +89,8 @@ pub enum SpectralError {
         "CALYX_SPECTRAL_NOT_CONVERGED: spectral iteration did not converge after {iterations} \
          iterations: normalized eigenpair residual {residual:e} still exceeds tol {tol:e} on the \
          {component_nodes}-node connected component (component {component_index} of {components}, \
-         over {nodes} nodes) whose adjacency spectral radius is {component_radius:e}"
+         over {nodes} nodes) whose adjacency spectral radius is {component_radius:e} and shift \
+         scale is {component_shift_scale:e}"
     )]
     NotConverged {
         iterations: usize,
@@ -96,6 +101,7 @@ pub enum SpectralError {
         component_index: usize,
         component_nodes: usize,
         component_radius: f32,
+        component_shift_scale: f32,
     },
     /// The Lanczos pass could not build the Krylov basis it was asked for. This
     /// is not a residual failure — no residual was ever measured — so it does
@@ -233,6 +239,7 @@ pub fn eigenvector_centrality(
                  iterations,
                  residual,
                  radius,
+                 shift_scale,
              }| SpectralError::NotConverged {
                 iterations,
                 residual,
@@ -242,6 +249,7 @@ pub fn eigenvector_centrality(
                 component_index,
                 component_nodes: nodes.len(),
                 component_radius: radius,
+                component_shift_scale: shift_scale,
             },
         )?;
         max_radius = max_radius.max(spectrum.radius);
@@ -389,6 +397,7 @@ struct ComponentDivergence {
     iterations: usize,
     residual: f32,
     radius: f32,
+    shift_scale: f32,
 }
 
 struct SymmetricSparseGraph {
@@ -487,15 +496,21 @@ impl SymmetricSparseGraph {
             .collect()
     }
 
-    /// The component's Gershgorin bound on its own adjacency spectral radius:
-    /// the largest weighted degree among its nodes.
+    /// A component-local upper bound on its adjacency spectral radius:
+    /// `||A_c^8||_inf^(1/8)`.
     ///
-    /// For a symmetric non-negative block, `rho(A_c) <= max_i sum_j |A_ij|`,
-    /// and no edge leaves a connected component, so a node's full stored degree
-    /// *is* its within-component row sum. This is the scale the shift is
-    /// measured against; see [`Self::component_perron`] for why that matters.
-    fn component_scale(&self, nodes: &[usize]) -> f64 {
-        nodes
+    /// Every consistent matrix norm upper-bounds spectral radius, and Gelfand's
+    /// formula makes the root of a power norm approach it. For a non-negative
+    /// matrix, the infinity norm is exactly the largest entry of `A^8 * 1`, so
+    /// this stays sparse: no matrix power is materialized.
+    ///
+    /// The calculation first divides by the one-hop Gershgorin bound. This
+    /// prevents overflow and preserves exact invariance to a global rescaling
+    /// of edge weights. On a `k`-leaf star the old max-degree scale was `k`
+    /// while `rho(A) = sqrt(k)`, making the identity shift arbitrarily dominant;
+    /// every even power norm recovers `sqrt(k)` exactly.
+    fn component_scale(&self, nodes: &[usize], local_of: &[usize]) -> f64 {
+        let gershgorin = nodes
             .iter()
             .map(|global_index| {
                 self.adjacency[*global_index]
@@ -503,12 +518,38 @@ impl SymmetricSparseGraph {
                     .map(|(_, weight)| f64::from(*weight))
                     .sum::<f64>()
             })
-            .fold(0.0_f64, f64::max)
+            .fold(0.0_f64, f64::max);
+        if !gershgorin.is_finite() || gershgorin <= 0.0 {
+            return gershgorin;
+        }
+
+        let inverse_gershgorin = gershgorin.recip();
+        let mut powered_row_sums = vec![1.0_f64; nodes.len()];
+        for _ in 0..COMPONENT_SCALE_POWER {
+            powered_row_sums = nodes
+                .par_iter()
+                .map(|global_index| {
+                    self.adjacency[*global_index]
+                        .iter()
+                        .map(|(col_index, weight)| {
+                            f64::from(*weight)
+                                * inverse_gershgorin
+                                * powered_row_sums[local_of[*col_index]]
+                        })
+                        .sum::<f64>()
+                })
+                .collect();
+        }
+        let powered_norm = powered_row_sums.iter().copied().fold(0.0_f64, f64::max);
+        if !powered_norm.is_finite() || powered_norm <= 0.0 {
+            return f64::NAN;
+        }
+        gershgorin * powered_norm.powf(1.0 / COMPONENT_SCALE_POWER as f64)
     }
 
     /// Shifted power iteration restricted to one connected component, on
-    /// `I + A_c / scale_c` where `scale_c` is the component's own Gershgorin
-    /// radius bound (#2081).
+    /// `I + A_c / scale_c` where `scale_c` is the component's own eighth-power
+    /// infinity-norm radius bound (#2081, #2130).
     ///
     /// # Why the block is restricted to one component
     ///
@@ -546,13 +587,15 @@ impl SymmetricSparseGraph {
     /// units of an unrelated edge. The live app lane already runs at
     /// `max_pair_count = 2533` and a minimum edge weight of `3.9e-4`.
     ///
-    /// Taking the shift to be the block's own Gershgorin bound
-    /// `scale_c = max_i sum_j |A_ij| >= rho(A_c)` makes the contraction ratio
+    /// Taking the shift from a block-local matrix-norm bound
+    /// `scale_c = ||A_c^8||_inf^(1/8) >= rho(A_c)` makes the contraction ratio
     /// `(scale_c + lambda_2) / (scale_c + lambda_1)`, which is invariant under
     /// any global rescaling of the weights: it depends on the component's shape
-    /// alone. Equivalently, and as implemented, the block is divided by
-    /// `scale_c` first — putting its spectrum in `[-1, 1]` — and then shifted by
-    /// the same cheap `1`.
+    /// alone. Unlike the one-hop max-degree/Gershgorin bound, the eighth-power
+    /// bound does not make a high-degree process-tree hub impose an arbitrarily
+    /// oversized shift. Equivalently, and as implemented, the block is divided
+    /// by `scale_c` first — putting its spectrum in `[-1, 1]` — and then shifted
+    /// by the same cheap `1`.
     ///
     /// The returned pair is mathematically identical either way: a shift and a
     /// positive scaling of a symmetric matrix change no eigenvector, and the
@@ -565,9 +608,13 @@ impl SymmetricSparseGraph {
         tol: f32,
     ) -> std::result::Result<ComponentSpectrum, ComponentDivergence> {
         let size = nodes.len();
-        let scale = self.component_scale(nodes);
+        let mut local_of = vec![0_usize; self.len()];
+        for (local_index, global_index) in nodes.iter().copied().enumerate() {
+            local_of[global_index] = local_index;
+        }
+        let scale = self.component_scale(nodes, &local_of);
         let unit = vec![1.0 / (size as f64).sqrt(); size];
-        if !scale.is_finite() || scale <= 0.0 {
+        if scale == 0.0 {
             // An edgeless component: `A_c` is the zero block, every vector is an
             // eigenvector, and the radius is exactly zero. There is nothing to
             // iterate towards and no scale to divide by, so answer in closed
@@ -577,9 +624,13 @@ impl SymmetricSparseGraph {
                 radius: 0.0,
             });
         }
-        let mut local_of = vec![0_usize; self.len()];
-        for (local_index, global_index) in nodes.iter().copied().enumerate() {
-            local_of[global_index] = local_index;
+        if !scale.is_finite() || scale < 0.0 {
+            return Err(ComponentDivergence {
+                iterations: 0,
+                residual: f32::INFINITY,
+                radius: 0.0,
+                shift_scale: scale as f32,
+            });
         }
         let mut current = unit;
         let mut product = self.component_mat_vec(nodes, &local_of, scale, &current);
@@ -596,6 +647,7 @@ impl SymmetricSparseGraph {
                     iterations: step,
                     residual: f32::INFINITY,
                     radius: 0.0,
+                    shift_scale: scale as f32,
                 });
             }
             let mut next = product;
@@ -609,6 +661,7 @@ impl SymmetricSparseGraph {
                     iterations: step,
                     residual: f32::INFINITY,
                     radius: 0.0,
+                    shift_scale: scale as f32,
                 });
             }
             current = next;
@@ -626,6 +679,7 @@ impl SymmetricSparseGraph {
             iterations: max_iter,
             residual: residual as f32,
             radius: unshifted_radius(shifted_rayleigh, scale) as f32,
+            shift_scale: scale as f32,
         })
     }
 

@@ -9,8 +9,12 @@ Accepted — 2026-08-15 (#2130).
 The component-local shifted power iteration used `f32` for sparse accumulation,
 normalization, Rayleigh recovery, and its successive-vector convergence check.
 On a real Windows process forest, that change norm plateaued around `1e-6` for
-more than 65,536 iterations. The process observer therefore remained disabled
-because one uncertified component failed the complete derived-state subpass.
+more than 65,536 iterations. Its identity shift also used the component's
+maximum weighted degree. That is a valid but arbitrarily loose spectral-radius
+bound on irregular graphs: for a `k`-leaf star it is `k`, while the radius is
+only `sqrt(k)`. The oversized identity shift creates an artificial near-unit
+contraction ratio. The process observer therefore remained disabled because one
+uncertified component failed the complete derived-state subpass.
 
 This was not dominant-eigenvalue multiplicity inside a connected component. A
 connected nonnegative adjacency block is irreducible and has a simple Perron
@@ -24,6 +28,10 @@ of single-precision roundoff in the iterative kernel and its stopping metric.
   `B = I + A_c / scale_c`.
 - Keep persisted graph weights and public centrality scores as `f32`, but run
   bounded component-local accumulation and normalization in `f64`.
+- Scale the identity shift with `||A_c^8||_inf^(1/8)`, computed by eight sparse
+  matrix-vector products from the all-ones vector. This remains a rigorous
+  spectral-radius upper bound without materializing a matrix power and is much
+  tighter than max degree on irregular forests.
 - Certify convergence with normalized eigenpair residual
   `||Bx - mu*x||_2 / |mu|`, not successive-vector distance.
 - Reject a zero iteration budget and non-finite or non-positive tolerances with
@@ -47,3 +55,4 @@ measured normalized residual and exact component identity.
 - [NetworkX eigenvector centrality](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.centrality.eigenvector_centrality.html): a positive all-ones start and `A + I` power iteration target the unique positive eigenvector on a connected graph.
 - [LAPACK symmetric eigenproblem error bounds](https://www.netlib.org/lapack/lug/node90.html): eigenpair accuracy is assessed through backward error; eigenvector forward sensitivity separately depends on the spectral gap.
 - [SciPy `eigsh`](https://docs.scipy.org/doc/scipy/reference/generated/scipy.sparse.linalg.eigsh.html): symmetric sparse eigensolvers use a relative accuracy stopping criterion and fail explicitly when convergence is not obtained.
+- [Nick Higham on spectral radius](https://nhigham.com/2024/01/12/what-is-the-spectral-radius-of-a-matrix/): every consistent matrix norm bounds spectral radius, and Gelfand's formula tightens the bound through roots of matrix-power norms.
