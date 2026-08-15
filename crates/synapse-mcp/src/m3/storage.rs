@@ -2014,6 +2014,7 @@ pub enum StorageIntelligenceOperation {
     Redundancy,
     Synergy,
     Causality,
+    CausalMap,
     Periodicity,
     Drift,
     Hazard,
@@ -2038,7 +2039,7 @@ impl StorageIntelligenceOperation {
     /// `server::tool_profiles` can be proven complete at daemon construction
     /// (#2077): a variant added here without a declared classification refuses
     /// to start the daemon instead of silently inheriting a gate.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Weave,
         Self::Abundance,
         Self::Bits,
@@ -2046,6 +2047,7 @@ impl StorageIntelligenceOperation {
         Self::Redundancy,
         Self::Synergy,
         Self::Causality,
+        Self::CausalMap,
         Self::Periodicity,
         Self::Drift,
         Self::Hazard,
@@ -2070,6 +2072,7 @@ impl StorageIntelligenceOperation {
             Self::Redundancy => "redundancy",
             Self::Synergy => "synergy",
             Self::Causality => "causality",
+            Self::CausalMap => "causal_map",
             Self::Periodicity => "periodicity",
             Self::Drift => "drift",
             Self::Hazard => "hazard",
@@ -2130,14 +2133,15 @@ pub struct StorageIntelligenceParams {
     #[schemars(range(min = 1, max = 64))]
     pub knn_k: Option<u32>,
     /// Inclusive lower bound (Unix nanoseconds) on a record's server-stamped
-    /// `created_at` for the `weave` pass. Calyx stamps `created_at` in
-    /// milliseconds, so a record is in the window iff
+    /// `created_at` for `weave`, or inclusive lower source-event-time bound for
+    /// temporal operations. Calyx stamps `created_at` in milliseconds, so a
+    /// weave record is in the window iff
     /// `since_ts_ns <= created_at_ms * 1_000_000 < until_ts_ns`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ts_ns: Option<i64>,
-    /// Exclusive upper bound (Unix nanoseconds) on `created_at` for `weave`.
-    /// Must be strictly greater than `since_ts_ns` when both are given; an
-    /// inverted window fails closed rather than returning zero records.
+    /// Exclusive upper bound (Unix nanoseconds) on `created_at` for `weave`, or
+    /// on physical source-event time for temporal operations. Must be strictly
+    /// greater than `since_ts_ns` when both are given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ts_ns: Option<i64>,
     /// Panel slots to withhold from the measurement.
@@ -2166,16 +2170,16 @@ pub struct StorageIntelligenceParams {
     #[schemars(range(min = 1, max = 32))]
     pub ksg_k: Option<u32>,
     /// Metadata key partitioning the panel into activity streams (the
-    /// app/agent/tool identifier). Required for `causality`; optional filter
-    /// dimension for `periodicity`/`drift`/`hazard`.
+    /// app/agent/tool identifier). Required for `causality`/`causal_map`;
+    /// optional filter dimension for `periodicity`/`drift`/`hazard`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_key: Option<String>,
-    /// Causality source-stream value under `group_key` (defaults to the most
-    /// frequent stream when absent).
+    /// Causality source-stream value under `group_key`. For `causal_map`, both
+    /// group values select one explicit pair; omitting both enumerates all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_a: Option<String>,
-    /// Causality target-stream value under `group_key` (defaults to the second
-    /// most frequent stream when absent).
+    /// Causality target-stream value under `group_key`. One-sided pair scope is
+    /// rejected by `causal_map`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_b: Option<String>,
     /// Restricts `periodicity`/`drift`/`hazard` to one `group_key` stream value.
@@ -2183,12 +2187,17 @@ pub struct StorageIntelligenceParams {
     pub filter_value: Option<String>,
     /// Occurrence-count bin width in seconds (causality/periodicity/drift).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1))]
+    #[schemars(range(min = 0.001))]
     pub bin_seconds: Option<f64>,
-    /// Maximum transfer-entropy lag in bins (causality only).
+    /// Maximum temporal lag in bins (`causality`/`causal_map`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(range(min = 1, max = 64))]
+    #[schemars(range(min = 1, max = 32))]
     pub max_lag: Option<u32>,
+    /// Benjamini-Hochberg false-discovery-rate threshold (`causal_map` only).
+    /// Must be finite and strictly inside `(0,1)`; default `0.05`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = 0, max = 1))]
+    pub causal_fdr_alpha: Option<f32>,
     /// Reference "now" (Unix seconds) for the overdue-hazard elapsed time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub now_secs: Option<i64>,
@@ -2813,6 +2822,21 @@ pub struct StorageIntelligenceCausalityReport {
     pub graph_cf_rows_after: u64,
 }
 
+/// Complete typed causal-evidence artifact with its physical Graph-CF proof.
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageIntelligenceCausalMapReport {
+    pub source_of_truth: &'static str,
+    /// Native `synapse.calyx.causal_map.v1` artifact. Its evidence lanes remain
+    /// separate; callers must not collapse them into one causal score.
+    pub artifact: serde_json::Value,
+    pub graph_key_hex: String,
+    pub graph_value_sha256: String,
+    pub graph_value_bytes: u64,
+    pub graph_cf_rows_after: u64,
+    pub physical_readback_matches: bool,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligencePeriodogramPeak {
@@ -2988,6 +3012,8 @@ pub struct StorageIntelligenceResponse {
     pub synergy: Option<StorageIntelligenceSynergyReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub causality: Option<StorageIntelligenceCausalityReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_map: Option<StorageIntelligenceCausalMapReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub periodicity: Option<StorageIntelligencePeriodicityReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4731,17 +4757,27 @@ pub fn validate_intelligence_numeric_ranges(
         validate_u32_range("intelligence", "ksg_k", value, 1, 32)?;
     }
     if let Some(value) = params.bin_seconds
-        && (!value.is_finite() || value < 1.0)
+        && (!value.is_finite() || value < 0.001)
     {
         return Err(numeric_range_error(
             "intelligence",
             "bin_seconds",
             &value.to_string(),
-            "a finite number >= 1",
+            "a finite number >= 0.001",
         ));
     }
     if let Some(value) = params.max_lag {
-        validate_u32_range("intelligence", "max_lag", value, 1, 64)?;
+        validate_u32_range("intelligence", "max_lag", value, 1, 32)?;
+    }
+    if let Some(value) = params.causal_fdr_alpha
+        && (!value.is_finite() || value <= 0.0 || value >= 1.0)
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "causal_fdr_alpha",
+            &value.to_string(),
+            "a finite number strictly inside (0,1)",
+        ));
     }
     if let Some(value) = params.min_recall_ratio
         && (!value.is_finite() || !(0.0..=1.0).contains(&value))
@@ -5271,6 +5307,8 @@ fn temporal_params(
 ) -> synapse_calyx::SynapseCalyxTemporalParams {
     let mut temporal = synapse_calyx::SynapseCalyxTemporalParams::new(params.panel_version);
     temporal.max_records = intelligence_record_limit(params.max_records);
+    temporal.since_ts_ns = params.since_ts_ns;
+    temporal.until_ts_ns = params.until_ts_ns;
     temporal.group_key = params.group_key.clone();
     temporal.group_a = params.group_a.clone();
     temporal.group_b = params.group_b.clone();
@@ -5333,6 +5371,35 @@ pub fn run_intelligence_causality(
             })
             .collect(),
         graph_cf_rows_after: report.graph_cf_rows_after as u64,
+    })
+}
+
+/// Computes every causal-evidence lane for every selected stream pair and
+/// returns the byte-proven Graph-CF artifact.
+pub fn run_intelligence_causal_map(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceCausalMapReport, ErrorData> {
+    let fdr_alpha = params
+        .causal_fdr_alpha
+        .unwrap_or(synapse_calyx::SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA);
+    let report = db
+        .temporal_causal_map_intelligence(&temporal_params(params), fdr_alpha)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    let artifact = serde_json::to_value(report.artifact).map_err(|error| {
+        mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!("SYNAPSE_CAUSAL_MAP_RESPONSE_ENCODE_FAILED: {error}"),
+        )
+    })?;
+    Ok(StorageIntelligenceCausalMapReport {
+        source_of_truth: "Calyx Graph CF content-addressed causal-map row",
+        artifact,
+        graph_key_hex: report.graph_key_hex,
+        graph_value_sha256: report.graph_value_sha256,
+        graph_value_bytes: report.graph_value_bytes as u64,
+        graph_cf_rows_after: report.graph_cf_rows_after as u64,
+        physical_readback_matches: report.physical_readback_matches,
     })
 }
 

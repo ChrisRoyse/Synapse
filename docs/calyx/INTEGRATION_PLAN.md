@@ -137,7 +137,7 @@ Everything not yet anchored is reported **provisional** — the grounding-gap re
 |---|---|---|
 | Loom cross-terms + agreement/between-record graphs | `timeline`/`episode`/`find` | associations among apps, documents, times, agents; abundance report `n·(N + C(N,2) + 1)` |
 | Assay bits/sufficiency/redundancy | new `intelligence` surface (extends `storage`/`hygiene`) | which captured fields actually predict outcomes, in bits; panel sufficiency deficits → propose-lens |
-| Assay transfer entropy / Granger | `timeline` causality | "app A drives app B", agent-tool → failure arrows |
+| Assay PC/partial network + transfer entropy + Granger + CCM + cross-K + Hawkes | `storage intelligence causal_map` | exhaustive, source-time-scoped causal evidence with separate assumption lanes, FDR-corrected p-value families, and no structural-effect claim without identification |
 | Assay periodicity (Lomb–Scargle) + hazard | `routine` | rigorous cadence, overdue-ness, false-alarm probability — upgrades the hand-rolled miner |
 | Lodestar kernel + kernel_answer | `episode`/`timeline` query, `find` | the ~1% of records that explain the corpus; grounded answers with hop-scored evidence paths |
 | Sextant RRF fusion + BM25 + per-slot indexes | `find` | find-similar episodes/agent-runs/actions across all slots at once, temporal-boosted |
@@ -157,7 +157,7 @@ Beyond storing and analyzing, Calyx **controls** what it can do so with groundin
 | Steered surface | Mechanism | Doctrine |
 |---|---|---|
 | Model routing (`model` tool) | bits + cost/success posteriors per model × task class | grounded ⇒ recommend with CI; ledger-logged |
-| Tool selection at agent spawn (`agent` tool) | per-tool success bits + failure arrows (transfer entropy) | recommended/discouraged sets with evidence |
+| Tool selection at agent spawn (`agent` tool) | per-tool success bits + typed failure arrows sourced from a persisted causal map | recommended/discouraged sets with predictive-evidence class and estimator trace; structural control requires separate identification |
 | Risky tool calls (destructive shell, deletes, sends) | pre-flight oracle what-if + ward OOD check | warn by default, deny per policy; honesty-gated; Insufficient ⇒ warn-only |
 | Running agents | quarantine-grade drift verdicts → pause/kill recommendation via `escalation` | per-slot evidence attached |
 | Routine arming / autonomy tiers | identity-lock + readiness predicate + periodicity confidence | fail closed: unready domains cannot arm |

@@ -32,10 +32,10 @@ use synapse_calyx::{
     SynapseCalyxAnchorWriteReadback, SynapseCalyxAssayParams,
     SynapseCalyxAtomicConstellationRecurrenceReadback, SynapseCalyxBackupReport,
     SynapseCalyxBitsReport, SynapseCalyxBlindSpotParams, SynapseCalyxBlindSpotReport,
-    SynapseCalyxCausalityReport, SynapseCalyxCfRangePage, SynapseCalyxCfRows, SynapseCalyxCfWalk,
-    SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError, SynapseCalyxConfig,
-    SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport, SynapseCalyxErasureReport,
-    SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
+    SynapseCalyxCausalMapReport, SynapseCalyxCausalityReport, SynapseCalyxCfRangePage,
+    SynapseCalyxCfRows, SynapseCalyxCfWalk, SynapseCalyxCfWrite, SynapseCalyxConditionalWriteError,
+    SynapseCalyxConfig, SynapseCalyxDriftReport, SynapseCalyxEnsembleCardReport,
+    SynapseCalyxErasureReport, SynapseCalyxError, SynapseCalyxFindParams, SynapseCalyxFindReport,
     SynapseCalyxGroundedObservationReadback, SynapseCalyxGroundingGapReport,
     SynapseCalyxGuardCalibrateParams, SynapseCalyxGuardCalibrateReport,
     SynapseCalyxGuardVerifyParams, SynapseCalyxGuardVerifyReport, SynapseCalyxHazardReport,
@@ -1181,6 +1181,11 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: &SynapseCalyxTemporalParams,
     ) -> StorageResult<SynapseCalyxCausalityReport>;
+    fn temporal_causal_map_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<SynapseCalyxCausalMapReport>;
     fn temporal_periodicity_intelligence(
         &self,
         params: &SynapseCalyxTemporalParams,
@@ -6437,6 +6442,29 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn temporal_causal_map_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<SynapseCalyxCausalMapReport> {
+        self.with_vault(
+            "calyx_assay",
+            "measure exhaustive native Calyx causal map",
+            true,
+            |vault| {
+                vault
+                    .temporal_causal_map(params, fdr_alpha)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_assay",
+                            "measure exhaustive native Calyx causal map",
+                            &source,
+                        )
+                    })
             },
         )
     }

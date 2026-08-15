@@ -4929,6 +4929,10 @@ const TEMPORAL_HAZARD_PREFIX: &[u8; 5] = b"THAZ1";
 pub struct SynapseCalyxTemporalParams {
     pub panel_version: u32,
     pub max_records: usize,
+    /// Inclusive lower source-event-time bound in Unix nanoseconds.
+    pub since_ts_ns: Option<i64>,
+    /// Exclusive upper source-event-time bound in Unix nanoseconds.
+    pub until_ts_ns: Option<i64>,
     /// Metadata key that partitions the panel into activity streams (e.g. the
     /// app/agent/tool identifier). Required for causality; optional filter for
     /// periodicity/drift/hazard.
@@ -4957,6 +4961,8 @@ impl SynapseCalyxTemporalParams {
         Self {
             panel_version,
             max_records: SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+            since_ts_ns: None,
+            until_ts_ns: None,
             group_key: None,
             group_a: None,
             group_b: None,
@@ -5098,9 +5104,11 @@ pub struct SynapseCalyxHazardReport {
 }
 
 /// One panel record reduced to its source event time and stream group.
-struct EventRecord {
-    secs: f64,
-    group: Option<String>,
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct EventRecord {
+    pub(crate) secs: f64,
+    pub(crate) nanos: u64,
+    pub(crate) group: Option<String>,
 }
 
 /// Nanoseconds per second, for reconstructing sub-second event times.
@@ -5133,7 +5141,7 @@ fn sub_second_event_secs(
     constellation: &Constellation,
     whole_secs_i64: i64,
     whole_secs: f64,
-) -> Result<f64, SynapseCalyxError> {
+) -> Result<(f64, u64), SynapseCalyxError> {
     let raw = constellation.metadata_value(METADATA_SOURCE_EVENT_TIME_RAW);
     let Some(raw) = raw else {
         return Err(temporal_error(
@@ -5185,7 +5193,10 @@ fn sub_second_event_secs(
             "inspect the persisted Base row's source_event_time_raw value",
         )
     })?;
-    Ok(whole_secs + f64::from(sub_second_nanos) / NS_PER_SEC_F64)
+    Ok((
+        whole_secs + f64::from(sub_second_nanos) / NS_PER_SEC_F64,
+        nanos,
+    ))
 }
 
 impl SynapseCalyxVault {
@@ -5524,11 +5535,21 @@ impl SynapseCalyxVault {
     /// Loads the panel's ascending source-event-time series (seconds) with the
     /// optional stream group. Records without an active source event time are
     /// suppressed (never storage-time-substituted).
-    fn load_panel_event_records(
+    #[allow(clippy::redundant_pub_crate)]
+    pub(crate) fn load_panel_event_records(
         &self,
         params: &SynapseCalyxTemporalParams,
         group_key: Option<&str>,
     ) -> Result<Vec<EventRecord>, SynapseCalyxError> {
+        if let (Some(since), Some(until)) = (params.since_ts_ns, params.until_ts_ns)
+            && since >= until
+        {
+            return Err(temporal_error(
+                SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID,
+                "the temporal source-event window is empty or inverted: since_ts_ns must be strictly less than until_ts_ns",
+                "supply an inclusive since_ts_ns lower bound strictly below the exclusive until_ts_ns upper bound",
+            ));
+        }
         let max_records = params
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
@@ -5570,15 +5591,27 @@ impl SynapseCalyxVault {
                 // exist in the source (issue #1893). Prefer the full-precision
                 // stamp, and fail loudly rather than silently using the lossy one
                 // when the two disagree — that is a Base-row integrity defect.
-                let secs = sub_second_event_secs(&constellation, secs, whole_secs)?;
+                let (secs, nanos) = sub_second_event_secs(&constellation, secs, whole_secs)?;
+                let nanos_cmp = i128::from(nanos);
+                if params
+                    .since_ts_ns
+                    .is_some_and(|since| nanos_cmp < i128::from(since))
+                    || params
+                        .until_ts_ns
+                        .is_some_and(|until| nanos_cmp >= i128::from(until))
+                {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
                 let group =
                     group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
-                records.push(EventRecord { secs, group });
-                // The pre-paging form `break`s here, after the push, so the walk
-                // stops on the same row with the same records loaded.
                 if records.len() >= max_records {
-                    return Ok(crate::SynapseCalyxWalkStep::Stop);
+                    return Err(temporal_error(
+                        "SYNAPSE_CALYX_TEMPORAL_SCOPE_EXCEEDS_MAX_RECORDS",
+                        "the requested temporal source-event scope contains more matching records than max_records; returning the membership prefix would be a biased, incomplete measurement",
+                        "narrow since_ts_ns/until_ts_ns or raise max_records within the 20,000-record bound; the estimator will run only when the full requested scope fits",
+                    ));
                 }
+                records.push(EventRecord { secs, nanos, group });
                 Ok(crate::SynapseCalyxWalkStep::Continue)
             }),
         )?;

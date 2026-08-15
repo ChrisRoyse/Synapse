@@ -104,7 +104,7 @@ Because real outcomes are attached as **anchors** — routine confirmations and 
 
 ## 4. Temporal and causal understanding of the operator's world
 
-- **Direction, not just correlation** — transfer entropy with lag sweeps turns "Slack and the IDE co-occur" into "Slack activity *precedes and drives* IDE context switches", including agent-tool → failure arrows.
+- **Typed direction evidence, not a causality shortcut** — `storage intelligence causal_map` enumerates every stream pair in an explicit source-event window and keeps PC-stable/partial-network, transfer-entropy, Granger, signed-lag, CCM, cross-K, and Hawkes evidence in separate assumption lanes. P-value families are FDR-corrected. The artifact says `observational_predictive`; it never translates temporal precedence into an identified intervention effect by wording alone.
 - **Rigorous rhythm detection** — Lomb–Scargle periodograms with permutation false-alarm probabilities replace hand-rolled cadence stats in routine mining: real periods, honest confidence.
 - **Overdue awareness** — renewal hazard per confirmed routine: "the Tuesday report routine is now 40 minutes overdue against its historical cadence."
 - **Change detection** — CUSUM change-points and MMD drift alarms notice when behavior *shifts* (new job rhythm, new tool habits) and trigger guard recalibration.

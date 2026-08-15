@@ -2030,6 +2030,24 @@ impl Db {
         self.backend.temporal_causality_intelligence(params)
     }
 
+    /// Computes every stream pair in a bounded source-event scope, preserves
+    /// each causal estimator as a typed evidence lane, and persists one
+    /// byte-verified causal-map artifact to the native Graph CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when scope coverage is incomplete,
+    /// stream classification is missing, the request is invalid, or Graph-CF
+    /// persistence/readback does not match.
+    pub fn temporal_causal_map_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxCausalMapReport> {
+        self.backend
+            .temporal_causal_map_intelligence(params, fdr_alpha)
+    }
+
     /// Runs the Lomb-Scargle periodogram (with permutation false-alarm
     /// probability) and a slotted-autocorrelation cross-check over a panel's
     /// occurrence series and persists the result to the native `TemporalXTerm` CF.

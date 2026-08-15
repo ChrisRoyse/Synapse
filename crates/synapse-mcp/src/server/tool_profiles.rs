@@ -2645,7 +2645,7 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                     "per-sub-operation physical CF readback: derived row counts after the pass, grounded flags, and the exact panel_version the report was computed for",
                 ),
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
-                "read-only sub-operations need only READ_STORAGE; measurement-class sub-operations (bits, sufficiency, redundancy, synergy, causality, periodicity, drift, hazard, ensemble_card, oracle_predict, oracle_reverse, oracle_validate, oracle_readiness) need READ_STORAGE+WRITE_STORAGE and run under any profile, unattended, with no foreground lease (#2077); control-class sub-operations (weave, kernel, oracle_complete) still require an explicit maintenance profile plus the foreground input lease -- see INTELLIGENCE_OPERATION_CLASSES for the declared classification of every sub-operation",
+                "read-only sub-operations need only READ_STORAGE; measurement-class sub-operations (bits, sufficiency, redundancy, synergy, causality, causal_map, periodicity, drift, hazard, ensemble_card, oracle_predict, oracle_reverse, oracle_validate, oracle_readiness) need READ_STORAGE+WRITE_STORAGE and run under any profile, unattended, with no foreground lease (#2077); control-class sub-operations (weave, kernel, oracle_complete) still require an explicit maintenance profile plus the foreground input lease -- see INTELLIGENCE_OPERATION_CLASSES for the declared classification of every sub-operation",
             ),
             op(
                 "backup",
@@ -3600,6 +3600,11 @@ pub(crate) const INTELLIGENCE_OPERATION_CLASSES: &[(
             Op::Causality,
             Measurement,
             "reads the panel corpus, writes derived Graph/TemporalXTerm rows scoped to the measurement.",
+        ),
+        (
+            Op::CausalMap,
+            Measurement,
+            "reads a complete bounded source-event scope, exhaustively evaluates every selected stream pair through separate typed causal-evidence lanes, and writes one byte-verified content-addressed Graph CF artifact.",
         ),
         (
             Op::Periodicity,

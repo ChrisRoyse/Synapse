@@ -1239,6 +1239,7 @@ pub(super) async fn handle(
                     redundancy: None,
                     synergy: None,
                     causality: None,
+                    causal_map: None,
                     periodicity: None,
                     drift: None,
                     hazard: None,
@@ -1301,6 +1302,14 @@ pub(super) async fn handle(
                         crate::m3::storage::run_intelligence_causality(&db, &spec).map(
                             |causality| StorageIntelligenceResponse {
                                 causality: Some(causality),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::CausalMap => {
+                        crate::m3::storage::run_intelligence_causal_map(&db, &spec).map(
+                            |causal_map| StorageIntelligenceResponse {
+                                causal_map: Some(causal_map),
                                 ..base
                             },
                         )
@@ -1597,6 +1606,27 @@ pub(super) async fn handle(
                     causality.estimator,
                     causality.grounded,
                     causality.graph_cf_rows_after,
+                )
+            } else if let Some(causal_map) = &response.causal_map {
+                let streams = causal_map.artifact["streams"]
+                    .as_array()
+                    .map_or(0, Vec::len);
+                let pairs = causal_map.artifact["pairs"].as_array().map_or(0, Vec::len);
+                format!(
+                    "intelligence causal_map streams={} pairs={} evidence_class={} structural_identified={} graph_key={} sha256={} bytes={} readback_match={} graph_rows={}",
+                    streams,
+                    pairs,
+                    causal_map.artifact["evidence_class"]
+                        .as_str()
+                        .unwrap_or("unknown"),
+                    causal_map.artifact["structural_effect_identified"]
+                        .as_bool()
+                        .unwrap_or(false),
+                    causal_map.graph_key_hex,
+                    causal_map.graph_value_sha256,
+                    causal_map.graph_value_bytes,
+                    causal_map.physical_readback_matches,
+                    causal_map.graph_cf_rows_after,
                 )
             } else if let Some(periodicity) = &response.periodicity {
                 format!(

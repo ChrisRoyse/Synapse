@@ -11,6 +11,7 @@ mod action_validation;
 pub use action_validation::SynapseCalyxActionValidationEvidence;
 mod async_vault;
 pub mod backup;
+mod causal_map;
 mod drift;
 mod error_bridge;
 
@@ -131,6 +132,13 @@ pub use async_vault::{
 pub use backup::{
     SynapseCalyxBackupExclusion, SynapseCalyxBackupFile, SynapseCalyxBackupLineage,
     SynapseCalyxBackupReport, SynapseCalyxVerifyReport, verify_vault_restore,
+};
+pub use causal_map::{
+    SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA, SYNAPSE_CAUSAL_MAP_MAX_STREAMS,
+    SYNAPSE_CAUSAL_MAP_PC_MAX_CONDITIONING, SynapseCalyxCausalEstimatorError,
+    SynapseCalyxCausalEstimatorEvidence, SynapseCalyxCausalMapArtifact,
+    SynapseCalyxCausalMapReport, SynapseCalyxCausalPairEvidence, SynapseCalyxCausalStream,
+    SynapseCalyxFdrDecision, SynapseCalyxFdrFamily,
 };
 pub use drift::{
     SYNAPSE_BLIND_SPOT_ALPHA, SYNAPSE_BLIND_SPOT_MAX_ALERTS, SYNAPSE_BLIND_SPOT_MIN_SAMPLES,
