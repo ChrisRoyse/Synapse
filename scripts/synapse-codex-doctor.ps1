@@ -18,8 +18,16 @@ $ErrorActionPreference = 'Stop'
 function Write-SynapseUtf8NoBomFile {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
-        [Parameter(Mandatory=$true)][string]$Text
+        [Parameter(Mandatory=$true)][AllowNull()][AllowEmptyString()][object]$Text
     )
+
+    if ($null -eq $Text) {
+        throw "SYNAPSE_UTF8_WRITE_TEXT_NULL path=$Path remediation=pass a string; use an empty string only when the source stream is physically empty"
+    }
+    if ($Text -isnot [string]) {
+        $actualType = $Text.GetType().FullName
+        throw "SYNAPSE_UTF8_WRITE_TEXT_TYPE_INVALID path=$Path expected=System.String actual=$actualType remediation=convert the source value to a string before writing"
+    }
 
     $dir = Split-Path -Parent $Path
     if (-not [string]::IsNullOrWhiteSpace($dir)) {
