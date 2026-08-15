@@ -1960,6 +1960,11 @@ where
         self.rows.release_lease(lease_id)
     }
 
+    /// Renews one still-live explicit reader while preserving its exact pin.
+    pub fn renew_reader(&self, snapshot: Snapshot) -> Result<Snapshot> {
+        self.rows.renew_snapshot(snapshot, &self.clock)
+    }
+
     /// Pins a reader lease at a historical `seq` (time-travel) and returns its
     /// lease id, which the caller must release with [`Self::release_reader`].
     pub fn pin_reader_at(&self, seq: Seq, max_age_ms: u64) -> Result<u64> {

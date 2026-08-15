@@ -191,11 +191,11 @@ impl SynapseCalyxVault {
         // The sealed panel membership sidecar is the selective access path.
         // This fold accumulates per-slot and per-anchor-kind totals without
         // decoding unrelated rows from the global CxId-ordered Base keyspace.
-        let walk = self.with_panel_read_snapshot(
+        let (walk, _) = self.with_panel_read_snapshot(
             panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
             |snapshot| {
-                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |snapshot, _key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;

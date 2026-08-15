@@ -615,6 +615,12 @@ const SEARCH_DELTA_SCAN_LEASE_MS: u64 = 30_000;
 /// Reader-lease lifetime for bounded off-runtime corpus scans that enumerate
 /// Base rows and hydrate their slot rows from the same MVCC view.
 pub(crate) const INTELLIGENCE_CORPUS_READER_LEASE_MS: u64 = 30_000;
+/// Maximum panel-membership point reads between lease heartbeats.
+///
+/// Renewal preserves the same pinned sequence; it does not rebase the reader.
+/// A finite row cadence lets a progressing whole-panel scan outlive the lease
+/// TTL while a stalled or abandoned scan still expires normally.
+const PANEL_BASE_SNAPSHOT_RENEW_ROWS: usize = 1_024;
 /// Reader-lease lifetime for MMD drift's exact two-pass bounded corpus.
 ///
 /// The public drift contract accepts up to 20,000 selected records and must
@@ -1312,6 +1318,12 @@ pub struct SynapseCalyxPanelBaseWalk {
     pub indexed_rows: usize,
     pub rows_visited: usize,
     pub stopped_early: bool,
+    /// Successful heartbeats that preserved this walk's exact snapshot pin.
+    pub reader_lease_renewals: usize,
+    /// Initial lease expiry before the first membership point read.
+    pub reader_lease_initial_expires_at: u64,
+    /// Authoritative expiry after the final successful renewal.
+    pub reader_lease_final_expires_at: u64,
 }
 
 impl SynapseCalyxPanelBaseWalk {
@@ -4020,6 +4032,20 @@ impl SynapseCalyxVault {
         )
     }
 
+    /// Renews a still-live scoped reader at the same exact pinned sequence.
+    fn renew_read_snapshot(&self, snapshot: Snapshot) -> Result<Snapshot, SynapseCalyxError> {
+        self.vault.renew_reader(snapshot).map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                &format!(
+                    "renew scoped Calyx reader lease {} at pinned seq {}",
+                    snapshot.lease().id(),
+                    snapshot.seq()
+                ),
+                &error,
+            )
+        })
+    }
+
     fn panel_membership_at_snapshot(
         &self,
         snapshot: Snapshot,
@@ -4124,18 +4150,32 @@ impl SynapseCalyxVault {
     /// path exists to eliminate.
     pub(crate) fn walk_panel_base_snapshot<V>(
         &self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         panel_version: u32,
         mut visit: V,
-    ) -> Result<SynapseCalyxPanelBaseWalk, SynapseCalyxError>
+    ) -> Result<(SynapseCalyxPanelBaseWalk, Snapshot), SynapseCalyxError>
     where
-        V: FnMut(&[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
+        V: FnMut(Snapshot, &[u8], &[u8]) -> Result<SynapseCalyxWalkStep, SynapseCalyxError>,
     {
         let membership = self.panel_membership_at_snapshot(snapshot, panel_version)?;
         let indexed_rows = membership.ids.len();
         let mut rows_visited = 0usize;
         let mut stopped_early = false;
+        let reader_lease_initial_expires_at = snapshot.lease().expires_at();
+        let mut reader_lease_renewals = 0usize;
         for cx_id in membership.ids {
+            if rows_visited > 0 && rows_visited.is_multiple_of(PANEL_BASE_SNAPSHOT_RENEW_ROWS) {
+                snapshot = self.renew_read_snapshot(snapshot)?;
+                reader_lease_renewals = reader_lease_renewals.checked_add(1).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_READER_LEASE_RENEWAL_COUNT_OVERFLOW",
+                        format!(
+                            "panel {panel_version} reader lease renewal count overflowed usize"
+                        ),
+                        "preserve the vault and inspect the bounded panel-walk progress counter",
+                    )
+                })?;
+            }
             let value = self.verified_panel_base_row_at_snapshot(snapshot, panel_version, cx_id)?;
             rows_visited = rows_visited.checked_add(1).ok_or_else(|| {
                 SynapseCalyxError::new(
@@ -4144,7 +4184,7 @@ impl SynapseCalyxVault {
                     "inspect the membership manifest row count and repair the corrupt generation",
                 )
             })?;
-            if visit(cx_id.as_bytes(), &value)? == SynapseCalyxWalkStep::Stop {
+            if visit(snapshot, cx_id.as_bytes(), &value)? == SynapseCalyxWalkStep::Stop {
                 stopped_early = true;
                 break;
             }
@@ -4159,6 +4199,9 @@ impl SynapseCalyxVault {
             indexed_rows,
             rows_visited,
             stopped_early,
+            reader_lease_renewals,
+            reader_lease_initial_expires_at,
+            reader_lease_final_expires_at: snapshot.lease().expires_at(),
         };
         tracing::info!(
             code = "SYNAPSE_CALYX_PANEL_BASE_WALK_COMPLETED",
@@ -4171,9 +4214,12 @@ impl SynapseCalyxVault {
             indexed_rows = report.indexed_rows,
             rows_visited = report.rows_visited,
             stopped_early = report.stopped_early,
+            reader_lease_renewals = report.reader_lease_renewals,
+            reader_lease_initial_expires_at = report.reader_lease_initial_expires_at,
+            reader_lease_final_expires_at = report.reader_lease_final_expires_at,
             "completed a freshness-proven panel-selective Base walk"
         );
-        Ok(report)
+        Ok((report, snapshot))
     }
 
     /// Reads one constellation with its slot vectors hydrated from the per-slot

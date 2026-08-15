@@ -1045,7 +1045,7 @@ impl SynapseCalyxVault {
             panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
             |snapshot| {
-                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |snapshot, _key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
@@ -5508,7 +5508,7 @@ impl SynapseCalyxVault {
         self.with_panel_read_snapshot(
             params.panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
-            |snapshot| self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
+            |snapshot| self.walk_panel_base_snapshot(snapshot, params.panel_version, |_snapshot, _key, value| {
                 let constellation = decode_constellation_base(value).map_err(|error| {
                     SynapseCalyxError::from_calyx("decode Base constellation", &error)
                 })?;
@@ -7040,88 +7040,93 @@ impl SynapseCalyxVault {
                 params.panel_version,
                 crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
                 |snapshot| {
-                    self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
-                        let base = decode_constellation_base(value).map_err(|error| {
-                            SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                        })?;
-                        if base.panel_version != params.panel_version {
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        vault_corpus_size = vault_corpus_size.checked_add(1).ok_or_else(|| {
-                            kernel_corpus_allocation_error(
-                                params.panel_version,
-                                params.content_slot,
-                                "panel corpus count overflowed usize",
-                            )
-                        })?;
-                        // Base identifies slot presence but the vector lives in
-                        // its slot CF. The selected-slot read preserves the same
-                        // pinned snapshot and anchors without allocating every
-                        // other slot in the constellation.
-                        if !base.slots.contains_key(&content_slot.slot_id()) {
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        }
-                        let mut constellation = self
-                            .vault
-                            .get_selected_slots_at_snapshot(
-                                base.cx_id,
-                                snapshot,
-                                [content_slot.slot_id()],
-                            )
-                            .map_err(|error| {
-                                SynapseCalyxError::from_calyx(
-                                    "hydrate pinned kernel content slot",
-                                    &error,
-                                )
+                    self.walk_panel_base_snapshot(
+                        snapshot,
+                        params.panel_version,
+                        |snapshot, _key, value| {
+                            let base = decode_constellation_base(value).map_err(|error| {
+                                SynapseCalyxError::from_calyx("decode Base constellation", &error)
                             })?;
-                        let Some(vector) = constellation.slots.remove(&content_slot.slot_id())
-                        else {
-                            rejects.record("absent");
-                            return Ok(crate::SynapseCalyxWalkStep::Continue);
-                        };
-                        match &vector {
-                            SlotVector::Dense { data, .. }
-                                if data.iter().all(|value| *value == 0.0) =>
-                            {
-                                rejects.record("empty");
+                            if base.panel_version != params.panel_version {
                                 return Ok(crate::SynapseCalyxWalkStep::Continue);
                             }
-                            SlotVector::Sparse { entries, .. } if entries.is_empty() => {
-                                rejects.record("empty");
+                            vault_corpus_size =
+                                vault_corpus_size.checked_add(1).ok_or_else(|| {
+                                    kernel_corpus_allocation_error(
+                                        params.panel_version,
+                                        params.content_slot,
+                                        "panel corpus count overflowed usize",
+                                    )
+                                })?;
+                            // Base identifies slot presence but the vector lives in
+                            // its slot CF. The selected-slot read preserves the same
+                            // pinned snapshot and anchors without allocating every
+                            // other slot in the constellation.
+                            if !base.slots.contains_key(&content_slot.slot_id()) {
                                 return Ok(crate::SynapseCalyxWalkStep::Continue);
                             }
-                            SlotVector::Multi { .. } => {
-                                rejects.record("multi");
-                                return Ok(crate::SynapseCalyxWalkStep::Continue);
-                            }
-                            SlotVector::Absent { .. } => {
+                            let mut constellation = self
+                                .vault
+                                .get_selected_slots_at_snapshot(
+                                    base.cx_id,
+                                    snapshot,
+                                    [content_slot.slot_id()],
+                                )
+                                .map_err(|error| {
+                                    SynapseCalyxError::from_calyx(
+                                        "hydrate pinned kernel content slot",
+                                        &error,
+                                    )
+                                })?;
+                            let Some(vector) = constellation.slots.remove(&content_slot.slot_id())
+                            else {
                                 rejects.record("absent");
                                 return Ok(crate::SynapseCalyxWalkStep::Continue);
+                            };
+                            match &vector {
+                                SlotVector::Dense { data, .. }
+                                    if data.iter().all(|value| *value == 0.0) =>
+                                {
+                                    rejects.record("empty");
+                                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                                }
+                                SlotVector::Sparse { entries, .. } if entries.is_empty() => {
+                                    rejects.record("empty");
+                                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                                }
+                                SlotVector::Multi { .. } => {
+                                    rejects.record("multi");
+                                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                                }
+                                SlotVector::Absent { .. } => {
+                                    rejects.record("absent");
+                                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                                }
+                                SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
                             }
-                            SlotVector::Dense { .. } | SlotVector::Sparse { .. } => {}
-                        }
-                        let has_anchor = constellation.anchors.iter().any(|anchor| {
-                            anchor.confidence > 0.0
-                                && params.anchor_kind.as_deref().is_none_or(|kind| {
-                                    crate::grounding::anchor_kind_label(&anchor.kind) == kind
-                                })
-                        });
-                        let cx_id = constellation.cx_id;
-                        measured_rows.push(
-                            params.panel_version,
-                            params.content_slot,
-                            max_records,
-                            cx_id,
-                            vector,
-                        )?;
-                        if has_anchor {
-                            anchors.push(cx_id);
-                        }
-                        if measured_rows.len() >= max_records {
-                            return Ok(crate::SynapseCalyxWalkStep::Stop);
-                        }
-                        Ok(crate::SynapseCalyxWalkStep::Continue)
-                    })
+                            let has_anchor = constellation.anchors.iter().any(|anchor| {
+                                anchor.confidence > 0.0
+                                    && params.anchor_kind.as_deref().is_none_or(|kind| {
+                                        crate::grounding::anchor_kind_label(&anchor.kind) == kind
+                                    })
+                            });
+                            let cx_id = constellation.cx_id;
+                            measured_rows.push(
+                                params.panel_version,
+                                params.content_slot,
+                                max_records,
+                                cx_id,
+                                vector,
+                            )?;
+                            if has_anchor {
+                                anchors.push(cx_id);
+                            }
+                            if measured_rows.len() >= max_records {
+                                return Ok(crate::SynapseCalyxWalkStep::Stop);
+                            }
+                            Ok(crate::SynapseCalyxWalkStep::Continue)
+                        },
+                    )
                 },
             )?;
 

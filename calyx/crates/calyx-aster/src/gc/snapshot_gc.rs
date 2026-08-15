@@ -37,6 +37,19 @@ pub struct ReadLease {
     pub reader_id: ReaderId,
 }
 
+/// Result of atomically renewing one registered reader lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadLeaseRenewal {
+    /// The same reader id and pinned sequence remain live with a fresh expiry.
+    Renewed(ReadLease),
+    /// No registered lease has this reader id.
+    Missing,
+    /// The registered lease expired before the renewal acquired the registry.
+    Expired,
+    /// The reader id exists but names a different pinned sequence.
+    PinnedSeqMismatch { registered: Seq, requested: Seq },
+}
+
 impl ReadLease {
     pub fn new(reader_id: ReaderId, seq: Seq, created_at: Ts, lease_duration: Duration) -> Self {
         Self::from_millis(reader_id, seq, created_at, duration_millis(lease_duration))
@@ -170,6 +183,44 @@ impl SnapshotPinWatchdog {
 
     pub fn release(&self, reader_id: ReaderId) -> bool {
         self.lock().remove(&reader_id).is_some()
+    }
+
+    /// Renews one still-live lease without changing its reader identity or pin.
+    ///
+    /// The validation and replacement share one registry lock. A watchdog tick
+    /// therefore cannot expire the lease between the liveness check and the
+    /// renewed expiry becoming authoritative, and an already-expired lease is
+    /// never resurrected.
+    pub fn renew_lease_at(
+        &self,
+        reader_id: ReaderId,
+        expected_seq: Seq,
+        now: Ts,
+    ) -> ReadLeaseRenewal {
+        let mut leases = self.lock();
+        let Some(current) = leases.get(&reader_id).copied() else {
+            return ReadLeaseRenewal::Missing;
+        };
+        if current.seq != expected_seq {
+            return ReadLeaseRenewal::PinnedSeqMismatch {
+                registered: current.seq,
+                requested: expected_seq,
+            };
+        }
+        if current.is_expired_at(now) {
+            leases.remove(&reader_id);
+            self.reader_lease_expired_total
+                .fetch_add(1, Ordering::Relaxed);
+            return ReadLeaseRenewal::Expired;
+        }
+        let renewed = ReadLease::from_millis(
+            current.reader_id,
+            current.seq,
+            now,
+            current.lease_duration_ms,
+        );
+        leases.insert(reader_id, renewed);
+        ReadLeaseRenewal::Renewed(renewed)
     }
 
     pub fn abort_reader(&self, reader_id: ReaderId) -> Option<ReadLease> {

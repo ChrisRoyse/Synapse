@@ -336,7 +336,7 @@ impl SynapseCalyxVault {
             panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
             |snapshot| {
-                self.walk_panel_base_snapshot(snapshot, panel_version, |_key, value| {
+                self.walk_panel_base_snapshot(snapshot, panel_version, |_snapshot, _key, value| {
                 let base = calyx_aster::vault::encode::decode_constellation_base_projection(value)
                     .map_err(|error| {
                         SynapseCalyxError::from_calyx(

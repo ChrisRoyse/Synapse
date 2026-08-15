@@ -10,7 +10,8 @@ use crate::mvcc::{
     Freshness, ReadBarrier, ReaderLease, SeqAllocator, Snapshot, read_barrier::first_blocking,
 };
 use crate::resource::{
-    LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ResourceCounters,
+    LeaseRegistry, LeaseView, MemtableCfStatus, MemtableStatus, ReaderLeaseRenewal,
+    ResourceCounters,
 };
 use crate::sst::SstSummary;
 use calyx_core::{CalyxError, Clock, Result, Seq, SlotId, Ts};
@@ -1931,6 +1932,39 @@ impl VersionedCfStore {
     /// Releases one pinned reader lease; returns whether it was still live.
     pub fn release_lease(&self, lease_id: u64) -> bool {
         self.leases.release(lease_id)
+    }
+
+    /// Renews one still-live snapshot lease without changing the pinned state.
+    ///
+    /// Renewal is atomic in the lease registry. Missing, expired, or mismatched
+    /// identities fail closed; a caller can never resurrect an expired pin or
+    /// renew a different sequence under the same reader id.
+    pub fn renew_snapshot(&self, snapshot: Snapshot, clock: &dyn Clock) -> Result<Snapshot> {
+        let lease = snapshot.lease();
+        match self.leases.renew(lease, clock.now()) {
+            ReaderLeaseRenewal::Renewed(renewed) => {
+                Ok(Snapshot::new(snapshot.seq(), snapshot.freshness(), renewed)
+                    .with_derived_content_seq(snapshot.derived_content_seq()))
+            }
+            ReaderLeaseRenewal::Missing => Err(CalyxError::reader_lease_expired(format!(
+                "reader lease {} for seq {} is no longer registered and cannot be renewed",
+                lease.id(),
+                lease.pinned_seq()
+            ))),
+            ReaderLeaseRenewal::Expired => Err(CalyxError::reader_lease_expired(format!(
+                "reader lease {} for seq {} expired at {} before renewal acquired the registry",
+                lease.id(),
+                lease.pinned_seq(),
+                lease.expires_at()
+            ))),
+            ReaderLeaseRenewal::PinnedSeqMismatch {
+                registered,
+                requested,
+            } => Err(CalyxError::aster_corrupt_shard(format!(
+                "reader lease {} renewal identity mismatch: registry pins seq {registered}, caller requested seq {requested}",
+                lease.id()
+            ))),
+        }
     }
 
     /// Live reader-lease view at `now` for resource accounting.

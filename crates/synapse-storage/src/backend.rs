@@ -14261,7 +14261,7 @@ impl PackedSourceReferenceKeys {
         Ok(())
     }
 
-    fn sort_and_dedup(&mut self) {
+    fn sort_and_dedup(&mut self, cf_name: &str) -> Result<(), String> {
         let chunks = self.chunks.as_slice();
         self.ranges.sort_unstable_by(|left, right| {
             packed_source_reference_key(chunks, *left)
@@ -14271,11 +14271,103 @@ impl PackedSourceReferenceKeys {
             packed_source_reference_key(chunks, *left)
                 == packed_source_reference_key(chunks, *right)
         });
+
+        // Deduplicating only the range index is not enough: duplicate source
+        // keys remain physically owned by the byte arena even after no range
+        // can reach them. On the production vault that left hundreds of
+        // thousands of dead key copies resident in the long-lived GC cache.
+        // Compact the unique keys in original physical order, in place. The
+        // destination never advances beyond the source, so no second
+        // corpus-sized arena is allocated and `copy_within` handles overlap.
+        self.ranges
+            .sort_unstable_by_key(|range| (range.chunk(), range.start()));
+        let mut destination_chunk = 0usize;
+        let mut destination_start = 0usize;
+        for index in 0..self.ranges.len() {
+            let source = self.ranges[index];
+            let source_len = source.end().saturating_sub(source.start());
+            while self
+                .chunks
+                .get(destination_chunk)
+                .is_some_and(|chunk| chunk.len().saturating_sub(destination_start) < source_len)
+            {
+                destination_chunk = destination_chunk.checked_add(1).ok_or_else(|| {
+                    format!(
+                        "source-reference compaction destination chunk overflowed for {cf_name}"
+                    )
+                })?;
+                destination_start = 0;
+            }
+            let destination = self.chunks.get(destination_chunk).ok_or_else(|| {
+                format!(
+                    "source-reference compaction exhausted the existing arena for {cf_name}: destination_chunk={destination_chunk} source_chunk={} source_start={} source_len={source_len}",
+                    source.chunk(),
+                    source.start()
+                )
+            })?;
+            if destination.len().saturating_sub(destination_start) < source_len {
+                return Err(format!(
+                    "source-reference compaction destination for {cf_name} has {} bytes but needs {source_len}",
+                    destination.len().saturating_sub(destination_start)
+                ));
+            }
+            if destination_chunk > source.chunk()
+                || (destination_chunk == source.chunk() && destination_start > source.start())
+            {
+                return Err(format!(
+                    "source-reference in-place compaction moved ahead of unread source bytes for {cf_name}: destination={destination_chunk}:{destination_start} source={}:{}",
+                    source.chunk(),
+                    source.start()
+                ));
+            }
+
+            if destination_chunk == source.chunk() {
+                self.chunks[destination_chunk]
+                    .copy_within(source.start()..source.end(), destination_start);
+            } else {
+                let (destination_chunks, source_chunks) = self.chunks.split_at_mut(source.chunk());
+                let destination = destination_chunks.get_mut(destination_chunk).ok_or_else(|| {
+                    format!(
+                        "source-reference destination chunk {destination_chunk} vanished while compacting {cf_name}"
+                    )
+                })?;
+                let source_chunk = source_chunks.first().ok_or_else(|| {
+                    format!(
+                        "source-reference source chunk {} vanished while compacting {cf_name}",
+                        source.chunk()
+                    )
+                })?;
+                destination[destination_start..destination_start + source_len]
+                    .copy_from_slice(&source_chunk[source.start()..source.end()]);
+            }
+            self.ranges[index] = PackedSourceReferenceRange::new(
+                cf_name,
+                destination_chunk,
+                destination_start,
+                source_len,
+            )?;
+            destination_start = destination_start.checked_add(source_len).ok_or_else(|| {
+                format!("source-reference destination offset overflowed while compacting {cf_name}")
+            })?;
+        }
+
+        if self.ranges.is_empty() {
+            self.chunks.clear();
+        } else {
+            self.chunks.truncate(destination_chunk + 1);
+            self.chunks[destination_chunk].truncate(destination_start);
+        }
+        let chunks = self.chunks.as_slice();
+        self.ranges.sort_unstable_by(|left, right| {
+            packed_source_reference_key(chunks, *left)
+                .cmp(packed_source_reference_key(chunks, *right))
+        });
         self.ranges.shrink_to_fit();
         for chunk in &mut self.chunks {
             chunk.shrink_to_fit();
         }
         self.chunks.shrink_to_fit();
+        Ok(())
     }
 
     fn contains(&self, key: &[u8]) -> bool {
@@ -14985,8 +15077,13 @@ fn rebuild_derived_source_references(
             )
         })
     })?;
-    for keys in referenced.values_mut() {
-        keys.sort_and_dedup();
+    for (cf_name, keys) in &mut referenced {
+        keys.sort_and_dedup(cf_name).map_err(|detail| {
+            calyx_write_failed_detail(
+                CALYX_GC_CF,
+                format!("STORAGE_CALYX_GC_SOURCE_CENSUS_COMPACTION_FAILED: {detail}"),
+            )
+        })?;
     }
     let index = DerivedSourceReferenceIndex {
         baseline: referenced,

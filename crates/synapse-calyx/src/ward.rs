@@ -1127,6 +1127,10 @@ impl SynapseCalyxVault {
 
     /// Splits the panel into adjudicated good/bad records, counting everything
     /// it refuses to interpret.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one snapshot-scoped pass classifies every grounded outcome and hydrates its requested guard slots; splitting would obscure that all accepted rows share one coherent pin"
+    )]
     fn collect_adjudicated_corpus(
         &self,
         params: &SynapseCalyxGuardCalibrateParams,
@@ -1150,110 +1154,114 @@ impl SynapseCalyxVault {
             params.panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
             |snapshot| {
-                self.walk_panel_base_snapshot(snapshot, params.panel_version, |_key, value| {
-                    let constellation = decode_constellation_base(value).map_err(|error| {
-                        SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                    })?;
-                    if constellation.panel_version != params.panel_version {
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    corpus.records_scanned += 1;
-                    let mut good = false;
-                    let mut bad = false;
-                    let mut adjudicated = false;
-                    for anchor in &constellation.anchors {
-                        if anchor.confidence <= 0.0 {
-                            continue;
+                self.walk_panel_base_snapshot(
+                    snapshot,
+                    params.panel_version,
+                    |snapshot, _key, value| {
+                        let constellation = decode_constellation_base(value).map_err(|error| {
+                            SynapseCalyxError::from_calyx("decode Base constellation", &error)
+                        })?;
+                        if constellation.panel_version != params.panel_version {
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
                         }
-                        match anchor.value {
-                            AnchorValue::Bool(true) => {
-                                good = true;
-                                adjudicated = true;
+                        corpus.records_scanned += 1;
+                        let mut good = false;
+                        let mut bad = false;
+                        let mut adjudicated = false;
+                        for anchor in &constellation.anchors {
+                            if anchor.confidence <= 0.0 {
+                                continue;
                             }
-                            AnchorValue::Bool(false) => {
-                                bad = true;
-                                adjudicated = true;
-                            }
-                            // An enum is adjudicable only when its kind appears in the
-                            // closed declaration table, which copies a partition the
-                            // writing subsystem already makes. An undeclared kind falls
-                            // through to unadjudicated, so this stays fail-closed.
-                            AnchorValue::Enum(ref value) => {
-                                match declared_enum_verdict(&anchor.kind, value) {
-                                    Some(true) => {
-                                        good = true;
-                                        adjudicated = true;
-                                    }
-                                    Some(false) => {
-                                        bad = true;
-                                        adjudicated = true;
-                                    }
-                                    None => {}
+                            match anchor.value {
+                                AnchorValue::Bool(true) => {
+                                    good = true;
+                                    adjudicated = true;
                                 }
+                                AnchorValue::Bool(false) => {
+                                    bad = true;
+                                    adjudicated = true;
+                                }
+                                // An enum is adjudicable only when its kind appears in the
+                                // closed declaration table, which copies a partition the
+                                // writing subsystem already makes. An undeclared kind falls
+                                // through to unadjudicated, so this stays fail-closed.
+                                AnchorValue::Enum(ref value) => {
+                                    match declared_enum_verdict(&anchor.kind, value) {
+                                        Some(true) => {
+                                            good = true;
+                                            adjudicated = true;
+                                        }
+                                        Some(false) => {
+                                            bad = true;
+                                            adjudicated = true;
+                                        }
+                                        None => {}
+                                    }
+                                }
+                                // No repo-wide polarity convention exists for these values.
+                                // Interpreting one would fabricate the very labels the
+                                // conformal bound is a statement about.
+                                _ => {}
                             }
-                            // No repo-wide polarity convention exists for these values.
-                            // Interpreting one would fabricate the very labels the
-                            // conformal bound is a statement about.
-                            _ => {}
                         }
-                    }
-                    if !adjudicated {
-                        corpus.unadjudicated += 1;
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    if good && bad {
-                        corpus.conflicting += 1;
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    // A Base row carries only `(slot_id, slot_hash)` pairs: every slot
-                    // it decodes to is `SlotVector::Absent`, by design, because the
-                    // vectors live in the per-slot CFs (#1894). Reading `slots`
-                    // straight off the decoded row therefore found NOTHING on every
-                    // record of every panel, so `slots.is_empty()` was always true and
-                    // every adjudicated record was dropped by the `continue` below —
-                    // silently, without a counter.
-                    //
-                    // That made `guard_calibrate` incapable of scoring a single record
-                    // on any vault, including one with a perfect Bool corpus. It went
-                    // unnoticed because the guard has always refused earlier, at
-                    // PANEL_MISMATCH or BAD_CORPUS_ABSENT, and never reached this line
-                    // on real data. `load_panel_dense_corpus` hydrates for exactly this
-                    // reason; the guard has to as well.
-                    let hydrated =
-                        self.hydrated_constellation_at_snapshot(constellation.cx_id, snapshot)?;
-                    let mut slots = BTreeMap::new();
-                    for slot in &wanted {
-                        if let Some(vector) = hydrated
-                            .slots
-                            .get(&SlotId::new(*slot))
-                            .and_then(guard_dense_vector)
-                        {
-                            slots.insert(*slot, vector);
+                        if !adjudicated {
+                            corpus.unadjudicated += 1;
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
                         }
-                    }
-                    if slots.is_empty() {
-                        // Counted, not swallowed. An adjudicated record that carries
-                        // none of the requested slots is a real finding — it usually
-                        // means the caller named a slot this panel does not measure, or
-                        // measures only on a subset — and the previous silent `continue`
-                        // is what let the hydration defect above hide.
-                        corpus.adjudicated_without_guarded_slots += 1;
-                        return Ok(crate::SynapseCalyxWalkStep::Continue);
-                    }
-                    let record = AdjudicatedRecord {
-                        cx_id: constellation.cx_id,
-                        slots,
-                    };
-                    if good {
-                        corpus.good.push(record);
-                    } else {
-                        corpus.bad.push(record);
-                    }
-                    if corpus.records_scanned >= max_records {
-                        return Ok(crate::SynapseCalyxWalkStep::Stop);
-                    }
-                    Ok(crate::SynapseCalyxWalkStep::Continue)
-                })
+                        if good && bad {
+                            corpus.conflicting += 1;
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        // A Base row carries only `(slot_id, slot_hash)` pairs: every slot
+                        // it decodes to is `SlotVector::Absent`, by design, because the
+                        // vectors live in the per-slot CFs (#1894). Reading `slots`
+                        // straight off the decoded row therefore found NOTHING on every
+                        // record of every panel, so `slots.is_empty()` was always true and
+                        // every adjudicated record was dropped by the `continue` below —
+                        // silently, without a counter.
+                        //
+                        // That made `guard_calibrate` incapable of scoring a single record
+                        // on any vault, including one with a perfect Bool corpus. It went
+                        // unnoticed because the guard has always refused earlier, at
+                        // PANEL_MISMATCH or BAD_CORPUS_ABSENT, and never reached this line
+                        // on real data. `load_panel_dense_corpus` hydrates for exactly this
+                        // reason; the guard has to as well.
+                        let hydrated =
+                            self.hydrated_constellation_at_snapshot(constellation.cx_id, snapshot)?;
+                        let mut slots = BTreeMap::new();
+                        for slot in &wanted {
+                            if let Some(vector) = hydrated
+                                .slots
+                                .get(&SlotId::new(*slot))
+                                .and_then(guard_dense_vector)
+                            {
+                                slots.insert(*slot, vector);
+                            }
+                        }
+                        if slots.is_empty() {
+                            // Counted, not swallowed. An adjudicated record that carries
+                            // none of the requested slots is a real finding — it usually
+                            // means the caller named a slot this panel does not measure, or
+                            // measures only on a subset — and the previous silent `continue`
+                            // is what let the hydration defect above hide.
+                            corpus.adjudicated_without_guarded_slots += 1;
+                            return Ok(crate::SynapseCalyxWalkStep::Continue);
+                        }
+                        let record = AdjudicatedRecord {
+                            cx_id: constellation.cx_id,
+                            slots,
+                        };
+                        if good {
+                            corpus.good.push(record);
+                        } else {
+                            corpus.bad.push(record);
+                        }
+                        if corpus.records_scanned >= max_records {
+                            return Ok(crate::SynapseCalyxWalkStep::Stop);
+                        }
+                        Ok(crate::SynapseCalyxWalkStep::Continue)
+                    },
+                )
             },
         )?;
         Ok(corpus)

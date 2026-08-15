@@ -1,6 +1,8 @@
 //! Active reader-lease registry for oldest-pinned-seq gap accounting.
 
-use crate::gc::{GapAlert, ReadLease, ReaderId, SnapshotPinMetrics, SnapshotPinWatchdog};
+use crate::gc::{
+    GapAlert, ReadLease, ReadLeaseRenewal, ReaderId, SnapshotPinMetrics, SnapshotPinWatchdog,
+};
 use crate::mvcc::ReaderLease;
 use calyx_core::{Seq, Ts};
 
@@ -27,6 +29,15 @@ pub struct LeaseView {
     pub reader_lease_expired_total: u64,
 }
 
+/// Store-facing result of renewing one reader lease.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReaderLeaseRenewal {
+    Renewed(ReaderLease),
+    Missing,
+    Expired,
+    PinnedSeqMismatch { registered: Seq, requested: Seq },
+}
+
 impl LeaseRegistry {
     /// Registers a freshly issued lease.
     pub fn register(&self, lease: ReaderLease) {
@@ -41,6 +52,30 @@ impl LeaseRegistry {
     /// Releases one lease; returns whether it was still registered.
     pub fn release(&self, lease_id: u64) -> bool {
         self.watchdog.release(lease_id)
+    }
+
+    /// Atomically renews one live lease at the same identity and pinned seq.
+    pub(crate) fn renew(&self, lease: ReaderLease, now: Ts) -> ReaderLeaseRenewal {
+        match self
+            .watchdog
+            .renew_lease_at(lease.id(), lease.pinned_seq(), now)
+        {
+            ReadLeaseRenewal::Renewed(renewed) => ReaderLeaseRenewal::Renewed(ReaderLease::new(
+                renewed.reader_id,
+                renewed.seq,
+                renewed.created_at,
+                renewed.lease_duration_ms,
+            )),
+            ReadLeaseRenewal::Missing => ReaderLeaseRenewal::Missing,
+            ReadLeaseRenewal::Expired => ReaderLeaseRenewal::Expired,
+            ReadLeaseRenewal::PinnedSeqMismatch {
+                registered,
+                requested,
+            } => ReaderLeaseRenewal::PinnedSeqMismatch {
+                registered,
+                requested,
+            },
+        }
     }
 
     /// Aborts one lease if the caller observed it expired at `now`.

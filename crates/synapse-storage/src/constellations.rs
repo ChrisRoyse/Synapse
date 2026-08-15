@@ -3454,6 +3454,7 @@ pub fn syn_active_panel_contract(
     let slots = match panel_version {
         SYN_TIMELINE_PANEL_VERSION => timeline_panel_slots(panel_version, &mut registry)?,
         SYN_EPISODE_PANEL_VERSION => episode_panel_slots(panel_version, &mut registry)?,
+        SYN_AGENT_EVENT_PANEL_VERSION => agent_event_panel_slots(panel_version, &mut registry)?,
         SYN_MCP_USAGE_PANEL_VERSION => mcp_usage_panel_slots(panel_version, &mut registry)?,
         SYN_AGENT_TRANSCRIPT_PANEL_VERSION => {
             agent_transcript_panel_slots(panel_version, &mut registry)?
@@ -3474,6 +3475,155 @@ pub fn syn_active_panel_contract(
         },
         registry,
     }))
+}
+
+/// The built-in contract for the live agent-event panel.
+///
+/// This mirrors [`build_agent_event_constellation`] exactly. The scheduled Loom
+/// and Lodestar routes consume this panel, so omitting it from the reconstructable
+/// contract made those real consumers depend on a search-membership generation
+/// that the declared-queryable maintainer was structurally unable to build.
+#[allow(
+    clippy::too_many_lines,
+    reason = "agent event panel contract is a one-to-one slot-to-frozen-lens map mirroring build_agent_event_constellation; splitting would obscure the stable contract"
+)]
+fn agent_event_panel_slots(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Vec<Slot>> {
+    Ok(vec![
+        syn_content_slot(
+            AE_SLOT_KIND_ONEHOT,
+            "syn.agent_event.kind_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_event.kind_onehot.v1",
+                Modality::Structured,
+                32,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_OPERATION_ONEHOT,
+            "syn.agent_event.operation_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_event.operation_onehot.v1",
+                Modality::Structured,
+                16,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_PROVIDER_HASH,
+            "syn.agent_event.provider_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_event.provider_hash.v1",
+                Modality::Structured,
+                512,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_REQUEST_MODEL_HASH,
+            "syn.agent_event.request_model_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_event.request_model_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_RESPONSE_MODEL_HASH,
+            "syn.agent_event.response_model_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_event.response_model_hash.v1",
+                Modality::Structured,
+                1024,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_TOOL_HASH,
+            "syn.agent_event.tool_hash.v1",
+            RegistryAlgorithmicLens::syn_hash(
+                "syn.agent_event.tool_hash.v1",
+                Modality::Structured,
+                2048,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_ERROR_ONEHOT,
+            "syn.agent_event.error_onehot.v1",
+            RegistryAlgorithmicLens::syn_one_hot(
+                "syn.agent_event.error_onehot.v1",
+                Modality::Structured,
+                64,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_END_STATE_ONEHOT,
+            "syn.agent_event.end_state_onehot.v2",
+            RegistryAlgorithmicLens::syn_one_hot_index(
+                "syn.agent_event.end_state_onehot.v2",
+                Modality::Structured,
+                3,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_HOUR_CYCLIC,
+            "syn.agent_event.hour_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.agent_event.hour_cyclic.v1",
+                Modality::Structured,
+                24,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_DOW_CYCLIC,
+            "syn.agent_event.dow_cyclic.v1",
+            RegistryAlgorithmicLens::syn_cyclic_time(
+                "syn.agent_event.dow_cyclic.v1",
+                Modality::Structured,
+                7,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_USAGE_TOTAL_LOG1P,
+            "syn.agent_event.usage_total_log1p.v1",
+            RegistryAlgorithmicLens::syn_scalar_log1p(
+                "syn.agent_event.usage_total_log1p.v1",
+                Modality::Structured,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            AE_SLOT_HAS_END_STATE,
+            "syn.agent_event.has_end_state.v1",
+            RegistryAlgorithmicLens::syn_one_hot_index(
+                "syn.agent_event.has_end_state.v1",
+                Modality::Structured,
+                2,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ])
 }
 
 /// One panel slot's declared cosine grading (#1963 ask 3).

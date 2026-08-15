@@ -13,6 +13,7 @@ mod status;
 pub use collect::collect_resource_status;
 pub use counters::{BackpressureStatus, ResourceCounters};
 pub use heap::{CALYX_RESOURCE_PROBE_UNAVAILABLE, heap_rss_bytes, process_private_bytes};
+pub(crate) use leases::ReaderLeaseRenewal;
 pub use leases::{LeaseRegistry, LeaseView};
 pub use status::{
     CfCompactionDebt, CompactionDebtStatus, HeapStatus, MemtableCfStatus, MemtableStatus,

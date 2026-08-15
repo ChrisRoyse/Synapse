@@ -296,7 +296,7 @@ impl SynapseCalyxVault {
         self.with_panel_read_snapshot(
             ACTION_PANEL_VERSION,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
-            |snapshot| self.walk_panel_base_snapshot(snapshot, ACTION_PANEL_VERSION, |_key, value| {
+            |snapshot| self.walk_panel_base_snapshot(snapshot, ACTION_PANEL_VERSION, |_snapshot, _key, value| {
             let base = decode_constellation_base(value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode action validation Base row", &error)
             })?;

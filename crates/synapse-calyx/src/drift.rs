@@ -1273,10 +1273,10 @@ impl SynapseCalyxVault {
             |snapshot| {
             let mut selected = BTreeSet::new();
             let mut records_scanned = 0usize;
-            let walk = self.walk_panel_base_snapshot(
+            let (walk, mut snapshot) = self.walk_panel_base_snapshot(
                 snapshot,
                 panel_version,
-                |_key, value| {
+                |_snapshot, _key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
@@ -1310,7 +1310,12 @@ impl SynapseCalyxVault {
 
             let mut dense_slots = BTreeSet::new();
             let mut dimensions: BTreeMap<SlotId, BTreeMap<usize, usize>> = BTreeMap::new();
-            for (_, cx_id) in &selected {
+            for (index, (_, cx_id)) in selected.iter().enumerate() {
+                if index > 0
+                    && index.is_multiple_of(crate::PANEL_BASE_SNAPSHOT_RENEW_ROWS)
+                {
+                    snapshot = self.renew_read_snapshot(snapshot)?;
+                }
                 let constellation = self.hydrated_constellation_at_snapshot(*cx_id, snapshot)?;
                 for (slot, vector) in constellation.slots {
                     if let SlotVector::Dense { data, .. } = vector {
@@ -1567,10 +1572,10 @@ impl SynapseCalyxVault {
             // selection, so a large panel costs O(max_records) memory and reads.
             // Membership point reads and every hydration share this scope's one
             // registered snapshot lease: no latest read can introduce a post-pin id.
-            let walk = self.walk_panel_base_snapshot(
+            let (walk, mut snapshot) = self.walk_panel_base_snapshot(
                 snapshot,
                 panel_version,
-                |_key, value| {
+                |_snapshot, _key, value| {
                     let base = decode_constellation_base(value).map_err(|error| {
                         SynapseCalyxError::from_calyx("decode Base constellation", &error)
                     })?;
@@ -1602,7 +1607,12 @@ impl SynapseCalyxVault {
                 ));
             }
             let mut records = Vec::with_capacity(selected.len());
-            for (_, cx_id) in selected {
+            for (index, (_, cx_id)) in selected.into_iter().enumerate() {
+                if index > 0
+                    && index.is_multiple_of(crate::PANEL_BASE_SNAPSHOT_RENEW_ROWS)
+                {
+                    snapshot = self.renew_read_snapshot(snapshot)?;
+                }
                 // Slot vectors live in the per-slot CFs; Base carries their typed
                 // absence only (#1894), so hydrate exactly the selected records.
                 let constellation = self.hydrated_constellation_at_snapshot(cx_id, snapshot)?;
