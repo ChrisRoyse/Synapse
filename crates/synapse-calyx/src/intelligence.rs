@@ -5992,9 +5992,9 @@ fn anchor_source_leakage_error(
 // Every estimator is wired from the calyx-lodestar substrate (kernel selection,
 // recall measurement, answer derivation — no reimplementation). The selected
 // kernel persists to the native Kernel CF with a corpus fingerprint and is read
-// back so oracle (#1678)/ward (#1677)/hygiene can consume it. Answers rebuild the
-// kernel inputs from the vault (the sole source of truth — no side store) and
-// derive the grounded path fresh, bounded and off-runtime.
+// back so oracle (#1678)/ward (#1677)/hygiene can consume it. Answers load that
+// exact persisted kernel and require its corpus fingerprint to match the current
+// bounded vault corpus before deriving a grounded path, bounded and off-runtime.
 // ---------------------------------------------------------------------------
 
 /// Default k for the embedding-proximity association graph the kernel selects on.
@@ -6050,6 +6050,37 @@ impl SynapseCalyxKernelParams {
     }
 }
 
+/// Validates one kernel request without silently correcting any field.
+///
+/// # Errors
+///
+/// Returns `SYNAPSE_CALYX_KERNEL_PARAMS_INVALID` with all measured fields when
+/// any bound, finite-number requirement, or domain-label invariant is violated.
+pub fn validate_kernel_params(params: &SynapseCalyxKernelParams) -> Result<(), SynapseCalyxError> {
+    let anchor_kind_valid = params
+        .anchor_kind
+        .as_deref()
+        .is_none_or(|kind| !kind.trim().is_empty());
+    if (1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&params.max_records)
+        && (1..=64).contains(&params.knn)
+        && params.edge_cos_threshold.is_finite()
+        && (-1.0..=1.0).contains(&params.edge_cos_threshold)
+        && params.min_recall_ratio.is_finite()
+        && (0.0..=1.0).contains(&params.min_recall_ratio)
+        && anchor_kind_valid
+    {
+        return Ok(());
+    }
+    Err(SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_PARAMS_INVALID",
+        format!(
+            "kernel parameters are outside the serving contract: max_records={} (required 1..={SYNAPSE_INTELLIGENCE_MAX_RECORDS}), knn={} (required 1..=64), edge_cos_threshold={} (required finite -1..=1), min_recall_ratio={} (required finite 0..=1), anchor_kind_nonempty={anchor_kind_valid}",
+            params.max_records, params.knn, params.edge_cos_threshold, params.min_recall_ratio
+        ),
+        "repair the exact invalid parameter; kernel operations never clamp, default, or reinterpret an invalid value",
+    ))
+}
+
 /// A derived per-domain grounding kernel with its measured recall and the
 /// physical Kernel CF readback.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -6057,8 +6088,8 @@ pub struct SynapseCalyxKernelReport {
     pub panel_version: u32,
     pub content_slot: u16,
     pub kernel_id: String,
-    /// Corpus fingerprint (sha256 over the sorted embedded `cx_ids`) proving which
-    /// corpus this kernel was selected against.
+    /// Semantic corpus fingerprint over sorted identities, exact vectors, and
+    /// the sorted anchored set, proving what the kernel was selected against.
     pub corpus_fingerprint: String,
     pub members: usize,
     pub kernel_graph_nodes: usize,
@@ -6115,6 +6146,15 @@ pub struct DomainKernelInputs {
     pub corpus_size: usize,
     pub vault_corpus_size: usize,
     pub corpus_fingerprint: String,
+}
+
+struct DomainKernelCorpus {
+    rows: KernelContentRows,
+    anchors: Vec<CxId>,
+    graph: AssocGraph,
+    corpus_size: usize,
+    vault_corpus_size: usize,
+    corpus_fingerprint: String,
 }
 
 enum KernelContentRows {
@@ -6790,6 +6830,7 @@ impl SynapseCalyxVault {
         &self,
         params: &SynapseCalyxKernelParams,
     ) -> Result<SynapseCalyxKernelReport, SynapseCalyxError> {
+        validate_kernel_params(params)?;
         let inputs = self.build_domain_kernel_inputs(params)?;
         // The honesty gate: an ungrounded kernel (recall below the gate) is a
         // structured error, never persisted or served.
@@ -6826,9 +6867,14 @@ impl SynapseCalyxVault {
             .collect();
 
         let row = serde_json::json!({
+            "serving_contract_version": crate::kernel_maintenance::KERNEL_SERVING_CONTRACT_VERSION,
             "panel_version": params.panel_version,
             "content_slot": params.content_slot,
             "kernel_id": inputs.kernel.kernel_id.to_string(),
+            "max_records": params.max_records,
+            "knn": params.knn,
+            "edge_cos_threshold": params.edge_cos_threshold,
+            "math_execution_class": params.math_execution_class.as_str(),
             "corpus_fingerprint": inputs.corpus_fingerprint,
             "anchor_kind": inputs.kernel.anchor_kind,
             "members": inputs.kernel.members.iter().map(CxId::to_string).collect::<Vec<_>>(),
@@ -6840,21 +6886,19 @@ impl SynapseCalyxVault {
             "built_at_millis": inputs.kernel.built_at_millis,
             "estimator_provenance": inputs.kernel.estimator_provenance,
         });
-        self.persist_temporal_row(
-            ColumnFamily::Kernel,
-            kernel_row_key(params.panel_version, params.content_slot),
-            &row,
-        )?;
-        // The JSON row above is a *report*. `kernel_health` (PRD 08 §8) is
-        // defined to READ the persisted Kernel artifact and never recompute
-        // recall/groundedness, so the artifact itself has to be durable as
-        // well; otherwise health has nothing honest to read and would have to
-        // re-derive — exactly the fabrication that surface forbids.
+        // Publish immutable data before its discoverable index pointer. A crash
+        // may leave an unreachable artifact, but can never expose an index row
+        // whose artifact has not reached the Kernel CF yet.
         write_kernel_artifact(
             &inputs.kernel,
             &crate::kernel_maintenance::VaultKernelArtifactStore::new(self),
         )
         .map_err(|error| kernel_math_error("persist the Kernel artifact", &error))?;
+        self.persist_temporal_row(
+            ColumnFamily::Kernel,
+            kernel_row_key(params.panel_version, params.content_slot),
+            &row,
+        )?;
         let kernel_cf_rows_after = self
             .count_cf_latest_bounded(ColumnFamily::Kernel)?
             .rows_visited;
@@ -6880,12 +6924,10 @@ impl SynapseCalyxVault {
         })
     }
 
-    /// Answers a grounded query through the domain kernel: rebuilds the kernel
-    /// inputs from the vault, enforces the recall gate, then walks the kernel from
-    /// the query record to its nearest anchored kernel node and returns the
-    /// evidence path with hop scores. Insufficient grounding (recall below gate,
-    /// query record without an embedding, or no anchored path within `max_hops`)
-    /// is a structured refusal that names the gap — never a confabulated answer.
+    /// Answers a grounded query through the persisted domain kernel. The Kernel
+    /// CF supplies the immutable selection and measured recall; current Base/slot
+    /// rows must reproduce the exact semantic corpus before the query graph is
+    /// hydrated. Missing, stale, or mismatched state is never rebuilt in-read.
     ///
     /// # Errors
     ///
@@ -6911,8 +6953,15 @@ impl SynapseCalyxVault {
         query_cx_id: &str,
         max_hops: usize,
     ) -> Result<SynapseCalyxKernelAnswerReport, SynapseCalyxError> {
+        if !(1..=64).contains(&max_hops) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_PARAMS_INVALID",
+                format!("kernel answer max_hops={max_hops} is outside 1..=64"),
+                "pass max_hops within the declared bound; kernel answers never clamp an invalid request",
+            ));
+        }
         let query_cx = crate::parse_cx_id(query_cx_id)?;
-        let inputs = self.build_domain_kernel_inputs(params)?;
+        let inputs = self.load_persisted_domain_kernel_inputs(params)?;
         if inputs.recall_ratio < params.min_recall_ratio {
             return Err(SynapseCalyxError::new(
                 LodestarError::RecallBelowGate {
@@ -6948,7 +6997,6 @@ impl SynapseCalyxVault {
             ));
         }
 
-        let max_hops = max_hops.clamp(1, 64);
         let derivation: AnswerDerivation = match (&inputs.rows, &inputs.kernel_index) {
             (KernelContentRows::Dense(rows), Some(index)) => {
                 let query_vec = rows.iter().find(|row| row.cx_id == query_cx)
@@ -6999,11 +7047,10 @@ impl SynapseCalyxVault {
         })
     }
 
-    /// Assembles the kernel inputs from the vault: scans the panel's Base CF for
-    /// the content-slot embedding, builds the embedding-proximity kNN association
-    /// graph through the explicitly declared math execution class, selects the kernel via the
-    /// substrate MFVS pipeline, builds the kernel index, and measures kernel-only
-    /// recall against the full corpus.
+    /// Hydrates the bounded current corpus and association graph used by both
+    /// cold kernel builds and persisted-kernel serving. Selection and recall do
+    /// not belong here: a read must be able to hydrate current query data without
+    /// silently constructing a second, unpersisted kernel.
     ///
     /// # Errors
     ///
@@ -7011,13 +7058,12 @@ impl SynapseCalyxVault {
     /// concepts, no anchored concept in the requested domain scope, or when the
     /// substrate graph/kernel/recall math fails closed.
     #[allow(clippy::too_many_lines)]
-    pub fn build_domain_kernel_inputs(
+    fn hydrate_domain_kernel_corpus(
         &self,
         params: &SynapseCalyxKernelParams,
-    ) -> Result<DomainKernelInputs, SynapseCalyxError> {
-        let max_records = params
-            .max_records
-            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
+    ) -> Result<DomainKernelCorpus, SynapseCalyxError> {
+        validate_kernel_params(params)?;
+        let max_records = params.max_records;
         let content_slot = PanelSlotId::new(params.panel_version, SlotId::new(params.content_slot));
         let hydration = (|| {
             let mut measured_rows = KernelHydrationRows::Empty;
@@ -7235,11 +7281,147 @@ impl SynapseCalyxVault {
         );
 
         let graph = self.build_kernel_assoc_graph(&rows, params)?;
-        let corpus_fingerprint = corpus_fingerprint(&rows);
+        let corpus_fingerprint = corpus_fingerprint(&rows, &anchors);
+        let corpus_size = rows.len();
+        Ok(DomainKernelCorpus {
+            rows,
+            anchors,
+            graph,
+            corpus_size,
+            vault_corpus_size,
+            corpus_fingerprint,
+        })
+    }
+
+    fn load_persisted_domain_kernel_inputs(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<DomainKernelInputs, SynapseCalyxError> {
+        validate_kernel_params(params)?;
+        let persisted = self.read_domain_kernel_for_serving(
+            params.panel_version,
+            params.content_slot,
+            params.anchor_kind.as_deref(),
+        )?;
+        if persisted.max_records != params.max_records
+            || persisted.knn != params.knn
+            || persisted.edge_cos_threshold.to_bits() != params.edge_cos_threshold.to_bits()
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_SERVING_CONTRACT_MISMATCH",
+                format!(
+                    "persisted kernel graph contract max_records={} knn={} edge_cos_threshold={} does not match requested max_records={} knn={} edge_cos_threshold={} for panel {} slot {}",
+                    persisted.max_records,
+                    persisted.knn,
+                    persisted.edge_cos_threshold,
+                    params.max_records,
+                    params.knn,
+                    params.edge_cos_threshold,
+                    params.panel_version,
+                    params.content_slot
+                ),
+                "query with the exact persisted graph contract or rebuild the kernel under the intended parameters; reads never recompute a replacement kernel",
+            ));
+        }
+
+        let mut serving_params = params.clone();
+        serving_params.math_execution_class = persisted.math_execution_class;
+        let DomainKernelCorpus {
+            rows,
+            anchors,
+            graph,
+            corpus_size,
+            vault_corpus_size,
+            corpus_fingerprint,
+        } = self.hydrate_domain_kernel_corpus(&serving_params)?;
+        if persisted.corpus_fingerprint != corpus_fingerprint {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_CORPUS_STALE",
+                format!(
+                    "persisted kernel {} corpus fingerprint {} does not match current bounded panel {} slot {} corpus fingerprint {}",
+                    persisted.kernel.kernel_id,
+                    persisted.corpus_fingerprint,
+                    params.panel_version,
+                    params.content_slot,
+                    corpus_fingerprint
+                ),
+                "run the cold kernel rebuild for this exact panel/slot/domain; serving never combines an old kernel selection and recall certificate with a different corpus",
+            ));
+        }
+        let available = rows.ids().into_iter().collect::<BTreeSet<_>>();
+        if let Some(missing) = persisted
+            .kernel
+            .members
+            .iter()
+            .find(|member| !available.contains(member))
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_ARTIFACT_MEMBER_MISSING",
+                format!(
+                    "persisted kernel {} member {missing} is absent from the current bounded panel {} slot {} corpus",
+                    persisted.kernel.kernel_id, params.panel_version, params.content_slot
+                ),
+                "rebuild the persisted kernel against the current corpus; never silently drop an artifact member",
+            ));
+        }
+
+        verify_kernel_serving_identity(&persisted.kernel, &serving_params, &rows, &anchors)?;
+
+        let kernel = persisted.kernel;
+        let kernel_index = match &rows {
+            KernelContentRows::Dense(dense) => {
+                let members = kernel.members.iter().copied().collect::<BTreeSet<_>>();
+                let embeddings = dense
+                    .iter()
+                    .filter(|row| members.contains(&row.cx_id))
+                    .map(|row| (row.cx_id, row.vector.clone()))
+                    .collect::<BTreeMap<_, _>>();
+                Some(build_kernel_index(&kernel, &embeddings).map_err(|error| {
+                    kernel_math_error("build persisted dense kernel serving index", &error)
+                })?)
+            }
+            KernelContentRows::Sparse(_) => None,
+        };
+        Ok(DomainKernelInputs {
+            rows,
+            anchors,
+            graph,
+            recall_kernel_only: kernel.recall.kernel_only,
+            recall_ratio: kernel.recall.ratio,
+            kernel,
+            kernel_index,
+            corpus_size,
+            vault_corpus_size,
+            corpus_fingerprint,
+        })
+    }
+
+    /// Assembles a new kernel from the current vault corpus for cold build and
+    /// persistence. Read-only answer serving uses
+    /// [`Self::load_persisted_domain_kernel_inputs`] instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when request bounds are invalid, corpus
+    /// hydration fails, kernel selection cannot ground the corpus, or recall
+    /// measurement fails.
+    #[allow(clippy::too_many_lines)]
+    pub fn build_domain_kernel_inputs(
+        &self,
+        params: &SynapseCalyxKernelParams,
+    ) -> Result<DomainKernelInputs, SynapseCalyxError> {
+        let DomainKernelCorpus {
+            rows,
+            anchors,
+            graph,
+            corpus_size,
+            vault_corpus_size,
+            corpus_fingerprint,
+        } = self.hydrate_domain_kernel_corpus(params)?;
         let kernel_params = KernelParams {
             panel_version: params.panel_version,
             anchor_kind: params.anchor_kind.clone(),
-            corpus_shard_hash: corpus_hash_bytes(&rows),
+            corpus_shard_hash: corpus_hash_bytes(&rows, &anchors),
             built_at_millis: self.clock_now_ms().unwrap_or(0),
             kernel_graph: KernelGraphParams::default(),
             lp_round: LpRoundParams::default(),
@@ -7256,7 +7438,6 @@ impl SynapseCalyxVault {
                 "inspect the association graph density (knn/edge_cos_threshold) and the anchored set",
             ));
         }
-        let corpus_size = rows.len();
         let recall_params = RecallEvalParams {
             min_recall_ratio: params.min_recall_ratio,
             ..RecallEvalParams::default()
@@ -7381,14 +7562,7 @@ impl SynapseCalyxVault {
         recall.tau_star_estimate = kernel.recall.tau_star_estimate;
         recall.tau_star_exact = kernel.recall.tau_star_exact;
         kernel.recall = recall.clone();
-        let mut physical_contract = Sha256::new();
-        physical_contract.update(b"synapse-domain-kernel-physical-contract-v1");
-        physical_contract.update(params.panel_version.to_be_bytes());
-        physical_contract.update(params.content_slot.to_be_bytes());
-        physical_contract.update(u64::try_from(params.knn).unwrap_or(u64::MAX).to_be_bytes());
-        physical_contract.update(params.edge_cos_threshold.to_bits().to_be_bytes());
-        physical_contract.update(corpus_hash_bytes(&rows));
-        let physical_contract: [u8; 32] = physical_contract.finalize().into();
+        let physical_contract = kernel_physical_contract(params, &rows, &anchors);
         seal_completed_kernel_identity(&mut kernel, &physical_contract)
             .map_err(|error| kernel_math_error("seal completed domain kernel identity", &error))?;
 
@@ -7431,7 +7605,7 @@ impl SynapseCalyxVault {
                 .add_node(row.cx_id, 1.0)
                 .map_err(|error| paths_error("add kernel graph node", &error))?;
         }
-        let knn = params.knn.clamp(1, 64);
+        let knn = params.knn;
         // Only equal-dimension vectors can be compared by cosine; group by dim.
         let mut by_dim: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (index, row) in rows.iter().enumerate() {
@@ -7488,7 +7662,7 @@ fn build_sparse_kernel_assoc_graph(
             .add_node(row.cx_id, 1.0)
             .map_err(|error| paths_error("add sparse kernel graph node", &error))?;
     }
-    let knn = params.knn.clamp(1, 64);
+    let knn = params.knn;
     tracing::info!(
         code = "SYNAPSE_CALYX_KERNEL_MATH_EXECUTION_CLASS",
         panel_version = params.panel_version,
@@ -7654,10 +7828,10 @@ fn kernel_graph_cosine(score: f32) -> Result<f32, SynapseCalyxError> {
     Ok(score.clamp(0.0, 1.0))
 }
 
-/// Content fingerprint of the embedded corpus: sha256 over the sorted `cx_id`
-/// bytes, hex-encoded — proves which concepts the kernel was selected against.
-fn corpus_fingerprint(rows: &KernelContentRows) -> String {
-    let bytes = corpus_hash_bytes(rows);
+/// Semantic fingerprint of every input that defines kernel selection: vector
+/// kind, sorted row identities, exact vector bits, and sorted anchored members.
+fn corpus_fingerprint(rows: &KernelContentRows, anchors: &[CxId]) -> String {
+    let bytes = corpus_hash_bytes(rows, anchors);
     let mut hex = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         hex.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
@@ -7666,18 +7840,83 @@ fn corpus_fingerprint(rows: &KernelContentRows) -> String {
     hex
 }
 
-fn corpus_hash_bytes(rows: &KernelContentRows) -> [u8; 32] {
-    let mut ids: Vec<[u8; 16]> = rows
-        .ids()
-        .into_iter()
-        .map(calyx_core::CxId::to_bytes)
-        .collect();
-    ids.sort_unstable();
+fn corpus_hash_bytes(rows: &KernelContentRows, anchors: &[CxId]) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    for id in ids {
-        hasher.update(id);
+    hasher.update(b"synapse-domain-kernel-semantic-corpus-v2");
+    match rows {
+        KernelContentRows::Dense(rows) => {
+            hasher.update(b"dense");
+            let mut sorted = rows.iter().collect::<Vec<_>>();
+            sorted.sort_unstable_by_key(|row| row.cx_id);
+            for row in sorted {
+                hasher.update(row.cx_id.to_bytes());
+                hasher.update(row.vector.len().to_be_bytes());
+                for value in &row.vector {
+                    hasher.update(value.to_bits().to_be_bytes());
+                }
+            }
+        }
+        KernelContentRows::Sparse(index) => {
+            hasher.update(b"sparse");
+            let mut sorted = index.rows.iter().collect::<Vec<_>>();
+            sorted.sort_unstable_by_key(|row| row.cx_id);
+            for row in sorted {
+                hasher.update(row.cx_id.to_bytes());
+                hasher.update(row.entries.len().to_be_bytes());
+                for entry in &row.entries {
+                    hasher.update(entry.idx.to_be_bytes());
+                    hasher.update(entry.val.to_bits().to_be_bytes());
+                }
+            }
+        }
+    }
+    let mut sorted_anchors = anchors.to_vec();
+    sorted_anchors.sort_unstable();
+    for anchor in sorted_anchors {
+        hasher.update(anchor.to_bytes());
     }
     hasher.finalize().into()
+}
+
+fn kernel_physical_contract(
+    params: &SynapseCalyxKernelParams,
+    rows: &KernelContentRows,
+    anchors: &[CxId],
+) -> [u8; 32] {
+    let mut physical_contract = Sha256::new();
+    physical_contract.update(b"synapse-domain-kernel-physical-contract-v2");
+    physical_contract.update(params.panel_version.to_be_bytes());
+    physical_contract.update(params.content_slot.to_be_bytes());
+    physical_contract.update(params.max_records.to_be_bytes());
+    physical_contract.update(params.knn.to_be_bytes());
+    physical_contract.update(params.edge_cos_threshold.to_bits().to_be_bytes());
+    physical_contract.update(params.math_execution_class.as_str().as_bytes());
+    physical_contract.update(corpus_hash_bytes(rows, anchors));
+    physical_contract.finalize().into()
+}
+
+fn verify_kernel_serving_identity(
+    kernel: &Kernel,
+    params: &SynapseCalyxKernelParams,
+    rows: &KernelContentRows,
+    anchors: &[CxId],
+) -> Result<(), SynapseCalyxError> {
+    let mut identity_readback = kernel.clone();
+    let physical_contract = kernel_physical_contract(params, rows, anchors);
+    let expected_kernel_id =
+        seal_completed_kernel_identity(&mut identity_readback, &physical_contract)
+            .map_err(|error| kernel_math_error("verify persisted kernel identity", &error))?;
+    if expected_kernel_id == kernel.kernel_id {
+        return Ok(());
+    }
+    Err(SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_SERVING_CONTRACT_ID_MISMATCH",
+        format!(
+            "persisted kernel id {} does not match recomputed id {expected_kernel_id} for its durable graph/corpus contract",
+            kernel.kernel_id
+        ),
+        "rebuild the persisted kernel; never serve an artifact whose id is not bound to its serving contract",
+    ))
 }
 
 pub fn kernel_row_key(panel_version: u32, content_slot: u16) -> Vec<u8> {

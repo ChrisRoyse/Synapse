@@ -2181,6 +2181,7 @@ pub struct StorageIntelligenceParams {
     pub content_slot: Option<u32>,
     /// Cosine floor for a kernel-graph association edge (`kernel`/`kernel_answer`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(min = -1, max = 1))]
     pub edge_cos_threshold: Option<f32>,
     /// Kernel-only recall gate ratio (`kernel`/`kernel_answer`); default ~0.95.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4715,6 +4716,16 @@ pub fn validate_intelligence_numeric_ranges(
             "min_recall_ratio",
             &value.to_string(),
             "a finite number in 0..=1",
+        ));
+    }
+    if let Some(value) = params.edge_cos_threshold
+        && (!value.is_finite() || !(-1.0..=1.0).contains(&value))
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "edge_cos_threshold",
+            &value.to_string(),
+            "a finite number in -1..=1",
         ));
     }
     if let Some(value) = params.max_hops {

@@ -55,6 +55,20 @@ const KERNEL_DOMAIN_PREFIX: &[u8; 5] = b"KDOM1";
 /// Upper bound on domains rebuilt in one sweep. A sweep is minutes of CPU per
 /// domain; an unbounded sweep would be an unbounded maintenance window.
 pub const SYNAPSE_KERNEL_MAX_DOMAINS: usize = 64;
+/// Schema for the durable parameters required to serve a persisted kernel.
+/// A reader refuses older index rows because reconstructing graph semantics
+/// from defaults would make the Kernel CF cease to be the Source of Truth.
+pub(super) const KERNEL_SERVING_CONTRACT_VERSION: u64 = 1;
+
+pub(super) struct PersistedDomainKernel {
+    pub kernel: calyx_lodestar::Kernel,
+    pub artifact_bytes: usize,
+    pub max_records: usize,
+    pub knn: usize,
+    pub edge_cos_threshold: f32,
+    pub corpus_fingerprint: String,
+    pub math_execution_class: SynapseCalyxMathExecutionClass,
+}
 
 /// The vault-backed [`KernelArtifactStore`].
 ///
@@ -204,6 +218,152 @@ pub struct SynapseCalyxKernelHealthReport {
 }
 
 impl SynapseCalyxVault {
+    #[allow(clippy::too_many_lines)]
+    pub(super) fn read_domain_kernel_for_serving(
+        &self,
+        panel_version: u32,
+        content_slot: u16,
+        anchor_kind: Option<&str>,
+    ) -> Result<PersistedDomainKernel, SynapseCalyxError> {
+        let index_key = anchor_kind.map_or_else(
+            || kernel_row_key(panel_version, content_slot),
+            |kind| domain_index_key(panel_version, content_slot, kind),
+        );
+        let Some(index_bytes) = self.read_cf_latest(ColumnFamily::Kernel, &index_key)? else {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_NOT_BUILT",
+                format!(
+                    "no grounding kernel is persisted for panel {panel_version} slot {content_slot} domain {}; the Kernel CF has no row at this key",
+                    anchor_kind.unwrap_or("<panel default>")
+                ),
+                "run the cold kernel rebuild for this exact panel/slot/domain before serving an answer; reads never synthesize a missing kernel",
+            ));
+        };
+        let index: serde_json::Value = serde_json::from_slice(&index_bytes).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_INDEX_DECODE_FAILED",
+                format!("decode the persisted kernel index row: {error}"),
+                "the Kernel CF index row is corrupt; rebuild the domain kernel",
+            )
+        })?;
+        let contract_version = required_index_u64(&index, "serving_contract_version")?;
+        if contract_version != KERNEL_SERVING_CONTRACT_VERSION {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_SERVING_CONTRACT_UNSUPPORTED",
+                format!(
+                    "persisted kernel serving contract version {contract_version} is not supported; expected {KERNEL_SERVING_CONTRACT_VERSION} for panel {panel_version} slot {content_slot}"
+                ),
+                "rebuild the persisted kernel with the current runtime before serving answers",
+            ));
+        }
+        let indexed_panel = required_index_u64(&index, "panel_version")?;
+        let indexed_slot = required_index_u64(&index, "content_slot")?;
+        let indexed_anchor = index.get("anchor_kind").and_then(serde_json::Value::as_str);
+        if indexed_panel != u64::from(panel_version)
+            || indexed_slot != u64::from(content_slot)
+            || indexed_anchor != anchor_kind
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_INDEX_SCOPE_MISMATCH",
+                format!(
+                    "persisted kernel index scope panel={indexed_panel} slot={indexed_slot} domain={} does not match requested panel={panel_version} slot={content_slot} domain={}",
+                    indexed_anchor.unwrap_or("<panel default>"),
+                    anchor_kind.unwrap_or("<panel default>")
+                ),
+                "rebuild the exact requested kernel; never serve an artifact through a mismatched index key",
+            ));
+        }
+        let kernel_id_text = required_index_str(&index, "kernel_id")?;
+        let kernel_id = crate::parse_cx_id(kernel_id_text)?;
+        let max_records = index_usize(&index, "max_records")?;
+        let knn = index_usize(&index, "knn")?;
+        let edge_cos_threshold = required_index_f32(&index, "edge_cos_threshold")?;
+        let corpus_fingerprint = required_sha256(&index, "corpus_fingerprint")?;
+        let math_execution_class = required_execution_class(&index)?;
+        if !(1..=crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&max_records)
+            || !(1..=64).contains(&knn)
+            || !(-1.0..=1.0).contains(&edge_cos_threshold)
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_INDEX_CONTRACT_INVALID",
+                format!(
+                    "persisted kernel serving contract has max_records={max_records}, knn={knn}, edge_cos_threshold={edge_cos_threshold}; required max_records=1..={} knn=1..=64 edge_cos_threshold=-1..=1",
+                    crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS
+                ),
+                "rebuild the persisted kernel with valid graph parameters; never clamp a corrupt serving contract during a read",
+            ));
+        }
+
+        let store = VaultKernelArtifactStore::new(self);
+        let artifact_bytes = store
+            .read_kernel_bytes(kernel_id)
+            .map_err(|error| {
+                crate::intelligence::kernel_math_error("read kernel artifact", &error)
+            })?
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_KERNEL_ARTIFACT_MISSING",
+                    format!(
+                        "kernel index points to {kernel_id}, but its Kernel CF artifact row is absent"
+                    ),
+                    "rebuild the persisted kernel; do not reconstruct a missing artifact during a read",
+                )
+            })?
+            .len();
+        let kernel = read_kernel_artifact(kernel_id, &store).map_err(|error| {
+            crate::intelligence::kernel_math_error("read the persisted Kernel artifact", &error)
+        })?;
+        if kernel.panel_version != panel_version || kernel.anchor_kind.as_deref() != anchor_kind {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_ARTIFACT_SCOPE_MISMATCH",
+                format!(
+                    "kernel artifact {kernel_id} scope panel={} domain={} does not match index panel={panel_version} domain={}",
+                    kernel.panel_version,
+                    kernel.anchor_kind.as_deref().unwrap_or("<panel default>"),
+                    anchor_kind.unwrap_or("<panel default>")
+                ),
+                "rebuild the exact requested kernel; never serve a cross-scope artifact",
+            ));
+        }
+        let health = kernel_health_from_kernel(&kernel);
+        if health.corpus_shard_hash != corpus_fingerprint {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_INDEX_ARTIFACT_MISMATCH",
+                format!(
+                    "kernel index corpus fingerprint {corpus_fingerprint} does not match artifact {kernel_id} corpus fingerprint {}",
+                    health.corpus_shard_hash
+                ),
+                "rebuild the persisted kernel; never serve an artifact through index metadata from another build",
+            ));
+        }
+        if health.trust != KernelTrust::Anchored
+            || health.recall.pass_mode != RecallPassMode::Passed
+            || !health.recall.ratio.is_finite()
+            || health.recall.ratio < health.recall.min_recall_ratio
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_PERSISTED_UNGROUNDED",
+                format!(
+                    "kernel artifact {kernel_id} is not serveable: trust={} recall_mode={} recall_ratio={} min_recall_ratio={}",
+                    trust_label(health.trust),
+                    recall_pass_mode_label(health.recall.pass_mode),
+                    health.recall.ratio,
+                    health.recall.min_recall_ratio
+                ),
+                "rebuild and persist an anchored kernel that passes its measured recall gate",
+            ));
+        }
+        Ok(PersistedDomainKernel {
+            kernel,
+            artifact_bytes,
+            max_records,
+            knn,
+            edge_cos_threshold,
+            corpus_fingerprint,
+            math_execution_class,
+        })
+    }
+
     /// Rebuilds one grounding kernel per grounded outcome domain in a panel,
     /// persisting each full Kernel artifact plus a per-domain index row to the
     /// native `Kernel` CF, then reading the CF back.
@@ -227,6 +387,17 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxKernelRebuildParams,
     ) -> Result<SynapseCalyxKernelRebuildReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("rebuild_domain_kernels");
+        crate::intelligence::validate_kernel_params(&params.kernel_params(None))?;
+        if !(1..=SYNAPSE_KERNEL_MAX_DOMAINS).contains(&params.max_domains) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_KERNEL_REBUILD_PARAMS_INVALID",
+                format!(
+                    "kernel rebuild max_domains={} is outside 1..={SYNAPSE_KERNEL_MAX_DOMAINS}",
+                    params.max_domains
+                ),
+                "pass max_domains within the declared bound; rebuild never clamps an invalid request",
+            ));
+        }
         let discovered = self.discover_panel_domains(params.panel_version, params.max_records)?;
         if discovered.is_empty() {
             return Err(SynapseCalyxError::new(
@@ -239,7 +410,7 @@ impl SynapseCalyxVault {
             ));
         }
         let domains_discovered = discovered.len();
-        let max_domains = params.max_domains.clamp(1, SYNAPSE_KERNEL_MAX_DOMAINS);
+        let max_domains = params.max_domains;
 
         let mut outcomes = Vec::new();
         let mut artifacts_persisted = 0usize;
@@ -332,49 +503,11 @@ impl SynapseCalyxVault {
         anchor_kind: Option<&str>,
     ) -> Result<SynapseCalyxKernelHealthReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("domain_kernel_health");
-        let index_key = anchor_kind.map_or_else(
-            || kernel_row_key(panel_version, content_slot),
-            |kind| domain_index_key(panel_version, content_slot, kind),
-        );
-        let Some(index_bytes) = self.read_cf_latest(ColumnFamily::Kernel, &index_key)? else {
-            return Err(SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_NOT_BUILT",
-                format!(
-                    "no grounding kernel is persisted for panel {panel_version} slot {content_slot} domain {}; the Kernel CF has no row at this key",
-                    anchor_kind.unwrap_or("<panel default>")
-                ),
-                "run the cold kernel rebuild (hygiene kernel_rebuild) for this panel before asking for kernel health; health never re-derives a kernel it cannot read",
-            ));
-        };
-        let index: serde_json::Value = serde_json::from_slice(&index_bytes).map_err(|error| {
-            SynapseCalyxError::new(
-                "SYNAPSE_CALYX_KERNEL_INDEX_DECODE_FAILED",
-                format!("decode the persisted kernel index row: {error}"),
-                "the Kernel CF index row is corrupt; rebuild the domain kernel",
-            )
-        })?;
-        let kernel_id_text = index
-            .get("kernel_id")
-            .and_then(serde_json::Value::as_str)
-            .ok_or_else(|| {
-                SynapseCalyxError::new(
-                    "SYNAPSE_CALYX_KERNEL_INDEX_DECODE_FAILED",
-                    "the persisted kernel index row carries no kernel_id".to_owned(),
-                    "the Kernel CF index row is corrupt; rebuild the domain kernel",
-                )
-            })?;
-        let kernel_id = crate::parse_cx_id(kernel_id_text)?;
-
-        let store = VaultKernelArtifactStore::new(self);
-        let artifact_bytes = store
-            .read_kernel_bytes(kernel_id)
-            .map_err(|error| {
-                crate::intelligence::kernel_math_error("read kernel artifact", &error)
-            })?
-            .map_or(0, |bytes| bytes.len());
-        let kernel = read_kernel_artifact(kernel_id, &store).map_err(|error| {
-            crate::intelligence::kernel_math_error("read the persisted Kernel artifact", &error)
-        })?;
+        let PersistedDomainKernel {
+            kernel,
+            artifact_bytes,
+            ..
+        } = self.read_domain_kernel_for_serving(panel_version, content_slot, anchor_kind)?;
         let health: KernelHealth = kernel_health_from_kernel(&kernel);
         let kernel_cf_rows = self
             .count_cf_latest_bounded(ColumnFamily::Kernel)?
@@ -414,7 +547,6 @@ impl SynapseCalyxVault {
         panel_version: u32,
         max_records: usize,
     ) -> Result<Vec<(String, usize)>, SynapseCalyxError> {
-        let max_records = max_records.clamp(1, crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS);
         let mut counts: BTreeMap<String, usize> = BTreeMap::new();
         let mut scanned = 0usize;
         // The panel membership sidecar prevents a cross-panel Base scan. This
@@ -460,10 +592,15 @@ impl SynapseCalyxVault {
         report: &crate::SynapseCalyxKernelReport,
     ) -> Result<(), SynapseCalyxError> {
         let row = serde_json::json!({
+            "serving_contract_version": KERNEL_SERVING_CONTRACT_VERSION,
             "panel_version": params.panel_version,
             "content_slot": params.content_slot,
             "anchor_kind": anchor_kind,
             "kernel_id": report.kernel_id,
+            "max_records": params.max_records,
+            "knn": params.knn,
+            "edge_cos_threshold": params.edge_cos_threshold,
+            "math_execution_class": params.math_execution_class.as_str(),
             "corpus_fingerprint": report.corpus_fingerprint,
             "members": report.members,
             "corpus_size": report.corpus_size,
@@ -486,6 +623,81 @@ impl SynapseCalyxVault {
         }])?;
         self.flush()
     }
+}
+
+fn required_index_u64(
+    index: &serde_json::Value,
+    field: &'static str,
+) -> Result<u64, SynapseCalyxError> {
+    index
+        .get(field)
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| kernel_index_field_error(field, "an unsigned integer"))
+}
+
+fn index_usize(index: &serde_json::Value, field: &'static str) -> Result<usize, SynapseCalyxError> {
+    usize::try_from(required_index_u64(index, field)?)
+        .map_err(|_| kernel_index_field_error(field, "an integer representable as usize"))
+}
+
+fn required_index_f32(
+    index: &serde_json::Value,
+    field: &'static str,
+) -> Result<f32, SynapseCalyxError> {
+    let encoded = index
+        .get(field)
+        .cloned()
+        .ok_or_else(|| kernel_index_field_error(field, "a finite f32 number"))?;
+    let value: f32 = serde_json::from_value(encoded)
+        .map_err(|_| kernel_index_field_error(field, "a finite f32 number"))?;
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(kernel_index_field_error(field, "a finite f32 number"))
+    }
+}
+
+fn required_index_str<'a>(
+    index: &'a serde_json::Value,
+    field: &'static str,
+) -> Result<&'a str, SynapseCalyxError> {
+    index
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| kernel_index_field_error(field, "a string"))
+}
+
+fn required_sha256(
+    index: &serde_json::Value,
+    field: &'static str,
+) -> Result<String, SynapseCalyxError> {
+    let value = required_index_str(index, field)?;
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err(kernel_index_field_error(field, "a 64-hex SHA-256 digest"))
+    }
+}
+
+fn required_execution_class(
+    index: &serde_json::Value,
+) -> Result<SynapseCalyxMathExecutionClass, SynapseCalyxError> {
+    match required_index_str(index, "math_execution_class")? {
+        "configured" => Ok(SynapseCalyxMathExecutionClass::Configured),
+        "background_cpu" => Ok(SynapseCalyxMathExecutionClass::BackgroundCpu),
+        _ => Err(kernel_index_field_error(
+            "math_execution_class",
+            "one of configured or background_cpu",
+        )),
+    }
+}
+
+fn kernel_index_field_error(field: &'static str, expected: &'static str) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_KERNEL_INDEX_CONTRACT_MISSING",
+        format!("persisted kernel index field {field} is absent or is not {expected}"),
+        "rebuild the persisted kernel with the current runtime; reads never infer missing serving-contract fields",
+    )
 }
 
 fn artifact_key(kernel_id: CxId) -> Vec<u8> {
