@@ -55,11 +55,12 @@ pub use cuda::{
     build_grouped_gemm_plan, build_ragged_batch, build_ragged_batch_from_slabs,
     ccm_simplex_predictions_host, correlation_precision_host, cross_correlation_batch_host,
     dcor_1d_host, entropy_radii_host, execute_grouped_gemm, execute_grouped_gemm_strict,
-    extract_ragged_results, gaussian_mmd_host, granger_lag_summaries_host, hawkes_em_host,
-    hsic_1d_host, init_cuda, ksg_continuous_counts_host, linear_cka_pair_estimates_host,
-    logistic_summaries_host, mixed_ksg_counts_host, mmd_change_point_host,
-    pairwise_euclidean_gram_tiled_host, periodogram_batch_host, query_device_info,
-    read_grouped_gemm_output, try_extract_ragged_results,
+    extract_ragged_results, gaussian_mmd_device_bytes, gaussian_mmd_host,
+    granger_lag_summaries_host, hawkes_em_host, hsic_1d_host, init_cuda,
+    ksg_continuous_counts_host, linear_cka_pair_estimates_host, logistic_summaries_host,
+    mixed_ksg_counts_host, mmd_change_point_host, pairwise_euclidean_gram_tiled_host,
+    periodogram_batch_host, query_device_info, read_grouped_gemm_output,
+    try_extract_ragged_results,
 };
 pub use error::ForgeError;
 pub use mxfp4::{

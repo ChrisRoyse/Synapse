@@ -30,9 +30,9 @@ pub use assay::{
     CudaLogisticSummaries, CudaMixedKsgCounts, CudaMmdChangePointResult, CudaMmdResult,
     CudaPeriodogramBatch, autocorrelation_sums_host, ccm_simplex_predictions_host,
     correlation_precision_host, cross_correlation_batch_host, dcor_1d_host, entropy_radii_host,
-    gaussian_mmd_host, granger_lag_summaries_host, hawkes_em_host, hsic_1d_host,
-    ksg_continuous_counts_host, linear_cka_pair_estimates_host, logistic_summaries_host,
-    mixed_ksg_counts_host, mmd_change_point_host, periodogram_batch_host,
+    gaussian_mmd_device_bytes, gaussian_mmd_host, granger_lag_summaries_host, hawkes_em_host,
+    hsic_1d_host, ksg_continuous_counts_host, linear_cka_pair_estimates_host,
+    logistic_summaries_host, mixed_ksg_counts_host, mmd_change_point_host, periodogram_batch_host,
 };
 pub use context::{CudaContext, init_cuda, query_device_info};
 pub use distance::{

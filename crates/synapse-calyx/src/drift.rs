@@ -39,9 +39,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(feature = "calyx-cuda")]
+use calyx_assay::gaussian_mmd_flat_with_config_cuda_budgeted;
 use calyx_assay::{
     DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
-    gaussian_mmd_flat_with_config,
+    gaussian_mmd_flat_with_config_cpu_strict,
 };
 use calyx_aster::cf::{ColumnFamily, prefix_range};
 use calyx_aster::vault::encode::decode_constellation_base;
@@ -55,7 +57,8 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::{
-    SYNAPSE_INTELLIGENCE_MAX_RECORDS, SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault,
+    SYNAPSE_INTELLIGENCE_MAX_RECORDS, SynapseCalyxCfWrite, SynapseCalyxError,
+    SynapseCalyxMathExecutionClass, SynapseCalyxVault,
 };
 
 /// Default calibration sample floor for the blind-spot detector (loom default).
@@ -569,6 +572,10 @@ pub struct SynapseCalyxPanelDriftParams {
     pub recent_fraction: f32,
     pub permutations: usize,
     pub alpha: f64,
+    /// Physical math resource this pass is allowed to activate. Explicit MCP
+    /// requests use the configured backend; unattended maintenance declares
+    /// background CPU so it never creates a CUDA context behind a game.
+    pub math_execution_class: SynapseCalyxMathExecutionClass,
 }
 
 impl SynapseCalyxPanelDriftParams {
@@ -580,6 +587,7 @@ impl SynapseCalyxPanelDriftParams {
             recent_fraction: SYNAPSE_DRIFT_DEFAULT_RECENT_FRACTION,
             permutations: DEFAULT_MMD_PERMUTATIONS,
             alpha: DEFAULT_MMD_ALPHA,
+            math_execution_class: SynapseCalyxMathExecutionClass::Configured,
         }
     }
 }
@@ -609,6 +617,8 @@ pub struct SynapseCalyxPanelDriftReport {
     pub walk: crate::SynapseCalyxPanelBaseWalk,
     pub recent_fraction: f32,
     pub permutations: usize,
+    pub math_execution_class: String,
+    pub math_backend_used: String,
     pub lenses_evaluated: usize,
     pub lenses_insufficient: usize,
     pub drifted_lenses: usize,
@@ -1083,6 +1093,56 @@ impl SynapseCalyxVault {
         let mut lenses_insufficient = lenses_without_nonempty_shape;
         let mut drifted_lenses = 0usize;
 
+        let has_evaluable_lens = by_slot.values().any(|samples| {
+            samples.reference_rows >= SYNAPSE_DRIFT_MIN_WINDOW
+                && samples.recent_rows >= SYNAPSE_DRIFT_MIN_WINDOW
+        });
+        let configured_math = if has_evaluable_lens
+            && params.math_execution_class == SynapseCalyxMathExecutionClass::Configured
+        {
+            Some(self.math_runtime.backend()?)
+        } else {
+            None
+        };
+        let background_cpu = if has_evaluable_lens
+            && params.math_execution_class == SynapseCalyxMathExecutionClass::BackgroundCpu
+        {
+            Some(crate::math::verified_background_cpu_backend()?)
+        } else {
+            None
+        };
+        let math_backend_used = if has_evaluable_lens {
+            match params.math_execution_class {
+                SynapseCalyxMathExecutionClass::BackgroundCpu => "cpu_background",
+                SynapseCalyxMathExecutionClass::Configured => configured_math
+                    .as_ref()
+                    .ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_MATH_BACKEND_MISSING",
+                            format!(
+                                "panel {} has an evaluable MMD lens but the configured execution class produced no math lease",
+                                params.panel_version
+                            ),
+                            "repair configured math runtime initialization; drift never substitutes another backend",
+                        )
+                    })?
+                    .assay_backend()
+                    .as_str(),
+            }
+        } else {
+            "none_no_evaluable_lens"
+        };
+        tracing::info!(
+            code = "SYNAPSE_CALYX_DRIFT_MATH_EXECUTION_CLASS",
+            panel_version = params.panel_version,
+            requested_execution_class = params.math_execution_class.as_str(),
+            backend_used = math_backend_used,
+            evaluable_lens = has_evaluable_lens,
+            configured_runtime_activated = configured_math.is_some(),
+            background_cpu_proved = background_cpu.is_some(),
+            "selected the declared MMD math execution class without runtime fallback"
+        );
+
         for (slot, samples) in by_slot {
             let MmdSlotSamples {
                 dimension,
@@ -1105,13 +1165,52 @@ impl SynapseCalyxVault {
                 &recent,
             )?;
 
-            let estimate = gaussian_mmd_flat_with_config(
-                &pooled_f64,
-                reference_rows,
-                recent_rows,
-                dimension,
-                &config,
-            );
+            let estimate = match params.math_execution_class {
+                SynapseCalyxMathExecutionClass::BackgroundCpu => {
+                    gaussian_mmd_flat_with_config_cpu_strict(
+                        &pooled_f64,
+                        reference_rows,
+                        recent_rows,
+                        dimension,
+                        &config,
+                    )
+                }
+                SynapseCalyxMathExecutionClass::Configured => {
+                    let lease = configured_math.as_ref().ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_DRIFT_MATH_BACKEND_MISSING",
+                            format!(
+                                "panel {} slot {} reached MMD estimation without its configured math lease",
+                                params.panel_version,
+                                slot.get()
+                            ),
+                            "repair the configured math-runtime lease invariant; drift never substitutes another backend",
+                        )
+                    })?;
+                    match lease.assay_backend() {
+                        crate::math::SynapseCalyxAssayBackend::Cpu(_) => {
+                            gaussian_mmd_flat_with_config_cpu_strict(
+                                &pooled_f64,
+                                reference_rows,
+                                recent_rows,
+                                dimension,
+                                &config,
+                            )
+                        }
+                        #[cfg(feature = "calyx-cuda")]
+                        crate::math::SynapseCalyxAssayBackend::Cuda(backend) => {
+                            gaussian_mmd_flat_with_config_cuda_budgeted(
+                                backend,
+                                &pooled_f64,
+                                reference_rows,
+                                recent_rows,
+                                dimension,
+                                &config,
+                            )
+                        }
+                    }
+                }
+            };
             drop(pooled_f64);
             drop(reference);
             drop(recent);
@@ -1201,6 +1300,54 @@ impl SynapseCalyxVault {
             });
         }
 
+        drop(background_cpu);
+        drop(configured_math);
+        let runtime_status = self.math_runtime.status_snapshot();
+        if let Some(code) = runtime_status.runtime_readback_code.as_deref() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_MATH_RELEASE_FAILED",
+                format!(
+                    "panel {} completed estimation but math runtime readback failed with {code}: {}",
+                    params.panel_version,
+                    runtime_status
+                        .runtime_readback_error
+                        .as_deref()
+                        .unwrap_or("missing structured runtime error detail")
+                ),
+                "preserve the host GPU reservation ledger and inspect the named math release failure before retrying",
+            ));
+        }
+        if math_backend_used == "cuda_budgeted"
+            && (runtime_status.probe.status != "dormant_verified"
+                || runtime_status.host_reservation_id.is_some()
+                || runtime_status.host_reservation.is_some())
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_DRIFT_CUDA_RELEASE_UNPROVEN",
+                format!(
+                    "panel {} CUDA MMD ended with probe_status={} host_reservation_id={:?} host_reservation_live={}",
+                    params.panel_version,
+                    runtime_status.probe.status,
+                    runtime_status.host_reservation_id,
+                    runtime_status.host_reservation.is_some()
+                ),
+                "stop drift work and repair managed CUDA idle release; Synapse refuses to claim idle while its context or reservation is unproven",
+            ));
+        }
+        let backend_release = crate::release_process_memory("MMD execution backend release")?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_DRIFT_MATH_RELEASE_PROVED",
+            panel_version = params.panel_version,
+            backend_used = math_backend_used,
+            runtime_probe_status = runtime_status.probe.status,
+            host_reservation_live = runtime_status.host_reservation.is_some(),
+            private_bytes_before = backend_release.private_bytes_before,
+            private_bytes_after = backend_release.private_bytes_after,
+            private_bytes_reclaimed = backend_release.private_bytes_reclaimed,
+            release_elapsed_us = backend_release.elapsed_us,
+            "proved the selected MMD backend reached its declared post-pass ownership state"
+        );
+
         let drift_rows_persisted = writes.len();
         if !writes.is_empty() {
             self.write_cf_batch(writes)?;
@@ -1245,6 +1392,8 @@ impl SynapseCalyxVault {
             walk,
             recent_fraction,
             permutations,
+            math_execution_class: params.math_execution_class.as_str().to_owned(),
+            math_backend_used: math_backend_used.to_owned(),
             lenses_evaluated: lens_drift.len(),
             lenses_insufficient,
             drifted_lenses,

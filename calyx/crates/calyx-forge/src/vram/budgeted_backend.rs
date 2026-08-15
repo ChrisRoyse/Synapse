@@ -12,13 +12,15 @@ use crate::vram::{
     CudaVramProbe, HostGpuReservation, HostGpuReservationRequest, HostGpuReservationStore,
     VramBudgeter, VramStats,
 };
-use crate::{Backend, CudaBackend, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result};
+use crate::{
+    Backend, CudaBackend, CudaMmdResult, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result,
+};
 
 const F32_BYTES: usize = size_of::<f32>();
 const I32_BYTES: usize = size_of::<i32>();
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const DISPATCH_REMEDIATION: &str = "reduce the exact input/batch dimensions or raise the explicit Forge VRAM budget only after measuring the operation; never bypass admission or move the dispatch to CPU implicitly";
-const DISPATCH_OPERATIONS: [&str; 8] = [
+const DISPATCH_OPERATIONS: [&str; 9] = [
     "gemm",
     "cosine",
     "dot",
@@ -27,6 +29,7 @@ const DISPATCH_OPERATIONS: [&str; 8] = [
     "topk",
     "knn",
     "paired_cosine",
+    "gaussian_mmd",
 ];
 
 /// Process-local CUDA dispatch telemetry since the serving epoch began.
@@ -249,6 +252,52 @@ impl VramBudgetedCudaBackend {
             epoch_started_unix_ms: telemetry.epoch_started_unix_ms,
             sampled_at_unix_ms,
             operations,
+        })
+    }
+
+    /// Runs Gaussian MMD through the same process-local and host-wide
+    /// admission contract as every [`Backend`] dispatch.
+    ///
+    /// The exact byte shape is shared with the concrete kernel allocator. No
+    /// unbudgeted raw CUDA context is created by this path.
+    pub fn gaussian_mmd(
+        &self,
+        pooled: &[f64],
+        n_a: usize,
+        n_b: usize,
+        dimension: usize,
+        bandwidth: f64,
+        permutations: &[i32],
+    ) -> Result<CudaMmdResult> {
+        let sample_count = n_a.checked_add(n_b).ok_or_else(|| {
+            budget_error(format!(
+                "gaussian_mmd sample count overflow: n_a={n_a} n_b={n_b}"
+            ))
+        })?;
+        if sample_count == 0 || dimension == 0 {
+            return Err(budget_error(format!(
+                "gaussian_mmd requires non-zero sample_count and dimension: sample_count={sample_count} dimension={dimension}"
+            )));
+        }
+        if permutations.len() % sample_count != 0 {
+            return Err(budget_error(format!(
+                "gaussian_mmd permutation arena length {} is not divisible by sample_count={sample_count}",
+                permutations.len()
+            )));
+        }
+        let permutation_count = permutations.len() / sample_count;
+        let measured_bytes =
+            crate::gaussian_mmd_device_bytes(pooled.len(), sample_count, permutation_count)?;
+        self.run_reserved("gaussian_mmd", measured_bytes, |inner| {
+            crate::gaussian_mmd_host(
+                inner.context(),
+                pooled,
+                n_a,
+                n_b,
+                dimension,
+                bandwidth,
+                permutations,
+            )
         })
     }
 

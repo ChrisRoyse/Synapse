@@ -23,6 +23,21 @@ pub(super) fn gaussian_mmd_cuda_strict_impl(
     .map_err(|err| crate::cuda_strict::forge_to_calyx("MMD", err))
 }
 
+#[cfg(feature = "cuda")]
+pub(super) fn gaussian_mmd_cuda_budgeted_impl(
+    backend: &calyx_forge::VramBudgetedCudaBackend,
+    flat: &[f64],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    bandwidth: f64,
+    permutations: &[i32],
+) -> Result<calyx_forge::CudaMmdResult> {
+    backend
+        .gaussian_mmd(flat, n_a, n_b, dimension, bandwidth, permutations)
+        .map_err(|err| crate::cuda_strict::forge_to_calyx("MMD", err))
+}
+
 #[cfg(not(feature = "cuda"))]
 pub(super) fn gaussian_mmd_cuda_strict_impl(
     _flat: &[f64],

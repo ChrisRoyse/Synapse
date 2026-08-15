@@ -249,6 +249,26 @@ pub struct SynapseCalyxMathLease<'runtime> {
     _runtime: PhantomData<&'runtime SynapseCalyxMathRuntime>,
 }
 
+/// Concrete Assay dispatch resource owned by a live Synapse math lease.
+///
+/// Keeping the budgeted CUDA backend borrowed from the lease prevents Assay
+/// from creating an independent context or escaping host-wide admission.
+pub enum SynapseCalyxAssayBackend<'backend> {
+    Cpu(PhantomData<&'backend ()>),
+    #[cfg(feature = "calyx-cuda")]
+    Cuda(&'backend VramBudgetedCudaBackend),
+}
+
+impl SynapseCalyxAssayBackend<'_> {
+    pub(super) const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Cpu(_) => "cpu",
+            #[cfg(feature = "calyx-cuda")]
+            Self::Cuda(_) => "cuda_budgeted",
+        }
+    }
+}
+
 impl fmt::Debug for SynapseCalyxMathRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -544,6 +564,20 @@ impl Deref for SynapseCalyxMathLease<'_> {
 }
 
 impl SynapseCalyxMathLease<'_> {
+    pub(super) fn assay_backend(&self) -> SynapseCalyxAssayBackend<'_> {
+        self.backend
+            .as_deref()
+            .unwrap_or_else(|| {
+                tracing::error!(
+                    code = "SYNAPSE_CALYX_MATH_LEASE_BACKEND_MISSING",
+                    remediation = MATH_BACKEND_REMEDIATION,
+                    "a live math lease lost its Assay backend ownership invariant"
+                );
+                std::process::abort();
+            })
+            .assay_backend()
+    }
+
     fn release(&mut self) {
         let mut lifecycle = match self.shared.lifecycle.lock() {
             Ok(lifecycle) => lifecycle,
@@ -1043,6 +1077,7 @@ impl CpuReadback {
 }
 
 trait SynapseMathBackend: Backend {
+    fn assay_backend(&self) -> SynapseCalyxAssayBackend<'_>;
     fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError>;
     fn strict_dispatch_telemetry(
         &self,
@@ -1051,6 +1086,10 @@ trait SynapseMathBackend: Backend {
 }
 
 impl SynapseMathBackend for CpuBackend {
+    fn assay_backend(&self) -> SynapseCalyxAssayBackend<'_> {
+        SynapseCalyxAssayBackend::Cpu(PhantomData)
+    }
+
     fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError> {
         Ok(None)
     }
@@ -1068,6 +1107,10 @@ impl SynapseMathBackend for CpuBackend {
 
 #[cfg(feature = "calyx-cuda")]
 impl SynapseMathBackend for VramBudgetedCudaBackend {
+    fn assay_backend(&self) -> SynapseCalyxAssayBackend<'_> {
+        SynapseCalyxAssayBackend::Cuda(self)
+    }
+
     fn strict_vram_status(&self) -> Result<Option<SynapseCalyxVramDispatchStatus>, ForgeError> {
         self.stats_strict()
             .map(SynapseCalyxVramDispatchStatus::from)

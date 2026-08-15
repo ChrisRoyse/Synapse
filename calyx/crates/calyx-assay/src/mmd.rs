@@ -19,6 +19,8 @@ use crate::cuda_strict::{deterministic_permutations, strict_cuda_requested};
 mod cuda;
 mod kernel;
 
+#[cfg(feature = "cuda")]
+use self::cuda::gaussian_mmd_cuda_budgeted_impl;
 use self::cuda::{gaussian_mmd_cuda_strict_impl, mmd_change_point_cuda_strict_impl};
 use self::kernel::{KernelMatrix, packed_matrix_len, quantile, squared_distance};
 
@@ -120,6 +122,61 @@ pub fn gaussian_mmd_flat_with_config(
         ));
     }
     gaussian_mmd_borrowed_with_config(&samples, n_a, n_b, dimension, config)
+}
+
+/// Runs flat Gaussian MMD on CPU regardless of the process-wide Assay backend.
+///
+/// This is an explicit execution class for background maintenance, not a
+/// failure fallback. Invalid inputs and estimator failures remain hard errors.
+pub fn gaussian_mmd_flat_with_config_cpu_strict(
+    pooled: &[f64],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    config: &MmdConfig,
+) -> Result<MmdReport> {
+    validate_flat_pair(pooled, n_a, n_b, dimension, config)?;
+    let samples = pooled.chunks_exact(dimension).collect::<Vec<_>>();
+    gaussian_mmd_borrowed_with_config(&samples, n_a, n_b, dimension, config)
+}
+
+/// Runs flat Gaussian MMD through an already-leased, budgeted CUDA backend.
+///
+/// Synapse uses this entry point so Assay shares the application-owned CUDA
+/// context, module cache, process-local VRAM admission, and host reservation
+/// ledger instead of creating an untracked context per estimator call.
+#[cfg(feature = "cuda")]
+pub fn gaussian_mmd_flat_with_config_cuda_budgeted(
+    backend: &calyx_forge::VramBudgetedCudaBackend,
+    pooled: &[f64],
+    n_a: usize,
+    n_b: usize,
+    dimension: usize,
+    config: &MmdConfig,
+) -> Result<MmdReport> {
+    validate_flat_pair(pooled, n_a, n_b, dimension, config)?;
+    let samples = pooled.chunks_exact(dimension).collect::<Vec<_>>();
+    let (bandwidth, workspace) = resolve_bandwidth(&samples, config.bandwidth)?;
+    drop(workspace);
+    let permutations = deterministic_permutations(samples.len(), config.permutations, config.seed)?;
+    let result = gaussian_mmd_cuda_budgeted_impl(
+        backend,
+        pooled,
+        n_a,
+        n_b,
+        dimension,
+        bandwidth,
+        &permutations,
+    )?;
+    Ok(report_from_null(
+        n_a,
+        n_b,
+        dimension,
+        bandwidth,
+        result.mmd2,
+        result.null,
+        config.alpha,
+    ))
 }
 
 fn gaussian_mmd_borrowed_with_config(

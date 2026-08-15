@@ -180,11 +180,13 @@ pub use mi_estimator::{
     MiEstimatorSelection, MiOutcome, mi_about_labels, resolve_mi_estimator,
 };
 pub use mic::{DEFAULT_MIC_ALPHA, MIN_MIC_SAMPLES, MicReport, mic, mic_with_alpha};
+#[cfg(feature = "cuda")]
+pub use mmd::gaussian_mmd_flat_with_config_cuda_budgeted;
 pub use mmd::{
     ChangePointReport, DEFAULT_MMD_ALPHA, DEFAULT_MMD_PERMUTATIONS, DEFAULT_MMD_SEED, MmdConfig,
     MmdReport, gaussian_mmd, gaussian_mmd_cuda_strict, gaussian_mmd_flat_with_config,
-    gaussian_mmd_with_config, gaussian_mmd_with_config_cuda_strict, mmd_change_point,
-    mmd_change_point_cuda_strict,
+    gaussian_mmd_flat_with_config_cpu_strict, gaussian_mmd_with_config,
+    gaussian_mmd_with_config_cuda_strict, mmd_change_point, mmd_change_point_cuda_strict,
 };
 pub use n_eff::{NeffReport, stable_rank};
 pub use nmi::{NmiReport, partitioned_histogram_nmi};

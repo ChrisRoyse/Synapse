@@ -12,19 +12,8 @@ pub fn gaussian_mmd_host(
     validate_mmd_inputs(pooled, n_a, n_b, dim, bandwidth)?;
     let n = n_a + n_b;
     let perm_count = validate_permutations(Some(permutations), n)?;
-    let matrix_len = checked_square(n, "MMD kernel matrix length")?;
-    ensure_device_room(
-        ctx,
-        "gaussian_mmd_host",
-        checked_sum_bytes(&[
-            bytes::<f64>(pooled.len(), "MMD pooled samples")?,
-            bytes::<f64>(matrix_len, "MMD kernel matrix")?,
-            bytes::<f64>(n, "MMD row sums")?,
-            bytes::<i32>(perm_count * n, "MMD permutations")?,
-            bytes::<f64>(perm_count, "MMD permutation outputs")?,
-            bytes::<f64>(1, "MMD observed output")?,
-        ])?,
-    )?;
+    let device_bytes = gaussian_mmd_device_bytes(pooled.len(), n, perm_count)?;
+    ensure_device_room(ctx, "gaussian_mmd_host", device_bytes)?;
 
     let stream = ctx.inner().default_stream();
     let samples_dev = stream
@@ -42,6 +31,29 @@ pub fn gaussian_mmd_host(
         mmd2: observed,
         null,
     })
+}
+
+/// Exact peak device-buffer bytes held by [`gaussian_mmd_host`].
+///
+/// The budgeted CUDA backend calls this same shape function before dispatch,
+/// so admission and the concrete kernel allocation cannot drift apart.
+pub fn gaussian_mmd_device_bytes(
+    pooled_len: usize,
+    sample_count: usize,
+    permutation_count: usize,
+) -> Result<usize> {
+    let matrix_len = checked_square(sample_count, "MMD kernel matrix length")?;
+    let permutation_elements = permutation_count
+        .checked_mul(sample_count)
+        .ok_or_else(|| shape_overflow("MMD permutation matrix length"))?;
+    checked_sum_bytes(&[
+        bytes::<f64>(pooled_len, "MMD pooled samples")?,
+        bytes::<f64>(matrix_len, "MMD kernel matrix")?,
+        bytes::<f64>(sample_count, "MMD row sums")?,
+        bytes::<i32>(permutation_elements, "MMD permutations")?,
+        bytes::<f64>(permutation_count, "MMD permutation outputs")?,
+        bytes::<f64>(1, "MMD observed output")?,
+    ])
 }
 
 pub fn mmd_change_point_host(

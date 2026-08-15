@@ -44,7 +44,7 @@ pub use self::linear_cka::linear_cka_pair_estimates_host;
 pub use self::logistic::{
     CudaLogisticConfig, CudaLogisticDataset, CudaLogisticSplits, logistic_summaries_host,
 };
-pub use self::mmd::{gaussian_mmd_host, mmd_change_point_host};
+pub use self::mmd::{gaussian_mmd_device_bytes, gaussian_mmd_host, mmd_change_point_host};
 pub use self::temporal::{
     autocorrelation_sums_host, cross_correlation_batch_host, periodogram_batch_host,
 };

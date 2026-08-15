@@ -3008,6 +3008,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
 fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
     let mut params = synapse_calyx::SynapseCalyxPanelDriftParams::new(panel_version);
     params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
+    params.math_execution_class = synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu;
     let report = db
         .panel_drift_intelligence(&params)
         .map_err(|error| format!("measure panel {panel_version} post-ingest drift: {error}"))?;
@@ -3059,6 +3060,8 @@ fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), Strin
         records_scanned = report.records_scanned,
         drifted_lenses = report.drifted_lenses,
         drift_rows_persisted = report.drift_rows_persisted,
+        math_execution_class = report.math_execution_class,
+        math_backend_used = report.math_backend_used,
         notifications_matched = delivery.matched,
         notifications_queued = delivery.queued,
         notifications_dropped = delivery.dropped,
