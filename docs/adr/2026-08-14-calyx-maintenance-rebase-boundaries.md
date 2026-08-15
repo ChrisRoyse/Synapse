@@ -72,6 +72,14 @@ fail-closed audit surface unusable. Silently skipping it would make the audit
 answer incomplete; a generic delete operation would weaken the authority the
 codec boundary was added to protect.
 
+The same audit found a repair-token split in CDP profile cleanup. An unfiltered
+status read omitted the physical tree measurement, while repair re-read the
+exact token with that measurement present. Because the tree was part of the
+revision material, one unchanged directory had two deterministic revisions and
+the status surface could never issue a token the repair surface would accept.
+The filter had accidentally changed the represented state rather than only
+selecting which state to return.
+
 A fresh installed-daemon memory census then isolated the remaining steady-state
 growth. The watcher queue was empty and physically bounded. Retention GC instead
 kept 1,681,542 exact source keys in a private heap arena for the whole process,
@@ -154,12 +162,18 @@ the authority.
     content-specific migration. The caller must re-submit the diagnostic's
     exact key/value lengths and SHA-256 identities plus the physical envelope
     revision. The migration then validates the exact historical key prefix,
-    suffix, JSON marker, schema, row kind, timestamp, sequence, and `probe_id`.
-    It atomically deletes that one revision and writes a canonical repair audit
-    row under an absent-key guard. A conflict or mismatch performs no mutation;
-    success is followed by separate exact reads proving source absence and the
-    repair row's bytes. Unknown malformed rows remain hard errors and have no
-    deletion route.
+    suffix, prefix/marker pairing, and the presence of the `seq`/`probe_id` keys
+    that the historical generic probe producer actually guaranteed. The
+    producer used `or_insert`, so caller-supplied values were preserved, and it
+    emitted `ts_ns` only when `ts_ns_start` was supplied; the migration must not
+    invent value or timestamp invariants that never existed. It also does not
+    invent a current command-audit schema or row-kind requirement for an
+    arbitrary JSON producer that never emitted those fields. It atomically deletes that
+    one content-addressed revision and writes a canonical repair audit row under
+    an absent-key guard. A conflict or mismatch performs no mutation; success
+    is followed by separate exact reads proving source absence and the repair
+    row's bytes. Unknown malformed rows remain hard errors and have no deletion
+    route.
 13. The exact GC source-census baseline is published as an immutable file-backed
     generation under the vault. Its header binds the pinned sequence, Base
     commit watermark, row count, canonical directory/range widths, file length,
@@ -183,6 +197,14 @@ the authority.
     successful current-pointer readback; cleanup failure is named and retried by
     the next publication/reuse without making a known-published generation
     ambiguous.
+14. A revision used as a destructive maintenance precondition is derived from
+    one canonical state representation. Query filters only select entries; they
+    cannot add or remove fields from the revision material. CDP profile status
+    therefore measures directory identity, tree metadata, ownership ledgers,
+    process generation, and live users identically for list and exact-token
+    reads. Repair reuses that representation before validation and at the final
+    mutation boundary, so any relevant state drift changes the same token the
+    client observed.
 
 ## Consequences
 
@@ -218,6 +240,9 @@ the authority.
 - Older/restored vaults can remove the one positively identified #1540 probe
   without teaching audit readers to omit corruption or exposing a general raw
   delete surface. The repair itself remains a canonical, queryable audit fact.
+- CDP status can no longer advertise a revision that exact-token repair rejects
+  solely because the selector changed the hashed representation. Directory
+  identity, tree, owner, and process evidence remain part of the guard.
 - Idle GC no longer charges the complete exact protection corpus to private
   process commit. Cold baseline pages are file-backed and pageable, while exact
   binary-search membership and fail-closed corruption behavior remain intact.
@@ -246,6 +271,9 @@ the authority.
 - [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations): a write batch applies its contained updates atomically, supporting one commit for the exact delete and its canonical audit record.
 - [RocksDB online verification](https://github.com/facebook/rocksdb/wiki/Online-Verification): per-key checksums and independent verification reads complement commit status when stored bytes are the authority.
 - [RocksDB MANIFEST](https://github.com/facebook/rocksdb/wiki/MANIFEST): immutable generations plus a synced current pointer recover one complete version; atomic groups are never partially applied.
+- [RFC 9110 validators and `If-Match`](https://www.rfc-editor.org/rfc/rfc9110.html#section-8.8): a strong validator changes with the represented data and conditional mutation uses strong comparison to prevent lost updates; the read and write precondition must therefore name the same representation.
+- [Microsoft file identity](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfileinformationbyhandle): volume serial and file index identify whether paths resolve to the same filesystem object, complementing the canonical tree representation at a destructive boundary.
+- [Confluent schema evolution](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html): current consumers remain explicitly compatible with data produced under older schemas; a migration validates the historical producer contract rather than assuming fields introduced later.
 - [RocksDB checksums](https://github.com/facebook/rocksdb/wiki/Basic-Operations): stored data carries checksums and read-time verification reports corruption instead of serving unchecked bytes.
 - [Microsoft Windows working sets](https://learn.microsoft.com/en-us/windows/win32/memory/working-set): file-backed mapped pages are pageable and may be trimmed independently from process-private allocations.
 - [Microsoft cache/memory guidance](https://learn.microsoft.com/en-us/windows-server/administration/performance-tuning/subsystem/cache-memory-management/troubleshoot): random-access file hints can retain excessive mapped pages, so the census uses the ordinary read-only mapping path without that hint.

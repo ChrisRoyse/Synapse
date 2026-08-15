@@ -11028,7 +11028,13 @@ fn cdp_profile_status_internal(ownership_token_filter: Option<&str>) -> CdpProfi
         } else {
             None
         };
-        let tree = if directory_present && ownership_token_filter.is_some() {
+        // A filter selects entries; it must never change the representation
+        // whose revision authorizes deletion. Repair re-reads an exact token,
+        // so omitting the tree from an unfiltered status made the advertised
+        // revision impossible for repair to accept even when reality had not
+        // changed. Measure the same physical state in both modes and hash that
+        // one canonical representation below.
+        let tree = if directory_present {
             match cdp_profile_tree_measurement(&path) {
                 Ok(tree) => Some(tree),
                 Err(error) => {

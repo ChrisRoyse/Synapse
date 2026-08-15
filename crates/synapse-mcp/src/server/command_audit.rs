@@ -1406,10 +1406,10 @@ fn validate_issue1540_probe_row(key: &[u8], value: &[u8]) -> Result<String, Erro
             "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: noncanonical key is not UTF-8; no mutation occurred",
         )
     })?;
-    let prefix = if key_text.starts_with("issue1540-final-redaction-") {
-        "issue1540-final-redaction"
+    let (prefix, expected_marker) = if key_text.starts_with("issue1540-final-redaction-") {
+        ("issue1540-final-redaction", "ISSUE1540_FINAL_SYNTHETIC")
     } else if key_text.starts_with("issue1540-redaction-") {
-        "issue1540-redaction"
+        ("issue1540-redaction", "ISSUE1540_SYNTHETIC")
     } else {
         return Err(mcp_error(
             synapse_core::error_codes::STORAGE_CORRUPTED,
@@ -1432,30 +1432,41 @@ fn validate_issue1540_probe_row(key: &[u8], value: &[u8]) -> Result<String, Erro
             ),
         )
     })?;
+    if !record.is_object() {
+        return Err(mcp_error(
+            synapse_core::error_codes::STORAGE_CORRUPTED,
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: value is not a JSON object; no mutation occurred",
+        ));
+    }
     let marker = record
         .get("error_code")
         .and_then(Value::as_str)
-        .filter(|marker| {
-            matches!(
-                *marker,
-                "ISSUE1540_SYNTHETIC" | "ISSUE1540_FINAL_SYNTHETIC"
-            )
-        })
+        .filter(|marker| *marker == expected_marker)
         .ok_or_else(|| {
             mcp_error(
                 synapse_core::error_codes::STORAGE_CORRUPTED,
-                "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: error_code is not an exact #1540 synthetic marker; no mutation occurred",
+                format!(
+                    "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: error_code does not match the exact #1540 marker {expected_marker} paired with key prefix {prefix}; no mutation occurred"
+                ),
             )
         })?;
-    let exact_envelope = record.get("schema_version").and_then(Value::as_u64) == Some(1)
-        && record.get("row_kind").and_then(Value::as_str) == Some(COMMAND_AUDIT_ROW_KIND)
-        && record.get("ts_ns").and_then(Value::as_u64) == Some(0)
-        && record.get("seq").and_then(Value::as_u64) == Some(0)
-        && record.get("probe_id").and_then(Value::as_str) == Some(key_text);
-    if !exact_envelope {
+    // #1540 used the historical generic `storage_put_probe_rows` producer.
+    // That producer accepted an arbitrary JSON object and used `or_insert` for
+    // `probe_id` and `seq`: it guaranteed that both keys were present, but it
+    // deliberately preserved arbitrary caller-supplied values and added
+    // `ts_ns` only when the request supplied `ts_ns_start`. Requiring specific
+    // values (or requiring `ts_ns` to exist) invents a contract the producer
+    // never had and makes this migration reject the artifact it exists to
+    // remove. The exact paired #1540 key/marker plus the caller-supplied key and
+    // value lengths, SHA-256 identities, and physical revision keep the delete
+    // content-addressed and non-generic.
+    if !record
+        .as_object()
+        .is_some_and(|object| object.contains_key("seq") && object.contains_key("probe_id"))
+    {
         return Err(mcp_error(
             synapse_core::error_codes::STORAGE_CORRUPTED,
-            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: JSON does not match the exact schema_version/row_kind/ts_ns/seq/probe_id envelope emitted by the #1540 probe writer; no mutation occurred",
+            "COMMAND_AUDIT_LEGACY_REPAIR_NOT_ISSUE1540: JSON lacks the seq/probe_id keys guaranteed by the historical #1540 probe writer; no mutation occurred",
         ));
     }
     Ok(format!("{prefix}/{marker}"))
