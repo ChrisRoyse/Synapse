@@ -714,10 +714,26 @@ impl SymmetricSparseGraph {
                     normalize_f64(&mut candidate)?;
                     let candidate_product = self
                         .component_scaled_adjacency_mat_vec(nodes, &local_of, scale, &candidate);
+                    validate_f64_operator_product(size, &candidate_product)?;
                     let (rayleigh, candidate_residual) =
                         eigenpair_residual_f64(&candidate_product, &candidate);
+                    if !rayleigh.is_finite() || rayleigh <= 0.0 || !candidate_residual.is_finite() {
+                        return Err(ComponentDivergence {
+                            iterations: dim,
+                            residual: f32::INFINITY,
+                            radius: 0.0,
+                            shift_scale: scale as f32,
+                        }
+                        .into());
+                    }
                     normalized_radius = rayleigh;
                     residual = candidate_residual;
+                    if residual < f64::from(tol) {
+                        return Ok(ComponentSpectrum {
+                            radius: (normalized_radius * scale) as f32,
+                            vector: candidate.into_iter().map(|value| value as f32).collect(),
+                        });
+                    }
                 }
                 break;
             }
