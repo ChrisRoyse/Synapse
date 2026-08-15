@@ -15,7 +15,7 @@ use calyx_assay::{
     partial_correlation_network, pc_stable_gaussian, temporal_cross_k, transfer_entropy_sweep,
 };
 use calyx_aster::cf::ColumnFamily;
-use calyx_core::SystemClock;
+use calyx_core::FixedClock;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -232,7 +232,7 @@ impl SynapseCalyxVault {
                 let stream_b = &binned[group_b];
                 let times_a = &by_group[group_a];
                 let times_b = &by_group[group_b];
-                let transfer_entropy = transfer_entropy_evidence(stream_a, stream_b, &lags);
+                let transfer_entropy = transfer_entropy_evidence(stream_a, stream_b, &lags)?;
                 let granger_a_to_b = granger_evidence(
                     group_a,
                     group_b,
@@ -613,7 +613,7 @@ fn transfer_entropy_evidence(
     a: &[f32],
     b: &[f32],
     lags: &[usize],
-) -> SynapseCalyxCausalEstimatorEvidence {
+) -> Result<SynapseCalyxCausalEstimatorEvidence, SynapseCalyxError> {
     let a_stream = a
         .iter()
         .copied()
@@ -626,12 +626,17 @@ fn transfer_entropy_evidence(
         .enumerate()
         .map(|(i, v)| (i as u64, v))
         .collect::<Vec<_>>();
-    let results = transfer_entropy_sweep(&a_stream, &b_stream, lags, &SystemClock);
+    // The causal map is content-addressed. A wall-clock timestamp inside one
+    // estimator result would make identical source rows produce different
+    // Graph keys, so the estimator runs under a fixed clock and its runtime-only
+    // timestamp is removed from the persisted semantic projection below.
+    let results = transfer_entropy_sweep(&a_stream, &b_stream, lags, &FixedClock::new(0));
     let measured = results
         .iter()
         .any(|result| !result.provisional && result.error_code.is_none());
-    let result = json!({ "lags": results });
-    if measured {
+    let mut result = json!({ "lags": results });
+    canonicalize_transfer_entropy_projection(&mut result)?;
+    let evidence = if measured {
         measured_evidence(
             "transfer_entropy_lag_sweep",
             vec![
@@ -650,7 +655,48 @@ fn transfer_entropy_evidence(
             "no transfer-entropy lag reached a non-provisional estimate; inspect each persisted lag error_code and n_samples",
             "capture more aligned bins or correct the specific estimator failure; no other causal lane substitutes for transfer entropy",
         )
+    };
+    Ok(evidence)
+}
+
+fn canonicalize_transfer_entropy_projection(result: &mut Value) -> Result<(), SynapseCalyxError> {
+    let lags = result
+        .get_mut("lags")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CANONICALIZATION_FAILED",
+                "the transfer-entropy projection has no lags array",
+                "inspect the calyx-assay TEResult serialization contract and update the explicit causal-map projection",
+            )
+        })?;
+    for (index, lag) in lags.iter_mut().enumerate() {
+        let fields = lag.as_object_mut().ok_or_else(|| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CANONICALIZATION_FAILED",
+                format!("transfer-entropy lag {index} is not an object"),
+                "inspect the calyx-assay TEResult serialization contract and update the explicit causal-map projection",
+            )
+        })?;
+        match fields.remove("computed_at") {
+            Some(Value::Number(_)) => {}
+            Some(_) => {
+                return Err(causal_error(
+                    "SYNAPSE_CALYX_CAUSAL_MAP_CANONICALIZATION_FAILED",
+                    format!("transfer-entropy lag {index} has a non-numeric computed_at field"),
+                    "restore TEResult.computed_at to its declared timestamp type or update the explicit causal-map projection",
+                ));
+            }
+            None => {
+                return Err(causal_error(
+                    "SYNAPSE_CALYX_CAUSAL_MAP_CANONICALIZATION_FAILED",
+                    format!("transfer-entropy lag {index} has no computed_at field"),
+                    "inspect the calyx-assay TEResult serialization contract and update the explicit causal-map projection",
+                ));
+            }
+        }
     }
+    Ok(())
 }
 
 fn granger_evidence(

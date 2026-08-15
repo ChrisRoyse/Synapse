@@ -25,13 +25,14 @@ Primary sources constrain the interpretation:
 4. The artifact keeps estimator lanes separate, including their assumptions, samples, and typed failures. There is no combined causal score and no estimator fallback.
 5. Benjamini-Hochberg q-values are persisted for each applicable p-value family. Transfer entropy and CCM retain their native confidence/convergence evidence rather than receiving invented p-values.
 6. Every artifact is `observational_predictive` and `structural_effect_identified=false` unless a future version accepts and verifies a persisted intervention/identification contract. Estimator agreement alone cannot change that class.
-7. The complete artifact is content-addressed under the native Calyx Graph CF (`GCMP1...`). The write is flushed and separately read byte-for-byte before the response exposes its key, SHA-256, byte count, Graph row count, and readback verdict.
+7. The complete artifact is content-addressed under the native Calyx Graph CF (`GCMP1...`). Runtime-only estimator timestamps are excluded from the semantic bytes; source-data time remains explicit in `earliest_event_ns` / `latest_event_ns`, and upstream projection drift fails closed instead of reintroducing nondeterminism. The write is flushed and separately read byte-for-byte before the response exposes its key, SHA-256, byte count, Graph row count, and readback verdict.
 
 ## Consequences
 
 - Large or heterogeneous calls must narrow their physical source-event scope instead of receiving a biased prefix.
 - A lane can be unresolved because its assumptions or quorum are not met while the map remains a complete account of what was and was not measurable. The persisted typed error is evidence, not a silent substitute.
 - Consumers can use predictive arrows for explanation and hypothesis generation, but structural control requires a separately identified causal contract.
+- Repeating the same request over byte-identical source rows reuses the same Graph key and value digest; invocation time belongs in runtime provenance, not the content-addressed artifact.
 - Existing periodicity, drift, hazard, and targeted causality calls inherit the source-event window and complete-scope refusal, removing the same silent-truncation class from the shared loader.
 
 ## References
