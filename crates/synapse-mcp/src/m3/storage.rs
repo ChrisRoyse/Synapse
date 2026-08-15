@@ -1355,6 +1355,10 @@ pub struct StorageGcOnceResponse {
 pub struct StorageSnapshotGcObservation {
     pub floor_seq: u64,
     pub current_seq: u64,
+    pub active_reader_leases: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_pinned_seq: Option<u64>,
+    pub reader_lease_expired_total: u64,
     pub versions_reclaimed_total: u64,
     pub bytes_reclaimed_total: u64,
     pub soft_deletes_purged_total: u64,
@@ -6189,6 +6193,9 @@ fn storage_snapshot_gc_observation(
     StorageSnapshotGcObservation {
         floor_seq: report.floor_seq,
         current_seq: report.current_seq,
+        active_reader_leases: report.active_reader_leases,
+        oldest_pinned_seq: report.oldest_pinned_seq,
+        reader_lease_expired_total: report.reader_lease_expired_total,
         versions_reclaimed_total: report.versions_reclaimed_total,
         bytes_reclaimed_total: report.bytes_reclaimed_total,
         soft_deletes_purged_total: report.soft_deletes_purged_total,

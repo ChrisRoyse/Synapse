@@ -6,6 +6,7 @@ use crate::compaction::{
 };
 use crate::gc::{GcMetrics, GcRateLimit, GcResult, SnapshotGcTick};
 use crate::mvcc::{SnapshotVersionGcBudget, SnapshotVersionGcPass};
+use crate::resource::LeaseView;
 use crate::storage_names::sst_order_key;
 use crate::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Result};
@@ -103,6 +104,17 @@ where
     #[must_use]
     pub fn snapshot_gc_floor_seq(&self) -> u64 {
         self.rows.snapshot_gc_safe_point(self.clock.now())
+    }
+
+    /// Returns the live reader registry view used to derive the snapshot-GC
+    /// floor, pruning expired leases at the same physical watchdog boundary.
+    ///
+    /// This is intentionally O(1): operational readback must be able to prove
+    /// that a public snapshot pin appeared and disappeared without running a
+    /// version-table census or trusting the open/release return value.
+    #[must_use]
+    pub fn reader_lease_view(&self) -> LeaseView {
+        self.rows.lease_view(self.clock.now())
     }
 
     fn reclaim_snapshot_ssts(&self, safe_point: u64, max_input_files: usize) -> Result<GcResult> {

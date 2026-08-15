@@ -2762,6 +2762,15 @@ pub struct SynapseCalyxSnapshotVersionGcPass {
 pub struct SynapseCalyxSnapshotGcObservation {
     pub floor_seq: u64,
     pub current_seq: u64,
+    /// Number of unexpired readers in Aster's physical lease watchdog.
+    #[serde(default)]
+    pub active_reader_leases: u64,
+    /// Oldest sequence still pinned by a live reader, if any.
+    #[serde(default)]
+    pub oldest_pinned_seq: Option<u64>,
+    /// Process-lifetime count of expired readers physically aborted by Aster.
+    #[serde(default)]
+    pub reader_lease_expired_total: u64,
     pub versions_reclaimed_total: u64,
     pub bytes_reclaimed_total: u64,
     pub soft_deletes_purged_total: u64,
@@ -3537,9 +3546,14 @@ impl SynapseCalyxReadOnlyVault {
     #[must_use]
     pub fn snapshot_gc_observation(&self) -> SynapseCalyxSnapshotGcObservation {
         let metrics = self.vault.snapshot_gc_counters_only();
+        let leases = self.vault.reader_lease_view();
+        let current_seq = self.vault.latest_seq();
         SynapseCalyxSnapshotGcObservation {
-            floor_seq: self.vault.snapshot_gc_floor_seq(),
-            current_seq: self.vault.latest_seq(),
+            floor_seq: leases.oldest_pinned_seq.unwrap_or(current_seq),
+            current_seq,
+            active_reader_leases: u64::try_from(leases.active_leases).unwrap_or(u64::MAX),
+            oldest_pinned_seq: leases.oldest_pinned_seq,
+            reader_lease_expired_total: leases.reader_lease_expired_total,
             versions_reclaimed_total: metrics.versions_reclaimed_total,
             bytes_reclaimed_total: metrics.bytes_freed_total,
             soft_deletes_purged_total: metrics.soft_deletes_purged_total,
@@ -8445,9 +8459,14 @@ impl SynapseCalyxVault {
     #[must_use]
     pub fn snapshot_gc_observation(&self) -> SynapseCalyxSnapshotGcObservation {
         let metrics = self.vault.snapshot_gc_counters_only();
+        let leases = self.vault.reader_lease_view();
+        let current_seq = self.vault.latest_seq();
         SynapseCalyxSnapshotGcObservation {
-            floor_seq: self.vault.snapshot_gc_floor_seq(),
-            current_seq: self.vault.latest_seq(),
+            floor_seq: leases.oldest_pinned_seq.unwrap_or(current_seq),
+            current_seq,
+            active_reader_leases: u64::try_from(leases.active_leases).unwrap_or(u64::MAX),
+            oldest_pinned_seq: leases.oldest_pinned_seq,
+            reader_lease_expired_total: leases.reader_lease_expired_total,
             versions_reclaimed_total: metrics.versions_reclaimed_total,
             bytes_reclaimed_total: metrics.bytes_freed_total,
             soft_deletes_purged_total: metrics.soft_deletes_purged_total,

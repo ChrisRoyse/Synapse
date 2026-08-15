@@ -34,6 +34,11 @@ inside the existing `storage` MCP facade:
 The process-local public lease table and Aster's reader registry / snapshot-GC
 floor are one lifecycle. Admission is atomic under the public lease-table lock,
 and expired entries are pruned without allowing the table to grow unbounded.
+`snapshot_gc_status` independently reads the Aster watchdog's live reader
+count, oldest pinned sequence, and monotonic expired-reader count beside the GC
+floor and current sequence. Those fields come from the physical registry, not
+from an open/read/release response, so a leaked or failed-to-release reader is
+directly observable without a version-table scan.
 
 Generic answer replay is removed. `EntryKind::Measure` keeps its historical wire
 code reserved so old bytes can never be reinterpreted. Answer traces retain any
@@ -63,3 +68,9 @@ may claim deterministic re-execution.
 - [W3C PROV-DM](https://www.w3.org/TR/prov-dm/): reproducible derivation requires explicit entities, activities, usage, and generation.
 - [Microsoft event sourcing](https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing): immutable events are the system of record; snapshots are an optimization, not a substitute.
 - [MCP tool schema guidance](https://modelcontextprotocol.io/seps/2106-json-schema-2020-12): tool arguments retain an object-root JSON Schema contract.
+- [RocksDB snapshots](https://github.com/facebook/rocksdb/wiki/Snapshot): the
+  database registers every live snapshot, preserves versions visible to it,
+  and requires the caller to release the snapshot's resources.
+- [PostgreSQL activity statistics](https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW):
+  the active backend's cleanup-pinning `xmin` horizon is an explicit monitoring
+  field rather than an inference from transaction return values.
