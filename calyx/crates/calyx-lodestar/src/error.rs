@@ -37,6 +37,10 @@ pub enum LodestarError {
         from: calyx_core::CxId,
         to: calyx_core::CxId,
     },
+    #[error("CALYX_KERNEL_TRAVERSAL_RESOURCE: {detail}")]
+    KernelTraversalResource { detail: String },
+    #[error("CALYX_KERNEL_TRAVERSAL_INVARIANT: {detail}")]
+    KernelTraversalInvariant { detail: String },
     #[error("CALYX_KERNEL_ANSWER_LEDGER_REQUIRED: {detail}")]
     KernelAnswerLedgerRequired { detail: String },
     #[error("CALYX_KERNEL_ANSWER_LEDGER_MISMATCH: {detail}")]
@@ -138,6 +142,8 @@ impl LodestarError {
             Self::KernelIndexBuild { .. } => "CALYX_KERNEL_INDEX_BUILD",
             Self::KernelNoAnchoredNode => "CALYX_KERNEL_NO_ANCHORED_NODE",
             Self::KernelAnswerNoPath { .. } => "CALYX_KERNEL_ANSWER_NO_PATH",
+            Self::KernelTraversalResource { .. } => "CALYX_KERNEL_TRAVERSAL_RESOURCE",
+            Self::KernelTraversalInvariant { .. } => "CALYX_KERNEL_TRAVERSAL_INVARIANT",
             Self::KernelAnswerLedgerRequired { .. } => "CALYX_KERNEL_ANSWER_LEDGER_REQUIRED",
             Self::KernelAnswerLedgerMismatch { .. } => "CALYX_KERNEL_ANSWER_LEDGER_MISMATCH",
             Self::KernelProvenancePayloadCodec { .. } => "CALYX_KERNEL_PROVENANCE_PAYLOAD_CODEC",

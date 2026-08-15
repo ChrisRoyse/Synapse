@@ -1,8 +1,10 @@
+use std::collections::{HashSet, VecDeque};
+
 use calyx_aster::ledger_view::AsterLedgerCfStore;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{Clock, CxId, LedgerRef};
 use calyx_ledger::{EntryKind, LedgerAppender, LedgerCfStore, decode};
-use calyx_paths::{AssocGraph, attenuate, reach};
+use calyx_paths::{AssocGraph, PathsError, attenuate};
 use serde::{Deserialize, Serialize};
 
 use crate::provenance::{
@@ -371,41 +373,163 @@ fn nearest_answerable_anchored_path_from_ranked(
     if anchored_nodes.is_empty() {
         return Err(LodestarError::KernelNoAnchoredNode);
     }
+
+    let mut anchored = HashSet::new();
+    anchored
+        .try_reserve(anchored_nodes.len())
+        .map_err(|error| traversal_resource("index anchored kernel nodes", error))?;
+    anchored.extend(anchored_nodes.iter().copied());
+
+    let mut ranked_anchors = Vec::new();
+    ranked_anchors
+        .try_reserve(candidates.len().min(anchored.len()))
+        .map_err(|error| traversal_resource("collect ranked anchored candidates", error))?;
     let mut saw_anchored_candidate = false;
-    let mut first_path_error = None;
-    for anchor in candidates
-        .iter()
-        .map(|(cx_id, _)| *cx_id)
-        .filter(|cx_id| anchored_nodes.contains(cx_id))
-    {
-        saw_anchored_candidate = true;
-        if graph.node_index(anchor).is_none() {
+    for anchor in candidates.iter().map(|(cx_id, _)| *cx_id) {
+        if !anchored.contains(&anchor) {
             continue;
         }
+        saw_anchored_candidate = true;
+        let Some(anchor_index) = graph.node_index(anchor) else {
+            continue;
+        };
         if query_cx == anchor {
             return Ok((anchor, vec![anchor]));
         }
-        match reach(graph, anchor, query_cx, max_hops) {
-            Ok(Some(path)) => return Ok((anchor, path)),
-            Ok(None) => {
-                first_path_error.get_or_insert(LodestarError::KernelAnswerNoPath {
-                    from: anchor,
-                    to: query_cx,
-                });
-            }
-            Err(err) => {
-                let error = LodestarError::from(err);
-                if error.code() != "CALYX_PATHS_MAX_HOPS" {
-                    return Err(error);
-                }
-                first_path_error.get_or_insert(error);
-            }
-        }
+        ranked_anchors.push((anchor, anchor_index));
     }
-    if !saw_anchored_candidate {
+    if !saw_anchored_candidate || ranked_anchors.is_empty() {
         return Err(LodestarError::KernelNoAnchoredNode);
     }
-    Err(first_path_error.unwrap_or(LodestarError::KernelNoAnchoredNode))
+
+    let query_index = graph
+        .node_index(query_cx)
+        .ok_or(PathsError::NodeNotFound { id: query_cx })?;
+    let (next_to_query, truncated) = reverse_paths_to_query(graph, query_index, max_hops)?;
+    for (anchor, anchor_index) in &ranked_anchors {
+        if next_to_query[*anchor_index].is_some() {
+            return Ok((
+                *anchor,
+                reconstruct_reverse_path(graph, *anchor_index, query_index, &next_to_query)?,
+            ));
+        }
+    }
+
+    let first_anchor = ranked_anchors[0].0;
+    if truncated {
+        let required = max_hops.checked_add(1).ok_or_else(|| {
+            LodestarError::KernelTraversalInvariant {
+                detail: "truncated reverse traversal cannot report required hops because max_hops is usize::MAX"
+                    .to_owned(),
+            }
+        })?;
+        return Err(PathsError::MaxHops { required, max_hops }.into());
+    }
+    Err(LodestarError::KernelAnswerNoPath {
+        from: first_anchor,
+        to: query_cx,
+    })
+}
+
+/// Index every path to one query with a single bounded reverse BFS. Keeping the
+/// traversal query-centric is O(V + E); calling `reach` once per ranked anchor
+/// multiplies that cost by the number of candidate anchors.
+fn reverse_paths_to_query(
+    graph: &AssocGraph,
+    query_index: usize,
+    max_hops: usize,
+) -> Result<(Vec<Option<usize>>, bool)> {
+    let mut next_to_query = Vec::new();
+    next_to_query
+        .try_reserve_exact(graph.node_count())
+        .map_err(|error| traversal_resource("allocate reverse traversal index", error))?;
+    next_to_query.resize(graph.node_count(), None);
+    next_to_query[query_index] = Some(query_index);
+
+    let mut queue = VecDeque::new();
+    queue
+        .try_reserve(1)
+        .map_err(|error| traversal_resource("allocate reverse traversal queue", error))?;
+    queue.push_back((query_index, 0_usize));
+    let mut truncated = false;
+
+    while let Some((node, depth)) = queue.pop_front() {
+        if depth == max_hops {
+            truncated |= graph
+                .incoming_edges_by_index(node)
+                .any(|edge| next_to_query[edge.src].is_none());
+            continue;
+        }
+        let next_depth = depth.checked_add(1).ok_or_else(|| {
+            LodestarError::KernelTraversalInvariant {
+                detail: format!(
+                    "reverse traversal depth overflowed at graph node {node} toward query index {query_index}"
+                ),
+            }
+        })?;
+        for edge in graph.incoming_edges_by_index(node) {
+            if next_to_query[edge.src].is_some() {
+                continue;
+            }
+            next_to_query[edge.src] = Some(node);
+            queue
+                .try_reserve(1)
+                .map_err(|error| traversal_resource("grow reverse traversal queue", error))?;
+            queue.push_back((edge.src, next_depth));
+        }
+    }
+    Ok((next_to_query, truncated))
+}
+
+fn reconstruct_reverse_path(
+    graph: &AssocGraph,
+    anchor_index: usize,
+    query_index: usize,
+    next_to_query: &[Option<usize>],
+) -> Result<Vec<CxId>> {
+    let mut path = Vec::new();
+    let mut cursor = anchor_index;
+    loop {
+        path.try_reserve(1)
+            .map_err(|error| traversal_resource("grow grounded answer path", error))?;
+        let node_id =
+            graph
+                .node_id(cursor)
+                .ok_or_else(|| LodestarError::KernelTraversalInvariant {
+                    detail: format!(
+                        "reverse traversal produced out-of-range graph node index {cursor}"
+                    ),
+                })?;
+        path.push(node_id);
+        if cursor == query_index {
+            return Ok(path);
+        }
+        cursor = next_to_query
+            .get(cursor)
+            .copied()
+            .flatten()
+            .ok_or_else(|| LodestarError::KernelTraversalInvariant {
+                detail: format!(
+                    "reverse traversal lost the successor from node {node_id} toward query index {query_index}"
+                ),
+            })?;
+        if path.len() > next_to_query.len() {
+            return Err(LodestarError::KernelTraversalInvariant {
+                detail: format!(
+                    "reverse traversal formed a cycle from anchor index {anchor_index} toward query index {query_index}"
+                ),
+            });
+        }
+    }
+}
+
+fn traversal_resource(
+    action: &'static str,
+    error: std::collections::TryReserveError,
+) -> LodestarError {
+    LodestarError::KernelTraversalResource {
+        detail: format!("failed to {action}: {error}"),
+    }
 }
 
 fn derivation_hops(graph: &AssocGraph, path: &[CxId]) -> Result<Vec<AnswerDerivationHop>> {
