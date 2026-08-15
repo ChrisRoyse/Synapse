@@ -2092,6 +2092,20 @@ impl StorageIntelligenceOperation {
             Self::Abundance | Self::KernelAnswer | Self::OlapAggregate
         )
     }
+
+    /// Whether this read has an operation-level bound independent of the live
+    /// vault's total physical row count.
+    ///
+    /// `abundance` and `kernel_answer` both hydrate at most `max_records`
+    /// (`1..=20_000`) and never write. `olap_aggregate` is also read-only, but
+    /// may scan up to one million materialized rows, so it remains serialized
+    /// with whole-corpus work. Keeping the classification explicit and
+    /// exhaustive prevents a newly added operation from silently bypassing the
+    /// memory-ownership lane.
+    #[must_use]
+    pub const fn is_bounded_read(self) -> bool {
+        matches!(self, Self::Abundance | Self::KernelAnswer)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]

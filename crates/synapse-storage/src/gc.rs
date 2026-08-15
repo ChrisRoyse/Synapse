@@ -413,8 +413,9 @@ pub fn spawn_runner(
     let state = Arc::new(GcTaskState::default());
     let task_state = Arc::clone(&state);
     let task = handle.spawn(async move {
+        let cadence = interval;
         let mut interval =
-            tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+            tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
@@ -472,6 +473,22 @@ pub fn spawn_runner(
                         tokio::time::sleep(delay).await;
                     };
                     let deferral = mark_gc_tick_completed(&task_state, started, attempt, &result);
+                    // A maintenance pass may legitimately take longer than its
+                    // cadence. `MissedTickBehavior::Delay` prevents a *burst* of
+                    // overdue ticks, but the first already-due tick still
+                    // resolves immediately when the loop reaches `tick()`
+                    // again. That admitted a second multi-minute derived-state
+                    // pass as soon as the first one released the whole-corpus
+                    // lane, keeping foreground Calyx calls queued indefinitely.
+                    //
+                    // Maintenance is state-convergent: one completed pass has
+                    // already observed everything committed before its own
+                    // coherent snapshots. Discard cadence debt and schedule the
+                    // next pass one full cadence after this terminal readback.
+                    // This is completion-relative scheduling, not a disabled or
+                    // skipped capability; every runner still executes forever,
+                    // with a real idle/admission window between passes.
+                    interval.reset_after(cadence);
                     if let Err(error) = result {
                         match deferral {
                             Some(deferral) if !deferral.escalated => tracing::warn!(

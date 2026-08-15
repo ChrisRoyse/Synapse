@@ -1216,17 +1216,20 @@ pub(super) async fn handle(
                     "repair storage/Calyx initialization and retry storage operation=intelligence",
                 )
             })?;
-            // These intelligence operations scan a bounded but potentially
-            // large Base corpus and run substrate math. Admit the entire public
-            // intelligence surface through the same exclusive whole-corpus
-            // lane as scheduled derived state, search rebuild, GC, pressure,
-            // and hygiene kernel rebuild. This prevents a second public route
-            // from reintroducing multiplied resident sets (#2243).
-            let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
-                    "storage_intelligence",
-                    move || {
-                use crate::m3::storage::{StorageIntelligenceOperation, StorageIntelligenceResponse};
+            // Mutating intelligence and OLAP can traverse large physical
+            // families, so they retain the exclusive whole-corpus ownership
+            // required by #2243. Abundance and kernel_answer are different by
+            // contract: both are read-only and hydrate at most the validated
+            // `max_records` bound (<=20,000). Queueing those bounded foreground
+            // reads behind a multi-minute scheduled pass made the public Calyx
+            // surface time out before its actual work began. They use a
+            // separate single-permit bounded-read lane; no second whole-corpus
+            // working set is admitted.
+            let bounded_read = sub_operation.is_bounded_read();
+            let work = move || {
+                use crate::m3::storage::{
+                    StorageIntelligenceOperation, StorageIntelligenceResponse,
+                };
                 let base = StorageIntelligenceResponse {
                     operation: sub_operation,
                     weave: None,
@@ -1255,12 +1258,12 @@ pub(super) async fn handle(
                         })
                     }
                     StorageIntelligenceOperation::Abundance => {
-                        crate::m3::storage::run_intelligence_abundance(&db, &spec).map(|abundance| {
-                            StorageIntelligenceResponse {
+                        crate::m3::storage::run_intelligence_abundance(&db, &spec).map(
+                            |abundance| StorageIntelligenceResponse {
                                 abundance: Some(abundance),
                                 ..base
-                            }
-                        })
+                            },
+                        )
                     }
                     StorageIntelligenceOperation::Bits => {
                         crate::m3::storage::run_intelligence_bits(&db, &spec).map(|bits| {
@@ -1391,14 +1394,18 @@ pub(super) async fn handle(
                         )
                     }
                     StorageIntelligenceOperation::OlapAggregate => {
-                        let slot = spec.content_slot.ok_or_else(|| crate::m1::mcp_error(
-                            synapse_core::error_codes::TOOL_PARAMS_INVALID,
-                            "intelligence olap_aggregate requires content_slot",
-                        ))?;
-                        let value_column = spec.value_column.ok_or_else(|| crate::m1::mcp_error(
-                            synapse_core::error_codes::TOOL_PARAMS_INVALID,
-                            "intelligence olap_aggregate requires value_column",
-                        ))?;
+                        let slot = spec.content_slot.ok_or_else(|| {
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                                "intelligence olap_aggregate requires content_slot",
+                            )
+                        })?;
+                        let value_column = spec.value_column.ok_or_else(|| {
+                            crate::m1::mcp_error(
+                                synapse_core::error_codes::TOOL_PARAMS_INVALID,
+                                "intelligence olap_aggregate requires value_column",
+                            )
+                        })?;
                         db.olap_aggregate_slot(
                             spec.panel_version,
                             slot,
@@ -1408,22 +1415,40 @@ pub(super) async fn handle(
                             spec.olap_max_groups.unwrap_or(4_096) as usize,
                         )
                         .map_err(|error| crate::m1::mcp_error(error.code(), error.to_string()))
-                        .and_then(|report| serde_json::to_value(report).map_err(|error| {
-                            crate::m1::mcp_error(
-                                synapse_core::error_codes::TOOL_INTERNAL_ERROR,
-                                format!("serialize native OLAP aggregate: {error}"),
-                            )
-                        }))
-                        .map(|olap_aggregate| StorageIntelligenceResponse {
-                            olap_aggregate: Some(olap_aggregate),
-                            ..base
+                        .and_then(|report| {
+                            serde_json::to_value(report).map_err(|error| {
+                                crate::m1::mcp_error(
+                                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                                    format!("serialize native OLAP aggregate: {error}"),
+                                )
+                            })
+                        })
+                        .map(|olap_aggregate| {
+                            StorageIntelligenceResponse {
+                                olap_aggregate: Some(olap_aggregate),
+                                ..base
+                            }
                         })
                     }
                 }
-                    },
-                ),
-            )
-            .await
+            };
+            let response = if bounded_read {
+                Box::pin(
+                    synapse_storage::maintenance::run_admitted_bounded_read_preserving_error(
+                        "storage_intelligence_bounded_read",
+                        work,
+                    ),
+                )
+                .await
+            } else {
+                Box::pin(
+                    synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                        "storage_intelligence",
+                        work,
+                    ),
+                )
+                .await
+            }
             .map_err(|error| {
                 facade_delegate_error(
                     STORAGE_TOOL,
@@ -1431,7 +1456,7 @@ pub(super) async fn handle(
                     &source_id,
                     STORAGE_SOT,
                     crate::m1::mcp_error(error.code(), error.to_string()),
-                    "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named intelligence error",
+                    "inspect daemon STORAGE_MAINTENANCE_* or STORAGE_BOUNDED_READ_* admission/completion records and the named intelligence error",
                 )
             })??;
             let summary = if let Some(weave) = &response.weave {

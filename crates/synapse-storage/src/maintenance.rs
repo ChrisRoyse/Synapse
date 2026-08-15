@@ -46,6 +46,18 @@ const STORAGE_HEAVY_MAINTENANCE_LANES: usize = 1;
 static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_HEAVY_MAINTENANCE_LANES)));
 
+/// Number of concurrent bounded foreground storage reads.
+///
+/// This lane is intentionally separate from whole-corpus maintenance. Its
+/// callers must have a statically enforced input bound and must not mutate the
+/// vault. A single permit prevents a client fan-out from multiplying even those
+/// bounded working sets while allowing one foreground read to remain servable
+/// during a long background pass.
+const STORAGE_BOUNDED_READ_LANES: usize = 1;
+
+static STORAGE_BOUNDED_READ_PERMITS: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_BOUNDED_READ_LANES)));
+
 /// Runs one blocking storage-maintenance pass off the async runtime workers.
 ///
 /// The closure executes on Tokio's blocking pool under a dedicated admission
@@ -153,6 +165,87 @@ where
             cf_name: "storage_maintenance".to_owned(),
             detail: format!(
                 "{operation}: storage maintenance blocking task failed to join: {join_error}"
+            ),
+        }),
+    }
+}
+
+/// Runs one statically bounded, read-only storage operation off the async
+/// runtime while preserving its domain error type.
+///
+/// This is not a second whole-corpus lane. Callers must prove both properties at
+/// their dispatch boundary: the operation cannot write, and every corpus input
+/// is bounded independently of vault size. Operations that can scan an entire
+/// physical family, even when read-only, remain on
+/// [`run_admitted_maintenance_preserving_error`].
+///
+/// The permit and completion record remain inside the blocking owner because a
+/// disconnected MCP client cannot abort work after `spawn_blocking` starts.
+///
+/// # Errors
+///
+/// Returns a structured storage error if bounded-read admission closes or the
+/// blocking task fails to join. The operation's own error remains unchanged in
+/// the nested result.
+pub async fn run_admitted_bounded_read_preserving_error<T, E, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<Result<T, E>>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    let semaphore = Arc::clone(&STORAGE_BOUNDED_READ_PERMITS);
+    let lane_occupied_at_request = semaphore.available_permits() == 0;
+    let admission_started = Instant::now();
+    let permit = Arc::clone(&semaphore)
+        .acquire_owned()
+        .await
+        .map_err(|_closed| StorageError::WriteFailed {
+            cf_name: "storage_bounded_read".to_owned(),
+            detail: format!(
+                "{operation}: bounded storage-read admission semaphore was unexpectedly closed"
+            ),
+        })?;
+    let admission_wait_ms =
+        u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let active_after_admission =
+        STORAGE_BOUNDED_READ_LANES.saturating_sub(semaphore.available_permits());
+    tracing::info!(
+        code = "STORAGE_BOUNDED_READ_ADMITTED",
+        operation,
+        admission_wait_ms,
+        lane_occupied_at_request,
+        active_after_admission = active_after_admission as u64,
+        max_concurrent = STORAGE_BOUNDED_READ_LANES as u64,
+        exclusive_whole_corpus_lane = false,
+        read_only = true,
+        "admitted a bounded read-only storage operation off the async runtime workers"
+    );
+    let exec_started = Instant::now();
+    let joined = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let outcome = work();
+        let exec_ms = u64::try_from(exec_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        tracing::info!(
+            code = "STORAGE_BOUNDED_READ_COMPLETED",
+            operation,
+            exec_ms,
+            admission_wait_ms,
+            is_ok = outcome.is_ok(),
+            completion_emitted_by_blocking_owner = true,
+            "completed a bounded read-only storage operation"
+        );
+        outcome
+    })
+    .await;
+    match joined {
+        Ok(result) => Ok(result),
+        Err(join_error) => Err(StorageError::WriteFailed {
+            cf_name: "storage_bounded_read".to_owned(),
+            detail: format!(
+                "{operation}: bounded storage-read blocking task failed to join: {join_error}"
             ),
         }),
     }
