@@ -51,7 +51,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::lens_provenance;
-use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
+use crate::{
+    SynapseCalyxCfCountProvenance, SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault,
+};
 
 /// Hard cap on records scanned per weave pass to bound one bounded,
 /// pressure-aware maintenance operation. The caller may request fewer.
@@ -262,6 +264,17 @@ pub struct SynapseCalyxAbundanceReport {
     pub dpi_ceiling_anchor_kind: Option<String>,
     pub xterm_cf_rows: usize,
     pub graph_cf_rows: usize,
+    /// How `xterm_cf_rows` was established: a physical baseline walk, an
+    /// unchanged memo, or the exact commit-maintained aggregate.
+    pub xterm_cf_rows_readback: SynapseCalyxCfCountProvenance,
+    /// How `graph_cf_rows` was established.
+    pub graph_cf_rows_readback: SynapseCalyxCfCountProvenance,
+    /// Last logical commit incorporated into the exact `XTerm` count.
+    pub xterm_cf_last_commit_seq: u64,
+    /// Last logical commit incorporated into the exact `Graph` count.
+    pub graph_cf_last_commit_seq: u64,
+    /// Vault-wide sequence observed by the later `Graph` readback.
+    pub vault_latest_seq: u64,
 }
 
 /// One *coverage* blind spot in a woven panel: a lens pair that never co-occurs
@@ -683,6 +696,11 @@ impl SynapseCalyxVault {
             cross_terms_materialized,
             xterm_cf_rows_after,
             graph_cf_rows_after,
+            xterm_readback.provenance_kind(),
+            graph_readback.provenance_kind(),
+            xterm_readback.cf_last_commit_seq,
+            graph_readback.cf_last_commit_seq,
+            graph_readback.vault_latest_seq,
         )?;
         abundance.measurable_lenses = lens_ids.len();
         abundance.slot_states = corpus.slot_states();
@@ -834,12 +852,10 @@ impl SynapseCalyxVault {
             }
             measured_slot_instances += record.slots.len();
         }
-        let xterm_cf_rows = self
-            .count_cf_latest_bounded_memoized(ColumnFamily::XTerm)?
-            .rows();
-        let graph_cf_rows = self
-            .count_cf_latest_bounded_memoized(ColumnFamily::Graph)?
-            .rows();
+        let xterm_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::XTerm)?;
+        let graph_readback = self.count_cf_latest_bounded_memoized(ColumnFamily::Graph)?;
+        let xterm_cf_rows = xterm_readback.rows();
+        let graph_cf_rows = graph_readback.rows();
         // `N` is the panel contract, not the subset one loader accepted: the
         // DDA yield `n·(N + C(N,2) + 1)` is a statement about the panel, and
         // shrinking `N` to the carried subset understates the association
@@ -854,6 +870,11 @@ impl SynapseCalyxVault {
             xterm_cf_rows,
             xterm_cf_rows,
             graph_cf_rows,
+            xterm_readback.provenance_kind(),
+            graph_readback.provenance_kind(),
+            xterm_readback.cf_last_commit_seq,
+            graph_readback.cf_last_commit_seq,
+            graph_readback.vault_latest_seq,
         )?;
         report.measurable_lenses = lens_ids.len();
         report.slot_states = corpus.slot_states();
@@ -880,6 +901,11 @@ impl SynapseCalyxVault {
         derived_count: usize,
         xterm_cf_rows: usize,
         graph_cf_rows: usize,
+        xterm_cf_rows_readback: SynapseCalyxCfCountProvenance,
+        graph_cf_rows_readback: SynapseCalyxCfCountProvenance,
+        xterm_cf_last_commit_seq: u64,
+        graph_cf_last_commit_seq: u64,
+        vault_latest_seq: u64,
     ) -> Result<SynapseCalyxAbundanceReport, SynapseCalyxError> {
         let measured_ceiling = self.measured_dpi_ceiling(panel_version)?;
         let dpi_ceiling = measured_ceiling.as_ref().map_or(
@@ -924,6 +950,11 @@ impl SynapseCalyxVault {
             dpi_ceiling_anchor_kind: measured_ceiling.map(|ceiling| ceiling.anchor_kind),
             xterm_cf_rows,
             graph_cf_rows,
+            xterm_cf_rows_readback,
+            graph_cf_rows_readback,
+            xterm_cf_last_commit_seq,
+            graph_cf_last_commit_seq,
+            vault_latest_seq,
         })
     }
 

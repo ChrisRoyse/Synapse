@@ -1278,7 +1278,7 @@ fn invalid_range_page(message: impl Into<String>) -> CalyxError {
 }
 
 #[derive(Clone)]
-enum VisibleValue {
+pub(super) enum VisibleValue {
     Live(Vec<u8>),
     Tombstone,
 }
@@ -1292,7 +1292,7 @@ impl VisibleValue {
     }
 }
 
-fn visible_value_state(versions: &VersionChain, seq: Seq) -> Option<VisibleValue> {
+pub(super) fn visible_value_state(versions: &VersionChain, seq: Seq) -> Option<VisibleValue> {
     visible_version(versions, seq).map(|version| {
         if is_tombstone_value(&version.value) {
             VisibleValue::Tombstone

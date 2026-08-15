@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ops::Bound;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
 pub(crate) const TOMBSTONE_VALUE: &[u8] = b"\0CALYX_ASTER_TOMBSTONE_V1";
@@ -432,6 +432,32 @@ pub struct CfChangeSignal {
     pub last_commit_seq: Seq,
     /// Physical content changes to this family that allocated no sequence.
     pub out_of_band_epoch: u64,
+}
+
+/// Exact latest logical row count maintained from committed key-state
+/// transitions after one physical baseline measurement.
+///
+/// This is deliberately a count, not a retained key set. LSM table entry
+/// totals cannot answer logical cardinality under overwrites and tombstones;
+/// once a physical merge establishes the baseline, the centralized MVCC
+/// commit boundary has both the old and new logical state needed to maintain
+/// the aggregate exactly in constant memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExactCfCardinality {
+    /// Current live logical rows in this column family.
+    pub rows: usize,
+    /// Greatest committed sequence incorporated into `rows` for this family.
+    pub last_commit_seq: Seq,
+    /// Out-of-band content epoch incorporated into `rows`.
+    pub out_of_band_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PreparedCfCardinalityDelta {
+    cf: ColumnFamily,
+    delta: i64,
+    previous_last_commit_seq: Seq,
+    out_of_band_epoch: u64,
 }
 
 /// One family's change signal in its atomic form.
@@ -1098,6 +1124,14 @@ pub struct VersionedCfStore {
     /// Exact `O(1)` per-family change signal (#2139). See [`CfChangeCell`] and
     /// [`new_cf_change_cells`]. Fixed length, allocated once, never resized.
     cf_change: Vec<CfChangeCell>,
+    /// Exact logical cardinalities that have received one physical baseline.
+    ///
+    /// Only one fixed-size entry per measured column family is retained. Every
+    /// normal logical write is advanced at the commit boundary; an out-of-band
+    /// level replacement removes the entry before publishing its new view, so
+    /// a caller either receives a proved exact count or must establish a new
+    /// physical baseline.
+    exact_cf_cardinality: Mutex<BTreeMap<ColumnFamily, ExactCfCardinality>>,
 }
 
 impl VersionedCfStore {
@@ -1294,6 +1328,7 @@ impl VersionedCfStore {
             snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
             cf_change: new_cf_change_cells(),
+            exact_cf_cardinality: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1332,6 +1367,7 @@ impl VersionedCfStore {
             snapshot_gc_cursor: std::sync::Mutex::new(gc::SnapshotGcCursor::default()),
             row_guard_census: RowGuardCensus::default(),
             cf_change: new_cf_change_cells(),
+            exact_cf_cardinality: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -1403,7 +1439,7 @@ impl VersionedCfStore {
         // Retention GC reaches this path with inputs whose replacement dropped
         // expired rows, so this is a real content change that allocates no
         // sequence — the one case a sequence-keyed memo cannot see.
-        self.note_cf_content_changed_outside_commit(&unique);
+        self.note_cf_content_changed_outside_commit(&unique)?;
 
         // ---- Phase A: exclusive, metadata only ----------------------------
         // The guard lives only inside this block: Phase B below MUST run with
@@ -1492,7 +1528,7 @@ impl VersionedCfStore {
         };
         // Before `reclaim()` touches a file (#2139); see
         // `retire_then_purge_cf_inputs`.
-        self.note_cf_content_changed_outside_commit(&unique);
+        self.note_cf_content_changed_outside_commit(&unique)?;
         tracing::info!(
             code = "CALYX_ASTER_ROUTER_RECLAIM_REFRESH_START",
             operation,
@@ -1598,7 +1634,7 @@ impl VersionedCfStore {
         // Retiring the CF removes its rows outright, and allocates no sequence
         // (#2139). Published before the retire so no reader can see the emptied
         // family through an unchanged signal.
-        self.note_cf_content_changed_outside_commit(&[cf]);
+        self.note_cf_content_changed_outside_commit(&[cf])?;
         let physical = router.retire_cf(cf)?;
         let elapsed_ms = started_at.elapsed().as_millis();
         if elapsed_ms > u128::from(EXCLUSIVE_ROUTER_RECLAIM_WARN_MS) {
@@ -1638,6 +1674,76 @@ impl VersionedCfStore {
             last_commit_seq,
             out_of_band_epoch,
         }
+    }
+
+    /// Returns the exact transaction-maintained latest cardinality when a
+    /// physical baseline exists and still matches the family's publication
+    /// signals.
+    ///
+    /// The row-shard read guard is the visibility boundary: a concurrent
+    /// commit cannot publish its maintained count while its rows remain hidden
+    /// (or vice versa). A mismatched signal removes the stale aggregate and
+    /// returns `None`; it is never served approximately.
+    pub fn exact_cf_cardinality(&self, cf: ColumnFamily) -> Result<Option<ExactCfCardinality>> {
+        let _row_guard = self.read_rows(RowGuardSite::CountCfLatest, cf);
+        let signal = self.cf_change_signal(cf);
+        let mut cardinalities = self.exact_cf_cardinality.lock().map_err(|_| CalyxError {
+            code: "CALYX_ASTER_EXACT_CARDINALITY_LOCK_POISONED",
+            message: format!(
+                "exact cardinality state lock is poisoned while reading {}",
+                cf.name()
+            ),
+            remediation: "stop this vault process, inspect the panic that poisoned exact cardinality state, then reopen the durable vault and establish a new physical count baseline",
+        })?;
+        let Some(cardinality) = cardinalities.get(&cf).copied() else {
+            return Ok(None);
+        };
+        if cardinality.last_commit_seq != signal.last_commit_seq
+            || cardinality.out_of_band_epoch != signal.out_of_band_epoch
+        {
+            cardinalities.remove(&cf);
+            return Ok(None);
+        }
+        Ok(Some(cardinality))
+    }
+
+    /// Installs one exact physical count as the maintained baseline when the
+    /// family has not changed since that count's snapshot.
+    ///
+    /// Returns `false` only for a real concurrent change. The supplied count is
+    /// still an exact statement about its pinned snapshot, but is not allowed
+    /// to seed latest-state maintenance across the intervening transition.
+    pub fn install_exact_cf_cardinality(
+        &self,
+        cf: ColumnFamily,
+        rows: usize,
+        snapshot_seq: Seq,
+        out_of_band_epoch_before_walk: u64,
+    ) -> Result<bool> {
+        let _row_guard = self.read_rows(RowGuardSite::CountCfLatest, cf);
+        let signal = self.cf_change_signal(cf);
+        if signal.last_commit_seq > snapshot_seq
+            || signal.out_of_band_epoch != out_of_band_epoch_before_walk
+        {
+            return Ok(false);
+        }
+        let mut cardinalities = self.exact_cf_cardinality.lock().map_err(|_| CalyxError {
+            code: "CALYX_ASTER_EXACT_CARDINALITY_LOCK_POISONED",
+            message: format!(
+                "exact cardinality state lock is poisoned while installing {} baseline at snapshot {snapshot_seq}",
+                cf.name()
+            ),
+            remediation: "stop this vault process, inspect the panic that poisoned exact cardinality state, then reopen the durable vault and establish a new physical count baseline",
+        })?;
+        cardinalities.insert(
+            cf,
+            ExactCfCardinality {
+                rows,
+                last_commit_seq: signal.last_commit_seq,
+                out_of_band_epoch: signal.out_of_band_epoch,
+            },
+        );
+        Ok(true)
     }
 
     /// Greatest sequence that wrote a row into `cf`, in `O(1)`.
@@ -1690,12 +1796,14 @@ impl VersionedCfStore {
     /// retention GC that deleted half the family. Bumping an epoch the memo
     /// compares for equality closes that hole without pretending a sequence was
     /// allocated.
-    fn note_cf_content_changed_outside_commit(&self, cfs: &[ColumnFamily]) {
+    fn note_cf_content_changed_outside_commit(&self, cfs: &[ColumnFamily]) -> Result<()> {
+        self.invalidate_exact_cf_cardinalities(cfs)?;
         for cf in cfs {
             self.cf_change[row_shard_index(*cf)]
                 .out_of_band_epoch
                 .fetch_add(1, Ordering::AcqRel);
         }
+        Ok(())
     }
 
     pub fn set_start_seq(&self, seq: Seq) -> Result<()> {
@@ -2233,6 +2341,7 @@ impl VersionedCfStore {
         timings.panel_attribution_us = elapsed_us(&attribution_started);
         let history_baseline_started = Instant::now();
         self.ensure_router_history_baselines(&mut table, &rows)?;
+        let cardinality_deltas = self.prepare_exact_cf_cardinality_deltas(&mut table, &rows)?;
         timings.history_baseline_us = elapsed_us(&history_baseline_started);
         // Advance the derived-content watermark BEFORE allocating the seq:
         // readers pin without taking the row lock, so a reader that observes
@@ -2262,6 +2371,7 @@ impl VersionedCfStore {
         for (cf, key, value) in &rows {
             self.append_mvcc_version(&mut table, *cf, key.clone(), seq, value.clone())?;
         }
+        self.apply_exact_cf_cardinality_deltas(&cardinality_deltas, seq)?;
         timings.row_apply_us = elapsed_us(&row_apply_started);
 
         let router_apply_started = Instant::now();
@@ -2444,6 +2554,184 @@ impl VersionedCfStore {
         Ok(())
     }
 
+    fn invalidate_exact_cf_cardinalities(&self, cfs: &[ColumnFamily]) -> Result<()> {
+        if cfs.is_empty() {
+            return Ok(());
+        }
+        let mut cardinalities = self.exact_cf_cardinality.lock().map_err(|_| CalyxError {
+            code: "CALYX_ASTER_EXACT_CARDINALITY_LOCK_POISONED",
+            message: format!(
+                "exact cardinality state lock is poisoned while invalidating {} family/families",
+                cfs.len()
+            ),
+            remediation: "stop this vault process, inspect the panic that poisoned exact cardinality state, then reopen the durable vault and establish new physical count baselines",
+        })?;
+        for cf in cfs {
+            cardinalities.remove(cf);
+        }
+        Ok(())
+    }
+
+    fn prepare_exact_cf_cardinality_deltas(
+        &self,
+        table: &mut RowWriteSet<'_>,
+        rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+    ) -> Result<Vec<PreparedCfCardinalityDelta>> {
+        let current_seq = self.current_seq();
+        let maintained = {
+            let mut cardinalities = self.exact_cf_cardinality.lock().map_err(|_| CalyxError {
+                code: "CALYX_ASTER_EXACT_CARDINALITY_LOCK_POISONED",
+                message: "exact cardinality state lock is poisoned while preparing a commit"
+                    .to_owned(),
+                remediation: "stop this vault process, inspect the panic that poisoned exact cardinality state, then reopen the durable vault and establish new physical count baselines",
+            })?;
+            let touched = rows.iter().map(|(cf, _, _)| *cf).collect::<BTreeSet<_>>();
+            let mut maintained = BTreeMap::new();
+            for cf in touched {
+                let signal = self.cf_change_signal(cf);
+                match cardinalities.get(&cf).copied() {
+                    Some(cardinality)
+                        if cardinality.last_commit_seq == signal.last_commit_seq
+                            && cardinality.out_of_band_epoch == signal.out_of_band_epoch =>
+                    {
+                        maintained.insert(cf, cardinality);
+                    }
+                    Some(_) => {
+                        cardinalities.remove(&cf);
+                    }
+                    None => {}
+                }
+            }
+            maintained
+        };
+        if maintained.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // One batch may name the same key more than once. Cardinality depends
+        // on the final state only, so collapse to the last value before
+        // comparing old and new logical liveness.
+        let mut final_states = BTreeMap::<(ColumnFamily, Vec<u8>), bool>::new();
+        for (cf, key, value) in rows {
+            if maintained.contains_key(cf) {
+                final_states.insert((*cf, key.clone()), !is_tombstone_value(value));
+            }
+        }
+        let mut deltas = maintained
+            .iter()
+            .map(|(cf, cardinality)| {
+                (
+                    *cf,
+                    PreparedCfCardinalityDelta {
+                        cf: *cf,
+                        delta: 0,
+                        previous_last_commit_seq: cardinality.last_commit_seq,
+                        out_of_band_epoch: cardinality.out_of_band_epoch,
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        for ((cf, key), new_live) in final_states {
+            let old_live = table
+                .entry_mut(cf)?
+                .get(&key)
+                .and_then(|versions| read::visible_value_state(versions, current_seq))
+                .is_some_and(|state| matches!(state, read::VisibleValue::Live(_)));
+            let delta = match (old_live, new_live) {
+                (false, true) => 1,
+                (true, false) => -1,
+                _ => 0,
+            };
+            let prepared = deltas.get_mut(&cf).ok_or_else(|| CalyxError {
+                code: "CALYX_ASTER_EXACT_CARDINALITY_PREPARE_CORRUPT",
+                message: format!(
+                    "prepared exact cardinality family {} disappeared while folding commit transitions",
+                    cf.name()
+                ),
+                remediation: "do not retry the write; inspect the exact-cardinality preparation path before reopening the vault",
+            })?;
+            prepared.delta = prepared.delta.checked_add(delta).ok_or_else(|| CalyxError {
+                code: "CALYX_ASTER_EXACT_CARDINALITY_DELTA_OVERFLOW",
+                message: format!(
+                    "exact cardinality delta overflow while preparing {} commit",
+                    cf.name()
+                ),
+                remediation: "reduce the atomic write batch below the platform integer bound and retry",
+            })?;
+        }
+        Ok(deltas.into_values().collect())
+    }
+
+    fn apply_exact_cf_cardinality_deltas(
+        &self,
+        deltas: &[PreparedCfCardinalityDelta],
+        committed_seq: Seq,
+    ) -> Result<()> {
+        if deltas.is_empty() {
+            return Ok(());
+        }
+        let mut cardinalities = self.exact_cf_cardinality.lock().map_err(|_| CalyxError {
+            code: "CALYX_ASTER_EXACT_CARDINALITY_RECONCILIATION_REQUIRED",
+            message: format!(
+                "MVCC rows committed at sequence {committed_seq}, but the exact cardinality state lock is poisoned"
+            ),
+            remediation: "treat committed_seq as applied; stop the process, inspect the poisoning panic, reopen the durable vault, and establish new physical count baselines before retrying any write",
+        })?;
+        for delta in deltas {
+            let Some(cardinality) = cardinalities.get(&delta.cf).copied() else {
+                // An out-of-band invalidation won the race. Absence is the
+                // fail-closed state; no stale count can be served.
+                continue;
+            };
+            if cardinality.last_commit_seq != delta.previous_last_commit_seq
+                || cardinality.out_of_band_epoch != delta.out_of_band_epoch
+            {
+                cardinalities.remove(&delta.cf);
+                continue;
+            }
+            let magnitude = usize::try_from(delta.delta.unsigned_abs()).map_err(|_| CalyxError {
+                code: "CALYX_ASTER_EXACT_CARDINALITY_DELTA_OVERFLOW",
+                message: format!(
+                    "exact cardinality delta {} for {} exceeds this platform's usize",
+                    delta.delta,
+                    delta.cf.name()
+                ),
+                remediation: "stop the process and inspect the atomic write-batch bound; do not use the invalidated cardinality until a physical baseline is re-established",
+            })?;
+            let updated = if delta.delta >= 0 {
+                cardinality.rows.checked_add(magnitude)
+            } else {
+                cardinality.rows.checked_sub(magnitude)
+            };
+            let Some(updated) = updated else {
+                cardinalities.remove(&delta.cf);
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_EXACT_CARDINALITY_RECONCILIATION_REQUIRED",
+                    message: format!(
+                        "MVCC rows committed at sequence {committed_seq}, but applying delta {} to {} count {} overflowed or underflowed",
+                        delta.delta,
+                        delta.cf.name(),
+                        cardinality.rows
+                    ),
+                    remediation: "treat committed_seq as applied; stop the process, inspect old/new key-state transition accounting, reopen the durable vault, and establish a new physical count baseline before retrying any write",
+                });
+            };
+            let Some(cardinality) = cardinalities.get_mut(&delta.cf) else {
+                return Err(CalyxError {
+                    code: "CALYX_ASTER_EXACT_CARDINALITY_RECONCILIATION_REQUIRED",
+                    message: format!(
+                        "MVCC rows committed at sequence {committed_seq}, but exact cardinality state for {} disappeared while applying its delta",
+                        delta.cf.name()
+                    ),
+                    remediation: "treat committed_seq as applied; stop the process, inspect exact cardinality state mutation, reopen the durable vault, and establish a new physical count baseline before retrying any write",
+                });
+            };
+            cardinality.rows = updated;
+            cardinality.last_commit_seq = committed_seq;
+        }
+        Ok(())
+    }
+
     fn append_mvcc_version(
         &self,
         table: &mut RowWriteSet<'_>,
@@ -2520,6 +2808,8 @@ impl VersionedCfStore {
             .into_iter()
             .map(|(cf, key, value)| (cf, key.into(), value.into()))
             .collect();
+        let restored_cfs = rows.iter().map(|(cf, _, _)| *cf).collect::<BTreeSet<_>>();
+        self.invalidate_exact_cf_cardinalities(&restored_cfs.into_iter().collect::<Vec<_>>())?;
         // Recovery is whole-table by nature and runs single-threaded at open.
         let mut table =
             self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;
@@ -2612,6 +2902,11 @@ impl VersionedCfStore {
                 "recovered MVCC batches must have strictly increasing sequences at or below final sequence {final_seq}"
             )));
         }
+        let restored_cfs = batches
+            .iter()
+            .flat_map(|(_seq, rows)| rows.iter().map(|(cf, _, _)| *cf))
+            .collect::<BTreeSet<_>>();
+        self.invalidate_exact_cf_cardinalities(&restored_cfs.into_iter().collect::<Vec<_>>())?;
         // Recovery is whole-table by nature and runs single-threaded at open.
         let mut table =
             self.write_rows_all("MVCC row-table lock was poisoned during atomic recovery restore")?;

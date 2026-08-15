@@ -708,6 +708,34 @@ where
         self.rows.cf_change_signal(cf)
     }
 
+    /// Exact transaction-maintained live cardinality after one physical
+    /// baseline, or `None` when no valid baseline exists.
+    pub fn exact_cf_cardinality(
+        &self,
+        cf: ColumnFamily,
+    ) -> Result<Option<crate::mvcc::ExactCfCardinality>> {
+        self.assert_cf_selected(cf, "exact_cf_cardinality")?;
+        self.rows.exact_cf_cardinality(cf)
+    }
+
+    /// Installs a physical count as the exact transaction-maintained baseline
+    /// if its column family did not change during or after the walk.
+    pub fn install_exact_cf_cardinality(
+        &self,
+        cf: ColumnFamily,
+        rows: usize,
+        snapshot_seq: Seq,
+        out_of_band_epoch_before_walk: u64,
+    ) -> Result<bool> {
+        self.assert_cf_selected(cf, "install_exact_cf_cardinality")?;
+        self.rows.install_exact_cf_cardinality(
+            cf,
+            rows,
+            snapshot_seq,
+            out_of_band_epoch_before_walk,
+        )
+    }
+
     /// Greatest committed sequence that wrote a row into `cf`, in `O(1)`.
     pub fn latest_seq_for_cf(&self, cf: ColumnFamily) -> Seq {
         self.rows.latest_seq_for_cf(cf)

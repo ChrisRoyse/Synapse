@@ -218,8 +218,12 @@ pub struct StorageResponse {
     pub backup_status: Option<StorageBackupStatusResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore_verify: Option<StorageRestoreVerifyResponse>,
+    /// Boxed because this is a tagged union represented as a struct of many
+    /// optional, capability-specific reports. Keeping every report inline
+    /// inflates the storage facade stack for operations that never use Calyx
+    /// intelligence; `Box` is transparent to the JSON response and schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub intelligence: Option<StorageIntelligenceResponse>,
+    pub intelligence: Option<Box<StorageIntelligenceResponse>>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]

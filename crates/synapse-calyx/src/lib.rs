@@ -3359,6 +3359,25 @@ struct MemoizedCfCount {
 ///
 /// The provenance travels with the number so a log line can say which it is
 /// rather than implying a fresh walk that may not have happened.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SynapseCalyxCfCountProvenance {
+    Walked,
+    MaintainedExact,
+    UnchangedSinceLastWalk,
+}
+
+impl SynapseCalyxCfCountProvenance {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Walked => "walked",
+            Self::MaintainedExact => "maintained_exact",
+            Self::UnchangedSinceLastWalk => "unchanged_since_last_walk",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct MemoizedCfCountReadback {
     /// The walk that produced the count — freshly measured, or the memoized
@@ -3366,6 +3385,11 @@ pub struct MemoizedCfCountReadback {
     pub walk: SynapseCalyxCfWalk,
     /// Whether the column family was physically walked on this call.
     pub measured: bool,
+    /// Whether the answer came from the exact commit-maintained aggregate.
+    /// This is neither an estimate nor an unchanged memo: every logical
+    /// insert/delete transition through the Aster commit boundary has already
+    /// advanced it.
+    pub maintained_exact: bool,
     /// When reused, the walk sequence the family has not committed past.
     pub unchanged_since_seq: Option<Seq>,
     /// The family's last-commit sequence at this call, the `O(1)` signal the
@@ -3389,10 +3413,17 @@ impl MemoizedCfCountReadback {
     /// reports it.
     #[must_use]
     pub const fn provenance(&self) -> &'static str {
+        self.provenance_kind().as_str()
+    }
+
+    #[must_use]
+    pub const fn provenance_kind(&self) -> SynapseCalyxCfCountProvenance {
         if self.measured {
-            "walked"
+            SynapseCalyxCfCountProvenance::Walked
+        } else if self.maintained_exact {
+            SynapseCalyxCfCountProvenance::MaintainedExact
         } else {
-            "unchanged_since_last_walk"
+            SynapseCalyxCfCountProvenance::UnchangedSinceLastWalk
         }
     }
 }
@@ -8024,6 +8055,28 @@ impl SynapseCalyxVault {
         &self,
         cf: ColumnFamily,
     ) -> Result<MemoizedCfCountReadback, SynapseCalyxError> {
+        if let Some(cardinality) = self.vault.exact_cf_cardinality(cf).map_err(|error| {
+            SynapseCalyxError::from_calyx("read exact maintained Calyx CF cardinality", &error)
+        })? {
+            let vault_latest_seq = self.vault.latest_seq();
+            return Ok(MemoizedCfCountReadback {
+                walk: SynapseCalyxCfWalk {
+                    column_family: cf.name(),
+                    page_rows: SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                    pages: 0,
+                    rows_examined: 0,
+                    rows_visited: cardinality.rows,
+                    stopped_early: false,
+                    snapshot_seq_first: vault_latest_seq,
+                    snapshot_seq_last: vault_latest_seq,
+                },
+                measured: false,
+                maintained_exact: true,
+                unchanged_since_seq: None,
+                cf_last_commit_seq: cardinality.last_commit_seq,
+                vault_latest_seq,
+            });
+        }
         let signal = self.vault.cf_change_signal(cf);
         let vault_latest_seq = self.vault.latest_seq();
         let memoized = {
@@ -8043,6 +8096,7 @@ impl SynapseCalyxVault {
             return Ok(MemoizedCfCountReadback {
                 walk: entry.walk.clone(),
                 measured: false,
+                maintained_exact: false,
                 unchanged_since_seq: Some(entry.walk.snapshot_seq_last),
                 cf_last_commit_seq: signal.last_commit_seq,
                 vault_latest_seq,
@@ -8054,6 +8108,31 @@ impl SynapseCalyxVault {
         // this entry on the next call, rather than being memoized over.
         let out_of_band_epoch_before_walk = self.vault.cf_change_signal(cf).out_of_band_epoch;
         let walk = self.count_cf_latest_bounded(cf)?;
+        if walk.atomic() {
+            let installed = self
+                .vault
+                .install_exact_cf_cardinality(
+                    cf,
+                    walk.rows_visited,
+                    walk.snapshot_seq_last,
+                    out_of_band_epoch_before_walk,
+                )
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        "install exact maintained Calyx CF cardinality",
+                        &error,
+                    )
+                })?;
+            tracing::info!(
+                code = "SYNAPSE_CALYX_EXACT_CF_CARDINALITY_BASELINE",
+                cf = cf.name(),
+                rows = walk.rows_visited,
+                snapshot_seq = walk.snapshot_seq_last,
+                out_of_band_epoch_before_walk,
+                installed,
+                "physically measured an exact CF cardinality baseline for transaction maintenance"
+            );
+        }
         let mut memo = match self.cf_count_memo.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -8071,12 +8150,15 @@ impl SynapseCalyxVault {
             memo.remove(&cf);
         }
         drop(memo);
+        let readback_signal = self.vault.cf_change_signal(cf);
+        let readback_vault_latest_seq = self.vault.latest_seq();
         Ok(MemoizedCfCountReadback {
             walk,
             measured: true,
+            maintained_exact: false,
             unchanged_since_seq: None,
-            cf_last_commit_seq: signal.last_commit_seq,
-            vault_latest_seq,
+            cf_last_commit_seq: readback_signal.last_commit_seq,
+            vault_latest_seq: readback_vault_latest_seq,
         })
     }
 

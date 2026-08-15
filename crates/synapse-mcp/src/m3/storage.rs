@@ -2236,6 +2236,14 @@ pub struct StorageIntelligenceNeffEstimate {
     pub ci_high: Option<f32>,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageIntelligenceCfCountProvenance {
+    Walked,
+    MaintainedExact,
+    UnchangedSinceLastWalk,
+}
+
 #[derive(Clone, Debug, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceAbundanceReport {
@@ -2268,6 +2276,13 @@ pub struct StorageIntelligenceAbundanceReport {
     pub dpi_ceiling_anchor_kind: Option<String>,
     pub xterm_cf_rows: u64,
     pub graph_cf_rows: u64,
+    /// `walked`, `unchanged_since_last_walk`, or `maintained_exact`.
+    pub xterm_cf_rows_readback: StorageIntelligenceCfCountProvenance,
+    /// `walked`, `unchanged_since_last_walk`, or `maintained_exact`.
+    pub graph_cf_rows_readback: StorageIntelligenceCfCountProvenance,
+    pub xterm_cf_last_commit_seq: u64,
+    pub graph_cf_last_commit_seq: u64,
+    pub vault_latest_seq: u64,
 }
 
 /// A lens pair that never co-occurs on a measured record, so no cross-term over
@@ -5683,6 +5698,31 @@ fn storage_intelligence_abundance(
         dpi_ceiling_anchor_kind: report.dpi_ceiling_anchor_kind,
         xterm_cf_rows: report.xterm_cf_rows as u64,
         graph_cf_rows: report.graph_cf_rows as u64,
+        xterm_cf_rows_readback: storage_intelligence_cf_count_provenance(
+            report.xterm_cf_rows_readback,
+        ),
+        graph_cf_rows_readback: storage_intelligence_cf_count_provenance(
+            report.graph_cf_rows_readback,
+        ),
+        xterm_cf_last_commit_seq: report.xterm_cf_last_commit_seq,
+        graph_cf_last_commit_seq: report.graph_cf_last_commit_seq,
+        vault_latest_seq: report.vault_latest_seq,
+    }
+}
+
+const fn storage_intelligence_cf_count_provenance(
+    provenance: synapse_calyx::SynapseCalyxCfCountProvenance,
+) -> StorageIntelligenceCfCountProvenance {
+    match provenance {
+        synapse_calyx::SynapseCalyxCfCountProvenance::Walked => {
+            StorageIntelligenceCfCountProvenance::Walked
+        }
+        synapse_calyx::SynapseCalyxCfCountProvenance::MaintainedExact => {
+            StorageIntelligenceCfCountProvenance::MaintainedExact
+        }
+        synapse_calyx::SynapseCalyxCfCountProvenance::UnchangedSinceLastWalk => {
+            StorageIntelligenceCfCountProvenance::UnchangedSinceLastWalk
+        }
     }
 }
 
