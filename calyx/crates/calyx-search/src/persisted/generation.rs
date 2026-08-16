@@ -13,6 +13,7 @@ pub struct PersistedSearchGeneration {
     pub diskann_build_backend: Option<String>,
     pub diskann_build_backend_source: Option<String>,
     pub sextant_cuvs_compiled: Option<bool>,
+    pub sextant_cuda_pq_compiled: Option<bool>,
     pub dense_index_config: PersistedDenseIndexConfig,
     pub slots: Vec<PersistedSearchSlot>,
 }
@@ -87,6 +88,7 @@ impl PersistedSearchIndexes {
             diskann_build_backend: self.manifest.diskann_build_backend.clone(),
             diskann_build_backend_source: self.manifest.diskann_build_backend_source.clone(),
             sextant_cuvs_compiled: self.manifest.sextant_cuvs_compiled,
+            sextant_cuda_pq_compiled: self.manifest.sextant_cuda_pq_compiled,
             dense_index_config: self.manifest.dense_index_config.clone(),
             slots,
         })

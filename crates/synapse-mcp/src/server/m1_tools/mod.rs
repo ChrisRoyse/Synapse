@@ -17093,8 +17093,10 @@ fn write_screenshot_bitmap_with_quality(
     let native_width = captured.width;
     let native_height = captured.height;
     let (captured, scale) =
-        downscale_captured_bitmap(captured, params.max_pixels, params.max_long_edge)?;
-    save_screenshot_bitmap_with_quality(&captured, &temp_path, format, jpeg_quality)?;
+        prepare_screenshot_rgba_bitmap(captured, params.max_pixels, params.max_long_edge)?;
+    let width = captured.width;
+    let height = captured.height;
+    save_screenshot_bitmap_with_quality(captured, &temp_path, format, jpeg_quality)?;
     let (published_bytes, published_sha256) = publish_atomic_artifact(
         &temp_path,
         &output_path,
@@ -17142,8 +17144,8 @@ fn write_screenshot_bitmap_with_quality(
         format,
         capture_backend: capture_backend.to_owned(),
         region: source_region,
-        width: captured.width,
-        height: captured.height,
+        width,
+        height,
         native_width,
         native_height,
         scale,
@@ -17200,30 +17202,45 @@ fn screenshot_downscale_scale(
     Ok(scale.min(1.0))
 }
 
-/// Downscale a captured BGRA bitmap (aspect-preserving) to fit the optional vision
-/// pixel budget, returning the possibly-resized bitmap and the applied scale
-/// (`written_long_edge / native_long_edge`). A scale of `1.0` returns the bitmap
-/// untouched. Uses Lanczos3 resampling via the `image` crate already linked here.
-fn downscale_captured_bitmap(
-    captured: synapse_capture::CapturedBgraBitmap,
+/// Encoder-ready screenshot pixels. Screenshot capture is BGRA, while the
+/// image codecs are RGBA. Owning this buffer makes the channel conversion an
+/// in-place pass and prevents the encoder from cloning and converting it again.
+struct ScreenshotRgbaBitmap {
+    width: u32,
+    height: u32,
+    bytes: Vec<u8>,
+}
+
+/// Convert one owned BGRA capture to encoder-ready RGBA and, when requested,
+/// downscale it aspect-preserving. The source conversion happens in place;
+/// resized output remains RGBA, so the scaled path performs no swap-back pass.
+/// Triangle is the image crate's linear filter and is materially cheaper than
+/// the six-tap Lanczos3 kernel for model/preview screenshots.
+fn prepare_screenshot_rgba_bitmap(
+    mut captured: synapse_capture::CapturedBgraBitmap,
     max_pixels: Option<u64>,
     max_long_edge: Option<u32>,
-) -> Result<(synapse_capture::CapturedBgraBitmap, f64), ErrorData> {
+) -> Result<(ScreenshotRgbaBitmap, f64), ErrorData> {
     let scale =
         screenshot_downscale_scale(captured.width, captured.height, max_pixels, max_long_edge)?;
+    validate_screenshot_pixel_bytes(captured.width, captured.height, &captured.bytes)?;
+    for pixel in captured.bytes.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
     if scale >= 1.0 {
-        return Ok((captured, 1.0));
+        return Ok((
+            ScreenshotRgbaBitmap {
+                width: captured.width,
+                height: captured.height,
+                bytes: captured.bytes,
+            },
+            1.0,
+        ));
     }
     let native_long_edge = captured.width.max(captured.height);
     let target_width = ((f64::from(captured.width) * scale).round() as u32).max(1);
     let target_height = ((f64::from(captured.height) * scale).round() as u32).max(1);
-    // Build an RgbaImage from the BGRA source, resize, then swap back to BGRA so the
-    // downstream encoder (which expects BGRA) keeps working unchanged.
-    let mut rgba = captured.bytes;
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    let source = RgbaImage::from_raw(captured.width, captured.height, rgba).ok_or_else(|| {
+    let source = RgbaImage::from_raw(captured.width, captured.height, captured.bytes).ok_or_else(|| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!(
@@ -17236,22 +17253,44 @@ fn downscale_captured_bitmap(
         &source,
         target_width,
         target_height,
-        image::imageops::FilterType::Lanczos3,
+        image::imageops::FilterType::Triangle,
     );
     let resized_width = resized.width();
     let resized_height = resized.height();
-    let mut bgra = resized.into_raw();
-    for pixel in bgra.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
     let applied_scale = f64::from(resized_width.max(resized_height)) / f64::from(native_long_edge);
-    let bitmap = synapse_capture::CapturedBgraBitmap {
-        region: bitmap_full_region(resized_width, resized_height)?,
+    let bitmap = ScreenshotRgbaBitmap {
         width: resized_width,
         height: resized_height,
-        bytes: bgra,
+        bytes: resized.into_raw(),
     };
     Ok((bitmap, applied_scale))
+}
+
+fn validate_screenshot_pixel_bytes(width: u32, height: u32, bytes: &[u8]) -> Result<(), ErrorData> {
+    let expected_len = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            mcp_error(
+                error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_screenshot bitmap dimensions overflow: {width}x{height}"),
+            )
+        })?;
+    if bytes.len() != expected_len {
+        return Err(mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "capture_screenshot BGRA byte length mismatch: expected {expected_len}, got {}",
+                bytes.len()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn hidden_desktop_pip_ended_response(
@@ -17963,50 +18002,22 @@ fn publish_atomic_artifact(
 }
 
 fn save_screenshot_bitmap_with_quality(
-    captured: &synapse_capture::CapturedBgraBitmap,
+    captured: ScreenshotRgbaBitmap,
     path: &Path,
     format: CaptureScreenshotFormat,
     jpeg_quality: Option<u8>,
 ) -> Result<(), ErrorData> {
-    let expected_len = usize::try_from(captured.width)
-        .ok()
-        .and_then(|width| {
-            usize::try_from(captured.height)
-                .ok()
-                .and_then(|height| width.checked_mul(height))
-        })
-        .and_then(|pixels| pixels.checked_mul(4))
-        .ok_or_else(|| {
+    validate_screenshot_pixel_bytes(captured.width, captured.height, &captured.bytes)?;
+    let image =
+        RgbaImage::from_raw(captured.width, captured.height, captured.bytes).ok_or_else(|| {
             mcp_error(
-                error_codes::CAPTURE_TARGET_INVALID,
+                error_codes::TOOL_INTERNAL_ERROR,
                 format!(
-                    "capture_screenshot bitmap dimensions overflow: {}x{}",
+                    "capture_screenshot could not create image buffer from {}x{} bitmap",
                     captured.width, captured.height
                 ),
             )
         })?;
-    if captured.bytes.len() != expected_len {
-        return Err(mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "capture_screenshot BGRA byte length mismatch: expected {expected_len}, got {}",
-                captured.bytes.len()
-            ),
-        ));
-    }
-    let mut rgba = captured.bytes.clone();
-    for pixel in rgba.chunks_exact_mut(4) {
-        pixel.swap(0, 2);
-    }
-    let image = RgbaImage::from_raw(captured.width, captured.height, rgba).ok_or_else(|| {
-        mcp_error(
-            error_codes::TOOL_INTERNAL_ERROR,
-            format!(
-                "capture_screenshot could not create image buffer from {}x{} bitmap",
-                captured.width, captured.height
-            ),
-        )
-    })?;
     let mut file = create_artifact_staging_file(path, "capture_screenshot")?;
     let result = match format {
         CaptureScreenshotFormat::Png => {

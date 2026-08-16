@@ -96,7 +96,7 @@ impl SynapseService {
                             max_long_edge,
                         ));
                     }
-                    let rgba = bgra_to_rgba(&bitmap.bytes, bitmap.width, bitmap.height)?;
+                    let rgba = bgra_to_rgba(bitmap.bytes, bitmap.width, bitmap.height)?;
                     let (tw, th) = target_dims.unwrap_or((bitmap.width, bitmap.height));
                     let frame = if (tw, th) == (bitmap.width, bitmap.height) {
                         rgba
@@ -282,25 +282,34 @@ fn capture_gif_target_dims(width: u32, height: u32, max_long_edge: u32) -> (u32,
     (tw, th)
 }
 
-fn bgra_to_rgba(bgra: &[u8], width: u32, height: u32) -> Result<RgbaImage, ErrorData> {
-    let expected = (width as usize) * (height as usize) * 4;
-    if bgra.len() < expected {
+fn bgra_to_rgba(mut bgra: Vec<u8>, width: u32, height: u32) -> Result<RgbaImage, ErrorData> {
+    let expected = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| {
+            mcp_error(
+                synapse_core::error_codes::CAPTURE_TARGET_INVALID,
+                format!("capture_gif frame dimensions overflow: {width}x{height}"),
+            )
+        })?;
+    if bgra.len() != expected {
         return Err(mcp_error(
             synapse_core::error_codes::TOOL_INTERNAL_ERROR,
             format!(
-                "capture_gif frame byte length {} smaller than {width}x{height}x4={expected}",
+                "capture_gif frame byte length {} does not equal {width}x{height}x4={expected}",
                 bgra.len()
             ),
         ));
     }
-    let mut rgba = vec![0u8; expected];
-    for (dst, src) in rgba.chunks_exact_mut(4).zip(bgra.chunks_exact(4)) {
-        dst[0] = src[2];
-        dst[1] = src[1];
-        dst[2] = src[0];
-        dst[3] = src[3];
+    for pixel in bgra.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
     }
-    RgbaImage::from_raw(width, height, rgba).ok_or_else(|| {
+    RgbaImage::from_raw(width, height, bgra).ok_or_else(|| {
         mcp_error(
             synapse_core::error_codes::TOOL_INTERNAL_ERROR,
             "capture_gif could not build RGBA frame buffer",

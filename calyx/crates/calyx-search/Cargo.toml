@@ -17,6 +17,7 @@ default = []
 # resolved truth is still `calyx_sextant::CUVS_COMPILED`; this feature only
 # forwards the intended GPU build surface to sextant for explicit FSV runs.
 cuda = ["calyx-sextant/cuda"]
+cuda-pq = ["calyx-sextant/cuda-pq"]
 
 [dependencies]
 calyx-core = { workspace = true }

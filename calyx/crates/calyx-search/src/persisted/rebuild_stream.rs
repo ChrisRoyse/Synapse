@@ -303,6 +303,122 @@ fn rebuild_from_base_with_progress<C: Clock, F>(
 where
     F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
 {
+    let failed_candidate_root = match options.destination {
+        RebuildDestination::Live => None,
+        RebuildDestination::Candidate(candidate_key) => Some(candidate_index_root(
+            vault_dir,
+            options.panel_version,
+            candidate_key,
+            snapshot.seq(),
+        )),
+    };
+    let result = rebuild_from_base_with_progress_inner(
+        vault_dir, vault, snapshot, base_docs, options, progress,
+    );
+    match (failed_candidate_root, result) {
+        (Some(root), Err(error)) => match remove_failed_candidate_generation(&root) {
+            Ok(()) => {
+                tracing::info!(
+                    code = "CALYX_SEARCH_FAILED_CANDIDATE_RECLAIMED",
+                    candidate_root = %root.display(),
+                    source_code = error.code(),
+                    source_detail = %error,
+                    "removed every unpublished candidate artifact after an in-process build failure and verified the exact candidate root is absent"
+                );
+                Err(error)
+            }
+            Err(cleanup_error) => Err(CliError::io(format!(
+                "candidate search build failed with code={} detail={error}; cleanup of unpublished candidate root {} also failed: {cleanup_error}",
+                error.code(),
+                root.display()
+            ))),
+        },
+        (_, result) => result,
+    }
+}
+
+fn remove_failed_candidate_generation(root: &Path) -> CliResult {
+    match fs::symlink_metadata(root) {
+        Ok(_) => fs::remove_dir_all(root).map_err(|error| {
+            CliError::io(format!(
+                "remove failed unpublished candidate generation {}: {error}",
+                root.display()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(CliError::io(format!(
+                "inspect failed unpublished candidate generation {} before cleanup: {error}",
+                root.display()
+            )));
+        }
+    }
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(CliError::io(format!(
+                "failed unpublished candidate generation still exists after cleanup at {}",
+                root.display()
+            )));
+        }
+        Err(error) => {
+            return Err(CliError::io(format!(
+                "read back failed unpublished candidate generation cleanup at {}: {error}",
+                root.display()
+            )));
+        }
+    }
+
+    let candidate_key_root = root.parent().ok_or_else(|| {
+        CliError::io(format!(
+            "candidate generation root {} has no candidate-key parent",
+            root.display()
+        ))
+    })?;
+    remove_empty_candidate_directory(candidate_key_root)?;
+    let candidates_root = candidate_key_root.parent().ok_or_else(|| {
+        CliError::io(format!(
+            "candidate-key root {} has no candidates parent",
+            candidate_key_root.display()
+        ))
+    })?;
+    remove_empty_candidate_directory(candidates_root)?;
+    Ok(())
+}
+
+fn remove_empty_candidate_directory(path: &Path) -> CliResult {
+    let mut entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(CliError::io(format!(
+                "read candidate cleanup directory {}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if entries.next().transpose()?.is_none() {
+        fs::remove_dir(path).map_err(|error| {
+            CliError::io(format!(
+                "remove empty candidate cleanup directory {}: {error}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn rebuild_from_base_with_progress_inner<C: Clock, F>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    snapshot: Snapshot,
+    base_docs: LoadedBaseDocs,
+    options: RebuildOptions<'_>,
+    progress: &mut F,
+) -> CliResult<RebuildSummary>
+where
+    F: FnMut(RebuildProgress<'_>) -> CliResult + Send,
+{
     let RebuildOptions {
         page_rows,
         panel_version,
@@ -604,6 +720,7 @@ where
         diskann_build_backend: Some(backend),
         diskann_build_backend_source: Some(backend_source),
         sextant_cuvs_compiled: Some(cuvs_compiled),
+        sextant_cuda_pq_compiled: Some(calyx_sextant::CUDA_PQ_COMPILED),
         dense_index_config: dense_index_config.clone(),
         filter: Some(filter),
         slots: entries,

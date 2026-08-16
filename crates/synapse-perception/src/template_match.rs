@@ -135,8 +135,7 @@ pub fn extract_template_counter_from_region(
 
     for index in 0..config.slots {
         let (slot_x, slot_w) = slot_bounds(region_w, config.slots, index)?;
-        let slot = image::imageops::crop_imm(region, slot_x, 0, slot_w, region.height()).to_image();
-        let best = best_slot_match(&slot, templates).ok_or_else(|| {
+        let best = best_slot_match(region, slot_x, slot_w, templates).ok_or_else(|| {
             hud_error(format!(
                 "slot {index} has no valid template candidate for {slot_w}x{}",
                 region.height()
@@ -293,10 +292,15 @@ fn scaled_slot_edge(region_w: u32, slots: u32, index: u32) -> PerceptionResult<u
         .map_err(|_err| hud_error("slot geometry does not fit u32"))
 }
 
-fn best_slot_match(slot: &GrayImage, templates: &[HudTemplate]) -> Option<Candidate> {
+fn best_slot_match(
+    region: &GrayImage,
+    slot_x: u32,
+    slot_w: u32,
+    templates: &[HudTemplate],
+) -> Option<Candidate> {
     let mut best: Option<Candidate> = None;
     for template in templates {
-        if let Some(candidate) = best_template_location(slot, template)
+        if let Some(candidate) = best_template_location(region, slot_x, slot_w, template)
             && best
                 .as_ref()
                 .is_none_or(|current| candidate.confidence > current.confidence)
@@ -307,8 +311,13 @@ fn best_slot_match(slot: &GrayImage, templates: &[HudTemplate]) -> Option<Candid
     best
 }
 
-fn best_template_location(slot: &GrayImage, template: &HudTemplate) -> Option<Candidate> {
-    let (slot_w, slot_h) = slot.dimensions();
+fn best_template_location(
+    region: &GrayImage,
+    slot_x: u32,
+    slot_w: u32,
+    template: &HudTemplate,
+) -> Option<Candidate> {
+    let slot_h = region.height();
     let (template_w, template_h) = template.image.dimensions();
     if template_w > slot_w || template_h > slot_h {
         return None;
@@ -319,7 +328,8 @@ fn best_template_location(slot: &GrayImage, template: &HudTemplate) -> Option<Ca
     let mut best_y = 0_u32;
     for y in 0..=slot_h.saturating_sub(template_h) {
         for x in 0..=slot_w.saturating_sub(template_w) {
-            if let Some(score) = normalized_cross_correlation(slot, &template.image, x, y)
+            if let Some(score) =
+                normalized_cross_correlation(region, &template.image, slot_x.checked_add(x)?, y)
                 && best_score.is_none_or(|current| score > current)
             {
                 best_score = Some(score);

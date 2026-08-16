@@ -617,6 +617,7 @@ dependencies = [
  "calyx-forge",
  "calyx-paths",
  "calyx-ward",
+ "cudarc",
  "memmap2",
  "rand 0.9.4",
  "rand_chacha",

@@ -170,6 +170,8 @@ pub(crate) struct SearchIndexManifest {
     diskann_build_backend_source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sextant_cuvs_compiled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sextant_cuda_pq_compiled: Option<bool>,
     #[serde(default)]
     dense_index_config: PersistedDenseIndexConfig,
     #[serde(default)]

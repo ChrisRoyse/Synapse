@@ -8,6 +8,20 @@
 /// cannot prove what a dependency crate actually compiled.
 pub const CUVS_COMPILED: bool = cfg!(sextant_cuvs);
 
+/// True when the in-tree CUDA Lloyd kernels used for DiskANN PQ training and
+/// encoding are physically compiled into this binary. This is independent of
+/// cuVS/CAGRA availability and therefore works on CUDA-capable Windows hosts.
+pub const CUDA_PQ_COMPILED: bool = cfg!(sextant_cuda_pq);
+
+/// Exact fail-closed remediation for a build without the CUDA PQ kernels.
+pub fn cuda_pq_unavailable_reason() -> String {
+    if cfg!(feature = "cuda-pq") || (cfg!(feature = "cuda") && cfg!(target_os = "linux")) {
+        "DiskANN PQ CUDA kernels were requested but the build did not publish sextant_cuda_pq; inspect the CUDA 13.3 nvcc build output".to_owned()
+    } else {
+        "DiskANN PQ training and encoding requires building calyx-sextant with --features cuda-pq (or cuda on Linux)".to_owned()
+    }
+}
+
 /// Explains, for a fail-closed stub, exactly why the cuVS GPU path is absent
 /// from this binary and how to get it (#1130): feature off vs a target OS
 /// where RAPIDS ships no libcuvs (#1016).

@@ -17,6 +17,11 @@ default = []
 # is exported as `CUVS_COMPILED` for build-info capability readback — deploy
 # gates must assert that, never the feature name.
 cuda = ["dep:cudarc", "dep:cuvs-sys"]
+# Cross-platform CUDA PQ training/encoding. Unlike `cuda`, this does not imply
+# cuVS/CAGRA (RAPIDS does not ship native Windows libraries); it compiles the
+# in-tree deterministic Lloyd kernels through the same CUDA 13.3 toolkit used
+# by calyx-forge.
+cuda-pq = ["dep:cudarc"]
 # `forge-gpu` turns on calyx-forge's CUDA surface so the DiskANN build lane can
 # be measured against a real `Backend` (#2103). It is a *probe* feature: nothing
 # in the library depends on it, and the CPU build path is byte-for-byte the same
@@ -42,9 +47,9 @@ serde_json.workspace = true
 tracing.workspace = true
 zeroize = "1"
 zstd.workspace = true
+cudarc = { workspace = true, optional = true, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13030"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-cudarc = { workspace = true, optional = true, features = ["std", "driver", "nvrtc", "dynamic-linking", "cuda-13030"] }
 cuvs-sys = { workspace = true, optional = true }
 
 [lints]
