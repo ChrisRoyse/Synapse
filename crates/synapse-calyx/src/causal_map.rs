@@ -622,6 +622,7 @@ impl SynapseCalyxVault {
             })?;
         let pointer = decode_causal_map_pointer(&pointer_bytes)?;
         validate_pointer_scope(&pointer, &scope)?;
+        validate_requested_source_limit(pointer.source_records, params.max_records)?;
         let artifact_digest = decode_sha256(&pointer.artifact_sha256)?;
         let artifact_key = causal_map_key(pointer.panel_version, &artifact_digest);
         if hex_encode(&artifact_key) != pointer.artifact_key_hex {
@@ -876,6 +877,22 @@ fn validate_pointer_scope(
     Ok(())
 }
 
+fn validate_requested_source_limit(
+    source_records: usize,
+    requested_max_records: usize,
+) -> Result<(), SynapseCalyxError> {
+    if source_records > requested_max_records {
+        return Err(causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_RECORD_LIMIT_EXCEEDED",
+            format!(
+                "the persisted causal-map population contains {source_records} source records, exceeding the caller's max_records={requested_max_records} bound"
+            ),
+            "narrow the source-event-time window or explicitly raise max_records to the reported source population without exceeding the system ceiling",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_pointer_advance(
     existing: &SynapseCalyxCausalMapPointer,
     candidate: &SynapseCalyxCausalMapPointer,
@@ -1013,6 +1030,13 @@ fn validate_artifact_contract(
     {
         return Err(artifact_contract_error(
             "the pointed causal-map artifact does not byte-semantically match its normalized scope pointer",
+        ));
+    }
+    if !(1..=crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&artifact.max_records)
+        || artifact.source_records > artifact.max_records
+    {
+        return Err(artifact_contract_error(
+            "the pointed causal-map artifact carries an invalid max-records contract or more source records than that contract permits",
         ));
     }
     decode_sha256(&artifact.source_fingerprint_sha256)?;
