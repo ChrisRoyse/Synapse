@@ -637,7 +637,7 @@ Write-Gate 'Gate 0c    authenticated Chrome error/body-budget contract (#2217/#2
 try {
     $contractFailureCountBefore = $script:Failures.Count
     $workerPath = Join-Path $RepoRoot 'extensions/synapse-chrome-debugger/service_worker.js'
-    $bridgePath = Join-Path $RepoRoot 'crates/synapse-mcp/src/chrome_debugger_bridge/mod.rs'
+    $bridgePath = Join-Path $RepoRoot 'crates/synapse-chrome-bridge/src/lib.rs'
     $coreErrorPath = Join-Path $RepoRoot 'crates/synapse-core/src/error_codes.rs'
     foreach ($path in @($workerPath, $bridgePath, $coreErrorPath)) {
         if (-not (Test-Path -LiteralPath $path)) {
@@ -728,7 +728,7 @@ try {
     if (($workerBudgets -join "`n") -ne ($bridgeBudgets -join "`n")) {
         Add-Failure 'SYNAPSE_LINT_CHROME_NATIVE_MESSAGE_BUDGET_DIVERGED' `
             "extension and daemon native-message budget contracts differ; extension=$($workerBudgets -join ',') daemon=$($bridgeBudgets -join ',')" `
-            'keep the exact HTTP envelope limit and screenshot payload budget synchronized across service_worker.js and chrome_debugger_bridge/mod.rs, preserving explicit envelope headroom'
+            'keep the exact HTTP envelope limit and screenshot payload budget synchronized across service_worker.js and synapse-chrome-bridge/src/lib.rs, preserving explicit envelope headroom'
     }
     if (($workerBudgets -join "`n") -ne ($expectedBudgets -join "`n")) {
         Add-Failure 'SYNAPSE_LINT_CHROME_NATIVE_MESSAGE_BUDGET_INVALID' `
