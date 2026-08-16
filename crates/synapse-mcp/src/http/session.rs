@@ -50,6 +50,14 @@ enum SessionFailure {
     /// target row was persisted, so re-binding (adopting) the same browser tab
     /// is the right recovery rather than re-creating it.
     Terminated,
+    /// A tool call proved that this session never listed the current tool
+    /// surface. The server terminated it to force the protocol's mandatory
+    /// initialize -> tools/list recovery cycle.
+    ToolSurfaceAttestationMissing,
+    /// A tool call proved that this session listed a different tool surface.
+    /// The server terminated it because notification-only refresh did not
+    /// happen before the unsafe call was attempted.
+    ToolSurfaceAttestationStale,
 }
 
 impl SessionFailure {
@@ -59,6 +67,8 @@ impl SessionFailure {
             Self::Missing => "session_header_missing",
             Self::UnknownOrExpired => "session_unknown_or_expired",
             Self::Terminated => "session_terminated",
+            Self::ToolSurfaceAttestationMissing => "tool_surface_attestation_missing",
+            Self::ToolSurfaceAttestationStale => "tool_surface_attestation_stale",
         }
     }
 
@@ -81,6 +91,9 @@ impl SessionFailure {
         match self {
             Self::Missing => "initialize_session",
             Self::UnknownOrExpired | Self::Terminated => "recreate_session_then_rebind_target",
+            Self::ToolSurfaceAttestationMissing | Self::ToolSurfaceAttestationStale => {
+                "reinitialize_session_then_list_tools"
+            }
         }
     }
 
@@ -95,6 +108,24 @@ impl SessionFailure {
             Self::Terminated => {
                 "the session lifecycle terminated this session (stale-eviction / session_end / agent_kill); create a new session and re-bind the same target (its binding was persisted)"
             }
+            Self::ToolSurfaceAttestationMissing => {
+                "the session called a tool without a physical attestation for its current tools/list surface; the session was terminated so the client must initialize and validate tools/list again"
+            }
+            Self::ToolSurfaceAttestationStale => {
+                "the session called a tool after its physical tools/list attestation diverged from the live surface; the session was terminated so the client must initialize and validate tools/list again"
+            }
+        }
+    }
+
+    fn root_cause_code(self) -> Option<&'static str> {
+        match self {
+            Self::ToolSurfaceAttestationMissing => {
+                Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING)
+            }
+            Self::ToolSurfaceAttestationStale => {
+                Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE)
+            }
+            Self::Missing | Self::UnknownOrExpired | Self::Terminated => None,
         }
     }
 }
@@ -169,7 +200,10 @@ pub(super) async fn require_mcp_session(
                     session_id,
                     "HTTP MCP session rejected because session lifecycle already terminated it"
                 );
-                return session_invalid_for(SessionFailure::Terminated, Some(session_id));
+                return session_invalid_for(
+                    terminated_session_failure(&state.terminated_sessions, session_id),
+                    Some(session_id),
+                );
             }
             match record_session_request(&state.session_registry, session_id, request).await {
                 Ok(pair) => pair,
@@ -324,7 +358,26 @@ fn session_is_terminated(
 ) -> bool {
     terminated_sessions
         .lock()
-        .is_ok_and(|terminated| terminated.contains(session_id))
+        .is_ok_and(|terminated| terminated.contains_key(session_id))
+}
+
+fn terminated_session_failure(
+    terminated_sessions: &crate::server::session_lifecycle::SharedTerminatedSessions,
+    session_id: &str,
+) -> SessionFailure {
+    let reason = terminated_sessions
+        .lock()
+        .ok()
+        .and_then(|terminated| terminated.get(session_id).cloned());
+    match reason.as_deref() {
+        Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING) => {
+            SessionFailure::ToolSurfaceAttestationMissing
+        }
+        Some(synapse_core::error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE) => {
+            SessionFailure::ToolSurfaceAttestationStale
+        }
+        _ => SessionFailure::Terminated,
+    }
 }
 
 fn session_idle_timeout_secs() -> anyhow::Result<u64> {
@@ -499,6 +552,7 @@ fn session_invalid_for(failure: SessionFailure, session_id: Option<&str>) -> Res
         "failure_class": failure.failure_class(),
         "daemon_alive": true,
         "recovery": failure.recovery(),
+        "root_cause_code": failure.root_cause_code(),
         "session_id": session_id,
         "detail": failure.detail(),
         "source_of_truth": "http_session_middleware",

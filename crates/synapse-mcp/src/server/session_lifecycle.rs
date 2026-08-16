@@ -61,7 +61,11 @@ pub(crate) struct AbandonedHttpSession {
 
 pub(crate) type SharedSessionProcessResources =
     Arc<Mutex<BTreeMap<String, BTreeMap<u32, SessionProcessResource>>>>;
-pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeSet<String>>>;
+/// Process-local transport rejection authority. The value preserves the exact
+/// cause that first terminated a session so the HTTP 404 can tell a reconnecting
+/// client whether expiry, operator teardown, or stale tool discovery forced the
+/// new initialize cycle.
+pub(crate) type SharedTerminatedSessions = Arc<Mutex<BTreeMap<String, String>>>;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTeardownOptions {
@@ -998,7 +1002,7 @@ impl SessionLifecycleState {
     pub(crate) fn is_session_terminated(&self, session_id: &str) -> bool {
         self.terminated_sessions
             .lock()
-            .is_ok_and(|terminated| terminated.contains(session_id))
+            .is_ok_and(|terminated| terminated.contains_key(session_id))
     }
 
     pub(crate) async fn teardown_session(
@@ -1906,8 +1910,11 @@ impl SessionLifecycleState {
     fn mark_terminated_session(&self, report: &mut SessionTeardownReport) {
         match self.terminated_sessions.lock() {
             Ok(mut terminated) => {
-                report.already_terminated = terminated.contains(&report.session_id);
-                report.marked_terminated = terminated.insert(report.session_id.clone());
+                report.already_terminated = terminated.contains_key(&report.session_id);
+                report.marked_terminated = !report.already_terminated;
+                terminated
+                    .entry(report.session_id.clone())
+                    .or_insert_with(|| report.reason.clone());
             }
             Err(_error) => {
                 report.termination_marker_failed = true;

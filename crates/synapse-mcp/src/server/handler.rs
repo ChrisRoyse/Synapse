@@ -88,6 +88,8 @@ impl ServerHandler for SynapseService {
                 argument_shape,
                 error,
             )?;
+            let attestation_reinitialization =
+                tool_surface_attestation_reinitialization_code(&error).map(str::to_owned);
             if tool_list_refresh_required(&error) {
                 match context.peer.notify_tool_list_changed().await {
                     Ok(()) => {
@@ -106,6 +108,48 @@ impl ServerHandler for SynapseService {
                             error = %notify_err,
                             "profile policy denied a hidden/stale tool call but failed to notify tools/list_changed"
                         );
+                    }
+                }
+            }
+            if let (Some(session_id), Some(reason_code)) =
+                (mcp_session_id.as_deref(), attestation_reinitialization)
+            {
+                let lifecycle = self.session_lifecycle_state().map_err(|teardown_error| {
+                    tool_surface_reinitialization_failed(
+                        &tool_name,
+                        session_id,
+                        &reason_code,
+                        &error,
+                        &teardown_error,
+                    )
+                })?;
+                match lifecycle.teardown_session(session_id, &reason_code).await {
+                    Ok(report) => {
+                        tracing::warn!(
+                            code = "MCP_TOOL_SURFACE_SESSION_REINITIALIZATION_REQUIRED",
+                            tool = %tool_name,
+                            session_id,
+                            root_cause_code = %reason_code,
+                            report = ?report,
+                            "terminated an unrefreshable MCP session so the client must initialize and list tools again"
+                        );
+                    }
+                    Err(teardown_error) => {
+                        tracing::error!(
+                            code = error_codes::MCP_TOOL_SURFACE_REINITIALIZATION_FAILED,
+                            tool = %tool_name,
+                            session_id,
+                            root_cause_code = %reason_code,
+                            teardown_error = ?teardown_error,
+                            "failed to fully reclaim a stale tool-surface session"
+                        );
+                        return Err(tool_surface_reinitialization_failed(
+                            &tool_name,
+                            session_id,
+                            &reason_code,
+                            &error,
+                            &teardown_error,
+                        ));
                     }
                 }
             }
@@ -512,7 +556,7 @@ impl SynapseService {
                 "terminated-session registry lock poisoned while admitting MCP tool call",
             )
         })?;
-        if !terminated.contains(session_id) {
+        if !terminated.contains_key(session_id) {
             return Ok(());
         }
         tracing::warn!(
@@ -869,6 +913,45 @@ fn tool_list_refresh_required(error: &ErrorData) -> bool {
                 | error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING
                 | error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE
         )
+    )
+}
+
+fn tool_surface_attestation_reinitialization_code(error: &ErrorData) -> Option<&str> {
+    match error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("code"))
+        .and_then(Value::as_str)
+    {
+        Some(
+            code @ (error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING
+            | error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE),
+        ) => Some(code),
+        _ => None,
+    }
+}
+
+fn tool_surface_reinitialization_failed(
+    tool_name: &str,
+    session_id: &str,
+    root_cause_code: &str,
+    attestation_error: &ErrorData,
+    teardown_error: &ErrorData,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "MCP session {session_id:?} has an untrusted tool surface and could not be fully terminated"
+        ),
+        Some(json!({
+            "code": error_codes::MCP_TOOL_SURFACE_REINITIALIZATION_FAILED,
+            "tool": tool_name,
+            "session_id": session_id,
+            "root_cause_code": root_cause_code,
+            "attestation_error": error_snapshot(attestation_error),
+            "teardown_error": error_snapshot(teardown_error),
+            "remediation": "inspect the named session teardown failure and physical resource readbacks; do not admit another tool call until cleanup succeeds and the client initializes a new session then issues tools/list",
+        })),
     )
 }
 
