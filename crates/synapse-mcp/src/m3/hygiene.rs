@@ -403,13 +403,23 @@ pub fn required_permissions_report(_params: &HygieneReportParams) -> RequiredPer
 }
 
 /// Upper bound on records scanned in one Calyx-intelligence hygiene pass. Mirrors
-/// `synapse_calyx::SYNAPSE_INTELLIGENCE_MAX_RECORDS`; the vault re-clamps.
+/// `synapse_calyx::SYNAPSE_INTELLIGENCE_MAX_RECORDS`.
 const MAX_INTELLIGENCE_HYGIENE_RECORDS: u32 = 20_000;
 
-fn clamp_intelligence_hygiene_records(requested: Option<u32>) -> usize {
-    requested
-        .unwrap_or(MAX_INTELLIGENCE_HYGIENE_RECORDS)
-        .clamp(1, MAX_INTELLIGENCE_HYGIENE_RECORDS) as usize
+fn intelligence_hygiene_records(
+    operation: &str,
+    requested: Option<u32>,
+) -> Result<usize, ErrorData> {
+    let value = requested.unwrap_or(MAX_INTELLIGENCE_HYGIENE_RECORDS);
+    if !(1..=MAX_INTELLIGENCE_HYGIENE_RECORDS).contains(&value) {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "hygiene {operation} max_records={value} is outside 1..={MAX_INTELLIGENCE_HYGIENE_RECORDS}; request bounds are never clamped"
+            ),
+        ));
+    }
+    Ok(value as usize)
 }
 
 /// Grounding-gap report request over one panel (domain) (#1670).
@@ -420,6 +430,7 @@ pub struct HygieneGroundingGapParams {
     pub panel_version: u32,
     /// Optional cap on records scanned (defaults to the vault maximum).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 20000))]
     pub max_records: Option<u32>,
 }
 
@@ -519,7 +530,7 @@ pub fn run_grounding_gap(
     db: &Db,
     params: &HygieneGroundingGapParams,
 ) -> Result<HygieneGroundingGapResponse, ErrorData> {
-    let max_records = clamp_intelligence_hygiene_records(params.max_records);
+    let max_records = intelligence_hygiene_records("grounding_gap", params.max_records)?;
     let report = db
         .grounding_gap_intelligence(params.panel_version, max_records)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -569,9 +580,11 @@ pub fn run_grounding_gap(
 pub struct HygieneBlindSpotParams {
     pub panel_version: u32,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 20000))]
     pub max_records: Option<u32>,
     /// Optional cap on alerts returned (defaults to the vault maximum).
     #[serde(default)]
+    #[schemars(range(min = 1, max = 256))]
     pub max_alerts: Option<u32>,
 }
 
@@ -824,6 +837,7 @@ pub enum HygieneGuardAspect {
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct HygieneGuardSlotSpec {
+    #[schemars(range(max = 65535))]
     pub slot: u32,
     pub aspect: HygieneGuardAspect,
 }
@@ -844,6 +858,7 @@ pub struct HygieneGuardCalibrateParams {
     #[serde(default)]
     pub target_far: Option<f32>,
     #[serde(default)]
+    #[schemars(range(min = 1, max = 20000))]
     pub max_records: Option<u32>,
     /// Dry run when false: the calibration is computed but the Guard CF is not
     /// written.
@@ -1160,15 +1175,21 @@ pub fn run_guard_calibrate(
     let slots = params
         .slots
         .iter()
-        .map(|spec| synapse_calyx::SynapseCalyxGuardSlotSpec {
-            slot: clamp_slot(spec.slot),
-            aspect: match spec.aspect {
-                HygieneGuardAspect::Identity => synapse_calyx::SynapseCalyxGuardAspect::Identity,
-                HygieneGuardAspect::Stylistic => synapse_calyx::SynapseCalyxGuardAspect::Stylistic,
-                HygieneGuardAspect::Content => synapse_calyx::SynapseCalyxGuardAspect::Content,
-            },
+        .map(|spec| {
+            Ok(synapse_calyx::SynapseCalyxGuardSlotSpec {
+                slot: guard_slot(spec.slot)?,
+                aspect: match spec.aspect {
+                    HygieneGuardAspect::Identity => {
+                        synapse_calyx::SynapseCalyxGuardAspect::Identity
+                    }
+                    HygieneGuardAspect::Stylistic => {
+                        synapse_calyx::SynapseCalyxGuardAspect::Stylistic
+                    }
+                    HygieneGuardAspect::Content => synapse_calyx::SynapseCalyxGuardAspect::Content,
+                },
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, ErrorData>>()?;
     let mut spec =
         synapse_calyx::SynapseCalyxGuardCalibrateParams::new(params.panel_version, slots);
     if let Some(domain) = &params.domain {
@@ -1178,7 +1199,7 @@ pub fn run_guard_calibrate(
         spec.alpha = alpha;
     }
     spec.target_far = params.target_far;
-    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    spec.max_records = intelligence_hygiene_records("guard_calibrate", params.max_records)?;
     spec.persist = params.persist.unwrap_or(true);
     spec.novelty_action = match params
         .novelty_action
@@ -1313,11 +1334,16 @@ pub fn run_guard_verify(
     })
 }
 
-/// Narrows a wire slot id into the physical `u16` panel slot space. A value
-/// above the ceiling is pinned to `u16::MAX`, which no published panel defines,
-/// so the request fails closed downstream instead of silently guarding slot 0.
-fn clamp_slot(slot: u32) -> u16 {
-    u16::try_from(slot).unwrap_or(u16::MAX)
+/// Validates a wire slot id against the physical `u16` panel slot space.
+fn guard_slot(slot: u32) -> Result<u16, ErrorData> {
+    u16::try_from(slot).map_err(|_| {
+        mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "hygiene guard_calibrate slot={slot} exceeds the physical u16 slot ceiling 65535"
+            ),
+        )
+    })
 }
 
 #[must_use]
@@ -1343,9 +1369,18 @@ pub fn run_blind_spot(
     params: &HygieneBlindSpotParams,
 ) -> Result<HygieneBlindSpotResponse, ErrorData> {
     let mut spec = synapse_calyx::SynapseCalyxBlindSpotParams::new(params.panel_version);
-    spec.max_records = clamp_intelligence_hygiene_records(params.max_records);
+    spec.max_records = intelligence_hygiene_records("blind_spot", params.max_records)?;
     if let Some(max_alerts) = params.max_alerts {
-        spec.max_alerts = max_alerts.max(1) as usize;
+        if !(1..=synapse_calyx::SYNAPSE_BLIND_SPOT_MAX_ALERTS as u32).contains(&max_alerts) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "hygiene blind_spot max_alerts={max_alerts} is outside 1..={}; request bounds are never clamped",
+                    synapse_calyx::SYNAPSE_BLIND_SPOT_MAX_ALERTS
+                ),
+            ));
+        }
+        spec.max_alerts = max_alerts as usize;
     }
     let report = db
         .blind_spot_intelligence(&spec)
@@ -4497,6 +4532,7 @@ pub struct HygieneVaultVerifyParams {
     /// `full_chain` is set. Defaults to
     /// `synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES`.
     #[serde(default)]
+    #[schemars(range(min = 1, max = 1000000))]
     pub tail_entries: Option<u64>,
 }
 
@@ -4683,8 +4719,12 @@ pub fn run_vault_verify_typed(
 ) -> Result<VaultVerifyOutcome, ErrorData> {
     let tail_entries = params
         .tail_entries
-        .unwrap_or(synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES)
-        .clamp(1, MAX_VAULT_VERIFY_TAIL_ENTRIES);
+        .unwrap_or(synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES);
+    if !(1..=MAX_VAULT_VERIFY_TAIL_ENTRIES).contains(&tail_entries) {
+        return Err(invalid(format!(
+            "hygiene vault_verify tail_entries={tail_entries} is outside 1..={MAX_VAULT_VERIFY_TAIL_ENTRIES}; request bounds are never clamped"
+        )));
+    }
     let report = db
         .verify_calyx_vault(params.full_chain, tail_entries)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
