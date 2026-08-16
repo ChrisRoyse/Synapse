@@ -19,7 +19,7 @@
 //! every emitted tool schema is walked and any boolean found in a *schema
 //! position that strict clients validate as a subschema* is replaced with an
 //! explicit, fully permissive object schema. This is exhaustive over current and
-//! future tools and is enforced by `schema_sanitize_tests`.
+//! future tools and is enforced again when the immutable tool surface is built.
 //!
 //! Booleans in `additionalProperties` / `additionalItems` / `unevaluated*`
 //! positions are intentionally preserved: a boolean there is meaningful and is
@@ -109,6 +109,22 @@ const STANDARD_JSON_SCHEMA_FORMATS: &[&str] = &[
 /// valid UTF-8 punctuation into mojibake in `tools/list`.
 const TEXT_ANNOTATION_KEYS: &[&str] = &["$comment", "description", "title"];
 
+/// Non-validating annotations removed from every served schema object. The
+/// tool itself remains named/described by MCP, while generated Rust type names
+/// and repeated dialect declarations consume context without constraining an
+/// argument. JSON Schema 2020-12 classifies `title` as metadata and `$schema`
+/// only selects the dialect; removing either leaves the accepted instance set
+/// unchanged.
+const GLOBAL_COMPACT_ANNOTATION_KEYS: &[&str] = &["$schema", "title"];
+
+/// Repeated prose inside `$defs` is documentation for Rust implementation
+/// types, not a validation assertion. Facade-level descriptions and direct
+/// property descriptions remain available to the model; only descriptions
+/// below a reusable definition container are removed. This prevents operation
+/// growth from multiplying the model-facing payload while retaining every
+/// `$ref`, enum, range, required field, and object-closure constraint.
+const DEFINITION_COMPACT_ANNOTATION_KEYS: &[&str] = &["$comment", "description"];
+
 /// True if `format` is a standard JSON Schema 2020-12 format that compliant MCP
 /// clients recognize and therefore must be preserved.
 fn is_standard_format(format: &str) -> bool {
@@ -185,7 +201,32 @@ fn sanitize_tool(mut tool: Tool) -> Tool {
 fn sanitize_schema_object(schema: &Arc<Map<String, Value>>) -> Arc<Map<String, Value>> {
     let mut cloned = (**schema).clone();
     rewrite_map(&mut cloned);
+    compact_schema_map(&mut cloned, false);
     Arc::new(cloned)
+}
+
+fn compact_schema_value(value: &mut Value, inside_definition: bool) {
+    match value {
+        Value::Object(map) => compact_schema_map(map, inside_definition),
+        Value::Array(items) => {
+            for item in items {
+                compact_schema_value(item, inside_definition);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn compact_schema_map(map: &mut Map<String, Value>, inside_definition: bool) {
+    map.retain(|key, _| {
+        !GLOBAL_COMPACT_ANNOTATION_KEYS.contains(&key.as_str())
+            && !(inside_definition && DEFINITION_COMPACT_ANNOTATION_KEYS.contains(&key.as_str()))
+    });
+    for (key, child) in map.iter_mut() {
+        let child_inside_definition =
+            inside_definition || matches!(key.as_str(), "$defs" | "definitions");
+        compact_schema_value(child, child_inside_definition);
+    }
 }
 
 /// A fully permissive but explicit object schema used to replace a bare boolean

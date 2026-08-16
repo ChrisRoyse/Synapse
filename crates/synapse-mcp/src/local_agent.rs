@@ -3400,7 +3400,7 @@ fn content_text(content: &Content) -> Option<String> {
     content.as_text().map(|text| text.text.clone())
 }
 
-fn openai_tool_from_mcp(tool: &Tool) -> Value {
+pub(crate) fn openai_tool_from_mcp(tool: &Tool) -> Value {
     json!({
         "type": "function",
         "function": {
@@ -3409,6 +3409,68 @@ fn openai_tool_from_mcp(tool: &Tool) -> Value {
             "parameters": Value::Object((*tool.input_schema).clone()),
         }
     })
+}
+
+/// Build the exact OpenAI `tools[]` representation used by direct local-agent
+/// exposure and measure the bytes that will enter the model request. Keeping
+/// this beside `openai_tool_from_mcp` makes startup admission and telemetry
+/// consume the same representation as the real caller instead of maintaining
+/// look-alike serializers that can drift.
+pub(crate) fn measure_openai_tool_payload(
+    tools: &[Tool],
+) -> anyhow::Result<OpenAiToolPayloadMeasurement> {
+    let mut openai_tools = Vec::with_capacity(tools.len());
+    let mut contributors = Vec::with_capacity(tools.len());
+    let mut input_schema_bytes = 0_usize;
+    for tool in tools {
+        let openai_tool = openai_tool_from_mcp(tool);
+        let openai_tool_bytes = serde_json::to_vec(&openai_tool)
+            .with_context(|| format!("serialize OpenAI tool definition for {}", tool.name))?
+            .len();
+        let input_bytes = serde_json::to_vec(&Value::Object((*tool.input_schema).clone()))
+            .with_context(|| format!("serialize input schema for {}", tool.name))?
+            .len();
+        input_schema_bytes = input_schema_bytes
+            .checked_add(input_bytes)
+            .context("OpenAI tool input-schema byte count overflow")?;
+        contributors.push(OpenAiToolPayloadContributorMeasurement {
+            name: tool.name.to_string(),
+            openai_tool_bytes,
+            input_schema_bytes: input_bytes,
+            description_bytes: tool.description.as_ref().map_or(0, |value| value.len()),
+        });
+        openai_tools.push(openai_tool);
+    }
+    contributors.sort_by(|left, right| {
+        right
+            .openai_tool_bytes
+            .cmp(&left.openai_tool_bytes)
+            .then(left.name.cmp(&right.name))
+    });
+    let serialized =
+        serde_json::to_string(&openai_tools).context("serialize complete OpenAI tools payload")?;
+    Ok(OpenAiToolPayloadMeasurement {
+        serialized_bytes: serialized.len(),
+        serialized_chars: serialized.chars().count(),
+        input_schema_bytes,
+        contributors,
+    })
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OpenAiToolPayloadMeasurement {
+    pub(crate) serialized_bytes: usize,
+    pub(crate) serialized_chars: usize,
+    pub(crate) input_schema_bytes: usize,
+    pub(crate) contributors: Vec<OpenAiToolPayloadContributorMeasurement>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OpenAiToolPayloadContributorMeasurement {
+    pub(crate) name: String,
+    pub(crate) openai_tool_bytes: usize,
+    pub(crate) input_schema_bytes: usize,
+    pub(crate) description_bytes: usize,
 }
 
 fn routed_harness_tools() -> Vec<Value> {

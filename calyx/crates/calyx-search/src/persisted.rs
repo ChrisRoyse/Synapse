@@ -21,10 +21,11 @@ mod rebuild_stream;
 #[path = "persisted/sparse.rs"]
 mod sparse;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Constellation, CxId, SlotId, SlotVector};
@@ -60,6 +61,10 @@ const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v2";
 const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";
 const INDEX_ROOT: &str = "idx/search";
 const MANIFEST_NAME: &str = "manifest.json";
+const DEFAULT_OPEN_GENERATION_CACHE_ENTRIES: usize = 4;
+const MAX_OPEN_GENERATION_CACHE_ENTRIES: usize = 16;
+const OPEN_GENERATION_CACHE_ENTRIES_ENV: &str = "CALYX_SEARCH_OPEN_GENERATION_CACHE_ENTRIES";
+static OPEN_GENERATION_CACHE: OnceLock<Mutex<OpenGenerationCache>> = OnceLock::new();
 pub const CALYX_SEARCH_PANEL_SCOPE_REQUIRED: &str = "CALYX_SEARCH_PANEL_SCOPE_REQUIRED";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -235,6 +240,281 @@ pub struct PersistedSearchIndexes {
     vault_dir: PathBuf,
     manifest: SearchIndexManifest,
     manifest_sha256: String,
+    runtime: Arc<PersistedSearchRuntime>,
+    runtime_cache_hit: bool,
+}
+
+#[derive(Debug)]
+struct PersistedSearchRuntime {
+    dense: dense::DenseIndexCache,
+    artifact_roots: BTreeSet<PathBuf>,
+}
+
+impl PersistedSearchRuntime {
+    fn new(artifact_roots: BTreeSet<PathBuf>) -> Self {
+        Self {
+            dense: dense::DenseIndexCache::default(),
+            artifact_roots,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct OpenGenerationKey {
+    vault_dir: String,
+    panel_version: u32,
+    manifest_sha256: String,
+}
+
+#[derive(Debug)]
+struct OpenGenerationCache {
+    entries: BTreeMap<OpenGenerationKey, Arc<PersistedSearchRuntime>>,
+    order: VecDeque<OpenGenerationKey>,
+    retired: Vec<Weak<PersistedSearchRuntime>>,
+    max_entries: usize,
+}
+
+impl OpenGenerationCache {
+    fn new(max_entries: usize) -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            order: VecDeque::new(),
+            retired: Vec::new(),
+            max_entries,
+        }
+    }
+
+    fn touch(&mut self, key: &OpenGenerationKey) {
+        self.order.retain(|candidate| candidate != key);
+        self.order.push_back(key.clone());
+    }
+
+    fn get(&mut self, key: &OpenGenerationKey) -> Option<Arc<PersistedSearchRuntime>> {
+        let runtime = self.entries.get(key).cloned()?;
+        self.touch(key);
+        Some(runtime)
+    }
+
+    fn get_or_insert(
+        &mut self,
+        key: OpenGenerationKey,
+        artifact_roots: BTreeSet<PathBuf>,
+    ) -> (Arc<PersistedSearchRuntime>, bool, Option<OpenGenerationKey>) {
+        if let Some(runtime) = self.entries.get(&key).cloned() {
+            self.touch(&key);
+            return (runtime, true, None);
+        }
+        let runtime = Arc::new(PersistedSearchRuntime::new(artifact_roots));
+        self.entries.insert(key.clone(), Arc::clone(&runtime));
+        self.touch(&key);
+        let mut evicted = None;
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if oldest == key {
+                self.order.push_back(oldest);
+                continue;
+            }
+            if let Some(old_runtime) = self.entries.remove(&oldest) {
+                self.retired.push(Arc::downgrade(&old_runtime));
+                evicted = Some(oldest);
+            }
+        }
+        self.retired.retain(|runtime| runtime.strong_count() > 0);
+        (runtime, false, evicted)
+    }
+}
+
+fn read_open_generation_cache_capacity() -> Result<(usize, Option<String>), String> {
+    match std::env::var(OPEN_GENERATION_CACHE_ENTRIES_ENV) {
+        Ok(raw) => {
+            let parsed = raw.parse::<usize>().map_err(|error| {
+                format!(
+                    "{OPEN_GENERATION_CACHE_ENTRIES_ENV} must be an integer in 1..={MAX_OPEN_GENERATION_CACHE_ENTRIES}: value={raw:?} error={error}"
+                )
+            })?;
+            if !(1..=MAX_OPEN_GENERATION_CACHE_ENTRIES).contains(&parsed) {
+                return Err(format!(
+                    "{OPEN_GENERATION_CACHE_ENTRIES_ENV} must be in 1..={MAX_OPEN_GENERATION_CACHE_ENTRIES}: value={parsed}"
+                ));
+            }
+            Ok((parsed, Some(raw)))
+        }
+        Err(std::env::VarError::NotPresent) => Ok((DEFAULT_OPEN_GENERATION_CACHE_ENTRIES, None)),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{OPEN_GENERATION_CACHE_ENTRIES_ENV} is not valid UTF-8"
+        )),
+    }
+}
+
+fn open_generation_cache_capacity() -> CliResult<usize> {
+    static CAPACITY: OnceLock<(usize, Option<String>)> = OnceLock::new();
+    let observed = read_open_generation_cache_capacity().map_err(|detail| CliError::usage(format!(
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_CONFIG_INVALID: {detail}; remediation=set {OPEN_GENERATION_CACHE_ENTRIES_ENV} to an integer in 1..={MAX_OPEN_GENERATION_CACHE_ENTRIES} or unset it for the bounded default {DEFAULT_OPEN_GENERATION_CACHE_ENTRIES}"
+        )))?;
+    let frozen = CAPACITY.get_or_init(|| observed.clone());
+    if frozen != &observed {
+        return Err(CliError::usage(format!(
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_CONFIG_DRIFT: frozen value {:?} (capacity {}) differs from current value {:?} (capacity {}); remediation=restart the process after changing {OPEN_GENERATION_CACHE_ENTRIES_ENV}",
+            frozen.1, frozen.0, observed.1, observed.0
+        )));
+    }
+    Ok(frozen.0)
+}
+
+fn open_generation_artifact_roots(
+    vault_dir: &Path,
+    manifest: &SearchIndexManifest,
+) -> CliResult<BTreeSet<PathBuf>> {
+    let canonical_vault = PathBuf::from(canonical_pin_vault_dir(vault_dir)?);
+    let mut roots = BTreeSet::new();
+    for entry in manifest
+        .slots
+        .iter()
+        .filter(|entry| entry.kind == "diskann")
+    {
+        let slot = SlotId::new(entry.slot);
+        let graph = fs::canonicalize(canonical_vault.join(entry.require_graph_rel(slot)?))?;
+        if !graph.starts_with(&canonical_vault) {
+            return Err(CliError::io(format!(
+                "CALYX_SEARCH_GENERATION_ARTIFACT_OUTSIDE_VAULT: panel={} slot={} artifact={}; remediation=rebuild the manifest with vault-relative immutable artifacts",
+                manifest.panel_version,
+                entry.slot,
+                graph.display()
+            )));
+        }
+        let root = graph.parent().ok_or_else(|| {
+            CliError::io(format!(
+                "CALYX_SEARCH_GENERATION_ARTIFACT_ROOT_MISSING: panel={} slot={} artifact={}; remediation=rebuild the malformed generation",
+                manifest.panel_version,
+                entry.slot,
+                graph.display()
+            ))
+        })?;
+        roots.insert(root.to_path_buf());
+    }
+    Ok(roots)
+}
+
+/// Canonical artifact directories that remain reachable through an open mmap
+/// runtime. Rebuild pruning must retain these until the final query/reference
+/// drops; otherwise Windows refuses deletion and platforms that permit unlink
+/// can violate the mmap immutability contract if a path is rebuilt in place.
+pub(super) fn retained_open_generation_artifact_roots_for_prune(
+    root: &Path,
+    keep: &[PathBuf],
+) -> CliResult<BTreeSet<PathBuf>> {
+    let Some(cache) = OPEN_GENERATION_CACHE.get() else {
+        return Ok(BTreeSet::new());
+    };
+    let canonical_root = fs::canonicalize(root)?;
+    let canonical_keep = keep
+        .iter()
+        .filter(|path| path.exists())
+        .map(fs::canonicalize)
+        .collect::<std::io::Result<BTreeSet<_>>>()?;
+    let mut cache = cache.lock().map_err(|_| {
+        CliError::io(
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_POISONED: generation runtime cache lock was poisoned during pruning; remediation=restart the process and inspect the first panic",
+        )
+    })?;
+    let superseded = cache
+        .entries
+        .iter()
+        .filter_map(|(key, runtime)| {
+            runtime
+                .artifact_roots
+                .iter()
+                .any(|artifact| {
+                    artifact.parent() == Some(canonical_root.as_path())
+                        && !canonical_keep.contains(artifact)
+                })
+                .then_some(key.clone())
+        })
+        .collect::<Vec<_>>();
+    for key in superseded {
+        if let Some(runtime) = cache.entries.remove(&key) {
+            cache.retired.push(Arc::downgrade(&runtime));
+        }
+        cache.order.retain(|candidate| candidate != &key);
+    }
+    let mut retained = BTreeSet::new();
+    for runtime in cache.entries.values() {
+        retained.extend(runtime.artifact_roots.iter().cloned());
+    }
+    cache.retired.retain(|runtime| {
+        let Some(runtime) = runtime.upgrade() else {
+            return false;
+        };
+        retained.extend(runtime.artifact_roots.iter().cloned());
+        true
+    });
+    Ok(retained)
+}
+
+fn open_generation_runtime(
+    vault_dir: &Path,
+    panel_version: u32,
+    manifest_sha256: &str,
+    manifest: &SearchIndexManifest,
+) -> CliResult<(Arc<PersistedSearchRuntime>, bool)> {
+    let max_entries = open_generation_cache_capacity()?;
+    let key = OpenGenerationKey {
+        vault_dir: canonical_pin_vault_dir(vault_dir)?,
+        panel_version,
+        manifest_sha256: manifest_sha256.to_owned(),
+    };
+    let cache =
+        OPEN_GENERATION_CACHE.get_or_init(|| Mutex::new(OpenGenerationCache::new(max_entries)));
+    {
+        let mut cache = cache.lock().map_err(|_| {
+            CliError::io(
+                "CALYX_SEARCH_OPEN_GENERATION_CACHE_POISONED: generation runtime cache lock was poisoned; remediation=restart the process and inspect the first panic",
+            )
+        })?;
+        if cache.max_entries != max_entries {
+            return Err(CliError::usage(format!(
+                "CALYX_SEARCH_OPEN_GENERATION_CACHE_CONFIG_DRIFT: frozen capacity {} differs from requested {max_entries}; remediation=restart the process after changing {OPEN_GENERATION_CACHE_ENTRIES_ENV}",
+                cache.max_entries
+            )));
+        }
+        if let Some(runtime) = cache.get(&key) {
+            tracing::info!(
+                code = "CALYX_SEARCH_OPEN_GENERATION_CACHE_HIT",
+                vault_dir = %key.vault_dir,
+                panel_version,
+                manifest_sha256,
+                cache_entries = cache.entries.len(),
+                cache_capacity = cache.max_entries,
+                "resolved the immutable persisted-search generation runtime"
+            );
+            return Ok((runtime, true));
+        }
+    }
+    let artifact_roots = open_generation_artifact_roots(vault_dir, manifest)?;
+    let mut cache = cache.lock().map_err(|_| {
+        CliError::io(
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_POISONED: generation runtime cache lock was poisoned; remediation=restart the process and inspect the first panic",
+        )
+    })?;
+    let (runtime, hit, evicted) = cache.get_or_insert(key.clone(), artifact_roots);
+    tracing::info!(
+        code = if hit {
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_HIT"
+        } else {
+            "CALYX_SEARCH_OPEN_GENERATION_CACHE_MISS"
+        },
+        vault_dir = %key.vault_dir,
+        panel_version,
+        manifest_sha256,
+        cache_entries = cache.entries.len(),
+        cache_capacity = cache.max_entries,
+        evicted_panel_version = evicted.as_ref().map(|entry| entry.panel_version),
+        evicted_manifest_sha256 = evicted.as_ref().map(|entry| entry.manifest_sha256.as_str()),
+        "resolved the immutable persisted-search generation runtime"
+    );
+    Ok((runtime, hit))
 }
 
 impl PersistedSearchIndexes {
@@ -316,10 +596,14 @@ impl PersistedSearchIndexes {
                 manifest.panel_version
             )));
         }
+        let (runtime, runtime_cache_hit) =
+            open_generation_runtime(vault_dir, panel_version, &manifest_sha256, &manifest)?;
         Ok(Self {
             vault_dir: vault_dir.to_path_buf(),
             manifest,
             manifest_sha256,
+            runtime,
+            runtime_cache_hit,
         })
     }
 
@@ -355,11 +639,14 @@ impl PersistedSearchIndexes {
             SlotVector::Dense { .. } => dense::search(
                 &self.vault_dir,
                 entry,
-                self.manifest.panel_version,
-                slot,
+                dense::DenseSearchContext {
+                    panel_version: self.manifest.panel_version,
+                    slot,
+                    config: self.manifest.dense_index_config.validate()?,
+                },
                 query,
                 k,
-                self.manifest.dense_index_config.validate()?,
+                &self.runtime.dense,
             ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
@@ -400,18 +687,28 @@ impl PersistedSearchIndexes {
         dense::exact_search(
             &self.vault_dir,
             entry,
-            self.manifest.panel_version,
-            slot,
+            dense::DenseSearchContext {
+                panel_version: self.manifest.panel_version,
+                slot,
+                config: self.manifest.dense_index_config.validate()?,
+            },
             query,
             k,
-            self.manifest.dense_index_config.validate()?,
+            &self.runtime.dense,
         )
     }
 
     /// Exact indexed identities for one dense lane, in durable id-map order.
     pub fn dense_ids(&self, slot: SlotId) -> CliResult<Vec<CxId>> {
         let entry = self.require_entry(slot)?;
-        dense::ids(&self.vault_dir, entry, self.manifest.panel_version, slot)
+        dense::ids(
+            &self.vault_dir,
+            entry,
+            self.manifest.panel_version,
+            slot,
+            self.manifest.dense_index_config.validate()?,
+            &self.runtime.dense,
+        )
     }
 
     pub fn search_filtered(
@@ -437,6 +734,7 @@ impl PersistedSearchIndexes {
                 query,
                 k,
                 candidates,
+                &self.runtime.dense,
             ),
             SlotVector::Sparse { .. } => sparse::search(
                 &self.vault_dir,
@@ -596,6 +894,12 @@ impl PersistedSearchIndexes {
 
     pub fn manifest_sha256(&self) -> &str {
         &self.manifest_sha256
+    }
+
+    /// Whether this handle reused the already-open immutable runtime for the
+    /// exact `(vault, panel, manifest_sha256)` generation.
+    pub fn runtime_cache_hit(&self) -> bool {
+        self.runtime_cache_hit
     }
 
     pub fn max_len_for_slots(&self, allowed_slots: Option<&BTreeSet<SlotId>>) -> usize {

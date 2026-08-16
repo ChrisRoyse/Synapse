@@ -67,10 +67,11 @@ pub(super) async fn handle(
                 "repair tool profile policy or schema sanitization before reading telemetry status",
             )
         })?;
+    let tool_surface = tool_surface_telemetry(&snapshot, &visible_tools)?;
     let status = TelemetryStatusResponse {
         source_of_truth: TELEMETRY_SOT,
         metrics_recorder: metrics_recorder_telemetry(),
-        tool_surface: tool_surface_telemetry(&snapshot, &visible_tools),
+        tool_surface,
         tool_usage: crate::daemon_lifecycle::recent_tool_usage(10_000, 128),
         storage_summary,
         agent_event_ingress: ingress,
@@ -184,12 +185,12 @@ const TOOL_PAYLOAD_SOURCE_OF_TRUTH: &str =
 fn tool_surface_telemetry(
     snapshot: &ToolProfileSnapshot,
     visible_tools: &[Tool],
-) -> ToolSurfaceTelemetry {
+) -> Result<ToolSurfaceTelemetry, ErrorData> {
     let visible_public_count = count_visible_public_tools(
         &snapshot.public_tool_registry.public_tool_names,
         &snapshot.visible_tool_names,
     );
-    ToolSurfaceTelemetry {
+    Ok(ToolSurfaceTelemetry {
         source_of_truth: snapshot.source_of_truth,
         profile: snapshot.profile.as_str().to_owned(),
         profile_label: snapshot.profile_label.to_owned(),
@@ -218,75 +219,71 @@ fn tool_surface_telemetry(
         facade_contract_tool_count: snapshot.facade_contract.contract_tool_count,
         facade_contract_operation_count: snapshot.facade_contract.operation_count,
         facade_contract_mutating_operation_count: snapshot.facade_contract.mutating_operation_count,
-        model_payload: tool_surface_payload_telemetry(visible_tools),
+        model_payload: tool_surface_payload_telemetry(visible_tools)?,
         codex_client_surface: snapshot.codex_client_surface.clone(),
-    }
+    })
 }
 
-fn tool_surface_payload_telemetry(tools: &[Tool]) -> ToolSurfacePayloadTelemetry {
-    let mut openai_tools = Vec::with_capacity(tools.len());
-    let mut input_schema_bytes = 0_usize;
+fn tool_surface_payload_telemetry(
+    tools: &[Tool],
+) -> Result<ToolSurfacePayloadTelemetry, ErrorData> {
+    let measured = crate::local_agent::measure_openai_tool_payload(tools).map_err(|error| {
+        crate::m1::mcp_error(
+            synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "MCP_TOOL_PAYLOAD_SERIALIZATION_FAILED: operation=telemetry_status source_of_truth={TOOL_PAYLOAD_SOURCE_OF_TRUTH} error={error:#}; remediation=repair the named sanitized schema before reading or sending the model-facing tool payload"
+            ),
+        )
+    })?;
     let mut output_schema_bytes = 0_usize;
-    let mut contributors = Vec::with_capacity(tools.len());
     for tool in tools {
-        let description = tool
-            .description
-            .as_ref()
-            .map(|desc| desc.as_ref())
-            .unwrap_or("Synapse MCP tool");
-        let input_schema = serde_json::Value::Object((*tool.input_schema).clone());
-        let input_schema_json =
-            serde_json::to_string(&input_schema).unwrap_or_else(|_| "{}".to_owned());
-        input_schema_bytes = input_schema_bytes.saturating_add(input_schema_json.len());
         if let Some(output_schema) = &tool.output_schema {
-            let output_schema_json =
-                serde_json::to_string(&serde_json::Value::Object((**output_schema).clone()))
-                    .unwrap_or_else(|_| "{}".to_owned());
-            output_schema_bytes = output_schema_bytes.saturating_add(output_schema_json.len());
+            let bytes = serde_json::to_vec(&serde_json::Value::Object((**output_schema).clone()))
+                .map_err(|error| {
+                    crate::m1::mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "MCP_TOOL_OUTPUT_SCHEMA_SERIALIZATION_FAILED: operation=telemetry_status source_of_truth=live sanitized tools/list tool={} error={error}; remediation=repair the named output schema before reading telemetry",
+                            tool.name
+                        ),
+                    )
+                })?
+                .len();
+            output_schema_bytes = output_schema_bytes.checked_add(bytes).ok_or_else(|| {
+                crate::m1::mcp_error(
+                    synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                    "MCP_TOOL_OUTPUT_SCHEMA_BYTE_COUNT_OVERFLOW: operation=telemetry_status; remediation=reduce the published output-schema surface",
+                )
+            })?;
         }
-        let openai_tool = serde_json::json!({
-            "type": "function",
-            "function": {
-                "name": tool.name.as_ref(),
-                "description": description,
-                "parameters": input_schema,
-            }
-        });
-        let openai_tool_json =
-            serde_json::to_string(&openai_tool).unwrap_or_else(|_| "{}".to_owned());
-        contributors.push(ToolSurfacePayloadContributor {
-            name: tool.name.to_string(),
-            openai_tool_bytes: openai_tool_json.len(),
-            input_schema_bytes: input_schema_json.len(),
-            description_bytes: description.len(),
-        });
-        openai_tools.push(openai_tool);
     }
-    contributors.sort_by(|left, right| {
-        right
-            .openai_tool_bytes
-            .cmp(&left.openai_tool_bytes)
-            .then(left.name.cmp(&right.name))
-    });
+    let mut contributors = measured
+        .contributors
+        .iter()
+        .map(|entry| ToolSurfacePayloadContributor {
+            name: entry.name.clone(),
+            openai_tool_bytes: entry.openai_tool_bytes,
+            input_schema_bytes: entry.input_schema_bytes,
+            description_bytes: entry.description_bytes,
+        })
+        .collect::<Vec<_>>();
     contributors.truncate(10);
-    let openai_tools_json = serde_json::to_string(&openai_tools).unwrap_or_default();
-    let openai_tools_chars = openai_tools_json.chars().count();
-    ToolSurfacePayloadTelemetry {
+    Ok(ToolSurfacePayloadTelemetry {
         source_of_truth: TOOL_PAYLOAD_SOURCE_OF_TRUTH,
         tool_count: tools.len(),
-        openai_tools_bytes: openai_tools_json.len(),
-        openai_tools_chars,
-        approx_tokens_chars_div_4: (openai_tools_chars as f64 / 4.0).ceil() as u64,
-        approx_tokens_chars_div_3_5: (openai_tools_chars as f64 / 3.5).ceil() as u64,
-        input_schema_bytes,
+        openai_tools_bytes: measured.serialized_bytes,
+        openai_tools_chars: measured.serialized_chars,
+        approx_tokens_chars_div_4: (measured.serialized_chars as f64 / 4.0).ceil() as u64,
+        approx_tokens_chars_div_3_5: (measured.serialized_chars as f64 / 3.5).ceil() as u64,
+        input_schema_bytes: measured.input_schema_bytes,
         output_schema_bytes,
         budget_openai_tools_bytes:
             crate::server::tool_profiles::PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES,
-        over_budget_by_bytes: openai_tools_json
-            .len()
+        over_budget_by_bytes: measured
+            .serialized_bytes
             .saturating_sub(crate::server::tool_profiles::PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES),
         top_contributors: contributors,
-    }
+    })
 }
 
 fn count_visible_public_tools(

@@ -548,11 +548,22 @@ pub(super) fn prune_stale_index_artifacts(
     manifest: &SearchIndexManifest,
 ) -> CliResult {
     let keep = referenced_index_artifacts(vault_dir, root, manifest)?;
+    let retained_open = retained_open_generation_artifact_roots_for_prune(root, &keep)?;
     for entry in fs::read_dir(root)? {
         let entry = entry?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
         if !is_prunable_index_artifact(&name) || keep.iter().any(|item| item == &path) {
+            continue;
+        }
+        let canonical_path = fs::canonicalize(&path)?;
+        if retained_open.contains(&canonical_path) {
+            tracing::info!(
+                code = "CALYX_SEARCH_PRUNE_RETAINED_OPEN_GENERATION",
+                panel_version = manifest.panel_version,
+                path = %canonical_path.display(),
+                "retained a superseded artifact until its final mmap runtime is released"
+            );
             continue;
         }
         if entry.file_type()?.is_dir() {

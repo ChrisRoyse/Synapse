@@ -96,6 +96,13 @@ pub struct DiskAnnSearch {
 }
 
 impl DiskAnnSearch {
+    /// Immutable content-address identities in durable graph-node order.
+    /// Callers that retain an opened generation can reuse this mapping instead
+    /// of reparsing its JSON id-map sidecar for every query.
+    pub fn ids(&self) -> &[CxId] {
+        &self.ids
+    }
+
     pub fn search_ids(
         &self,
         query: &[f32],

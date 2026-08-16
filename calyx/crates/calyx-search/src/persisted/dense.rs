@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use calyx_core::{CalyxError, CxId, PanelSlotId, SlotId, SlotVector};
 use calyx_sextant::index::{
@@ -15,6 +16,8 @@ use super::{
     sha256_file, sha256_hex, stale, write_json_atomic,
 };
 use crate::error::CliResult;
+
+pub(super) type DenseIndexCache = Mutex<BTreeMap<SlotId, Arc<DiskAnnSearch>>>;
 
 #[path = "dense/flat.rs"]
 mod flat;
@@ -169,12 +172,16 @@ where
 pub(super) fn search(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
-    panel_version: u32,
-    slot: SlotId,
+    context: DenseSearchContext,
     query: &SlotVector,
     k: usize,
-    config: PersistedDenseIndexConfig,
+    cache: &DenseIndexCache,
 ) -> CliResult<Vec<IndexSearchHit>> {
+    let DenseSearchContext {
+        panel_version,
+        slot,
+        config,
+    } = context;
     if entry.kind == "flat_dense" {
         return flat::search(vault_dir, entry, slot, query, k, None);
     }
@@ -183,9 +190,17 @@ pub(super) fn search(
             "persistent dense search slot {slot} received non-dense query"
         )));
     };
-    open(vault_dir, entry, panel_version, slot, *dim, config.clone())?
-        .search(query, want(k, entry.len), Some(config.ef_search.max(k)))
-        .map_err(Into::into)
+    open_cached(
+        cache,
+        vault_dir,
+        entry,
+        panel_version,
+        slot,
+        *dim,
+        config.clone(),
+    )?
+    .search(query, want(k, entry.len), Some(config.ef_search.max(k)))
+    .map_err(Into::into)
 }
 
 pub(super) fn ids(
@@ -193,6 +208,8 @@ pub(super) fn ids(
     entry: &SearchIndexEntry,
     panel_version: u32,
     slot: SlotId,
+    config: PersistedDenseIndexConfig,
+    cache: &DenseIndexCache,
 ) -> CliResult<Vec<CxId>> {
     if entry.kind != "diskann" && entry.kind != "flat_dense" {
         return Err(stale(format!(
@@ -203,18 +220,27 @@ pub(super) fn ids(
     if entry.kind == "flat_dense" {
         return flat::ids(vault_dir, entry, slot);
     }
-    read_ids(vault_dir, entry, panel_version, slot)
+    let dim = entry.require_dim(slot)?;
+    Ok(
+        open_cached(cache, vault_dir, entry, panel_version, slot, dim, config)?
+            .ids()
+            .to_vec(),
+    )
 }
 
 pub(super) fn exact_search(
     vault_dir: &Path,
     entry: &SearchIndexEntry,
-    panel_version: u32,
-    slot: SlotId,
+    context: DenseSearchContext,
     query: &SlotVector,
     k: usize,
-    config: PersistedDenseIndexConfig,
+    cache: &DenseIndexCache,
 ) -> CliResult<Vec<IndexSearchHit>> {
+    let DenseSearchContext {
+        panel_version,
+        slot,
+        config,
+    } = context;
     if entry.kind == "flat_dense" {
         return flat::search(vault_dir, entry, slot, query, k, None);
     }
@@ -223,10 +249,8 @@ pub(super) fn exact_search(
             "persistent exact dense search slot {slot} received non-dense query"
         )));
     };
-    let index = open(vault_dir, entry, panel_version, slot, *dim, config)?;
-    let candidates = read_ids(vault_dir, entry, panel_version, slot)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let index = open_cached(cache, vault_dir, entry, panel_version, slot, *dim, config)?;
+    let candidates = index.ids().iter().copied().collect::<BTreeSet<_>>();
     exact_filtered_hits(&index, data, k, &candidates)
 }
 
@@ -237,6 +261,7 @@ pub(super) fn search_filtered(
     query: &SlotVector,
     k: usize,
     candidates: &BTreeSet<CxId>,
+    cache: &DenseIndexCache,
 ) -> CliResult<Vec<IndexSearchHit>> {
     let DenseSearchContext {
         panel_version,
@@ -251,24 +276,40 @@ pub(super) fn search_filtered(
             "persistent dense filtered search slot {slot} received non-dense query"
         )));
     };
-    let index = open(vault_dir, entry, panel_version, slot, *dim, config)?;
+    let index = open_cached(cache, vault_dir, entry, panel_version, slot, *dim, config)?;
     exact_filtered_hits(&index, data, k, candidates)
 }
 
-fn open(
+fn open_cached(
+    cache: &DenseIndexCache,
     vault_dir: &Path,
     entry: &SearchIndexEntry,
     panel_version: u32,
     slot: SlotId,
     query_dim: u32,
     config: PersistedDenseIndexConfig,
-) -> CliResult<DiskAnnSearch> {
+) -> CliResult<Arc<DiskAnnSearch>> {
     entry.require_kind("diskann", slot)?;
     let dim = entry.require_dim(slot)?;
     if dim != query_dim {
         return Err(stale(format!(
             "persistent slot {slot} index dim {dim} != query dim {query_dim}; reingest/backfill the vault"
         )));
+    }
+    let mut cache = cache.lock().map_err(|_| {
+        crate::error::CliError::io(
+            "CALYX_SEARCH_DENSE_INDEX_CACHE_POISONED: dense runtime cache lock was poisoned; remediation=restart the process and inspect the first panic",
+        )
+    })?;
+    if let Some(index) = cache.get(&slot) {
+        tracing::info!(
+            code = "CALYX_SEARCH_DENSE_INDEX_RUNTIME_CACHE_HIT",
+            panel_version,
+            slot = slot.get(),
+            indexed_rows = entry.len,
+            "reused the immutable open DiskANN slot runtime"
+        );
+        return Ok(Arc::clone(index));
     }
     let ids = read_ids(vault_dir, entry, panel_version, slot)?;
     if ids.len() != entry.len {
@@ -284,6 +325,16 @@ fn open(
     let mut index =
         DiskAnnSearch::open(slot, graph, ids, None, search_params(&config, quant_bits))?;
     index.set_base_seq(entry.built_at_seq);
+    let index = Arc::new(index);
+    cache.insert(slot, Arc::clone(&index));
+    tracing::info!(
+        code = "CALYX_SEARCH_DENSE_INDEX_RUNTIME_CACHE_MISS",
+        panel_version,
+        slot = slot.get(),
+        indexed_rows = entry.len,
+        open_slot_count = cache.len(),
+        "opened and retained the immutable DiskANN slot runtime"
+    );
     Ok(index)
 }
 

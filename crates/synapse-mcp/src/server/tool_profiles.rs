@@ -36,6 +36,9 @@ pub(crate) const PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES: usize = 200_000;
 const PUBLIC_TOOL_REGISTRY_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs PUBLIC_TOOL_NAMES";
 const PUBLIC_TOOL_REGISTRY_OPERATION: &str = "validate_public_tool_registry";
+const PUBLIC_TOOL_PAYLOAD_SOURCE_OF_TRUTH: &str =
+    "immutable sanitized tools/list mapped to the local-agent OpenAI tools[] wrapper";
+const PUBLIC_TOOL_PAYLOAD_OPERATION: &str = "validate_public_tool_payload_budget";
 const FACADE_CONTRACT_SOURCE_OF_TRUTH: &str =
     "crates/synapse-mcp/src/server/tool_profiles.rs FACADE_TOOL_CONTRACTS";
 const FACADE_CONTRACT_OPERATION: &str = "validate_facade_contract";
@@ -420,6 +423,36 @@ impl ImmutableToolSurface {
         let started_at = Instant::now();
         let mut tools = super::schema_sanitize::sanitize_tools(tool_router.list_all());
         sort_tools_for_profile(&mut tools, ToolProfileKind::BreakGlass);
+        let public_tools = tools
+            .iter()
+            .filter(|tool| PUBLIC_TOOL_NAMES.contains(&tool.name.as_ref()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let payload = inspect_public_tool_payload(&public_tools)?;
+        if payload.openai_tools_bytes > PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES {
+            anyhow::bail!(
+                "MCP_PUBLIC_TOOL_SCHEMA_BUDGET_EXCEEDED: operation={} source_of_truth={} openai_tools_bytes={} budget_bytes={} over_budget_by_bytes={} top_contributors={:?}; remediation=compact non-validating schema annotations or operation structures while preserving strict assertions and every reachable capability; never raise the budget, hide operations, or replace typed schemas with permissive values",
+                PUBLIC_TOOL_PAYLOAD_OPERATION,
+                PUBLIC_TOOL_PAYLOAD_SOURCE_OF_TRUTH,
+                payload.openai_tools_bytes,
+                PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES,
+                payload
+                    .openai_tools_bytes
+                    .saturating_sub(PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES),
+                payload.top_contributors,
+            );
+        }
+        tracing::info!(
+            code = "MCP_PUBLIC_TOOL_SCHEMA_BUDGET_VERIFIED",
+            operation = PUBLIC_TOOL_PAYLOAD_OPERATION,
+            source_of_truth = PUBLIC_TOOL_PAYLOAD_SOURCE_OF_TRUTH,
+            openai_tools_bytes = payload.openai_tools_bytes,
+            budget_bytes = PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES,
+            headroom_bytes = PUBLIC_TOOL_OPENAI_PAYLOAD_BUDGET_BYTES
+                .saturating_sub(payload.openai_tools_bytes),
+            top_contributors = ?payload.top_contributors,
+            "the exact immutable model-facing tool payload is within its fail-closed budget"
+        );
         let fingerprint = super::health::tool_surface_fingerprint_for_tools(tools.clone());
         if let Some(error) = fingerprint.error.as_deref() {
             anyhow::bail!(
@@ -501,6 +534,30 @@ impl ImmutableToolSurface {
             schema_parity,
         })
     }
+}
+
+#[derive(Debug)]
+struct PublicToolPayloadAdmission {
+    openai_tools_bytes: usize,
+    top_contributors: Vec<(String, usize)>,
+}
+
+fn inspect_public_tool_payload(tools: &[Tool]) -> anyhow::Result<PublicToolPayloadAdmission> {
+    let measured = crate::local_agent::measure_openai_tool_payload(tools).map_err(|error| {
+        anyhow::anyhow!(
+            "MCP_PUBLIC_TOOL_SCHEMA_SERIALIZATION_FAILED: operation={PUBLIC_TOOL_PAYLOAD_OPERATION} source_of_truth={PUBLIC_TOOL_PAYLOAD_SOURCE_OF_TRUTH} error={error:#}; remediation=repair the named sanitized schema before publishing tools/list",
+        )
+    })?;
+    let mut contributors = measured
+        .contributors
+        .into_iter()
+        .map(|entry| (entry.name, entry.openai_tool_bytes))
+        .collect::<Vec<_>>();
+    contributors.truncate(10);
+    Ok(PublicToolPayloadAdmission {
+        openai_tools_bytes: measured.serialized_bytes,
+        top_contributors: contributors,
+    })
 }
 
 pub(crate) const PUBLIC_TOOL_NAMES: &[&str] = &[

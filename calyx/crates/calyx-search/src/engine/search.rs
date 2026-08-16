@@ -87,6 +87,16 @@ pub(super) fn search_outcome_with_measured_slots<C: Clock>(
     validate_primary_query_slots(panel, query_vectors)?;
     let indexed_max_len = indexes.max_len_for_slots(allowed_slots);
     trace.emit("indexes.open.done", None, Some(indexed_max_len));
+    trace.emit_detail(
+        "indexes.runtime_cache",
+        None,
+        Some(usize::from(indexes.runtime_cache_hit())),
+        Some(format!(
+            "manifest_sha256={} runtime_cache_hit={}",
+            indexes.manifest_sha256(),
+            indexes.runtime_cache_hit()
+        )),
+    );
     trace.emit("indexes.ensure_bounded.start", None, None);
     indexes.ensure_search_bounded_for_slots(allowed_slots)?;
     trace.emit("indexes.ensure_bounded.done", None, None);
