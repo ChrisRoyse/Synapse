@@ -899,8 +899,12 @@ pub struct HygieneGuardCalibrateResponse {
     pub slots: Vec<HygieneGuardSlotCalibration>,
     pub persisted: bool,
     pub guard_cf_profile_bytes: u64,
+    pub guard_cf_profile_sha256: String,
+    pub guard_cf_serving_bytes: u64,
+    pub guard_cf_serving_sha256: String,
     pub guard_cf_rows_after: u64,
     pub readback_calibrated: bool,
+    pub readback_serving_bound: bool,
 }
 
 /// Ward guard verification request for one record (#1677).
@@ -912,8 +916,6 @@ pub struct HygieneGuardVerifyParams {
     /// High-stakes verification refuses provisional/partially-calibrated profiles.
     #[serde(default)]
     pub high_stakes: Option<bool>,
-    #[serde(default)]
-    pub max_records: Option<u32>,
 }
 
 /// One slot's verdict inside a guard verification.
@@ -960,6 +962,8 @@ pub struct HygieneGuardVerifyResponse {
     pub calibration_frr: Option<f32>,
     pub calibration_confidence: Option<f32>,
     pub trusted_exemplars: u64,
+    pub guard_cf_profile_sha256: String,
+    pub guard_cf_serving_sha256: String,
     pub ledger_seq: u64,
     pub ledger_hash: String,
     pub persisted_novelty: Option<HygienePersistedNoveltyFinding>,
@@ -1188,7 +1192,7 @@ pub fn run_guard_calibrate(
         .guard_calibrate_intelligence(&spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneGuardCalibrateResponse {
-        source_of_truth: "Calyx Guard CF calibrated profile row",
+        source_of_truth: "Calyx Guard CF atomic profile + immutable trusted-exemplar serving generation",
         panel_version: report.panel_version,
         domain: report.domain,
         guard_id: report.guard_id,
@@ -1219,8 +1223,12 @@ pub fn run_guard_calibrate(
             .collect(),
         persisted: report.persisted,
         guard_cf_profile_bytes: report.guard_cf_profile_bytes as u64,
+        guard_cf_profile_sha256: report.guard_cf_profile_sha256,
+        guard_cf_serving_bytes: report.guard_cf_serving_bytes as u64,
+        guard_cf_serving_sha256: report.guard_cf_serving_sha256,
         guard_cf_rows_after: report.guard_cf_rows_after as u64,
         readback_calibrated: report.readback_calibrated,
+        readback_serving_bound: report.readback_serving_bound,
     })
 }
 
@@ -1239,7 +1247,6 @@ pub fn run_guard_verify(
         panel_version: params.panel_version,
         query_cx_id: params.query_cx_id.clone(),
         high_stakes: params.high_stakes.unwrap_or(false),
-        max_records: clamp_intelligence_hygiene_records(params.max_records),
     };
     let report = db
         .guard_verify_intelligence(&spec)
@@ -1260,7 +1267,7 @@ pub fn run_guard_verify(
         _ => None,
     };
     Ok(HygieneGuardVerifyResponse {
-        source_of_truth: "Calyx Guard profile + Ledger verdict + optional Reactive novelty row",
+        source_of_truth: "Calyx Guard profile + generation-bound serving artifact point reads + Ledger verdict + optional Reactive novelty row",
         panel_version: report.panel_version,
         query_cx_id: report.query_cx_id,
         guard_id: report.guard_id,
@@ -1287,6 +1294,8 @@ pub fn run_guard_verify(
         calibration_frr: report.calibration_frr,
         calibration_confidence: report.calibration_confidence,
         trusted_exemplars: report.trusted_exemplars as u64,
+        guard_cf_profile_sha256: report.guard_cf_profile_sha256,
+        guard_cf_serving_sha256: report.guard_cf_serving_sha256,
         ledger_seq: report.ledger_seq,
         ledger_hash: report.ledger_hash,
         persisted_novelty: persisted_novelty.map(|finding| HygienePersistedNoveltyFinding {

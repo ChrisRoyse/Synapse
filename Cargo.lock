@@ -3802,6 +3802,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "base64",
+ "bincode_reloaded",
  "calyx-anneal",
  "calyx-assay",
  "calyx-aster",

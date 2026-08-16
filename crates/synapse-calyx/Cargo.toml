@@ -27,6 +27,7 @@ calyx-cuda = ["calyx-assay/cuda", "calyx-forge/cuda", "calyx-search/cuda-pq"]
 [dependencies]
 arc-swap.workspace = true
 base64.workspace = true
+bincode.workspace = true
 calyx-assay = { workspace = true }
 calyx-anneal = { workspace = true }
 calyx-aster = { workspace = true }

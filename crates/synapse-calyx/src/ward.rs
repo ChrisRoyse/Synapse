@@ -117,9 +117,13 @@
 //!                                   SYNAPSE_DECLARED_ENUM_ADJUDICATIONS kind
 //! ```
 
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::mvcc::CfRead;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
     AnchorKind, AnchorValue, COSINE_ROUNDING_TOLERANCE, CalyxError, Clock, CxId, Panel, SlotId,
@@ -133,6 +137,7 @@ use calyx_ward::{
     calibrate, guard, validate_calibration_slots,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::{
@@ -156,6 +161,16 @@ pub const SYNAPSE_GUARD_DEFAULT_ALPHA: f32 = 0.05;
 /// floor for a leave-one-out nearest-neighbour score; it is not a statistical
 /// sufficiency claim and is not reported as one.
 pub const SYNAPSE_GUARD_MIN_GOOD_SCORES: usize = 2;
+
+/// Binary serving-artifact contract. Calibration publishes this immutable
+/// generation beside the Ward profile; verification never reconstructs it by
+/// scanning the calibration corpus.
+const SYNAPSE_GUARD_SERVING_SCHEMA: &str = "synapse.calyx.ward.serving.v1";
+
+/// A corrupt or pathologically large Guard CF row must not make the
+/// authorization path allocate without bound. This is a hard format ceiling,
+/// not a truncation target: calibration and readback fail closed above it.
+const SYNAPSE_GUARD_SERVING_MAX_BYTES: usize = 512 * 1024 * 1024;
 
 /// One slot to calibrate, with the aspect the operator asserts it carries.
 ///
@@ -300,18 +315,28 @@ pub struct SynapseCalyxGuardCalibrateReport {
     pub persisted: bool,
     /// Byte length of the Guard CF row read back after the write.
     pub guard_cf_profile_bytes: usize,
+    /// SHA-256 of the exact persisted profile bytes that bind the serving
+    /// generation.
+    pub guard_cf_profile_sha256: String,
+    /// Byte length of the immutable trusted-exemplar serving artifact.
+    pub guard_cf_serving_bytes: usize,
+    /// SHA-256 of the exact serving-artifact row read back from Guard CF.
+    pub guard_cf_serving_sha256: String,
     pub guard_cf_rows_after: usize,
     /// Proof the read-back row decodes as a calibrated profile.
     pub readback_calibrated: bool,
+    /// Proof the separately read serving row is schema-valid and bound to the
+    /// exact profile generation above.
+    pub readback_serving_bound: bool,
 }
 
-/// Bounded request for one guard verification.
+/// Request for one guard verification. Verification performs only point reads:
+/// the corpus bound belongs to calibration, never the serving path.
 #[derive(Clone, Debug)]
 pub struct SynapseCalyxGuardVerifyParams {
     pub panel_version: u32,
     pub query_cx_id: String,
     pub high_stakes: bool,
-    pub max_records: usize,
 }
 
 /// One slot's verdict inside a guard verification.
@@ -343,6 +368,9 @@ pub struct SynapseCalyxGuardVerifyReport {
     pub calibration_frr: Option<f32>,
     pub calibration_confidence: Option<f32>,
     pub trusted_exemplars: usize,
+    /// Exact immutable generation used for this decision.
+    pub guard_cf_profile_sha256: String,
+    pub guard_cf_serving_sha256: String,
     /// Physical append-only Ledger row sealing this exact verdict.
     pub ledger_seq: u64,
     pub ledger_hash: String,
@@ -406,9 +434,34 @@ fn declared_enum_verdict(kind: &AnchorKind, value: &str) -> Option<bool> {
 }
 
 /// One record's adjudicated slot vectors.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct AdjudicatedRecord {
     cx_id: CxId,
     slots: BTreeMap<u16, Vec<f32>>,
+}
+
+/// Frozen trusted-region vectors used by the online guard. The profile hash is
+/// a consistency token: thresholds and exemplars cannot be mixed across
+/// calibration generations.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub(crate) struct GuardServingArtifact {
+    schema: String,
+    panel_version: u32,
+    guard_id: String,
+    profile_sha256: String,
+    required_slots: Vec<u16>,
+    trusted_exemplars: Vec<AdjudicatedRecord>,
+}
+
+/// Process-local decoded view of one physically persisted serving generation.
+/// It is reusable only while the Guard CF's exact per-family change signal is
+/// unchanged; any Guard mutation forces a fresh point read and hash check.
+#[derive(Clone, Debug)]
+pub(crate) struct GuardServingMemo {
+    pub(crate) profile_sha256: String,
+    pub(crate) artifact_sha256: String,
+    pub(crate) guard_cf_signal: (u64, u64),
+    pub(crate) artifact: Arc<GuardServingArtifact>,
 }
 
 /// The adjudicated corpus split, with every excluded record counted.
@@ -423,6 +476,194 @@ struct AdjudicatedCorpus {
     /// Previously an uncounted `continue`, which is how the #1894 hydration
     /// defect stayed invisible: every record landed here and nothing said so.
     adjudicated_without_guarded_slots: usize,
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    crate::hex_bytes(&Sha256::digest(bytes))
+}
+
+fn encode_guard_serving_artifact(
+    artifact: &GuardServingArtifact,
+) -> Result<Vec<u8>, SynapseCalyxError> {
+    let bytes = bincode::serde::encode_to_vec(
+        artifact,
+        bincode::config::standard().with_limit::<{ SYNAPSE_GUARD_SERVING_MAX_BYTES }>(),
+    )
+    .map_err(|error| {
+        guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_ENCODE_FAILED",
+            format!("encode the immutable Ward serving artifact: {error}"),
+            "inspect the trusted exemplar ids, slot dimensions, and finite-value invariants before retrying calibration",
+        )
+    })?;
+    if bytes.len() > SYNAPSE_GUARD_SERVING_MAX_BYTES {
+        return Err(guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_TOO_LARGE",
+            format!(
+                "encoded Ward serving artifact is {} bytes, above the hard {}-byte format ceiling",
+                bytes.len(),
+                SYNAPSE_GUARD_SERVING_MAX_BYTES
+            ),
+            "reduce the explicitly requested calibration corpus or guard-slot dimensionality, then recalibrate; the artifact is never truncated",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn decode_guard_serving_artifact(
+    bytes: &[u8],
+    profile: &GuardProfile,
+    profile_sha256: &str,
+) -> Result<GuardServingArtifact, SynapseCalyxError> {
+    if bytes.is_empty() || bytes.len() > SYNAPSE_GUARD_SERVING_MAX_BYTES {
+        return Err(guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_SIZE_INVALID",
+            format!(
+                "Ward serving artifact length {} is outside 1..={SYNAPSE_GUARD_SERVING_MAX_BYTES}",
+                bytes.len()
+            ),
+            "recalibrate the guard to atomically republish a bounded serving artifact",
+        ));
+    }
+    let (artifact, consumed) = bincode::serde::decode_from_slice::<GuardServingArtifact, _>(
+        bytes,
+        bincode::config::standard().with_limit::<{ SYNAPSE_GUARD_SERVING_MAX_BYTES }>(),
+    )
+    .map_err(|error| {
+        guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_DECODE_FAILED",
+            format!("decode the persisted Ward serving artifact: {error}"),
+            "the Guard CF serving row is corrupt or uses an unsupported schema; recalibrate before verification",
+        )
+    })?;
+    if consumed != bytes.len() {
+        return Err(guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_TRAILING_BYTES",
+            format!(
+                "Ward serving decoder consumed {consumed} of {} persisted bytes",
+                bytes.len()
+            ),
+            "recalibrate the guard; a serving row with unaccounted bytes is never trusted",
+        ));
+    }
+    validate_guard_serving_artifact(&artifact, profile, profile_sha256)?;
+    Ok(artifact)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_guard_serving_artifact(
+    artifact: &GuardServingArtifact,
+    profile: &GuardProfile,
+    profile_sha256: &str,
+) -> Result<(), SynapseCalyxError> {
+    let expected_slots = profile
+        .required_slots
+        .iter()
+        .map(|slot| slot.get())
+        .collect::<Vec<_>>();
+    if artifact.schema != SYNAPSE_GUARD_SERVING_SCHEMA
+        || artifact.panel_version != profile.panel_version
+        || artifact.guard_id != profile.guard_id.to_string()
+        || artifact.profile_sha256 != profile_sha256
+        || artifact.required_slots != expected_slots
+    {
+        return Err(guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_GENERATION_MISMATCH",
+            format!(
+                "Ward serving artifact is not bound to profile generation: schema={:?}, panel={}, guard_id={}, profile_sha256={}, required_slots={:?}; expected schema={SYNAPSE_GUARD_SERVING_SCHEMA:?}, panel={}, guard_id={}, profile_sha256={profile_sha256}, required_slots={expected_slots:?}",
+                artifact.schema,
+                artifact.panel_version,
+                artifact.guard_id,
+                artifact.profile_sha256,
+                artifact.required_slots,
+                profile.panel_version,
+                profile.guard_id,
+            ),
+            "recalibrate the guard; thresholds and trusted vectors from different generations are never combined",
+        ));
+    }
+    if artifact.trusted_exemplars.is_empty() {
+        return Err(guard_error(
+            "SYNAPSE_CALYX_GUARD_SERVING_EMPTY",
+            "Ward serving artifact contains no trusted exemplar".to_owned(),
+            "attach grounded good outcomes and recalibrate the guard",
+        ));
+    }
+
+    let required = expected_slots.iter().copied().collect::<BTreeSet<_>>();
+    let mut ids = BTreeSet::new();
+    let mut dimensions = BTreeMap::<u16, usize>::new();
+    let mut coverage = BTreeMap::<u16, usize>::new();
+    for record in &artifact.trusted_exemplars {
+        if !ids.insert(record.cx_id) {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_SERVING_DUPLICATE_EXEMPLAR",
+                format!("trusted exemplar {} appears more than once", record.cx_id),
+                "recalibrate from the canonical panel membership generation; duplicate identities are never scored twice",
+            ));
+        }
+        if record.slots.is_empty() {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_SERVING_EXEMPLAR_EMPTY",
+                format!("trusted exemplar {} carries no guarded slots", record.cx_id),
+                "recalibrate from hydrated constellations that carry at least one required dense slot",
+            ));
+        }
+        for (slot, vector) in &record.slots {
+            if !required.contains(slot) {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_SERVING_SLOT_UNDECLARED",
+                    format!(
+                        "trusted exemplar {} carries slot {slot}, absent from profile required_slots {expected_slots:?}",
+                        record.cx_id
+                    ),
+                    "recalibrate the exact profile and serving artifact together",
+                ));
+            }
+            if vector.is_empty() || vector.iter().any(|value| !value.is_finite()) {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_SERVING_VECTOR_INVALID",
+                    format!(
+                        "trusted exemplar {} slot {slot} has dimension {} or a non-finite component",
+                        record.cx_id,
+                        vector.len()
+                    ),
+                    "repair the source lens/vector invariant and recalibrate; invalid vectors are never treated as absence or zero",
+                ));
+            }
+            match dimensions.get(slot) {
+                Some(dimension) if *dimension != vector.len() => {
+                    return Err(guard_error(
+                        "SYNAPSE_CALYX_GUARD_SERVING_DIMENSION_MISMATCH",
+                        format!(
+                            "trusted exemplar {} slot {slot} dimension {} differs from generation dimension {dimension}",
+                            record.cx_id,
+                            vector.len()
+                        ),
+                        "repair the frozen lens generation and recalibrate; mixed dimensions fail closed",
+                    ));
+                }
+                None => {
+                    dimensions.insert(*slot, vector.len());
+                }
+                Some(_) => {}
+            }
+            *coverage.entry(*slot).or_default() += 1;
+        }
+    }
+    for slot in expected_slots {
+        let count = coverage.get(&slot).copied().unwrap_or_default();
+        if count < SYNAPSE_GUARD_MIN_GOOD_SCORES {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_SERVING_SLOT_UNDERSUPPORTED",
+                format!(
+                    "required slot {slot} has {count} trusted exemplar(s), below the serving minimum {SYNAPSE_GUARD_MIN_GOOD_SCORES}"
+                ),
+                "attach more grounded good records carrying this slot and recalibrate",
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl SynapseCalyxVault {
@@ -676,7 +917,14 @@ impl SynapseCalyxVault {
             });
         }
 
-        let (guard_cf_profile_bytes, readback_calibrated) = if params.persist {
+        let (
+            guard_cf_profile_bytes,
+            guard_cf_profile_sha256,
+            guard_cf_serving_bytes,
+            guard_cf_serving_sha256,
+            readback_calibrated,
+            readback_serving_bound,
+        ) = if params.persist {
             let encoded = serde_json::to_vec(&profile).map_err(|error| {
                 guard_error(
                     "SYNAPSE_CALYX_GUARD_PROFILE_ENCODE_FAILED",
@@ -684,26 +932,77 @@ impl SynapseCalyxVault {
                     "inspect the profile fields before retrying the calibration",
                 )
             })?;
+            let profile_sha256 = sha256_hex(&encoded);
+            let serving = GuardServingArtifact {
+                schema: SYNAPSE_GUARD_SERVING_SCHEMA.to_owned(),
+                panel_version: profile.panel_version,
+                guard_id: profile.guard_id.to_string(),
+                profile_sha256: profile_sha256.clone(),
+                required_slots: profile
+                    .required_slots
+                    .iter()
+                    .map(|slot| slot.get())
+                    .collect(),
+                trusted_exemplars: corpus.good.clone(),
+            };
+            validate_guard_serving_artifact(&serving, &profile, &profile_sha256)?;
+            let serving_encoded = encode_guard_serving_artifact(&serving)?;
+            let serving_sha256 = sha256_hex(&serving_encoded);
             // The panel-keyed row is the source of truth. The constant
             // `profile\0default` key is a *mirror*, written only when this panel
             // is the one `calyx-search` is actually serving, so that reader can
             // never load a profile calibrated for a different panel (#1919).
             let panel_key = Self::guard_profile_key(params.panel_version);
-            let mut writes = vec![SynapseCalyxCfWrite {
-                cf: ColumnFamily::Guard,
-                key: panel_key.clone(),
-                value: encoded.clone(),
-            }];
+            let serving_key = Self::guard_serving_key(params.panel_version);
+            let mut writes = vec![
+                SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Guard,
+                    key: panel_key.clone(),
+                    value: encoded.clone(),
+                },
+                SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Guard,
+                    key: serving_key.clone(),
+                    value: serving_encoded.clone(),
+                },
+            ];
             if self.is_durable_active_panel(params.panel_version) {
                 writes.push(SynapseCalyxCfWrite {
                     cf: ColumnFamily::Guard,
                     key: SYNAPSE_GUARD_DEFAULT_PROFILE_KEY.to_vec(),
-                    value: encoded,
+                    value: encoded.clone(),
                 });
             }
+            // One Aster group commit publishes profile, exact serving
+            // generation, and optional active-panel mirror together. There is
+            // no interval in which a new profile can name absent exemplars.
             self.write_cf_batch(writes)?;
             self.flush()?;
-            let Some(row) = self.read_cf_latest(ColumnFamily::Guard, &panel_key)? else {
+            let mut readback = self.read_cf_batch_latest(&[
+                CfRead::new(ColumnFamily::Guard, panel_key),
+                CfRead::new(ColumnFamily::Guard, serving_key),
+            ])?;
+            if readback.len() != 2 {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_GENERATION_READBACK_COUNT_MISMATCH",
+                    format!(
+                        "atomic Guard generation readback returned {} rows for 2 requested keys",
+                        readback.len()
+                    ),
+                    "inspect the Aster atomic batch point-read path; calibration is not reported persisted",
+                ));
+            }
+            let serving_row = readback.pop().flatten().ok_or_else(|| {
+                guard_error(
+                    "SYNAPSE_CALYX_GUARD_SERVING_READBACK_MISSING",
+                    format!(
+                        "the trusted-exemplar serving row for guard {} is absent immediately after its atomic publication",
+                        profile.guard_id
+                    ),
+                    "inspect the Aster Guard CF group commit; verification cannot serve this profile",
+                )
+            })?;
+            let Some(row) = readback.pop().flatten() else {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_PROFILE_READBACK_MISSING",
                     format!(
@@ -720,12 +1019,57 @@ impl SynapseCalyxVault {
                     "the persisted row is not a GuardProfile the guarded-search consumer can load; inspect the codec",
                 )
             })?;
+            let readback_profile_sha256 = sha256_hex(&row);
+            if row != encoded || readback_profile_sha256 != profile_sha256 {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_PROFILE_READBACK_MISMATCH",
+                    format!(
+                        "flushed Guard profile readback hash {readback_profile_sha256} differs from published hash {profile_sha256}"
+                    ),
+                    "inspect the Aster group-commit and Guard CF point-read paths; calibration is not reported persisted",
+                ));
+            }
+            let readback_serving_sha256 = sha256_hex(&serving_row);
+            if serving_row != serving_encoded || readback_serving_sha256 != serving_sha256 {
+                return Err(guard_error(
+                    "SYNAPSE_CALYX_GUARD_SERVING_READBACK_MISMATCH",
+                    format!(
+                        "flushed serving-artifact readback hash {readback_serving_sha256} differs from published hash {serving_sha256}"
+                    ),
+                    "inspect the Aster group-commit and Guard CF point-read paths; the generation is never served",
+                ));
+            }
+            let decoded_serving = Arc::new(decode_guard_serving_artifact(
+                &serving_row,
+                &decoded,
+                &readback_profile_sha256,
+            )?);
+            let readback_calibrated =
+                decoded.is_calibrated() && decoded.guard_id == profile.guard_id;
+            let readback_serving_bound = decoded_serving.guard_id == decoded.guard_id.to_string()
+                && decoded_serving.profile_sha256 == readback_profile_sha256;
+            let memo = GuardServingMemo {
+                profile_sha256: readback_profile_sha256.clone(),
+                artifact_sha256: readback_serving_sha256.clone(),
+                guard_cf_signal: self.cf_change_signal(ColumnFamily::Guard),
+                artifact: decoded_serving,
+            };
+            let mut serving_memo = match self.guard_serving_memo.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *serving_memo = Some(memo);
+            drop(serving_memo);
             (
                 row.len(),
-                decoded.is_calibrated() && decoded.guard_id == profile.guard_id,
+                readback_profile_sha256,
+                serving_row.len(),
+                readback_serving_sha256,
+                readback_calibrated,
+                readback_serving_bound,
             )
         } else {
-            (0, false)
+            (0, String::new(), 0, String::new(), false, false)
         };
         let guard_cf_rows_after = self
             .count_cf_latest_bounded(ColumnFamily::Guard)?
@@ -754,8 +1098,12 @@ impl SynapseCalyxVault {
             slots,
             persisted: params.persist,
             guard_cf_profile_bytes,
+            guard_cf_profile_sha256,
+            guard_cf_serving_bytes,
+            guard_cf_serving_sha256,
             guard_cf_rows_after,
             readback_calibrated,
+            readback_serving_bound,
         })
     }
 
@@ -775,26 +1123,47 @@ impl SynapseCalyxVault {
     ) -> Result<SynapseCalyxGuardVerifyReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("guard_verify");
         let query_cx = crate::parse_cx_id(&params.query_cx_id)?;
-        // Read the profile calibrated for *this* panel. The legacy constant key
-        // is consulted only as a fallback, so a profile persisted before #1919
-        // keyed the CF by panel still verifies; its `panel_version` is checked
-        // below either way, so the fallback can never apply the wrong profile.
+        // Read the profile calibrated for *this* panel. Legacy profiles without
+        // an exact panel key and a generation-bound serving artifact fail
+        // closed and must be recalibrated; verification never falls back to a
+        // default row or reconstructs trusted state from a corpus scan.
         let panel_key = Self::guard_profile_key(params.panel_version);
-        let row = match self.read_cf_latest(ColumnFamily::Guard, &panel_key)? {
-            Some(row) => row,
-            None => self
-                .read_cf_latest(ColumnFamily::Guard, SYNAPSE_GUARD_DEFAULT_PROFILE_KEY)?
-                .ok_or_else(|| {
-                    guard_error(
-                        calyx_ward::CALYX_GUARD_PROVISIONAL,
-                        format!(
-                            "no calibrated Ward guard profile is persisted for panel {}: neither the panel-keyed Guard CF row nor the legacy `profile\\0default` row is present",
-                            params.panel_version
-                        ),
-                        "run hygiene operation=guard_calibrate for this panel; guarded search and guard verification both fail closed rather than guess a tau",
-                    )
-                })?,
-        };
+        let serving_key = Self::guard_serving_key(params.panel_version);
+        let mut generation = self.read_cf_batch_latest(&[
+            CfRead::new(ColumnFamily::Guard, panel_key),
+            CfRead::new(ColumnFamily::Guard, serving_key),
+        ])?;
+        if generation.len() != 2 {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_GENERATION_READ_COUNT_MISMATCH",
+                format!(
+                    "atomic Guard generation point-read returned {} rows for 2 requested keys",
+                    generation.len()
+                ),
+                "inspect the Aster atomic batch point-read path; no verdict is released",
+            ));
+        }
+        let serving_row = generation.pop().flatten().ok_or_else(|| {
+            guard_error(
+                "SYNAPSE_CALYX_GUARD_SERVING_MISSING",
+                format!(
+                    "calibrated Ward panel {} has no immutable trusted-exemplar serving row",
+                    params.panel_version
+                ),
+                "recalibrate this panel with the current runtime; verification never reconstructs or falls back to a corpus scan",
+            )
+        })?;
+        let row = generation.pop().flatten().ok_or_else(|| {
+            guard_error(
+                calyx_ward::CALYX_GUARD_PROVISIONAL,
+                format!(
+                    "no calibrated Ward guard profile is persisted at the exact panel-keyed Guard CF row for panel {}",
+                    params.panel_version
+                ),
+                "run hygiene operation=guard_calibrate for this panel; verification never consults a legacy/default profile",
+            )
+        })?;
+        let profile_sha256 = sha256_hex(&row);
         let profile: GuardProfile = serde_json::from_slice(&row).map_err(|error| {
             guard_error(
                 calyx_ward::CALYX_GUARD_PROVISIONAL,
@@ -820,34 +1189,15 @@ impl SynapseCalyxVault {
             ));
         }
 
-        let slot_specs: Vec<SynapseCalyxGuardSlotSpec> = profile
-            .required_slots
-            .iter()
-            .map(|slot| SynapseCalyxGuardSlotSpec {
-                slot: slot.get(),
-                // Aspect is irrelevant to verification (only the corpus split
-                // and the dense vectors are used); Content is the neutral
-                // placeholder and is never persisted from this path.
-                aspect: SynapseCalyxGuardAspect::Content,
-            })
-            .collect();
-        let scan = SynapseCalyxGuardCalibrateParams {
-            panel_version: params.panel_version,
-            slots: slot_specs,
-            domain: profile.domain.clone(),
-            alpha: SYNAPSE_GUARD_DEFAULT_ALPHA,
-            target_far: None,
-            max_records: params.max_records,
-            persist: false,
-            novelty_action: profile.novelty_action.clone(),
-            // Verification never validates slots against a panel definition —
-            // the required slots come from the persisted profile, which was
-            // already validated at calibration time. Only the corpus scan and
-            // the record's dense vectors are used from here.
-            calibration_panel: None,
-        };
-        let corpus = self.collect_adjudicated_corpus(&scan)?;
-        let query = self.load_record_slots(params.panel_version, query_cx, &scan)?;
+        let serving_sha256 = sha256_hex(&serving_row);
+        let (serving, serving_sha256) = self.load_guard_serving_generation(
+            &profile,
+            &profile_sha256,
+            &serving_row,
+            &serving_sha256,
+        )?;
+        let query =
+            self.load_record_slots(params.panel_version, query_cx, &profile.required_slots)?;
 
         let mut produced = BTreeMap::new();
         let mut matched = BTreeMap::new();
@@ -864,7 +1214,7 @@ impl SynapseCalyxVault {
                     "supply a record that carries every slot the profile requires; a missing required slot is never treated as a pass",
                 ));
             };
-            let Some((exemplar, _)) = best_match(query_vec, &corpus.good, raw) else {
+            let Some((exemplar, _)) = best_match(query_vec, &serving.trusted_exemplars, raw) else {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_NO_TRUSTED_EXEMPLAR",
                     format!(
@@ -874,12 +1224,12 @@ impl SynapseCalyxVault {
                     "anchor in-region records with AnchorValue::Bool(true) and embed the guarded slots before verifying",
                 ));
             };
-            let exemplar_vec = corpus.good[exemplar]
+            let exemplar_vec = serving.trusted_exemplars[exemplar]
                 .slots
                 .get(&raw)
                 .cloned()
                 .unwrap_or_default();
-            matched_ids.insert(raw, corpus.good[exemplar].cx_id.to_string());
+            matched_ids.insert(raw, serving.trusted_exemplars[exemplar].cx_id.to_string());
             produced.insert(*slot, query_vec.clone());
             matched.insert(*slot, exemplar_vec);
         }
@@ -1012,7 +1362,9 @@ impl SynapseCalyxVault {
             calibration_far: profile.calibration.as_ref().map(|meta| meta.far),
             calibration_frr: profile.calibration.as_ref().map(|meta| meta.frr),
             calibration_confidence: profile.calibration.as_ref().map(|meta| meta.confidence),
-            trusted_exemplars: corpus.good.len(),
+            trusted_exemplars: serving.trusted_exemplars.len(),
+            guard_cf_profile_sha256: profile_sha256,
+            guard_cf_serving_sha256: serving_sha256,
             ledger_seq: ledger_ref.seq,
             ledger_hash: crate::hex_bytes(&ledger_ref.hash),
         })
@@ -1111,6 +1463,61 @@ impl SynapseCalyxVault {
         key.extend_from_slice(b"profile\0panel\0");
         key.extend_from_slice(&panel_version.to_be_bytes());
         key
+    }
+
+    /// Guard CF key of the immutable trusted-exemplar generation currently
+    /// served for one panel. Profile and artifact share one atomic commit/read
+    /// snapshot, so a stable key avoids retaining an unbounded large row per
+    /// recalibration while the embedded profile hash still binds the contents.
+    #[must_use]
+    fn guard_serving_key(panel_version: u32) -> Vec<u8> {
+        let mut key = Vec::with_capacity(15 + std::mem::size_of::<u32>());
+        key.extend_from_slice(b"serving\0panel\0");
+        key.extend_from_slice(&panel_version.to_be_bytes());
+        key
+    }
+
+    /// Point-reads and validates the exact serving generation named by the
+    /// profile, or reuses the decoded generation while the Guard CF's exact
+    /// change signal proves no physical mutation occurred.
+    fn load_guard_serving_generation(
+        &self,
+        profile: &GuardProfile,
+        profile_sha256: &str,
+        bytes: &[u8],
+        artifact_sha256: &str,
+    ) -> Result<(Arc<GuardServingArtifact>, String), SynapseCalyxError> {
+        let signal = self.cf_change_signal(ColumnFamily::Guard);
+        let memo = match self.guard_serving_memo.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(memo) = memo
+            && memo.profile_sha256 == profile_sha256
+            && memo.artifact_sha256 == artifact_sha256
+            && memo.guard_cf_signal == signal
+        {
+            return Ok((memo.artifact, memo.artifact_sha256));
+        }
+        let artifact = Arc::new(decode_guard_serving_artifact(
+            bytes,
+            profile,
+            profile_sha256,
+        )?);
+        let readback_signal = self.cf_change_signal(ColumnFamily::Guard);
+        let replacement = GuardServingMemo {
+            profile_sha256: profile_sha256.to_owned(),
+            artifact_sha256: artifact_sha256.to_owned(),
+            guard_cf_signal: readback_signal,
+            artifact: Arc::clone(&artifact),
+        };
+        let mut memo = match self.guard_serving_memo.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *memo = Some(replacement);
+        drop(memo);
+        Ok((artifact, artifact_sha256.to_owned()))
     }
 
     /// True when `panel_version` is the vault's durable active panel.
@@ -1272,7 +1679,7 @@ impl SynapseCalyxVault {
         &self,
         panel_version: u32,
         cx_id: CxId,
-        params: &SynapseCalyxGuardCalibrateParams,
+        required_slots: &[SlotId],
     ) -> Result<BTreeMap<u16, Vec<f32>>, SynapseCalyxError> {
         self.with_panel_read_snapshot(
             panel_version,
@@ -1290,13 +1697,14 @@ impl SynapseCalyxVault {
                     ));
                 }
                 let mut slots = BTreeMap::new();
-                for spec in &params.slots {
+                for slot in required_slots {
+                    let raw = slot.get();
                     if let Some(vector) = constellation
                         .slots
-                        .get(&SlotId::new(spec.slot))
+                        .get(slot)
                         .and_then(guard_dense_vector)
                     {
-                        slots.insert(spec.slot, vector);
+                        slots.insert(raw, vector);
                     }
                 }
                 Ok(slots)

@@ -3340,6 +3340,10 @@ pub struct SynapseCalyxVault {
     /// they were measured at, so a repeat count can be *proved* redundant
     /// (#2114, sharpened by #2139).
     cf_count_memo: std::sync::Mutex<BTreeMap<ColumnFamily, MemoizedCfCount>>,
+    /// Decoded immutable Ward serving generation. Reuse is licensed only by
+    /// the Guard CF's exact `(last_commit_seq, out_of_band_epoch)` signal and
+    /// the profile hash; see `ward::GuardServingMemo` (#2124).
+    guard_serving_memo: std::sync::Mutex<Option<ward::GuardServingMemo>>,
 }
 
 /// One physical CF row count, the walk that produced it, and the bookkeeping
@@ -4623,6 +4627,7 @@ impl SynapseCalyxVault {
             open_mode,
             lineage,
             cf_count_memo: std::sync::Mutex::default(),
+            guard_serving_memo: std::sync::Mutex::default(),
         };
         opened.initialize_anneal_tuning()?;
         let math_status = opened.math_runtime.status_snapshot();
@@ -8797,6 +8802,7 @@ impl SynapseCalyxVault {
             open_mode: _,
             lineage,
             cf_count_memo: _,
+            guard_serving_memo: _,
         } = self;
         let close_started = std::time::Instant::now();
         let vault_dir = config.vault_dir.clone();

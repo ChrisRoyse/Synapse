@@ -636,7 +636,6 @@ fn oracle_preflight(
             panel_version: synapse_storage::SYN_ACTION_PANEL_VERSION,
             query_cx_id: candidate_cx_id.clone(),
             high_stakes: Some(false),
-            max_records: None,
         },
     ) {
         Ok(report) => {

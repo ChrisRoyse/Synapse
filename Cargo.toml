@@ -72,6 +72,7 @@ anyhow = "1.0.103"
 async-trait = "0.1.89"
 arboard = { version = "3.6.1", default-features = false }
 base64 = "0.22.1"
+bincode = { package = "bincode_reloaded", version = "3.1.6", features = ["serde"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 tracing-appender = "0.2.5"
