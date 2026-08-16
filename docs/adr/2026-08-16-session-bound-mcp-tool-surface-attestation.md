@@ -26,6 +26,7 @@ The MCP 2026-07-28 revision removes protocol-level sessions. This decision delib
 9. Profile surface changes continue to emit `notifications/tools/list_changed`. A client that attempts a call before rediscovery receives the stale refusal and forced session reinitialization.
 10. Session teardown deletes the attestation and separately reads its absence. Cleanup failure is part of the session-continuity cleanup report and prevents a clean teardown verdict.
 11. Unscoped stdio/admin calls retain their existing behavior because they have no Streamable HTTP session identity. This is an explicit protocol boundary, not a fallback for failed session attestation.
+12. Readers accept the previously shipped schema-v1 bytes without rewriting them: the legacy `listed_at_unix_ms` field is decoded as `bound_at_unix_ms`, and its absent binding source is deterministically interpreted as `client_tools_list`. Validation still requires schema v1's exact client-list semantics. All new writes remain schema v2. This is a read migration, not permissive normalization of malformed state.
 
 ## Consequences
 

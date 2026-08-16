@@ -28,6 +28,7 @@ const SESSION_TOOL_SURFACE_ATTESTATION_PREFIX: &str = "mcp/tool-surface-attestat
 const SESSION_TOOL_SURFACE_ATTESTATION_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-surface-attestation/v1/<session_id> + live sanitized tools/list + MCP session registry";
 const SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND: &str = "mcp_session_tool_surface_attestation";
 const SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION: u32 = 2;
+const SESSION_TOOL_SURFACE_ATTESTATION_LEGACY_SCHEMA_VERSION: u32 = 1;
 const SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST: &str = "client_tools_list";
 const SESSION_TOOL_SURFACE_BINDING_SERVER_CALL: &str = "server_first_tool_call";
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
@@ -4170,8 +4171,10 @@ pub(crate) struct SessionToolSurfaceAttestation {
     /// stronger observation when it occurs; `server_first_tool_call` records
     /// the standards-compliant boundary where the server binds and verifies
     /// its exact current surface before admitting the first call.
-    pub binding_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_source: Option<String>,
     pub request_observed_at_unix_ms: u64,
+    #[serde(alias = "listed_at_unix_ms")]
     pub bound_at_unix_ms: u64,
     pub tool_count: usize,
     pub tool_surface_sha256: String,
@@ -5075,7 +5078,7 @@ impl SynapseService {
             client_version: registry.client_version.clone(),
             protocol_version: registry.protocol_version.clone(),
             agent_kind: registry.agent_kind.clone(),
-            binding_source: binding_source.to_owned(),
+            binding_source: Some(binding_source.to_owned()),
             request_observed_at_unix_ms: registry.last_seen_unix_ms,
             bound_at_unix_ms: unix_ms_now().max(registry.last_seen_unix_ms),
             tool_count: fingerprint.names.len(),
@@ -6935,7 +6938,25 @@ fn validate_session_tool_surface_attestation_record(
             .tool_surface_sha256
             .bytes()
             .all(|byte| byte.is_ascii_hexdigit());
-    let valid = record.schema_version == SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION
+    let supported_schema = matches!(
+        record.schema_version,
+        SESSION_TOOL_SURFACE_ATTESTATION_LEGACY_SCHEMA_VERSION
+            | SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION
+    );
+    let binding_matches_schema = match record.schema_version {
+        SESSION_TOOL_SURFACE_ATTESTATION_LEGACY_SCHEMA_VERSION => record.binding_source.is_none(),
+        SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION => {
+            record.binding_source.as_deref().is_some_and(|source| {
+                matches!(
+                    source,
+                    SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST
+                        | SESSION_TOOL_SURFACE_BINDING_SERVER_CALL
+                )
+            })
+        }
+        _ => false,
+    };
+    let valid = supported_schema
         && record.row_kind == SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND
         && record.session_id == session_id
         && !record.transport.trim().is_empty()
@@ -6952,10 +6973,7 @@ fn validate_session_tool_surface_attestation_record(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         && !record.agent_kind.trim().is_empty()
-        && matches!(
-            record.binding_source.as_str(),
-            SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST | SESSION_TOOL_SURFACE_BINDING_SERVER_CALL
-        )
+        && binding_matches_schema
         && record.request_observed_at_unix_ms != 0
         && record.bound_at_unix_ms >= record.request_observed_at_unix_ms
         && record.tool_count != 0
@@ -6970,8 +6988,9 @@ fn validate_session_tool_surface_attestation_record(
         error_codes::STORAGE_CORRUPTED,
         session_id,
         format!(
-            "invalid tool-surface binding row: schema_version={} row_kind={:?} row_session_id={:?} transport={:?} client_name={:?} client_version={:?} protocol_version={:?} agent_kind={:?} binding_source={:?} request_observed_at_unix_ms={} bound_at_unix_ms={} tool_count={} tool_names_len={} names_strictly_sorted={} hash_is_sha256={}",
+            "invalid tool-surface binding row: schema_version={} supported_schema={} row_kind={:?} row_session_id={:?} transport={:?} client_name={:?} client_version={:?} protocol_version={:?} agent_kind={:?} binding_source={:?} binding_matches_schema={} request_observed_at_unix_ms={} bound_at_unix_ms={} tool_count={} tool_names_len={} names_strictly_sorted={} hash_is_sha256={}",
             record.schema_version,
+            supported_schema,
             record.row_kind,
             record.session_id,
             record.transport,
@@ -6980,6 +6999,7 @@ fn validate_session_tool_surface_attestation_record(
             record.protocol_version,
             record.agent_kind,
             record.binding_source,
+            binding_matches_schema,
             record.request_observed_at_unix_ms,
             record.bound_at_unix_ms,
             record.tool_count,
