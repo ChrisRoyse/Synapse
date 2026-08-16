@@ -27,7 +27,9 @@ const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
 const SESSION_TOOL_SURFACE_ATTESTATION_PREFIX: &str = "mcp/tool-surface-attestation/v1/";
 const SESSION_TOOL_SURFACE_ATTESTATION_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-surface-attestation/v1/<session_id> + live sanitized tools/list + MCP session registry";
 const SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND: &str = "mcp_session_tool_surface_attestation";
-const SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
+const SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION: u32 = 2;
+const SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST: &str = "client_tools_list";
+const SESSION_TOOL_SURFACE_BINDING_SERVER_CALL: &str = "server_first_tool_call";
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
 /// #1559: source of truth for the runtime reality-write opt-in overlay.
 const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
@@ -4161,8 +4163,16 @@ pub(crate) struct SessionToolSurfaceAttestation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol_version: Option<String>,
     pub agent_kind: String,
+    /// Physical event that bound this exact sanitized surface to the session.
+    ///
+    /// MCP does not require a client to repeat discovery after every
+    /// Streamable-HTTP session initialization. `client_tools_list` records the
+    /// stronger observation when it occurs; `server_first_tool_call` records
+    /// the standards-compliant boundary where the server binds and verifies
+    /// its exact current surface before admitting the first call.
+    pub binding_source: String,
     pub request_observed_at_unix_ms: u64,
-    pub listed_at_unix_ms: u64,
+    pub bound_at_unix_ms: u64,
     pub tool_count: usize,
     pub tool_surface_sha256: String,
     pub tool_names: Vec<String>,
@@ -5031,18 +5041,29 @@ impl SynapseService {
         &self,
         session_id: &str,
         tools: &[Tool],
+        binding_source: &str,
     ) -> Result<SessionToolSurfaceAttestationReadback, ErrorData> {
         let fingerprint = session_tool_surface_fingerprint(session_id, tools)?;
         let registry = self.session_registry_read_for_attestation(session_id)?;
-        if registry.lifecycle != "live" || registry.last_action.as_deref() != Some("tools/list") {
+        let action_matches_binding = match binding_source {
+            SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST => {
+                registry.last_action.as_deref() == Some("tools/list")
+            }
+            SESSION_TOOL_SURFACE_BINDING_SERVER_CALL => registry
+                .last_action
+                .as_deref()
+                .is_some_and(|action| action.starts_with("tools/call:")),
+            _ => false,
+        };
+        if registry.lifecycle != "live" || !action_matches_binding {
             return Err(session_tool_surface_attestation_error(
                 error_codes::HTTP_SESSION_INVALID,
                 session_id,
                 format!(
-                    "tools/list attestation requires a live initialized session whose current request is tools/list; lifecycle={} last_action={:?}",
-                    registry.lifecycle, registry.last_action
+                    "tool-surface binding requires a live initialized session whose current request matches binding_source={binding_source:?}; lifecycle={} last_action={:?}",
+                    registry.lifecycle, registry.last_action,
                 ),
-                "initialize a fresh Streamable-HTTP MCP session and issue tools/list through that session before calling any tool",
+                "initialize a fresh Streamable-HTTP MCP session and retry the same discovery or tool-call request",
             ));
         }
         let record = SessionToolSurfaceAttestation {
@@ -5054,8 +5075,9 @@ impl SynapseService {
             client_version: registry.client_version.clone(),
             protocol_version: registry.protocol_version.clone(),
             agent_kind: registry.agent_kind.clone(),
+            binding_source: binding_source.to_owned(),
             request_observed_at_unix_ms: registry.last_seen_unix_ms,
-            listed_at_unix_ms: unix_ms_now().max(registry.last_seen_unix_ms),
+            bound_at_unix_ms: unix_ms_now().max(registry.last_seen_unix_ms),
             tool_count: fingerprint.names.len(),
             tool_surface_sha256: fingerprint.sha256.clone(),
             tool_names: fingerprint.names,
@@ -5104,7 +5126,8 @@ impl SynapseService {
             tool_surface_sha256 = %record.tool_surface_sha256,
             value_sha256 = %readback.value_sha256,
             key_hex = %readback.key_hex,
-            "persisted and independently read back the exact session tools/list surface"
+            binding_source,
+            "persisted and independently read back the exact sanitized session tool surface"
         );
         Ok(readback)
     }
@@ -5307,7 +5330,32 @@ impl SynapseService {
         if !full_tool_names.iter().any(|name| name == tool_name) {
             return Ok(());
         }
-        let attestation = self.current_session_tool_surface_attestation(session_id)?;
+        let attestation = match self.current_session_tool_surface_attestation(session_id) {
+            Ok(attestation) => attestation,
+            Err(error)
+                if error
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("code"))
+                    .and_then(Value::as_str)
+                    == Some(error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING) =>
+            {
+                // The MCP discovery flow is descriptive, not a per-session
+                // admission handshake: a compliant client may retain an
+                // unchanged catalog across Streamable-HTTP reinitialization.
+                // Bind the server's immutable, schema-sanitized surface at the
+                // first actual call and require physical CF_SESSIONS readback.
+                // Corrupt or stale existing rows still fail closed below; only
+                // an honestly absent row can take this initialization path.
+                let tools = self.tools_for_session_profile(Some(session_id))?;
+                self.persist_session_tool_surface_attestation(
+                    session_id,
+                    &tools,
+                    SESSION_TOOL_SURFACE_BINDING_SERVER_CALL,
+                )?
+            }
+            Err(error) => return Err(error),
+        };
         if !attestation.matches_live_tool_surface || !attestation.subsequent_tool_call_observed {
             return Err(session_tool_surface_attestation_error(
                 error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE,
@@ -5320,7 +5368,7 @@ impl SynapseService {
                     attestation.live_tool_surface_sha256,
                     attestation.subsequent_tool_call_observed
                 ),
-                "honor notifications/tools/list_changed or reconnect, then issue tools/list in this same MCP session before retrying the tool call",
+                "honor notifications/tools/list_changed or reconnect before retrying; the server will bind only the exact current sanitized surface and never overwrite a corrupt or mismatched row",
             ));
         }
         let row = self.ensure_tool_profile_assignment(session_id)?;
@@ -6904,8 +6952,12 @@ fn validate_session_tool_surface_attestation_record(
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty())
         && !record.agent_kind.trim().is_empty()
+        && matches!(
+            record.binding_source.as_str(),
+            SESSION_TOOL_SURFACE_BINDING_CLIENT_LIST | SESSION_TOOL_SURFACE_BINDING_SERVER_CALL
+        )
         && record.request_observed_at_unix_ms != 0
-        && record.listed_at_unix_ms >= record.request_observed_at_unix_ms
+        && record.bound_at_unix_ms >= record.request_observed_at_unix_ms
         && record.tool_count != 0
         && record.tool_count == record.tool_names.len()
         && record.tool_names.iter().all(|name| !name.trim().is_empty())
@@ -6918,7 +6970,7 @@ fn validate_session_tool_surface_attestation_record(
         error_codes::STORAGE_CORRUPTED,
         session_id,
         format!(
-            "invalid tools/list attestation row: schema_version={} row_kind={:?} row_session_id={:?} transport={:?} client_name={:?} client_version={:?} protocol_version={:?} agent_kind={:?} request_observed_at_unix_ms={} listed_at_unix_ms={} tool_count={} tool_names_len={} names_strictly_sorted={} hash_is_sha256={}",
+            "invalid tool-surface binding row: schema_version={} row_kind={:?} row_session_id={:?} transport={:?} client_name={:?} client_version={:?} protocol_version={:?} agent_kind={:?} binding_source={:?} request_observed_at_unix_ms={} bound_at_unix_ms={} tool_count={} tool_names_len={} names_strictly_sorted={} hash_is_sha256={}",
             record.schema_version,
             record.row_kind,
             record.session_id,
@@ -6927,8 +6979,9 @@ fn validate_session_tool_surface_attestation_record(
             record.client_version,
             record.protocol_version,
             record.agent_kind,
+            record.binding_source,
             record.request_observed_at_unix_ms,
-            record.listed_at_unix_ms,
+            record.bound_at_unix_ms,
             record.tool_count,
             record.tool_names.len(),
             names_are_strictly_sorted,

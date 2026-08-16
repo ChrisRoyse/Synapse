@@ -355,7 +355,7 @@ impl ServerHandler for SynapseService {
             // sanitized response surface before returning it. A 2026-07-28
             // stateless transport must use a different request-scoped design;
             // this row never claims to cover that future protocol boundary.
-            self.persist_session_tool_surface_attestation(session_id, &tools)?;
+            self.persist_session_tool_surface_attestation(session_id, &tools, "client_tools_list")?;
         }
         Ok(rmcp::model::ListToolsResult {
             tools,
