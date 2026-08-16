@@ -3844,6 +3844,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "synapse-chrome-bridge"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "base64",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "subtle",
+ "synapse-action",
+ "synapse-core",
+ "sysinfo",
+ "tokio",
+ "tracing",
+ "uuid",
+ "windows",
+]
+
+[[package]]
 name = "synapse-core"
 version = "0.1.0"
 dependencies = [
@@ -3898,6 +3920,7 @@ dependencies = [
  "synapse-audio",
  "synapse-calyx",
  "synapse-capture",
+ "synapse-chrome-bridge",
  "synapse-core",
  "synapse-models",
  "synapse-perception",

@@ -2,40 +2,30 @@
 //! authenticates to it (#2099).
 //!
 //! This module is the **single** implementation of "where does the bearer token
-//! come from". It lives at the crate root rather than inside `http::auth`
-//! because the `synapse-chrome-native-host` binary also authenticates to the
-//! daemon and cannot reach `crate::http` — it composes a subset of this crate's
-//! modules by `#[path]` include. Before #2099 that binary carried its own copy
-//! of the resolution rule, and a copy is exactly the thing that can silently
-//! disagree with the daemon it is trying to talk to.
-
-// `pub(crate)` is the correct visibility in the daemon binary, where this module
-// sits beside `http`, `connect` and `local_agent`. In the native-host binary the
-// module is composed alone, so the same visibility reads as redundant to
-// clippy — the lint is about that binary's shape, not about this item's.
-#![allow(
-    clippy::redundant_pub_crate,
-    reason = "visibility is load-bearing in the daemon binary; the native-host binary composes \
-              this module alone, which is what makes the lint fire"
-)]
+//! come from". It lives in the shared Chrome bridge crate because both the
+//! daemon and `synapse-chrome-native-host` authenticate through this boundary.
+//! Before #2099 the native host carried its own copy of the resolution rule,
+//! and a copy is exactly the thing that can silently disagree with the daemon
+//! it is trying to talk to.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-pub(crate) const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
+pub const TOKEN_ENV: &str = "SYNAPSE_BEARER_TOKEN";
 const APPDATA_ENV: &str = "APPDATA";
 
 /// Which source supplied the token in force.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum TokenSource {
+pub enum TokenSource {
     File(PathBuf),
     Env,
 }
 
 impl TokenSource {
     /// Stable, operator-facing name. Never contains the token value.
-    pub(crate) const fn label(&self) -> &'static str {
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
         match *self {
             Self::File(_) => "file",
             Self::Env => "env",
@@ -45,9 +35,9 @@ impl TokenSource {
 
 /// The outcome of bearer-token resolution, with enough evidence to explain a
 /// mismatch without ever disclosing a token value.
-pub(crate) struct TokenResolution {
-    pub(crate) token: String,
-    pub(crate) source: TokenSource,
+pub struct TokenResolution {
+    pub token: String,
+    pub source: TokenSource,
     /// The machine-shared token file path that was considered. Retained even
     /// when the env var won, because "the file exists and holds a *different*
     /// token" is exactly the condition that used to surface as an opaque 401.
@@ -65,7 +55,7 @@ pub(crate) struct TokenResolution {
 ///
 /// Returns an error when neither source supplies a non-empty token, or when a
 /// source that is present cannot be read.
-pub(crate) fn load_token_value() -> anyhow::Result<String> {
+pub fn load_token_value() -> anyhow::Result<String> {
     load_token().map(|resolution| resolution.token)
 }
 
@@ -106,7 +96,7 @@ pub(crate) fn load_token_value() -> anyhow::Result<String> {
 ///
 /// Returns an error naming both consulted sources when neither supplies a
 /// non-empty token, or when a present source cannot be read.
-pub(crate) fn load_token() -> anyhow::Result<TokenResolution> {
+pub fn load_token() -> anyhow::Result<TokenResolution> {
     let file_path = token_file_path();
     let file_token = read_token_file(file_path.as_deref())?;
     let env_token = read_env_token()?;
@@ -151,7 +141,7 @@ impl TokenResolution {
     /// to be undiagnosable: every client holding the *other* token gets a bare
     /// `401 HTTP_TOKEN_INVALID`, and on a health probe that reads as a timeout
     /// rather than as an auth mismatch.
-    pub(crate) fn report(&self) {
+    pub fn report(&self) {
         let file_path = self.file_path.as_ref().map_or_else(
             || "<unresolved>".to_owned(),
             |path| path.display().to_string(),

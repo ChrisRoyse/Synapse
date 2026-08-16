@@ -1,3 +1,11 @@
+//! Shared normal-profile Chrome bridge compiled once for both shipped binaries.
+//!
+//! Keeping this high-cohesion transport/lifecycle boundary in its own crate
+//! lets stable Cargo schedule its front end independently and prevents the
+//! previous `#[path]` inclusion from compiling the same 399 KB module twice.
+
+pub mod bearer_token;
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     ffi::OsString,
@@ -222,12 +230,12 @@ pub struct ChromeDebuggerBridgeError {
 
 impl ChromeDebuggerBridgeError {
     #[must_use]
-    pub(crate) const fn code(&self) -> &'static str {
+    pub const fn code(&self) -> &'static str {
         self.code
     }
 
     #[must_use]
-    pub(crate) fn detail(&self) -> &str {
+    pub fn detail(&self) -> &str {
         &self.detail
     }
 
@@ -2121,6 +2129,7 @@ pub struct ChromeDebuggerTypeActiveElementResult {
 }
 
 /// Result of the background-safe `setFieldValue` bridge command (#1000/#717):
+///
 /// an in-page React-safe field REPLACE on the user's normal Chrome, with no
 /// debugger attach and no OS foreground. `before_value`/`after_value` are the
 /// raw in-page field values returned to the daemon for an exact Source-of-Truth
@@ -6665,6 +6674,7 @@ fn active_bridge_host_lineage_snapshot() -> Result<(Option<String>, u64), Chrome
 }
 
 /// Cancels commands which have not crossed the extension delivery boundary,
+///
 /// then waits for every delivered mutation to publish a terminal response.
 /// Transport teardown deliberately preserves delivered ownership until daemon
 /// owner-registry teardown; a replacement transport lineage cannot reconcile
@@ -7441,6 +7451,7 @@ pub async fn type_active_element(
 }
 
 /// Background-safe field REPLACE via the normal Chrome bridge (#1000/#717).
+///
 /// Resolves the target in-page by a strict CSS `selector` (exactly one
 /// editable+visible match), a normal Chrome bridge `element_id`, or the current
 /// `active_element`, replaces its value with the native prototype setter
@@ -8156,6 +8167,7 @@ pub async fn navigate_tab(
 }
 
 /// Background-intended tab activation (#1189): selects `target_id` as the
+///
 /// active tab in its own Chrome window via `chrome.tabs.update({active:true})`.
 /// Callers that promise background-safe behavior must separately read the OS
 /// foreground before/after and fail closed if Chrome becomes foreground.
@@ -8200,6 +8212,7 @@ pub async fn activate_tab(
     reason = "mirrors the MCP browser_evaluate parameters sent to the bridge, including the caller-configurable evaluate budget"
 )]
 /// Closes the extension mutation-admission gate immediately on receipt, ahead
+///
 /// of its normal command FIFO, durably records the transition, and returns its
 /// monotonic disable generation. K2 must call this before draining daemon-side
 /// delivered owners; cleanup/readback then serialize behind earlier handlers.
@@ -8236,6 +8249,7 @@ pub async fn operator_panic_cleanup(
 }
 
 /// Independent extension owner readback, serialized after every earlier
+///
 /// extension command. It may reconcile caller-timeout owners only when the
 /// same host remained active throughout; transport-loss owners deliberately
 /// remain fail-closed until daemon teardown because a replacement host is not
@@ -8264,6 +8278,7 @@ pub async fn operator_panic_readback()
 }
 
 /// Reopens extension mutation admission only when no newer disable generation
+///
 /// superseded `expected_disable_sequence` and independent owner readback is
 /// empty. The extension never recreates prior durable owners on reset.
 pub async fn operator_panic_enable_if_unchanged(
@@ -8538,6 +8553,7 @@ pub fn is_direct_http_extension_bridge_cors_preflight_request(
         .is_some_and(|method| matches!(method, "GET" | "POST" | "OPTIONS"))
 }
 
+#[must_use]
 pub fn direct_http_bridge_cors_preflight_response() -> Response {
     with_direct_http_bridge_cors_headers(StatusCode::NO_CONTENT.into_response())
 }

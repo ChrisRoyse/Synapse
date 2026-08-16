@@ -189,8 +189,14 @@ fn reclaim_mimalloc_transient_pages() {
 }
 
 mod approval_protocol;
-mod bearer_token;
-mod chrome_debugger_bridge;
+// Preserve the daemon's domain name while compiling the high-cohesion bridge
+// once as an independently schedulable workspace crate (#2216).
+use synapse_chrome_bridge as chrome_debugger_bridge;
+mod bearer_token {
+    pub(crate) use synapse_chrome_bridge::bearer_token::{
+        TokenSource, load_token, load_token_value,
+    };
+}
 mod connect;
 mod daemon_lifecycle;
 mod desktop_worker;

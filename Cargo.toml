@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/synapse-chrome-bridge",
     "crates/synapse-mcp",
     "crates/synapse-core",
     "crates/synapse-capture",
@@ -200,9 +201,11 @@ debug = false
 # target/release/synapse-mcp.exe into ~/.cargo/bin. Tuned for FAST rebuilds (the
 # iteration loop is build-the-daemon -> reinstall -> verify) while staying a
 # fully optimized binary:
-#   codegen-units = 16 parallel codegen across all cores. fat + cgu=1 forced the
-#                      whole synapse-mcp crate through ONE thread at the end,
-#                      idling 28+ of 32 threads for the long tail of every build.
+#   codegen-units = 16 permits parallel LLVM backend work. It does not parallelize
+#                      stable rustc's largely serial front end; high-cohesion
+#                      ownership seams (for example synapse-chrome-bridge) are
+#                      separate crates so Cargo can schedule those front ends
+#                      independently and avoid recompiling them for MCP-only edits.
 #   debug = false      we strip(true) anyway, so don't spend time emitting a PDB.
 # Day-to-day, iterate with `cargo build` (dev, ~45s incremental) or `cargo check`.
 #

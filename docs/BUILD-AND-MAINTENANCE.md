@@ -12,6 +12,7 @@ system disk again.
 | Dev incremental compilation | `Cargo.toml [profile.dev]` | Rebuilds only changed codegen units during the edit loop. |
 | Dependency debuginfo off | `Cargo.toml [profile.dev.package."*"]` | Avoids large dependency debug artifacts while keeping workspace panic line tables. |
 | `jobs = 32` | user Cargo config | Uses the configured host's logical cores for local builds. |
+| Cohesive crate seams | workspace crates | Lets Cargo schedule independent stable-rustc front ends and prevents unrelated main-crate edits from recompiling large subsystems. The Chrome bridge and native-host runtime live in `synapse-chrome-bridge`; both daemon binaries consume that one compiled artifact. |
 
 Use the fast local edit loop:
 
@@ -22,6 +23,16 @@ cargo build
 
 Use `cargo build --release` only when shipping or running the optimized daemon,
 not as compile feedback during edits.
+
+`codegen-units = 16` parallelizes LLVM backend work; it does not make stable
+rustc's front end parallel. If a release timing report shows one large crate
+occupying the critical path, first locate a real high-cohesion ownership seam
+and extract that subsystem into one shared workspace crate. Do not duplicate the
+source with `#[path]`, create a second target directory, enable unstable rustc
+flags, or raise codegen units as a substitute for an architectural seam. Use
+`cargo build --release --timings` only for an explicit build investigation and
+read the generated timing artifact plus the built binary as the Sources of
+Truth.
 
 ## CUDA Build Environment
 

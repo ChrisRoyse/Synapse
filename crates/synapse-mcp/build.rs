@@ -144,10 +144,9 @@ fn verify_chrome_bridge_declared_identity(source_dir: &Path) -> Result<(), Strin
         .join("service_worker.js");
     let daemon_path = source_dir
         .join("crates")
-        .join("synapse-mcp")
+        .join("synapse-chrome-bridge")
         .join("src")
-        .join("chrome_debugger_bridge")
-        .join("mod.rs");
+        .join("lib.rs");
     rerun_if_changed(&worker_path);
     rerun_if_changed(&daemon_path);
     let worker = std::fs::read_to_string(&worker_path).map_err(|error| {

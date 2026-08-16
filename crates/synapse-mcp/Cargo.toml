@@ -94,6 +94,7 @@ synapse-audio = { version = "0.1.0", path = "../synapse-audio", features = ["cud
 synapse-calyx = { version = "0.1.0", path = "../synapse-calyx" }
 synapse-core = { version = "0.1.0", path = "../synapse-core" }
 synapse-capture = { version = "0.1.0", path = "../synapse-capture" }
+synapse-chrome-bridge = { version = "0.1.0", path = "../synapse-chrome-bridge" }
 synapse-models = { version = "0.1.0", path = "../synapse-models", features = ["cuda"] }
 synapse-perception = { version = "0.1.0", path = "../synapse-perception" }
 synapse-profiles = { version = "0.1.0", path = "../synapse-profiles" }
