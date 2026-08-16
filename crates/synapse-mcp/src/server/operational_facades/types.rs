@@ -534,6 +534,7 @@ pub struct HygieneAnnealStatusResponse {
     pub index_beamwidth: usize,
     pub index_ef_search: usize,
     pub index_alpha: f32,
+    pub index_quant_bits_by_slot: BTreeMap<u16, u8>,
     pub budget_cpu_used_fraction: f64,
     pub budget_vram_used_bytes: u64,
     pub budget_warning_code: Option<String>,
@@ -549,6 +550,11 @@ pub struct HygieneAnnealSearchProposeParams {
     pub index_beamwidth: usize,
     pub index_ef_search: usize,
     pub index_alpha: f32,
+    /// Complete candidate slot-to-PQ-bit map. Values must be 4 or 8; omit an
+    /// exact slot from the map. Supplying the complete map makes removal of a
+    /// prior quantization explicit and lets the shadow transaction own the
+    /// exact immutable generation shape it measures.
+    pub index_quant_bits_by_slot: BTreeMap<u16, u8>,
     pub description: String,
 }
 
@@ -565,6 +571,8 @@ pub struct HygieneAnnealSearchProposeResponse {
     pub incumbent_manifest_sha256: String,
     pub candidate_manifest_sha256: String,
     pub live_manifest_sha256_after: String,
+    pub candidate_index_quant_bits_by_slot: BTreeMap<u16, u8>,
+    pub live_index_quant_bits_by_slot_after: BTreeMap<u16, u8>,
     pub candidate_slot_metrics: Vec<HygieneAnnealSearchSlotMetrics>,
     pub incumbent_slot_metrics: Vec<HygieneAnnealSearchSlotMetrics>,
 }

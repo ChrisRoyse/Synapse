@@ -1173,6 +1173,7 @@ pub(super) async fn handle(
                 index_beamwidth: tuning.index_beamwidth,
                 index_ef_search: tuning.index_ef_search,
                 index_alpha: tuning.index_alpha,
+                index_quant_bits_by_slot: tuning.index_quant_bits_by_slot,
                 budget_cpu_used_fraction: anneal.budget.cpu_used_fraction,
                 budget_vram_used_bytes: anneal.budget.vram_used_bytes,
                 budget_warning_code: anneal.budget.warning_code,
@@ -1239,11 +1240,13 @@ pub(super) async fn handle(
                     )
                 })?
                 .effective_tuning;
+            let incumbent_index_quant_bits_by_slot = candidate.index_quant_bits_by_slot.clone();
             candidate.index_m_max = spec.index_m_max;
             candidate.index_ef_construction = spec.index_ef_construction;
             candidate.index_beamwidth = spec.index_beamwidth;
             candidate.index_ef_search = spec.index_ef_search;
             candidate.index_alpha = spec.index_alpha;
+            candidate.index_quant_bits_by_slot = spec.index_quant_bits_by_slot;
             let panel_version = spec.panel_version;
             let description = spec.description;
             let report = synapse_storage::maintenance::run_admitted_maintenance(
@@ -1260,6 +1263,20 @@ pub(super) async fn handle(
                     ),
                 )
             })?;
+            let promoted = matches!(
+                &report.change.outcome,
+                calyx_anneal::ChangeOutcome::Promoted(_)
+            );
+            let candidate_index_quant_bits_by_slot = report
+                .candidate_generation
+                .dense_index_config
+                .quant_bits_by_slot
+                .clone();
+            let live_index_quant_bits_by_slot_after = if promoted {
+                candidate_index_quant_bits_by_slot.clone()
+            } else {
+                incumbent_index_quant_bits_by_slot
+            };
             let (outcome, change_id) = match report.change.outcome {
                 calyx_anneal::ChangeOutcome::Promoted(id) => ("promoted".to_owned(), Some(id.0)),
                 calyx_anneal::ChangeOutcome::Reverted { change_id, .. } => {
@@ -1278,6 +1295,8 @@ pub(super) async fn handle(
                 incumbent_manifest_sha256: report.incumbent_manifest_sha256,
                 candidate_manifest_sha256: report.candidate_manifest_sha256,
                 live_manifest_sha256_after: report.live_manifest_sha256_after,
+                candidate_index_quant_bits_by_slot,
+                live_index_quant_bits_by_slot_after,
                 candidate_slot_metrics: report
                     .candidate_slot_metrics
                     .into_iter()

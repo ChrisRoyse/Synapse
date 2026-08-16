@@ -9,7 +9,7 @@ use calyx_anneal::{
 };
 use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::Freshness;
-use calyx_core::{CalyxError, SlotId, SlotVector};
+use calyx_core::{CalyxError, SlotId, SlotShape, SlotState, SlotVector};
 use calyx_ledger::{ActorId, LedgerAppender};
 use calyx_registry::VaultPanelState;
 use calyx_search::{
@@ -346,6 +346,7 @@ impl SynapseCalyxVault {
         let candidate_tuning = candidate_tuning.validate()?;
         let (prior_hash, _, incumbent_tuning) = self.read_live_tuning()?;
         ensure_index_only_candidate(&incumbent_tuning, &candidate_tuning)?;
+        validate_index_quantization_targets(panel, &candidate_tuning.index_quant_bits_by_slot)?;
         let snapshot = self
             .vault
             .pin_reader(Freshness::FreshDerived, 300_000)
@@ -1218,6 +1219,50 @@ fn ensure_index_only_candidate(
             "search-generation proposal does not change persisted dense index configuration",
             "change at least one load-bearing index build/search parameter",
         ));
+    }
+    Ok(())
+}
+
+fn validate_index_quantization_targets(
+    panel: &VaultPanelState,
+    quant_bits_by_slot: &BTreeMap<u16, u8>,
+) -> Result<(), SynapseCalyxError> {
+    for slot_id in quant_bits_by_slot.keys().copied() {
+        let slot = panel
+            .panel
+            .slots
+            .iter()
+            .find(|slot| slot.slot_id.get() == slot_id)
+            .ok_or_else(|| {
+                anneal_error(
+                    "SYNAPSE_CALYX_ANNEAL_QUANT_SLOT_UNKNOWN",
+                    format!(
+                        "search candidate selects PQ quantization for slot {slot_id}, which is not declared by panel {}",
+                        panel.panel.version
+                    ),
+                    "select only an active dense slot from the exact queryable panel contract",
+                )
+            })?;
+        if slot.state != SlotState::Active {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_QUANT_SLOT_INACTIVE",
+                format!(
+                    "search candidate selects PQ quantization for panel {} slot {slot_id}, whose lifecycle state is {:?}",
+                    panel.panel.version, slot.state
+                ),
+                "remove parked or retired slots from index_quant_bits_by_slot",
+            ));
+        }
+        if !matches!(slot.shape, SlotShape::Dense(_)) {
+            return Err(anneal_error(
+                "SYNAPSE_CALYX_ANNEAL_QUANT_SLOT_NOT_DENSE",
+                format!(
+                    "search candidate selects PQ quantization for panel {} slot {slot_id}, whose frozen shape is {:?}",
+                    panel.panel.version, slot.shape
+                ),
+                "select only active Dense slots; sparse, multi-vector, and absent lanes have separate immutable index contracts",
+            ));
+        }
     }
     Ok(())
 }
