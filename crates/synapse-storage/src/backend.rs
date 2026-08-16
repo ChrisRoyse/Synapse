@@ -1158,6 +1158,7 @@ pub trait StorageBackend: Send + Sync {
         &self,
         panel_version: u32,
         through_seq: u64,
+        mutation_through_seq: u64,
         max_rows: usize,
     ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport>;
     fn commission_search_kernels(
@@ -6281,6 +6282,7 @@ impl StorageBackend for CalyxBackend {
         &self,
         panel_version: u32,
         through_seq: u64,
+        mutation_through_seq: u64,
         max_rows: usize,
     ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport> {
         self.with_vault(
@@ -6289,7 +6291,12 @@ impl StorageBackend for CalyxBackend {
             true,
             |vault| {
                 vault
-                    .prune_panel_input_changes(panel_version, through_seq, max_rows)
+                    .prune_panel_input_changes(
+                        panel_version,
+                        through_seq,
+                        mutation_through_seq,
+                        max_rows,
+                    )
                     .map_err(|source| {
                         calyx_write_failed(
                             "calyx_loom",

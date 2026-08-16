@@ -1948,10 +1948,15 @@ impl Db {
         &self,
         panel_version: u32,
         through_seq: u64,
+        mutation_through_seq: u64,
         max_rows: usize,
     ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport> {
-        self.backend
-            .prune_panel_input_changes(panel_version, through_seq, max_rows)
+        self.backend.prune_panel_input_changes(
+            panel_version,
+            through_seq,
+            mutation_through_seq,
+            max_rows,
+        )
     }
 
     /// Runs the bounded production search-kernel commissioning suite and

@@ -1439,6 +1439,7 @@ pub struct SynapseCalyxPanelInputPruneReport {
     pub through_seq: u64,
     pub rows_deleted: usize,
     pub committed_seq: Option<u64>,
+    pub mutation_floor_seq: u64,
 }
 
 impl SynapseCalyxPanelBaseWalk {
@@ -4308,12 +4309,18 @@ impl SynapseCalyxVault {
         &self,
         panel_version: u32,
         through_seq: u64,
+        mutation_through_seq: u64,
         max_rows: usize,
     ) -> Result<SynapseCalyxPanelInputPruneReport, SynapseCalyxError> {
         crate::lowering::hot_context::assert_cold_calyx("prune_panel_input_changes");
         let report = self
             .vault
-            .prune_panel_input_changes(panel_version, through_seq, max_rows)
+            .prune_panel_input_changes(
+                panel_version,
+                through_seq,
+                mutation_through_seq,
+                max_rows,
+            )
             .map_err(|error| {
                 SynapseCalyxError::from_calyx(
                     &format!(
@@ -4327,6 +4334,7 @@ impl SynapseCalyxVault {
             through_seq: report.through_seq,
             rows_deleted: report.rows_deleted,
             committed_seq: report.committed_seq,
+            mutation_floor_seq: report.mutation_floor_seq,
         })
     }
 

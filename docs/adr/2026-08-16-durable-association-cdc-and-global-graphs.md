@@ -48,9 +48,13 @@ Primary references:
    reason bootstrap is required.
 5. A crash before bootstrap completion publishes no cursor. The next attempt's
    newer source snapshot makes older partial snapshot events irrelevant.
-6. CDC retention is acknowledgement-driven. Only rows at or below an already
-   persisted and reread cursor are tombstoned, in bounded pages, and every
-   tombstone receives an independent latest-state readback.
+6. CDC retention is acknowledgement-driven and multi-consumer. Bootstrap rows
+   occupy a separate ordered snapshot prefix and may retire at the association
+   cursor; real Base/slot mutations retire only through the minimum of the
+   association cursor and persisted search-generation base. A durable mutation
+   floor records the coverage origin and every later retirement, so a consumer
+   below it fails closed and rebases. Tombstones and floor updates share one
+   bounded commit and receive independent latest-state readback.
 7. Each changed or removed identity reconciles its complete physical XTerm
    prefix. Missing current keys are tombstoned before the cursor advances.
 8. Agreement edges persist exact `sum_agreement` and `n`. Existing vaults run
@@ -64,6 +68,11 @@ Primary references:
 10. Legacy batch-local graph rows remain historical bytes but are not an
     authoritative graph source. Consumers must follow the versioned complete
     graph reference.
+11. Persisted search reconciliation consumes the same commit-atomic mutation
+    lane rather than Aster's disposable MVCC journal. Snapshot signals are
+    excluded before identity coalescing. The first CDC publication seals its
+    pre-commit sequence as the coverage floor, preventing an upgraded vault
+    from interpreting absent pre-install history as an empty delta.
 
 ## Consequences
 
@@ -73,7 +82,7 @@ Primary references:
 - Routine agreement work is delta-proportional without sacrificing a global
   mean; the one-time migration remains independently reconstructible from
   XTerms.
-- The durable CDC log is bounded by acknowledged progress rather than either
-  growing forever or being pruned ahead of its consumer.
+- The durable CDC log is bounded by the slowest durable consumer rather than
+  either growing forever or being pruned ahead of search or association state.
 - Between-record traversal must resolve the complete graph reference on demand;
   materializing a partial neighbour batch is explicitly invalid.

@@ -40,41 +40,21 @@ pub struct PanelDeltaComposition {
     pub base_seq: u64,
     /// Pinned snapshot sequence the delta ends at (inclusive).
     pub pinned_seq: u64,
-    /// Changed `Base` keys across every panel, before scoping.
+    /// Durable mutation events scanned for this panel before identity coalescing.
     pub base_keys_scanned: usize,
-    /// Changed `Base` keys attributed to this panel.
+    /// Distinct changed identities attributed to this panel.
     pub base_keys_panel: usize,
-    /// Changed `Base` keys attributed to some other panel and excluded.
+    /// Always zero for the panel-keyed durable lane; retained for report compatibility.
     pub base_keys_other_panels: usize,
-    /// Changed `Base` keys whose visible history is entirely tombstoned.
+    /// Always zero: durable events carry their panel and identity in the key.
     pub base_keys_unattributed: usize,
-    /// Changed keys observed in each indexed slot CF.
-    ///
-    /// A slot id belongs to exactly one panel *name* (#1776) — but **not** to one
-    /// panel *version*: a new generation of the same panel reuses its slot ids,
-    /// so `cf/slot_03` holds rows from every generation of that panel. These
-    /// counts are therefore **reported, not counted** (#1905): they no longer
-    /// contribute to `changed`, so an inflated slot contribution stays visible
-    /// here without charging this generation's budget for another generation's
-    /// ingest.
+    /// Declared indexed slot CFs, each reported as zero because the durable
+    /// event already unions Base and quantized-slot causes by identity.
     pub slot_keys: BTreeMap<SlotId, usize>,
-    /// Changed slot keys with no matching key in the panel-scoped `Base` set.
-    ///
-    /// A single reported number, not three classified ones (#1935). Each such
-    /// key is one of: another generation's row (slot ids are reused across
-    /// generations of the same panel), an orphan awaiting GC, or a live row of
-    /// this generation whose slot CF was compacted more recently than `Base`.
-    /// Telling them apart costs two point reads and a `Base` decode **per key**
-    /// — ~1M of them on the agent-transcript panel, which blew the
-    /// measurement's 30 s reader lease — and none of the three changes any
-    /// decision, because slot keys do not contribute to `changed` at all
-    /// (#1905).
-    ///
-    /// The size of this number relative to `slot_keys` is still the diagnosis:
-    /// close to the whole lane means that lane was compacted after `Base`.
+    /// Always zero under commit-atomic CDC; retained for report compatibility.
     pub slot_keys_not_in_base_set: usize,
-    /// Distinct constellations to reconcile: exactly the panel-scoped `Base`
-    /// changed keys.
+    /// Distinct constellations to reconcile from the panel-scoped durable
+    /// mutation lane.
     ///
     /// Slot keys are deliberately **not** unioned in. Every live slot write is
     /// staged in the same atomic batch as its own `Base` row — see
@@ -301,8 +281,9 @@ fn merge_membership_delta(
 ///
 /// # Errors
 ///
-/// Fails closed when the MVCC changed-key history cannot prove the requested
-/// range, or when a changed key is not a well-formed `CxId`.
+/// Fails closed when the durable panel mutation log cannot prove the requested
+/// range. Bootstrap membership signals are excluded: they replay current
+/// association membership but do not mutate search content.
 pub fn measure_panel_delta<C: Clock>(
     vault: &AsterVault<C>,
     snapshot: calyx_aster::mvcc::Snapshot,
@@ -310,38 +291,35 @@ pub fn measure_panel_delta<C: Clock>(
     base_seq: u64,
     query_slots: impl IntoIterator<Item = SlotId>,
 ) -> CliResult<PanelDeltaComposition> {
-    let scoped =
-        vault.changed_base_keys_after_snapshot_for_panel(snapshot, base_seq, panel_version)?;
-    let mut changed = BTreeSet::new();
-    for key in &scoped.keys {
-        changed.insert(cx_id_from_key(key, ColumnFamily::Base)?);
-    }
+    let scoped = vault.panel_input_mutations_snapshot(
+        snapshot,
+        base_seq,
+        snapshot.seq(),
+        panel_version,
+        MAX_RECONCILED_DELTA_KEYS.saturating_add(1),
+    )?;
+    let changed = scoped
+        .changes
+        .iter()
+        .map(|change| change.cx_id)
+        .collect::<BTreeSet<_>>();
     let mut slot_keys = BTreeMap::new();
-    // Counted, never classified. `keys.len()` is free once the scan has run;
-    // deciding what each key *is* costs two point reads and a `Base` decode per
-    // key, produced only diagnostics, and could not be answered correctly from
-    // this evidence anyway (#1935).
-    let mut slot_keys_not_in_base_set = 0_usize;
+    // Commit-atomic CDC already unions Base and quantized-slot causes by
+    // identity. Keeping the declared slots in the composition preserves the
+    // panel contract while avoiding a second, disposable MVCC-history walk.
     for slot in query_slots {
-        let cf = ColumnFamily::slot(slot);
-        let keys = vault.changed_cf_keys_after_snapshot(snapshot, cf, base_seq)?;
-        slot_keys.insert(slot, keys.len());
-        for key in keys {
-            if !changed.contains(&cx_id_from_key(&key, cf)?) {
-                slot_keys_not_in_base_set += 1;
-            }
-        }
+        slot_keys.insert(slot, 0);
     }
     Ok(PanelDeltaComposition {
         panel_version,
         base_seq,
         pinned_seq: snapshot.seq(),
-        base_keys_scanned: scoped.scanned,
-        base_keys_panel: scoped.panel,
-        base_keys_other_panels: scoped.other_panels,
-        base_keys_unattributed: scoped.unattributed,
+        base_keys_scanned: scoped.events_scanned,
+        base_keys_panel: changed.len(),
+        base_keys_other_panels: 0,
+        base_keys_unattributed: 0,
         slot_keys,
-        slot_keys_not_in_base_set,
+        slot_keys_not_in_base_set: 0,
         changed,
     })
 }
@@ -688,17 +666,6 @@ pub(super) fn search_slots_reconciled(
         }
     }
     Ok(out)
-}
-
-fn cx_id_from_key(key: &[u8], cf: ColumnFamily) -> CliResult<CxId> {
-    let bytes: [u8; 16] = key.try_into().map_err(|_| {
-        CalyxError::aster_corrupt_shard(format!(
-            "changed-key journal for {} contains a non-CxId key with {} bytes",
-            cf.name(),
-            key.len()
-        ))
-    })?;
-    Ok(CxId::from_bytes(bytes))
 }
 
 fn empty_vectors() -> &'static BTreeMap<CxId, SlotVector> {

@@ -490,10 +490,26 @@ fn prune_acknowledged_weave_history(
     if through_seq == 0 {
         return Ok(());
     }
+    // Association snapshots and real content mutations share one ordered CDC
+    // stream, but search is an independent consumer. Snapshot signals can be
+    // retired at the association cursor; real mutations may be retired only
+    // once both the association cursor and the persisted search generation
+    // cover them. This is the replication-slot `restart_lsn` rule applied to
+    // the two durable consumers instead of assuming the faster one owns
+    // retention.
+    let search_status = db
+        .calyx_search_generation_status_for_panel(panel_version, false)
+        .map_err(|error| {
+            format!(
+                "read panel {panel_version} persisted search cursor before pruning association history: {error}"
+            )
+        })?;
+    let mutation_through_seq = search_status.built_at_seq.unwrap_or(0).min(through_seq);
     let report = db
         .prune_panel_input_changes(
             panel_version,
             through_seq,
+            mutation_through_seq,
             ASSOCIATION_CHANGE_LOG_PRUNE_ROWS,
         )
         .map_err(|error| {
@@ -505,6 +521,8 @@ fn prune_acknowledged_weave_history(
         code = "STORAGE_DERIVED_STATE_WEAVE_HISTORY_PRUNED",
         panel_version,
         acknowledged_through_seq = through_seq,
+        search_mutation_through_seq = mutation_through_seq,
+        mutation_floor_seq = report.mutation_floor_seq,
         rows_deleted = report.rows_deleted,
         prune_commit_seq = report.committed_seq,
         "pruned one bounded page only after the durable association cursor was independently reread"
