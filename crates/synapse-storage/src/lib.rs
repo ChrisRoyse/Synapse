@@ -1921,6 +1921,20 @@ impl Db {
         self.backend.weave_panel_intelligence(params)
     }
 
+    /// Runs the bounded production search-kernel commissioning suite and
+    /// persists its byte-proven artifact to the native Calyx KV CF.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact structured Calyx/storage failure when inputs, kernel
+    /// parity, durable publication, or physical readback do not hold.
+    pub fn commission_search_kernels(
+        &self,
+        params: &synapse_calyx::SynapseCalyxSearchCommissionParams,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxSearchCommissionReport> {
+        self.backend.commission_search_kernels(params)
+    }
+
     /// Reads the derived-data abundance report for one panel back from the
     /// physical `Base`, `XTerm`, and `Graph` CFs without re-weaving.
     ///

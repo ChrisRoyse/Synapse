@@ -65,7 +65,7 @@ pub use partitioned::{
 pub use quant_config::{QuantConfig, QuantKind, QuantizedVector};
 pub use spann::{
     PostingListReader, PostingListWriter, PostingMember, SPANN_CENTROID_MAGIC, SpannCentroidIndex,
-    SpannSearch, build_centroids,
+    SpannSearch, build_centroids, try_build_centroids,
 };
 pub use vecfile::{DenseVectorFile, FbinVectors, I8BinVectors, I32BinMatrix, VEC_MAGIC};
 

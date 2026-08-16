@@ -49,6 +49,7 @@ use synapse_calyx::{
     SynapseCalyxReadOnlyVault, SynapseCalyxRecurrenceAppendReadback,
     SynapseCalyxRecurrenceSeriesReadback, SynapseCalyxRedundancyReport,
     SynapseCalyxReproduceReport, SynapseCalyxRetiredSearchGeneration, SynapseCalyxRevisionGuard,
+    SynapseCalyxSearchCommissionParams, SynapseCalyxSearchCommissionReport,
     SynapseCalyxSearchRebuildReport, SynapseCalyxSnapshotGcObservation,
     SynapseCalyxSufficiencyReport, SynapseCalyxTemporalCandidate, SynapseCalyxTemporalParams,
     SynapseCalyxTemporalRerankReadback, SynapseCalyxVault, SynapseCalyxVaultCloseReadback,
@@ -1148,6 +1149,10 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: SynapseCalyxWeaveParams,
     ) -> StorageResult<SynapseCalyxWeaveReport>;
+    fn commission_search_kernels(
+        &self,
+        params: &SynapseCalyxSearchCommissionParams,
+    ) -> StorageResult<SynapseCalyxSearchCommissionReport>;
     fn abundance_report_intelligence(
         &self,
         panel_version: u32,
@@ -6231,6 +6236,26 @@ impl StorageBackend for CalyxBackend {
                     calyx_write_failed(
                         "calyx_loom",
                         "weave native Calyx panel associations",
+                        &source,
+                    )
+                })
+            },
+        )
+    }
+
+    fn commission_search_kernels(
+        &self,
+        params: &SynapseCalyxSearchCommissionParams,
+    ) -> StorageResult<SynapseCalyxSearchCommissionReport> {
+        self.with_vault(
+            "calyx_search_commission",
+            "commission optimized Calyx search kernels",
+            true,
+            |vault| {
+                vault.commission_search_kernels(params).map_err(|source| {
+                    calyx_write_failed(
+                        "calyx_search_commission",
+                        "commission optimized Calyx search kernels",
                         &source,
                     )
                 })

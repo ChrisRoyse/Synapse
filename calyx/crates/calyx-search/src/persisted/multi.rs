@@ -400,6 +400,42 @@ fn score(
         .collect()
 }
 
+/// Scores one validated query/document token pair through the exact MaxSim
+/// kernel used by persisted multi-vector generations.
+///
+/// This is the bounded commissioning/readiness surface for hosts that need to
+/// prove the persisted scorer before admitting a generation. It deliberately
+/// accepts no index path and performs no fallback: malformed token shapes are
+/// rejected before the shared Sextant reduction is entered.
+pub fn score_persisted_maxsim_pair(query: &[Vec<f32>], document: &[Vec<f32>]) -> CliResult<f32> {
+    let token_dim = query
+        .first()
+        .map(Vec::len)
+        .ok_or_else(|| stale("persisted MaxSim commissioning query has no tokens"))?;
+    if token_dim == 0 {
+        return Err(stale(
+            "persisted MaxSim commissioning query token dimension is zero",
+        ));
+    }
+    let valid = |tokens: &[Vec<f32>]| {
+        !tokens.is_empty()
+            && tokens.iter().all(|token| {
+                token.len() == token_dim && token.iter().all(|value| value.is_finite())
+            })
+    };
+    if !valid(query) {
+        return Err(stale(
+            "persisted MaxSim commissioning query tokens are non-finite or dimensionally inconsistent",
+        ));
+    }
+    if !valid(document) {
+        return Err(stale(
+            "persisted MaxSim commissioning document tokens are empty, non-finite, or do not match the query token dimension",
+        ));
+    }
+    Ok(MaxSimIndex::maxsim(query, document))
+}
+
 fn top_k(mut scored: Vec<(CxId, f32)>, k: usize) -> Vec<(CxId, f32)> {
     scored.sort_by(|left, right| {
         right

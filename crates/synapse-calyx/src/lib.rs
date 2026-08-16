@@ -27,6 +27,7 @@ pub mod lowering;
 mod math;
 pub mod olap;
 mod readiness;
+mod search_commission;
 pub mod timeseries;
 pub use readiness::{
     SynapseCalyxReadinessEvidence, SynapseCalyxReadinessPredicate, SynapseCalyxReadinessSnapshot,
@@ -195,6 +196,10 @@ pub use math::{
     SynapseCalyxMathBackendStatus, SynapseCalyxMathProbeReport, SynapseCalyxMathProbeTopKEntry,
     SynapseCalyxMathRuntime, SynapseCalyxResidentL2GatherProbe, SynapseCalyxVramDispatchStatus,
     math_backend,
+};
+pub use search_commission::{
+    SynapseCalyxSearchCommissionArtifact, SynapseCalyxSearchCommissionParams,
+    SynapseCalyxSearchCommissionReport,
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;

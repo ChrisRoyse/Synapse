@@ -1147,6 +1147,12 @@ impl SynapseService {
             calyx_derived_state_last_weave_graph_rows_written: Some(
                 readback.last_weave_graph_rows_written,
             ),
+            calyx_derived_state_last_weave_through_seq: Some(readback.last_weave_through_seq),
+            calyx_derived_state_last_weave_backlog_seqs: Some(readback.last_weave_backlog_seqs),
+            calyx_derived_state_last_weave_pending_parts: Some(readback.last_weave_pending_parts),
+            calyx_derived_state_last_weave_backlog_growth_ticks: Some(
+                readback.last_weave_backlog_growth_ticks,
+            ),
             calyx_derived_state_last_weave_global_xterm_cf_rows_after: Some(
                 readback.last_weave_global_xterm_cf_rows_after,
             ),

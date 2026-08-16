@@ -3724,6 +3724,11 @@ pub(crate) const INTELLIGENCE_OPERATION_CLASSES: &[(
             "read-only aggregation; writes nothing.",
         ),
         (
+            Op::SearchKernelCommission,
+            Measurement,
+            "runs bounded caller-supplied real vectors through CPU-reference PQ, live/persisted MaxSim, and SPANN routing, then writes only a content-addressed proof artifact; it changes no serving generation or admission threshold.",
+        ),
+        (
             Op::EnsembleCard,
             Measurement,
             "reads the panel corpus, writes the derived capability-card Assay row (per-lens marginal value, PID triple, A37 gate verdict). Establishes 'calibrated' (#1684).",

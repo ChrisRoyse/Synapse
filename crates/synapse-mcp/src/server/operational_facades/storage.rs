@@ -1250,6 +1250,7 @@ pub(super) async fn handle(
                     oracle: None,
                     ensemble_card: None,
                     olap_aggregate: None,
+                    search_commission: None,
                 };
                 match sub_operation {
                     StorageIntelligenceOperation::Weave => {
@@ -1448,6 +1449,13 @@ pub(super) async fn handle(
                                 ..base
                             }
                         })
+                    }
+                    StorageIntelligenceOperation::SearchKernelCommission => {
+                        crate::m3::storage::run_intelligence_search_kernel_commission(&db, &spec)
+                            .map(|search_commission| StorageIntelligenceResponse {
+                                search_commission: Some(search_commission),
+                                ..base
+                            })
                     }
                 }
             };

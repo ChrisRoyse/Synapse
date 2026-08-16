@@ -43,6 +43,7 @@ pub use marker::{
     RebuildRequiredMarker, clear_rebuild_required_marker, clear_rebuild_required_marker_if_owned,
     read_rebuild_required_marker, rebuild_required_marker_path, write_rebuild_required_marker,
 };
+pub use multi::score_persisted_maxsim_pair;
 pub(crate) use pinned::canonical_vault_dir as canonical_pin_vault_dir;
 pub use rebuild::{
     CandidateSearchGeneration, RebuildProgress, load_docs,

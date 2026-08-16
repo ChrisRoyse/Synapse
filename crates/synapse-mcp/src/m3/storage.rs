@@ -2027,6 +2027,9 @@ pub enum StorageIntelligenceOperation {
     OracleValidate,
     OracleReadiness,
     OlapAggregate,
+    /// Runs the bounded production CPU-PQ, live/persisted MaxSim, and SPANN
+    /// kernel suite and persists the exact proof artifact to Calyx KV.
+    SearchKernelCommission,
     /// The ensemble capability card: per-lens marginal value, the PID triple,
     /// the A37 associational-diversity gate, and a keep/park/retire verdict
     /// (#1668's admission gate; wired for #1944 ask 1).
@@ -2040,7 +2043,7 @@ impl StorageIntelligenceOperation {
     /// `server::tool_profiles` can be proven complete at daemon construction
     /// (#2077): a variant added here without a declared classification refuses
     /// to start the daemon instead of silently inheriting a gate.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Weave,
         Self::Abundance,
         Self::Bits,
@@ -2061,6 +2064,7 @@ impl StorageIntelligenceOperation {
         Self::OracleValidate,
         Self::OracleReadiness,
         Self::OlapAggregate,
+        Self::SearchKernelCommission,
         Self::EnsembleCard,
     ];
 
@@ -2087,6 +2091,7 @@ impl StorageIntelligenceOperation {
             Self::OracleValidate => "oracle_validate",
             Self::OracleReadiness => "oracle_readiness",
             Self::OlapAggregate => "olap_aggregate",
+            Self::SearchKernelCommission => "search_kernel_commission",
             Self::EnsembleCard => "ensemble_card",
         }
     }
@@ -2125,6 +2130,32 @@ impl StorageIntelligenceOperation {
 
 #[derive(Clone, Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+pub struct StorageSearchKernelCommissionParams {
+    /// Small real dense corpus used by the CPU-reference PQ and SPANN builders.
+    #[schemars(length(min = 1, max = 256))]
+    pub rows: Vec<Vec<f32>>,
+    /// Dense query with exactly the same dimension as every row.
+    #[schemars(length(min = 1, max = 256))]
+    pub query: Vec<f32>,
+    #[schemars(range(min = 1, max = 256))]
+    pub pq_subvectors: u32,
+    #[schemars(range(min = 1, max = 256))]
+    pub pq_centroids: u32,
+    #[schemars(range(min = 1, max = 64))]
+    pub pq_iterations: u32,
+    /// Real query tokens for both live and persisted MaxSim scoring.
+    #[schemars(length(min = 1, max = 64))]
+    pub maxsim_query: Vec<Vec<f32>>,
+    /// Real document tokens for both live and persisted MaxSim scoring.
+    #[schemars(length(min = 1, max = 64))]
+    pub maxsim_document: Vec<Vec<f32>>,
+    #[schemars(range(min = 1, max = 256))]
+    pub spann_clusters: u32,
+    pub seed: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceParams {
     /// Which native intelligence action to run over the panel corpus.
     pub operation: StorageIntelligenceOperation,
@@ -2138,11 +2169,9 @@ pub struct StorageIntelligenceParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 64))]
     pub knn_k: Option<u32>,
-    /// Inclusive lower bound (Unix nanoseconds) on a record's server-stamped
-    /// `created_at` for `weave`, or inclusive lower source-event-time bound for
-    /// temporal operations. Calyx stamps `created_at` in milliseconds, so a
-    /// weave record is in the window iff
-    /// `since_ts_ns <= created_at_ms * 1_000_000 < until_ts_ns`.
+    /// Inclusive lower source-event-time bound for temporal operations.
+    /// Timestamp-range Loom weave is deliberately refused because no durable
+    /// time secondary index owns that query; use the Base sequence fields.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub since_ts_ns: Option<i64>,
     /// Exclusive upper bound (Unix nanoseconds) on `created_at` for `weave`, or
@@ -2150,6 +2179,18 @@ pub struct StorageIntelligenceParams {
     /// greater than `since_ts_ns` when both are given.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ts_ns: Option<i64>,
+    /// Exclusive Base-commit lower bound for a delta-first Loom weave. Must be
+    /// supplied together with `through_base_seq` and cannot be mixed with the
+    /// timestamp fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_base_seq: Option<u64>,
+    /// Inclusive Base-commit upper bound for a delta-first Loom weave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_base_seq: Option<u64>,
+    /// Required only for `operation=search_kernel_commission`. The caller owns
+    /// the small real vectors; Synapse never substitutes generated/mock data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_commission: Option<StorageSearchKernelCommissionParams>,
     /// Panel slots to withhold from the measurement.
     ///
     /// This is the remediation the #1958 structural anchor-leakage refusal
@@ -2380,6 +2421,11 @@ pub struct StorageIntelligenceWeaveResponse {
     pub since_ts_ns: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_ts_ns: Option<i64>,
+    /// Exact Base sequence interval consumed by a delta-first weave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_base_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub through_base_seq: Option<u64>,
     /// Panel rows the time window excluded from this pass.
     pub records_outside_window: u64,
     /// `n * (N + C(N,2) + 1)` over the woven corpus.
@@ -3046,6 +3092,44 @@ pub struct StorageIntelligenceResponse {
     /// Native Aster memory-mapped slot-column aggregate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub olap_aggregate: Option<serde_json::Value>,
+    /// Durable byte-proven result of `search_kernel_commission`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_commission: Option<StorageSearchKernelCommissionReport>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSearchKernelCommissionArtifact {
+    pub format: String,
+    pub panel_version: u32,
+    pub input_sha256: String,
+    pub row_count: u64,
+    pub dim: u64,
+    pub pq_backend: String,
+    pub pq_codes: Vec<u8>,
+    pub pq_codes_sha256: String,
+    pub pq_codebook_sha256: String,
+    pub pq_query_distances_bits: Vec<u32>,
+    pub maxsim_live_bits: u32,
+    pub maxsim_persisted_bits: u32,
+    pub maxsim_bit_identical: bool,
+    pub spann_centroids_sha256: String,
+    pub spann_assignments: Vec<(u32, u32)>,
+    pub spann_exact_query_order: Vec<u32>,
+    pub spann_graph_query_order: Vec<u32>,
+    pub spann_graph_matches_exact: bool,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSearchKernelCommissionReport {
+    pub source_of_truth: String,
+    pub key_hex: String,
+    pub committed_seq: u64,
+    pub artifact_sha256: String,
+    pub physical_readback_sha256: String,
+    pub physical_readback_matches: bool,
+    pub artifact: StorageSearchKernelCommissionArtifact,
 }
 
 #[must_use]
@@ -4676,6 +4760,8 @@ pub fn run_intelligence_weave(
     }
     weave.since_ts_ns = params.since_ts_ns;
     weave.until_ts_ns = params.until_ts_ns;
+    weave.after_base_seq = params.after_base_seq;
+    weave.through_base_seq = params.through_base_seq;
     let report = db
         .weave_panel_intelligence(weave)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -4708,6 +4794,8 @@ pub fn run_intelligence_weave(
         graph_cf_rows_after: report.graph_cf_rows_after as u64,
         since_ts_ns: report.since_ts_ns,
         until_ts_ns: report.until_ts_ns,
+        after_base_seq: report.after_base_seq,
+        through_base_seq: report.through_base_seq,
         records_outside_window: report.records_outside_window as u64,
         dda_signal_yield: report.dda_signal_yield as u64,
         lens_pairs_possible: report.lens_pairs_possible as u64,
@@ -4735,6 +4823,64 @@ pub fn run_intelligence_weave(
     })
 }
 
+/// Runs the bounded real-input search-kernel commissioning suite and returns
+/// the exact Calyx KV artifact readback.
+pub fn run_intelligence_search_kernel_commission(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageSearchKernelCommissionReport, ErrorData> {
+    let input = params.search_commission.as_ref().ok_or_else(|| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage intelligence search_kernel_commission requires search_commission",
+            "supply the bounded real rows/query, PQ parameters, MaxSim tokens, SPANN cluster count, and seed; Synapse never substitutes mock inputs",
+        )
+    })?;
+    let commission = synapse_calyx::SynapseCalyxSearchCommissionParams {
+        panel_version: params.panel_version,
+        rows: input.rows.clone(),
+        query: input.query.clone(),
+        pq_subvectors: input.pq_subvectors as usize,
+        pq_centroids: input.pq_centroids as usize,
+        pq_iterations: input.pq_iterations as usize,
+        maxsim_query: input.maxsim_query.clone(),
+        maxsim_document: input.maxsim_document.clone(),
+        spann_clusters: input.spann_clusters as usize,
+        seed: input.seed,
+    };
+    let report = db
+        .commission_search_kernels(&commission)
+        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+    Ok(StorageSearchKernelCommissionReport {
+        source_of_truth: report.source_of_truth.to_owned(),
+        key_hex: report.key_hex,
+        committed_seq: report.committed_seq,
+        artifact_sha256: report.artifact_sha256,
+        physical_readback_sha256: report.physical_readback_sha256,
+        physical_readback_matches: report.physical_readback_matches,
+        artifact: StorageSearchKernelCommissionArtifact {
+            format: report.artifact.format.to_owned(),
+            panel_version: report.artifact.panel_version,
+            input_sha256: report.artifact.input_sha256,
+            row_count: report.artifact.row_count as u64,
+            dim: report.artifact.dim as u64,
+            pq_backend: report.artifact.pq_backend,
+            pq_codes: report.artifact.pq_codes,
+            pq_codes_sha256: report.artifact.pq_codes_sha256,
+            pq_codebook_sha256: report.artifact.pq_codebook_sha256,
+            pq_query_distances_bits: report.artifact.pq_query_distances_bits,
+            maxsim_live_bits: report.artifact.maxsim_live_bits,
+            maxsim_persisted_bits: report.artifact.maxsim_persisted_bits,
+            maxsim_bit_identical: report.artifact.maxsim_bit_identical,
+            spann_centroids_sha256: report.artifact.spann_centroids_sha256,
+            spann_assignments: report.artifact.spann_assignments,
+            spann_exact_query_order: report.artifact.spann_exact_query_order,
+            spann_graph_query_order: report.artifact.spann_graph_query_order,
+            spann_graph_matches_exact: report.artifact.spann_graph_matches_exact,
+        },
+    })
+}
+
 /// Reads the derived-data abundance report for a panel back from the physical
 /// `Base`/`XTerm`/`Graph` CFs.
 pub fn run_intelligence_abundance(
@@ -4757,6 +4903,56 @@ fn intelligence_record_limit(requested: Option<u32>) -> usize {
 pub fn validate_intelligence_numeric_ranges(
     params: &StorageIntelligenceParams,
 ) -> Result<(), ErrorData> {
+    match (params.operation, params.search_commission.as_ref()) {
+        (StorageIntelligenceOperation::SearchKernelCommission, None) => {
+            return Err(mcp_error_with_remediation(
+                error_codes::TOOL_PARAMS_INVALID,
+                "intelligence search_kernel_commission requires search_commission",
+                "supply the bounded real commissioning corpus and kernel parameters; no generated/mock inputs are substituted",
+            ));
+        }
+        (StorageIntelligenceOperation::SearchKernelCommission, Some(commission)) => {
+            validate_u32_range(
+                "intelligence.search_commission",
+                "pq_subvectors",
+                commission.pq_subvectors,
+                1,
+                256,
+            )?;
+            validate_u32_range(
+                "intelligence.search_commission",
+                "pq_centroids",
+                commission.pq_centroids,
+                1,
+                256,
+            )?;
+            validate_u32_range(
+                "intelligence.search_commission",
+                "pq_iterations",
+                commission.pq_iterations,
+                1,
+                64,
+            )?;
+            validate_u32_range(
+                "intelligence.search_commission",
+                "spann_clusters",
+                commission.spann_clusters,
+                1,
+                256,
+            )?;
+        }
+        (_, Some(_)) => {
+            return Err(mcp_error_with_remediation(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "intelligence operation={} does not accept search_commission",
+                    params.operation.as_str()
+                ),
+                "remove search_commission or select operation=search_kernel_commission; no storage operation was attempted",
+            ));
+        }
+        (_, None) => {}
+    }
     if let Some(value) = params.max_records {
         validate_u32_range("intelligence", "max_records", value, 1, 20_000)?;
     }

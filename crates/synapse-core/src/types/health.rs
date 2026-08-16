@@ -840,6 +840,14 @@ pub struct SubsystemHealth {
     /// completed incremental-weave pass.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_weave_graph_rows_written: Option<BTreeMap<u32, usize>>,
+    /// MVCC Base sequence through which each scheduled panel weave has
+    /// committed one contiguous delta prefix.
+    pub calyx_derived_state_last_weave_through_seq: Option<BTreeMap<u32, u64>>,
+    /// Remaining global MVCC sequence distance to the tip captured by the last
+    /// scheduled pass.
+    pub calyx_derived_state_last_weave_backlog_seqs: Option<BTreeMap<u32, u64>>,
+    pub calyx_derived_state_last_weave_pending_parts: Option<BTreeMap<u32, usize>>,
+    pub calyx_derived_state_last_weave_backlog_growth_ticks: Option<BTreeMap<u32, u32>>,
     /// Vault-global physical `XTerm` CF gauges observed after each panel's last
     /// completed interval part. These are deliberately non-additive snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
