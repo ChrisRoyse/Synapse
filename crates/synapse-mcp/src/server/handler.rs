@@ -88,7 +88,7 @@ impl ServerHandler for SynapseService {
                 argument_shape,
                 error,
             )?;
-            if profile_policy_denied(&error) {
+            if tool_list_refresh_required(&error) {
                 match context.peer.notify_tool_list_changed().await {
                     Ok(()) => {
                         tracing::info!(
@@ -857,13 +857,19 @@ fn parse_hwnd_literal(value: &str) -> Option<i64> {
         .or_else(|| value.parse::<i64>().ok())
 }
 
-fn profile_policy_denied(error: &ErrorData) -> bool {
-    error
-        .data
-        .as_ref()
-        .and_then(|data| data.get("code"))
-        .and_then(Value::as_str)
-        == Some(error_codes::TOOL_PROFILE_POLICY_DENIED)
+fn tool_list_refresh_required(error: &ErrorData) -> bool {
+    matches!(
+        error
+            .data
+            .as_ref()
+            .and_then(|data| data.get("code"))
+            .and_then(Value::as_str),
+        Some(
+            error_codes::TOOL_PROFILE_POLICY_DENIED
+                | error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING
+                | error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE
+        )
+    )
 }
 
 fn daemon_restarting_mcp_error(
