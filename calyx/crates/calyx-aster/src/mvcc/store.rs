@@ -1055,6 +1055,9 @@ pub fn is_tombstone_value(value: &[u8]) -> bool {
     value == TOMBSTONE_VALUE
 }
 
+type ChangedKeyCommit = Vec<(ColumnFamily, Vec<u8>)>;
+type ChangedKeysBySeq = BTreeMap<Seq, ChangedKeyCommit>;
+
 /// Versioned row table with a single vault-wide sequence.
 #[derive(Debug)]
 pub struct VersionedCfStore {
@@ -1107,6 +1110,18 @@ pub struct VersionedCfStore {
     /// sequence, so a delta query below this floor must fail closed and rebase
     /// instead of silently omitting checkpointed changes (#1842).
     changed_key_history_floor: AtomicU64,
+    /// Ordered logical change journal above `changed_key_history_floor`.
+    ///
+    /// The MVCC row table is authoritative for values and historical reads,
+    /// but folding every row-table key to answer "what changed after seq N?"
+    /// makes an empty delta cost O(process-lifetime changed keys).  This
+    /// journal is published under the same row write guard and at the same
+    /// sequence boundary as the version chains, so a delta read visits only
+    /// commits in its requested sequence range.  It is process-local by
+    /// design: latest-only recovery establishes `changed_key_history_floor`
+    /// from the immutable router baseline and replays every later WAL batch
+    /// through this journal before readers are admitted.
+    changed_keys_by_seq: RwLock<ChangedKeysBySeq>,
     router_eager_lookup_on_refresh: AtomicBool,
     read_barriers: RwLock<Vec<ReadBarrier>>,
     leases: LeaseRegistry,
@@ -1319,6 +1334,7 @@ impl VersionedCfStore {
             router: None,
             router_latest_readback: AtomicBool::new(false),
             changed_key_history_floor: AtomicU64::new(0),
+            changed_keys_by_seq: RwLock::new(BTreeMap::new()),
             router_eager_lookup_on_refresh: AtomicBool::new(true),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -1358,6 +1374,7 @@ impl VersionedCfStore {
             } else {
                 0
             }),
+            changed_keys_by_seq: RwLock::new(BTreeMap::new()),
             router_eager_lookup_on_refresh: AtomicBool::new(eager_lookup_on_refresh),
             read_barriers: RwLock::new(Vec::new()),
             leases: LeaseRegistry::default(),
@@ -2224,11 +2241,21 @@ impl VersionedCfStore {
         let flushed_ssts = self.flush_all_cfs()?.len();
         let new_floor_seq = self.current_seq();
         let retired = tables.take_all_for_snapshot_delta_rebase();
+        let retired_changed_keys = {
+            let mut journal = self.changed_keys_by_seq.write().map_err(|_| {
+                CalyxError::aster_corrupt_shard(
+                    "MVCC changed-key journal lock was poisoned while rebasing the checkpointed snapshot delta"
+                        .to_owned(),
+                )
+            })?;
+            std::mem::take(&mut *journal)
+        };
         self.changed_key_history_floor
             .store(new_floor_seq, Ordering::Release);
         self.mvcc_resident.reset_after_rebase();
         drop(tables);
         drop(retired);
+        drop(retired_changed_keys);
         let after = self.mvcc_resident.snapshot();
         tracing::info!(
             code = "CALYX_ASTER_SNAPSHOT_DELTA_REBASED",
@@ -2374,7 +2401,7 @@ impl VersionedCfStore {
                 .fetch_max(self.current_seq() + 1, Ordering::AcqRel);
         }
         self.advance_affected_panel_content_seqs(&affected_panels, self.current_seq() + 1)?;
-        let seq = self.seqs.allocate();
+        let seq = self.allocate_and_publish_changed_keys(&rows)?;
         // Publish the per-family change signal BEFORE the rows are applied and
         // while the row write guard for every touched family is still held
         // (#2139). A reader can reach these rows only after the guard is
@@ -2568,6 +2595,65 @@ impl VersionedCfStore {
             self.mvcc_resident
                 .record_insert(new_key, key_bytes, value_bytes);
         }
+        Ok(())
+    }
+
+    /// Allocates one commit sequence and publishes its deduplicated changed
+    /// identities into the ordered delta journal.
+    ///
+    /// The caller holds the write shard for every family in `rows`.  A delta
+    /// reader takes that same family shard before reading the journal, so even
+    /// though the sequence allocator itself is atomic, no reader can observe
+    /// the allocated sequence without also observing this journal entry.
+    fn allocate_and_publish_changed_keys(
+        &self,
+        rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+    ) -> Result<Seq> {
+        let changes = rows
+            .iter()
+            .map(|(cf, key, _value)| (*cf, key.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut journal = self.changed_keys_by_seq.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC changed-key journal lock was poisoned while publishing a commit".to_owned(),
+            )
+        })?;
+        let seq = self.seqs.allocate();
+        if seq > self.changed_key_history_floor.load(Ordering::Acquire) {
+            journal.insert(seq, changes);
+        }
+        Ok(seq)
+    }
+
+    /// Restores one already-sequenced batch into the process-local changed-key
+    /// journal. Manifest-baseline rows at or below the history floor are not a
+    /// delta and are deliberately excluded; every WAL row above it is retained.
+    fn restore_changed_keys_at(
+        &self,
+        rows: &[(ColumnFamily, Vec<u8>, Vec<u8>)],
+        seq: Seq,
+    ) -> Result<()> {
+        if seq <= self.changed_key_history_floor.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let changes = rows
+            .iter()
+            .map(|(cf, key, _value)| (*cf, key.clone()))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut journal = self.changed_keys_by_seq.write().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC changed-key journal lock was poisoned while restoring a durable batch"
+                    .to_owned(),
+            )
+        })?;
+        let entry = journal.entry(seq).or_default();
+        entry.extend(changes);
+        entry.sort();
+        entry.dedup();
         Ok(())
     }
 
@@ -2858,6 +2944,7 @@ impl VersionedCfStore {
         // must carry them too or a family whose only writes were replayed would
         // report `last_commit_seq = 0` while holding rows at much higher ones.
         self.publish_cf_commit_seq(&rows, seq);
+        self.restore_changed_keys_at(&rows, seq)?;
         for (cf, key, value) in rows {
             self.append_mvcc_version(&mut table, cf, key, seq, value)?;
         }
@@ -2969,6 +3056,7 @@ impl VersionedCfStore {
             }
             self.advance_affected_panel_content_seqs(&affected_panels, seq)?;
             self.publish_cf_commit_seq(&rows, seq);
+            self.restore_changed_keys_at(&rows, seq)?;
             for (cf, key, value) in rows {
                 self.append_mvcc_version(&mut table, cf, key, seq, value)?;
             }

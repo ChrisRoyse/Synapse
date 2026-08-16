@@ -396,66 +396,33 @@ impl VersionedCfStore {
         if self.cf_change_signal(cf).last_commit_seq <= after_exclusive {
             return Ok(Vec::new());
         }
-        // Folded in bounded pages, releasing the row read guard between them
-        // (#2060). The single hold this replaces was `O(family)` — 117 ms over
-        // a 1,039,273-row `Base` on the deployed daemon, 17 of its 20 lifetime
-        // holds over the 25 ms budget — and every commit in the process waits
-        // on that guard.
-        //
-        // Paging is exact here, not an approximation, for three reasons that
-        // hold together:
-        //
-        // 1. **The cursor cannot skip a key.** Row-table entries are only ever
-        //    created (`entry(key).or_default()`); nothing removes a key, not
-        //    even snapshot GC, which trims version chains in place. So the key
-        //    order this cursor walks is append-only and stable.
-        // 2. **A concurrent commit cannot enter the answer.** It allocates a
-        //    sequence above `snapshot.seq()`, and the predicate admits only
-        //    versions at or below it. Keys created after the pin therefore fold
-        //    to "unchanged" wherever the cursor happens to meet them.
-        // 3. **A concurrent reclaim cannot remove the answer.** GC keeps each
-        //    chain's newest version at or below the safe point, and the safe
-        //    point is clamped to the oldest live lease — this snapshot's
-        //    included. A version it does drop is strictly older than the one it
-        //    keeps, so if any dropped version satisfied `seq > after_exclusive`
-        //    the retained boundary version satisfies it too. No key can leave
-        //    the delta by being compacted.
-        //
-        // The lease is re-checked on every page rather than once at entry: it
-        // is what makes 2 and 3 true, so a fold that outlived it must fail
-        // closed instead of reading a view whose versions have started being
-        // reclaimed.
-        let mut keys = Vec::new();
-        let mut cursor: Option<Vec<u8>> = None;
-        loop {
-            self.ensure_snapshot_live(snapshot, clock)?;
-            let mut page_end: Option<Vec<u8>> = None;
-            {
-                let table = self.read_rows(RowGuardSite::ChangedKeysAfterAt, cf);
-                let Some(cf_rows) = table.get(&cf) else {
-                    break;
-                };
-                let lower = cursor.as_deref().map_or(Bound::Unbounded, Bound::Excluded);
-                let mut examined = 0_usize;
-                for (key, versions) in cf_rows.range::<[u8], _>((lower, Bound::Unbounded)) {
-                    if versions.iter().any(|version| {
-                        version.seq > after_exclusive && version.seq <= snapshot.seq()
-                    }) {
-                        keys.push(key.clone());
-                    }
-                    examined += 1;
-                    if examined == ROW_GUARD_FOLD_PAGE_ROWS {
-                        page_end = Some(key.clone());
-                        break;
-                    }
+        // The ordered journal is published at the same sequence boundary as
+        // the version chains. Taking this family's row guard first closes the
+        // visibility race with a commit: the writer holds the corresponding
+        // write shard until both its row versions and journal entry exist.
+        // The range walk is therefore O(commits + changed keys in the requested
+        // delta), independent of the family population and of quiet history.
+        let _table = self.read_rows(RowGuardSite::ChangedKeysAfterAt, cf);
+        self.ensure_snapshot_live(snapshot, clock)?;
+        let journal = self.changed_keys_by_seq.read().map_err(|_| {
+            CalyxError::aster_corrupt_shard(
+                "MVCC changed-key journal lock was poisoned while reading a sequence delta"
+                    .to_owned(),
+            )
+        })?;
+        let mut unique = BTreeSet::new();
+        for (_seq, changes) in journal.range((
+            Bound::Excluded(after_exclusive),
+            Bound::Included(snapshot.seq()),
+        )) {
+            for (changed_cf, key) in changes {
+                if *changed_cf == cf {
+                    unique.insert(key.clone());
                 }
             }
-            // A page that ended before the limit reached the end of the family.
-            let Some(page_end) = page_end else {
-                break;
-            };
-            cursor = Some(page_end);
         }
+        drop(journal);
+        let keys = unique.into_iter().collect::<Vec<_>>();
         for key in &keys {
             self.ensure_unbarriered(cf, key)?;
         }

@@ -92,4 +92,30 @@ where
         let snapshot = self.snapshot_handle(seq)?;
         read(snapshot.snapshot())
     }
+
+    /// Runs one external read operation against an exact historical sequence
+    /// while retaining and automatically releasing the reader lease.
+    ///
+    /// This is the historical counterpart of
+    /// [`Self::with_scoped_latest_snapshot`]. It exists for bounded delta
+    /// consumers that must enumerate changes through sequence `seq` and then
+    /// hydrate those identities from that same physical view; composing a
+    /// numeric sequence with separately pinned reads would leave a GC race.
+    pub fn with_scoped_snapshot_at<T, E>(
+        &self,
+        seq: Seq,
+        max_age_ms: u64,
+        map_pin_error: impl FnOnce(calyx_core::CalyxError) -> E,
+        read: impl FnOnce(Snapshot) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let snapshot = self
+            .rows
+            .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, max_age_ms)
+            .map_err(map_pin_error)?;
+        let snapshot = ScopedSnapshot {
+            rows: &self.rows,
+            snapshot,
+        };
+        read(snapshot.snapshot())
+    }
 }

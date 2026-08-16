@@ -67,6 +67,20 @@ pub const SYNAPSE_WEAVE_MAX_BLIND_SPOTS: usize = 32;
 /// Structured code raised when an intelligence time window is empty/inverted.
 pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_INVALID: &str =
     "SYNAPSE_CALYX_INTELLIGENCE_TIME_RANGE_INVALID";
+/// Sequence and time selectors were mixed or only half of a sequence range was
+/// supplied.
+pub const SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID: &str =
+    "SYNAPSE_CALYX_INTELLIGENCE_SOURCE_RANGE_INVALID";
+/// A timestamp-filtered weave would require a population scan because no
+/// durable time secondary index owns that query.
+pub const SYNAPSE_INTELLIGENCE_TIME_RANGE_UNINDEXED: &str =
+    "SYNAPSE_CALYX_INTELLIGENCE_TIME_RANGE_UNINDEXED";
+/// A sequence interval exceeds the bounded delta corpus.
+///
+/// Scheduled maintenance bisects the interval; an indivisible one-commit
+/// burst remains a named hard error.
+pub const SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED: &str =
+    "SYNAPSE_CALYX_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED";
 /// Structured code raised when a caller addresses a panel generation that the
 /// durable Calyx allocator has never registered.
 pub const SYNAPSE_INTELLIGENCE_PANEL_UNREGISTERED: &str =
@@ -132,6 +146,12 @@ pub struct SynapseCalyxWeaveParams {
     /// Exclusive upper bound on a record's server-stamped `created_at`, in Unix
     /// nanoseconds. `None` leaves the window open at that end.
     pub until_ts_ns: Option<i64>,
+    /// Exclusive lower Base-commit bound for a delta-first weave. Must be
+    /// supplied together with `through_base_seq`, and cannot be mixed with a
+    /// time window.
+    pub after_base_seq: Option<u64>,
+    /// Inclusive upper Base-commit bound for a delta-first weave.
+    pub through_base_seq: Option<u64>,
     pub math_execution_class: SynapseCalyxMathExecutionClass,
 }
 
@@ -145,6 +165,8 @@ impl SynapseCalyxWeaveParams {
             cache_capacity: 4_096,
             since_ts_ns: None,
             until_ts_ns: None,
+            after_base_seq: None,
+            through_base_seq: None,
             math_execution_class: SynapseCalyxMathExecutionClass::Configured,
         }
     }
@@ -356,6 +378,12 @@ pub struct SynapseCalyxWeaveReport {
     /// Effective half-open time window applied to `Base` rows, echoed back.
     pub since_ts_ns: Option<i64>,
     pub until_ts_ns: Option<i64>,
+    /// Exact sequence selector used by a delta-first pass. Both are `None` for
+    /// an explicit time/full-corpus weave.
+    #[serde(default)]
+    pub after_base_seq: Option<u64>,
+    #[serde(default)]
+    pub through_base_seq: Option<u64>,
     /// Panel rows the time window excluded from this pass.
     pub records_outside_window: usize,
     /// DDA signal yield `n * (N + C(N,2) + 1)` for the woven corpus.
@@ -434,13 +462,62 @@ impl SynapseCalyxVault {
                 "read the durable Calyx panel-generation allocator and retry with one of its registered generation IDs",
             ));
         }
-        let max_records = params
-            .max_records
-            .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
-        let window = TimeWindowNs::new(params.since_ts_ns, params.until_ts_ns)?;
+        if !(1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS).contains(&params.max_records) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_INTELLIGENCE_MAX_RECORDS_INVALID",
+                format!(
+                    "panel {} weave max_records={} is outside 1..={SYNAPSE_INTELLIGENCE_MAX_RECORDS}",
+                    params.panel_version, params.max_records
+                ),
+                "pass an explicit max_records inside the reported inclusive bound; Synapse does not clamp intelligence budgets",
+            ));
+        }
+        let max_records = params.max_records;
         let corpus_load_started = std::time::Instant::now();
-        let corpus =
-            self.load_panel_dense_corpus_in_window(params.panel_version, max_records, window)?;
+        let corpus = match (params.after_base_seq, params.through_base_seq) {
+            (Some(after), Some(through)) => {
+                if params.since_ts_ns.is_some() || params.until_ts_ns.is_some() || after > through {
+                    return Err(SynapseCalyxError::new(
+                        SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID,
+                        format!(
+                            "panel {} weave source selector is invalid: after_base_seq={after} through_base_seq={through} since_ts_ns={:?} until_ts_ns={:?}",
+                            params.panel_version, params.since_ts_ns, params.until_ts_ns
+                        ),
+                        "supply either one valid half-open time window or both sequence bounds with after_base_seq <= through_base_seq; never mix the selectors",
+                    ));
+                }
+                self.load_panel_dense_corpus_delta(
+                    params.panel_version,
+                    max_records,
+                    after,
+                    through,
+                )?
+            }
+            (None, None) => {
+                if params.since_ts_ns.is_some() || params.until_ts_ns.is_some() {
+                    return Err(SynapseCalyxError::new(
+                        SYNAPSE_INTELLIGENCE_TIME_RANGE_UNINDEXED,
+                        format!(
+                            "panel {} requested a timestamp-filtered weave since_ts_ns={:?} until_ts_ns={:?}, but the only timestamp access path is an O(panel population) membership scan",
+                            params.panel_version, params.since_ts_ns, params.until_ts_ns
+                        ),
+                        "use after_base_seq + through_base_seq for incremental work, or omit all bounds for an explicit bounded full-corpus prefix; add a transactionally maintained time secondary index before restoring timestamp-range weave",
+                    ));
+                }
+                let window = TimeWindowNs::new(params.since_ts_ns, params.until_ts_ns)?;
+                self.load_panel_dense_corpus_in_window(params.panel_version, max_records, window)?
+            }
+            _ => {
+                return Err(SynapseCalyxError::new(
+                    SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID,
+                    format!(
+                        "panel {} weave requires both sequence bounds: after_base_seq={:?} through_base_seq={:?}",
+                        params.panel_version, params.after_base_seq, params.through_base_seq
+                    ),
+                    "supply both after_base_seq and through_base_seq, or omit both for an explicit time/full-corpus weave",
+                ));
+            }
+        };
         let corpus_load_secs = corpus_load_started.elapsed().as_secs_f64();
         let records_scanned = corpus.records_scanned;
         let records_outside_window = corpus.records_outside_window;
@@ -726,6 +803,8 @@ impl SynapseCalyxVault {
             graph_cf_rows_readback: graph_readback.provenance().to_owned(),
             since_ts_ns: params.since_ts_ns,
             until_ts_ns: params.until_ts_ns,
+            after_base_seq: params.after_base_seq,
+            through_base_seq: params.through_base_seq,
             records_outside_window,
             dda_signal_yield: dda_signal_yield(corpus.records.len(), corpus.n_lenses()),
             lens_pairs_possible: blind_spots.pairs_possible,
@@ -1009,6 +1088,95 @@ impl SynapseCalyxVault {
         self.load_panel_dense_corpus_in_window(panel_version, max_records, TimeWindowNs::default())
     }
 
+    /// Loads exactly the panel Base identities changed in
+    /// `(after_base_seq, through_base_seq]` and hydrates them from the same
+    /// pinned historical view.
+    ///
+    /// The changed-key journal is the access path; the panel membership and
+    /// global Base families are never walked.  The complete identity set is
+    /// counted before any hydration or derived write.  An over-cap interval
+    /// therefore refuses with a split point still available to its caller and
+    /// cannot publish a partial association layer.
+    fn load_panel_dense_corpus_delta(
+        &self,
+        panel_version: u32,
+        max_records: usize,
+        after_base_seq: u64,
+        through_base_seq: u64,
+    ) -> Result<DenseCorpus, SynapseCalyxError> {
+        if max_records == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_INTELLIGENCE_MAX_RECORDS_ZERO",
+                format!(
+                    "panel {panel_version} delta corpus loading requires at least one record; max_records=0"
+                ),
+                "pass max_records in 1..=SYNAPSE_INTELLIGENCE_MAX_RECORDS",
+            ));
+        }
+        let mut records = Vec::new();
+        let mut panel_slots = BTreeMap::new();
+        let mut sparse_support = BTreeMap::new();
+        self.with_read_snapshot_at(
+            through_base_seq,
+            crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
+            |snapshot| {
+                let scoped = self
+                    .vault
+                    .changed_base_keys_after_snapshot_for_panel(
+                        snapshot,
+                        after_base_seq,
+                        panel_version,
+                    )
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx(
+                            &format!(
+                                "enumerate panel {panel_version} Base changes in ({after_base_seq},{through_base_seq}]"
+                            ),
+                            &error,
+                        )
+                    })?;
+                if scoped.keys.len() > max_records {
+                    return Err(SynapseCalyxError::new(
+                        SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED,
+                        format!(
+                            "panel {panel_version} has {} changed Base identities in ({after_base_seq},{through_base_seq}], above max_records={max_records}; scanned_journal_keys={} other_panels={} unattributed={}",
+                            scoped.keys.len(), scoped.scanned, scoped.other_panels, scoped.unattributed
+                        ),
+                        "bisect the sequence interval and retry both contiguous halves; if one commit alone exceeds the bound, increase the cap only after measuring its memory and latency budget",
+                    ));
+                }
+                for key in scoped.keys {
+                    let bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_CHANGED_BASE_KEY_INVALID",
+                            format!(
+                                "panel {panel_version} changed Base key at snapshot {} has {} bytes, expected 16",
+                                snapshot.seq(), key.len()
+                            ),
+                            "preserve the vault and repair the malformed Base key before retrying the delta weave",
+                        )
+                    })?;
+                    let cx_id = CxId::from_bytes(bytes);
+                    let _base = self.verified_panel_base_row_at_snapshot(
+                        snapshot,
+                        panel_version,
+                        cx_id,
+                    )?;
+                    let hydrated = self.hydrated_constellation_at_snapshot(cx_id, snapshot)?;
+                    accumulate_dense_constellation(
+                        hydrated,
+                        &mut records,
+                        &mut panel_slots,
+                        &mut sparse_support,
+                    );
+                }
+                Ok(())
+            },
+        )?;
+        let records_scanned = records.len();
+        finalize_dense_corpus(records, records_scanned, 0, panel_slots, &sparse_support)
+    }
+
     /// Reads a bounded `Base` prefix and returns the panel corpus.
     ///
     /// `panel_slots` records **every** lens the corpus carries with the kind of
@@ -1089,24 +1257,12 @@ impl SynapseCalyxVault {
                     }
                     records_scanned += 1;
                     let hydrated = self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
-                    for (slot, vector) in &hydrated.slots {
-                        let kind = SynapseCalyxSlotKind::of(vector);
-                        // A slot that is `Absent` on this record but present on
-                        // another must not be recorded as absent for the panel:
-                        // `Absent` is an explicit per-record absence, never a
-                        // statement about the lens.
-                        let entry = panel_slots.entry(*slot).or_insert(kind);
-                        if *entry == SynapseCalyxSlotKind::Absent {
-                            *entry = kind;
-                        }
-                        if let SlotVector::Sparse { entries, .. } = vector {
-                            let support = sparse_support.entry(*slot).or_default();
-                            for entry in entries {
-                                support.insert(entry.idx);
-                            }
-                        }
-                    }
-                    records.push(DenseRecord::from_constellation(hydrated));
+                    accumulate_dense_constellation(
+                        hydrated,
+                        &mut records,
+                        &mut panel_slots,
+                        &mut sparse_support,
+                    );
                     if records.len() >= max_records {
                         Ok(crate::SynapseCalyxWalkStep::Stop)
                     } else {
@@ -1116,70 +1272,13 @@ impl SynapseCalyxVault {
             },
         )?;
 
-        // Densify every sparse slot whose observed support fits the bound. This
-        // happens after the scan because the support is a property of the
-        // corpus, not of any one record.
-        let mut densified_sparse_slots: BTreeMap<SlotId, usize> = BTreeMap::new();
-        let mut unusable_slots: BTreeMap<SlotId, String> = BTreeMap::new();
-        for (slot, support) in &sparse_support {
-            if support.is_empty() {
-                unusable_slots.insert(
-                    *slot,
-                    format!(
-                        "sparse lens has empty observed support across the {} loaded record(s). The stored all-zero sparse value remains exact, but an observed-support densifier cannot manufacture a zero-dimensional vector for Loom/KSG/kNN",
-                        records.len()
-                    ),
-                );
-                continue;
-            }
-            if support.len() > SYNAPSE_SPARSE_SLOT_MAX_SUPPORT {
-                unusable_slots.insert(
-                    *slot,
-                    format!(
-                        "sparse lens occupies {} distinct index(es) across the {} scanned \
-                         record(s), above the densification bound of \
-                         {SYNAPSE_SPARSE_SLOT_MAX_SUPPORT}. Densifying over the observed support \
-                         is exact, but at this width the bounded association and \
-                         mutual-information passes cannot complete: the kNN and KSG paths are \
-                         quadratic in records and linear in width. Narrow the lens (coarser \
-                         hashing/bucketing) or lower max_records",
-                        support.len(),
-                        records.len()
-                    ),
-                );
-                continue;
-            }
-            let index_of: BTreeMap<u32, usize> = support
-                .iter()
-                .enumerate()
-                .map(|(position, idx)| (*idx, position))
-                .collect();
-            let width = support.len();
-            for record in &mut records {
-                let Some(entries) = record.sparse.get(slot) else {
-                    continue;
-                };
-                let mut dense = vec![0.0f32; width];
-                for (idx, value) in entries {
-                    // Every occupied index is in the map by construction: the
-                    // support was built from these same entries.
-                    if let Some(position) = index_of.get(idx) {
-                        dense[*position] += *value;
-                    }
-                }
-                record.slots.insert(*slot, dense);
-            }
-            densified_sparse_slots.insert(*slot, width);
-        }
-
-        Ok(DenseCorpus {
+        finalize_dense_corpus(
             records,
             records_scanned,
             records_outside_window,
             panel_slots,
-            densified_sparse_slots,
-            unusable_slots,
-        })
+            &sparse_support,
+        )
     }
 
     /// Builds the between-record nearest-neighbor graph: for every dense slot
@@ -1369,6 +1468,103 @@ impl DenseRecord {
             anchors,
         }
     }
+}
+
+fn accumulate_dense_constellation(
+    constellation: Constellation,
+    records: &mut Vec<DenseRecord>,
+    panel_slots: &mut BTreeMap<SlotId, SynapseCalyxSlotKind>,
+    sparse_support: &mut BTreeMap<SlotId, BTreeSet<u32>>,
+) {
+    for (slot, vector) in &constellation.slots {
+        let kind = SynapseCalyxSlotKind::of(vector);
+        // A slot that is `Absent` on this record but present on another must
+        // not be recorded as absent for the panel: `Absent` is an explicit
+        // per-record absence, never a statement about the lens.
+        let entry = panel_slots.entry(*slot).or_insert(kind);
+        if *entry == SynapseCalyxSlotKind::Absent {
+            *entry = kind;
+        }
+        if let SlotVector::Sparse { entries, .. } = vector {
+            let support = sparse_support.entry(*slot).or_default();
+            for entry in entries {
+                support.insert(entry.idx);
+            }
+        }
+    }
+    records.push(DenseRecord::from_constellation(constellation));
+}
+
+fn finalize_dense_corpus(
+    mut records: Vec<DenseRecord>,
+    records_scanned: usize,
+    records_outside_window: usize,
+    panel_slots: BTreeMap<SlotId, SynapseCalyxSlotKind>,
+    sparse_support: &BTreeMap<SlotId, BTreeSet<u32>>,
+) -> Result<DenseCorpus, SynapseCalyxError> {
+    // Densify every sparse slot whose observed support fits the bound. This
+    // happens after collection because support is a corpus property, not a
+    // property of any one record.
+    let mut densified_sparse_slots = BTreeMap::new();
+    let mut unusable_slots = BTreeMap::new();
+    for (slot, support) in sparse_support {
+        if support.is_empty() {
+            unusable_slots.insert(
+                *slot,
+                format!(
+                    "sparse lens has empty observed support across the {} loaded record(s). The stored all-zero sparse value remains exact, but an observed-support densifier cannot manufacture a zero-dimensional vector for Loom/KSG/kNN",
+                    records.len()
+                ),
+            );
+            continue;
+        }
+        if support.len() > SYNAPSE_SPARSE_SLOT_MAX_SUPPORT {
+            unusable_slots.insert(
+                *slot,
+                format!(
+                    "sparse lens occupies {} distinct index(es) across the {} scanned record(s), above the densification bound of {SYNAPSE_SPARSE_SLOT_MAX_SUPPORT}. Densifying over the observed support is exact, but at this width the bounded association and mutual-information passes cannot complete: the kNN and KSG paths are quadratic in records and linear in width. Narrow the lens (coarser hashing/bucketing) or lower max_records",
+                    support.len(),
+                    records.len()
+                ),
+            );
+            continue;
+        }
+        let index_of = support
+            .iter()
+            .enumerate()
+            .map(|(position, idx)| (*idx, position))
+            .collect::<BTreeMap<_, _>>();
+        let width = support.len();
+        for record in &mut records {
+            let Some(entries) = record.sparse.get(slot) else {
+                continue;
+            };
+            let mut dense = vec![0.0_f32; width];
+            for (idx, value) in entries {
+                let position = index_of.get(idx).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_SPARSE_SUPPORT_INCONSISTENT",
+                        format!(
+                            "slot {} sparse index {idx} is absent from the corpus support assembled from the same records",
+                            slot.get()
+                        ),
+                        "preserve the corpus and inspect sparse support assembly; Synapse refuses to silently omit the stored value",
+                    )
+                })?;
+                dense[*position] += *value;
+            }
+            record.slots.insert(*slot, dense);
+        }
+        densified_sparse_slots.insert(*slot, width);
+    }
+    Ok(DenseCorpus {
+        records,
+        records_scanned,
+        records_outside_window,
+        panel_slots,
+        densified_sparse_slots,
+        unusable_slots,
+    })
 }
 
 struct DenseCorpus {

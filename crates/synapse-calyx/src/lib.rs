@@ -164,7 +164,9 @@ pub use grounding::{
 };
 pub use intelligence::{
     SYNAPSE_ASSAY_ANCHOR_SOURCE_LEAKAGE, SYNAPSE_ASSAY_BIT_FLOOR,
-    SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES, SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+    SYNAPSE_ASSAY_CORRELATION_CEILING, SYNAPSE_ASSAY_MIN_SAMPLES,
+    SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED, SYNAPSE_INTELLIGENCE_MAX_RECORDS,
+    SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID, SYNAPSE_INTELLIGENCE_TIME_RANGE_UNINDEXED,
     SYNAPSE_KERNEL_DEFAULT_EDGE_COS, SYNAPSE_KERNEL_DEFAULT_KNN, SYNAPSE_KERNEL_DEFAULT_MAX_HOPS,
     SYNAPSE_KERNEL_DEFAULT_MIN_RECALL, SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS, SYNAPSE_KNN_DEFAULT_K,
     SYNAPSE_KNN_MAX_EDGES, SYNAPSE_KSG_DEFAULT_K, SYNAPSE_LENS_BLIND_SPOT_CEILING,
@@ -4097,6 +4099,28 @@ impl SynapseCalyxVault {
             Freshness::FreshDerived,
             max_age_ms,
             |error| SynapseCalyxError::from_calyx("pin the scoped Calyx read snapshot", &error),
+            read,
+        )
+    }
+
+    /// Runs a multi-read intelligence operation against one exact historical
+    /// sequence. The Aster scoped handle retains the physical snapshot for the
+    /// closure and releases it on success, error, or unwind.
+    pub(crate) fn with_read_snapshot_at<T>(
+        &self,
+        seq: u64,
+        max_age_ms: u64,
+        read: impl FnOnce(Snapshot) -> Result<T, SynapseCalyxError>,
+    ) -> Result<T, SynapseCalyxError> {
+        self.vault.with_scoped_snapshot_at(
+            seq,
+            max_age_ms,
+            |error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("pin the scoped Calyx historical snapshot at seq {seq}"),
+                    &error,
+                )
+            },
             read,
         )
     }

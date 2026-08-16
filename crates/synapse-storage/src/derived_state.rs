@@ -389,13 +389,14 @@ pub struct NoveltyDeliveryReadback {
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
     LazyLock::new(|| Mutex::new(DerivedStateReadback::default()));
 
-/// Exclusive end of the last completely woven ingest interval per panel.
+/// Inclusive MVCC sequence through which each panel's Base changes were
+/// completely woven.
 ///
-/// Registration initializes these watermarks before the daemon accepts live
-/// writes. A restart therefore cannot create an unwoven live-ingest gap: the
-/// replacement process starts a fresh interval at registration, while all
-/// historical rows remain available to the explicit full-corpus weave.
-static WEAVE_WATERMARK_NS: LazyLock<Mutex<BTreeMap<u32, i64>>> =
+/// Registration establishes the current vault sequence as a baseline before
+/// the daemon accepts live writes. Routine work then consumes the ordered Base
+/// change journal, never a repeated timestamp-filtered membership snapshot.
+/// Historical rows remain available to the explicit full-corpus weave.
+static WEAVE_BASE_SEQ: LazyLock<Mutex<BTreeMap<u32, u64>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 /// Externally readable outcome of the derived-state maintainer, as published for
@@ -538,7 +539,7 @@ pub struct DerivedStateReadback {
     pub last_anchor_debt_lineage_rebuild_ms: u64,
     /// Last incremental Loom action and physical readback (#1671).
     pub last_weave_actions: BTreeMap<u32, String>,
-    pub last_weave_until_ns: BTreeMap<u32, i64>,
+    pub last_weave_through_seq: BTreeMap<u32, u64>,
     pub last_weave_records: BTreeMap<u32, u64>,
     /// Per-panel rows submitted and durably flushed by the completed interval
     /// parts in this pass. These are write counts, not claims that every upsert
@@ -555,16 +556,13 @@ pub struct DerivedStateReadback {
     /// check, or proof that the CF commit sequence was unchanged (#2114).
     pub last_weave_global_xterm_cf_rows_readback: BTreeMap<u32, String>,
     pub last_weave_global_graph_cf_rows_readback: BTreeMap<u32, String>,
-    /// Ingest time this panel's weave has not reached yet, the parts still owed,
-    /// and how many consecutive ticks the backlog has grown (#2085).
+    /// Committed Base sequences this panel's weave has not reached yet, the
+    /// parts still owed, and how many consecutive ticks the backlog has grown.
     ///
-    /// `last_weave_until_ns` is the committed **frontier**, not the instant the
-    /// tick aimed at, so these three say whether a partial pass is catching up
-    /// or losing ground. Without them a frozen watermark and a converging one
-    /// read identically from the outside — which is how a panel's derived layer
-    /// stayed pinned to a fixed instant for 44 minutes while the maintainer
-    /// reported work on every tick.
-    pub last_weave_backlog_ns: BTreeMap<u32, i64>,
+    /// `last_weave_through_seq` is the committed **frontier**, not the vault tip
+    /// the tick aimed at, so these fields distinguish a frozen cursor from a
+    /// converging one without consulting wall-clock timestamps.
+    pub last_weave_backlog_seqs: BTreeMap<u32, u64>,
     pub last_weave_pending_parts: BTreeMap<u32, usize>,
     pub last_weave_backlog_growth_ticks: BTreeMap<u32, u32>,
     /// Scheduled post-ingest Reactive drift production and delivery (#1680).
@@ -627,22 +625,31 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
         Ok(mut guard) => *guard = Some(weak),
         Err(poisoned) => *poisoned.into_inner() = Some(weak),
     }
-    let registered_at_ns = now_unix_ms()
-        .and_then(|value| value.checked_mul(1_000_000))
-        .and_then(|value| i64::try_from(value).ok());
-    if let Some(registered_at_ns) = registered_at_ns {
-        let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
-            watermarks.entry(panel_version).or_insert(registered_at_ns);
+    let baseline_seq = db
+        .calyx_vault_status()
+        .map_err(|error| error.to_string())
+        .and_then(|status| {
+            status.latest_seq.ok_or_else(|| {
+                "opened Calyx vault status omitted latest_seq while initializing incremental weave"
+                    .to_owned()
+            })
+        });
+    match baseline_seq {
+        Ok(baseline_seq) => {
+            let mut watermarks = match WEAVE_BASE_SEQ.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
+                watermarks.entry(panel_version).or_insert(baseline_seq);
+            }
         }
-    } else {
-        record_failure(
-            "STORAGE_DERIVED_STATE_WEAVE_CLOCK_INVALID",
-            "system time could not be represented as signed Unix nanoseconds while initializing incremental Loom watermarks; unattended weave remains disabled until a valid clock is observed".to_owned(),
-        );
+        Err(error) => record_failure(
+            "STORAGE_DERIVED_STATE_WEAVE_BASELINE_UNAVAILABLE",
+            format!(
+                "could not read the live Calyx MVCC sequence while initializing incremental Loom cursors: {error}"
+            ),
+        ),
     }
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_SOURCE_REGISTERED",
@@ -2807,18 +2814,7 @@ fn drive_scheduled_kernels(
     Ok(())
 }
 
-fn calyx_time_boundary_ns_now() -> Result<i64, String> {
-    let duration = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|error| format!("system clock precedes Unix epoch: {error}"))?;
-    let millis = i64::try_from(duration.as_millis())
-        .map_err(|_| "system time exceeds signed millisecond range".to_owned())?;
-    millis
-        .checked_mul(1_000_000)
-        .ok_or_else(|| "system time exceeds signed nanosecond range".to_owned())
-}
-
-/// Why one tick stopped weaving before it reached `until_ns` (#2085).
+/// Why one tick stopped weaving before it reached the captured vault tip.
 ///
 /// Three stops, deliberately distinguished, because two of them are progress and
 /// one of them is a wall. Collapsing them into "the interval did not finish" is
@@ -2830,13 +2826,13 @@ enum WeaveStop {
     BudgetExhausted { pending_parts: usize },
     /// The bisection needed more bounded parts than one tick may hold.
     MaxParts { pending_parts: usize },
-    /// A single millisecond holds more records than the cap, so no further
-    /// split can separate them. The frontier cannot pass this instant by any
-    /// amount of running — a wall, not a backlog.
+    /// One commit holds more Base identities than the cap, so no sequence split
+    /// can separate them. The frontier cannot pass this commit without a
+    /// measured cap change — a wall, not a backlog.
     IndivisibleInterval {
-        part_since: i64,
-        part_until: i64,
-        records_scanned: usize,
+        after_seq: u64,
+        through_seq: u64,
+        detail: String,
     },
 }
 
@@ -2848,7 +2844,7 @@ enum WeaveStop {
 /// it, so the trend is measured and kept.
 #[derive(Clone, Copy, Debug, Default)]
 struct WeaveBacklogTrend {
-    backlog_ns: i64,
+    backlog_seqs: u64,
     consecutive_growth: u32,
 }
 
@@ -2868,74 +2864,71 @@ const WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT: u32 = 3;
 /// converging on its backlog or losing ground to it.
 ///
 /// Returns the backlog trend after this tick.
-fn record_weave_backlog(panel_version: u32, backlog_ns: i64) -> WeaveBacklogTrend {
+fn record_weave_backlog(panel_version: u32, backlog_seqs: u64) -> WeaveBacklogTrend {
     let mut trends = match WEAVE_BACKLOG_TREND.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     let entry = trends.entry(panel_version).or_default();
-    entry.consecutive_growth = if backlog_ns > entry.backlog_ns {
+    entry.consecutive_growth = if backlog_seqs > entry.backlog_seqs {
         entry.consecutive_growth.saturating_add(1)
     } else {
         0
     };
-    entry.backlog_ns = backlog_ns;
+    entry.backlog_seqs = backlog_seqs;
     let trend = *entry;
     drop(trends);
     trend
 }
 
-/// Commits the frontier of contiguously woven time for one panel (#2085).
+/// Commits the frontier of contiguously woven MVCC sequences for one panel.
 ///
 /// # Why a frontier and not a completion flag
 ///
-/// The interval queue is consumed in strictly ascending time order — a bisection
-/// pushes `[since,mid)` ahead of `[mid,until)`, and both ahead of everything
-/// already queued — so at every moment the parts completed so far cover exactly
-/// `[since_ns, frontier_ns)` with no hole in it. That contiguity is what makes
+/// The interval queue is consumed in strictly ascending sequence order — a
+/// bisection pushes `(after,mid]` ahead of `(mid,through]`, and both ahead of
+/// everything already queued — so completed parts form one prefix with no
+/// hole. That contiguity is what makes
 /// advancing to a partial frontier safe: the invariant the old code actually
 /// needed was *never advance past an unprocessed suffix*, and it enforced that
 /// with the much stronger *never advance unless the whole interval finished*.
 ///
-/// The stronger rule is what diverged. `until_ns` is recomputed to `now()` every
-/// tick while the budget is fixed, so the moment one interval misses the budget
-/// the interval to clear grows by a tick period every tick, forever, and the
-/// bisection makes it worse: a longer interval splits into larger first parts,
-/// which is why the deployed daemon's `completed_parts` decayed 1 → 0 while
-/// `pending_parts` rose 2 → 4 and the watermark sat unmoved for 44 minutes.
+/// The stronger rule is what diverged: the target advances every tick while
+/// the budget is fixed, so discarding a completed prefix makes the work grow
+/// forever.
 /// Committing the frontier makes every tick start strictly ahead of the last,
 /// which is the difference between a loop that converges and one that cannot.
 fn commit_weave_frontier(
     panel_version: u32,
-    since_ns: i64,
-    frontier_ns: i64,
+    after_seq: u64,
+    frontier_seq: u64,
 ) -> Result<(), String> {
-    if frontier_ns <= since_ns {
+    if frontier_seq <= after_seq {
         return Ok(());
     }
-    let mut watermarks = match WEAVE_WATERMARK_NS.lock() {
+    let mut watermarks = match WEAVE_BASE_SEQ.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
     let watermark = watermarks
         .get_mut(&panel_version)
         .ok_or_else(|| format!("panel {panel_version} watermark disappeared before commit"))?;
-    if *watermark != since_ns {
+    if *watermark != after_seq {
         return Err(format!(
-            "panel {panel_version} watermark changed concurrently: expected={since_ns} \
+            "panel {panel_version} Base-sequence cursor changed concurrently: expected={after_seq} \
              actual={watermark}; refusing to overwrite a newer owner"
         ));
     }
-    *watermark = frontier_ns;
+    *watermark = frontier_seq;
     drop(watermarks);
     Ok(())
 }
 
-/// Weaves every record in one panel's new ingest interval without permitting a
-/// record cap to become data loss.
+/// Weaves every changed Base identity in one panel's new sequence interval
+/// without permitting a record cap to become data loss.
 ///
 /// Bounded by a wall-clock budget, and **convergent** under it (#2085): a tick
-/// that cannot reach `until_ns` commits the frontier it did reach and reports
+/// that cannot reach the captured sequence tip commits its frontier and reports
 /// the remaining backlog, rather than discarding the work and starting the same
 /// growing interval again on the next tick.
 /// What one panel's weave achieved, plus any advisory it wants published.
@@ -3022,13 +3015,15 @@ fn weave_panel_subpass(db: &Arc<Db>, panel_version: u32) -> WeaveSubpass {
               convergence classification are a single ordered sequence"
 )]
 fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProgress, String> {
-    // Constellation `created_at` is millisecond-granular. Both ends must be
-    // aligned to that same grid: a fractional watermark would exclude records
-    // created later in the same millisecond but carrying the same stored stamp.
-    // The current millisecond stays open and is picked up on the next tick.
-    let until_ns = calyx_time_boundary_ns_now()?;
-    let since_ns = {
-        let watermarks = match WEAVE_WATERMARK_NS.lock() {
+    let until_seq = db
+        .calyx_vault_status()
+        .map_err(|error| format!("read Calyx weave sequence tip: {error}"))?
+        .latest_seq
+        .ok_or_else(|| {
+            "opened Calyx vault status omitted latest_seq during incremental weave".to_owned()
+        })?;
+    let after_seq = {
+        let watermarks = match WEAVE_BASE_SEQ.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
@@ -3038,20 +3033,20 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             )
         })?
     };
-    if until_ns == since_ns {
+    if until_seq == after_seq {
         return Ok(WeaveProgress {
             records_woven: 0,
             advisory: None,
         });
     }
-    if until_ns < since_ns {
+    if until_seq < after_seq {
         return Err(format!(
-            "regressed system clock at weave boundary: since_ns={since_ns} until_ns={until_ns}"
+            "regressed Calyx MVCC sequence at weave boundary: after_seq={after_seq} until_seq={until_seq}"
         ));
     }
 
     let started = std::time::Instant::now();
-    let mut intervals = VecDeque::from([(since_ns, until_ns)]);
+    let mut intervals = VecDeque::from([(after_seq, until_seq)]);
     let mut completed_parts = 0usize;
     let mut records_woven = 0u64;
     let mut xterm_rows_written = 0usize;
@@ -3069,12 +3064,11 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
     let mut last_xterm_readback = "not_woven".to_owned();
     let mut last_graph_readback = "not_woven".to_owned();
     let mut walked_readbacks = 0_usize;
-    // Exclusive end of contiguously woven time. Every completed part is adjacent
-    // to the last, so this is a position the next tick may safely resume from.
-    let mut frontier_ns = since_ns;
+    // Inclusive tip of the contiguous sequence prefix woven so far.
+    let mut frontier_seq = after_seq;
     let mut stop: Option<WeaveStop> = None;
 
-    while let Some((part_since, part_until)) = intervals.pop_front() {
+    while let Some((part_after, part_through)) = intervals.pop_front() {
         if started.elapsed() >= WEAVE_PANEL_TICK_BUDGET {
             stop = Some(WeaveStop::BudgetExhausted {
                 pending_parts: intervals.len() + 1,
@@ -3090,45 +3084,44 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
 
         let mut params = synapse_calyx::SynapseCalyxWeaveParams::new(panel_version);
         params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
-        params.since_ts_ns = Some(part_since);
-        params.until_ts_ns = Some(part_until);
+        params.after_base_seq = Some(part_after);
+        params.through_base_seq = Some(part_through);
         // Scheduled derived-state maintenance is an explicit background class.
         // It must not initialize a CUDA context or reserve GPU resources while
         // the operator is gaming; CPU probe failure remains a hard error.
         params.math_execution_class = synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu;
         let report = match db.weave_panel_intelligence(params) {
             Ok(report) => report,
+            Err(error)
+                if error.code()
+                    == synapse_calyx::SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED =>
+            {
+                if part_through.saturating_sub(part_after) <= 1 {
+                    stop = Some(WeaveStop::IndivisibleInterval {
+                        after_seq: part_after,
+                        through_seq: part_through,
+                        detail: error.to_string(),
+                    });
+                    break;
+                }
+                let midpoint = part_after + (part_through - part_after) / 2;
+                intervals.push_front((midpoint, part_through));
+                intervals.push_front((part_after, midpoint));
+                continue;
+            }
             Err(error) => {
                 // The parts already woven are durable and contiguous. Discarding
                 // the frontier because a LATER part failed would make every
                 // retry redo them, which is the divergence this function was
                 // repaired for — the failure itself is unchanged and still loud.
-                commit_weave_frontier(panel_version, since_ns, frontier_ns)?;
+                commit_weave_frontier(panel_version, after_seq, frontier_seq)?;
                 return Err(format!(
-                    "{error}; frontier committed at {frontier_ns} after {completed_parts} \
+                    "{error}; Base-sequence frontier committed at {frontier_seq} after {completed_parts} \
                      completed interval part(s), so the retry resumes there rather than at \
-                     {since_ns}"
+                     {after_seq}"
                 ));
             }
         };
-
-        if report.records_scanned > WEAVE_INTERVAL_MAX_RECORDS {
-            // Calyx timestamps are millisecond-granular. Once the interval is a
-            // single millisecond, another split cannot separate its records;
-            // refuse instead of advancing past an unprocessed suffix.
-            if part_until - part_since <= 1_000_000 {
-                stop = Some(WeaveStop::IndivisibleInterval {
-                    part_since,
-                    part_until,
-                    records_scanned: report.records_scanned,
-                });
-                break;
-            }
-            let midpoint = part_since + (part_until - part_since) / 2;
-            intervals.push_front((midpoint, part_until));
-            intervals.push_front((part_since, midpoint));
-            continue;
-        }
 
         // #2076: the weave already classifies directionless (zero-norm) slot
         // vectors out of the cosine lane and reports which records they came
@@ -3150,8 +3143,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             tracing::info!(
                 code = "STORAGE_DERIVED_STATE_WEAVE_ZERO_NORM_EXCLUSIONS",
                 panel_version,
-                since_ns = part_since,
-                until_ns = part_until,
+                after_base_seq = part_after,
+                through_base_seq = part_through,
                 excluded_slot_count = report.knn_zero_norm_exclusions.len(),
                 excluded_records,
                 slots = %slots,
@@ -3176,8 +3169,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             tracing::info!(
                 code = "STORAGE_DERIVED_STATE_WEAVE_AGREEMENT_ZERO_NORM_SKIPS",
                 panel_version,
-                since_ns = part_since,
-                until_ns = part_until,
+                after_base_seq = part_after,
+                through_base_seq = part_through,
                 skipped_pairs = report.agreement_zero_norm_skips,
                 affected_records = report.agreement_zero_norm_records,
                 records_woven = report.records_woven,
@@ -3190,14 +3183,14 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         }
 
         completed_parts += 1;
-        frontier_ns = part_until;
+        frontier_seq = part_through;
         records_woven = records_woven.saturating_add(report.records_woven as u64);
         xterm_rows_written = xterm_rows_written
             .checked_add(report.cross_terms_materialized)
             .ok_or_else(|| {
                 format!(
-                    "panel {panel_version} XTerm write-count overflow after interval \
-                     [{part_since},{part_until}): prior={xterm_rows_written} \
+                    "panel {panel_version} XTerm write-count overflow after sequence interval \
+                     ({part_after},{part_through}]: prior={xterm_rows_written} \
                      part={}",
                     report.cross_terms_materialized
                 )
@@ -3208,7 +3201,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             .ok_or_else(|| {
                 format!(
                     "panel {panel_version} Graph interval write-count overflow for \
-                     [{part_since},{part_until}): agreement={} between_record={}",
+                     ({part_after},{part_through}]: agreement={} between_record={}",
                     report.agreement_edges_persisted, report.between_record_edges_persisted
                 )
             })?;
@@ -3217,7 +3210,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             .ok_or_else(|| {
                 format!(
                     "panel {panel_version} Graph pass write-count overflow after interval \
-                     [{part_since},{part_until}): prior={graph_rows_written} \
+                     ({part_after},{part_through}]: prior={graph_rows_written} \
                      part={part_graph_rows_written}"
                 )
             })?;
@@ -3235,9 +3228,9 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         last_graph_readback = report.graph_cf_rows_readback;
     }
 
-    commit_weave_frontier(panel_version, since_ns, frontier_ns)?;
-    let backlog_ns = until_ns.saturating_sub(frontier_ns);
-    let trend = record_weave_backlog(panel_version, backlog_ns);
+    commit_weave_frontier(panel_version, after_seq, frontier_seq)?;
+    let backlog_seqs = until_seq.saturating_sub(frontier_seq);
+    let trend = record_weave_backlog(panel_version, backlog_seqs);
     let action = match &stop {
         None => "interval_complete",
         Some(WeaveStop::BudgetExhausted { .. }) => "interval_partial_budget",
@@ -3260,8 +3253,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             .last_weave_actions
             .insert(panel_version, action.to_owned());
         readback
-            .last_weave_until_ns
-            .insert(panel_version, frontier_ns);
+            .last_weave_through_seq
+            .insert(panel_version, frontier_seq);
         readback
             .last_weave_records
             .insert(panel_version, records_woven);
@@ -3284,8 +3277,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             .last_weave_global_graph_cf_rows_readback
             .insert(panel_version, last_graph_readback.clone());
         readback
-            .last_weave_backlog_ns
-            .insert(panel_version, backlog_ns);
+            .last_weave_backlog_seqs
+            .insert(panel_version, backlog_seqs);
         readback
             .last_weave_pending_parts
             .insert(panel_version, pending_parts);
@@ -3296,13 +3289,13 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_WEAVE_PASS",
         panel_version,
-        since_ns,
-        until_ns,
-        frontier_ns,
+        after_base_seq = after_seq,
+        until_base_seq = until_seq,
+        frontier_base_seq = frontier_seq,
         action,
         completed_parts,
         pending_parts,
-        backlog_ns,
+        backlog_seqs,
         backlog_growth_ticks = trend.consecutive_growth,
         records_woven,
         xterm_rows_written,
@@ -3315,7 +3308,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "readback=per-panel rows durably written plus explicit vault-global XTerm/Graph CF \
          gauges, each either walked on this pass or proved unchanged by an unmoved commit \
-         sequence (see *_readback); the watermark now stands at frontier_ns"
+         sequence (see *_readback); the cursor now stands at frontier_base_seq"
     );
 
     // --- Classifying the stop: progress, or a wall (#2085) ---
@@ -3332,24 +3325,22 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             advisory: None,
         }),
         Some(WeaveStop::IndivisibleInterval {
-            part_since,
-            part_until,
-            records_scanned,
+            after_seq: blocked_after,
+            through_seq: blocked_through,
+            detail,
         }) => Err(format!(
-            "panel {panel_version} contains {records_scanned} records in the indivisible interval \
-             [{part_since},{part_until}), above cap {WEAVE_INTERVAL_MAX_RECORDS}; the frontier is \
-             committed at {frontier_ns} so the prefix is not re-woven, but no split can separate \
-             this millisecond and the weave cannot pass it; increase the cap only with a measured \
-             memory/latency budget or add a Base-key cursor"
+            "panel {panel_version} has an indivisible over-cap Base commit in sequence interval \
+             ({blocked_after},{blocked_through}]: {detail}; the frontier is committed at \
+             {frontier_seq} so the prefix is not re-woven, but no sequence split can separate \
+             one commit; increase the cap only with a measured memory/latency budget"
         )),
         Some(stop) => {
-            if frontier_ns <= since_ns {
+            if frontier_seq <= after_seq {
                 return Err(format!(
                     "panel {panel_version} completed ZERO bounded interval parts within \
-                     budget_ms={} ({stop:?}); the watermark stands at {since_ns} and the backlog \
-                     is {backlog_ns} ns after {} consecutive ticks of growth, so this panel is not \
-                     converging on its own ingest and needs a larger budget, a smaller record cap, \
-                     or a Base-key cursor",
+                     budget_ms={} ({stop:?}); the Base cursor stands at {after_seq} and the backlog \
+                     is {backlog_seqs} sequence(s) after {} consecutive ticks of growth, so this \
+                     panel is not converging on its own ingest",
                     WEAVE_PANEL_TICK_BUDGET.as_millis(),
                     trend.consecutive_growth,
                 ));
@@ -3357,8 +3348,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             if trend.consecutive_growth >= WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT {
                 return Err(format!(
                     "panel {panel_version} weave backlog has grown on {} consecutive ticks and now \
-                     stands at {backlog_ns} ns ({stop:?}); the frontier advanced from {since_ns} \
-                     to {frontier_ns} this tick, so the pass is making progress but slower than \
+                     stands at {backlog_seqs} sequence(s) ({stop:?}); the frontier advanced from \
+                     {after_seq} to {frontier_seq} this tick, so the pass is making progress but slower than \
                      ingest, and the derived association layer for this panel falls further behind \
                      every tick",
                     trend.consecutive_growth,
@@ -3370,8 +3361,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
                     "STORAGE_DERIVED_STATE_WEAVE_BACKLOG",
                     format!(
                         "panel {panel_version} wove {completed_parts} bounded interval part(s) and \
-                         advanced its watermark from {since_ns} to {frontier_ns}, leaving \
-                         {backlog_ns} ns of backlog across {pending_parts} pending part(s) \
+                         advanced its Base cursor from {after_seq} to {frontier_seq}, leaving \
+                         {backlog_seqs} sequence(s) of backlog across {pending_parts} pending part(s) \
                          ({stop:?}); the next tick resumes at the frontier rather than re-weaving \
                          the prefix, so this is bounded catch-up work and not a maintenance failure"
                     ),
