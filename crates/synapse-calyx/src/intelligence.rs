@@ -5749,70 +5749,129 @@ impl SynapseCalyxVault {
         let max_records = params
             .max_records
             .clamp(1, SYNAPSE_INTELLIGENCE_MAX_RECORDS);
-        let mut records = Vec::new();
-        // The panel-scoped membership sidecar is the selective access path.
-        // `max_records` now bounds point reads within this panel instead of
-        // decoding unrelated rows from the global CxId-ordered Base keyspace.
+        let since_ts_ns = params
+            .since_ts_ns
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    temporal_error(
+                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_DOMAIN",
+                        "the event-time index stores the source_event_time_raw contract as an unsigned Unix-nanosecond value, but since_ts_ns is negative",
+                        "supply a non-negative Unix-nanosecond lower bound",
+                    )
+                })
+            })
+            .transpose()?;
+        let until_ts_ns = params
+            .until_ts_ns
+            .map(|value| {
+                u64::try_from(value).map_err(|_| {
+                    temporal_error(
+                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_DOMAIN",
+                        "the event-time index stores the source_event_time_raw contract as an unsigned Unix-nanosecond value, but until_ts_ns is negative",
+                        "supply a non-negative Unix-nanosecond upper bound",
+                    )
+                })
+            })
+            .transpose()?;
         self.with_panel_read_snapshot(
             params.panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
-            |snapshot| self.walk_panel_base_snapshot(snapshot, params.panel_version, |_snapshot, _key, value| {
-                let constellation = decode_constellation_base(value).map_err(|error| {
-                    SynapseCalyxError::from_calyx("decode Base constellation", &error)
-                })?;
-                if constellation.panel_version != params.panel_version {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                }
-                let Some(secs) = constellation.source_event_time_secs() else {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
-                };
-                if secs.unsigned_abs() > MAX_EXACT_I64_IN_F64 {
-                    return Err(temporal_error(
-                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
-                        "a source event timestamp exceeds the exactly representable f64 integer range",
-                        "repair the source timestamp to a valid Unix-second value within +/- 2^53",
-                    ));
-                }
-                let whole_secs = secs.to_f64().ok_or_else(|| {
-                    temporal_error(
-                        "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
-                        "a validated source event timestamp could not be converted to f64",
-                        "inspect the persisted Base row and repair its source event timestamp",
+            |snapshot| {
+                let indexed = self
+                    .vault
+                    .read_event_time_index_range_snapshot(
+                        snapshot,
+                        params.panel_version,
+                        since_ts_ns,
+                        until_ts_ns,
+                        max_records,
                     )
-                })?;
-                // `activate_temporal_lane` writes the nanosecond stamp and its
-                // whole-second truncation together, so the sub-second part is
-                // already on this row. Reading only the truncation quantised every
-                // occurrence to a 1-second grid and manufactured ties that do not
-                // exist in the source (issue #1893). Prefer the full-precision
-                // stamp, and fail loudly rather than silently using the lossy one
-                // when the two disagree — that is a Base-row integrity defect.
-                let (secs, nanos) = sub_second_event_secs(&constellation, secs, whole_secs)?;
-                let nanos_cmp = i128::from(nanos);
-                if params
-                    .since_ts_ns
-                    .is_some_and(|since| nanos_cmp < i128::from(since))
-                    || params
-                        .until_ts_ns
-                        .is_some_and(|until| nanos_cmp >= i128::from(until))
-                {
-                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx(
+                            &format!(
+                                "read panel {} bounded event-time index",
+                                params.panel_version
+                            ),
+                            &error,
+                        )
+                    })?;
+                let mut records = Vec::with_capacity(indexed.entries.len());
+                for entry in indexed.entries {
+                    records.push(self.event_record_from_index_entry(
+                        snapshot,
+                        params.panel_version,
+                        entry,
+                        group_key,
+                    )?);
                 }
-                let group =
-                    group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
-                if records.len() >= max_records {
-                    return Err(temporal_error(
-                        "SYNAPSE_CALYX_TEMPORAL_SCOPE_EXCEEDS_MAX_RECORDS",
-                        "the requested temporal source-event scope contains more matching records than max_records; returning the membership prefix would be a biased, incomplete measurement",
-                        "narrow since_ts_ns/until_ts_ns or raise max_records within the 20,000-record bound; the estimator will run only when the full requested scope fits",
-                    ));
-                }
-                records.push(EventRecord { secs, nanos, group });
-                Ok(crate::SynapseCalyxWalkStep::Continue)
-            }),
-        )?;
-        records.sort_by(|a, b| a.secs.total_cmp(&b.secs));
-        Ok(records)
+                Ok(records)
+            },
+        )
+    }
+
+    fn event_record_from_index_entry(
+        &self,
+        snapshot: calyx_aster::mvcc::Snapshot,
+        panel_version: u32,
+        entry: calyx_aster::vault::EventTimeIndexEntry,
+        group_key: Option<&str>,
+    ) -> Result<EventRecord, SynapseCalyxError> {
+        let value = self
+            .vault
+            .read_cf_snapshot(snapshot, ColumnFamily::Base, entry.cx_id.as_bytes())
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("read event-time indexed Base constellation {}", entry.cx_id),
+                    &error,
+                )
+            })?
+            .ok_or_else(|| {
+                temporal_error(
+                    "SYNAPSE_CALYX_EVENT_TIME_INDEX_BASE_MISSING",
+                    "the complete event-time index references a Base row absent at the same MVCC snapshot",
+                    "preserve the IndexBtree key and rebuild the derived index after repairing the Base/index atomicity defect",
+                )
+            })?;
+        let constellation = decode_constellation_base(&value)
+            .map_err(|error| SynapseCalyxError::from_calyx("decode Base constellation", &error))?;
+        if constellation.panel_version != panel_version {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_EVENT_TIME_INDEX_PANEL_MISMATCH",
+                "the bounded event-time index references a Base row in another panel at the same MVCC snapshot",
+                "preserve the index and Base bytes and rebuild the affected derived panel index",
+            ));
+        }
+        let Some(whole_secs_i64) = constellation.source_event_time_secs() else {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_EVENT_TIME_INDEX_INACTIVE_ROW",
+                "the bounded event-time index references a Base row whose temporal lane is inactive",
+                "rebuild the event-time index and inspect the Base mutation that failed to remove the stale derived row",
+            ));
+        };
+        if whole_secs_i64.unsigned_abs() > MAX_EXACT_I64_IN_F64 {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_OUT_OF_RANGE",
+                "a source event timestamp exceeds the exactly representable f64 integer range",
+                "repair the source timestamp to a valid Unix-second value within +/- 2^53",
+            ));
+        }
+        let whole_secs = whole_secs_i64.to_f64().ok_or_else(|| {
+            temporal_error(
+                "SYNAPSE_CALYX_TEMPORAL_TIMESTAMP_CONVERSION_FAILED",
+                "a validated source event timestamp could not be converted to f64",
+                "inspect the persisted Base row and repair its source event timestamp",
+            )
+        })?;
+        let (secs, nanos) = sub_second_event_secs(&constellation, whole_secs_i64, whole_secs)?;
+        if nanos != entry.source_event_ns {
+            return Err(temporal_error(
+                "SYNAPSE_CALYX_EVENT_TIME_INDEX_TIMESTAMP_MISMATCH",
+                "the event-time IndexBtree key disagrees with its Base row's source_event_time_raw at the same MVCC snapshot",
+                "preserve both physical rows and rebuild the derived index before running temporal intelligence",
+            ));
+        }
+        let group = group_key.and_then(|key| constellation.metadata_value(key).map(str::to_owned));
+        Ok(EventRecord { secs, nanos, group })
     }
 
     /// Ascending occurrence-time series (seconds) for periodicity/drift/hazard,

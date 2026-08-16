@@ -763,7 +763,14 @@ where
                 "time_index is a reserved derived column family; caller-supplied rows are forbidden because they can forge or corrupt the sole time-to-sequence mapping",
             ));
         }
-        self.commit_rows_locked_inner(rows)
+        if rows.iter().any(super::event_time_index::is_reserved_row) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "the event-time IndexBtree keyspace is reserved derived state; caller-supplied rows are forbidden because they can forge temporal coverage",
+            ));
+        }
+        let predicted = self.rows.current_seq().saturating_add(1);
+        let rows = self.augment_event_time_index_rows_locked(rows, predicted)?;
+        self.commit_rows_locked_inner(&rows)
     }
 
     /// Trusted erasure path for tombstoning existing derived TimeIndex rows.
@@ -780,10 +787,17 @@ where
                 row.value.len()
             )));
         }
-        self.commit_rows_locked_inner(rows)
+        if rows.iter().any(super::event_time_index::is_reserved_row) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "trusted erasure supplied an event-time IndexBtree row directly; Base erasure must derive that tombstone atomically instead",
+            ));
+        }
+        let predicted = self.rows.current_seq().saturating_add(1);
+        let rows = self.augment_event_time_index_rows_locked(rows, predicted)?;
+        self.commit_rows_locked_inner(&rows)
     }
 
-    fn commit_rows_locked_inner(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
+    pub(super) fn commit_rows_locked_inner(&self, rows: &[encode::WriteRow]) -> Result<Seq> {
         if rows.is_empty() {
             // Empty commit: do not advance the seq or stamp a time-index entry.
             return Ok(self.latest_seq());

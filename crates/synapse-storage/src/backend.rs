@@ -6466,6 +6466,15 @@ impl StorageBackend for CalyxBackend {
             "measure native Calyx temporal causality",
             true,
             |vault| {
+                vault
+                    .ensure_event_time_index(params.panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_index_btree",
+                            "ensure exact event-time index before temporal causality",
+                            &source,
+                        )
+                    })?;
                 vault.temporal_causality(params).map_err(|source| {
                     calyx_write_failed(
                         "calyx_assay",
@@ -6505,6 +6514,15 @@ impl StorageBackend for CalyxBackend {
                             )
                         })?;
                 }
+                vault
+                    .ensure_event_time_index(params.panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_index_btree",
+                            "ensure exact event-time index before exhaustive causal map",
+                            &source,
+                        )
+                    })?;
                 vault
                     .temporal_causal_map(params, fdr_alpha)
                     .map_err(|source| {
@@ -6550,6 +6568,15 @@ impl StorageBackend for CalyxBackend {
             "measure native Calyx temporal periodicity",
             true,
             |vault| {
+                vault
+                    .ensure_event_time_index(params.panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_index_btree",
+                            "ensure exact event-time index before periodicity",
+                            &source,
+                        )
+                    })?;
                 vault.temporal_periodicity(params).map_err(|source| {
                     calyx_write_failed(
                         "calyx_assay",
@@ -6570,6 +6597,15 @@ impl StorageBackend for CalyxBackend {
             "measure native Calyx temporal drift",
             true,
             |vault| {
+                vault
+                    .ensure_event_time_index(params.panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_index_btree",
+                            "ensure exact event-time index before drift",
+                            &source,
+                        )
+                    })?;
                 vault.temporal_drift(params).map_err(|source| {
                     calyx_write_failed(
                         "calyx_assay",
@@ -6590,6 +6626,15 @@ impl StorageBackend for CalyxBackend {
             "measure native Calyx temporal overdue hazard",
             true,
             |vault| {
+                vault
+                    .ensure_event_time_index(params.panel_version)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_index_btree",
+                            "ensure exact event-time index before overdue hazard",
+                            &source,
+                        )
+                    })?;
                 vault.temporal_hazard(params).map_err(|source| {
                     calyx_write_failed(
                         "calyx_assay",

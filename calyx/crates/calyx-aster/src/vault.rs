@@ -22,6 +22,7 @@ mod cursor;
 mod dedup_commit;
 mod durable;
 pub mod encode;
+mod event_time_index;
 mod gc_bridge;
 pub mod grant;
 mod grounded_observation;
@@ -82,6 +83,11 @@ pub use backup::{
 pub use commit::CALYX_DURABLE_COMMIT_RECONCILIATION_REQUIRED;
 pub(crate) use compaction_bridge::LIVE_COMPACTION_TRIGGER_FILES;
 pub use compaction_bridge::VaultCompactionScheduler;
+pub use event_time_index::{
+    CALYX_EVENT_TIME_INDEX_INCOMPLETE, CALYX_EVENT_TIME_INDEX_INVALID,
+    CALYX_EVENT_TIME_INDEX_STALE, EventTimeIndexBackfill, EventTimeIndexEntry, EventTimeIndexRange,
+    EventTimeIndexStatus,
+};
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use grounded_observation::{
     CALYX_ASTER_GROUNDED_OBSERVATION_REVISION_CONFLICT, GroundedObservationBatchCommit,

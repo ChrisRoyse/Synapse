@@ -64,6 +64,7 @@ use calyx_aster::recurrence::{
 };
 pub use calyx_aster::vault::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
+    EventTimeIndexBackfill, EventTimeIndexStatus,
 };
 use calyx_aster::vault::{
     AsterVault, MultiCxAnchorBatchOutcome, PutDisposition, RecoveryProgressHook,
@@ -4029,6 +4030,50 @@ pub struct SynapseCalyxBaseSourcePointer {
 }
 
 impl SynapseCalyxVault {
+    /// Returns the fail-closed completeness state of the native ordered
+    /// `(panel, source_event_ns, cx_id)` secondary index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx error when the panel is invalid or the
+    /// physical completeness marker is malformed or unreadable.
+    pub fn event_time_index_status(
+        &self,
+        panel_version: u32,
+    ) -> Result<EventTimeIndexStatus, SynapseCalyxError> {
+        self.vault
+            .event_time_index_status(panel_version)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("read panel {panel_version} event-time index status"),
+                    &error,
+                )
+            })
+    }
+
+    /// Populates historical event-time rows resumably and publishes
+    /// completeness only after an independent Base-vs-IndexBtree
+    /// reconciliation at one exact panel watermark.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured Calyx error when Base/index bytes disagree,
+    /// temporal metadata is malformed, the panel keeps changing through all
+    /// reconciliation attempts, or durable publication fails.
+    pub fn ensure_event_time_index(
+        &self,
+        panel_version: u32,
+    ) -> Result<EventTimeIndexBackfill, SynapseCalyxError> {
+        self.vault
+            .backfill_event_time_index(panel_version)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!("backfill panel {panel_version} event-time index"),
+                    &error,
+                )
+            })
+    }
+
     /// Reads the panel identity and source-row pointer recorded on one Base row.
     ///
     /// This is the exact evidence an exact-match confirmation needs (#1899): a
