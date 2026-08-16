@@ -44,9 +44,9 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-14-absent-target-v21";
+const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-16-document-owner-v22";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "ea9d4ea93914d7d86f9a23b742f47e8cefb7e367480f31b4cdf4ccbca02c35ce";
+    "0d376d90e6d89f5e29845fac2f8ea2e6dd02cc19de33b34c097652e818d07f4c";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;
@@ -2789,6 +2789,10 @@ pub struct ChromeDebuggerClockReadback {
     pub error_count: Option<u64>,
     #[serde(default)]
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub ownership_verified: bool,
+    #[serde(default)]
+    pub descriptor_count: u32,
 }
 
 /// Result of the typed `clock` bridge command: Playwright-style page clock

@@ -300,7 +300,7 @@ struct NormalizedBrowserPageEventsParams {
 #[tool_router(router = browser_clock_events_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script shim for current/future documents; the normal Chrome bridge uses a typed MAIN-world chrome.scripting shim for chrome-tab:* current-document targets. set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status returns current shim state. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script for current/future documents; the normal Chrome bridge uses one exact documentId-bound MAIN-world descriptor transaction for chrome-tab:* targets, refuses collisions, verifies every installed/restored descriptor, and reconciles ownership when navigation destroys the document. set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status returns current ownership state. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_clock(
         &self,
@@ -358,7 +358,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Arm and read target-scoped page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Raw CDP returns Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots, and Target worker/service_worker/shared_worker snapshots. The normal Chrome bridge supports chrome-tab:* current-profile targets through a per-tab chrome.webNavigation ring buffer plus a typed MAIN-world worker shim for current-document worker creation/termination readback. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
+        description = "Arm and read target-scoped page lifecycle, popup/new-page, and worker events for the calling session's owned browser tab. Raw CDP returns Page.domContentEventFired, Page.loadEventFired, Page.lifecycleEvent, Page.frameNavigated, Page.navigatedWithinDocument / SPA route changes, frame loading events, Target page created/attached/destroyed snapshots, and Target worker/service_worker/shared_worker snapshots. The debugger-free normal Chrome bridge serves only an explicitly requested page-only event kind from chrome.webNavigation/chrome.tabs; unfiltered or worker requests fail closed and require a session-owned raw-CDP target, because mutating host Worker constructors is not an observation boundary. Captured live pages include ready-to-pass set_target payloads and are scoped by opener metadata to the armed page target. Background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. Call before navigation, popup creation, or worker creation for gap-free capture, then poll with since_seq=next_cursor."
     )]
     pub async fn browser_page_events(
         &self,
@@ -582,7 +582,7 @@ impl SynapseService {
                     returned = result.returned,
                     page_count = result.pages.len(),
                     worker_count = result.workers.len(),
-                    "readback=chrome.webNavigation+chrome.scripting.executeScript(MAIN worker shim) outcome=list_returned"
+                    "readback=chrome.webNavigation+chrome.tabs(page-only; workers require raw CDP) outcome=list_returned"
                 );
                 return Ok(BrowserPageEventsResponse {
                     session_id: session_id.to_owned(),

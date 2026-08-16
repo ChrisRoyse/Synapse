@@ -3800,7 +3800,7 @@ impl SynapseService {
     }
 
     #[tool(
-        description = "Wait in the calling session's owned browser tab for one of seven predicates, selected by `condition` with the matching nested spec (#1348 — folds the former browser_wait_for_text/load_state/url/selector/function/request/response tools into one). condition=text waits for page text to appear/disappear or a plain timeout (spec `text`); condition=load_state waits for domcontentloaded/load/networkidle (spec `load_state`); condition=url waits until the tab URL matches an exact string/glob/regex (spec `url`); condition=selector waits for a Playwright-style selector to reach attached/visible/hidden/detached using the same engines/options as browser_locate (spec `selector`); condition=function polls a JavaScript predicate until truthy (spec `function`); condition=request/response wait for a captured network request/response matching url/method/status/resource_type predicates (spec `request`/`response`). Each spec object is exactly the former standalone tool's parameters. Text/load-state/url/selector/request/response use raw CDP when available or the debugger-free normal Chrome bridge; function is raw-CDP-only and fails before Chrome mutation on a normal bridge target. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. The response field matching `condition` carries that predicate's full result."
+        description = "Wait in the calling session's owned browser tab for one of seven predicates, selected by `condition` with the matching nested spec (#1348 — folds the former browser_wait_for_text/load_state/url/selector/function/request/response tools into one). condition=text waits for page text to appear/disappear or a plain timeout (spec `text`); condition=load_state waits for domcontentloaded/load/networkidle (spec `load_state`); condition=url waits until the tab URL matches an exact string/glob/regex (spec `url`); condition=selector waits for a Playwright-style selector to reach attached/visible/hidden/detached using the same engines/options as browser_locate (spec `selector`); condition=function polls a JavaScript predicate until truthy (spec `function`); condition=request/response wait for a captured network request/response matching url/method/status/resource_type predicates (spec `request`/`response`). Each spec object is exactly the former standalone tool's parameters. Text/load-state/url/selector/request/response use raw CDP when available or the debugger-free normal Chrome bridge; normal-bridge load/network waits use Chrome's native webNavigation/webRequest lifecycle and never wrap host fetch/XMLHttpRequest. Function is raw-CDP-only and fails before Chrome mutation on a normal bridge target. Timeouts return BROWSER_WAIT_TIMEOUT. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab. The response field matching `condition` carries that predicate's full result."
     )]
     pub async fn browser_wait_for(
         &self,
@@ -8761,7 +8761,7 @@ impl SynapseService {
                     max_in_flight_requests = waited.max_in_flight_requests,
                     in_flight_requests = waited.in_flight_requests,
                     target_url = %waited.url,
-                    "readback=chrome.webNavigation+chrome.scripting.executeScript(load-state polling) outcome=wait_satisfied"
+                    "readback=chrome.tabs+chrome.webNavigation+chrome.webRequest(request lifecycle) outcome=wait_satisfied"
                 );
                 return Ok(BrowserWaitForLoadStateResponse {
                     session_id: session_id.to_owned(),
@@ -9087,8 +9087,9 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
-                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_request)"
-                        .to_owned(),
+                    readback_backend:
+                        "chrome.webRequest request lifecycle ring buffer(browser_wait_for_request)"
+                            .to_owned(),
                     backend_tier_used: "chrome_tabs_extension".to_owned(),
                     required_foreground: false,
                 });
@@ -9234,8 +9235,9 @@ impl SynapseService {
                     polling_interval_ms: wait.polling_interval_ms,
                     poll_count: waited.poll_count,
                     matched_entry: chrome_bridge_network_entry_to_wire(matched_entry),
-                    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer(browser_wait_for_response)"
-                        .to_owned(),
+                    readback_backend:
+                        "chrome.webRequest request lifecycle ring buffer(browser_wait_for_response)"
+                            .to_owned(),
                     backend_tier_used: "chrome_tabs_extension".to_owned(),
                     required_foreground: false,
                 });

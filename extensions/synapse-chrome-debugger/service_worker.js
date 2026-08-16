@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-14-absent-target-v21";
-const BRIDGE_DECLARED_BUILD_SHA256 = "ea9d4ea93914d7d86f9a23b742f47e8cefb7e367480f31b4cdf4ccbca02c35ce";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-16-document-owner-v22";
+const BRIDGE_DECLARED_BUILD_SHA256 = "0d376d90e6d89f5e29845fac2f8ea2e6dd02cc19de33b34c097652e818d07f4c";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -207,6 +207,10 @@ const BINDING_DEBUGGER_SESSIONS = new Map();
 const DIALOG_DEBUGGER_SESSIONS = new Map();
 const FILE_CHOOSER_DEBUGGER_SESSIONS = new Map();
 const CLOCK_INSTALLED_TABS = new Set();
+// Exact owner descriptors for the sole intentional MAIN-world mutation. The
+// durable ledger persists the same rows; a tab id alone is not a document
+// identity because Chrome reuses frame/tab ids across navigations.
+const CLOCK_DOCUMENT_OWNERS = new Map();
 const DIALOG_AUTO_HANDLE_IN_FLIGHT = new Set();
 let DURABLE_MUTATION_OWNERS_ENABLED = true;
 let DURABLE_MUTATION_DISABLE_SEQUENCE = 0;
@@ -224,7 +228,7 @@ let IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT = 0;
 let OPERATOR_PANIC_DISABLE_ADMISSION_TAIL = Promise.resolve();
 let DURABLE_OWNER_PERSIST_TAIL = Promise.resolve();
 const DURABLE_OWNER_STORAGE_KEY = "synapseOperatorPanicDurableOwnerLedgerV4";
-const DURABLE_OWNER_STORAGE_SCHEMA_VERSION = 6;
+const DURABLE_OWNER_STORAGE_SCHEMA_VERSION = 7;
 const DURABLE_OWNER_STORAGE_CHANGE_TIMEOUT_MS = 5000;
 const LEGACY_DURABLE_OWNER_SCHEMA5_ARCHIVE_KEY =
   "synapseOperatorPanicDurableOwnerLedgerSchema5ArchiveV1";
@@ -1561,7 +1565,7 @@ function normalizeDurableOwnerLedger(value) {
     throw new Error("durable owner ledger is not an object");
   }
   const source = value;
-  if (![2, 4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
+  if (![2, 4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
     throw new Error(`durable owner ledger version is unsupported: ${String(source.version)}`);
   }
   if (source.version === 2 && source.inFlightMutation) {
@@ -1603,6 +1607,13 @@ function normalizeDurableOwnerLedger(value) {
       throw new Error(`durable owner ledger ${field} is not an array`);
     }
   }
+  if (source.version === DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
+    for (const entry of source.clockTabs) {
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+        throw new Error("durable owner ledger clockTabs contains a non-descriptor row");
+      }
+    }
+  }
   if (source.inFlightMutation !== null &&
       (!source.inFlightMutation || typeof source.inFlightMutation !== "object" ||
        Array.isArray(source.inFlightMutation))) {
@@ -1628,7 +1639,7 @@ function normalizeDurableOwnerLedger(value) {
     }
     ledger.inFlightMutation = { id, kind, activitySequence, workerBootId };
   }
-  if ([4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
+  if ([4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
     if (!Number.isSafeInteger(source.commandTerminalSequence) ||
         source.commandTerminalSequence < 0) {
       throw new Error("durable owner ledger command terminal sequence is malformed");
@@ -1659,7 +1670,7 @@ function normalizeDurableOwnerLedger(value) {
       ? null
       : normalizeStoredCommandTerminalAck(source.lastCommandTerminalAck);
   }
-  if (source.version === DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
+  if ([6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(source.version)) {
     ledger.legacySchema5Migration = normalizeLegacySchema5MigrationMetadata(
       source.legacySchema5Migration
     );
@@ -1747,13 +1758,55 @@ function normalizeDurableOwnerLedger(value) {
     });
   }
   ledger.openedTabs = Array.from(openedTabsById.values());
-  for (const field of ["dialogTabs", "fileChooserTabs", "clockTabs"]) {
+  for (const field of ["dialogTabs", "fileChooserTabs"]) {
     const normalized = source[field].map(normalizeStoredTabId);
     if (normalized.some((tabId) => tabId === null)) {
       throw new Error(`durable owner ledger ${field} contains an invalid tab id`);
     }
     ledger[field] = Array.from(new Set(normalized));
   }
+  const clockOwnersByTab = new Map();
+  for (const raw of source.clockTabs) {
+    if (source.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION) {
+      const tabId = normalizeStoredTabId(raw);
+      if (tabId === null) {
+        throw new Error("durable owner ledger legacy clockTabs contains an invalid tab id");
+      }
+      clockOwnersByTab.set(tabId, {
+        tabId,
+        targetId: targetIdForTabId(tabId),
+        documentId: null,
+        clockVersion: "legacy-unbound",
+        installedAtUnixMs: 0
+      });
+      continue;
+    }
+    const tabId = normalizeStoredTabId(raw?.tabId);
+    const targetId = String(raw?.targetId || "").trim();
+    const documentId = raw?.documentId === null
+      ? null
+      : String(raw?.documentId || "").trim();
+    const clockVersion = String(raw?.clockVersion || "").trim();
+    const installedAtUnixMs = Number(raw?.installedAtUnixMs);
+    const legacyUnbound = documentId === null && clockVersion === "legacy-unbound";
+    if (tabId === null || targetId !== targetIdForTabId(tabId) ||
+        (!legacyUnbound && !documentId) || !clockVersion ||
+        !Number.isSafeInteger(installedAtUnixMs) || installedAtUnixMs < 0 ||
+        (legacyUnbound && installedAtUnixMs !== 0)) {
+      throw new Error("durable owner ledger clockTabs contains a malformed descriptor row");
+    }
+    if (clockOwnersByTab.has(tabId)) {
+      throw new Error(`durable owner ledger clockTabs contains duplicate tab ${tabId}`);
+    }
+    clockOwnersByTab.set(tabId, {
+      tabId,
+      targetId,
+      documentId,
+      clockVersion,
+      installedAtUnixMs
+    });
+  }
+  ledger.clockTabs = Array.from(clockOwnersByTab.values());
   for (const field of [
     "viewportOverrides",
     "deviceOverrides",
@@ -1863,7 +1916,7 @@ function durableOwnerLedgerTabIds(ledger = DURABLE_OWNER_LEDGER) {
   for (const entry of ledger.unresolvedDebuggerCommandTimeouts) add(entry.tabId);
   for (const tabId of ledger.dialogTabs) add(tabId);
   for (const tabId of ledger.fileChooserTabs) add(tabId);
-  for (const tabId of ledger.clockTabs) add(tabId);
+  for (const entry of ledger.clockTabs) add(entry.tabId);
   for (const entry of ledger.executedInitScriptEffects) add(entry.tabId);
   for (const field of [
     "viewportOverrides",
@@ -2240,7 +2293,7 @@ async function migrateLegacySchema5DurableOwnerLedger(
   const actualJson = canonicalDurableOwnerJson(persistedLedger);
   if (actualJson !== expectedJson) {
     throw new Error(
-      "schema-5 to schema-6 durable owner migration postcondition failed; " +
+      "schema-5 to schema-7 durable owner migration postcondition failed; " +
         `expected_sha256=${await sha256HexText(expectedJson)} ` +
         `actual_sha256=${await sha256HexText(actualJson)}`
     );
@@ -2263,7 +2316,7 @@ async function migrateLegacySchema5DurableOwnerLedger(
     );
     if (!legacyAbsent || currentJson !== expectedJson) {
       throw new Error(
-        "schema-5 migration cleanup postcondition failed; canonical schema-6 must " +
+        "schema-5 migration cleanup postcondition failed; canonical schema-7 must " +
           "remain exact and the legacy source key must be absent; " +
           `legacy_absent=${legacyAbsent}`
       );
@@ -2277,7 +2330,7 @@ async function migrateLegacySchema5DurableOwnerLedger(
     ledger: persistedLedger,
     readback: {
       migrated: true,
-      reason: "validated_quiescent_schema_5_to_schema_6",
+      reason: "validated_quiescent_schema_5_to_schema_7",
       source_revision: analysis.sourceRevision,
       accepted_revision: persistedLedger.revision,
       source_terminal_sequence: analysis.sourceTerminalSequence,
@@ -2296,7 +2349,7 @@ async function reconcileInterruptedLegacySchema5Migration(
   archiveStored
 ) {
   const canonicalLedger = normalizeDurableOwnerLedger(canonicalStored);
-  if (canonicalStored?.version !== DURABLE_OWNER_STORAGE_SCHEMA_VERSION ||
+  if (![6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(canonicalStored?.version) ||
       legacyStored?.version !== 5 || !canonicalLedger.legacySchema5Migration) {
     throw new Error(
       "canonical and legacy durable owner rows do not form a schema-5 migration pair; " +
@@ -2315,7 +2368,7 @@ async function reconcileInterruptedLegacySchema5Migration(
   const actualJson = canonicalDurableOwnerJson(canonicalLedger);
   if (actualJson !== expectedJson) {
     throw new Error(
-      "canonical schema-6 row is not the exact one-revision product of the retained " +
+      "canonical schema-7 row is not the exact one-revision product of the retained " +
         "schema-5 source; refusing ambiguous authority; " +
         `expected_sha256=${await sha256HexText(expectedJson)} ` +
         `actual_sha256=${await sha256HexText(actualJson)}`
@@ -2338,7 +2391,7 @@ async function reconcileInterruptedLegacySchema5Migration(
   );
   if (!legacyAbsent || canonicalDurableOwnerJson(persistedLedger) !== actualJson) {
     throw new Error(
-      "interrupted schema-5 migration cleanup postcondition failed; canonical schema-6 " +
+      "interrupted schema-5 migration cleanup postcondition failed; canonical schema-7 " +
         `must remain exact and legacy source must be absent; legacy_absent=${legacyAbsent}`
     );
   }
@@ -2347,7 +2400,7 @@ async function reconcileInterruptedLegacySchema5Migration(
     readback: {
       migrated: true,
       reconciled_interrupted_migration: true,
-      reason: "exact_one_revision_schema_5_to_schema_6_migration_product",
+      reason: "exact_one_revision_schema_5_to_schema_7_migration_product",
       source_revision: analysis.sourceRevision,
       accepted_revision: persistedLedger.revision,
       source_terminal_sequence: analysis.sourceTerminalSequence,
@@ -2365,7 +2418,7 @@ async function verifyLegacySchema5MigrationArchive(metadata, archive) {
   if (!metadata) {
     if (archive !== undefined) {
       throw new Error(
-        "durable owner schema-5 archive exists without canonical schema-6 migration metadata; " +
+        "durable owner schema-5 archive exists without canonical schema-7 migration metadata; " +
           "refusing ambiguous authority"
       );
     }
@@ -2379,7 +2432,7 @@ async function verifyLegacySchema5MigrationArchive(metadata, archive) {
       metadata.sourceTerminalSequence !== analysis.sourceTerminalSequence ||
       metadata.archivedAtUnixMs !== archive.archivedAtUnixMs) {
     throw new Error(
-      "canonical schema-6 migration metadata contradicts the immutable schema-5 archive"
+      "canonical schema-7 migration metadata contradicts the immutable schema-5 archive"
     );
   }
   return {
@@ -2397,7 +2450,7 @@ async function verifyLegacySchema5MigrationArchive(metadata, archive) {
 }
 
 async function reconcileInterruptedDurableOwnerMigration(v4Stored, v2Stored) {
-  if (![4, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(v4Stored?.version) ||
+  if (![4, 6, DURABLE_OWNER_STORAGE_SCHEMA_VERSION].includes(v4Stored?.version) ||
       v2Stored?.version !== 2) {
     throw new Error(
       "both durable owner ledger keys exist but do not carry exact canonical/v2 versions; " +
@@ -3012,8 +3065,9 @@ async function restoreDurableOwnerLedger() {
       IMMEDIATE_OPERATOR_PANIC_DISABLE_REQUEST_COUNT === 0;
     DURABLE_MUTATION_DISABLE_SEQUENCE = DURABLE_OWNER_LEDGER.disableSequence;
     if (DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED) {
-      for (const tabId of DURABLE_OWNER_LEDGER.clockTabs) {
-        CLOCK_INSTALLED_TABS.add(tabId);
+      for (const owner of DURABLE_OWNER_LEDGER.clockTabs) {
+        CLOCK_INSTALLED_TABS.add(owner.tabId);
+        CLOCK_DOCUMENT_OWNERS.set(owner.tabId, { ...owner });
       }
       hydrateDurableOverrideMaps();
     }
@@ -3039,7 +3093,7 @@ async function restoreDurableOwnerLedger() {
             DURABLE_OWNER_STORAGE_SCHEMA_VERSION ||
           migrationReadback?.[LEGACY_DURABLE_OWNER_LOCAL_STORAGE_KEY] !== undefined) {
         throw new Error(
-          "durable owner ledger schema migration postcondition failed; canonical schema-6 " +
+          "durable owner ledger schema migration postcondition failed; canonical schema-7 " +
             "must exist and the legacy v2 key must be absent after the verified write"
         );
       }
@@ -3128,10 +3182,19 @@ function mergeLiveOwnersIntoDurableLedger() {
       .filter(([, session]) => session?.interceptEnabled)
       .map(([tabId]) => tabId)
   ]));
-  DURABLE_OWNER_LEDGER.clockTabs = Array.from(new Set([
-    ...DURABLE_OWNER_LEDGER.clockTabs,
-    ...CLOCK_INSTALLED_TABS
-  ]));
+  const clockOwnersByTab = new Map(
+    DURABLE_OWNER_LEDGER.clockTabs.map((entry) => [entry.tabId, entry])
+  );
+  for (const tabId of CLOCK_INSTALLED_TABS) {
+    const owner = CLOCK_DOCUMENT_OWNERS.get(tabId);
+    if (!owner) {
+      throw new Error(
+        `clock mutation owner for tab ${tabId} has no exact document descriptor`
+      );
+    }
+    clockOwnersByTab.set(tabId, { ...owner });
+  }
+  DURABLE_OWNER_LEDGER.clockTabs = Array.from(clockOwnersByTab.values());
   const mergeOverrideMap = (field, map, valueName = "baseline") => {
     const byTab = new Map(DURABLE_OWNER_LEDGER[field].map((entry) => [entry.tabId, entry]));
     for (const [tabId, value] of map.entries()) {
@@ -3234,6 +3297,7 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   DIALOG_DEBUGGER_SESSIONS.delete(tabId);
   FILE_CHOOSER_DEBUGGER_SESSIONS.delete(tabId);
   CLOCK_INSTALLED_TABS.delete(tabId);
+  CLOCK_DOCUMENT_OWNERS.delete(tabId);
   VIEWPORT_BASELINE_BY_TAB.delete(tabId);
   DEVICE_BASELINE_BY_TAB.delete(tabId);
   GEOLOCATION_OVERRIDE_BY_TAB.delete(tabId);
@@ -3262,7 +3326,7 @@ function pruneDurableOwnerLedgerForClosedTab(tabId) {
   DURABLE_OWNER_LEDGER.fileChooserTabs = DURABLE_OWNER_LEDGER.fileChooserTabs
     .filter((candidate) => candidate !== tabId);
   DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-    .filter((candidate) => candidate !== tabId);
+    .filter((candidate) => candidate.tabId !== tabId);
   for (const field of [
     "viewportOverrides",
     "deviceOverrides",
@@ -3339,6 +3403,55 @@ function enqueueInitScriptEffectNavigationReconcile(tabId) {
       recordDurableOwnerStateFailure(
         "persist_init_script_navigation_reconciliation",
         `persist init-script navigation reconciliation failed: ${errorMessage(error)}`
+      );
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
+    }
+  });
+  COMMAND_EXECUTION_TAIL = queued.catch(() => undefined);
+}
+
+function enqueueClockDocumentNavigationReconcile(tabId, committedDocumentId) {
+  const queued = COMMAND_EXECUTION_TAIL.then(async () => {
+    await DURABLE_OWNER_STATE_READY;
+    if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+      DURABLE_MUTATION_OWNERS_ENABLED = false;
+      UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = Math.max(
+        1,
+        UNRESOLVED_WORKER_RESTART_MUTATION_COUNT
+      );
+      recordDurableOwnerSecondaryFailure(
+        "clock_navigation_reconciliation_skipped",
+        `durable owner state is unavailable; tab=${tabId} ` +
+          `committed_document=${String(committedDocumentId || "missing")}`
+      );
+      return;
+    }
+    const owner = CLOCK_DOCUMENT_OWNERS.get(tabId) ||
+      DURABLE_OWNER_LEDGER.clockTabs.find((entry) => entry.tabId === tabId) ||
+      null;
+    if (!owner) {
+      return;
+    }
+    if (owner.documentId && owner.documentId === committedDocumentId) {
+      return;
+    }
+    // A committed main-frame document destroys every property owned in the old
+    // document. Reconcile that physical lifecycle instead of attempting to
+    // uninstall against the new, unrelated page.
+    CLOCK_INSTALLED_TABS.delete(tabId);
+    CLOCK_DOCUMENT_OWNERS.delete(tabId);
+    DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+      .filter((entry) => entry.tabId !== tabId);
+    try {
+      await persistDurableOwnerLedger({ mergeLiveOwners: true });
+    } catch (error) {
+      recordDurableOwnerStateFailure(
+        "persist_clock_navigation_reconciliation",
+        `persist clock navigation reconciliation failed: tab=${tabId} ` +
+          `old_document=${String(owner.documentId || "legacy-unbound")} ` +
+          `committed_document=${String(committedDocumentId || "missing")} ` +
+          `storage_error=${errorMessage(error)}`
       );
       DURABLE_MUTATION_OWNERS_ENABLED = false;
       UNRESOLVED_WORKER_RESTART_MUTATION_COUNT = 1;
@@ -3788,6 +3901,12 @@ if (chrome.webNavigation?.onCommitted?.addListener) {
     recordWebNavigationPageEvent("framenavigated", details, {
       navigation_type: webNavigationTransition(details)
     });
+    if (details?.frameId === 0 && Number.isSafeInteger(details?.tabId)) {
+      enqueueClockDocumentNavigationReconcile(
+        details.tabId,
+        details?.documentId == null ? null : String(details.documentId)
+      );
+    }
     postWebNavigationEvent("webNavigation.onCommitted", details).catch((error) => {
       console.error(`Synapse onCommitted event persistence failed: ${errorMessage(error)}`);
     });
@@ -3849,6 +3968,12 @@ if (chrome.webRequest?.onBeforeRequest?.addListener) {
 if (chrome.webRequest?.onHeadersReceived?.addListener) {
   chrome.webRequest.onHeadersReceived.addListener(
     (details) => recordWebRequestHeadersReceived(details),
+    { urls: ["<all_urls>"] }
+  );
+}
+if (chrome.webRequest?.onBeforeRedirect?.addListener) {
+  chrome.webRequest.onBeforeRedirect.addListener(
+    (details) => recordWebRequestRedirect(details),
     { urls: ["<all_urls>"] }
   );
 }
@@ -6113,6 +6238,16 @@ async function handleWaitForFunction(params) {
 }
 
 async function handleWaitForLoadState(params) {
+  if (!chrome.webRequest?.onBeforeRequest?.addListener ||
+      !chrome.webRequest?.onBeforeRedirect?.addListener ||
+      !chrome.webRequest?.onCompleted?.addListener ||
+      !chrome.webRequest?.onErrorOccurred?.addListener) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      "load-state waits require the complete chrome.webRequest request lifecycle; " +
+        "onBeforeRequest/onBeforeRedirect/onCompleted/onErrorOccurred are not all available"
+    );
+  }
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const state = normalizeWaitForLoadStateState(params.state);
   const timeoutMs = normalizeWaitTimeout(params.timeoutMs);
@@ -6120,6 +6255,9 @@ async function handleWaitForLoadState(params) {
   const startedAt = Date.now();
   const initialState = await tabPageState(selected.tabId, selected.target);
   const { buffer } = ensurePageEventBuffer(selected.tabId, initialState);
+  const { buffer: networkBuffer } = ensureNetworkEventBuffer(selected.tabId, initialState);
+  const networkStartSeq = networkBuffer.nextSeq;
+  let maxInFlightRequests = networkBuffer.inFlightRequests;
   let pollCount = 0;
   let last = null;
   while (true) {
@@ -6127,8 +6265,16 @@ async function handleWaitForLoadState(params) {
     const pageState = await tabPageState(selected.tabId, selected.target);
     updatePageSnapshot(buffer, pageState);
     const events = loadStateEventSummary(buffer, startedAt);
-    const probe = await loadStateProbe(selected);
-    last = loadStatePollSummary(pageState, probe, events);
+    maxInFlightRequests = Math.max(
+      maxInFlightRequests,
+      Number(networkBuffer.inFlightRequests || 0)
+    );
+    const network = loadStateNetworkSummary(
+      networkBuffer,
+      networkStartSeq,
+      maxInFlightRequests
+    );
+    last = loadStatePollSummary(pageState, network, events);
     const conditionMet = loadStateConditionMet(state, last);
     const elapsed = elapsedSince(startedAt);
     if (conditionMet) {
@@ -6217,17 +6363,25 @@ async function handleWaitForUrl(params) {
 }
 
 async function handleWaitForNetwork(params, requireResponse) {
+  if (!chrome.webRequest?.onBeforeRequest?.addListener ||
+      !chrome.webRequest?.onBeforeRedirect?.addListener ||
+      !chrome.webRequest?.onCompleted?.addListener ||
+      !chrome.webRequest?.onErrorOccurred?.addListener) {
+    throw bridgeError(
+      ERROR_ATTACH_FAILED,
+      "network waits require the complete chrome.webRequest request lifecycle; " +
+        "onBeforeRequest/onBeforeRedirect/onCompleted/onErrorOccurred are not all available"
+    );
+  }
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const wait = normalizeNetworkWaitParams(params, requireResponse);
   const state = await tabPageState(selected.tabId, selected.target);
   const { buffer } = ensureNetworkEventBuffer(selected.tabId, state);
-  const recorder = await ensureInPageNetworkRecorder(selected.tabId);
   const startSeq = buffer.nextSeq;
   const startedAt = Date.now();
   let pollCount = 0;
   while (true) {
     pollCount += 1;
-    await mergeInPageNetworkEvents(selected.tabId, buffer, recorder);
     const matched = findNetworkWaitEntry(buffer, wait, requireResponse, startSeq);
     const elapsed = elapsedSince(startedAt);
     if (matched) {
@@ -6301,10 +6455,34 @@ async function handleClock(params) {
     );
   }
   const state = await tabPageState(selected.tabId, selected.target);
+  let documentReadback;
+  try {
+    documentReadback = await mainFrameDocumentReadback(selected.tabId);
+  } catch (error) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `clock could not bind tab ${selected.tabId} to one committed main-frame document: ${errorMessage(error)}`
+    );
+  }
+  const existingOwner = CLOCK_DOCUMENT_OWNERS.get(selected.tabId) ||
+    DURABLE_OWNER_LEDGER.clockTabs.find((entry) => entry.tabId === selected.tabId) ||
+    null;
+  if (existingOwner && existingOwner.documentId !== documentReadback.document_id) {
+    throw bridgeError(
+      ERROR_ACTION_TARGET_INVALID,
+      `clock owner generation mismatch for tab ${selected.tabId}: ` +
+        `owned_document=${String(existingOwner.documentId || "legacy-unbound")} ` +
+        `current_document=${documentReadback.document_id}; ` +
+        "the old document must be reconciled before touching the current page"
+    );
+  }
   let injected;
   try {
     injected = await executeScriptMutation({
-      target: { tabId: selected.tabId },
+      target: {
+        tabId: selected.tabId,
+        documentIds: [documentReadback.document_id]
+      },
       world: "MAIN",
       func: runClockInPage,
       args: [{
@@ -6321,7 +6499,20 @@ async function handleClock(params) {
     );
   }
   const frameResults = frameExecutionResults(injected);
-  const first = frameResults.find((frame) => frame.result) || null;
+  const executionReadback = frameResults.map((frame) => ({
+    frame_id: frame.frame_id,
+    document_id: frame.document_id
+  }));
+  if (frameResults.length !== 1 || frameResults[0]?.frame_id !== 0 ||
+      frameResults[0]?.document_id !== documentReadback.document_id) {
+    throw bridgeError(
+      ERROR_AXTREE_FAILED,
+      `clock document-bound execution contradicted its target: tab=${selected.tabId} ` +
+        `expected_document=${documentReadback.document_id} ` +
+        `actual_results=${JSON.stringify(executionReadback)}`
+    );
+  }
+  const first = frameResults[0];
   const result = first?.result;
   if (!result || typeof result !== "object") {
     throw bridgeError(ERROR_AXTREE_FAILED, "chrome.scripting.executeScript clock returned no structured result");
@@ -6334,10 +6525,30 @@ async function handleClock(params) {
   }
   if (operation === "install") {
     CLOCK_INSTALLED_TABS.add(selected.tabId);
+    const owner = {
+      tabId: selected.tabId,
+      targetId: state.target_id || selected.target.id,
+      documentId: documentReadback.document_id,
+      clockVersion: String(result.readback?.version || ""),
+      installedAtUnixMs: Number.isSafeInteger(result.installed_at_unix_ms)
+        ? result.installed_at_unix_ms
+        : 0
+    };
+    if (!owner.clockVersion || owner.installedAtUnixMs <= 0) {
+      throw bridgeError(
+        ERROR_AXTREE_FAILED,
+        "clock install returned no exact version/installation generation; owner was not accepted"
+      );
+    }
+    CLOCK_DOCUMENT_OWNERS.set(selected.tabId, owner);
+    DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
+      .filter((entry) => entry.tabId !== selected.tabId);
+    DURABLE_OWNER_LEDGER.clockTabs.push({ ...owner });
   } else if (operation === "uninstall") {
     CLOCK_INSTALLED_TABS.delete(selected.tabId);
+    CLOCK_DOCUMENT_OWNERS.delete(selected.tabId);
     DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-      .filter((tabId) => tabId !== selected.tabId);
+      .filter((entry) => entry.tabId !== selected.tabId);
   }
   return {
     extension_id: chrome.runtime.id,
@@ -6352,7 +6563,7 @@ async function handleClock(params) {
     url: result.url || state.url || "",
     title: result.title || state.title || "",
     ready_state: result.ready_state || state.ready_state || "",
-    readback_backend: "chrome.scripting.executeScript(MAIN synapse clock shim)",
+    readback_backend: "chrome.scripting.executeScript(MAIN exact document-bound clock transaction)",
     backend_tier_used: "chrome_tabs_extension",
     frame_id: Number.isSafeInteger(first.frame_id) ? first.frame_id : null,
     frame_document_id: first.document_id,
@@ -6365,9 +6576,20 @@ async function handleClock(params) {
 async function handlePageEvents(params) {
   const selected = await selectTabTarget(params, { requireTargetId: true });
   const filters = normalizePageEventsFilter(params);
+  const workerEventRequested = filters.workerType !== null ||
+    filters.eventKind === null ||
+    String(filters.eventKind).startsWith("worker_");
+  if (workerEventRequested) {
+    throw bridgeError(
+      ERROR_DEBUGGER_WARNING_UNSUPPRESSED,
+      "the debugger-free normal Chrome bridge cannot observe Worker/SharedWorker/" +
+        "ServiceWorker lifecycle without mutating host constructors in MAIN world; " +
+        "select a session-owned raw-CDP target for unfiltered or worker page_events, " +
+        "or request one explicit page-only event_kind"
+    );
+  }
   const state = await tabPageState(selected.tabId, selected.target);
   const bufferResult = ensurePageEventBuffer(selected.tabId, state);
-  const workerProbe = await drainPageWorkerEvents(selected.tabId, state);
   const read = readPageEventBuffer(bufferResult.buffer, filters);
   return {
     extension_id: chrome.runtime.id,
@@ -6392,67 +6614,13 @@ async function handlePageEvents(params) {
     },
     entries: read.entries,
     pages: read.pages,
-    workers: read.workers,
-    readback_backend: "chrome.webNavigation+chrome.tabs+chrome.scripting.executeScript(MAIN synapse page-events shim)",
+    workers: [],
+    readback_backend: "chrome.webNavigation + chrome.tabs page lifecycle ring buffer",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     web_navigation_available: Boolean(chrome.webNavigation),
-    worker_probe_available: workerProbe.available,
-    worker_probe_error_code: workerProbe.error_code || null,
-    worker_probe_error_detail: workerProbe.error_detail || null,
-    worker_probe_frame_result_count: workerProbe.frame_result_count || 0,
     target_candidate_count: selected.targetCandidateCount,
     target_selection_reason: selected.selectionReason
-  };
-}
-
-async function drainPageWorkerEvents(tabId, state) {
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    return {
-      available: false,
-      error_code: "CHROME_SCRIPTING_UNAVAILABLE",
-      error_detail: "Chrome scripting API is unavailable; extension is missing scripting permission",
-      frame_result_count: 0
-    };
-  }
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      world: "MAIN",
-      func: runPageEventsWorkerProbe
-    });
-  } catch (error) {
-    return {
-      available: false,
-      error_code: ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      error_detail: errorMessage(error),
-      frame_result_count: 0
-    };
-  }
-  const frames = frameExecutionResults(injected);
-  for (const frame of frames) {
-    const result = frame.result;
-    if (!result || typeof result !== "object" || !Array.isArray(result.events)) {
-      continue;
-    }
-    for (const event of result.events) {
-      pushPageEvent(tabId, {
-        ...event,
-        target_id: state.target_id || targetIdForTabId(tabId),
-        frame_id: event.frame_id == null && Number.isSafeInteger(frame.frame_id)
-          ? String(frame.frame_id)
-          : event.frame_id,
-        url: event.url || result.url || state.url || "",
-        title: event.title || result.title || state.title || ""
-      });
-    }
-  }
-  return {
-    available: true,
-    error_code: null,
-    error_detail: null,
-    frame_result_count: frames.length
   };
 }
 
@@ -16157,27 +16325,44 @@ async function handleOperatorPanicCleanup(params) {
 
   const clocksFound = DURABLE_OWNER_LEDGER.clockTabs.length;
   let clocksUninstalled = 0;
-  for (const tabId of Array.from(DURABLE_OWNER_LEDGER.clockTabs)) {
+  for (const owner of Array.from(DURABLE_OWNER_LEDGER.clockTabs)) {
+    const tabId = owner.tabId;
     try {
+      if (!owner.documentId) {
+        throw new Error(
+          `clock owner for tab ${tabId} is legacy-unbound; navigate or close that tab ` +
+            "to destroy the old document without touching an unrelated current document"
+        );
+      }
       const injected = await executeScriptMutation({
-        target: { tabId },
+        target: { tabId, documentIds: [owner.documentId] },
         world: "MAIN",
         func: runClockInPage,
         args: [{ operation: "uninstall", timeMs: null, deltaMs: null, loopLimit: 10000 }]
       }, "operatorPanicCleanup:clockUninstall");
-      const result = frameExecutionResults(injected).find((frame) => frame.result)?.result;
+      const frames = frameExecutionResults(injected);
+      if (frames.length !== 1 || frames[0]?.frame_id !== 0 ||
+          frames[0]?.document_id !== owner.documentId) {
+        throw new Error(
+          `clock uninstall document readback mismatch: expected=${owner.documentId} ` +
+            `actual=${JSON.stringify(frames.map((frame) => frame.document_id))}`
+        );
+      }
+      const result = frames[0]?.result;
       if (!result?.ok || result?.readback?.installed !== false) {
         throw new Error(`clock uninstall returned ${JSON.stringify(result || null)}`);
       }
       CLOCK_INSTALLED_TABS.delete(tabId);
+      CLOCK_DOCUMENT_OWNERS.delete(tabId);
       DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-        .filter((candidate) => candidate !== tabId);
+        .filter((candidate) => candidate.tabId !== tabId);
       clocksUninstalled += 1;
     } catch (error) {
       if (await operatorPanicTargetAbsentAfterReadback(error, tabId)) {
         CLOCK_INSTALLED_TABS.delete(tabId);
+        CLOCK_DOCUMENT_OWNERS.delete(tabId);
         DURABLE_OWNER_LEDGER.clockTabs = DURABLE_OWNER_LEDGER.clockTabs
-          .filter((candidate) => candidate !== tabId);
+          .filter((candidate) => candidate.tabId !== tabId);
         clocksUninstalled += 1;
       } else {
         failures.push(`clock tab=${tabId}: ${errorMessage(error)}`);
@@ -18701,39 +18886,20 @@ function waitForFunctionResult(
   };
 }
 
-async function loadStateProbe(selected) {
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      "chrome.scripting.executeScript unavailable; extension is missing scripting permission"
-    );
-  }
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId: selected.tabId },
-      world: "MAIN",
-      func: runLoadStateProbeInPage,
-      args: [{ quietMs: 500 }]
-    });
-  } catch (error) {
-    throw bridgeError(
-      ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-      `chrome.scripting.executeScript waitForLoadState(${selected.tabId}) failed: ${errorMessage(error)}`
-    );
-  }
-  const frames = frameExecutionResults(injected);
-  const first = frames.find((frame) => frame.result && typeof frame.result === "object");
-  if (!first) {
-    throw bridgeError(ERROR_CHROME_SCRIPTING_EXECUTE_FAILED, "chrome.scripting.executeScript waitForLoadState returned no structured result");
-  }
-  if (first.result.ok === false) {
-    throw bridgeError(
-      String(first.result.error_code || ERROR_CHROME_SCRIPTING_EXECUTE_FAILED),
-      `waitForLoadState failed: ${String(first.result.error_detail || "")}`
-    );
-  }
-  return first.result;
+function loadStateNetworkSummary(buffer, startSeq, maxInFlightRequests) {
+  const now = Date.now();
+  const lastActivityAtUnixMs = Math.max(
+    Number(buffer?.armedAtUnixMs || now),
+    Number(buffer?.lastActivityAtUnixMs || 0)
+  );
+  const networkEventCount = Math.max(0, Number(buffer?.nextSeq || 0) - startSeq);
+  return {
+    network_event_count: networkEventCount,
+    max_in_flight_requests: Math.max(0, Number(maxInFlightRequests || 0)),
+    in_flight_requests: Math.max(0, Number(buffer?.inFlightRequests || 0)),
+    network_idle_quiet_ms: Math.max(0, now - lastActivityAtUnixMs),
+    lifecycle_network_idle_seen: false
+  };
 }
 
 function loadStateEventSummary(buffer, startedAt) {
@@ -18816,7 +18982,7 @@ function waitForLoadStateResult(
     in_flight_requests: current.in_flight_requests || 0,
     network_idle_quiet_ms: current.network_idle_quiet_ms || 0,
     lifecycle_network_idle_seen: Boolean(current.lifecycle_network_idle_seen),
-    readback_backend: "chrome.webNavigation + chrome.scripting.executeScript(MAIN load-state/fetch/XHR/resource-timing polling)",
+    readback_backend: "chrome.tabs + chrome.webNavigation + chrome.webRequest request lifecycle",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -18941,7 +19107,7 @@ function waitForNetworkResult(
     total_buffered: buffer.entries.length,
     dropped: buffer.dropped,
     matched_entry: matchedEntry ? networkEntryToWire(matchedEntry) : null,
-    readback_backend: "chrome.webRequest + in-page fetch/XHR event buffer",
+    readback_backend: "chrome.webRequest request lifecycle ring buffer",
     backend_tier_used: "chrome_tabs_extension",
     required_foreground: false,
     target_candidate_count: selected.targetCandidateCount,
@@ -18954,7 +19120,10 @@ function findNetworkWaitEntry(buffer, wait, requireResponse, startSeq) {
     return null;
   }
   return buffer.entries.find((entry) => {
-    if (Number(entry.seq || 0) <= startSeq) {
+    const relevantSeq = requireResponse
+      ? Number(entry.response_seq || 0)
+      : Number(entry.started_seq || 0);
+    if (relevantSeq <= startSeq) {
       return false;
     }
     if (requireResponse && !(entry.response_received && entry.status !== null && entry.status !== undefined)) {
@@ -21973,7 +22142,7 @@ async function setContentInPage(request) {
 }
 
 function runClockInPage(request) {
-  const VERSION = "synapse-clock-2026-06-21-v1";
+  const VERSION = "synapse-clock-2026-08-16-v2";
   const operation = String(request?.operation || "status");
   const timeMs = request?.timeMs;
   const deltaMs = request?.deltaMs;
@@ -21984,7 +22153,45 @@ function runClockInPage(request) {
   }
 
   try {
-    const clock = ensureSynapseClock();
+    const marker = Object.getOwnPropertyDescriptor(globalThis, "__synapseClock");
+    const markerClock = marker && Object.prototype.hasOwnProperty.call(marker, "value")
+      ? marker.value
+      : null;
+    if (marker && (!markerClock || markerClock.version !== VERSION ||
+        typeof markerClock.call !== "function")) {
+      throw new Error(
+        "Synapse clock collision: globalThis.__synapseClock is already owned by " +
+          "an unknown or incompatible instrument"
+      );
+    }
+    if (!marker && (operation === "status" || operation === "uninstall")) {
+      return {
+        ok: true,
+        init_script_identifier: "chrome.scripting.executeScript:MAIN:synapse-clock",
+        init_script_newly_added: false,
+        installed_at_unix_ms: 0,
+        readback: {
+          installed: false,
+          version: VERSION,
+          now_ms: null,
+          pending_timer_count: 0,
+          fired_timer_count: 0,
+          last_timer_id: 0,
+          next_timer_ms: null,
+          error_count: 0,
+          last_error: null,
+          ownership_verified: true,
+          descriptor_count: 0
+        },
+        url: String(location.href || ""),
+        title: String(document.title || ""),
+        ready_state: String(document.readyState || "")
+      };
+    }
+    if (!marker && operation !== "install") {
+      throw new Error("Synapse browser clock is not installed");
+    }
+    const clock = markerClock || createSynapseClock();
     let readback;
     if (operation === "install") {
       readback = clock.call("install", { nowMs: timeMs, loopLimit });
@@ -22019,11 +22226,7 @@ function runClockInPage(request) {
     };
   }
 
-  function ensureSynapseClock() {
-    if (globalThis.__synapseClock && globalThis.__synapseClock.version === VERSION) {
-      return globalThis.__synapseClock;
-    }
-
+  function createSynapseClock() {
     const NativeDate = globalThis.Date;
     const nativeGlobalDescriptors = new Map();
     for (const name of ["Date", "setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"]) {
@@ -22035,6 +22238,111 @@ function runClockInPage(request) {
     const nativePerformanceNow = globalThis.performance && globalThis.performance.now
       ? globalThis.performance.now.bind(globalThis.performance)
       : () => 0;
+    const installedDescriptors = new Map();
+    const descriptorTargets = new Map();
+    for (const name of nativeGlobalDescriptors.keys()) {
+      descriptorTargets.set(name, globalThis);
+    }
+    if (globalThis.performance) {
+      descriptorTargets.set("performance.now", globalThis.performance);
+    }
+    descriptorTargets.set("__synapseClock", globalThis);
+
+    function descriptorAt(target, name) {
+      return Object.getOwnPropertyDescriptor(target, name);
+    }
+
+    function descriptorsEqual(left, right) {
+      if (left === undefined || right === undefined) {
+        return left === right;
+      }
+      return left.configurable === right.configurable &&
+        left.enumerable === right.enumerable &&
+        left.writable === right.writable &&
+        left.value === right.value &&
+        left.get === right.get &&
+        left.set === right.set;
+    }
+
+    function propertyName(key) {
+      return key === "performance.now" ? "now" : key;
+    }
+
+    function originalDescriptor(key) {
+      if (key === "performance.now") {
+        return nativePerformanceNowDescriptor;
+      }
+      if (key === "__synapseClock") {
+        return undefined;
+      }
+      return nativeGlobalDescriptors.get(key);
+    }
+
+    function assertCanReplace(key, original) {
+      const target = descriptorTargets.get(key);
+      const name = propertyName(key);
+      if (!target) {
+        throw new Error(`Synapse clock target ${key} is unavailable`);
+      }
+      if (original === undefined) {
+        if (!Object.isExtensible(target)) {
+          throw new Error(`Synapse clock cannot create ${key} on a non-extensible target`);
+        }
+        return;
+      }
+      if (original.configurable === false &&
+          (!Object.prototype.hasOwnProperty.call(original, "value") ||
+           original.writable !== true)) {
+        throw new Error(`Synapse clock refuses non-configurable collision at ${key}`);
+      }
+      if (!descriptorsEqual(descriptorAt(target, name), original)) {
+        throw new Error(`Synapse clock preflight observed descriptor drift at ${key}`);
+      }
+    }
+
+    function replacementDescriptor(original, value) {
+      if (original === undefined) {
+        return {
+          configurable: true,
+          enumerable: false,
+          writable: true,
+          value
+        };
+      }
+      return {
+        configurable: original.configurable,
+        enumerable: original.enumerable,
+        writable: Object.prototype.hasOwnProperty.call(original, "value")
+          ? original.writable
+          : true,
+        value
+      };
+    }
+
+    function restoreDescriptor(key, descriptor) {
+      const target = descriptorTargets.get(key);
+      const name = propertyName(key);
+      if (descriptor === undefined) {
+        if (!delete target[name] || descriptorAt(target, name) !== undefined) {
+          throw new Error(`Synapse clock could not remove owned descriptor ${key}`);
+        }
+      } else {
+        Object.defineProperty(target, name, descriptor);
+        if (!descriptorsEqual(descriptorAt(target, name), descriptor)) {
+          throw new Error(`Synapse clock could not restore exact descriptor ${key}`);
+        }
+      }
+    }
+
+    function verifyInstalledOwnership() {
+      for (const [key, descriptor] of installedDescriptors.entries()) {
+        const target = descriptorTargets.get(key);
+        if (!descriptorsEqual(descriptorAt(target, propertyName(key)), descriptor)) {
+          throw new Error(`Synapse clock ownership drift detected at ${key}`);
+        }
+      }
+      return installedDescriptors.size;
+    }
     const state = {
       installed: false,
       nowMs: NativeDate.now(),
@@ -22062,6 +22370,7 @@ function runClockInPage(request) {
     }
 
     function status() {
+      const descriptorCount = state.installed ? verifyInstalledOwnership() : 0;
       let next = null;
       for (const timer of state.timers.values()) {
         if (next === null || timer.due < next) {
@@ -22077,7 +22386,9 @@ function runClockInPage(request) {
         last_timer_id: state.nextTimerId - 1,
         next_timer_ms: next === null ? null : Math.floor(next),
         error_count: state.errorCount,
-        last_error: state.lastError
+        last_error: state.lastError,
+        ownership_verified: true,
+        descriptor_count: descriptorCount
       };
     }
 
@@ -22178,21 +22489,60 @@ function runClockInPage(request) {
       }
       api.lastInstallNewlyAdded = !state.installed;
       if (!state.installed) {
-        globalThis.Date = SynapseDate;
-        globalThis.setTimeout = (handler, delay, ...rest) => schedule("timeout", handler, delay, rest);
-        globalThis.clearTimeout = clear;
-        globalThis.setInterval = (handler, delay, ...rest) => schedule("interval", handler, delay, rest);
-        globalThis.clearInterval = clear;
-        globalThis.requestAnimationFrame = (handler) =>
-          schedule("raf", (ts) => handler(ts), 16, [Math.max(0, state.nowMs - state.performanceOriginMs)]);
-        globalThis.cancelAnimationFrame = clear;
-        if (globalThis.performance) {
-          try {
-            Object.defineProperty(globalThis.performance, "now", {
-              configurable: true,
-              value: () => Math.max(0, state.nowMs - state.performanceOriginMs)
-            });
-          } catch (_) {}
+        const replacements = new Map([
+          ["Date", SynapseDate],
+          ["setTimeout", (handler, delay, ...rest) => schedule("timeout", handler, delay, rest)],
+          ["clearTimeout", clear],
+          ["setInterval", (handler, delay, ...rest) => schedule("interval", handler, delay, rest)],
+          ["clearInterval", clear],
+          ["requestAnimationFrame", (handler) =>
+            schedule("raf", (ts) => handler(ts), 16, [
+              Math.max(0, state.nowMs - state.performanceOriginMs)
+            ])],
+          ["cancelAnimationFrame", clear],
+          ["performance.now", () => Math.max(0, state.nowMs - state.performanceOriginMs)],
+          ["__synapseClock", api]
+        ]);
+        const desired = new Map();
+        for (const [key, value] of replacements.entries()) {
+          const original = originalDescriptor(key);
+          assertCanReplace(key, original);
+          desired.set(key, key === "__synapseClock"
+            ? {
+                configurable: true,
+                enumerable: false,
+                writable: false,
+                value
+              }
+            : replacementDescriptor(original, value));
+        }
+        try {
+          for (const [key, descriptor] of desired.entries()) {
+            const target = descriptorTargets.get(key);
+            const name = propertyName(key);
+            Object.defineProperty(target, name, descriptor);
+            if (!descriptorsEqual(descriptorAt(target, name), descriptor)) {
+              throw new Error(`Synapse clock install postcondition failed at ${key}`);
+            }
+            installedDescriptors.set(key, descriptor);
+          }
+        } catch (error) {
+          let rollbackError = null;
+          for (const key of Array.from(desired.keys()).reverse()) {
+            try {
+              restoreDescriptor(key, originalDescriptor(key));
+            } catch (candidate) {
+              rollbackError = rollbackError || candidate;
+            }
+          }
+          installedDescriptors.clear();
+          if (rollbackError) {
+            throw new Error(
+              `Synapse clock install failed at ${errorDetail(error)}; ` +
+                `exact rollback also failed: ${errorDetail(rollbackError)}`
+            );
+          }
+          throw error;
         }
         state.installed = true;
         state.installedAtUnixMs = NativeDate.now();
@@ -22210,35 +22560,43 @@ function runClockInPage(request) {
     }
 
     function uninstall() {
-      state.timers.clear();
-      for (const [name, descriptor] of nativeGlobalDescriptors.entries()) {
-        try {
-          if (descriptor) {
-            Object.defineProperty(globalThis, name, descriptor);
-          } else {
-            delete globalThis[name];
-          }
-        } catch (error) {
-          recordError(error);
-        }
+      if (!state.installed) {
+        return status();
       }
-      if (globalThis.performance) {
-        try {
-          if (nativePerformanceNowDescriptor) {
-            Object.defineProperty(globalThis.performance, "now", nativePerformanceNowDescriptor);
-          } else {
-            delete globalThis.performance.now;
-          }
-        } catch (error) {
-          recordError(error);
-        }
-      }
-      state.installed = false;
-      const readback = status();
+      verifyInstalledOwnership();
       try {
-        delete globalThis.__synapseClock;
-      } catch (_) {}
-      return readback;
+        for (const key of Array.from(installedDescriptors.keys()).reverse()) {
+          restoreDescriptor(key, originalDescriptor(key));
+        }
+      } catch (error) {
+        let rollbackError = null;
+        for (const key of installedDescriptors.keys()) {
+          try {
+            const target = descriptorTargets.get(key);
+            const descriptor = installedDescriptors.get(key);
+            Object.defineProperty(target, propertyName(key), descriptor);
+            if (!descriptorsEqual(
+              descriptorAt(target, propertyName(key)),
+              descriptor
+            )) {
+              throw new Error(`rollback postcondition failed at ${key}`);
+            }
+          } catch (candidate) {
+            rollbackError = rollbackError || candidate;
+          }
+        }
+        if (rollbackError) {
+          throw new Error(
+            `Synapse clock uninstall failed at ${errorDetail(error)}; ` +
+              `exact rollback also failed: ${errorDetail(rollbackError)}`
+          );
+        }
+        throw error;
+      }
+      installedDescriptors.clear();
+      state.timers.clear();
+      state.installed = false;
+      return status();
     }
 
     function fastForward(args) {
@@ -22294,7 +22652,6 @@ function runClockInPage(request) {
       }
     };
 
-    globalThis.__synapseClock = api;
     return api;
   }
 }
@@ -26974,21 +27331,28 @@ function ensureNetworkEventBuffer(tabId, state = {}) {
     requests: new Map(),
     nextSeq: 0,
     dropped: 0,
-    armedAtUnixMs: now
+    armedAtUnixMs: now,
+    lastActivityAtUnixMs: now,
+    inFlightRequests: 0,
+    maxInFlightRequests: 0
   };
   networkEventBuffers.set(tabId, buffer);
   return { buffer, newlyArmed: true };
 }
 
-function networkBufferForTabId(tabId) {
+function networkBufferForTabId(tabId, { create = false } = {}) {
   if (!Number.isInteger(tabId) || tabId < 0) {
     return null;
   }
-  return networkEventBuffers.get(tabId) || null;
+  const existing = networkEventBuffers.get(tabId) || null;
+  if (existing || !create) {
+    return existing;
+  }
+  return ensureNetworkEventBuffer(tabId).buffer;
 }
 
 function recordWebRequestStarted(details) {
-  const buffer = networkBufferForTabId(details?.tabId);
+  const buffer = networkBufferForTabId(details?.tabId, { create: true });
   if (!buffer) {
     return;
   }
@@ -26997,11 +27361,21 @@ function recordWebRequestStarted(details) {
   entry.method = String(details.method || entry.method || "").toUpperCase() || null;
   entry.resource_type = webRequestResourceTypeToCdp(details.type);
   entry.web_request_type = String(details.type || "");
+  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
+  if (!entry.request_started) {
+    entry.request_started = true;
+    buffer.inFlightRequests += 1;
+    buffer.maxInFlightRequests = Math.max(
+      buffer.maxInFlightRequests,
+      buffer.inFlightRequests
+    );
+  }
   touchNetworkEntry(buffer, entry);
+  entry.started_seq = entry.seq;
 }
 
 function recordWebRequestHeadersReceived(details) {
-  const buffer = networkBufferForTabId(details?.tabId);
+  const buffer = networkBufferForTabId(details?.tabId, { create: true });
   if (!buffer) {
     return;
   }
@@ -27016,11 +27390,38 @@ function recordWebRequestHeadersReceived(details) {
   entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
   entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
   entry.response_headers = headersArrayToObject(details.responseHeaders);
+  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
+  entry.response_seq = entry.seq;
+}
+
+function recordWebRequestRedirect(details) {
+  const buffer = networkBufferForTabId(details?.tabId, { create: true });
+  if (!buffer) {
+    return;
+  }
+  const entry = ensureNetworkEntry(buffer, details);
+  entry.response_received = true;
+  entry.response_url = String(details.url || entry.response_url || entry.url || "");
+  entry.status = Number.isFinite(Number(details.statusCode)) ? Number(details.statusCode) : entry.status;
+  entry.status_text = statusTextFromWebRequest(details.statusLine, entry.status);
+  entry.protocol = protocolFromStatusLine(details.statusLine) || entry.protocol;
+  entry.remote_ip_address = details.ip || entry.remote_ip_address || null;
+  entry.response_headers = headersArrayToObject(details.responseHeaders);
+  entry.redirect_url = details.redirectUrl == null ? null : String(details.redirectUrl);
+  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
+  touchNetworkEntry(buffer, entry);
+  entry.response_seq = entry.seq;
+  // Chrome documents one terminal exception: a redirect to data: has no later
+  // onCompleted/onErrorOccurred. Close that request here so network-idle cannot
+  // leak a permanent in-flight count.
+  if (/^data:/i.test(entry.redirect_url || "")) {
+    terminalizeNetworkEntry(buffer, entry, { failed: false });
+  }
 }
 
 function recordWebRequestCompleted(details) {
-  const buffer = networkBufferForTabId(details?.tabId);
+  const buffer = networkBufferForTabId(details?.tabId, { create: true });
   if (!buffer) {
     return;
   }
@@ -27037,11 +27438,14 @@ function recordWebRequestCompleted(details) {
   entry.loading_finished = true;
   entry.loading_failed = false;
   entry.failure_error_text = null;
+  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
+  entry.response_seq = entry.seq;
+  terminalizeNetworkEntry(buffer, entry, { failed: false });
 }
 
 function recordWebRequestFailed(details) {
-  const buffer = networkBufferForTabId(details?.tabId);
+  const buffer = networkBufferForTabId(details?.tabId, { create: true });
   if (!buffer) {
     return;
   }
@@ -27053,7 +27457,24 @@ function recordWebRequestFailed(details) {
   entry.loading_finished = false;
   entry.loading_failed = true;
   entry.failure_error_text = details.error || "webRequest.onErrorOccurred";
+  entry.document_id = details?.documentId == null ? entry.document_id : String(details.documentId);
   touchNetworkEntry(buffer, entry);
+  terminalizeNetworkEntry(buffer, entry, { failed: true });
+}
+
+function terminalizeNetworkEntry(buffer, entry, { failed }) {
+  if (entry.terminal) {
+    return;
+  }
+  entry.terminal = true;
+  entry.loading_finished = !failed;
+  entry.loading_failed = Boolean(failed);
+  if (entry.request_started) {
+    buffer.inFlightRequests = Math.max(0, buffer.inFlightRequests - 1);
+  }
+  if (!buffer.entries.includes(entry) && buffer.requests.get(entry.request_id) === entry) {
+    buffer.requests.delete(entry.request_id);
+  }
 }
 
 function ensureNetworkEntry(buffer, details) {
@@ -27082,7 +27503,13 @@ function ensureNetworkEntry(buffer, details) {
     encoded_data_length: null,
     loading_finished: false,
     loading_failed: false,
-    failure_error_text: null
+    failure_error_text: null,
+    request_started: false,
+    started_seq: 0,
+    response_seq: 0,
+    terminal: false,
+    document_id: details?.documentId == null ? null : String(details.documentId),
+    redirect_url: null
   };
   buffer.requests.set(requestId, entry);
   pushNetworkEntry(buffer, entry);
@@ -27094,7 +27521,7 @@ function pushNetworkEntry(buffer, entry) {
   while (buffer.entries.length > buffer.capacity) {
     const dropped = buffer.entries.shift();
     buffer.dropped += 1;
-    if (dropped && buffer.requests.get(dropped.request_id) === dropped) {
+    if (dropped?.terminal && buffer.requests.get(dropped.request_id) === dropped) {
       buffer.requests.delete(dropped.request_id);
     }
   }
@@ -27104,6 +27531,7 @@ function touchNetworkEntry(buffer, entry) {
   buffer.nextSeq += 1;
   entry.seq = buffer.nextSeq;
   entry.observed_at_unix_ms = Date.now();
+  buffer.lastActivityAtUnixMs = entry.observed_at_unix_ms;
 }
 
 function webRequestResourceTypeToCdp(type) {
@@ -27183,99 +27611,6 @@ function statusTextFromWebRequest(statusLine, status) {
     return match[1] || "";
   }
   return line;
-}
-
-async function ensureInPageNetworkRecorder(tabId) {
-  if (!chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
-      throw bridgeError(
-        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-        "network waits require chrome.webRequest or chrome.scripting.executeScript"
-      );
-    }
-    return { available: false, reason: "chrome.scripting unavailable" };
-  }
-  try {
-    const injected = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: installSynapseNetworkRecorderInPage
-    });
-    const first = Array.isArray(injected) ? injected[0]?.result : null;
-    return {
-      available: Boolean(first?.ok),
-      reason: first?.reason || "installed",
-      installed_at_seq: Number(first?.next_seq || 0)
-    };
-  } catch (error) {
-    if (!chrome.webRequest?.onBeforeRequest?.addListener) {
-      throw bridgeError(
-        ERROR_CHROME_SCRIPTING_EXECUTE_FAILED,
-        `network wait recorder injection failed and chrome.webRequest is unavailable: ${errorMessage(error)}`
-      );
-    }
-    return { available: false, reason: errorMessage(error) };
-  }
-}
-
-async function mergeInPageNetworkEvents(tabId, buffer, recorder) {
-  if (!recorder?.available || !chrome.scripting || typeof chrome.scripting.executeScript !== "function") {
-    return;
-  }
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
-      target: { tabId },
-      world: "MAIN",
-      func: readSynapseNetworkRecorderInPage
-    });
-  } catch (error) {
-    recorder.available = false;
-    recorder.reason = errorMessage(error);
-    return;
-  }
-  const entries = Array.isArray(injected) ? injected.flatMap((item) => item?.result?.entries || []) : [];
-  for (const raw of entries) {
-    mergeInPageNetworkEntry(buffer, raw);
-  }
-}
-
-function mergeInPageNetworkEntry(buffer, raw) {
-  if (!raw || typeof raw !== "object") {
-    return;
-  }
-  const requestId = `page:${String(raw.request_id || "")}`;
-  if (requestId === "page:") {
-    return;
-  }
-  let entry = buffer.requests.get(requestId);
-  if (!entry) {
-    entry = ensureNetworkEntry(buffer, {
-      requestId,
-      url: raw.url,
-      method: raw.method,
-      type: String(raw.resource_type || "").toLowerCase() === "xhr" ? "xmlhttprequest" : "fetch"
-    });
-  }
-  const rawSeq = Number(raw.seq || 0);
-  if (Number(entry.page_recorder_seq || 0) >= rawSeq) {
-    return;
-  }
-  entry.page_recorder_seq = rawSeq;
-  entry.url = raw.url ? String(raw.url) : entry.url;
-  entry.method = raw.method ? String(raw.method).toUpperCase() : entry.method;
-  entry.resource_type = raw.resource_type ? String(raw.resource_type) : entry.resource_type;
-  entry.response_received = Boolean(raw.response_received);
-  entry.response_url = raw.response_url ? String(raw.response_url) : entry.response_url;
-  entry.status = Number.isFinite(Number(raw.status)) ? Number(raw.status) : entry.status;
-  entry.status_text = raw.status_text === undefined || raw.status_text === null ? entry.status_text : String(raw.status_text);
-  entry.loading_finished = Boolean(raw.loading_finished);
-  entry.loading_failed = Boolean(raw.loading_failed);
-  entry.failure_error_text = raw.failure_error_text ? String(raw.failure_error_text) : null;
-  entry.response_headers = null;
-  entry.request_headers = null;
-  entry.response_timing = null;
-  touchNetworkEntry(buffer, entry);
 }
 
 function installSynapseNetworkRecorderInPage() {
