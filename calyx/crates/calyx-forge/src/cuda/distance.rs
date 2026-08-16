@@ -103,6 +103,92 @@ pub fn l2_batch_gpu(
     check_device_output(ctx, "l2_batch_gpu", out, false)
 }
 
+pub(crate) struct L2GatherLaunch<'a> {
+    pub queries: &'a CudaSlice<f32>,
+    pub candidates: &'a CudaSlice<f32>,
+    pub indices: &'a CudaSlice<u32>,
+    pub dim: usize,
+    pub n_cands: usize,
+    pub query_count: usize,
+    pub stride: usize,
+    pub out: &'a mut CudaSlice<f32>,
+}
+
+pub(crate) fn launch_l2_gather_gpu(ctx: &CudaContext, request: L2GatherLaunch<'_>) -> Result<()> {
+    let L2GatherLaunch {
+        queries,
+        candidates,
+        indices,
+        dim,
+        n_cands,
+        query_count,
+        stride,
+        out,
+    } = request;
+    check_device_shape(queries.len(), query_count, dim, "cuda gather queries")?;
+    check_device_shape(candidates.len(), n_cands, dim, "cuda gather candidates")?;
+    check_device_shape(indices.len(), query_count, stride, "cuda gather indices")?;
+    check_device_shape(out.len(), query_count, stride, "cuda gather output")?;
+    if query_count == 0 || stride == 0 {
+        return Ok(());
+    }
+    if query_count > DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH {
+        return Err(ForgeError::ShapeMismatch {
+            expected: vec![DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH],
+            got: vec![query_count],
+            remediation: "split resident gather queries into batches of at most 65535 rows"
+                .to_string(),
+        });
+    }
+    let dim_i32 = to_i32(dim, "dim")?;
+    let n_cands_i32 = to_i32(n_cands, "n_cands")?;
+    let stride_i32 = to_i32(stride, "stride")?;
+    let stride_u32 = u32::try_from(stride).map_err(|_| ForgeError::ShapeMismatch {
+        expected: vec![u32::MAX as usize],
+        got: vec![stride],
+        remediation: "resident gather stride exceeds the CUDA grid x limit".to_string(),
+    })?;
+    let query_count_u32 = u32::try_from(query_count).map_err(|_| ForgeError::ShapeMismatch {
+        expected: vec![DISTANCE_MAX_QUERY_ROWS_PER_LAUNCH],
+        got: vec![query_count],
+        remediation: "resident gather query count exceeds the CUDA grid y limit".to_string(),
+    })?;
+    let module = distance_module(ctx)?;
+    let func = ctx
+        .cached_function(&module, "distance.l2_gather_f32", "l2_gather_f32")
+        .map_err(|err| {
+            device_unavailable(
+                ctx,
+                format!("resident L2 gather load function failed: {err}"),
+            )
+        })?;
+    let cfg = LaunchConfig {
+        grid_dim: (stride_u32, query_count_u32, 1),
+        block_dim: (BLOCK_THREADS, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let stream = ctx.inner().default_stream();
+    let mut launch = stream.launch_builder(func.as_ref());
+    unsafe {
+        launch
+            .arg(queries)
+            .arg(candidates)
+            .arg(indices)
+            .arg(&dim_i32)
+            .arg(&n_cands_i32)
+            .arg(&stride_i32)
+            .arg(out)
+            .launch(cfg)
+    }
+    .map_err(|err| {
+        device_unavailable(
+            ctx,
+            format!("resident L2 gather kernel launch failed: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
 pub fn paired_cosine_gpu(
     ctx: &CudaContext,
     left: &CudaSlice<f32>,
@@ -501,6 +587,7 @@ fn distance_cache_key(kernel_name: &'static str) -> &'static str {
         "cosine_batch_f32" => "distance.cosine_batch_f32",
         "dot_batch_f32" => "distance.dot_batch_f32",
         "l2_batch_f32" => "distance.l2_batch_f32",
+        "l2_gather_f32" => "distance.l2_gather_f32",
         "paired_cosine_f32" => "distance.paired_cosine_f32",
         _ => kernel_name,
     }

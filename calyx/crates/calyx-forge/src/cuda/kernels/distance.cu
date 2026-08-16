@@ -179,6 +179,62 @@ extern "C" __global__ __launch_bounds__(256) void l2_batch_f32(
     }
 }
 
+// Score an independently indexed resident candidate row for each output cell.
+// grid.x is the per-query index offset; grid.y is the query row. Although
+// adjacent blocks may select unrelated rows, lanes inside each block traverse
+// one selected row contiguously, preserving coalesced lane-level loads.
+extern "C" __global__ __launch_bounds__(256) void l2_gather_f32(
+    const float *queries,
+    const float *candidates,
+    const unsigned int *indices,
+    int dim,
+    int n_cands,
+    int stride,
+    float *out) {
+    __shared__ float l2_shared[256];
+    __shared__ float unused_shared[256];
+    __shared__ int bad_shared[256];
+
+    const int selected_offset = blockIdx.x;
+    const int query_row = blockIdx.y;
+    const int tid = threadIdx.x;
+    if (selected_offset >= stride) {
+        return;
+    }
+
+    const long long output_index =
+        (long long)query_row * (long long)stride + selected_offset;
+    const unsigned int candidate_row = indices[output_index];
+    if (candidate_row >= (unsigned int)n_cands) {
+        if (tid == 0) {
+            out[output_index] = NAN;
+        }
+        return;
+    }
+
+    const long long query_base = (long long)query_row * (long long)dim;
+    const long long candidate_base = (long long)candidate_row * (long long)dim;
+    float l2 = 0.0f;
+    int bad = dim <= 0;
+    for (int i = tid; i < dim; i += blockDim.x) {
+        const float q = queries[query_base + i];
+        const float c = candidates[candidate_base + i];
+        const float diff = q - c;
+        bad |= !finite2(q, c);
+        l2 += diff * diff;
+    }
+
+    l2_shared[tid] = l2;
+    unused_shared[tid] = 0.0f;
+    bad_shared[tid] = bad;
+    __syncthreads();
+    reduce_sums(l2_shared, unused_shared, bad_shared, tid);
+
+    if (tid == 0) {
+        out[output_index] = bad_shared[0] ? NAN : l2_shared[0];
+    }
+}
+
 extern "C" __global__ __launch_bounds__(256) void paired_cosine_f32(
     const float *left,
     const float *right,

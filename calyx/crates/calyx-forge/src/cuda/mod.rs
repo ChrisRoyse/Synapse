@@ -64,7 +64,12 @@ pub use ragged_gemm::{
     RaggedBatch, build_ragged_batch, build_ragged_batch_from_slabs, extract_ragged_results,
     try_extract_ragged_results,
 };
-pub use resident::{DeviceCandidateBlock, cosine_resident_host, upload_candidate_block};
+pub use resident::{
+    BudgetedDeviceCandidateBlock, CpuGatherReverificationReadback, CpuGatherReverificationRequest,
+    DeviceCandidateBlock, L2_GATHER_NUMERIC_CONTRACT, ResidentGatherReadback, cosine_resident_host,
+    l2_gather_resident_host, reverify_l2_gather_cpu, upload_candidate_block,
+    upload_candidate_block_budgeted,
+};
 pub use topk::topk_gpu;
 
 #[derive(Clone, Debug)]

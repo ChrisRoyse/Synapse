@@ -41,8 +41,9 @@ pub use cpu::CpuBackend;
 #[cfg(feature = "cuda")]
 pub use cuda::{
     ALGORITHMIC_SPARSE_MAX_TOKEN_BYTES, ALGORITHMIC_TOKEN_HASH_MAX_TOKEN_BYTES, AbsentSlotSentinel,
-    CUDA_GRANGER_STATUS_INVALID_LAG, CUDA_GRANGER_STATUS_NONFINITE, CUDA_GRANGER_STATUS_OK,
-    CUDA_GRANGER_STATUS_RANK_DEFICIENT, CudaAlgorithmicContext, CudaAlgorithmicStats,
+    BudgetedDeviceCandidateBlock, CUDA_GRANGER_STATUS_INVALID_LAG, CUDA_GRANGER_STATUS_NONFINITE,
+    CUDA_GRANGER_STATUS_OK, CUDA_GRANGER_STATUS_RANK_DEFICIENT, CpuGatherReverificationReadback,
+    CpuGatherReverificationRequest, CudaAlgorithmicContext, CudaAlgorithmicStats,
     CudaAutocorrelationSums, CudaBackend, CudaBinaryBatch, CudaBinaryScores, CudaByteFeatureRaw,
     CudaByteRaggedBatch, CudaCcmPredictions, CudaContext, CudaCorrelationPrecision,
     CudaCrossCorrelationBatch, CudaDcorResult, CudaGrangerLagBatch, CudaGrangerLagSummary,
@@ -50,17 +51,19 @@ pub use cuda::{
     CudaLinearCkaPairEstimates, CudaLogisticConfig, CudaLogisticDataset, CudaLogisticSplits,
     CudaLogisticSummaries, CudaMixedKsgCounts, CudaMmdChangePointResult, CudaMmdResult,
     CudaMxFpBatch, CudaPeriodogramBatch, CudaQuantContext, CudaQuantScores, CudaQuantStats,
-    CudaTurboQuantBatch, CudaTurboQuantScores, GemmProblem, GroupedGemmExecutionMode,
-    GroupedGemmPlan, ProfilePairwiseCudaStats, RaggedBatch, autocorrelation_sums_host,
+    CudaTurboQuantBatch, CudaTurboQuantScores, DeviceCandidateBlock, GemmProblem,
+    GroupedGemmExecutionMode, GroupedGemmPlan, L2_GATHER_NUMERIC_CONTRACT,
+    ProfilePairwiseCudaStats, RaggedBatch, ResidentGatherReadback, autocorrelation_sums_host,
     build_grouped_gemm_plan, build_ragged_batch, build_ragged_batch_from_slabs,
     ccm_simplex_predictions_host, correlation_precision_host, cross_correlation_batch_host,
     dcor_1d_host, entropy_radii_host, execute_grouped_gemm, execute_grouped_gemm_strict,
     extract_ragged_results, gaussian_mmd_device_bytes, gaussian_mmd_host,
     granger_lag_summaries_host, hawkes_em_host, hsic_1d_host, init_cuda,
-    ksg_continuous_counts_host, linear_cka_pair_estimates_host, logistic_summaries_host,
-    mixed_ksg_counts_host, mmd_change_point_host, pairwise_euclidean_gram_tiled_host,
-    periodogram_batch_host, query_device_info, read_grouped_gemm_output,
-    try_extract_ragged_results,
+    ksg_continuous_counts_host, l2_gather_resident_host, linear_cka_pair_estimates_host,
+    logistic_summaries_host, mixed_ksg_counts_host, mmd_change_point_host,
+    pairwise_euclidean_gram_tiled_host, periodogram_batch_host, query_device_info,
+    read_grouped_gemm_output, reverify_l2_gather_cpu, try_extract_ragged_results,
+    upload_candidate_block, upload_candidate_block_budgeted,
 };
 pub use error::ForgeError;
 pub use mxfp4::{

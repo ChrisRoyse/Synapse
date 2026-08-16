@@ -1135,6 +1135,10 @@ pub struct SubsystemHealth {
     pub calyx_math_probe_l2_squared: Option<Vec<f32>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_math_probe_topk: Option<Vec<CalyxMathProbeTopKEntry>>,
+    /// Real CUDA commissioning of the device-resident indexed L2 gather path,
+    /// including its CPU near-tie contract and reservation lifecycle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_math_probe_resident_l2_gather: Option<CalyxMathResidentL2GatherProbe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_clock_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1443,6 +1447,26 @@ pub struct ProcessQosHealth {
 pub struct CalyxMathProbeTopKEntry {
     pub index: usize,
     pub score: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CalyxMathResidentL2GatherProbe {
+    pub block_id: u64,
+    pub dataset_rows: usize,
+    pub dim: usize,
+    pub query_count: usize,
+    pub stride: usize,
+    pub raw_gpu_scores: Vec<f32>,
+    pub cpu_reverified_scores: Vec<f32>,
+    pub numeric_contract: String,
+    pub raw_gpu_topology_exact: bool,
+    pub cpu_reverified_topology_exact: bool,
+    pub output_cells_reverified: usize,
+    pub persistent_reserved_bytes: usize,
+    pub process_reserved_bytes_before: usize,
+    pub process_reserved_bytes_during: usize,
+    pub process_reserved_bytes_after: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize, JsonSchema)]

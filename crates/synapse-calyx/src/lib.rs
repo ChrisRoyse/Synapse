@@ -191,7 +191,8 @@ pub use lowering::{
 };
 pub use math::{
     SynapseCalyxMathBackendStatus, SynapseCalyxMathProbeReport, SynapseCalyxMathProbeTopKEntry,
-    SynapseCalyxMathRuntime, SynapseCalyxVramDispatchStatus, math_backend,
+    SynapseCalyxMathRuntime, SynapseCalyxResidentL2GatherProbe, SynapseCalyxVramDispatchStatus,
+    math_backend,
 };
 
 pub type SynapseCalyxCfRows = Vec<(Vec<u8>, Vec<u8>)>;

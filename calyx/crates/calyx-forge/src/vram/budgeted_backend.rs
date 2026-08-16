@@ -13,14 +13,16 @@ use crate::vram::{
     VramBudgeter, VramStats,
 };
 use crate::{
-    Backend, CudaBackend, CudaMmdResult, DeviceInfo, ForgeError, KnnBatch, KnnMetric, Result,
+    Backend, BlockId, BudgetedDeviceCandidateBlock, CpuGatherReverificationReadback,
+    CpuGatherReverificationRequest, CudaBackend, CudaMmdResult, DeviceInfo, ForgeError, KnnBatch,
+    KnnMetric, ResidentGatherReadback, Result,
 };
 
 const F32_BYTES: usize = size_of::<f32>();
 const I32_BYTES: usize = size_of::<i32>();
 const BYTES_PER_MIB: usize = 1024 * 1024;
 const DISPATCH_REMEDIATION: &str = "reduce the exact input/batch dimensions or raise the explicit Forge VRAM budget only after measuring the operation; never bypass admission or move the dispatch to CPU implicitly";
-const DISPATCH_OPERATIONS: [&str; 9] = [
+const DISPATCH_OPERATIONS: [&str; 10] = [
     "gemm",
     "cosine",
     "dot",
@@ -30,6 +32,7 @@ const DISPATCH_OPERATIONS: [&str; 9] = [
     "knn",
     "paired_cosine",
     "gaussian_mmd",
+    "l2_gather",
 ];
 
 /// Process-local CUDA dispatch telemetry since the serving epoch began.
@@ -255,6 +258,65 @@ impl VramBudgetedCudaBackend {
         })
     }
 
+    /// Uploads one immutable candidate matrix and retains both its exact
+    /// process-local VRAM reservation and, when configured, its host-wide
+    /// reservation for the handle's lifetime.
+    pub fn upload_candidate_block(
+        &self,
+        block_id: BlockId,
+        candidates: &[f32],
+        dim: usize,
+    ) -> Result<BudgetedDeviceCandidateBlock<'_, CudaVramProbe>> {
+        let measured_bytes = self.measured_f32_bytes("resident_dataset", &[candidates.len()])?;
+        self.budgeter.can_allocate(measured_bytes)?;
+        let host_reservation = self.acquire_host_dispatch("resident_dataset", measured_bytes)?;
+        crate::cuda::upload_candidate_block_budgeted(
+            self.inner.context(),
+            &self.budgeter,
+            block_id,
+            candidates,
+            dim,
+        )
+        .map(|block| block.attach_host_reservation(host_reservation))
+    }
+
+    /// Scores a row-major list of candidate indices against an immutable
+    /// device-resident matrix. Only queries, indices, and output scores cross
+    /// the host/device boundary for each call.
+    pub fn l2_gather(
+        &self,
+        queries: &[f32],
+        query_count: usize,
+        block: &BudgetedDeviceCandidateBlock<'_, CudaVramProbe>,
+        indices: &[u32],
+        stride: usize,
+        out: &mut [f32],
+    ) -> Result<ResidentGatherReadback> {
+        let measured_bytes = self.measured_l2_gather_bytes(queries, indices, out)?;
+        self.run_reserved("l2_gather", measured_bytes, |inner| {
+            crate::cuda::l2_gather_resident_host(
+                inner.context(),
+                queries,
+                query_count,
+                block.block(),
+                indices,
+                stride,
+                out,
+            )
+        })
+    }
+
+    /// Recomputes caller-selected decision-boundary cells with Forge's
+    /// canonical CPU reduction. This is the mandatory topology-changing
+    /// near-tie contract for raw parallel-f32 gather scores.
+    pub fn reverify_l2_gather_cpu(
+        &self,
+        request: CpuGatherReverificationRequest<'_>,
+        scores: &mut [f32],
+    ) -> Result<CpuGatherReverificationReadback> {
+        crate::cuda::reverify_l2_gather_cpu(request, scores)
+    }
+
     /// Runs Gaussian MMD through the same process-local and host-wide
     /// admission contract as every [`Backend`] dispatch.
     ///
@@ -438,6 +500,24 @@ impl VramBudgetedCudaBackend {
             budget_error(format!(
                 "{operation} f32 device-buffer byte count overflow: elements={elements}"
             ))
+        })
+    }
+
+    fn measured_l2_gather_bytes(
+        &self,
+        queries: &[f32],
+        indices: &[u32],
+        out: &[f32],
+    ) -> Result<usize> {
+        let f32_bytes = self.measured_f32_bytes("l2_gather", &[queries.len(), out.len()])?;
+        let index_bytes = indices.len().checked_mul(size_of::<u32>()).ok_or_else(|| {
+            budget_error(format!(
+                "l2_gather u32 index byte count overflow: elements={}",
+                indices.len()
+            ))
+        })?;
+        f32_bytes.checked_add(index_bytes).ok_or_else(|| {
+            budget_error("l2_gather aggregate device-buffer byte count overflow".to_owned())
         })
     }
 

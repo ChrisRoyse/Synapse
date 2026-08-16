@@ -48,6 +48,26 @@ const EXPECTED_COSINE: [f32; 3] = [1.0, 0.0, 1.0];
 const EXPECTED_L2_SQUARED: [f32; 3] = [0.0, 2.0, 1.0];
 const PROBE_TOPK_SCORES: [f32; 4] = [0.25, 1.5, -0.5, 1.5];
 const EXPECTED_TOPK: [(usize, f32); 3] = [(1, 1.5), (3, 1.5), (0, 0.25)];
+#[cfg(feature = "calyx-cuda")]
+const GATHER_PROBE_QUERY_COUNT: usize = 2;
+#[cfg(feature = "calyx-cuda")]
+const GATHER_PROBE_STRIDE: usize = 3;
+#[cfg(feature = "calyx-cuda")]
+const GATHER_PROBE_CANDIDATES: [f32; 12] = [
+    1.0, 0.0, 0.0, // row 0
+    0.0, 1.0, 0.0, // row 1
+    2.0, 0.0, 0.0, // row 2
+    -1.0, 0.0, 0.0, // row 3
+];
+#[cfg(feature = "calyx-cuda")]
+const GATHER_PROBE_QUERIES: [f32; 6] = [
+    1.0, 0.0, 0.0, // query 0
+    0.0, 0.0, 1.0, // query 1
+];
+#[cfg(feature = "calyx-cuda")]
+const GATHER_PROBE_INDICES: [u32; 6] = [2, 0, 3, 1, 0, 2];
+#[cfg(feature = "calyx-cuda")]
+const EXPECTED_GATHER_L2_SQUARED: [f32; 6] = [1.0, 0.0, 4.0, 2.0, 2.0, 5.0];
 
 /// Process-lifetime CPU backend reserved for explicitly background intelligence
 /// work. It is separate from configured serving math: scheduled maintenance
@@ -202,6 +222,26 @@ pub struct SynapseCalyxMathProbeReport {
     pub cosine: Vec<f32>,
     pub l2_squared: Vec<f32>,
     pub topk: Vec<SynapseCalyxMathProbeTopKEntry>,
+    pub resident_l2_gather: Option<SynapseCalyxResidentL2GatherProbe>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SynapseCalyxResidentL2GatherProbe {
+    pub block_id: u64,
+    pub dataset_rows: usize,
+    pub dim: usize,
+    pub query_count: usize,
+    pub stride: usize,
+    pub raw_gpu_scores: Vec<f32>,
+    pub cpu_reverified_scores: Vec<f32>,
+    pub numeric_contract: String,
+    pub raw_gpu_topology_exact: bool,
+    pub cpu_reverified_topology_exact: bool,
+    pub output_cells_reverified: usize,
+    pub persistent_reserved_bytes: usize,
+    pub process_reserved_bytes_before: usize,
+    pub process_reserved_bytes_during: usize,
+    pub process_reserved_bytes_after: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -805,6 +845,7 @@ fn closed_placeholder_status() -> SynapseCalyxMathBackendStatus {
             cosine: Vec::new(),
             l2_squared: Vec::new(),
             topk: Vec::new(),
+            resident_l2_gather: None,
         },
     }
 }
@@ -1030,6 +1071,7 @@ fn deferred_cuda_runtime_candidate(
             cosine: Vec::new(),
             l2_squared: Vec::new(),
             topk: Vec::new(),
+            resident_l2_gather: None,
         },
     };
     tracing::info!(
@@ -1297,7 +1339,8 @@ fn warm_and_verify_cuda_startup_envelope(
     startup_envelope_mib: u64,
     runtime_ceiling_mib: u64,
 ) -> Result<(String, SynapseCalyxMathProbeReport), SynapseCalyxError> {
-    let probe = run_startup_probe(backend)?;
+    let mut probe = run_startup_probe(backend)?;
+    probe.resident_l2_gather = Some(run_cuda_resident_l2_gather_probe(backend)?);
     let free_before_cuda_mib = reservation.admitted_snapshot().last_physical_free_mib;
     let measured_snapshot = reservation.readback().map_err(|error| {
         forge_error(
@@ -1621,7 +1664,143 @@ fn run_startup_probe(
             .into_iter()
             .map(|(index, score)| SynapseCalyxMathProbeTopKEntry { index, score })
             .collect(),
+        resident_l2_gather: None,
     })
+}
+
+#[cfg(feature = "calyx-cuda")]
+struct ResidentL2GatherProbeExecution {
+    readback: calyx_forge::ResidentGatherReadback,
+    cpu_readback: calyx_forge::CpuGatherReverificationReadback,
+    raw_gpu_scores: Vec<f32>,
+    cpu_reverified_scores: Vec<f32>,
+    persistent_reserved_bytes: usize,
+    process_reserved_bytes_during: usize,
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn run_cuda_resident_l2_gather_probe(
+    backend: &VramBudgetedCudaBackend,
+) -> Result<SynapseCalyxResidentL2GatherProbe, SynapseCalyxError> {
+    let process_reserved_bytes_before = backend.allocated_bytes();
+    let execution = execute_cuda_resident_l2_gather_probe(backend)?;
+    let process_reserved_bytes_after = backend.allocated_bytes();
+    validate_cuda_resident_l2_gather_probe(
+        &execution,
+        process_reserved_bytes_before,
+        process_reserved_bytes_after,
+    )?;
+    Ok(SynapseCalyxResidentL2GatherProbe {
+        block_id: execution.readback.block_id,
+        dataset_rows: execution.readback.dataset_rows,
+        dim: execution.readback.dim,
+        query_count: execution.readback.query_count,
+        stride: execution.readback.stride,
+        raw_gpu_scores: execution.raw_gpu_scores,
+        cpu_reverified_scores: execution.cpu_reverified_scores,
+        numeric_contract: execution.readback.numeric_contract.to_owned(),
+        raw_gpu_topology_exact: execution.readback.topology_exact,
+        cpu_reverified_topology_exact: execution.cpu_readback.topology_exact_for_reverified_cells,
+        output_cells_reverified: execution.cpu_readback.output_cells_reverified,
+        persistent_reserved_bytes: execution.persistent_reserved_bytes,
+        process_reserved_bytes_before,
+        process_reserved_bytes_during: execution.process_reserved_bytes_during,
+        process_reserved_bytes_after,
+    })
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn execute_cuda_resident_l2_gather_probe(
+    backend: &VramBudgetedCudaBackend,
+) -> Result<ResidentL2GatherProbeExecution, SynapseCalyxError> {
+    let mut raw_gpu_scores = vec![0.0_f32; EXPECTED_GATHER_L2_SQUARED.len()];
+    let block = backend
+        .upload_candidate_block(
+            calyx_forge::BlockId(0x2147),
+            &GATHER_PROBE_CANDIDATES,
+            PROBE_DIM,
+        )
+        .map_err(|error| probe_error("resident_l2_gather_upload", &error))?;
+    let persistent_reserved_bytes = block.reserved_bytes();
+    let process_reserved_bytes_during = backend.allocated_bytes();
+    let readback = backend
+        .l2_gather(
+            &GATHER_PROBE_QUERIES,
+            GATHER_PROBE_QUERY_COUNT,
+            &block,
+            &GATHER_PROBE_INDICES,
+            GATHER_PROBE_STRIDE,
+            &mut raw_gpu_scores,
+        )
+        .map_err(|error| probe_error("resident_l2_gather", &error))?;
+    assert_close_vec(
+        "resident_l2_gather",
+        &raw_gpu_scores,
+        &EXPECTED_GATHER_L2_SQUARED,
+    )?;
+    let mut cpu_reverified_scores = raw_gpu_scores.clone();
+    let output_offsets = [0_u32, 1, 2, 3, 4, 5];
+    let cpu_readback = backend
+        .reverify_l2_gather_cpu(
+            calyx_forge::CpuGatherReverificationRequest {
+                queries: &GATHER_PROBE_QUERIES,
+                query_count: GATHER_PROBE_QUERY_COUNT,
+                candidates: &GATHER_PROBE_CANDIDATES,
+                dim: PROBE_DIM,
+                indices: &GATHER_PROBE_INDICES,
+                stride: GATHER_PROBE_STRIDE,
+                output_offsets: &output_offsets,
+            },
+            &mut cpu_reverified_scores,
+        )
+        .map_err(|error| probe_error("resident_l2_gather_cpu_reverify", &error))?;
+    if cpu_reverified_scores != EXPECTED_GATHER_L2_SQUARED {
+        return Err(probe_mismatch(format!(
+            "resident L2 gather CPU re-verification is not bit-exact: actual={cpu_reverified_scores:?} expected={EXPECTED_GATHER_L2_SQUARED:?}"
+        )));
+    }
+    Ok(ResidentL2GatherProbeExecution {
+        readback,
+        cpu_readback,
+        raw_gpu_scores,
+        cpu_reverified_scores,
+        persistent_reserved_bytes,
+        process_reserved_bytes_during,
+    })
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn validate_cuda_resident_l2_gather_probe(
+    execution: &ResidentL2GatherProbeExecution,
+    process_reserved_bytes_before: usize,
+    process_reserved_bytes_after: usize,
+) -> Result<(), SynapseCalyxError> {
+    let expected_during = process_reserved_bytes_before
+        .checked_add(execution.persistent_reserved_bytes)
+        .ok_or_else(|| {
+            probe_mismatch("resident L2 gather reservation accounting overflow".to_owned())
+        })?;
+    if execution.process_reserved_bytes_during != expected_during
+        || process_reserved_bytes_after != process_reserved_bytes_before
+    {
+        return Err(probe_mismatch(format!(
+            "resident L2 gather reservation lifecycle mismatch: before={process_reserved_bytes_before} persistent={} during={} after={process_reserved_bytes_after}",
+            execution.persistent_reserved_bytes, execution.process_reserved_bytes_during
+        )));
+    }
+    if execution.readback.topology_exact
+        || !execution.cpu_readback.topology_exact_for_reverified_cells
+        || execution.readback.numeric_contract != calyx_forge::L2_GATHER_NUMERIC_CONTRACT
+    {
+        return Err(probe_mismatch(format!(
+            "resident L2 gather numeric contract mismatch: raw_topology_exact={} cpu_topology_exact={} raw_contract={} expected_contract={}",
+            execution.readback.topology_exact,
+            execution.cpu_readback.topology_exact_for_reverified_cells,
+            execution.readback.numeric_contract,
+            calyx_forge::L2_GATHER_NUMERIC_CONTRACT
+        )));
+    }
+    Ok(())
 }
 
 /// Prove on this host that `calyx-forge`'s runtime-dispatched CPU kernels return

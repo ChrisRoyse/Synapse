@@ -7,8 +7,8 @@ use sha2::{Digest as _, Sha256};
 use std::sync::TryLockError;
 use synapse_action::BackendResolutionPolicy;
 use synapse_core::{
-    Backend, CalyxMathDispatchOperation, CalyxMathProbeTopKEntry, CalyxRowGuardSiteStatus,
-    CalyxTuningKnobEnforcement, CalyxTuningKnobStatus, ChromeBridgeDetail,
+    Backend, CalyxMathDispatchOperation, CalyxMathProbeTopKEntry, CalyxMathResidentL2GatherProbe,
+    CalyxRowGuardSiteStatus, CalyxTuningKnobEnforcement, CalyxTuningKnobStatus, ChromeBridgeDetail,
     PerceptionDetectionHealth, PerceptionMode,
 };
 
@@ -1861,6 +1861,28 @@ impl SynapseService {
                         score: entry.score,
                     })
                     .collect()
+            }),
+            calyx_math_probe_resident_l2_gather: math_backend.as_ref().and_then(|math| {
+                math.probe
+                    .resident_l2_gather
+                    .as_ref()
+                    .map(|probe| CalyxMathResidentL2GatherProbe {
+                        block_id: probe.block_id,
+                        dataset_rows: probe.dataset_rows,
+                        dim: probe.dim,
+                        query_count: probe.query_count,
+                        stride: probe.stride,
+                        raw_gpu_scores: probe.raw_gpu_scores.clone(),
+                        cpu_reverified_scores: probe.cpu_reverified_scores.clone(),
+                        numeric_contract: probe.numeric_contract.clone(),
+                        raw_gpu_topology_exact: probe.raw_gpu_topology_exact,
+                        cpu_reverified_topology_exact: probe.cpu_reverified_topology_exact,
+                        output_cells_reverified: probe.output_cells_reverified,
+                        persistent_reserved_bytes: probe.persistent_reserved_bytes,
+                        process_reserved_bytes_before: probe.process_reserved_bytes_before,
+                        process_reserved_bytes_during: probe.process_reserved_bytes_during,
+                        process_reserved_bytes_after: probe.process_reserved_bytes_after,
+                    })
             }),
             calyx_clock_mode: tuning
                 .as_ref()
