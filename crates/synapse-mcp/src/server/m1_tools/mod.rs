@@ -623,11 +623,24 @@ impl SynapseService {
                     perception_mode,
                     &mut input,
                 );
-                let mut state = shared_m1_state
-                    .lock()
-                    .map_err(|_error| "M1 state lock poisoned while restoring detection runtime")?;
+                let mut state = shared_m1_state.lock().map_err(|_error| {
+                    mcp_error(
+                        error_codes::OBSERVE_INTERNAL,
+                        "M1 state lock poisoned while restoring detection runtime",
+                    )
+                })?;
+                let reconciliation = detection_runtime
+                    .reconcile_config(&state.detection_config, state.perception_mode);
                 state.detection_runtime = Some(detection_runtime);
-                Ok::<_, &'static str>((detection_result, input))
+                reconciliation.map_err(|error| {
+                    mcp_error(
+                        error_codes::DETECTION_MODEL_INFER_FAILED,
+                        format!(
+                            "observe could not reconcile the returned persistent detector with the current profile: {error}"
+                        ),
+                    )
+                })?;
+                Ok::<_, ErrorData>((detection_result, input))
             });
             let (detection_result, returned_input) = tokio::time::timeout(
                 std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
@@ -642,13 +655,7 @@ impl SynapseService {
                     PERCEPTION_DETECTION_TIMEOUT_MS,
                 )
             })?
-            .map_err(|error| perception_join_error("observe", "detection", error))?
-            .map_err(|detail| {
-                mcp_error(
-                    error_codes::OBSERVE_INTERNAL,
-                    format!("observe detection runtime restore failed: {detail}"),
-                )
-            })?;
+            .map_err(|error| perception_join_error("observe", "detection", error))??;
             detection_result?;
             input = returned_input;
         }
@@ -833,11 +840,24 @@ impl SynapseService {
                 perception_mode,
                 &mut input,
             );
-            let mut state = shared_m1_state
-                .lock()
-                .map_err(|_error| "M1 state lock poisoned while restoring detection runtime")?;
+            let mut state = shared_m1_state.lock().map_err(|_error| {
+                mcp_error(
+                    error_codes::OBSERVE_INTERNAL,
+                    "M1 state lock poisoned while restoring detection runtime",
+                )
+            })?;
+            let reconciliation =
+                detection_runtime.reconcile_config(&state.detection_config, state.perception_mode);
             state.detection_runtime = Some(detection_runtime);
-            Ok::<_, &'static str>((detection_result, input))
+            reconciliation.map_err(|error| {
+                mcp_error(
+                    error_codes::DETECTION_MODEL_INFER_FAILED,
+                    format!(
+                        "find could not reconcile the returned persistent detector with the current profile: {error}"
+                    ),
+                )
+            })?;
+            Ok::<_, ErrorData>((detection_result, input))
         });
         let (detection_result, returned_input) = tokio::time::timeout(
             std::time::Duration::from_millis(PERCEPTION_DETECTION_TIMEOUT_MS),
@@ -852,13 +872,7 @@ impl SynapseService {
                 PERCEPTION_DETECTION_TIMEOUT_MS,
             )
         })?
-        .map_err(|error| perception_join_error("find", "detection", error))?
-        .map_err(|detail| {
-            mcp_error(
-                error_codes::OBSERVE_INTERNAL,
-                format!("find detection runtime restore failed: {detail}"),
-            )
-        })?;
+        .map_err(|error| perception_join_error("find", "detection", error))??;
         detection_result?;
         input = returned_input;
         let mut response = super::match_find_input(&input, &params.0);

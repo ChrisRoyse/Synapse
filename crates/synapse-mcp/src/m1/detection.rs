@@ -207,6 +207,51 @@ impl DetectionRuntime {
             None
         }
     }
+
+    /// Reconciles the owned inference worker with the effective runtime policy.
+    ///
+    /// A worker is retained only while pixel-bearing perception is active and
+    /// the complete detection configuration remains valid, registered, and on
+    /// the exact model the worker loaded. This is deliberately called both when
+    /// a profile changes and when an in-flight request returns its borrowed
+    /// runtime: otherwise a profile change racing inference could restore a
+    /// stale model after the profile apply path observed `detection_runtime=None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact owned-process shutdown failure. The runtime removes
+    /// the worker before shutdown so a failed teardown can never be reported as
+    /// a healthy reusable session.
+    pub fn reconcile_config(
+        &mut self,
+        config: &DetectionRuntimeConfig,
+        mode: PerceptionMode,
+    ) -> synapse_models::ModelResult<()> {
+        #[cfg(windows)]
+        {
+            let configured = matches!(mode, PerceptionMode::PixelOnly | PerceptionMode::Hybrid)
+                && valid_detection_config(config)
+                && detection_inference_gate(config).is_none();
+            let requested_model = configured.then(|| config.model_id.as_deref()).flatten();
+            let worker_is_stale = self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| Some(worker.model_id.as_str()) != requested_model);
+            if worker_is_stale {
+                let worker = self.worker.take().ok_or_else(|| {
+                    synapse_models::detection_infer_failed(
+                        "persistent detector reconciliation invariant was violated",
+                    )
+                })?;
+                worker.shutdown()?;
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (config, mode);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1252,6 +1297,22 @@ pub fn populate_detection_from_state(
     input: &mut synapse_perception::ObservationInput,
 ) -> Result<(), ErrorData> {
     let mode = input.mode_override.unwrap_or(perception_mode);
+    runtime.reconcile_config(config, mode).map_err(|error| {
+        tracing::error!(
+            code = error_codes::DETECTION_MODEL_INFER_FAILED,
+            error = %error,
+            mode = ?mode,
+            model_id = ?config.model_id,
+            "failed to reconcile the persistent detector with active configuration"
+        );
+        crate::m1::mcp_error_with_remediation(
+            error_codes::DETECTION_MODEL_INFER_FAILED,
+            format!(
+                "persistent detector reconciliation failed before inference: {error}"
+            ),
+            "inspect the named worker PID/process and GPU reservation source of truth, then retry after the exact owned worker is absent",
+        )
+    })?;
     if !matches!(mode, PerceptionMode::PixelOnly | PerceptionMode::Hybrid) {
         input.detection_status = SensorStatus::Disabled;
         return Ok(());

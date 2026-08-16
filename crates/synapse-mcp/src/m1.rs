@@ -4856,6 +4856,20 @@ pub fn apply_profile_runtime_config_in_state(
         state.perception_mode = profile.mode;
     }
     let detection_config = detection_config_from_profile(&profile.detection);
+    if let Some(runtime) = state.detection_runtime.as_mut() {
+        runtime
+            .reconcile_config(&detection_config, state.perception_mode)
+            .map_err(|error| {
+                mcp_error_with_remediation(
+                    error_codes::DETECTION_MODEL_INFER_FAILED,
+                    format!(
+                        "profile {} could not reconcile its persistent detector: {error}",
+                        profile.id
+                    ),
+                    "inspect the named worker PID/process and GPU reservation source of truth, then re-apply the profile after the exact owned worker is absent",
+                )
+            })?;
+    }
     if detection_config != state.detection_config
         || state.detection_config_source == "daemon_default:no_profile_applied"
     {
