@@ -137,6 +137,21 @@ pub fn detection_inference_gate(
             remediation,
         });
     }
+    if !valid_detection_config(config) {
+        return Some(DetectionInferenceFault {
+            kind: DetectionFaultKind::Misconfigured,
+            reason_code: error_codes::DETECTION_MODEL_INFER_FAILED.to_owned(),
+            detail: format!(
+                "the active profile declares an invalid [detection].confidence_threshold={}; expected a finite value in [0,1]. Every observe in a pixel-bearing perception mode fails; effective detection config model_id={} max_detections={}",
+                config.confidence_threshold,
+                config.model_id.as_deref().unwrap_or("<none>"),
+                config.max_detections
+            ),
+            remediation:
+                "set [detection].confidence_threshold to a finite value in [0,1], then re-apply the profile"
+                    .to_owned(),
+        });
+    }
     // #2064: a named-but-unloadable detector is the third state. It is not
     // `not_configured` (the operator did ask for inference) and it is emphatically
     // not `configured` (nothing can run). Resolved through exactly the id set the
