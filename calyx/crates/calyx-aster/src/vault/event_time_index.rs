@@ -26,7 +26,11 @@ const MARKER_VERSION: u8 = 1;
 const CX_ID_BYTES: usize = 16;
 const INDEX_BATCH_ROWS: usize = 1_024;
 const SCAN_PAGE_ROWS: usize = 1_024;
-const RECONCILE_ATTEMPTS: usize = 3;
+/// Maximum panel-scoped Base delta admitted while the final marker commit owns
+/// the durable writer boundary.  The complete historical proof runs outside
+/// the lock; this cap prevents an unexpectedly hot panel from turning the
+/// delta catch-up into another unbounded stop-the-world scan.
+const PUBLISH_DELTA_MAX_KEYS: usize = 4_096;
 const BACKFILL_LEASE_MS: u64 = 30_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,6 +221,7 @@ where
             |mut snapshot| {
                 let range = KeyRange::all();
                 let mut after = None::<Vec<u8>>;
+                let mut pending_temporal_keys = Vec::with_capacity(INDEX_BATCH_ROWS);
                 loop {
                     let page = self.scan_cf_range_page_snapshot(
                         snapshot,
@@ -231,59 +236,52 @@ where
                     base_rows_scanned = base_rows_scanned
                         .checked_add(page.len() as u64)
                         .ok_or_else(count_overflow)?;
-                    let mut keys = Vec::new();
                     for (key, value) in &page {
                         let projection = decode_base_event(key, value)?;
                         if projection.panel_version == panel_version {
                             panel_rows_scanned = panel_rows_scanned
                                 .checked_add(1)
                                 .ok_or_else(count_overflow)?;
-                            keys.push(key.clone());
                             if projection.source_event_ns.is_some() {
                                 temporal_rows_indexed = temporal_rows_indexed
                                     .checked_add(1)
                                     .ok_or_else(count_overflow)?;
+                                pending_temporal_keys.push(key.clone());
+                                if pending_temporal_keys.len() == INDEX_BATCH_ROWS {
+                                    if self.backfill_event_time_keys_locked(
+                                        panel_version,
+                                        &pending_temporal_keys,
+                                    )? {
+                                        index_batches_committed = index_batches_committed
+                                            .checked_add(1)
+                                            .ok_or_else(count_overflow)?;
+                                    }
+                                    pending_temporal_keys.clear();
+                                }
                             }
                         }
                     }
-                    if !keys.is_empty() {
-                        self.backfill_event_time_keys_locked(panel_version, &keys)?;
-                        index_batches_committed = index_batches_committed
-                            .checked_add(1)
-                            .ok_or_else(count_overflow)?;
-                    }
                     after = page.last().map(|(key, _)| key.clone());
                     snapshot = self.renew_reader(snapshot)?;
+                }
+                if !pending_temporal_keys.is_empty()
+                    && self
+                        .backfill_event_time_keys_locked(panel_version, &pending_temporal_keys)?
+                {
+                    index_batches_committed = index_batches_committed
+                        .checked_add(1)
+                        .ok_or_else(count_overflow)?;
                 }
                 Ok(())
             },
         )?;
 
-        let mut verification_attempts = 0_u32;
-        let mut published = false;
-        for _ in 0..RECONCILE_ATTEMPTS {
-            verification_attempts += 1;
-            let (snapshot_content_seq, count, fingerprint) =
-                self.verify_event_time_index(panel_version)?;
-            if self.publish_event_time_marker_locked(
-                panel_version,
-                snapshot_content_seq,
-                count,
-                fingerprint,
-            )? {
-                published = true;
-                break;
-            }
-        }
-        if !published {
-            return Err(CalyxError {
-                code: CALYX_EVENT_TIME_INDEX_STALE,
-                message: format!(
-                    "panel {panel_version} changed during all {RECONCILE_ATTEMPTS} event-time index reconciliation attempts; no completeness marker was published"
-                ),
-                remediation: "quiesce the competing Base writer long enough for one exact reconciliation, then retry the resumable event-time index backfill",
-            });
-        }
+        // Verify the complete historical population once, then carry that
+        // proof to the current commit boundary by reconciling only the exact
+        // panel-scoped Base delta.  A busy panel never has to become quiet for
+        // the duration of a second whole-corpus scan.
+        self.verify_and_publish_event_time_index(panel_version)?;
+        let verification_attempts = 1_u32;
         let status = self.event_time_index_status(panel_version)?;
         if !status.complete {
             return Err(stale_status_error(&status));
@@ -517,7 +515,11 @@ where
         Ok(expanded)
     }
 
-    fn backfill_event_time_keys_locked(&self, panel_version: u32, keys: &[Vec<u8>]) -> Result<Seq> {
+    fn backfill_event_time_keys_locked(
+        &self,
+        panel_version: u32,
+        keys: &[Vec<u8>],
+    ) -> Result<bool> {
         if keys.len() > INDEX_BATCH_ROWS {
             return Err(CalyxError {
                 code: CALYX_EVENT_TIME_INDEX_INVALID,
@@ -538,6 +540,10 @@ where
                 if base.panel_version == panel_version
                     && let Some(key) = base.index_key()
                 {
+                    if let Some(value) = self.read_cf_latest(ColumnFamily::IndexBtree, &key)? {
+                        validate_index_value(&key, &value)?;
+                        continue;
+                    }
                     rows.push(encode::WriteRow {
                         cf: ColumnFamily::IndexBtree,
                         key,
@@ -545,11 +551,15 @@ where
                     });
                 }
             }
-            self.commit_rows_locked_inner(&rows)
+            if rows.is_empty() {
+                return Ok(false);
+            }
+            self.commit_rows_locked_inner(&rows)?;
+            Ok(true)
         })
     }
 
-    fn verify_event_time_index(&self, panel_version: u32) -> Result<(Seq, u64, Fingerprint)> {
+    fn verify_and_publish_event_time_index(&self, panel_version: u32) -> Result<()> {
         self.with_scoped_latest_snapshot_for_panel(
             panel_version,
             Freshness::FreshDerived,
@@ -621,39 +631,136 @@ where
                         remediation: "retry the resumable backfill; if the mismatch persists, inspect the exact Base and IndexBtree rows before allowing bounded temporal reads",
                     });
                 }
-                Ok((snapshot.derived_content_seq(), actual_count, actual))
+                self.publish_event_time_marker_with_delta_locked(
+                    panel_version,
+                    snapshot,
+                    actual_count,
+                    actual,
+                )
             },
         )
     }
 
-    fn publish_event_time_marker_locked(
+    /// Seals a fully verified historical snapshot at the latest panel
+    /// watermark without requiring a quiet writer window.
+    ///
+    /// The caller proved Base/index equality at `verified_snapshot`.  Under the
+    /// durable commit lock, this method pins the exact current view, enumerates
+    /// every panel Base key changed between the two sequences, validates the
+    /// transactionally maintained IndexBtree state for those keys, applies
+    /// their exact fingerprint/count delta, and commits the marker.  Unchanged
+    /// keys retain the historical proof; changed keys are reproved physically.
+    fn publish_event_time_marker_with_delta_locked(
         &self,
         panel_version: u32,
-        expected_content_seq: Seq,
+        verified_snapshot: Snapshot,
         indexed_records: u64,
         fingerprint: Fingerprint,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         self.with_durable_commit_lock(|| {
-            let current = self
-                .rows
-                .panel_content_seqs_snapshot()?
-                .get(&panel_version)
-                .copied()
-                .unwrap_or_default();
-            if current != expected_content_seq {
-                return Ok(false);
-            }
-            self.commit_rows_locked_inner(&[encode::WriteRow {
-                cf: ColumnFamily::IndexBtree,
-                key: marker_key(panel_version),
-                value: encode_marker(Marker {
-                    panel_version,
-                    panel_content_seq: current,
-                    indexed_records,
-                    fingerprint,
-                }),
-            }])?;
-            Ok(true)
+            self.with_scoped_latest_snapshot_for_panel(
+                panel_version,
+                Freshness::FreshDerived,
+                BACKFILL_LEASE_MS,
+                |error| error,
+                |current_snapshot| {
+                    let changed = self.changed_base_keys_after_snapshot_for_panel(
+                        current_snapshot,
+                        verified_snapshot.seq(),
+                        panel_version,
+                    )?;
+                    if changed.keys.len() > PUBLISH_DELTA_MAX_KEYS {
+                        return Err(CalyxError {
+                            code: CALYX_EVENT_TIME_INDEX_STALE,
+                            message: format!(
+                                "panel {panel_version} changed by {} Base keys between verified seq {} and current seq {}, exceeding the bounded marker catch-up limit {PUBLISH_DELTA_MAX_KEYS}",
+                                changed.keys.len(),
+                                verified_snapshot.seq(),
+                                current_snapshot.seq(),
+                            ),
+                            remediation: "retry the resumable backfill so the full verification snapshot is closer to the current panel watermark; do not publish an unbounded or partial delta",
+                        });
+                    }
+
+                    let mut current_count = indexed_records;
+                    let mut current_fingerprint = fingerprint;
+                    for key in changed.keys {
+                        let before = self
+                            .read_cf_snapshot(verified_snapshot, ColumnFamily::Base, &key)?
+                            .map(|value| decode_base_event(&key, &value))
+                            .transpose()?
+                            .map(BaseEvent::from)
+                            .filter(|base| base.panel_version == panel_version)
+                            .and_then(|base| base.index_key());
+                        let after = self
+                            .read_cf_snapshot(current_snapshot, ColumnFamily::Base, &key)?
+                            .map(|value| decode_base_event(&key, &value))
+                            .transpose()?
+                            .map(BaseEvent::from)
+                            .filter(|base| base.panel_version == panel_version)
+                            .and_then(|base| base.index_key());
+
+                        if before == after {
+                            if let Some(index_key) = &after {
+                                let value = self
+                                    .read_cf_snapshot(
+                                        current_snapshot,
+                                        ColumnFamily::IndexBtree,
+                                        index_key,
+                                    )?
+                                    .ok_or_else(|| missing_index_row(panel_version, index_key))?;
+                                validate_index_value(index_key, &value)?;
+                            }
+                            continue;
+                        }
+                        if let Some(index_key) = &before {
+                            if self
+                                .read_cf_snapshot(
+                                    current_snapshot,
+                                    ColumnFamily::IndexBtree,
+                                    index_key,
+                                )?
+                                .is_some()
+                            {
+                                return Err(CalyxError {
+                                    code: CALYX_EVENT_TIME_INDEX_INCOMPLETE,
+                                    message: format!(
+                                        "panel {panel_version} delta catch-up found a superseded event-time index row still live at current seq {}",
+                                        current_snapshot.seq()
+                                    ),
+                                    remediation: "preserve the Base and IndexBtree rows for this key, repair the atomic Base/index writer, and rerun the exact historical backfill",
+                                });
+                            }
+                            current_fingerprint.remove(index_key);
+                            current_count = current_count.checked_sub(1).ok_or_else(count_overflow)?;
+                        }
+                        if let Some(index_key) = &after {
+                            let value = self
+                                .read_cf_snapshot(
+                                    current_snapshot,
+                                    ColumnFamily::IndexBtree,
+                                    index_key,
+                                )?
+                                .ok_or_else(|| missing_index_row(panel_version, index_key))?;
+                            validate_index_value(index_key, &value)?;
+                            current_fingerprint.add(index_key);
+                            current_count = current_count.checked_add(1).ok_or_else(count_overflow)?;
+                        }
+                    }
+
+                    self.commit_rows_locked_inner(&[encode::WriteRow {
+                        cf: ColumnFamily::IndexBtree,
+                        key: marker_key(panel_version),
+                        value: encode_marker(Marker {
+                            panel_version,
+                            panel_content_seq: current_snapshot.derived_content_seq(),
+                            indexed_records: current_count,
+                            fingerprint: current_fingerprint,
+                        }),
+                    }])?;
+                    Ok(())
+                },
+            )
         })
     }
 }
