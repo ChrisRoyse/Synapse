@@ -882,6 +882,13 @@ pub struct SubsystemHealth {
     pub calyx_derived_state_last_causal_map_latest_event_ns: Option<BTreeMap<String, u64>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_causal_map_rebuild_unix_ms: Option<u64>,
+    /// Exact finalized event-time window used by the last autonomous pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_window_since_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_window_until_ns: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_finalization_lag_ms: Option<u64>,
 
     // --- coverage-backfill rotation and anchor-debt quarantine (#2061) ---
     /// Coverage targets owed a sweep, and how many the last tick swept. Equal on

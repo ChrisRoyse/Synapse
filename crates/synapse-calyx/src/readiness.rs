@@ -33,11 +33,12 @@ use crate::{
 const ACTION_DOMAIN: &str = "synapse.action";
 const ACTION_CONTENT_SLOT: u16 = 50;
 const ACTION_ANCHOR_KIND: &str = "reward";
-/// `v2` carries the evidence provenance block and the admission log. A `v1`
-/// row cannot say which report it measured, so it is not read: readiness
-/// reports an absent snapshot and every autonomy consumer fails closed.
-const READINESS_KEY: &[u8] = b"oracle-readiness/v2/synapse.action";
-const READINESS_SCHEMA_VERSION: u32 = 2;
+/// Immutable readiness row generation. `v3` adds the exact domain and frozen
+/// panel version to the stored value. A `v2` row cannot identify the feature
+/// generation it measured, so it remains historical at its old key and is
+/// never inferred, upgraded, or served as current evidence.
+const READINESS_KEY: &[u8] = b"oracle-readiness/v3/synapse.action";
+const READINESS_SCHEMA_VERSION: u32 = 3;
 const EVIDENCE_CF: &str = "AnnealReport";
 const LEDGER_SOURCE: &str = "Ledger/anneal";
 const GUARD_SOURCE: &str = "Guard/profile\\0panel\\0<panel_version>";
@@ -104,6 +105,11 @@ pub struct SynapseCalyxReadinessEvidence {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxReadinessSnapshot {
     pub schema_version: u32,
+    /// Exact semantic domain this evidence measures.
+    pub domain: String,
+    /// Frozen panel generation whose slots, Guard, kernel, and held-out
+    /// evidence produced this verdict.
+    pub panel_version: u32,
     pub report: SuperIntelReport,
     pub measured_at_seq: u64,
     pub persisted_at_seq: Option<u64>,
@@ -119,6 +125,8 @@ pub struct SynapseCalyxReadinessSnapshot {
 #[derive(Serialize, Deserialize)]
 struct StoredReadinessSnapshot {
     schema_version: u32,
+    domain: String,
+    panel_version: u32,
     report: SuperIntelReport,
     measured_at_seq: u64,
     #[serde(default)]
@@ -294,6 +302,8 @@ impl SynapseCalyxVault {
         );
         let encoded = serde_json::to_vec(&StoredReadinessSnapshot {
             schema_version: READINESS_SCHEMA_VERSION,
+            domain: ACTION_DOMAIN.to_owned(),
+            panel_version: ACTION_PANEL_VERSION,
             report,
             measured_at_seq,
             evidence,
@@ -320,6 +330,8 @@ impl SynapseCalyxVault {
         })?;
         Ok(SynapseCalyxReadinessSnapshot {
             schema_version: readback.schema_version,
+            domain: readback.domain,
+            panel_version: readback.panel_version,
             report: readback.report,
             measured_at_seq,
             persisted_at_seq: Some(persisted_at_seq),
@@ -741,7 +753,8 @@ impl SynapseCalyxVault {
     /// # Errors
     ///
     /// Returns a structured error when the physical row cannot be read, decoded,
-    /// or matched to the current readiness schema.
+    /// or matched to the current readiness schema, domain, and frozen panel
+    /// generation.
     pub fn read_action_readiness(
         &self,
     ) -> Result<Option<SynapseCalyxReadinessSnapshot>, SynapseCalyxError> {
@@ -768,8 +781,20 @@ impl SynapseCalyxVault {
                 "remeasure readiness so the persisted row carries this build's evidence provenance",
             ));
         }
+        if stored.domain != ACTION_DOMAIN || stored.panel_version != ACTION_PANEL_VERSION {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_READINESS_SCOPE_MISMATCH",
+                format!(
+                    "persisted action readiness row has domain={} panel_version={}; this build requires domain={ACTION_DOMAIN} panel_version={ACTION_PANEL_VERSION}",
+                    stored.domain, stored.panel_version
+                ),
+                "preserve the mismatched row as historical evidence and remeasure readiness for the current action panel; reads never reinterpret a different frozen panel generation",
+            ));
+        }
         Ok(Some(SynapseCalyxReadinessSnapshot {
             schema_version: stored.schema_version,
+            domain: stored.domain,
+            panel_version: stored.panel_version,
             report: stored.report,
             measured_at_seq: stored.measured_at_seq,
             persisted_at_seq: None,

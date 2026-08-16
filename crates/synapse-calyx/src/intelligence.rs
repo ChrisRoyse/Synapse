@@ -5307,6 +5307,15 @@ pub(crate) struct EventRecord {
     pub(crate) group: Option<String>,
 }
 
+/// One exact bounded source population plus its physical Aster revision.
+/// The revision covers every ordered event-time index key and exact Base value
+/// read in the same MVCC snapshot as `records`.
+#[allow(clippy::redundant_pub_crate)]
+pub(crate) struct EventRecordSet {
+    pub(crate) records: Vec<EventRecord>,
+    pub(crate) source_revision_sha256: [u8; 32],
+}
+
 /// Nanoseconds per second, for reconstructing sub-second event times.
 const NS_PER_SEC: u64 = 1_000_000_000;
 /// `NS_PER_SEC` as an exactly-representable `f64` divisor.
@@ -5737,6 +5746,18 @@ impl SynapseCalyxVault {
         params: &SynapseCalyxTemporalParams,
         group_key: Option<&str>,
     ) -> Result<Vec<EventRecord>, SynapseCalyxError> {
+        self.load_panel_event_records_with_revision(params, group_key)
+            .map(|source| source.records)
+    }
+
+    /// Loads the same source population as [`Self::load_panel_event_records`]
+    /// and retains the exact physical revision required for an atomic derived
+    /// publication guard.
+    pub(crate) fn load_panel_event_records_with_revision(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        group_key: Option<&str>,
+    ) -> Result<EventRecordSet, SynapseCalyxError> {
         if let (Some(since), Some(until)) = (params.since_ts_ns, params.until_ts_ns)
             && since >= until
         {
@@ -5797,42 +5818,26 @@ impl SynapseCalyxVault {
                     })?;
                 let mut records = Vec::with_capacity(indexed.entries.len());
                 for entry in indexed.entries {
-                    records.push(self.event_record_from_index_entry(
-                        snapshot,
+                    records.push(Self::event_record_from_index_entry(
                         params.panel_version,
-                        entry,
+                        &entry,
                         group_key,
                     )?);
                 }
-                Ok(records)
+                Ok(EventRecordSet {
+                    records,
+                    source_revision_sha256: indexed.source_revision_sha256,
+                })
             },
         )
     }
 
     fn event_record_from_index_entry(
-        &self,
-        snapshot: calyx_aster::mvcc::Snapshot,
         panel_version: u32,
-        entry: calyx_aster::vault::EventTimeIndexEntry,
+        entry: &calyx_aster::vault::EventTimeIndexEntry,
         group_key: Option<&str>,
     ) -> Result<EventRecord, SynapseCalyxError> {
-        let value = self
-            .vault
-            .read_cf_snapshot(snapshot, ColumnFamily::Base, entry.cx_id.as_bytes())
-            .map_err(|error| {
-                SynapseCalyxError::from_calyx(
-                    &format!("read event-time indexed Base constellation {}", entry.cx_id),
-                    &error,
-                )
-            })?
-            .ok_or_else(|| {
-                temporal_error(
-                    "SYNAPSE_CALYX_EVENT_TIME_INDEX_BASE_MISSING",
-                    "the complete event-time index references a Base row absent at the same MVCC snapshot",
-                    "preserve the IndexBtree key and rebuild the derived index after repairing the Base/index atomicity defect",
-                )
-            })?;
-        let constellation = decode_constellation_base(&value)
+        let constellation = decode_constellation_base(&entry.base_value)
             .map_err(|error| SynapseCalyxError::from_calyx("decode Base constellation", &error))?;
         if constellation.panel_version != panel_version {
             return Err(temporal_error(

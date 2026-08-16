@@ -85,8 +85,9 @@ pub(crate) use compaction_bridge::LIVE_COMPACTION_TRIGGER_FILES;
 pub use compaction_bridge::VaultCompactionScheduler;
 pub use event_time_index::{
     CALYX_EVENT_TIME_INDEX_INCOMPLETE, CALYX_EVENT_TIME_INDEX_INVALID,
-    CALYX_EVENT_TIME_INDEX_STALE, EventTimeIndexBackfill, EventTimeIndexEntry, EventTimeIndexRange,
-    EventTimeIndexStatus,
+    CALYX_EVENT_TIME_INDEX_STALE, CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT,
+    EventTimeIndexBackfill, EventTimeIndexEntry, EventTimeIndexRange, EventTimeIndexStatus,
+    EventTimeSourceRevisionGuard,
 };
 pub use grant::{AuditEvent, GrantEntry, GrantStore};
 pub use grounded_observation::{

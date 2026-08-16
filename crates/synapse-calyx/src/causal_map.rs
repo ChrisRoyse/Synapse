@@ -15,6 +15,9 @@ use calyx_assay::{
     partial_correlation_network, pc_stable_gaussian, temporal_cross_k, transfer_entropy_sweep,
 };
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::vault::{
+    CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT, CfRevisionGuard, EventTimeSourceRevisionGuard,
+};
 use calyx_core::FixedClock;
 use num_traits::ToPrimitive;
 use serde::{Deserialize, Serialize};
@@ -24,7 +27,7 @@ use sha2::{Digest, Sha256};
 use crate::intelligence::{
     SYNAPSE_TEMPORAL_MAX_BINS, SYNAPSE_TEMPORAL_MAX_LAGS, SynapseCalyxTemporalParams,
 };
-use crate::{SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault};
+use crate::{SynapseCalyxError, SynapseCalyxVault};
 
 /// Maximum stream count for one exhaustive map. The request fails rather than
 /// sampling when the complete `C(n,2)` family cannot fit this declared budget.
@@ -225,7 +228,9 @@ impl SynapseCalyxVault {
             "starting exhaustive typed causal-evidence map"
         );
 
-        let records = self.load_panel_event_records(params, Some(group_key))?;
+        let source = self.load_panel_event_records_with_revision(params, Some(group_key))?;
+        let source_revision_sha256 = source.source_revision_sha256;
+        let records = source.records;
         if records.is_empty() {
             return Err(causal_error(
                 "SYNAPSE_CALYX_CAUSAL_MAP_EMPTY_SCOPE",
@@ -479,30 +484,61 @@ impl SynapseCalyxVault {
             )
         })?;
         let pointer_digest = Sha256::digest(&pointer_bytes);
-        // One revision-guarded native batch is the publication boundary:
-        // readers can observe neither row or both rows, never a pointer whose
-        // immutable artifact is absent, and a concurrent publisher cannot
-        // replace a newer frontier with the candidate validated above. The
-        // artifact is listed first to preserve the manifest model even for
-        // diagnostic write-order inspection.
+        let source_since_ts_ns = optional_source_bound(params.since_ts_ns, "since_ts_ns")?;
+        let source_until_ts_ns = optional_source_bound(params.until_ts_ns, "until_ts_ns")?;
+        let source_guard = EventTimeSourceRevisionGuard::new(
+            params.panel_version,
+            source_since_ts_ns,
+            source_until_ts_ns,
+            params.max_records,
+            source_revision_sha256,
+        );
+        // One pointer-and-source-guarded native batch is the publication
+        // boundary: readers can observe neither row or both rows, a concurrent
+        // publisher cannot replace a newer frontier, and an in-window Base or
+        // event-index mutation cannot publish an artifact computed from an
+        // obsolete MVCC source population. Events outside this exact bounded
+        // window do not contend with publication. The artifact is listed first
+        // to preserve the manifest model even for diagnostic write-order
+        // inspection.
         let expected_pointer_revision = existing_pointer.map(|row| row.revision_sha256);
-        let publication = self.write_cf_batch_if_revision(
-            ColumnFamily::Graph,
-            &pointer_key,
-            expected_pointer_revision,
-            vec![
-                SynapseCalyxCfWrite {
-                    cf: ColumnFamily::Graph,
-                    key: graph_key.clone(),
-                    value: bytes.clone(),
-                },
-                SynapseCalyxCfWrite {
-                    cf: ColumnFamily::Graph,
-                    key: pointer_key.clone(),
-                    value: pointer_bytes.clone(),
-                },
-            ],
-        )?;
+        let publication = self
+            .vault
+            .write_cf_batch_if_revision_and_event_time_source(
+                CfRevisionGuard::new(
+                    ColumnFamily::Graph,
+                    pointer_key.clone(),
+                    expected_pointer_revision,
+                ),
+                source_guard,
+                [
+                    (ColumnFamily::Graph, graph_key.clone(), bytes.clone()),
+                    (
+                        ColumnFamily::Graph,
+                        pointer_key.clone(),
+                        pointer_bytes.clone(),
+                    ),
+                ],
+            )
+            .map_err(|error| {
+                if error.committed_seq.is_some() {
+                    return causal_error(
+                        "SYNAPSE_CALYX_CAUSAL_MAP_PUBLICATION_RECONCILIATION_REQUIRED",
+                        format!(
+                            "causal-map publication reported an error after an irreversible commit boundary: {error}"
+                        ),
+                        "read the exact committed sequence and Graph artifact/pointer bytes before any retry; never infer whether the publication landed",
+                    );
+                }
+                if error.source.code == CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT {
+                    source_stale_error(&artifact, &error.source.message)
+                } else {
+                    SynapseCalyxError::from_calyx(
+                        "publish pointer-and-source-guarded causal-map generation",
+                        &error.source,
+                    )
+                }
+            })?;
         if !publication.applied {
             return Err(causal_error(
                 "SYNAPSE_CALYX_CAUSAL_MAP_POINTER_REVISION_CONFLICT",
@@ -513,7 +549,7 @@ impl SynapseCalyxVault {
                         .as_ref()
                         .map_or_else(|| "absent".to_owned(), |value| hex_encode(value)),
                     publication
-                        .previous_revision_sha256
+                        .previous_revision
                         .as_ref()
                         .map_or_else(|| "absent".to_owned(), |value| hex_encode(value)),
                 ),
@@ -803,6 +839,23 @@ fn append_optional_scope_part(encoded: &mut Vec<u8>, value: Option<&str>) {
         }
         None => encoded.push(0),
     }
+}
+
+fn optional_source_bound(
+    value: Option<i64>,
+    name: &'static str,
+) -> Result<Option<u64>, SynapseCalyxError> {
+    value
+        .map(|value| {
+            u64::try_from(value).map_err(|_| {
+                causal_error(
+                    "SYNAPSE_CALYX_CAUSAL_MAP_TIMESTAMP_OUT_OF_DOMAIN",
+                    format!("{name}={value} cannot be represented as an unsigned Unix-nanosecond event-time bound"),
+                    "supply a non-negative Unix-nanosecond bound; the physical event-time index has no negative timestamp domain",
+                )
+            })
+        })
+        .transpose()
 }
 
 fn validate_max_lag(max_lag: usize) -> Result<usize, SynapseCalyxError> {

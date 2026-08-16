@@ -230,6 +230,12 @@ pub const CAUSAL_MAP_REBUILD_INTERVAL: std::time::Duration = std::time::Duration
 /// enough one-minute bins for the longest declared eight-bin lag while staying
 /// far below the 4,096-bin assay ceiling.
 pub const CAUSAL_MAP_WINDOW: std::time::Duration = std::time::Duration::from_hours(6);
+/// Event-time watermark applied to autonomous causal windows.
+///
+/// Two complete one-minute bins let normal ingestion settle before a window
+/// becomes final. Later in-window data still conflicts atomically at
+/// publication and remains a typed failure rather than being silently dropped.
+pub const CAUSAL_MAP_FINALIZATION_LAG: std::time::Duration = std::time::Duration::from_mins(2);
 pub const CAUSAL_MAP_MAX_RECORDS: usize = 20_000;
 pub const CAUSAL_MAP_BIN_SECONDS: f64 = 60.0;
 pub const CAUSAL_MAP_MAX_LAG: usize = 8;
@@ -593,6 +599,9 @@ pub struct DerivedStateReadback {
     pub last_causal_map_source_records: BTreeMap<String, usize>,
     pub last_causal_map_latest_event_ns: BTreeMap<String, u64>,
     pub last_causal_map_rebuild_unix_ms: Option<u64>,
+    pub last_causal_map_window_since_ns: Option<i64>,
+    pub last_causal_map_window_until_ns: Option<i64>,
+    pub last_causal_map_finalization_lag_ms: Option<u64>,
     /// Last scheduled per-panel kernel outcome, including the physical Kernel
     /// CF row count returned after persistence.
     pub last_kernel_actions: BTreeMap<u32, String>,
@@ -2493,42 +2502,61 @@ fn drive_one_scheduled_causal_map(
     params.bin_seconds = CAUSAL_MAP_BIN_SECONDS;
     params.max_lag = CAUSAL_MAP_MAX_LAG;
 
-    let published = match db.temporal_causal_map_intelligence(&params, CAUSAL_MAP_FDR_ALPHA) {
-        Ok(report) => report,
-        Err(error)
-            if matches!(
-                error.code(),
-                "SYNAPSE_CALYX_CAUSAL_MAP_EMPTY_SCOPE"
-                    | "SYNAPSE_CALYX_CAUSAL_MAP_STREAMS_INSUFFICIENT"
-                    | "SYNAPSE_CALYX_CAUSAL_MAP_STREAM_LIMIT_EXCEEDED"
-            ) =>
-        {
-            clear_causal_map_physical_readback(&target_id);
-            record_causal_map_action(
-                target_id,
-                format!(
-                    "not_published code={} detail={} remediation={}",
+    let mut source_recompute_attempts = 0_u8;
+    let published = loop {
+        source_recompute_attempts = source_recompute_attempts.saturating_add(1);
+        match db.temporal_causal_map_intelligence(&params, CAUSAL_MAP_FDR_ALPHA) {
+            Ok(report) => break report,
+            Err(error)
+                if error.code() == "SYNAPSE_CALYX_CAUSAL_MAP_SOURCE_STALE"
+                    && source_recompute_attempts == 1 =>
+            {
+                tracing::warn!(
+                    code = "STORAGE_DERIVED_STATE_CAUSAL_MAP_SOURCE_RECOMPUTE",
+                    target = %target_id,
+                    panel_version = target.panel_version,
+                    group_key = target.group_key,
+                    since_ts_ns = since_ns,
+                    until_ts_ns = until_ns,
+                    detail = %error,
+                    "the bounded source changed before its atomic publication; recomputing the same finalized contract exactly once"
+                );
+            }
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "SYNAPSE_CALYX_CAUSAL_MAP_EMPTY_SCOPE"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_STREAMS_INSUFFICIENT"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_STREAM_LIMIT_EXCEEDED"
+                ) =>
+            {
+                clear_causal_map_physical_readback(&target_id);
+                record_causal_map_action(
+                    target_id,
+                    format!(
+                        "not_published source_recompute_attempts={source_recompute_attempts} code={} detail={} remediation={}",
+                        error.code(),
+                        error,
+                        error
+                            .remediation()
+                            .unwrap_or("inspect the exact typed failure")
+                    ),
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                clear_causal_map_physical_readback(&target_id);
+                return Err(format!(
+                    "target={target_id} panel={} group_key={} source_recompute_attempts={source_recompute_attempts}: code={} detail={} remediation={}",
+                    target.panel_version,
+                    target.group_key,
                     error.code(),
                     error,
                     error
                         .remediation()
                         .unwrap_or("inspect the exact typed failure")
-                ),
-            );
-            return Ok(());
-        }
-        Err(error) => {
-            clear_causal_map_physical_readback(&target_id);
-            return Err(format!(
-                "target={target_id} panel={} group_key={}: code={} detail={} remediation={}",
-                target.panel_version,
-                target.group_key,
-                error.code(),
-                error,
-                error
-                    .remediation()
-                    .unwrap_or("inspect the exact typed failure")
-            ));
+                ));
+            }
         }
     };
 
@@ -2586,7 +2614,7 @@ fn drive_one_scheduled_causal_map(
     state.last_causal_map_actions.insert(
         target_id.clone(),
         format!(
-            "published streams={} pairs={} evidence_statuses={status_counts:?} estimator_error_codes={error_codes:?} source_records={} latest_event_ns={}",
+            "published source_recompute_attempts={source_recompute_attempts} window_since_ns={since_ns} window_until_ns={until_ns} streams={} pairs={} evidence_statuses={status_counts:?} estimator_error_codes={error_codes:?} source_records={} latest_event_ns={}",
             readback.artifact.streams.len(),
             readback.artifact.pairs.len(),
             readback.artifact.source_records,
@@ -2628,10 +2656,15 @@ fn drive_scheduled_causal_maps(db: &Arc<Db>) -> Result<(), String> {
     // fault remains visible for the whole refresh interval instead of burning
     // the maintenance pool every five minutes.
     LAST_CAUSAL_MAP_REBUILD_UNIX_MS.store(now_ms, Ordering::Release);
-    let until_ns = i64::try_from(now_ms)
+    let wall_now_ns = i64::try_from(now_ms)
         .ok()
         .and_then(|value| value.checked_mul(1_000_000))
         .ok_or_else(|| "system time exceeds signed Unix-nanosecond range".to_owned())?;
+    let finalization_lag_ns = i64::try_from(CAUSAL_MAP_FINALIZATION_LAG.as_nanos())
+        .map_err(|_| "causal-map finalization lag exceeds signed nanoseconds".to_owned())?;
+    let until_ns = wall_now_ns
+        .checked_sub(finalization_lag_ns)
+        .ok_or_else(|| "causal-map finalized upper window bound underflowed i64".to_owned())?;
     let window_ns = i64::try_from(CAUSAL_MAP_WINDOW.as_nanos())
         .map_err(|_| "causal-map window exceeds signed nanoseconds".to_owned())?;
     let since_ns = until_ns
@@ -2658,6 +2691,10 @@ fn drive_scheduled_causal_maps(db: &Arc<Db>) -> Result<(), String> {
         Err(poisoned) => poisoned.into_inner(),
     };
     state.last_causal_map_rebuild_unix_ms = Some(now_ms);
+    state.last_causal_map_window_since_ns = Some(since_ns);
+    state.last_causal_map_window_until_ns = Some(until_ns);
+    state.last_causal_map_finalization_lag_ms =
+        u64::try_from(CAUSAL_MAP_FINALIZATION_LAG.as_millis()).ok();
     drop(state);
 
     if !failures.is_empty() {
@@ -2672,6 +2709,7 @@ fn drive_scheduled_causal_maps(db: &Arc<Db>) -> Result<(), String> {
         targets = crate::constellations::SYN_CAUSAL_MAP_MAINTENANCE_TARGETS.len(),
         since_ts_ns = since_ns,
         until_ts_ns = until_ns,
+        finalization_lag_ms = CAUSAL_MAP_FINALIZATION_LAG.as_millis(),
         max_records = CAUSAL_MAP_MAX_RECORDS,
         bin_seconds = CAUSAL_MAP_BIN_SECONDS,
         max_lag = CAUSAL_MAP_MAX_LAG,

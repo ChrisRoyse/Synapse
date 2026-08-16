@@ -5296,7 +5296,7 @@ pub fn build_action_constellation(
     );
     let target_text = action_target_text(record);
     if target_text.is_none() {
-        warn_action_target_absent_on_success(source_key, record);
+        warn_action_target_absent_on_success(source_key, record)?;
     }
     slots.insert(
         ACT_SLOT_TARGET_HASH,
@@ -9914,18 +9914,58 @@ fn action_request_vector_slot(source_key: &[u8], record: &Value) -> StorageResul
     )
 }
 
-/// Reports a terminal action SUCCESS whose target no known path carries.
+/// Reports a terminal action SUCCESS whose own foreground state says a target
+/// applied but whose target no known path carries.
 ///
-/// A successful action row is exactly the exemplar the target lane needs to be
-/// calibratable, so one that measures `Absent` is corpus loss, and #2050 is what
-/// silent corpus loss on this lane costs: the shortfall surfaced only as a Ward
-/// refusal with no way to tell "no target was ever bound" from "a target was
-/// bound and the projection could not see it". The two persisted foreground
-/// statuses are logged beside the miss so a reader can separate those cases from
-/// the log line alone.
-fn warn_action_target_absent_on_success(source_key: &[u8], record: &Value) {
+/// Explicit `Absent` is the correct typed value for target-independent actions.
+/// It becomes corpus loss only when the same row claims `set`, a session target
+/// lane, or that this specific action required the real foreground. Merely
+/// holding a foreground lease does not make lease/profile/shell operations
+/// target-bearing. Unknown status vocabulary fails measurement rather than
+/// being guessed as applicable or not applicable.
+fn warn_action_target_absent_on_success(source_key: &[u8], record: &Value) -> StorageResult<()> {
     if json_string(record, &["status", "outcome"]).as_deref() != Some("ok") {
-        return;
+        return Ok(());
+    }
+    let agent_status = json_pointer_text(record, &["/agent_logical_foreground/status"]);
+    let lane_status = json_pointer_text(record, &["/foreground_lane/status"]);
+    let agent_target_applies = match agent_status.as_deref() {
+        Some("set") => true,
+        None | Some("missing_session" | "missing" | "read_error") => false,
+        Some(status) => {
+            return Err(measurement_error(
+                "action target applicability",
+                format!(
+                    "source_cf={} source_key_hex={} unknown agent_logical_foreground.status={status}; remediation=declare the new status semantics and allocate a new action panel generation rather than guessing whether target absence is applicable",
+                    cf::CF_ACTION_LOG,
+                    hex_encode(source_key)
+                ),
+            ));
+        }
+    };
+    let lane_target_applies = match lane_status.as_deref() {
+        Some("conflicting_owner" | "claimed_by_session" | "unclaimed_session_target") => true,
+        None
+        | Some("missing_session" | "missing" | "read_error" | "explicit_real_foreground_lease") => {
+            false
+        }
+        Some(status) => {
+            return Err(measurement_error(
+                "action target applicability",
+                format!(
+                    "source_cf={} source_key_hex={} unknown foreground_lane.status={status}; remediation=declare the new status semantics and allocate a new action panel generation rather than guessing whether target absence is applicable",
+                    cf::CF_ACTION_LOG,
+                    hex_encode(source_key)
+                ),
+            ));
+        }
+    };
+    let real_foreground_target_applies = record
+        .pointer("/foreground_tier/required_foreground")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !agent_target_applies && !lane_target_applies && !real_foreground_target_applies {
+        return Ok(());
     }
     tracing::warn!(
         code = "CALYX_ACTION_TARGET_ABSENT_ON_SUCCESS",
@@ -9935,20 +9975,17 @@ fn warn_action_target_absent_on_success(source_key: &[u8], record: &Value) {
         source_cf = cf::CF_ACTION_LOG,
         source_key_hex = %hex_encode(source_key),
         action = %action_identity(record),
-        agent_logical_foreground_status = json_pointer_text(
-            record,
-            &["/agent_logical_foreground/status"]
-        )
-        .unwrap_or_else(|| "<absent>".to_owned()),
-        foreground_lane_status = json_pointer_text(record, &["/foreground_lane/status"])
-            .unwrap_or_else(|| "<absent>".to_owned()),
+        agent_logical_foreground_status = agent_status.as_deref().unwrap_or("<absent>"),
+        foreground_lane_status = lane_status.as_deref().unwrap_or("<absent>"),
+        required_real_foreground = real_foreground_target_applies,
         searched_pointers = ACTION_TARGET_POINTERS.join(","),
-        "terminal action success carries no target under any known path; its target-hash slot \
-         measures Absent and the row cannot serve as a good exemplar for target-lane calibration. \
-         Remediation: if the two foreground statuses show a bound session target, the projection \
-         has drifted from the audit writer and ACTION_TARGET_POINTERS must be repaired; if they \
-         show none was bound, bind one with target operation=set before the action"
+        "terminal action success claims a target-bearing foreground state but carries no target \
+         under any known path; its target-hash slot measures Absent and the row cannot serve as a \
+         good exemplar for target-lane calibration. Remediation: repair the audit writer and \
+         ACTION_TARGET_POINTERS together under a new frozen action-panel generation; never bind \
+         an unrelated target merely to populate this lens"
     );
+    Ok(())
 }
 
 fn reflex_latency_ms(record: &StoredReflexAudit) -> Option<u64> {

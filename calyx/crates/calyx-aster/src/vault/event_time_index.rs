@@ -18,6 +18,8 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const CALYX_EVENT_TIME_INDEX_INCOMPLETE: &str = "CALYX_EVENT_TIME_INDEX_INCOMPLETE";
 pub const CALYX_EVENT_TIME_INDEX_STALE: &str = "CALYX_EVENT_TIME_INDEX_STALE";
 pub const CALYX_EVENT_TIME_INDEX_INVALID: &str = "CALYX_EVENT_TIME_INDEX_INVALID";
+pub const CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT: &str =
+    "CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT";
 
 const INDEX_PREFIX: &[u8] = b"\x12calyx-event-time-v1\0";
 const MARKER_PREFIX: &[u8] = b"\x13calyx-event-time-marker-v1\0";
@@ -57,16 +59,53 @@ pub struct EventTimeIndexBackfill {
     pub status: EventTimeIndexStatus,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventTimeIndexEntry {
     pub source_event_ns: u64,
     pub cx_id: CxId,
+    /// Exact Base-CF bytes observed beside this index member in the same MVCC
+    /// snapshot. Returning them with the member prevents a second, potentially
+    /// different read from defining an intelligence source population.
+    pub base_value: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EventTimeIndexRange {
     pub status: EventTimeIndexStatus,
     pub entries: Vec<EventTimeIndexEntry>,
+    /// Domain-separated SHA-256 over the exact ordered index keys and Base
+    /// values in this range. It is a physical source revision, not a semantic
+    /// fingerprint, and can be compared under Aster's durable commit lock.
+    pub source_revision_sha256: [u8; 32],
+}
+
+/// Exact bounded event-time source revision required at a later commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EventTimeSourceRevisionGuard {
+    pub panel_version: u32,
+    pub since_ts_ns: Option<u64>,
+    pub until_ts_ns: Option<u64>,
+    pub max_records: usize,
+    pub expected_revision_sha256: [u8; 32],
+}
+
+impl EventTimeSourceRevisionGuard {
+    #[must_use]
+    pub const fn new(
+        panel_version: u32,
+        since_ts_ns: Option<u64>,
+        until_ts_ns: Option<u64>,
+        max_records: usize,
+        expected_revision_sha256: [u8; 32],
+    ) -> Self {
+        Self {
+            panel_version,
+            since_ts_ns,
+            until_ts_ns,
+            max_records,
+            expected_revision_sha256,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -361,14 +400,145 @@ where
                 remediation: "narrow the event-time window or raise max_records within the caller's declared hard bound",
             });
         }
-        let entries = rows
+        let mut revision =
+            source_revision_hasher(panel_version, since_ts_ns, until_ts_ns, rows.len())?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for (key, value) in rows {
+            validate_index_value(&key, &value)?;
+            let mut entry = decode_index_key(&key, panel_version)?;
+            let base_value = self
+                .read_cf_snapshot(snapshot, ColumnFamily::Base, entry.cx_id.as_bytes())?
+                .ok_or_else(|| CalyxError {
+                    code: CALYX_EVENT_TIME_INDEX_INVALID,
+                    message: format!(
+                        "event-time index member {} has no Base row at snapshot {}",
+                        entry.cx_id,
+                        snapshot.seq()
+                    ),
+                    remediation: "preserve the orphaned IndexBtree row and rebuild the event-time index after repairing the Base/index atomicity defect",
+                })?;
+            append_revision_part(&mut revision, &key)?;
+            append_revision_part(&mut revision, &base_value)?;
+            entry.base_value = base_value;
+            entries.push(entry);
+        }
+        Ok(EventTimeIndexRange {
+            status,
+            entries,
+            source_revision_sha256: revision.finalize().into(),
+        })
+    }
+
+    /// Publishes one derived batch only when both its pointer revision and the
+    /// exact bounded event-time source population still match the revisions
+    /// observed by the producer. Both comparisons and the commit execute under
+    /// Aster's process/cross-process durable commit boundary.
+    ///
+    /// This differs deliberately from guarding the panel-wide completeness
+    /// marker: active events outside a finalized window must not starve a
+    /// bounded publication, while an insertion or Base-value change inside the
+    /// window must make publication impossible.
+    pub fn write_cf_batch_if_revision_and_event_time_source(
+        &self,
+        pointer_guard: super::CfRevisionGuard,
+        source_guard: EventTimeSourceRevisionGuard,
+        rows: impl IntoIterator<Item = (ColumnFamily, Vec<u8>, Vec<u8>)>,
+    ) -> std::result::Result<super::ConditionalCfWriteOutcome, super::ConditionalCfWriteError> {
+        let guards = [pointer_guard];
+        let rows = rows
             .into_iter()
-            .map(|(key, value)| {
-                validate_index_value(&key, &value)?;
-                decode_index_key(&key, panel_version)
+            .map(|(cf, key, value)| encode::WriteRow { cf, key, value })
+            .collect::<Vec<_>>();
+        super::reject_raw_ledger_guards(
+            "write_cf_batch_if_revision_and_event_time_source",
+            &guards,
+        )
+        .map_err(super::conditional_write_error)?;
+        super::reject_raw_ledger_rows("write_cf_batch_if_revision_and_event_time_source", &rows)
+            .map_err(super::conditional_write_error)?;
+        if rows.iter().any(is_reserved_row) {
+            return Err(super::conditional_write_error(CalyxError {
+                code: CALYX_EVENT_TIME_INDEX_INVALID,
+                message: "event-time-source-guarded publication attempted to mutate the reserved event-time index keyspace".to_owned(),
+                remediation: "publish only caller-owned derived rows; Aster maintains event-time index rows from Base mutations",
+            }));
+        }
+        let guarded_row_indices =
+            super::guarded_row_indices(&guards, &rows).map_err(super::conditional_write_error)?;
+        self.ensure_writeable("event-time-source-guarded CF batch")
+            .map_err(super::conditional_write_error)?;
+
+        let mut committed_seq_on_error = None;
+        let outcome = self.with_durable_commit_lock(|| {
+            let pointer_actual = self
+                .read_cf_latest(guards[0].cf, &guards[0].key)?
+                .as_deref()
+                .map(super::value_revision);
+            if pointer_actual != guards[0].expected_revision {
+                return Ok(super::ConditionalCfWriteOutcome {
+                    applied: false,
+                    seq: self.latest_seq(),
+                    previous_revision: pointer_actual,
+                    committed_revision: None,
+                });
+            }
+
+            let current_source = self.with_scoped_latest_snapshot_for_panel(
+                source_guard.panel_version,
+                Freshness::FreshDerived,
+                BACKFILL_LEASE_MS,
+                |error| error,
+                |snapshot| {
+                    self.read_event_time_index_range_snapshot(
+                        snapshot,
+                        source_guard.panel_version,
+                        source_guard.since_ts_ns,
+                        source_guard.until_ts_ns,
+                        source_guard.max_records,
+                    )
+                },
+            )?;
+            if current_source.source_revision_sha256 != source_guard.expected_revision_sha256 {
+                return Err(CalyxError {
+                    code: CALYX_EVENT_TIME_SOURCE_REVISION_CONFLICT,
+                    message: format!(
+                        "bounded event-time source changed before publication: panel={} since_ts_ns={:?} until_ts_ns={:?} expected_revision={} actual_revision={}",
+                        source_guard.panel_version,
+                        source_guard.since_ts_ns,
+                        source_guard.until_ts_ns,
+                        hex(&source_guard.expected_revision_sha256),
+                        hex(&current_source.source_revision_sha256),
+                    ),
+                    remediation: "recompute the complete artifact from the current bounded source population and retry the same immutable analysis contract; never publish the stale candidate",
+                });
+            }
+
+            self.post_commit_error_seq.store(0, std::sync::atomic::Ordering::Release);
+            let seq = match self.commit_rows_locked(&rows) {
+                Ok(seq) => seq,
+                Err(error) => {
+                    committed_seq_on_error = super::nonzero_seq(
+                        self.post_commit_error_seq
+                            .swap(0, std::sync::atomic::Ordering::AcqRel),
+                    );
+                    return Err(error);
+                }
+            };
+            let committed_revision = guarded_row_indices[0].map(|row_index| {
+                let value = &rows[row_index].value;
+                (!is_tombstone_value(value)).then(|| super::value_revision(value))
+            });
+            Ok(super::ConditionalCfWriteOutcome {
+                applied: true,
+                seq,
+                previous_revision: pointer_actual,
+                committed_revision: committed_revision.flatten(),
             })
-            .collect::<Result<Vec<_>>>()?;
-        Ok(EventTimeIndexRange { status, entries })
+        });
+        outcome.map_err(|source| super::ConditionalCfWriteError {
+            source,
+            committed_seq: committed_seq_on_error,
+        })
     }
 
     pub(super) fn augment_event_time_index_rows_locked(
@@ -987,7 +1157,45 @@ fn decode_index_key(key: &[u8], expected_panel: u32) -> Result<EventTimeIndexEnt
     Ok(EventTimeIndexEntry {
         source_event_ns,
         cx_id,
+        base_value: Vec::new(),
     })
+}
+
+fn source_revision_hasher(
+    panel_version: u32,
+    since_ts_ns: Option<u64>,
+    until_ts_ns: Option<u64>,
+    records: usize,
+) -> Result<Sha256> {
+    let mut hasher = Sha256::new();
+    hasher.update(b"calyx.event-time-source-revision.v1\0");
+    hasher.update(panel_version.to_be_bytes());
+    append_optional_revision_u64(&mut hasher, since_ts_ns);
+    append_optional_revision_u64(&mut hasher, until_ts_ns);
+    let records = u64::try_from(records).map_err(|_| {
+        CalyxError::aster_corrupt_shard("event-time source revision record count does not fit u64")
+    })?;
+    hasher.update(records.to_be_bytes());
+    Ok(hasher)
+}
+
+fn append_optional_revision_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+        None => hasher.update([0]),
+    }
+}
+
+fn append_revision_part(hasher: &mut Sha256, value: &[u8]) -> Result<()> {
+    let len = u64::try_from(value.len()).map_err(|_| {
+        CalyxError::aster_corrupt_shard("event-time source revision member length does not fit u64")
+    })?;
+    hasher.update(len.to_be_bytes());
+    hasher.update(value);
+    Ok(())
 }
 
 fn validate_index_value(key: &[u8], value: &[u8]) -> Result<()> {

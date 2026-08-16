@@ -1186,6 +1186,12 @@ impl SynapseService {
             ),
             calyx_derived_state_last_causal_map_rebuild_unix_ms: readback
                 .last_causal_map_rebuild_unix_ms,
+            calyx_derived_state_last_causal_map_window_since_ns: readback
+                .last_causal_map_window_since_ns,
+            calyx_derived_state_last_causal_map_window_until_ns: readback
+                .last_causal_map_window_until_ns,
+            calyx_derived_state_last_causal_map_finalization_lag_ms: readback
+                .last_causal_map_finalization_lag_ms,
             ..SubsystemHealth::default()
         }
     }

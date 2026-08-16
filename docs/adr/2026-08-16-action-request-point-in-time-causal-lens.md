@@ -71,6 +71,13 @@ show why conditioning on post-treatment variables biases causal inference.
   asymmetric error details.
 - Historical rows may have an absent request slot. Absence is retained as
   absence; it is never a zero vector or a reconstructed request.
+- Target absence follows the same typed rule. A successful target-independent
+  action with no session target and no explicit real-foreground lease keeps
+  target slots `Absent`; it is not warned toward an unrelated target.
+  `CALYX_ACTION_TARGET_ABSENT_ON_SUCCESS` is reserved for a physical
+  contradiction where the row claims a target-bearing foreground state but
+  every exact target field is absent. Unknown foreground status vocabulary
+  fails measurement and requires an explicitly versioned contract.
 - Changed frozen instruments have new lens names even though their slot ids stay
   stable inside the new panel generation.
 - Readiness can remain false after deployment. That is the correct result until
