@@ -312,7 +312,7 @@ fn spawn_with_probe(
                     let tick_probe = Arc::clone(&probe);
                     let tick_compaction = Arc::clone(&compaction);
                     let tick_path = path.clone();
-                    let result = crate::maintenance::run_admitted_maintenance(
+                    let result = crate::maintenance::run_background_admitted_maintenance(
                         "storage_disk_pressure",
                         move || match tick_probe.available_space(&tick_path) {
                             Ok(free_bytes) => apply_free_bytes(

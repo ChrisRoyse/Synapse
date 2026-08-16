@@ -3,6 +3,22 @@ use serde_json::{Value, json};
 use synapse_core::error_codes;
 
 use crate::server::{ErrorData, tool_profiles::ToolProfileKind};
+
+/// Converts a storage failure without discarding its typed remediation.
+///
+/// Whole-corpus foreground admission is deliberately refused before dispatch
+/// when an autonomous owner outlives its budget. That refusal must survive the
+/// facade envelope as `{code,message,remediation}`; reducing it to `mcp_error`
+/// would keep the code but replace the exact retry boundary with a generic
+/// facade sentence.
+pub(super) fn storage_error_data(error: &synapse_storage::StorageError) -> ErrorData {
+    if let Some(remediation) = error.remediation() {
+        crate::m1::mcp_error_with_remediation(error.code(), error.to_string(), remediation)
+    } else {
+        crate::m1::mcp_error(error.code(), error.to_string())
+    }
+}
+
 pub(super) fn missing_spec(tool: &'static str, operation: &'static str) -> ErrorData {
     ErrorData::new(
         ErrorCode(-32099),

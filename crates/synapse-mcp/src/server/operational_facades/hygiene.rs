@@ -174,7 +174,7 @@ pub(crate) fn health_subsystem() -> SubsystemHealth {
 
 use super::{
     HYGIENE_SOT, HYGIENE_TOOL,
-    errors::{facade_delegate_error, missing_spec},
+    errors::{facade_delegate_error, missing_spec, storage_error_data},
     policy::{require_maintenance_profile, require_storage_operation_authority},
     response::hygiene_response,
     types::{HygieneOperation, HygieneParams, HygieneResponse},
@@ -618,7 +618,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named grounding-gap error",
                 )
             })??;
@@ -667,7 +667,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named blind-spot error",
                 )
             })??;
@@ -727,7 +727,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named MMD drift error",
                 )
             })??;
@@ -830,7 +830,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "calyx_vault",
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named vault-verification error",
                 )
             })??;
@@ -960,7 +960,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named kernel-rebuild error",
                 )
             })??;
@@ -1031,7 +1031,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named guard-calibration error",
                 )
             })??;
@@ -1101,7 +1101,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     HYGIENE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named guard-verification error",
                 )
             })??;

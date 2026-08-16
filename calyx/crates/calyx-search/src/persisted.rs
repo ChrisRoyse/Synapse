@@ -54,6 +54,7 @@ pub use rebuild::{
     rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
 };
+pub use rebuild_stream::rebuild_panel_membership_for_vault;
 
 const MANIFEST_FORMAT: &str = "calyx-search-index-manifest-v2";
 const IDMAP_FORMAT: &str = "calyx-search-index-idmap-v2";

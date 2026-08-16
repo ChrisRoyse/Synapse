@@ -111,6 +111,13 @@ pub struct CudaCrossCorrelationBatch {
     pub n_pairs: Vec<usize>,
 }
 
+/// Exact discrete transfer-entropy estimates for one fixed symbol table and a
+/// caller-declared batch of equal-length index selections.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CudaDiscreteTeBatch {
+    pub estimates: Vec<f32>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CudaHawkesFit {
     pub baseline_rates: Vec<f32>,

@@ -273,6 +273,13 @@ pub const STORAGE_DISK_PRESSURE_LEVEL_3: &str = "STORAGE_DISK_PRESSURE_LEVEL_3";
 pub const STORAGE_DISK_PRESSURE_LEVEL_4: &str = "STORAGE_DISK_PRESSURE_LEVEL_4";
 pub const STORAGE_CF_HARD_CAP_REACHED: &str = "STORAGE_CF_HARD_CAP_REACHED";
 pub const STORAGE_GC_UNSAFE_EVICTION_REFUSED: &str = "STORAGE_GC_UNSAFE_EVICTION_REFUSED";
+/// A foreground MCP operation could not acquire the exclusive whole-corpus
+/// storage lane within its declared admission budget.
+///
+/// The owning pass continues; no foreground work was dispatched and no second
+/// corpus working set was admitted. Callers must observe the named owner's
+/// completion boundary before retrying instead of increasing transport timeouts.
+pub const STORAGE_MAINTENANCE_BUSY: &str = "STORAGE_MAINTENANCE_BUSY";
 pub const STORAGE_SEARCH_REBUILD_IN_PROGRESS: &str = "STORAGE_SEARCH_REBUILD_IN_PROGRESS";
 pub const STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS: &str =
     "STORAGE_TRANSCRIPT_ORDER_REBUILD_IN_PROGRESS";

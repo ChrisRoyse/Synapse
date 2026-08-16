@@ -21,7 +21,7 @@ use std::sync::{
     Arc, LazyLock, Mutex, Weak,
     atomic::{AtomicU64, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use synapse_calyx::{
     LoweredArtifactHandle, LoweredArtifactKind, LoweringParams, SynapseCalyxVaultStatus,
@@ -46,6 +46,95 @@ const STORAGE_HEAVY_MAINTENANCE_LANES: usize = 1;
 static STORAGE_MAINTENANCE_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_HEAVY_MAINTENANCE_LANES)));
 
+/// Maximum time a foreground MCP request may wait merely to begin owning the
+/// whole-corpus lane. This is admission time, not an execution deadline.
+///
+/// A caller that cannot start within this budget receives a typed busy verdict
+/// while the existing owner continues uninterrupted. Keeping this far below the
+/// transport deadline prevents a queued request from being erased by a generic
+/// client timeout without ever reaching its own code (#2245).
+pub const STORAGE_FOREGROUND_ADMISSION_WAIT: Duration = Duration::from_secs(1);
+
+#[derive(Clone)]
+struct StorageMaintenanceOwner {
+    operation: &'static str,
+    generation: u64,
+    started: Instant,
+}
+
+static STORAGE_MAINTENANCE_OWNER: LazyLock<Mutex<Option<StorageMaintenanceOwner>>> =
+    LazyLock::new(|| Mutex::new(None));
+static STORAGE_MAINTENANCE_OWNER_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+struct StorageMaintenanceOwnerGuard {
+    operation: &'static str,
+    generation: u64,
+}
+
+impl Drop for StorageMaintenanceOwnerGuard {
+    fn drop(&mut self) {
+        let mut owner = match STORAGE_MAINTENANCE_OWNER.lock() {
+            Ok(owner) => owner,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if owner
+            .as_ref()
+            .is_some_and(|active| active.generation == self.generation)
+        {
+            *owner = None;
+        } else {
+            tracing::error!(
+                code = "STORAGE_MAINTENANCE_OWNER_RELEASE_DIVERGED",
+                operation = self.operation,
+                owner_generation = self.generation,
+                observed_operation = owner.as_ref().map(|active| active.operation),
+                observed_generation = owner.as_ref().map(|active| active.generation),
+                "whole-corpus permit owner registry diverged at release; the semaphore remains the authority and the registry was not overwritten"
+            );
+        }
+    }
+}
+
+fn maintenance_owner_snapshot() -> Option<StorageMaintenanceOwner> {
+    match STORAGE_MAINTENANCE_OWNER.lock() {
+        Ok(owner) => owner.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+fn install_maintenance_owner(
+    operation: &'static str,
+) -> StorageResult<StorageMaintenanceOwnerGuard> {
+    let generation = STORAGE_MAINTENANCE_OWNER_GENERATION
+        .fetch_add(1, Ordering::Relaxed)
+        .saturating_add(1);
+    let mut owner = match STORAGE_MAINTENANCE_OWNER.lock() {
+        Ok(owner) => owner,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(active) = owner.as_ref() {
+        return Err(StorageError::WriteFailed {
+            cf_name: "storage_maintenance".to_owned(),
+            detail: format!(
+                "STORAGE_MAINTENANCE_OWNER_DIVERGED requested_operation={operation} active_operation={} active_generation={} active_for_ms={}; acquired the exclusive semaphore while its owner registry was still occupied",
+                active.operation,
+                active.generation,
+                active.started.elapsed().as_millis()
+            ),
+        });
+    }
+    *owner = Some(StorageMaintenanceOwner {
+        operation,
+        generation,
+        started: Instant::now(),
+    });
+    drop(owner);
+    Ok(StorageMaintenanceOwnerGuard {
+        operation,
+        generation,
+    })
+}
+
 /// Number of concurrent bounded foreground storage reads.
 ///
 /// This lane is intentionally separate from whole-corpus maintenance. Its
@@ -60,7 +149,8 @@ const STORAGE_BOUNDED_READ_LANES: usize = 1;
 static STORAGE_BOUNDED_READ_PERMITS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(STORAGE_BOUNDED_READ_LANES)));
 
-/// Runs one blocking storage-maintenance pass off the async runtime workers.
+/// Runs one foreground blocking storage-maintenance pass off the async runtime
+/// workers with bounded admission time.
 ///
 /// The closure executes on Tokio's blocking pool under a dedicated admission
 /// permit, so it can never park a runtime worker that is polling MCP requests.
@@ -73,8 +163,10 @@ static STORAGE_BOUNDED_READ_PERMITS: LazyLock<Arc<Semaphore>> =
 ///
 /// # Errors
 ///
-/// Returns the closure's error, or a structured storage error if the admission
-/// semaphore was closed or the blocking task failed to join.
+/// Returns the closure's error, a typed busy error when another whole-corpus
+/// owner outlives the foreground admission budget, or a structured storage
+/// error if the semaphore closes or the blocking task fails to join. Scheduled
+/// tasks must use [`run_background_admitted_maintenance`] instead.
 pub async fn run_admitted_maintenance<T, F>(operation: &'static str, work: F) -> StorageResult<T>
 where
     F: FnOnce() -> StorageResult<T> + Send + 'static,
@@ -83,7 +175,8 @@ where
     run_admitted_maintenance_preserving_error(operation, work).await?
 }
 
-/// Runs one blocking whole-corpus pass while preserving its domain error type.
+/// Runs one foreground blocking whole-corpus pass while preserving its domain
+/// error type.
 ///
 /// MCP facades have typed protocol errors which must not be flattened into a
 /// generic storage failure merely to share the process-wide maintenance lane.
@@ -99,9 +192,11 @@ where
 ///
 /// # Errors
 ///
-/// Returns a structured storage error if the admission semaphore was closed or
-/// the blocking task failed to join. The operation's own error is returned
-/// unchanged in the nested result.
+/// Returns a typed busy error when another owner outlives the foreground
+/// admission budget, or a structured storage error if the semaphore closes or
+/// the blocking task fails to join. The operation's own error is returned
+/// unchanged in the nested result. Scheduled tasks must use
+/// [`run_background_admitted_maintenance_preserving_error`] instead.
 pub async fn run_admitted_maintenance_preserving_error<T, E, F>(
     operation: &'static str,
     work: F,
@@ -111,18 +206,148 @@ where
     T: Send + 'static,
     E: Send + 'static,
 {
+    run_admitted_maintenance_with_policy(operation, Some(STORAGE_FOREGROUND_ADMISSION_WAIT), work)
+        .await
+}
+
+/// Runs one scheduled/background whole-corpus pass and waits fairly for the
+/// exclusive lane.
+///
+/// Background maintainers have no client transport deadline and must converge,
+/// so they remain queued until admitted. This explicit name prevents a public
+/// MCP caller from accidentally inheriting unbounded admission again.
+///
+/// # Errors
+///
+/// Returns the operation error or a structured admission/worker error.
+pub async fn run_background_admitted_maintenance<T, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<T>
+where
+    F: FnOnce() -> StorageResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_background_admitted_maintenance_preserving_error(operation, work).await?
+}
+
+/// Background counterpart that preserves the closure's domain error type.
+///
+/// # Errors
+///
+/// Returns a structured admission/worker error, with the domain verdict nested
+/// unchanged.
+pub async fn run_background_admitted_maintenance_preserving_error<T, E, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<Result<T, E>>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    run_admitted_maintenance_with_policy(operation, None, work).await
+}
+
+/// Runs one foreground whole-corpus operation with bounded admission time.
+///
+/// Unlike scheduled maintenance, an MCP request has a finite transport
+/// lifetime. Waiting unboundedly behind a multi-minute autonomous pass makes
+/// the transport timeout erase the request before the operation starts. This
+/// entry point retains the same exclusive semaphore and blocking owner, but
+/// refuses with [`StorageError::MaintenanceBusy`] when it cannot start within
+/// [`STORAGE_FOREGROUND_ADMISSION_WAIT`]. No closure is dispatched on refusal.
+///
+/// # Errors
+///
+/// Returns a typed busy error on admission expiry, a structured storage error
+/// if the lane closes or ownership diverges, or the unchanged nested domain
+/// outcome after admitted execution.
+pub async fn run_foreground_admitted_maintenance_preserving_error<T, E, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<Result<T, E>>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
+    run_admitted_maintenance_preserving_error(operation, work).await
+}
+
+/// Foreground counterpart to [`run_admitted_maintenance`].
+///
+/// # Errors
+///
+/// Returns the operation error or a typed admission/worker error.
+pub async fn run_foreground_admitted_maintenance<T, F>(
+    operation: &'static str,
+    work: F,
+) -> StorageResult<T>
+where
+    F: FnOnce() -> StorageResult<T> + Send + 'static,
+    T: Send + 'static,
+{
+    run_admitted_maintenance(operation, work).await
+}
+
+async fn run_admitted_maintenance_with_policy<T, E, F>(
+    operation: &'static str,
+    admission_wait: Option<Duration>,
+    work: F,
+) -> StorageResult<Result<T, E>>
+where
+    F: FnOnce() -> Result<T, E> + Send + 'static,
+    T: Send + 'static,
+    E: Send + 'static,
+{
     let semaphore = Arc::clone(&STORAGE_MAINTENANCE_PERMITS);
     let lane_occupied_at_request = semaphore.available_permits() == 0;
+    let owner_at_request = maintenance_owner_snapshot();
     let admission_started = Instant::now();
-    let permit = Arc::clone(&semaphore)
-        .acquire_owned()
-        .await
-        .map_err(|_closed| StorageError::WriteFailed {
-            cf_name: "storage_maintenance".to_owned(),
-            detail: format!(
-                "{operation}: storage maintenance admission semaphore was unexpectedly closed"
-            ),
-        })?;
+    let acquire = Arc::clone(&semaphore).acquire_owned();
+    let acquired = if let Some(wait_budget) = admission_wait {
+        match tokio::time::timeout(wait_budget, acquire).await {
+            Ok(acquired) => acquired,
+            Err(_elapsed) => {
+                let active = maintenance_owner_snapshot().or(owner_at_request);
+                let active_operation = active.as_ref().map_or_else(
+                    || "semaphore_handoff_pending".to_owned(),
+                    |owner| owner.operation.to_owned(),
+                );
+                let active_for_ms = active.as_ref().map_or(0, |owner| {
+                    u64::try_from(owner.started.elapsed().as_millis()).unwrap_or(u64::MAX)
+                });
+                let wait_budget_ms = u64::try_from(wait_budget.as_millis()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    code = synapse_core::error_codes::STORAGE_MAINTENANCE_BUSY,
+                    requested_operation = operation,
+                    active_operation,
+                    active_for_ms,
+                    wait_budget_ms,
+                    lane_occupied_at_request,
+                    foreground_work_dispatched = false,
+                    exclusive_whole_corpus_lane = true,
+                    "foreground whole-corpus storage operation refused after bounded admission wait; the active owner continues uninterrupted"
+                );
+                return Err(StorageError::MaintenanceBusy {
+                    requested_operation: operation,
+                    active_operation,
+                    active_for_ms,
+                    wait_budget_ms,
+                });
+            }
+        }
+    } else {
+        acquire.await
+    };
+    let permit = acquired.map_err(|_closed| StorageError::WriteFailed {
+        cf_name: "storage_maintenance".to_owned(),
+        detail: format!(
+            "{operation}: storage maintenance admission semaphore was unexpectedly closed"
+        ),
+    })?;
+    let owner_guard = install_maintenance_owner(operation)?;
     let admission_wait_ms =
         u64::try_from(admission_started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let active_after_admission =
@@ -140,6 +365,7 @@ where
     let exec_started = Instant::now();
     let joined = tokio::task::spawn_blocking(move || {
         let _permit = permit;
+        let _owner_guard = owner_guard;
         let outcome = work();
         // Hot-path boundary (#1686). Lowering the guard-threshold hot set is
         // off-runtime work by construction, so it rides the same admitted

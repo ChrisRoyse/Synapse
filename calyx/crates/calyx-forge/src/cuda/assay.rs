@@ -11,6 +11,7 @@ mod ccm;
 mod common;
 mod dependence;
 mod dependence_support;
+mod discrete;
 mod hawkes;
 mod ksg;
 mod linalg;
@@ -37,6 +38,7 @@ use self::validation_temporal::*;
 
 pub use self::ccm::ccm_simplex_predictions_host;
 pub use self::dependence::{dcor_1d_host, hsic_1d_host};
+pub use self::discrete::discrete_te_batch_host;
 pub use self::hawkes::hawkes_em_host;
 pub use self::ksg::{entropy_radii_host, ksg_continuous_counts_host, mixed_ksg_counts_host};
 pub use self::linalg::{correlation_precision_host, granger_lag_summaries_host};

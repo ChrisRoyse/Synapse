@@ -1186,6 +1186,11 @@ pub trait StorageBackend: Send + Sync {
         params: &SynapseCalyxTemporalParams,
         fdr_alpha: f32,
     ) -> StorageResult<SynapseCalyxCausalMapReport>;
+    fn read_temporal_causal_map_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<SynapseCalyxCausalMapReport>;
     fn temporal_periodicity_intelligence(
         &self,
         params: &SynapseCalyxTemporalParams,
@@ -6457,12 +6462,53 @@ impl StorageBackend for CalyxBackend {
             "measure exhaustive native Calyx causal map",
             true,
             |vault| {
+                // Finite-only temporal panels deliberately have no ANN/search
+                // generation. They still require an exact panel-membership
+                // sidecar for bounded exhaustive analytics. Prepare that
+                // first-class membership generation here, on the mutating
+                // producer path; the independent causal_map_read path below
+                // remains strictly read-only and fails closed if it is absent
+                // or corrupt.
+                if !crate::constellations::syn_panel_is_queryable(params.panel_version) {
+                    vault
+                        .ensure_panel_membership_generation(params.panel_version)
+                        .map_err(|source| {
+                            calyx_write_failed(
+                                "calyx_search",
+                                "ensure finite-only panel membership for exhaustive causal map",
+                                &source,
+                            )
+                        })?;
+                }
                 vault
                     .temporal_causal_map(params, fdr_alpha)
                     .map_err(|source| {
                         calyx_write_failed(
                             "calyx_assay",
                             "measure exhaustive native Calyx causal map",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn read_temporal_causal_map_intelligence(
+        &self,
+        params: &SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<SynapseCalyxCausalMapReport> {
+        self.with_vault(
+            "calyx_graph",
+            "read persisted exhaustive native Calyx causal map",
+            false,
+            |vault| {
+                vault
+                    .read_temporal_causal_map(params, fdr_alpha)
+                    .map_err(|source| {
+                        calyx_read_failed(
+                            "calyx_graph",
+                            "read persisted exhaustive native Calyx causal map",
                             &source,
                         )
                     })

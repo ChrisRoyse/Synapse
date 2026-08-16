@@ -16331,6 +16331,15 @@ if (-not $ok) {
 
     Die $failureDetail
 }
+
+# The daemon handoff and strict MCP surface are committed before Chrome bridge
+# activation begins. Persist that independently verified surface now: a
+# background-only Chrome activation may legitimately checkpoint as pending, and
+# withholding the daemon snapshot until after that separate transaction traps
+# every freshly restarted MCP client on the previous tools/list hash.
+$toolSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $token -Health $h
+Write-SynapseCodexToolSurfaceSnapshot -Path $CodexToolSurfaceSnapshotPath -Surface $toolSurface
+
 try {
     $h = Assert-SynapseChromeBridgeLiveAfterSetup `
         -Bind $Bind `
@@ -16397,9 +16406,6 @@ if ($cmdAncestor) {
     $lineageText = ($daemonLineage | ForEach-Object { "{0}:{1}" -f $_.ProcessId, $_.Name }) -join ' <- '
     Die "SYNAPSE_DAEMON_CMD_ANCESTOR_FORBIDDEN pid=$healthPid cmd_pid=$($cmdAncestor.ProcessId) lineage=$lineageText remediation=rerun setup after removing legacy daemon launchers; daemon must not be launched through cmd.exe."
 }
-
-$toolSurface = Read-SynapseDaemonToolSurface -Bind $Bind -Token $token -Health $h
-Write-SynapseCodexToolSurfaceSnapshot -Path $CodexToolSurfaceSnapshotPath -Surface $toolSurface
 
 # ---------------------------------------------------------------------------
 # 9. Wire the Windows-side MCP clients

@@ -2,7 +2,7 @@
 
 - **Status:** accepted
 - **Date:** 2026-08-15
-- **Issue:** #2249
+- **Issues:** #2249, #2245
 - **Supersedes:** the implicit assumption that one transfer-entropy pair is the system's causal model
 
 ## Context
@@ -26,6 +26,13 @@ Primary sources constrain the interpretation:
 5. Benjamini-Hochberg q-values are persisted for each applicable p-value family. Transfer entropy and CCM retain their native confidence/convergence evidence rather than receiving invented p-values.
 6. Every artifact is `observational_predictive` and `structural_effect_identified=false` unless a future version accepts and verifies a persisted intervention/identification contract. Estimator agreement alone cannot change that class.
 7. The complete artifact is content-addressed under the native Calyx Graph CF (`GCMP1...`). Runtime-only estimator timestamps are excluded from the semantic bytes; source-data time remains explicit in `earliest_event_ns` / `latest_event_ns`, and upstream projection drift fails closed instead of reintroducing nondeterminism. The write is flushed and separately read byte-for-byte before the response exposes its key, SHA-256, byte count, Graph row count, and readback verdict.
+8. A second Graph row (`GCMI1...`) is the materialized-view pointer for a normalized panel/group/pair/window-shape/bin/lag/FDR scope. The immutable artifact and pointer publish in one Aster batch guarded by the pointer's physical revision. An older or concurrent computation cannot regress the serving frontier.
+9. `causal_map_read` is the read-only serving path. It follows the pointer, derives and hashes the artifact key, validates the complete typed artifact contract, then independently reloads and fingerprints every source event in the artifact's closed window. Missing, corrupt, cross-scope, incomplete, or source-stale state is an error; reads never recompute or fall back.
+10. The derived-state owner refreshes declared native temporal populations hourly over a six-hour closed window. It does not sample high-cardinality populations: empty, one-stream, and over-16-stream scopes are named non-publications, while storage/schema/invariant failures fail the maintenance tick. Health exposes the exact pointer/artifact/source identities only after the independent read succeeds.
+11. BH adjustments are family-local and explicitly disclose their validity boundary: FDR control assumes independent or positive-regression-dependent p-values within the named family. No arbitrary-dependence or cross-family error-rate claim is made.
+12. Exact panel membership is independent of retrieval admission. Queryable panels use their normal search generation. For a finite-only panel, the mutating producer first ensures a hash-sealed membership-only generation whose manifest has zero retrieval slots. It is built when absent; otherwise it is reopened and validated before reconciliation. A valid generation whose bounded delta cannot be reconstructed because it predates the recovered change-history floor, or whose measured delta exceeds the hard reconciliation bound, is rebuilt from authoritative Base rows and reconciled again. The read-only serving path never builds or repairs it. A present corrupt, wrong-panel, future, or otherwise invalid generation fails closed and remains preserved. This removes the accidental requirement that a temporal population possess meaningful ANN geometry before exact analytics can read it.
+13. Foreground MCP whole-corpus calls and autonomous maintenance share the same one-permit semaphore but not the same wait contract. Autonomous GC, pressure, and derived-state passes wait fairly until admitted. A foreground tool waits at most one second for admission and then returns `STORAGE_MAINTENANCE_BUSY`, naming the active operation, its observed ownership duration, the admission budget, and proving its closure was not dispatched. The active owner is tracked under a generation-guarded RAII record and cleared before its owned permit drops. This keeps the single-working-set memory invariant while preventing an MCP transport timeout from erasing a queued causal request before it starts.
+14. Integer-valued occurrence streams select the discrete plug-in transfer-entropy estimator under its declared auto rule. Strict CUDA executes that estimator natively: exact dense state codes feed batch-private integer histograms; small alphabets use dynamic shared memory and larger valid alphabets use explicitly VRAM-budgeted global rows; entropy and Miller-Madow terms use a fixed block reduction. Symbol interning and seeded selection construction remain deterministic host control work, but no entropy estimate runs on CPU and no failure substitutes continuous KSG. GPU allocation, launch, index, alphabet, or numerical failures remain typed terminal lane evidence.
 
 ## Consequences
 
@@ -34,6 +41,11 @@ Primary sources constrain the interpretation:
 - Consumers can use predictive arrows for explanation and hypothesis generation, but structural control requires a separately identified causal contract.
 - Repeating the same request over byte-identical source rows reuses the same Graph key and value digest; invocation time belongs in runtime provenance, not the content-addressed artifact.
 - Existing periodicity, drift, hazard, and targeted causality calls inherit the source-event window and complete-scope refusal, removing the same silent-truncation class from the shared loader.
+- Consumers use `causal_map_read` for a current materialized generation instead of recomputing estimators on each query. A stale generation remains physically auditable but cannot be served as current.
+- Autonomous publication supplies system-wide causal evidence without turning observational arrows into search weights, guard authorization, or intervention effects. Those policy decisions require their own identified contract.
+- Finite-only event panels no longer fail merely because no search manifest exists, and they do not acquire fake indexes as the price of becoming analyzable. The one-time membership build scans the physical Base population under one pinned reader, atomically publishes only the sealed identity filter, and subsequent calls use bounded panel reconciliation.
+- A busy autonomous pass is now an explicit, retryable concurrency state rather than a five-minute silent wait. Tokio's fair semaphore continues to order admitted owners, and timing out the acquisition safely removes only the foreground waiter's queue position; no blocking closure, estimator, or storage mutation has started.
+- Strict-CUDA causal maps no longer strand transfer entropy on the exact integer data for which discrete TE is required. Integer atomics make histogram counts scheduling-independent; fixed reduction order bounds the floating-point surface; device-room accounting prevents an oversized alphabet/bootstrap batch from becoming an implicit CPU route or an uncontrolled allocation.
 
 ## References
 
@@ -43,3 +55,6 @@ Primary sources constrain the interpretation:
 - Embrechts and Kirchner, “Hawkes Graphs,” Theory of Probability and Its Applications 62 (2018; preprint 2017).
 - Benjamini and Hochberg, “Controlling the False Discovery Rate,” JRSS B 57 (1995).
 - Hernán and Robins, *Causal Inference: What If* (living edition).
+- Tokio `Semaphore` and `time::timeout` API documentation (fair queueing, owned-permit lifetime, and acquire cancellation semantics).
+- NVIDIA, *CUDA Programming Guide*, histogram/shared-memory/atomics guidance: <https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html>.
+- NVIDIA, *CUDA C++ Best Practices Guide*, coalescing and shared-memory guidance: <https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/>.

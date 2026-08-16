@@ -1091,7 +1091,8 @@ impl SynapseService {
                  last_success_unix_ms={:?} last_search_action={} last_search_reason={} \
                  last_search_elapsed_ms={:?} refresh_delta_keys_threshold={} \
                  min_rebuild_interval_ms={} last_failure_code={} last_failure_detail={} \
-                 last_advisory_code={} last_advisory_detail={} last_skip={}",
+                 last_advisory_code={} last_advisory_detail={} last_skip={} \
+                 causal_map_targets={} causal_map_rebuild_unix_ms={:?}",
                 readback.attempts_total,
                 readback.success_total,
                 readback.failure_total,
@@ -1112,6 +1113,8 @@ impl SynapseService {
                 readback.last_advisory_code.as_deref().unwrap_or("none"),
                 readback.last_advisory_detail.as_deref().unwrap_or("none"),
                 readback.last_skip_code.as_deref().unwrap_or("none"),
+                readback.last_causal_map_actions.len(),
+                readback.last_causal_map_rebuild_unix_ms,
             )),
             calyx_derived_state_success_total: Some(readback.success_total),
             calyx_derived_state_skipped_total: Some(readback.skipped_total),
@@ -1156,6 +1159,27 @@ impl SynapseService {
             calyx_derived_state_last_weave_global_graph_cf_rows_readback: Some(
                 readback.last_weave_global_graph_cf_rows_readback,
             ),
+            calyx_derived_state_last_causal_map_actions: Some(readback.last_causal_map_actions),
+            calyx_derived_state_last_causal_map_pointer_keys: Some(
+                readback.last_causal_map_pointer_keys,
+            ),
+            calyx_derived_state_last_causal_map_artifact_keys: Some(
+                readback.last_causal_map_artifact_keys,
+            ),
+            calyx_derived_state_last_causal_map_artifact_sha256: Some(
+                readback.last_causal_map_artifact_sha256,
+            ),
+            calyx_derived_state_last_causal_map_source_fingerprint_sha256: Some(
+                readback.last_causal_map_source_fingerprint_sha256,
+            ),
+            calyx_derived_state_last_causal_map_source_records: Some(
+                readback.last_causal_map_source_records,
+            ),
+            calyx_derived_state_last_causal_map_latest_event_ns: Some(
+                readback.last_causal_map_latest_event_ns,
+            ),
+            calyx_derived_state_last_causal_map_rebuild_unix_ms: readback
+                .last_causal_map_rebuild_unix_ms,
             ..SubsystemHealth::default()
         }
     }

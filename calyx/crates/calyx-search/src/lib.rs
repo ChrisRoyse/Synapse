@@ -45,5 +45,6 @@ pub use persisted::{
     rebuild_for_vault_with_panel_state_dense_config_progress,
     rebuild_for_vault_with_panel_state_fallible_progress,
     rebuild_for_vault_with_panel_state_progress, rebuild_for_vault_with_progress,
-    rebuild_required_marker_path, validate_rebuild_config, write_rebuild_required_marker,
+    rebuild_panel_membership_for_vault, rebuild_required_marker_path, validate_rebuild_config,
+    write_rebuild_required_marker,
 };

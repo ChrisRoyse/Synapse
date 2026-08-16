@@ -78,6 +78,198 @@ __device__ __forceinline__ void reduce_float_max(float *values, unsigned int *ba
     }
 }
 
+__device__ __forceinline__ void reduce4_float(
+    float *a,
+    float *b,
+    float *c,
+    float *d,
+    unsigned int *bad,
+    int tid) {
+    for (int stride = ASSAY_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            a[tid] += a[tid + stride];
+            b[tid] += b[tid + stride];
+            c[tid] += c[tid + stride];
+            d[tid] += d[tid + stride];
+            bad[tid] |= bad[tid + stride];
+        }
+        __syncthreads();
+    }
+}
+
+__device__ __forceinline__ void reduce4_uint(
+    unsigned int *a,
+    unsigned int *b,
+    unsigned int *c,
+    unsigned int *d,
+    int tid) {
+    for (int stride = ASSAY_THREADS / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            a[tid] += a[tid + stride];
+            b[tid] += b[tid + stride];
+            c[tid] += c[tid + stride];
+            d[tid] += d[tid + stride];
+        }
+        __syncthreads();
+    }
+}
+
+// One block owns one exact index selection. Histogram increments are integer
+// atomics, so scheduling cannot change counts; the entropy sum uses a fixed
+// block-local reduction tree. Small alphabets live in dynamic shared memory,
+// while larger valid alphabets receive a disjoint global-memory row per block.
+extern "C" __global__ __launch_bounds__(ASSAY_THREADS) void assay_discrete_te_batch_f32(
+    const unsigned int *code_tables,
+    const int *selections,
+    int sample_count,
+    int selection_len,
+    int batch_count,
+    int bins_future_past,
+    int bins_source_target_past,
+    int bins_own_past,
+    int bins_joint,
+    int total_bins,
+    int use_shared,
+    unsigned int *global_histograms,
+    float *estimates,
+    unsigned int *flags) {
+    extern __shared__ unsigned int shared_histogram[];
+    __shared__ float entropy_0[ASSAY_THREADS];
+    __shared__ float entropy_1[ASSAY_THREADS];
+    __shared__ float entropy_2[ASSAY_THREADS];
+    __shared__ float entropy_3[ASSAY_THREADS];
+    __shared__ unsigned int support_0[ASSAY_THREADS];
+    __shared__ unsigned int support_1[ASSAY_THREADS];
+    __shared__ unsigned int support_2[ASSAY_THREADS];
+    __shared__ unsigned int support_3[ASSAY_THREADS];
+    __shared__ unsigned int bad[ASSAY_THREADS];
+
+    const int batch = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    unsigned int local_bad =
+        (batch < 0 || batch >= batch_count || sample_count <= 0 || selection_len <= 0 ||
+         bins_future_past <= 0 || bins_source_target_past <= 0 || bins_own_past <= 0 ||
+         bins_joint <= 0 || total_bins <= 0)
+            ? ASSAY_FLAG_INVALID_INDEX
+            : 0u;
+    unsigned int *histogram = use_shared != 0
+                                  ? shared_histogram
+                                  : global_histograms + (size_t)batch * (size_t)total_bins;
+    for (int bin = tid; bin < total_bins; bin += (int)blockDim.x) {
+        histogram[bin] = 0u;
+    }
+    __syncthreads();
+
+    const int offset_0 = 0;
+    const int offset_1 = bins_future_past;
+    const int offset_2 = offset_1 + bins_source_target_past;
+    const int offset_3 = offset_2 + bins_own_past;
+    if (offset_3 + bins_joint != total_bins) {
+        local_bad |= ASSAY_FLAG_INVALID_INDEX;
+    }
+    if (local_bad == 0u) {
+        const size_t selection_base = (size_t)batch * (size_t)selection_len;
+        for (int position = tid; position < selection_len; position += (int)blockDim.x) {
+            const int source = selections[selection_base + (size_t)position];
+            if (source < 0 || source >= sample_count) {
+                local_bad |= ASSAY_FLAG_INVALID_INDEX;
+                continue;
+            }
+            const unsigned int code_0 = code_tables[(size_t)source];
+            const unsigned int code_1 = code_tables[(size_t)sample_count + (size_t)source];
+            const unsigned int code_2 = code_tables[(size_t)sample_count * 2u + (size_t)source];
+            const unsigned int code_3 = code_tables[(size_t)sample_count * 3u + (size_t)source];
+            if (code_0 >= (unsigned int)bins_future_past ||
+                code_1 >= (unsigned int)bins_source_target_past ||
+                code_2 >= (unsigned int)bins_own_past ||
+                code_3 >= (unsigned int)bins_joint) {
+                local_bad |= ASSAY_FLAG_INVALID_INDEX;
+                continue;
+            }
+            atomicAdd(&histogram[offset_0 + (int)code_0], 1u);
+            atomicAdd(&histogram[offset_1 + (int)code_1], 1u);
+            atomicAdd(&histogram[offset_2 + (int)code_2], 1u);
+            atomicAdd(&histogram[offset_3 + (int)code_3], 1u);
+        }
+    }
+    bad[tid] = local_bad;
+    __syncthreads();
+
+    float h0 = 0.0f;
+    float h1 = 0.0f;
+    float h2 = 0.0f;
+    float h3 = 0.0f;
+    unsigned int k0 = 0u;
+    unsigned int k1 = 0u;
+    unsigned int k2 = 0u;
+    unsigned int k3 = 0u;
+    const float denominator = (float)selection_len;
+    for (int bin = tid; bin < bins_future_past; bin += (int)blockDim.x) {
+        const unsigned int count = histogram[offset_0 + bin];
+        if (count != 0u) {
+            const float probability = (float)count / denominator;
+            h0 -= probability * log2f(probability);
+            ++k0;
+        }
+    }
+    for (int bin = tid; bin < bins_source_target_past; bin += (int)blockDim.x) {
+        const unsigned int count = histogram[offset_1 + bin];
+        if (count != 0u) {
+            const float probability = (float)count / denominator;
+            h1 -= probability * log2f(probability);
+            ++k1;
+        }
+    }
+    for (int bin = tid; bin < bins_own_past; bin += (int)blockDim.x) {
+        const unsigned int count = histogram[offset_2 + bin];
+        if (count != 0u) {
+            const float probability = (float)count / denominator;
+            h2 -= probability * log2f(probability);
+            ++k2;
+        }
+    }
+    for (int bin = tid; bin < bins_joint; bin += (int)blockDim.x) {
+        const unsigned int count = histogram[offset_3 + bin];
+        if (count != 0u) {
+            const float probability = (float)count / denominator;
+            h3 -= probability * log2f(probability);
+            ++k3;
+        }
+    }
+    if (!(isfinite(h0) && isfinite(h1) && isfinite(h2) && isfinite(h3))) {
+        bad[tid] |= ASSAY_FLAG_NONFINITE;
+    }
+    entropy_0[tid] = h0;
+    entropy_1[tid] = h1;
+    entropy_2[tid] = h2;
+    entropy_3[tid] = h3;
+    support_0[tid] = k0;
+    support_1[tid] = k1;
+    support_2[tid] = k2;
+    support_3[tid] = k3;
+    __syncthreads();
+    reduce4_float(entropy_0, entropy_1, entropy_2, entropy_3, bad, tid);
+    reduce4_uint(support_0, support_1, support_2, support_3, tid);
+    if (tid == 0) {
+        if (bad[0] != 0u) {
+            atomicOr(flags, bad[0]);
+            return;
+        }
+        const float correction_scale =
+            1.0f / (2.0f * denominator * 0.69314718055994530942f);
+        const float corrected_0 = entropy_0[0] + (float)(support_0[0] - 1u) * correction_scale;
+        const float corrected_1 = entropy_1[0] + (float)(support_1[0] - 1u) * correction_scale;
+        const float corrected_2 = entropy_2[0] + (float)(support_2[0] - 1u) * correction_scale;
+        const float corrected_3 = entropy_3[0] + (float)(support_3[0] - 1u) * correction_scale;
+        const float estimate = fmaxf(corrected_0 + corrected_1 - corrected_2 - corrected_3, 0.0f);
+        if (!isfinite(estimate)) {
+            atomicOr(flags, ASSAY_FLAG_NONFINITE);
+            return;
+        }
+        estimates[batch] = estimate;
+    }
+}
+
 __device__ __forceinline__ void reduce6(
     double *a,
     double *b,

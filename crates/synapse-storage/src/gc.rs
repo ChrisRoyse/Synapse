@@ -433,7 +433,7 @@ pub fn spawn_runner(
                         // pool so neither the pass nor retry backoff parks a
                         // runtime worker serving MCP requests (#1798/#1836).
                         let tick_runner = Arc::clone(&runner);
-                        let attempt_result = crate::maintenance::run_admitted_maintenance(
+                        let attempt_result = crate::maintenance::run_background_admitted_maintenance(
                             task_kind.operation(),
                             move || tick_runner.run_once(),
                         )

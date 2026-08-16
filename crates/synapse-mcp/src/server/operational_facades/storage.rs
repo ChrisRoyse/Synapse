@@ -8,7 +8,7 @@ use crate::server::{ErrorData, Json, Parameters, SynapseService};
 
 use super::{
     STORAGE_SOT, STORAGE_TOOL,
-    errors::{facade_conflict_error, facade_delegate_error, missing_spec},
+    errors::{facade_conflict_error, facade_delegate_error, missing_spec, storage_error_data},
     policy::{require_maintenance_profile, require_storage_operation_authority},
     response::storage_response,
     types::{StorageOperation, StorageParams, StorageResponse},
@@ -104,7 +104,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "storage_inspect",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion and STORAGE_CALYX_INSPECT_SWEEP_DONE records",
                 )
             })?
@@ -328,7 +328,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "calyx_storage",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion and SYNAPSE_CALYX_PANEL_CENSUS records",
                 )
             })?
@@ -518,7 +518,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission records and SYNAPSE_CALYX_SEARCH_REBUILD phase records; the exclusive rebuild pass failed",
                 )
             })?;
@@ -591,7 +591,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "agent-transcript-order",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records before retrying the projection census",
                 )
             })?
@@ -679,7 +679,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     "agent-transcript-order",
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the durable repair marker before retrying",
                 )
             })?
@@ -916,7 +916,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the vault slot-CF tree",
                 )
             })?;
@@ -980,7 +980,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     error.remediation().unwrap_or(
                         "read health.calyx_search_generations_retirable_panel_versions for the \
                          versions this operation accepts",
@@ -1081,7 +1081,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion and SYNAPSE_CALYX_VAULT_BACKUP records",
                 )
             })??;
@@ -1152,7 +1152,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named restore-verification error",
                 )
             })??;
@@ -1223,8 +1223,10 @@ pub(super) async fn handle(
             // `max_records` bound (<=20,000). Queueing those bounded foreground
             // reads behind a multi-minute scheduled pass made the public Calyx
             // surface time out before its actual work began. They use a
-            // separate single-permit bounded-read lane; no second whole-corpus
-            // working set is admitted.
+            // separate single-permit bounded-read lane; causal_map_read joins
+            // it because it re-fingerprints at most the persisted 20,000-row
+            // source contract and never reruns an estimator. No second
+            // whole-corpus working set is admitted.
             let bounded_read = sub_operation.is_bounded_read();
             let work = move || {
                 use crate::m3::storage::{
@@ -1308,6 +1310,14 @@ pub(super) async fn handle(
                     }
                     StorageIntelligenceOperation::CausalMap => {
                         crate::m3::storage::run_intelligence_causal_map(&db, &spec).map(
+                            |causal_map| StorageIntelligenceResponse {
+                                causal_map: Some(causal_map),
+                                ..base
+                            },
+                        )
+                    }
+                    StorageIntelligenceOperation::CausalMapRead => {
+                        crate::m3::storage::run_intelligence_causal_map_read(&db, &spec).map(
                             |causal_map| StorageIntelligenceResponse {
                                 causal_map: Some(causal_map),
                                 ..base
@@ -1464,7 +1474,7 @@ pub(super) async fn handle(
                     operation.as_str(),
                     &source_id,
                     STORAGE_SOT,
-                    crate::m1::mcp_error(error.code(), error.to_string()),
+                    storage_error_data(&error),
                     "inspect daemon STORAGE_MAINTENANCE_* or STORAGE_BOUNDED_READ_* admission/completion records and the named intelligence error",
                 )
             })??;
@@ -1613,7 +1623,8 @@ pub(super) async fn handle(
                     .map_or(0, Vec::len);
                 let pairs = causal_map.artifact["pairs"].as_array().map_or(0, Vec::len);
                 format!(
-                    "intelligence causal_map streams={} pairs={} evidence_class={} structural_identified={} graph_key={} sha256={} bytes={} readback_match={} graph_rows={}",
+                    "intelligence {} streams={} pairs={} evidence_class={} structural_identified={} graph_key={} sha256={} bytes={} pointer_key={} pointer_sha256={} pointer_bytes={} artifact_readback_match={} pointer_readback_match={} graph_rows={}",
+                    response.operation.as_str(),
                     streams,
                     pairs,
                     causal_map.artifact["evidence_class"]
@@ -1625,7 +1636,11 @@ pub(super) async fn handle(
                     causal_map.graph_key_hex,
                     causal_map.graph_value_sha256,
                     causal_map.graph_value_bytes,
+                    causal_map.pointer_key_hex,
+                    causal_map.pointer_value_sha256,
+                    causal_map.pointer_value_bytes,
                     causal_map.physical_readback_matches,
+                    causal_map.pointer_readback_matches,
                     causal_map.graph_cf_rows_after,
                 )
             } else if let Some(periodicity) = &response.periodicity {
@@ -1735,7 +1750,7 @@ async fn handle_corpus_histogram(
             operation.as_str(),
             "calyx_storage",
             STORAGE_SOT,
-            crate::m1::mcp_error(error.code(), error.to_string()),
+            storage_error_data(&error),
             "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named corpus-histogram error",
         )
     })?
@@ -1977,7 +1992,7 @@ async fn handle_gc_once(
             operation.as_str(),
             &source_id,
             STORAGE_SOT,
-            crate::m1::mcp_error(error.code(), error.to_string()),
+            storage_error_data(&error),
             "inspect daemon STORAGE_MAINTENANCE_* admission/completion records and the named GC error",
         )
     })?

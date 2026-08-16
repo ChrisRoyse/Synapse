@@ -68,6 +68,15 @@ pub enum StorageError {
         pressure_level: String,
         rows: usize,
     },
+    #[error(
+        "foreground storage maintenance {requested_operation} was not admitted within {wait_budget_ms} ms: active_operation={active_operation} active_for_ms={active_for_ms}; no foreground work was dispatched"
+    )]
+    MaintenanceBusy {
+        requested_operation: &'static str,
+        active_operation: String,
+        active_for_ms: u64,
+        wait_budget_ms: u64,
+    },
     #[error("storage GC refused unsafe eviction in {cf_name}: {detail}")]
     UnsafeGcEvictionRefused { cf_name: String, detail: String },
     #[error("storage read failed in {cf_name}: {detail}")]
@@ -96,6 +105,7 @@ impl StorageError {
             Self::EncodeJson { .. } | Self::WriteFailed { .. } | Self::WriteShed { .. } => {
                 error_codes::STORAGE_WRITE_FAILED
             }
+            Self::MaintenanceBusy { .. } => error_codes::STORAGE_MAINTENANCE_BUSY,
             Self::RevisionGuardedMutationFailed { code, .. }
             | Self::CalyxWriteFailed { code, .. }
             | Self::CalyxReadFailed { code, .. } => code,
@@ -117,6 +127,9 @@ impl StorageError {
         match self {
             Self::CalyxWriteFailed { remediation, .. }
             | Self::CalyxReadFailed { remediation, .. } => Some(*remediation),
+            Self::MaintenanceBusy { .. } => Some(
+                "read the named active operation's STORAGE_MAINTENANCE_COMPLETED record, then retry the foreground call; do not increase the MCP timeout or admit an overlapping whole-corpus pass",
+            ),
             _ => None,
         }
     }

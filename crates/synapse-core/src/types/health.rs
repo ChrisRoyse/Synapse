@@ -854,6 +854,26 @@ pub struct SubsystemHealth {
     /// Physical-read provenance adjacent to each Graph global gauge.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calyx_derived_state_last_weave_global_graph_cf_rows_readback: Option<BTreeMap<u32, String>>,
+    /// Per declared `panel_name:group_key` causal-map maintenance disposition.
+    /// A published disposition is accompanied by the exact normalized-scope
+    /// pointer and immutable Graph artifact identities below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_actions: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_pointer_keys: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_artifact_keys: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_artifact_sha256: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_source_fingerprint_sha256:
+        Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_source_records: Option<BTreeMap<String, usize>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_latest_event_ns: Option<BTreeMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calyx_derived_state_last_causal_map_rebuild_unix_ms: Option<u64>,
 
     // --- coverage-backfill rotation and anchor-debt quarantine (#2061) ---
     /// Coverage targets owed a sweep, and how many the last tick swept. Equal on

@@ -279,7 +279,7 @@ impl VramBudgetedCudaBackend {
                 "gaussian_mmd requires non-zero sample_count and dimension: sample_count={sample_count} dimension={dimension}"
             )));
         }
-        if permutations.len() % sample_count != 0 {
+        if !permutations.len().is_multiple_of(sample_count) {
             return Err(budget_error(format!(
                 "gaussian_mmd permutation arena length {} is not divisible by sample_count={sample_count}",
                 permutations.len()

@@ -79,9 +79,6 @@ pub const CALYX_TE_DISCRETE_STATE_QUORUM: &str = "CALYX_TE_DISCRETE_STATE_QUORUM
 pub const CALYX_TE_DISCRETE_NON_FINITE_SAMPLE: &str = "CALYX_TE_DISCRETE_NON_FINITE_SAMPLE";
 /// A lagged sample's joint history is shorter than its own history.
 pub const CALYX_TE_DISCRETE_MALFORMED_SAMPLE: &str = "CALYX_TE_DISCRETE_MALFORMED_SAMPLE";
-/// The discrete estimator was selected while strict CUDA was demanded.
-pub const CALYX_TE_DISCRETE_CUDA_UNSUPPORTED: &str = "CALYX_TE_DISCRETE_CUDA_UNSUPPORTED";
-
 /// Minimum observations per *occupied* joint `(Yf, Yp, Xp)` state.
 ///
 /// Five is the classical expected-count floor for a multinomial cell; below it
@@ -97,6 +94,8 @@ pub(super) struct DiscreteStreams {
     target_future: Vec<u64>,
     target_past: Vec<u64>,
     source_past: Vec<u64>,
+    #[cfg(feature = "cuda")]
+    target_future_states: u64,
     target_past_states: u64,
     source_past_states: u64,
 }
@@ -207,6 +206,8 @@ fn symbolize(direction: &str, samples: &[LaggedSample]) -> Result<DiscreteStream
         target_future,
         target_past,
         source_past,
+        #[cfg(feature = "cuda")]
+        target_future_states: future_table.len() as u64,
         target_past_states: own_table.len() as u64,
         source_past_states: source_table.len() as u64,
     };
@@ -369,16 +370,197 @@ fn malformed(message: String) -> CalyxError {
     }
 }
 
-/// Strict-CUDA refusal: the discrete plug-in estimator has no CUDA kernel and is
-/// never silently swapped for the continuous one.
+/// Native strict-CUDA implementation of the same discrete plug-in estimator.
+/// Symbol interning and deterministic bootstrap-index generation are control
+/// work; every entropy histogram and Miller-Madow reduction is executed by the
+/// CUDA kernel. There is no CPU estimator retry and no KSG substitution.
 #[cfg(feature = "cuda")]
-pub(super) fn cuda_unsupported() -> CalyxError {
+pub(super) fn transfer_entropy_discrete_cuda(
+    ctx: &calyx_forge::CudaContext,
+    forward: &[LaggedSample],
+    reverse: &[LaggedSample],
+    lag: usize,
+    clock: &dyn Clock,
+    config: &TransferEntropyConfig,
+    pick: &EstimatorPick,
+) -> Result<TEResult> {
+    let n_samples = forward.len().min(reverse.len());
+    let forward = symbolize("A -> B", &forward[..n_samples])?;
+    let reverse = symbolize("B -> A", &reverse[..n_samples])?;
+    let all = (0..n_samples)
+        .map(|index| i32::try_from(index).map_err(|_| cuda_index_overflow(index)))
+        .collect::<Result<Vec<_>>>()?;
+    let t_a_to_b = cuda_estimates(ctx, &forward, &all, n_samples)?[0];
+    let t_b_to_a = cuda_estimates(ctx, &reverse, &all, n_samples)?[0];
+
+    let selection_len = (n_samples
+        .checked_mul(4)
+        .ok_or_else(|| cuda_size_overflow("subsample length"))?
+        / 5)
+    .max(super::MIN_ASSAY_SAMPLES)
+    .min(n_samples);
+    let selection_capacity = config
+        .bootstrap_resamples
+        .checked_mul(2)
+        .and_then(|count| count.checked_mul(selection_len))
+        .ok_or_else(|| cuda_size_overflow("bootstrap selection capacity"))?;
+    let mut forward_selections = Vec::with_capacity(selection_capacity);
+    let mut reverse_selections = Vec::with_capacity(selection_capacity);
+    let mut forward_rng = ChaCha8Rng::seed_from_u64(config.bootstrap_seed);
+    for _ in 0..config.bootstrap_resamples {
+        append_cuda_selection(
+            &mut forward_selections,
+            super::subsample_indices(n_samples, &mut forward_rng),
+        )?;
+    }
+    let mut reverse_rng = ChaCha8Rng::seed_from_u64(config.bootstrap_seed ^ 0x0B17_B1D5);
+    for _ in 0..config.bootstrap_resamples {
+        append_cuda_selection(
+            &mut reverse_selections,
+            super::subsample_indices(n_samples, &mut reverse_rng),
+        )?;
+    }
+    let mut difference_rng = ChaCha8Rng::seed_from_u64(config.bootstrap_seed ^ 0x00D1_FFC1);
+    for _ in 0..config.bootstrap_resamples {
+        append_cuda_selection(
+            &mut forward_selections,
+            super::subsample_indices(n_samples, &mut difference_rng),
+        )?;
+        append_cuda_selection(
+            &mut reverse_selections,
+            super::subsample_indices(n_samples, &mut difference_rng),
+        )?;
+    }
+    let forward_estimates = cuda_estimates(ctx, &forward, &forward_selections, selection_len)?;
+    let reverse_estimates = cuda_estimates(ctx, &reverse, &reverse_selections, selection_len)?;
+    let split = config.bootstrap_resamples;
+    let ci_95 = percentile_ci(forward_estimates[..split].to_vec(), t_a_to_b);
+    let t_b_to_a_ci_95 = percentile_ci(reverse_estimates[..split].to_vec(), t_b_to_a);
+    let difference_estimates = forward_estimates[split..]
+        .iter()
+        .zip(&reverse_estimates[split..])
+        .map(|(left, right)| left - right)
+        .collect();
+    let difference_ci_95 = percentile_ci(difference_estimates, t_a_to_b - t_b_to_a);
+    Ok(TEResult {
+        t_a_to_b,
+        t_b_to_a,
+        dominant_direction: dominant_direction(t_a_to_b, t_b_to_a, ci_95, t_b_to_a_ci_95),
+        ci_95,
+        t_b_to_a_ci_95,
+        difference_ci_95,
+        lag,
+        window_size: config.window_size,
+        provisional: false,
+        n_samples,
+        error_code: None,
+        estimator: Some(TeEstimator::DiscretePlugin),
+        estimator_selection: pick.selection,
+        estimator_reason: format!(
+            "{}; executed by the native strict-CUDA dense-histogram Miller-Madow kernel",
+            pick.reason
+        ),
+        trust: TrustTag::Provisional,
+        computed_at: clock.now(),
+    })
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_estimates(
+    ctx: &calyx_forge::CudaContext,
+    streams: &DiscreteStreams,
+    selections: &[i32],
+    selection_len: usize,
+) -> Result<Vec<f32>> {
+    let (tables, bin_counts) = cuda_code_tables(streams)?;
+    calyx_forge::cuda::discrete_te_batch_host(
+        ctx,
+        &tables,
+        streams.len(),
+        bin_counts,
+        selections,
+        selection_len,
+    )
+    .map(|batch| batch.estimates)
+    .map_err(|error| crate::cuda_strict::forge_to_calyx("discrete transfer entropy", error))
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_code_tables(streams: &DiscreteStreams) -> Result<(Vec<u32>, [usize; 4])> {
+    let all: Vec<usize> = (0..streams.len()).collect();
+    let future_past = gather(&all, |index| {
+        streams.target_future[index] * streams.target_past_states + streams.target_past[index]
+    });
+    let source_target_past = gather(&all, |index| {
+        streams.source_past[index] * streams.target_past_states + streams.target_past[index]
+    });
+    let own_past = gather(&all, |index| streams.target_past[index]);
+    let joint = joint_codes(streams, &all);
+    let table_capacity = streams
+        .len()
+        .checked_mul(4)
+        .ok_or_else(|| cuda_size_overflow("entropy code-table capacity"))?;
+    let mut tables = Vec::with_capacity(table_capacity);
+    for code in future_past
+        .into_iter()
+        .chain(source_target_past)
+        .chain(own_past)
+        .chain(joint)
+    {
+        tables.push(u32::try_from(code).map_err(|_| cuda_code_overflow(code))?);
+    }
+    let bin_counts_u64 = [
+        streams
+            .target_future_states
+            .checked_mul(streams.target_past_states),
+        streams
+            .source_past_states
+            .checked_mul(streams.target_past_states),
+        Some(streams.target_past_states),
+        streams
+            .target_future_states
+            .checked_mul(streams.target_past_states)
+            .and_then(|value| value.checked_mul(streams.source_past_states)),
+    ];
+    let mut bin_counts = [0usize; 4];
+    for (index, count) in bin_counts_u64.into_iter().enumerate() {
+        let count = count.ok_or_else(|| cuda_code_overflow(u64::MAX))?;
+        bin_counts[index] = usize::try_from(count).map_err(|_| cuda_code_overflow(count))?;
+    }
+    Ok((tables, bin_counts))
+}
+
+#[cfg(feature = "cuda")]
+fn append_cuda_selection(destination: &mut Vec<i32>, indices: Vec<usize>) -> Result<()> {
+    for index in indices {
+        destination.push(i32::try_from(index).map_err(|_| cuda_index_overflow(index))?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_index_overflow(index: usize) -> CalyxError {
     CalyxError {
-        code: CALYX_TE_DISCRETE_CUDA_UNSUPPORTED,
-        message:
-            "the discrete plug-in transfer-entropy estimator has no CUDA kernel, and strict CUDA was demanded"
-                .to_string(),
-        remediation:
-            "clear the strict-CUDA request, or pin the continuous KSG estimator on TransferEntropyConfig",
+        code: CALYX_TE_DISCRETE_MALFORMED_SAMPLE,
+        message: format!("discrete transfer-entropy sample index {index} exceeds CUDA i32"),
+        remediation: "reduce the bounded temporal sample window below the CUDA index ceiling",
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_code_overflow(code: u64) -> CalyxError {
+    CalyxError {
+        code: CALYX_TE_DISCRETE_ALPHABET_TOO_LARGE,
+        message: format!("discrete transfer-entropy dense state code {code} exceeds CUDA bounds"),
+        remediation: "widen temporal bins or shorten the declared history window",
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn cuda_size_overflow(context: &str) -> CalyxError {
+    CalyxError {
+        code: CALYX_TE_DISCRETE_MALFORMED_SAMPLE,
+        message: format!("discrete transfer-entropy {context} overflowed usize"),
+        remediation: "reduce bootstrap_resamples or the bounded temporal sample window",
     }
 }

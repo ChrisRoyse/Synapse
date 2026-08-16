@@ -2048,6 +2048,24 @@ impl Db {
             .temporal_causal_map_intelligence(params, fdr_alpha)
     }
 
+    /// Resolves the latest immutable causal-map generation for one normalized
+    /// analysis scope, verifies its Graph-CF pointer/artifact bytes, and
+    /// re-fingerprints the exact source-event population without recomputing
+    /// estimators or writing state.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured storage error when the scope is unpublished,
+    /// corrupt, cross-bound, or stale relative to its authoritative Base rows.
+    pub fn read_temporal_causal_map_intelligence(
+        &self,
+        params: &synapse_calyx::SynapseCalyxTemporalParams,
+        fdr_alpha: f32,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxCausalMapReport> {
+        self.backend
+            .read_temporal_causal_map_intelligence(params, fdr_alpha)
+    }
+
     /// Runs the Lomb-Scargle periodogram (with permutation false-alarm
     /// probability) and a slotted-autocorrelation cross-check over a panel's
     /// occurrence series and persists the result to the native `TemporalXTerm` CF.

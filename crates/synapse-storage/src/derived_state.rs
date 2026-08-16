@@ -222,6 +222,19 @@ pub const WEAVE_PANEL_TICK_BUDGET: std::time::Duration = std::time::Duration::fr
 pub const KERNEL_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_hours(24);
 pub const KERNEL_REBUILD_MAX_RECORDS: usize = 2_000;
 
+/// Causal maps are rolling operational intelligence, so refresh them more
+/// often than the corpus kernel while keeping the estimator work off the
+/// five-minute hot cadence.
+pub const CAUSAL_MAP_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_hours(1);
+/// Six hours is the smallest built-in operational window that normally carries
+/// enough one-minute bins for the longest declared eight-bin lag while staying
+/// far below the 4,096-bin assay ceiling.
+pub const CAUSAL_MAP_WINDOW: std::time::Duration = std::time::Duration::from_hours(6);
+pub const CAUSAL_MAP_MAX_RECORDS: usize = 20_000;
+pub const CAUSAL_MAP_BIN_SECONDS: f64 = 60.0;
+pub const CAUSAL_MAP_MAX_LAG: usize = 8;
+pub const CAUSAL_MAP_FDR_ALPHA: f32 = 0.05;
+
 /// Maximum bisection work items accepted for one panel interval.
 const WEAVE_MAX_INTERVAL_PARTS: usize = 1_024;
 
@@ -335,6 +348,7 @@ fn take_tick_ledger() -> Vec<String> {
     std::mem::take(&mut ledger)
 }
 static LAST_KERNEL_REBUILD_UNIX_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_CAUSAL_MAP_REBUILD_UNIX_MS: AtomicU64 = AtomicU64::new(0);
 
 /// Storage handle the derived-state pass reads the vault from.
 ///
@@ -569,6 +583,18 @@ pub struct DerivedStateReadback {
     pub last_novelty_notifications_dropped: u64,
     pub last_novelty_delivery_watermark: u64,
     pub last_novelty_quarantines_escalated: u64,
+    /// Last autonomous typed causal-map outcome per declared
+    /// `panel_name:group_key` scope. Successful rows name both independently
+    /// read Graph keys and hashes; non-applicable rows retain their exact Calyx
+    /// refusal code instead of inventing an empty artifact.
+    pub last_causal_map_actions: BTreeMap<String, String>,
+    pub last_causal_map_pointer_keys: BTreeMap<String, String>,
+    pub last_causal_map_artifact_keys: BTreeMap<String, String>,
+    pub last_causal_map_artifact_sha256: BTreeMap<String, String>,
+    pub last_causal_map_source_fingerprint_sha256: BTreeMap<String, String>,
+    pub last_causal_map_source_records: BTreeMap<String, usize>,
+    pub last_causal_map_latest_event_ns: BTreeMap<String, u64>,
+    pub last_causal_map_rebuild_unix_ms: Option<u64>,
     /// Last scheduled per-panel kernel outcome, including the physical Kernel
     /// CF row count returned after persistence.
     pub last_kernel_actions: BTreeMap<u32, String>,
@@ -1343,6 +1369,11 @@ pub fn run_derived_state_maintenance() -> crate::StorageResult<()> {
     if let Err(error) = drive_novelty_relay(&db) {
         any_failed = true;
         record_failure("STORAGE_DERIVED_STATE_WARD_NOVELTY_FAILED", error);
+    }
+
+    if let Err(error) = drive_scheduled_causal_maps(&db) {
+        any_failed = true;
+        record_failure("STORAGE_DERIVED_STATE_CAUSAL_MAP_FAILED", error);
     }
 
     if let Err(error) = drive_scheduled_kernels(&db, current_panel_coverage.as_ref()) {
@@ -2351,6 +2382,296 @@ fn exact_json_u64(
                 "CF_PROCESS_HISTORY process-graph field {field} must be an unsigned JSON integer"
             ),
         })
+}
+
+fn causal_map_target_id(target: crate::constellations::SynCausalMapMaintenanceTarget) -> String {
+    format!("{}:{}", target.panel_name, target.group_key)
+}
+
+fn clear_causal_map_physical_readback(target_id: &str) {
+    let mut readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    readback.last_causal_map_pointer_keys.remove(target_id);
+    readback.last_causal_map_artifact_keys.remove(target_id);
+    readback.last_causal_map_artifact_sha256.remove(target_id);
+    readback
+        .last_causal_map_source_fingerprint_sha256
+        .remove(target_id);
+    readback.last_causal_map_source_records.remove(target_id);
+    readback.last_causal_map_latest_event_ns.remove(target_id);
+}
+
+fn record_causal_map_action(target_id: String, action: String) {
+    let mut readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    readback.last_causal_map_actions.insert(target_id, action);
+}
+
+fn causal_map_evidence_status_counts(
+    artifact: &synapse_calyx::SynapseCalyxCausalMapArtifact,
+) -> BTreeMap<&str, usize> {
+    let mut counts = BTreeMap::new();
+    let global = [
+        &artifact.pc_stable_skeleton,
+        &artifact.partial_correlation_network,
+        &artifact.hawkes_branching_graph,
+    ];
+    for evidence in global
+        .into_iter()
+        .chain(artifact.pairs.iter().flat_map(|pair| {
+            [
+                &pair.transfer_entropy,
+                &pair.granger_a_to_b,
+                &pair.granger_b_to_a,
+                &pair.cross_correlation,
+                &pair.convergent_cross_mapping,
+                &pair.temporal_cross_k,
+            ]
+        }))
+    {
+        *counts.entry(evidence.status.as_str()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn causal_map_evidence_error_codes(
+    artifact: &synapse_calyx::SynapseCalyxCausalMapArtifact,
+) -> std::collections::BTreeSet<String> {
+    let mut codes = std::collections::BTreeSet::new();
+    let global = [
+        &artifact.pc_stable_skeleton,
+        &artifact.partial_correlation_network,
+        &artifact.hawkes_branching_graph,
+    ];
+    for evidence in global
+        .into_iter()
+        .chain(artifact.pairs.iter().flat_map(|pair| {
+            [
+                &pair.transfer_entropy,
+                &pair.granger_a_to_b,
+                &pair.granger_b_to_a,
+                &pair.cross_correlation,
+                &pair.convergent_cross_mapping,
+                &pair.temporal_cross_k,
+            ]
+        }))
+    {
+        if let Some(error) = &evidence.error {
+            codes.insert(error.code.clone());
+        }
+    }
+    codes
+}
+
+#[expect(
+    clippy::too_many_lines,
+    reason = "one target's publish, independent physical read, identity comparison, and atomic health projection form one verification boundary"
+)]
+fn drive_one_scheduled_causal_map(
+    db: &Arc<Db>,
+    target: crate::constellations::SynCausalMapMaintenanceTarget,
+    since_ns: i64,
+    until_ns: i64,
+) -> Result<(), String> {
+    let target_id = causal_map_target_id(target);
+    let mut params = synapse_calyx::SynapseCalyxTemporalParams::new(target.panel_version);
+    params.max_records = CAUSAL_MAP_MAX_RECORDS;
+    params.since_ts_ns = Some(since_ns);
+    params.until_ts_ns = Some(until_ns);
+    params.group_key = Some(target.group_key.to_owned());
+    params.bin_seconds = CAUSAL_MAP_BIN_SECONDS;
+    params.max_lag = CAUSAL_MAP_MAX_LAG;
+
+    let published = match db.temporal_causal_map_intelligence(&params, CAUSAL_MAP_FDR_ALPHA) {
+        Ok(report) => report,
+        Err(error)
+            if matches!(
+                error.code(),
+                "SYNAPSE_CALYX_CAUSAL_MAP_EMPTY_SCOPE"
+                    | "SYNAPSE_CALYX_CAUSAL_MAP_STREAMS_INSUFFICIENT"
+                    | "SYNAPSE_CALYX_CAUSAL_MAP_STREAM_LIMIT_EXCEEDED"
+            ) =>
+        {
+            clear_causal_map_physical_readback(&target_id);
+            record_causal_map_action(
+                target_id,
+                format!(
+                    "not_published code={} detail={} remediation={}",
+                    error.code(),
+                    error,
+                    error
+                        .remediation()
+                        .unwrap_or("inspect the exact typed failure")
+                ),
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            clear_causal_map_physical_readback(&target_id);
+            return Err(format!(
+                "target={target_id} panel={} group_key={}: code={} detail={} remediation={}",
+                target.panel_version,
+                target.group_key,
+                error.code(),
+                error,
+                error
+                    .remediation()
+                    .unwrap_or("inspect the exact typed failure")
+            ));
+        }
+    };
+
+    // A producer's return is not the verdict. Resolve the normalized-scope
+    // pointer through the independent reader, hash the immutable artifact, and
+    // re-fingerprint the exact closed source window before publishing health.
+    let readback = db
+        .read_temporal_causal_map_intelligence(&params, CAUSAL_MAP_FDR_ALPHA)
+        .map_err(|error| {
+            clear_causal_map_physical_readback(&target_id);
+            format!(
+                "target={target_id} causal-map publication could not be independently read: code={} detail={} remediation={}",
+                error.code(),
+                error,
+                error.remediation().unwrap_or("inspect the exact typed failure")
+            )
+        })?;
+    let identity_matches = published.graph_key_hex == readback.graph_key_hex
+        && published.graph_value_sha256 == readback.graph_value_sha256
+        && published.pointer_key_hex == readback.pointer_key_hex
+        && published.artifact.source_fingerprint_sha256
+            == readback.artifact.source_fingerprint_sha256
+        && published.artifact.source_records == readback.artifact.source_records
+        && published.artifact.latest_event_ns == readback.artifact.latest_event_ns
+        && published.physical_readback_matches
+        && published.pointer_readback_matches
+        && readback.physical_readback_matches
+        && readback.pointer_readback_matches;
+    if !identity_matches {
+        clear_causal_map_physical_readback(&target_id);
+        return Err(format!(
+            "target={target_id} independent Graph read did not reproduce the publication identity; published_pointer={} read_pointer={} published_artifact={} read_artifact={}",
+            published.pointer_key_hex,
+            readback.pointer_key_hex,
+            published.graph_value_sha256,
+            readback.graph_value_sha256
+        ));
+    }
+
+    let status_counts = causal_map_evidence_status_counts(&readback.artifact);
+    let error_codes = causal_map_evidence_error_codes(&readback.artifact);
+    if !error_codes.is_empty() {
+        tracing::warn!(
+            code = "STORAGE_DERIVED_STATE_CAUSAL_MAP_ESTIMATOR_FAILURES",
+            target = %target_id,
+            evidence_statuses = ?status_counts,
+            estimator_error_codes = ?error_codes,
+            "the complete causal-map artifact was published with typed failed or unresolved estimator lanes; no substitute estimator was used"
+        );
+    }
+    let mut state = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.last_causal_map_actions.insert(
+        target_id.clone(),
+        format!(
+            "published streams={} pairs={} evidence_statuses={status_counts:?} estimator_error_codes={error_codes:?} source_records={} latest_event_ns={}",
+            readback.artifact.streams.len(),
+            readback.artifact.pairs.len(),
+            readback.artifact.source_records,
+            readback.artifact.latest_event_ns
+        ),
+    );
+    state
+        .last_causal_map_pointer_keys
+        .insert(target_id.clone(), readback.pointer_key_hex);
+    state
+        .last_causal_map_artifact_keys
+        .insert(target_id.clone(), readback.graph_key_hex);
+    state
+        .last_causal_map_artifact_sha256
+        .insert(target_id.clone(), readback.graph_value_sha256);
+    state.last_causal_map_source_fingerprint_sha256.insert(
+        target_id.clone(),
+        readback.artifact.source_fingerprint_sha256,
+    );
+    state
+        .last_causal_map_source_records
+        .insert(target_id.clone(), readback.artifact.source_records);
+    state
+        .last_causal_map_latest_event_ns
+        .insert(target_id, readback.artifact.latest_event_ns);
+    drop(state);
+    Ok(())
+}
+
+fn drive_scheduled_causal_maps(db: &Arc<Db>) -> Result<(), String> {
+    let now_ms = now_unix_ms().ok_or_else(|| "system clock precedes Unix epoch".to_owned())?;
+    let interval_ms = u64::try_from(CAUSAL_MAP_REBUILD_INTERVAL.as_millis())
+        .map_err(|_| "causal-map rebuild interval exceeds u64 milliseconds".to_owned())?;
+    let last = LAST_CAUSAL_MAP_REBUILD_UNIX_MS.load(Ordering::Acquire);
+    if last != 0 && now_ms.saturating_sub(last) < interval_ms {
+        return Ok(());
+    }
+    // Latch the attempt before any corpus scan. A reproducible data/schema
+    // fault remains visible for the whole refresh interval instead of burning
+    // the maintenance pool every five minutes.
+    LAST_CAUSAL_MAP_REBUILD_UNIX_MS.store(now_ms, Ordering::Release);
+    let until_ns = i64::try_from(now_ms)
+        .ok()
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or_else(|| "system time exceeds signed Unix-nanosecond range".to_owned())?;
+    let window_ns = i64::try_from(CAUSAL_MAP_WINDOW.as_nanos())
+        .map_err(|_| "causal-map window exceeds signed nanoseconds".to_owned())?;
+    let since_ns = until_ns
+        .checked_sub(window_ns)
+        .ok_or_else(|| "causal-map lower window bound underflowed i64".to_owned())?;
+
+    let mut failures = Vec::new();
+    for &target in crate::constellations::SYN_CAUSAL_MAP_MAINTENANCE_TARGETS {
+        if let Err(error) = drive_one_scheduled_causal_map(db, target, since_ns, until_ns) {
+            let target_id = causal_map_target_id(target);
+            clear_causal_map_physical_readback(&target_id);
+            record_causal_map_action(target_id, format!("failed {error}"));
+            failures.push(error);
+        }
+        if let Err(error) = release_completed_phase_memory("one scheduled causal-map target") {
+            failures.push(format!(
+                "target={}: release completed target memory: {error}",
+                causal_map_target_id(target)
+            ));
+        }
+    }
+    let mut state = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    state.last_causal_map_rebuild_unix_ms = Some(now_ms);
+    drop(state);
+
+    if !failures.is_empty() {
+        return Err(format!(
+            "{} scheduled causal-map target(s) failed while independent targets continued: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_CAUSAL_MAP_PASS",
+        targets = crate::constellations::SYN_CAUSAL_MAP_MAINTENANCE_TARGETS.len(),
+        since_ts_ns = since_ns,
+        until_ts_ns = until_ns,
+        max_records = CAUSAL_MAP_MAX_RECORDS,
+        bin_seconds = CAUSAL_MAP_BIN_SECONDS,
+        max_lag = CAUSAL_MAP_MAX_LAG,
+        fdr_alpha = CAUSAL_MAP_FDR_ALPHA,
+        "autonomous causal-map targets were either physically published and independently read or explicitly classified as non-applicable"
+    );
+    Ok(())
 }
 
 #[expect(

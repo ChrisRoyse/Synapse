@@ -28,14 +28,19 @@ pub(super) fn transfer_entropy_with_config_cuda_strict_impl(
             &pick,
         ));
     }
-    // Strict CUDA only has a KSG kernel. Silently running the discrete estimator
-    // on the CPU would be exactly the hidden degradation the caller forbade.
-    if pick.estimator == Some(TeEstimator::DiscretePlugin) {
-        return Err(super::discrete::cuda_unsupported());
-    }
-
     let backend = calyx_forge::CudaBackend::new()
         .map_err(|err| crate::cuda_strict::forge_to_calyx("transfer entropy", err))?;
+    if pick.estimator == Some(TeEstimator::DiscretePlugin) {
+        return super::discrete::transfer_entropy_discrete_cuda(
+            backend.context(),
+            forward,
+            reverse,
+            lag,
+            clock,
+            config,
+            &pick,
+        );
+    }
     let t_a_to_b = estimate_te_cuda(backend.context(), forward, config.k)?;
     let t_b_to_a = estimate_te_cuda(backend.context(), reverse, config.k)?;
     let ci_95 = bootstrap_ci_cuda(

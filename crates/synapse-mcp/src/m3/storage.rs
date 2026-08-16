@@ -2015,6 +2015,7 @@ pub enum StorageIntelligenceOperation {
     Synergy,
     Causality,
     CausalMap,
+    CausalMapRead,
     Periodicity,
     Drift,
     Hazard,
@@ -2039,7 +2040,7 @@ impl StorageIntelligenceOperation {
     /// `server::tool_profiles` can be proven complete at daemon construction
     /// (#2077): a variant added here without a declared classification refuses
     /// to start the daemon instead of silently inheriting a gate.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Weave,
         Self::Abundance,
         Self::Bits,
@@ -2048,6 +2049,7 @@ impl StorageIntelligenceOperation {
         Self::Synergy,
         Self::Causality,
         Self::CausalMap,
+        Self::CausalMapRead,
         Self::Periodicity,
         Self::Drift,
         Self::Hazard,
@@ -2073,6 +2075,7 @@ impl StorageIntelligenceOperation {
             Self::Synergy => "synergy",
             Self::Causality => "causality",
             Self::CausalMap => "causal_map",
+            Self::CausalMapRead => "causal_map_read",
             Self::Periodicity => "periodicity",
             Self::Drift => "drift",
             Self::Hazard => "hazard",
@@ -2096,7 +2099,7 @@ impl StorageIntelligenceOperation {
         // Kernel CF).
         !matches!(
             self,
-            Self::Abundance | Self::KernelAnswer | Self::OlapAggregate
+            Self::Abundance | Self::CausalMapRead | Self::KernelAnswer | Self::OlapAggregate
         )
     }
 
@@ -2113,7 +2116,10 @@ impl StorageIntelligenceOperation {
     /// the resident-memory ownership lane.
     #[must_use]
     pub const fn is_bounded_read(self) -> bool {
-        matches!(self, Self::Abundance | Self::KernelAnswer)
+        matches!(
+            self,
+            Self::Abundance | Self::CausalMapRead | Self::KernelAnswer
+        )
     }
 }
 
@@ -2170,30 +2176,33 @@ pub struct StorageIntelligenceParams {
     #[schemars(range(min = 1, max = 32))]
     pub ksg_k: Option<u32>,
     /// Metadata key partitioning the panel into activity streams (the
-    /// app/agent/tool identifier). Required for `causality`/`causal_map`;
+    /// app/agent/tool identifier). Required for `causality`/`causal_map`/
+    /// `causal_map_read`;
     /// optional filter dimension for `periodicity`/`drift`/`hazard`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_key: Option<String>,
-    /// Causality source-stream value under `group_key`. For `causal_map`, both
-    /// group values select one explicit pair; omitting both enumerates all.
+    /// Causality source-stream value under `group_key`. For `causal_map` and
+    /// `causal_map_read`, both group values select one explicit pair; omitting
+    /// both selects the complete map.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_a: Option<String>,
     /// Causality target-stream value under `group_key`. One-sided pair scope is
-    /// rejected by `causal_map`.
+    /// rejected by `causal_map` and `causal_map_read`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group_b: Option<String>,
     /// Restricts `periodicity`/`drift`/`hazard` to one `group_key` stream value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filter_value: Option<String>,
-    /// Occurrence-count bin width in seconds (causality/periodicity/drift).
+    /// Occurrence-count bin width in seconds (causality/causal-map/periodicity/drift).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0.001))]
     pub bin_seconds: Option<f64>,
-    /// Maximum temporal lag in bins (`causality`/`causal_map`).
+    /// Maximum temporal lag in bins (`causality`/`causal_map`/`causal_map_read`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 32))]
     pub max_lag: Option<u32>,
-    /// Benjamini-Hochberg false-discovery-rate threshold (`causal_map` only).
+    /// Benjamini-Hochberg false-discovery-rate threshold (`causal_map` and
+    /// `causal_map_read`).
     /// Must be finite and strictly inside `(0,1)`; default `0.05`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 0, max = 1))]
@@ -2827,14 +2836,18 @@ pub struct StorageIntelligenceCausalityReport {
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceCausalMapReport {
     pub source_of_truth: &'static str,
-    /// Native `synapse.calyx.causal_map.v1` artifact. Its evidence lanes remain
+    /// Native `synapse.calyx.causal_map.v2` artifact. Its evidence lanes remain
     /// separate; callers must not collapse them into one causal score.
     pub artifact: serde_json::Value,
     pub graph_key_hex: String,
     pub graph_value_sha256: String,
     pub graph_value_bytes: u64,
+    pub pointer_key_hex: String,
+    pub pointer_value_sha256: String,
+    pub pointer_value_bytes: u64,
     pub graph_cf_rows_after: u64,
     pub physical_readback_matches: bool,
+    pub pointer_readback_matches: bool,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -5385,7 +5398,28 @@ pub fn run_intelligence_causal_map(
         .unwrap_or(synapse_calyx::SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA);
     let report = db
         .temporal_causal_map_intelligence(&temporal_params(params), fdr_alpha)
-        .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        .map_err(|error| storage_mcp_error(&error))?;
+    storage_intelligence_causal_map(report)
+}
+
+/// Reads and validates the latest persisted causal-map generation for the
+/// normalized scope without recomputing estimators or writing derived state.
+pub fn run_intelligence_causal_map_read(
+    db: &synapse_storage::Db,
+    params: &StorageIntelligenceParams,
+) -> Result<StorageIntelligenceCausalMapReport, ErrorData> {
+    let fdr_alpha = params
+        .causal_fdr_alpha
+        .unwrap_or(synapse_calyx::SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA);
+    let report = db
+        .read_temporal_causal_map_intelligence(&temporal_params(params), fdr_alpha)
+        .map_err(|error| storage_mcp_error(&error))?;
+    storage_intelligence_causal_map(report)
+}
+
+fn storage_intelligence_causal_map(
+    report: synapse_calyx::SynapseCalyxCausalMapReport,
+) -> Result<StorageIntelligenceCausalMapReport, ErrorData> {
     let artifact = serde_json::to_value(report.artifact).map_err(|error| {
         mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
@@ -5393,13 +5427,17 @@ pub fn run_intelligence_causal_map(
         )
     })?;
     Ok(StorageIntelligenceCausalMapReport {
-        source_of_truth: "Calyx Graph CF content-addressed causal-map row",
+        source_of_truth: "Calyx Graph CF normalized-scope pointer + content-addressed causal-map artifact",
         artifact,
         graph_key_hex: report.graph_key_hex,
         graph_value_sha256: report.graph_value_sha256,
         graph_value_bytes: report.graph_value_bytes as u64,
+        pointer_key_hex: report.pointer_key_hex,
+        pointer_value_sha256: report.pointer_value_sha256,
+        pointer_value_bytes: report.pointer_value_bytes as u64,
         graph_cf_rows_after: report.graph_cf_rows_after as u64,
         physical_readback_matches: report.physical_readback_matches,
+        pointer_readback_matches: report.pointer_readback_matches,
     })
 }
 

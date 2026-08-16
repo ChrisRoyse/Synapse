@@ -455,6 +455,78 @@ pub(crate) const SYN_ASSOCIATION_MAINTENANCE_TARGETS: &[(u32, u16)] = &[
     (SYN_EPISODE_PANEL_VERSION, EP_SLOT_RECORD_VECTOR.get()),
 ];
 
+/// One complete, low-level temporal stream universe maintained as a typed
+/// observational causal-evidence map.
+///
+/// Unlike [`SYN_ASSOCIATION_MAINTENANCE_TARGETS`], these targets do not require
+/// dense geometry or grounded outcomes. They require an active source-event
+/// lane and a metadata field that is present on every active row. The causal
+/// map itself enforces complete source coverage and complete `C(n,2)` stream
+/// enumeration; a field whose cardinality exceeds the estimator budget is
+/// reported as explicitly unmaintainable and is never sampled.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SynCausalMapMaintenanceTarget {
+    pub panel_name: &'static str,
+    pub panel_version: u32,
+    pub group_key: &'static str,
+}
+
+/// Built-in temporal populations whose native categorical event kinds are
+/// refreshed into durable causal-map generations by the derived-state owner.
+///
+/// The chosen keys are record-native classifications, not inferred labels:
+/// their writers above place them directly beside the exact source-event time.
+/// This makes the schedule domain-neutral while still covering human activity,
+/// episodes, agent activity, transcripts, actions, reflexes, processes,
+/// perception, and MCP tool use.
+pub(crate) const SYN_CAUSAL_MAP_MAINTENANCE_TARGETS: &[SynCausalMapMaintenanceTarget] = &[
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_TIMELINE_PANEL_NAME,
+        panel_version: SYN_TIMELINE_PANEL_VERSION,
+        group_key: "timeline_kind",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_EPISODE_PANEL_NAME,
+        panel_version: SYN_EPISODE_PANEL_VERSION,
+        group_key: "episode_started_because",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_AGENT_EVENT_PANEL_NAME,
+        panel_version: SYN_AGENT_EVENT_PANEL_VERSION,
+        group_key: "agent_event_kind",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_AGENT_TRANSCRIPT_PANEL_NAME,
+        panel_version: SYN_AGENT_TRANSCRIPT_PANEL_VERSION,
+        group_key: "agent_transcript_status",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_ACTION_PANEL_NAME,
+        panel_version: SYN_ACTION_PANEL_VERSION,
+        group_key: "action_kind",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_REFLEX_PANEL_NAME,
+        panel_version: SYN_REFLEX_PANEL_VERSION,
+        group_key: "reflex_status",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_PROCESS_PANEL_NAME,
+        panel_version: SYN_PROCESS_PANEL_VERSION,
+        group_key: "process_event_kind",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_OBSERVATION_PANEL_NAME,
+        panel_version: SYN_OBSERVATION_PANEL_VERSION,
+        group_key: "observation_mode",
+    },
+    SynCausalMapMaintenanceTarget {
+        panel_name: SYN_MCP_USAGE_PANEL_NAME,
+        panel_version: SYN_MCP_USAGE_PANEL_VERSION,
+        group_key: "mcp_usage_tool",
+    },
+];
+
 const AT_SLOT_ROLE_ONEHOT: SlotId = SlotId::new(35);
 const AT_SLOT_STATUS_ONEHOT: SlotId = SlotId::new(36);
 const AT_SLOT_SOURCE_ONEHOT: SlotId = SlotId::new(37);
@@ -3499,14 +3571,7 @@ pub fn syn_queryable_panel_contract(
     panel_version: u32,
     created_at_ms: u64,
 ) -> StorageResult<Option<SynActivePanelContract>> {
-    if !matches!(
-        panel_version,
-        SYN_TIMELINE_PANEL_VERSION
-            | SYN_EPISODE_PANEL_VERSION
-            | SYN_MCP_USAGE_PANEL_VERSION
-            | SYN_AGENT_TRANSCRIPT_PANEL_VERSION
-            | SYN_ACTION_PANEL_VERSION
-    ) {
+    if !syn_panel_is_queryable(panel_version) {
         return Ok(None);
     }
     let contract = syn_reconstructable_panel_contract(panel_version, created_at_ms)?.ok_or_else(
@@ -3528,6 +3593,23 @@ pub fn syn_queryable_panel_contract(
         &contract.registry,
     )?;
     Ok(Some(contract))
+}
+
+/// Whether a built-in panel is admitted to persisted retrieval generation.
+///
+/// This is intentionally distinct from reconstructability: finite-only panels
+/// are valid exact analytical populations but must never acquire empty or
+/// meaningless ANN lanes merely to obtain panel membership.
+#[must_use]
+pub(crate) const fn syn_panel_is_queryable(panel_version: u32) -> bool {
+    matches!(
+        panel_version,
+        SYN_TIMELINE_PANEL_VERSION
+            | SYN_EPISODE_PANEL_VERSION
+            | SYN_MCP_USAGE_PANEL_VERSION
+            | SYN_AGENT_TRANSCRIPT_PANEL_VERSION
+            | SYN_ACTION_PANEL_VERSION
+    )
 }
 
 /// The built-in contract for the live agent-event panel.

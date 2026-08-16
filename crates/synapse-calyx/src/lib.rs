@@ -302,6 +302,23 @@ pub struct SynapseCalyxSearchRebuildReport {
     pub raw_sidecars: Vec<SynapseCalyxSearchRawSidecar>,
 }
 
+/// Independently reopened physical state of one panel's exact membership
+/// generation.
+///
+/// A membership-only generation contains the complete panel identity filter
+/// but deliberately has no retrieval slots. It lets finite-only panels support
+/// bounded exact analytics without falsely admitting them to semantic search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxPanelMembershipGenerationReport {
+    pub panel_version: u32,
+    pub built: bool,
+    pub base_seq: u64,
+    pub member_rows: u64,
+    pub manifest_path: PathBuf,
+    pub manifest_sha256: String,
+    pub sidecar_sha256: String,
+}
+
 /// Read-only state of the persisted search generation for the active panel.
 ///
 /// Recall depends entirely on this generation, and nothing announced its state
@@ -5589,6 +5606,191 @@ impl SynapseCalyxVault {
         expected_panel_version: u32,
     ) -> Result<SynapseCalyxSearchRebuildReport, SynapseCalyxError> {
         self.rebuild_search_indexes_for_panel(expected_panel_version, None)
+    }
+
+    fn panel_membership_manifest_present(
+        panel_version: u32,
+        manifest_path: &Path,
+    ) -> Result<bool, SynapseCalyxError> {
+        match fs::metadata(manifest_path) {
+            Ok(metadata) if metadata.is_file() => Ok(true),
+            Ok(_) => Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_MANIFEST_NOT_FILE",
+                format!(
+                    "panel {panel_version} membership manifest path {} exists but is not a regular file",
+                    manifest_path.display()
+                ),
+                "preserve the path for diagnosis and replace it only through the owning rebuild workflow",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_MANIFEST_IO",
+                format!(
+                    "inspect panel {panel_version} membership manifest {}: {error}",
+                    manifest_path.display()
+                ),
+                "repair the exact manifest path permissions or filesystem error, then retry",
+            )),
+        }
+    }
+
+    fn read_panel_membership_generation(
+        &self,
+        panel_version: u32,
+        manifest_path: &Path,
+        built: bool,
+    ) -> Result<SynapseCalyxPanelMembershipGenerationReport, SynapseCalyxError> {
+        let indexes =
+            calyx_search::PersistedSearchIndexes::open(&self.config.vault_dir, panel_version)
+                .map_err(|error| {
+                    search_rebuild_error(
+                        &format!("reopen panel {panel_version} membership generation"),
+                        error,
+                    )
+                })?;
+        let generation = indexes.generation().map_err(|error| {
+            search_rebuild_error(
+                &format!("validate panel {panel_version} membership manifest"),
+                error,
+            )
+        })?;
+        if generation.panel_version != panel_version || !generation.slots.is_empty() {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_GENERATION_INVALID",
+                format!(
+                    "membership-only generation requested panel {panel_version}, but reopened panel {} with {} retrieval slots",
+                    generation.panel_version,
+                    generation.slots.len()
+                ),
+                "preserve the manifest and sidecars for diagnosis; rebuild the panel through its correct queryable or finite-only owner",
+            ));
+        }
+        let membership = indexes.panel_membership().map_err(|error| {
+            search_rebuild_error(
+                &format!("validate panel {panel_version} membership sidecar"),
+                error,
+            )
+        })?;
+        let member_rows = u64::try_from(membership.ids.len()).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_MEMBERSHIP_COUNT_OVERFLOW",
+                format!("panel {panel_version} membership row count does not fit u64: {error}"),
+                "preserve the membership sidecar and inspect its declared row count",
+            )
+        })?;
+        Ok(SynapseCalyxPanelMembershipGenerationReport {
+            panel_version,
+            built,
+            base_seq: membership.base_seq,
+            member_rows,
+            manifest_path: manifest_path.to_path_buf(),
+            manifest_sha256: membership.manifest_sha256,
+            sidecar_sha256: membership.sidecar_sha256,
+        })
+    }
+
+    fn panel_membership_rebase_required(error: &SynapseCalyxError) -> bool {
+        (error.code == "SYNAPSE_CALYX_STALE_DERIVED"
+            && error.source_code == Some("CALYX_STALE_DERIVED"))
+            || error.code == "CALYX_SEARCH_DELTA_REBASE_REQUIRED"
+    }
+
+    /// Ensures a finite-only panel has an exact hash-sealed membership
+    /// generation, without manufacturing retrieval indexes for it.
+    ///
+    /// Existing generations are reopened and validated before any replacement.
+    /// An absent manifest is built. A valid generation that cannot reconcile
+    /// because its delta exceeds the hard bound or its base predates recovered
+    /// changed-key history is authoritatively rebuilt, then reopened and
+    /// reconciled again. Any corrupt, wrong-panel, future, or otherwise invalid
+    /// generation fails closed and is preserved. Callers must use this only for
+    /// panels that are not query-admissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured error when the generation lock is contended, the
+    /// manifest or membership sidecar is corrupt, the Base scan fails, a
+    /// post-rebuild reconciliation still fails, or the published generation has
+    /// the wrong panel identity or any retrieval slot.
+    pub fn ensure_panel_membership_generation(
+        &self,
+        panel_version: u32,
+    ) -> Result<SynapseCalyxPanelMembershipGenerationReport, SynapseCalyxError> {
+        if panel_version == 0 {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_VERSION_INVALID",
+                "panel membership generation requires a non-zero panel version",
+                "supply the exact positive panel version declared by the temporal population",
+            ));
+        }
+        let _rebuild_lock = self.acquire_search_rebuild_lock(panel_version)?;
+        let manifest_path = calyx_search::manifest_path(&self.config.vault_dir, panel_version);
+        let manifest_present =
+            Self::panel_membership_manifest_present(panel_version, &manifest_path)?;
+        let mut built = if manifest_present {
+            false
+        } else {
+            calyx_search::rebuild_panel_membership_for_vault(
+                &self.config.vault_dir,
+                &self.vault,
+                panel_version,
+            )
+            .map_err(|error| {
+                search_rebuild_error(
+                    &format!("build panel {panel_version} membership-only generation"),
+                    error,
+                )
+            })?;
+            true
+        };
+        let mut report =
+            self.read_panel_membership_generation(panel_version, &manifest_path, built)?;
+        let reconcile = || {
+            self.with_panel_read_snapshot(panel_version, SEARCH_DELTA_SCAN_LEASE_MS, |snapshot| {
+                self.panel_membership_at_snapshot(snapshot, panel_version)
+                    .map(drop)
+            })
+        };
+        if let Err(error) = reconcile() {
+            if !Self::panel_membership_rebase_required(&error) {
+                return Err(error);
+            }
+            tracing::warn!(
+                code = "SYNAPSE_CALYX_PANEL_MEMBERSHIP_REBASE_REQUIRED",
+                panel_version,
+                error_code = error.code,
+                source_code = error.source_code.unwrap_or("none"),
+                detail = %error.message,
+                prior_base_seq = report.base_seq,
+                prior_member_rows = report.member_rows,
+                "finite-only membership generation cannot reconcile to the current panel snapshot; rebuilding from authoritative Base rows"
+            );
+            calyx_search::rebuild_panel_membership_for_vault(
+                &self.config.vault_dir,
+                &self.vault,
+                panel_version,
+            )
+            .map_err(|error| {
+                search_rebuild_error(
+                    &format!("rebase panel {panel_version} membership-only generation"),
+                    error,
+                )
+            })?;
+            built = true;
+            report = self.read_panel_membership_generation(panel_version, &manifest_path, built)?;
+            reconcile()?;
+        }
+        tracing::info!(
+            code = "SYNAPSE_CALYX_PANEL_MEMBERSHIP_GENERATION_READY",
+            panel_version,
+            built,
+            base_seq = report.base_seq,
+            member_rows = report.member_rows,
+            manifest_sha256 = %report.manifest_sha256,
+            sidecar_sha256 = %report.sidecar_sha256,
+            "finite-only panel membership generation reopened and verified"
+        );
+        Ok(report)
     }
 
     /// [`Self::rebuild_search_indexes`], with an explicit panel contract for a

@@ -66,6 +66,38 @@ where
     .map(|_| ())
 }
 
+/// Builds the hash-sealed panel-membership generation without publishing any
+/// retrieval indexes.
+///
+/// Finite-only panels still need an exact, incrementally reconcilable identity
+/// set for bounded panel-scoped analytics. Treating that set as though it
+/// required a queryable dense slot couples exact analytics to ANN admission and
+/// makes those panels unreadable. The empty active-slot set is deliberate: the
+/// normal rebuild path still performs one pinned Base scan, publishes and
+/// validates the membership filter atomically, and leaves `manifest.slots`
+/// empty so no caller can mistake the generation for a retrieval index.
+pub fn rebuild_panel_membership_for_vault<C: Clock>(
+    vault_dir: &Path,
+    vault: &AsterVault<C>,
+    panel_version: u32,
+) -> CliResult {
+    let active_slots = BTreeSet::new();
+    let sparse_scoring = BTreeMap::new();
+    rebuild_for_vault_with_slot_filter(
+        vault_dir,
+        vault,
+        RebuildRequest {
+            requested_panel_version: Some(panel_version),
+            active_slots: Some(&active_slots),
+            sparse_scoring: &sparse_scoring,
+            dense_index_config: PersistedDenseIndexConfig::default(),
+            destination: RebuildDestination::Live,
+        },
+        |_| Ok(()),
+    )
+    .map(|_| ())
+}
+
 pub(super) fn rebuild_candidate_for_vault_with_active_slots<C: Clock>(
     vault_dir: &Path,
     vault: &AsterVault<C>,
