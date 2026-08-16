@@ -157,7 +157,7 @@ Beyond storing and analyzing, Calyx **controls** what it can do so with groundin
 | Steered surface | Mechanism | Doctrine |
 |---|---|---|
 | Model routing (`model` tool) | bits + cost/success posteriors per model × task class | grounded ⇒ recommend with CI; ledger-logged |
-| Tool selection at agent spawn (`agent` tool) | per-tool success bits + typed failure arrows sourced from a persisted causal map | recommended/discouraged sets with predictive-evidence class and estimator trace; structural control requires separate identification |
+| Tool selection at agent spawn (`agent` tool) | per-tool success bits + independently read rolling MCP causal map (TE, bidirectional Granger, signed lag correlation, CCM, cross-K, PC-stable, partial correlation, Hawkes, BH-FDR) | recommended/discouraged sets with predictive-evidence class, full estimator trace, source fingerprint and Graph pointer/artifact identity; observational arrows never become structural control without separate identification |
 | Risky tool calls (destructive shell, deletes, sends) | pre-flight oracle what-if + ward OOD check | warn by default, deny per policy; honesty-gated; Insufficient ⇒ warn-only |
 | Running agents | quarantine-grade drift verdicts → pause/kill recommendation via `escalation` | per-slot evidence attached |
 | Routine arming / autonomy tiers | identity-lock + readiness predicate + periodicity confidence | fail closed: unready domains cannot arm |

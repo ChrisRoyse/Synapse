@@ -231,6 +231,8 @@ pub struct AgentToolRecommendResponse {
     pub tools: Vec<AgentToolEvidence>,
     pub failure_mode_arrows: Vec<Value>,
     pub failure_mode_arrow_grounding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causal_map_context: Option<Value>,
     pub decision_id: String,
     pub decision_row_key: String,
     pub decision_row_sha256: String,
@@ -1516,6 +1518,285 @@ struct ToolOutcomeCounts {
     failure: u64,
 }
 
+struct SteeringCausalEvidence {
+    arrows: Vec<Value>,
+    grounding: String,
+    context: Option<Value>,
+}
+
+fn steering_causal_evidence(
+    db: &synapse_storage::Db,
+    task_class: &str,
+    counts: &BTreeMap<String, ToolOutcomeCounts>,
+) -> Result<SteeringCausalEvidence, ErrorData> {
+    const MAX_FAILURE_MODE_ARROWS: usize = 256;
+    let window_ns = i64::try_from(
+        synapse_storage::derived_state::CAUSAL_MAP_WINDOW.as_nanos(),
+    )
+    .map_err(|_| {
+        crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            "STEERING_CAUSAL_MAP_WINDOW_OVERFLOW: configured causal-map window does not fit signed nanoseconds; remediation=repair the derived-state causal-map window contract",
+        )
+    })?;
+    let mut params =
+        synapse_calyx::SynapseCalyxTemporalParams::new(constellations::SYN_MCP_USAGE_PANEL_VERSION);
+    params.max_records = synapse_storage::derived_state::CAUSAL_MAP_MAX_RECORDS;
+    // Causal-map pointers are normalized by bounded window span, not wall-clock
+    // endpoints. The independent reader follows the latest pointer and validates
+    // the artifact against its own exact closed source window.
+    params.since_ts_ns = Some(0);
+    params.until_ts_ns = Some(window_ns);
+    params.group_key = Some("mcp_usage_tool".to_owned());
+    params.bin_seconds = synapse_storage::derived_state::CAUSAL_MAP_BIN_SECONDS;
+    params.max_lag = synapse_storage::derived_state::CAUSAL_MAP_MAX_LAG;
+
+    let report = match db.read_temporal_causal_map_intelligence(
+        &params,
+        synapse_storage::derived_state::CAUSAL_MAP_FDR_ALPHA,
+    ) {
+        Ok(report) => report,
+        Err(error) if error.code() == "SYNAPSE_CALYX_CAUSAL_MAP_NOT_BUILT" => {
+            let target_id = format!(
+                "{}:{}",
+                constellations::SYN_MCP_USAGE_PANEL_NAME,
+                "mcp_usage_tool"
+            );
+            let maintenance_action = synapse_storage::derived_state::derived_state_readback()
+                .last_causal_map_actions
+                .get(&target_id)
+                .cloned();
+            tracing::warn!(
+                code = "STEERING_CAUSAL_MAP_NOT_BUILT",
+                task_class,
+                target_id,
+                maintenance_action = ?maintenance_action,
+                detail = %error,
+                "tool steering has no physically published causal-map generation; the decision remains explicitly provisional"
+            );
+            return Ok(SteeringCausalEvidence {
+                arrows: Vec::new(),
+                grounding: "provisional_causal_map_not_built".to_owned(),
+                context: Some(json!({
+                    "schema": "synapse.steering.causal_map_context.v1",
+                    "status": "not_built",
+                    "panel_name": constellations::SYN_MCP_USAGE_PANEL_NAME,
+                    "panel_version": constellations::SYN_MCP_USAGE_PANEL_VERSION,
+                    "group_key": "mcp_usage_tool",
+                    "maintenance_target": target_id,
+                    "maintenance_action": maintenance_action,
+                    "error": {
+                        "code": error.code(),
+                        "message": error.to_string(),
+                        "remediation": error.remediation(),
+                    },
+                    "structural_effect_identified": false,
+                })),
+            });
+        }
+        Err(error) => {
+            return Err(crate::m1::mcp_error(
+                error.code(),
+                format!(
+                    "STEERING_CAUSAL_MAP_READ_FAILED: task_class={task_class} detail={error}; remediation={}",
+                    error.remediation().unwrap_or(
+                        "preserve the Graph pointer/artifact and repair the exact causal-map read failure"
+                    )
+                ),
+            ));
+        }
+    };
+    if !report.physical_readback_matches
+        || !report.pointer_readback_matches
+        || !report.artifact.all_requested_records_loaded
+        || !report.artifact.all_stream_pairs_enumerated
+        || report.artifact.structural_effect_identified
+        || report.artifact.evidence_class != "observational_predictive"
+    {
+        return Err(crate::m1::mcp_error(
+            error_codes::STORAGE_READ_FAILED,
+            "STEERING_CAUSAL_MAP_CONTRACT_INVALID: the persisted map lacks complete physical readback/pair coverage or misstates observational evidence as a structural effect; remediation=preserve and rebuild the exact Graph causal-map generation",
+        ));
+    }
+
+    // Agent transcripts preserve the client-qualified tool name
+    // (`mcp__synapse__agent`), while MCP usage records persist the daemon route
+    // (`agent`). Join those identities explicitly; unrelated local tools such
+    // as PowerShell have no MCP-usage stream and are never coerced into one.
+    let mut causal_counts: BTreeMap<String, ToolOutcomeCounts> = BTreeMap::new();
+    for stream in &report.artifact.streams {
+        for (observed_tool, outcome) in counts {
+            if steering_tool_matches_route(observed_tool, &stream.name) {
+                let aggregate = causal_counts.entry(stream.name.clone()).or_default();
+                aggregate.success = aggregate.success.saturating_add(outcome.success);
+                aggregate.failure = aggregate.failure.saturating_add(outcome.failure);
+            }
+        }
+    }
+    let failed_tools = causal_counts
+        .iter()
+        .filter(|(_, outcome)| outcome.failure > 0)
+        .map(|(tool, _)| tool.as_str())
+        .collect::<BTreeSet<_>>();
+    let relevant_pairs = report
+        .artifact
+        .pairs
+        .iter()
+        .filter(|pair| {
+            failed_tools.contains(pair.group_a.as_str())
+                || failed_tools.contains(pair.group_b.as_str())
+        })
+        .collect::<Vec<_>>();
+    if relevant_pairs.len() > MAX_FAILURE_MODE_ARROWS {
+        return Err(crate::m1::mcp_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            format!(
+                "STEERING_CAUSAL_ARROW_LIMIT_EXCEEDED: {} complete relevant pairs exceed declared response limit {MAX_FAILURE_MODE_ARROWS}; remediation=raise the explicit response budget after measuring payload cost, never truncate causal evidence",
+                relevant_pairs.len()
+            ),
+        ));
+    }
+    let arrows = relevant_pairs
+        .iter()
+        .map(|pair| {
+            json!({
+                "schema": "synapse.steering.failure_mode_arrow.v2",
+                "task_class": task_class,
+                "scope": "global_mcp_usage_rolling_window_with_task_class_outcome_overlay",
+                "group_a": pair.group_a,
+                "group_b": pair.group_b,
+                "events_a": pair.events_a,
+                "events_b": pair.events_b,
+                "task_class_outcomes_a": steering_tool_outcome_json(causal_counts.get(&pair.group_a)),
+                "task_class_outcomes_b": steering_tool_outcome_json(causal_counts.get(&pair.group_b)),
+                "transfer_entropy": pair.transfer_entropy,
+                "granger_a_to_b": pair.granger_a_to_b,
+                "granger_b_to_a": pair.granger_b_to_a,
+                "signed_lag_correlation": pair.cross_correlation,
+                "convergent_cross_mapping": pair.convergent_cross_mapping,
+                "temporal_cross_k": pair.temporal_cross_k,
+                "evidence_class": report.artifact.evidence_class,
+                "structural_effect_identified": false,
+                "interpretation": "observed temporal association involving a tool with task-class failures; this does not identify the tool as a structural cause of failure",
+            })
+        })
+        .collect::<Vec<_>>();
+    let relevant_fdr_families = report
+        .artifact
+        .fdr_families
+        .iter()
+        .map(|family| {
+            let decisions = family
+                .decisions
+                .iter()
+                .filter(|decision| {
+                    relevant_pairs.iter().any(|pair| {
+                        steering_hypothesis_matches_pair(
+                            &decision.hypothesis,
+                            &pair.group_a,
+                            &pair.group_b,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "name": family.name,
+                "method": family.method,
+                "assumptions": family.assumptions,
+                "alpha": family.alpha,
+                "complete_family_hypotheses_tested": family.hypotheses_tested,
+                "relevant_decisions": decisions,
+            })
+        })
+        .collect::<Vec<_>>();
+    let grounding = if failed_tools.is_empty() {
+        "observational_causal_map_present_no_task_class_failures"
+    } else if arrows.is_empty() {
+        "observational_causal_map_present_no_matching_failure_pairs"
+    } else {
+        "observational_predictive_causal_map"
+    };
+    let context = json!({
+        "schema": "synapse.steering.causal_map_context.v1",
+        "status": "physically_verified",
+        "panel_name": constellations::SYN_MCP_USAGE_PANEL_NAME,
+        "panel_version": report.artifact.panel_version,
+        "group_key": report.artifact.group_key,
+        "pair_scope": report.artifact.pair_scope,
+        "window": {
+            "since_ts_ns": report.artifact.since_ts_ns,
+            "until_ts_ns": report.artifact.until_ts_ns,
+            "bin_seconds": report.artifact.bin_seconds,
+            "max_lag": report.artifact.max_lag,
+            "source_records": report.artifact.source_records,
+            "source_fingerprint_sha256": report.artifact.source_fingerprint_sha256,
+        },
+        "coverage": {
+            "streams": report.artifact.streams,
+            "expected_pair_count": report.artifact.expected_pair_count,
+            "all_requested_records_loaded": report.artifact.all_requested_records_loaded,
+            "all_stream_pairs_enumerated": report.artifact.all_stream_pairs_enumerated,
+        },
+        "global_estimators": {
+            "pc_stable_skeleton": report.artifact.pc_stable_skeleton,
+            "partial_correlation_network": report.artifact.partial_correlation_network,
+            "hawkes_branching_graph": report.artifact.hawkes_branching_graph,
+        },
+        "bh_fdr_families": relevant_fdr_families,
+        "evidence_class": report.artifact.evidence_class,
+        "structural_effect_identified": report.artifact.structural_effect_identified,
+        "structural_identification_reason": report.artifact.structural_identification_reason,
+        "identification_requirements": report.artifact.identification_requirements,
+        "physical_source_of_truth": {
+            "column_family": "Graph",
+            "artifact_key_hex": report.graph_key_hex,
+            "artifact_sha256": report.graph_value_sha256,
+            "pointer_key_hex": report.pointer_key_hex,
+            "pointer_sha256": report.pointer_value_sha256,
+            "physical_readback_matches": report.physical_readback_matches,
+            "pointer_readback_matches": report.pointer_readback_matches,
+        },
+    });
+    Ok(SteeringCausalEvidence {
+        arrows,
+        grounding: grounding.to_owned(),
+        context: Some(context),
+    })
+}
+
+fn steering_tool_outcome_json(outcome: Option<&ToolOutcomeCounts>) -> Value {
+    outcome.map_or_else(
+        || json!({ "observed_in_task_class": false, "successes": 0, "failures": 0 }),
+        |outcome| {
+            json!({
+                "observed_in_task_class": true,
+                "successes": outcome.success,
+                "failures": outcome.failure,
+            })
+        },
+    )
+}
+
+fn steering_tool_matches_route(observed_tool: &str, route: &str) -> bool {
+    observed_tool == route
+        || observed_tool
+            .strip_prefix("mcp__synapse__")
+            .is_some_and(|name| name == route)
+}
+
+fn steering_hypothesis_matches_pair(hypothesis: &str, group_a: &str, group_b: &str) -> bool {
+    [
+        format!("{group_a}->{group_b}@"),
+        format!("{group_b}->{group_a}@"),
+        format!("{group_a}<->{group_b}@"),
+        format!("{group_b}<->{group_a}@"),
+        format!("{group_a}<->{group_b}|"),
+        format!("{group_b}<->{group_a}|"),
+    ]
+    .iter()
+    .any(|prefix| hypothesis.starts_with(prefix))
+}
+
 fn recommend_tools(
     db: &synapse_storage::Db,
     task_class: &str,
@@ -1664,8 +1945,16 @@ fn recommend_tools(
         .filter(|tool| tool.evidence_count as usize >= min_evidence && tool.success_ci95_high < 0.5)
         .map(|tool| tool.tool.clone())
         .collect::<Vec<_>>();
+    let causal_evidence = steering_causal_evidence(db, task_class, &counts)?;
     let observed_ns = super::agent_events::unix_time_ns_now();
-    let seed = serde_json::to_vec(&(&task_class, observed_ns, &tools)).map_err(|error| {
+    let seed = serde_json::to_vec(&(
+        &task_class,
+        observed_ns,
+        &tools,
+        &causal_evidence.arrows,
+        &causal_evidence.context,
+    ))
+    .map_err(|error| {
         crate::m1::mcp_error(
             error_codes::TOOL_INTERNAL_ERROR,
             format!("STEERING_TOOL_DECISION_ENCODE_FAILED: {error}"),
@@ -1684,8 +1973,9 @@ fn recommend_tools(
         "recommended_tools": recommended_tools,
         "discouraged_tools": discouraged_tools,
         "tools": tools,
-        "failure_mode_arrows": [],
-        "failure_mode_arrow_grounding": "provisional_no_transfer_entropy_assay"
+        "failure_mode_arrows": causal_evidence.arrows,
+        "failure_mode_arrow_grounding": causal_evidence.grounding,
+        "causal_map_context": causal_evidence.context,
     }))
     .map_err(|error| {
         crate::m1::mcp_error(
@@ -1729,8 +2019,9 @@ fn recommend_tools(
         recommended_tools,
         discouraged_tools,
         tools,
-        failure_mode_arrows: Vec::new(),
-        failure_mode_arrow_grounding: "provisional_no_transfer_entropy_assay".to_owned(),
+        failure_mode_arrows: causal_evidence.arrows,
+        failure_mode_arrow_grounding: causal_evidence.grounding,
+        causal_map_context: causal_evidence.context,
         decision_id,
         decision_row_key,
         decision_row_sha256: steering_sha256(&row),

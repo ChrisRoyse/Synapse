@@ -33,6 +33,15 @@ Primary sources constrain the interpretation:
 12. Exact panel membership is independent of retrieval admission. Queryable panels use their normal search generation. For a finite-only panel, the mutating producer first ensures a hash-sealed membership-only generation whose manifest has zero retrieval slots. It is built when absent; otherwise it is reopened and validated before reconciliation. A valid generation whose bounded delta cannot be reconstructed because it predates the recovered change-history floor, or whose measured delta exceeds the hard reconciliation bound, is rebuilt from authoritative Base rows and reconciled again. The read-only serving path never builds or repairs it. A present corrupt, wrong-panel, future, or otherwise invalid generation fails closed and remains preserved. This removes the accidental requirement that a temporal population possess meaningful ANN geometry before exact analytics can read it.
 13. Foreground MCP whole-corpus calls and autonomous maintenance share the same one-permit semaphore but not the same wait contract. Autonomous GC, pressure, and derived-state passes wait fairly until admitted. A foreground tool waits at most one second for admission and then returns `STORAGE_MAINTENANCE_BUSY`, naming the active operation, its observed ownership duration, the admission budget, and proving its closure was not dispatched. The active owner is tracked under a generation-guarded RAII record and cleared before its owned permit drops. This keeps the single-working-set memory invariant while preventing an MCP transport timeout from erasing a queued causal request before it starts.
 14. Integer-valued occurrence streams select the discrete plug-in transfer-entropy estimator under its declared auto rule. Strict CUDA executes that estimator natively: exact dense state codes feed batch-private integer histograms; small alphabets use dynamic shared memory and larger valid alphabets use explicitly VRAM-budgeted global rows; entropy and Miller-Madow terms use a fixed block reduction. Symbol interning and seeded selection construction remain deterministic host control work, but no entropy estimate runs on CPU and no failure substitutes continuous KSG. GPU allocation, launch, index, alphabet, or numerical failures remain typed terminal lane evidence.
+15. `agent operation=recommend_tools` consumes the independently read rolling
+    `syn-mcp-usage-v1:mcp_usage_tool` generation. It joins client-qualified
+    `mcp__synapse__<route>` names to canonical daemon routes, overlays the task
+    class's real success/failure counts, and serves relevant pair lanes plus
+    PC/partial/Hawkes context, relevant family-local BH decisions, source
+    fingerprint, and Graph pointer/artifact hashes. It does not use
+    observational arrows to rewrite empirical success posteriors. A never-built
+    generation is named provisional; stale, corrupt, cross-bound, or incomplete
+    state fails the recommendation rather than falling back.
 
 ## Consequences
 
@@ -46,6 +55,11 @@ Primary sources constrain the interpretation:
 - Finite-only event panels no longer fail merely because no search manifest exists, and they do not acquire fake indexes as the price of becoming analyzable. The one-time membership build scans the physical Base population under one pinned reader, atomically publishes only the sealed identity filter, and subsequent calls use bounded panel reconciliation.
 - A busy autonomous pass is now an explicit, retryable concurrency state rather than a five-minute silent wait. Tokio's fair semaphore continues to order admitted owners, and timing out the acquisition safely removes only the foreground waiter's queue position; no blocking closure, estimator, or storage mutation has started.
 - Strict-CUDA causal maps no longer strand transfer entropy on the exact integer data for which discrete TE is required. Integer atomics make histogram counts scheduling-independent; fixed reduction order bounds the floating-point surface; device-room accounting prevents an oversized alphabet/bootstrap batch from becoming an implicit CPU route or an uncontrolled allocation.
+- Tool steering now receives the complete typed causal context already mined by
+  Calyx instead of the obsolete `provisional_no_transfer_entropy_assay`
+  placeholder. The response still labels these arrows observational/predictive;
+  a tool appearing before a failed tool is not thereby declared a structural
+  cause of failure.
 
 ## References
 

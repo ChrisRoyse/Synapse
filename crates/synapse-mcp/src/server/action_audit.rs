@@ -6,6 +6,7 @@ use std::{
 use rmcp::{ErrorData, RoleServer, service::RequestContext};
 use serde::Serialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use super::SynapseService;
 use crate::m1::mcp_error;
@@ -389,6 +390,39 @@ impl SynapseService {
         redactions.sort();
         redactions.dedup();
         let redacted = !redactions.is_empty();
+        // Only pre-execution rows own a request snapshot. Terminal details are
+        // responses/errors and must never be reinterpreted as predictors. The
+        // field exists as null on every terminal outcome, so slot presence does
+        // not distinguish success from failure.
+        let request_snapshot = matches!(status, "preflight" | "started").then(|| details.clone());
+        let (request_snapshot_sha256, request_snapshot_bytes) = if let Some(snapshot) =
+            request_snapshot.as_ref()
+        {
+            let bytes = serde_json::to_vec(snapshot).map_err(|error| {
+                    mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "ACTION_AUDIT_REQUEST_SNAPSHOT_ENCODE_FAILED: tool={tool} status={status} detail={error}; remediation=repair the pre-action request projection before retrying"
+                        ),
+                    )
+                })?;
+            let byte_count = u64::try_from(bytes.len()).map_err(|error| {
+                    mcp_error(
+                        synapse_core::error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "ACTION_AUDIT_REQUEST_SNAPSHOT_LENGTH_OVERFLOW: tool={tool} status={status} detail={error}; remediation=bound the request before retrying"
+                        ),
+                    )
+                })?;
+            (
+                Some(synapse_storage::constellations::hex_encode(
+                    &Sha256::digest(&bytes),
+                )),
+                Some(byte_count),
+            )
+        } else {
+            (None, None)
+        };
         let value = json!({
             "schema_version": 1,
             "audit_id": format!("{ts_ns:020}-{seq:010}"),
@@ -411,6 +445,9 @@ impl SynapseService {
             "active_profile_schema_version": active_profile.schema_version,
             "redacted": redacted,
             "redactions": redactions,
+            "request_snapshot": request_snapshot,
+            "request_snapshot_sha256": request_snapshot_sha256,
+            "request_snapshot_bytes": request_snapshot_bytes,
             "details": details,
         });
         let encoded = synapse_storage::encode_json(&value).map_err(|error| {

@@ -158,7 +158,20 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// pre-merge build wrote a different slot map under `2_050_001`. A generation
 /// is the durable identity of one slot contract; once two physical layouts have
 /// used an id, that id cannot truthfully name either layout again.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_001;
+///
+/// Generation `2_185_002` adds [`ACT_SLOT_REQUEST_VECTOR`], the first lane that
+/// measures the actual pre-execution request rather than only its tool, verb,
+/// target and clock. The request is taken exclusively from point-in-time audit
+/// fields that existed before the outcome: command `payload_bounded` plus its
+/// redacted full-payload digest, or the explicit action-audit preflight request
+/// snapshot. Terminal response/error details are excluded.
+/// Status, error, response and after-state fields are never read. This is a new
+/// immutable generation because adding the slot to `2_185_001` would silently
+/// reinterpret every already-persisted constellation under a layout it never
+/// carried.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_002;
+/// The target-vector-only generation superseded by the request-cause lane.
+pub const SYN_ACTION_PANEL_VERSION_PRE_REQUEST: u32 = 2_185_001;
 /// The contaminated generation #2185 superseded. It remains readable history,
 /// but new rows must never join its mixed physical slot layouts.
 pub const SYN_ACTION_PANEL_VERSION_PRE_2185: u32 = 2_050_001;
@@ -660,7 +673,7 @@ const AT_SLOT_TEXT_FULL_BM25: SlotId = SlotId::new(109);
 /// adjust it by intuition.
 const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 
-/// Dimension of `syn.action.target_vector.v1` (#2050).
+/// Dimension of `syn.action.target_vector.v2` (#2050/#1690).
 ///
 /// The lens is `syn_record_vector_unit_fields`, which is exactly the **signed
 /// feature-hashing** construction of Weinberger et al., *Feature Hashing for
@@ -685,6 +698,22 @@ const AT_TEXT_FULL_BM25_DIM: u32 = 2_097_152;
 /// and therefore of the panel contract every stored vector was measured under.
 /// Changing it is a panel version bump and a full re-measure, never an edit.
 const ACT_TARGET_VECTOR_DIM: u32 = 256;
+/// Dimension of the bounded pre-action request projection.
+///
+/// A request emits at most 64 structural nodes plus a small bounded envelope. At
+/// 512 dimensions the signed-hash collision expectation is below five pairs
+/// and projection noise is about `1/sqrt(512) ~= 0.044`. The action source CF
+/// is TTL-managed, so this doubles one short-lived dense lane rather than
+/// creating an unbounded permanent corpus. Frozen with the lens id.
+const ACT_REQUEST_VECTOR_DIM: u32 = 512;
+/// Maximum payload nodes whose graded structure is materialized. Command audit
+/// rows retain an exact digest of the complete redacted request, so an overflow
+/// remains identity-complete and is explicitly marked in the vector. Legacy
+/// rows have no such digest and therefore fail closed instead of truncating.
+const ACT_REQUEST_MAX_NODES: usize = 64;
+const ACT_REQUEST_EXACT_WEIGHT: f64 = 1.0;
+const ACT_REQUEST_ENVELOPE_WEIGHT: f64 = 0.75;
+const ACT_REQUEST_SHAPE_WEIGHT: f64 = 0.5;
 /// Weight of a whole-field exact-value feature. The identity carrier: two rows
 /// naming the same value for the same field share this feature exactly.
 const ACT_TARGET_EXACT_WEIGHT: f64 = 1.0;
@@ -755,6 +784,9 @@ const ACT_SLOT_DOW_CYCLIC: SlotId = SlotId::new(52);
 /// **second** block — the same move #1900/#1921/#1964 made for the timeline,
 /// agent-transcript and episode panels.
 const ACT_SLOT_TARGET_VECTOR: SlotId = SlotId::new(117);
+/// Dense point-in-time request-cause lane. Slot 118 is in the action panel's
+/// reserved second block and has never carried another meaning.
+const ACT_SLOT_REQUEST_VECTOR: SlotId = SlotId::new(118);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -916,7 +948,7 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         last: 52,
     },
     // The action panel's second block (#2050). Holds `ACT_SLOT_TARGET_VECTOR`
-    // (117); 118..=120 are unallocated headroom inside this panel's own range,
+    // (117) and `ACT_SLOT_REQUEST_VECTOR` (118); 119..=120 are unallocated headroom inside this panel's own range,
     // so the next action lens needs no third block. `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
@@ -2400,11 +2432,12 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         "syn.agent_transcript.record_vector.v2",
     ),
     (ACT_SLOT_KIND_ONEHOT, "syn.action.kind_onehot.v2"),
-    (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v1"),
-    (ACT_SLOT_RECORD_VECTOR, "syn.action.record_vector.v1"),
+    (ACT_SLOT_TARGET_HASH, "syn.action.target_hash.v2"),
+    (ACT_SLOT_RECORD_VECTOR, "syn.action.record_vector.v2"),
     (ACT_SLOT_HOUR_CYCLIC, "syn.action.hour_cyclic.v1"),
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
-    (ACT_SLOT_TARGET_VECTOR, "syn.action.target_vector.v1"),
+    (ACT_SLOT_TARGET_VECTOR, "syn.action.target_vector.v2"),
+    (ACT_SLOT_REQUEST_VECTOR, "syn.action.request_vector.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2840,6 +2873,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_2020,
                 SYN_ACTION_PANEL_VERSION_PRE_2050,
                 SYN_ACTION_PANEL_VERSION_PRE_2185,
+                SYN_ACTION_PANEL_VERSION_PRE_REQUEST,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5259,7 +5293,7 @@ pub fn build_action_constellation(
         ACT_SLOT_TARGET_HASH,
         optional_hash_slot(
             SYN_ACTION_PANEL_NAME,
-            "syn.action.target_hash.v1",
+            "syn.action.target_hash.v2",
             target_text.as_deref(),
             2048,
         )?,
@@ -5269,11 +5303,15 @@ pub fn build_action_constellation(
         action_target_vector_slot(source_key, record)?,
     );
     slots.insert(
+        ACT_SLOT_REQUEST_VECTOR,
+        action_request_vector_slot(source_key, record)?,
+    );
+    slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
             SYN_ACTION_PANEL_NAME,
             AlgorithmicLens::syn_record_vector_unit_fields(
-                "syn.action.record_vector.v1",
+                "syn.action.record_vector.v2",
                 Modality::Structured,
                 32,
             ),
@@ -8157,9 +8195,9 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         )?,
         syn_content_slot(
             ACT_SLOT_TARGET_HASH,
-            "syn.action.target_hash.v1",
+            "syn.action.target_hash.v2",
             RegistryAlgorithmicLens::syn_hash(
-                "syn.action.target_hash.v1",
+                "syn.action.target_hash.v2",
                 Modality::Structured,
                 2048,
             ),
@@ -8168,9 +8206,9 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         )?,
         syn_content_slot(
             ACT_SLOT_RECORD_VECTOR,
-            "syn.action.record_vector.v1",
+            "syn.action.record_vector.v2",
             RegistryAlgorithmicLens::syn_record_vector_unit_fields(
-                "syn.action.record_vector.v1",
+                "syn.action.record_vector.v2",
                 Modality::Structured,
                 32,
             ),
@@ -8205,11 +8243,25 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         // and 117 is the graded lane Ward can actually score.
         syn_content_slot(
             ACT_SLOT_TARGET_VECTOR,
-            "syn.action.target_vector.v1",
+            "syn.action.target_vector.v2",
             RegistryAlgorithmicLens::syn_record_vector_unit_fields(
-                "syn.action.target_vector.v1",
+                "syn.action.target_vector.v2",
                 Modality::Structured,
                 ACT_TARGET_VECTOR_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+        // Point-in-time request cause. This deliberately coexists with target
+        // identity: target says what entity the action addressed; request says
+        // what operation-specific input was supplied to that entity.
+        syn_content_slot(
+            ACT_SLOT_REQUEST_VECTOR,
+            "syn.action.request_vector.v1",
+            RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+                "syn.action.request_vector.v1",
+                Modality::Structured,
+                ACT_REQUEST_VECTOR_DIM,
             ),
             panel_version,
             registry,
@@ -9246,8 +9298,8 @@ fn action_identity(record: &Value) -> String {
 /// ## The first two are the authoritative persisted paths (#2050)
 ///
 /// `synapse-mcp`'s action audit writer (`server::action_audit::
-/// write_action_audit_row_readback`) persists the session's bound target at
-/// exactly two TOP-LEVEL keys of the `CF_ACTION_LOG` row and nowhere else:
+/// write_action_audit_row_readback`) persists the session's bound target at two
+/// top-level `CF_ACTION_LOG` paths:
 ///
 /// * `agent_logical_foreground.target` — `target_claims::target_wire(&target)`,
 ///   written by `action_audit_agent_logical_foreground` only on the
@@ -9261,26 +9313,27 @@ fn action_identity(record: &Value) -> String {
 /// [`json_value_text`] canonicalizes to its JSON text. That text is the
 /// authoritative identity of the window/tab the action actually drove.
 ///
-/// This list previously started at `/target` and searched only
-/// `payload_bounded`/`details` below it. A real action audit row carries none of
-/// those at top level, so **every target-bound success measured as
+/// Command-audit rows independently persist `/target`; preflight request shapes
+/// may carry the same identity below `payload_bounded` or `request_snapshot`.
+/// This list previously started at `/target` and then searched terminal
+/// `details`. A real action audit row carries no top-level `/target`, so **every
+/// target-bound success measured as
 /// `AbsentReason::NotApplicable` on `ACT_SLOT_TARGET_HASH`** while some failure
 /// payloads happened to carry `details.target`. The result was a target lane
 /// populated only by bad cases: Ward reported `slot 49 has 0 adjudicated good
 /// exemplar(s)` no matter how many verified target-bound successes were run.
 ///
 /// Order is load-bearing. The authoritative session target wins when present;
-/// the historical payload/details paths keep their exact prior meaning for rows
-/// that carry only those; and `/actor/tool` stays last as the pre-existing
-/// last-resort identity rather than a target.
+/// command-audit and explicit preflight request fields follow. Terminal
+/// `details` and `details.request` are deliberately excluded: they are
+/// post-treatment response/error shapes, and using them populated the target
+/// lane on failures without an equivalent success field.
 const ACTION_TARGET_POINTERS: &[&str] = &[
     "/agent_logical_foreground/target",
     "/foreground_lane/target",
     "/target",
     "/payload_bounded/target",
-    "/details/target",
-    "/details/request/target",
-    "/actor/tool",
+    "/request_snapshot/target",
 ];
 
 fn action_target_text(record: &Value) -> Option<String> {
@@ -9330,7 +9383,7 @@ fn action_target_components(value: &str) -> Vec<String> {
 ///
 /// ## What makes this similarity-bearing where `syn_hash` is not
 ///
-/// `syn.action.target_hash.v1` content-addresses the **whole** target value into
+/// `syn.action.target_hash.v2` content-addresses the **whole** target value into
 /// one sparse cell, so its similarity is the indicator `same value / different
 /// value` — it cannot say that two actions drove the same window in different
 /// tabs, or the same executable under a different argument, and it is not a
@@ -9434,8 +9487,7 @@ fn action_target_features(target: &Value) -> StorageResult<serde_json::Map<Strin
             );
         }
         other => {
-            // A scalar or array target (the historical `/details/target` and
-            // `/actor/tool` paths). It has no field structure, so it is one
+            // A scalar or array target. It has no field structure, so it is one
             // unnamed field with its own shape.
             let text = json_value_text(other)
                 .and_then(|text| non_empty(&text).map(str::to_owned))
@@ -9498,9 +9550,348 @@ fn action_target_vector_slot(source_key: &[u8], record: &Value) -> StorageResult
     measure_json(
         SYN_ACTION_PANEL_NAME,
         AlgorithmicLens::syn_record_vector_unit_fields(
-            "syn.action.target_vector.v1",
+            "syn.action.target_vector.v2",
             Modality::Structured,
             ACT_TARGET_VECTOR_DIM,
+        ),
+        &Value::Object(features),
+    )
+}
+
+/// One point-in-time request projection source.
+///
+/// Current command rows carry a digest of the complete redacted request, and
+/// action-preflight rows carry a digest of the complete request snapshot after
+/// the writer's public-readback redaction pass. Their bounded structural
+/// projection may therefore summarize an oversized payload without pretending
+/// the visible structure is the whole input. Legacy action-audit requests have
+/// no such digest and must refuse any structural overflow instead.
+struct ActionRequestSource<'a> {
+    payload: &'a Value,
+    source: &'static str,
+    full_payload_sha256: Option<&'a str>,
+    payload_bytes: Option<u64>,
+    payload_truncated: Option<bool>,
+}
+
+/// Selects only request state known before the action outcome.
+///
+/// The command writer records the same redacted request on intent and final
+/// rows, so `payload_bounded` is point-in-time correct on both. The action-audit
+/// writer publishes `request_snapshot` only on its preflight/started rows and
+/// publishes null on every terminal outcome. Older action rows have no safe
+/// status-independent request snapshot and remain explicitly absent. Never
+/// infer a request from terminal details or outcome.
+fn action_request_source(record: &Value) -> StorageResult<Option<ActionRequestSource<'_>>> {
+    if json_string(record, &["row_kind"]).as_deref() == Some("command_audit") {
+        let payload = record.get("payload_bounded").ok_or_else(|| {
+            measurement_error(
+                "action request vector",
+                "command_audit row is missing required pre-action payload_bounded; remediation=repair the command-audit writer or preserve/quarantine the malformed row",
+            )
+        })?;
+        let digest = validated_action_request_sha256(record, "payload_sha256", "command_audit")?;
+        let payload_bytes = record
+            .get("payload_bytes")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| {
+                measurement_error(
+                    "action request vector",
+                    "command_audit row is missing unsigned payload_bytes; remediation=repair the malformed audit row before re-measurement",
+                )
+            })?;
+        if payload_bytes > MAX_EXACT_F64_INT {
+            return Err(measurement_error(
+                "action request vector",
+                format!(
+                    "command_audit payload_bytes={payload_bytes} exceeds the exact f64 integer limit {MAX_EXACT_F64_INT}; remediation=repair the malformed audit row before re-measurement"
+                ),
+            ));
+        }
+        let payload_truncated = record
+            .get("payload_truncated")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| {
+                measurement_error(
+                    "action request vector",
+                    "command_audit row is missing boolean payload_truncated; remediation=repair the malformed audit row before re-measurement",
+                )
+            })?;
+        return Ok(Some(ActionRequestSource {
+            payload,
+            source: "command_payload_bounded",
+            full_payload_sha256: Some(digest),
+            payload_bytes: Some(payload_bytes),
+            payload_truncated: Some(payload_truncated),
+        }));
+    }
+
+    let Some(payload) = record
+        .get("request_snapshot")
+        .filter(|payload| !payload.is_null())
+    else {
+        return Ok(None);
+    };
+    let digest =
+        validated_action_request_sha256(record, "request_snapshot_sha256", "action preflight")?;
+    let payload_bytes = record
+        .get("request_snapshot_bytes")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            measurement_error(
+                "action request vector",
+                "action preflight row has request_snapshot but no unsigned request_snapshot_bytes; remediation=repair the malformed audit row before re-measurement",
+            )
+        })?;
+    if payload_bytes > MAX_EXACT_F64_INT {
+        return Err(measurement_error(
+            "action request vector",
+            format!(
+                "action preflight request_snapshot_bytes={payload_bytes} exceeds the exact f64 integer limit {MAX_EXACT_F64_INT}; remediation=repair the malformed audit row before re-measurement"
+            ),
+        ));
+    }
+    Ok(Some(ActionRequestSource {
+        payload,
+        source: "action_preflight_request_snapshot",
+        full_payload_sha256: Some(digest),
+        payload_bytes: Some(payload_bytes),
+        payload_truncated: Some(false),
+    }))
+}
+
+fn validated_action_request_sha256<'a>(
+    record: &'a Value,
+    field: &str,
+    row_kind: &str,
+) -> StorageResult<&'a str> {
+    let digest = record
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            measurement_error(
+                "action request vector",
+                format!(
+                    "{row_kind} row is missing required full redacted {field}; remediation=repair the audit writer or preserve/quarantine the malformed row"
+                ),
+            )
+        })?;
+    if digest.len() != 64
+        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || digest.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err(measurement_error(
+            "action request vector",
+            format!(
+                "{row_kind} {field} must be 64 lowercase hexadecimal characters, got length {}; remediation=repair the malformed audit row before re-measurement",
+                digest.len()
+            ),
+        ));
+    }
+    Ok(digest)
+}
+
+fn insert_request_exact_feature(
+    features: &mut serde_json::Map<String, Value>,
+    namespace: &str,
+    value: &str,
+    weight: f64,
+) {
+    features.insert(
+        format!("{namespace}|{}", action_target_feature_digest(value)),
+        json!(weight),
+    );
+}
+
+const fn request_value_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Adds a bounded, order-stable structural projection of one request payload.
+/// Returns `true` exactly when the node/depth budget prevented full structural
+/// expansion. Object keys are sorted before traversal; feature names contain
+/// only short digests of paths and values, never raw request content.
+fn collect_action_request_nodes(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    visited: &mut usize,
+    features: &mut serde_json::Map<String, Value>,
+) -> bool {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH || *visited >= ACT_REQUEST_MAX_NODES {
+        return true;
+    }
+    *visited += 1;
+    let path_digest = action_target_feature_digest(path);
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            let shape = keys
+                .iter()
+                .map(|key| key.as_str())
+                .collect::<Vec<_>>()
+                .join("\u{1f}");
+            features.insert(
+                format!(
+                    "node|{path_digest}|object|{}",
+                    action_target_feature_digest(&shape)
+                ),
+                json!(ACT_REQUEST_SHAPE_WEIGHT),
+            );
+            let mut overflowed = false;
+            for key in keys {
+                let child_path = format!("{path}/{}", action_target_feature_digest(key));
+                overflowed |= collect_action_request_nodes(
+                    &map[key],
+                    &child_path,
+                    depth + 1,
+                    visited,
+                    features,
+                );
+            }
+            overflowed
+        }
+        Value::Array(items) => {
+            features.insert(
+                format!("node|{path_digest}|array|len={}", items.len()),
+                json!(ACT_REQUEST_SHAPE_WEIGHT),
+            );
+            let mut overflowed = false;
+            for (index, item) in items.iter().enumerate() {
+                let child_path = format!("{path}/{index}");
+                overflowed |=
+                    collect_action_request_nodes(item, &child_path, depth + 1, visited, features);
+            }
+            overflowed
+        }
+        scalar => {
+            let text = json_value_text(scalar).unwrap_or_else(|| request_value_kind(scalar).into());
+            features.insert(
+                format!(
+                    "node|{path_digest}|{}|{}",
+                    request_value_kind(scalar),
+                    action_target_feature_digest(&text)
+                ),
+                json!(ACT_REQUEST_EXACT_WEIGHT),
+            );
+            false
+        }
+    }
+}
+
+fn action_request_features(
+    record: &Value,
+    request: &ActionRequestSource<'_>,
+) -> StorageResult<serde_json::Map<String, Value>> {
+    let mut features = serde_json::Map::new();
+    insert_request_exact_feature(
+        &mut features,
+        "source",
+        request.source,
+        ACT_REQUEST_SHAPE_WEIGHT,
+    );
+    for (namespace, value) in [
+        ("tool", json_string(record, &["tool"])),
+        ("verb", json_string(record, &["verb"])),
+        ("channel", json_string(record, &["channel"])),
+    ] {
+        if let Some(value) = value.as_deref() {
+            insert_request_exact_feature(
+                &mut features,
+                namespace,
+                value,
+                ACT_REQUEST_ENVELOPE_WEIGHT,
+            );
+        }
+    }
+    if let Some(target) = action_target_value(record)
+        && let Some(target) = json_value_text(target)
+    {
+        insert_request_exact_feature(
+            &mut features,
+            "target",
+            &target,
+            ACT_REQUEST_ENVELOPE_WEIGHT,
+        );
+    }
+    if let Some(digest) = request.full_payload_sha256 {
+        insert_request_exact_feature(
+            &mut features,
+            "payload_sha256",
+            digest,
+            ACT_REQUEST_EXACT_WEIGHT,
+        );
+    }
+    if let Some(bytes) = request.payload_bytes {
+        features.insert(
+            "payload_bytes_log1p".to_owned(),
+            json!(exact_u64_as_f64(bytes).ln_1p()),
+        );
+    }
+    if let Some(truncated) = request.payload_truncated {
+        insert_request_exact_feature(
+            &mut features,
+            "payload_storage",
+            if truncated { "truncated" } else { "complete" },
+            ACT_REQUEST_SHAPE_WEIGHT,
+        );
+    }
+
+    let mut visited = 0_usize;
+    let overflowed =
+        collect_action_request_nodes(request.payload, "$", 0, &mut visited, &mut features);
+    if overflowed {
+        let Some(digest) = request.full_payload_sha256 else {
+            return Err(measurement_error(
+                "action request vector",
+                format!(
+                    "action preflight request exceeds the frozen {ACT_REQUEST_MAX_NODES}-node/16-depth structural budget and has no complete payload digest; remediation=upgrade the audit writer to persist an exact redacted request digest, then allocate a new action panel generation"
+                ),
+            ));
+        };
+        insert_request_exact_feature(
+            &mut features,
+            "structural_overflow_complete_digest",
+            digest,
+            ACT_REQUEST_EXACT_WEIGHT,
+        );
+    }
+    Ok(features)
+}
+
+/// Measures the pre-execution request cause, or explicit absence when the
+/// historical row did not persist a request independently of its outcome.
+fn action_request_vector_slot(source_key: &[u8], record: &Value) -> StorageResult<SlotVector> {
+    let Some(request) = action_request_source(record)? else {
+        return Ok(absent(AbsentReason::NotApplicable));
+    };
+    let features = action_request_features(record, &request).map_err(|error| {
+        measurement_error(
+            "action request vector",
+            format!(
+                "source_cf={} source_key_hex={} action={}: {error}",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                action_identity(record)
+            ),
+        )
+    })?;
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.request_vector.v1",
+            Modality::Structured,
+            ACT_REQUEST_VECTOR_DIM,
         ),
         &Value::Object(features),
     )
@@ -9833,10 +10224,6 @@ fn action_numeric_record(record: &Value) -> Value {
         "has_tool": bool_u64(json_string(record, &["tool"]).is_some()),
         "has_verb": bool_u64(json_string(record, &["verb"]).is_some()),
         "has_target": bool_u64(action_target_text(record).is_some()),
-        "detail_fields_scaled": scaled(
-            record.get("details").and_then(Value::as_object).map_or(0, |value| value.len() as u64),
-            32,
-        ),
     })
 }
 
