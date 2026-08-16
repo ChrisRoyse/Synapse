@@ -706,6 +706,15 @@ const ACT_TARGET_VECTOR_DIM: u32 = 256;
 /// is TTL-managed, so this doubles one short-lived dense lane rather than
 /// creating an unbounded permanent corpus. Frozen with the lens id.
 const ACT_REQUEST_VECTOR_DIM: u32 = 512;
+/// Frozen byte-length scale for the pre-action request lane.
+///
+/// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
+/// `synapse-mcp::http::session::MAX_MCP_REQUEST_BYTES`. Request snapshots are a
+/// projection of that body, so a larger claimed payload is source-contract
+/// drift and fails closed. The normalized feature is
+/// `ln(1+n) / ln(1+ACT_REQUEST_MAX_PAYLOAD_BYTES)`, keeping it in `[0,1]` as
+/// required by `syn_record_vector_unit_fields`.
+const ACT_REQUEST_MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 /// Maximum payload nodes whose graded structure is materialized. Command audit
 /// rows retain an exact digest of the complete redacted request, so an overflow
 /// remains identity-complete and is explicitly marked in the vector. Legacy
@@ -9591,23 +9600,8 @@ fn action_request_source(record: &Value) -> StorageResult<Option<ActionRequestSo
             )
         })?;
         let digest = validated_action_request_sha256(record, "payload_sha256", "command_audit")?;
-        let payload_bytes = record
-            .get("payload_bytes")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| {
-                measurement_error(
-                    "action request vector",
-                    "command_audit row is missing unsigned payload_bytes; remediation=repair the malformed audit row before re-measurement",
-                )
-            })?;
-        if payload_bytes > MAX_EXACT_F64_INT {
-            return Err(measurement_error(
-                "action request vector",
-                format!(
-                    "command_audit payload_bytes={payload_bytes} exceeds the exact f64 integer limit {MAX_EXACT_F64_INT}; remediation=repair the malformed audit row before re-measurement"
-                ),
-            ));
-        }
+        let payload_bytes =
+            validated_action_request_payload_bytes(record, "payload_bytes", "command_audit")?;
         let payload_truncated = record
             .get("payload_truncated")
             .and_then(Value::as_bool)
@@ -9634,23 +9628,11 @@ fn action_request_source(record: &Value) -> StorageResult<Option<ActionRequestSo
     };
     let digest =
         validated_action_request_sha256(record, "request_snapshot_sha256", "action preflight")?;
-    let payload_bytes = record
-        .get("request_snapshot_bytes")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            measurement_error(
-                "action request vector",
-                "action preflight row has request_snapshot but no unsigned request_snapshot_bytes; remediation=repair the malformed audit row before re-measurement",
-            )
-        })?;
-    if payload_bytes > MAX_EXACT_F64_INT {
-        return Err(measurement_error(
-            "action request vector",
-            format!(
-                "action preflight request_snapshot_bytes={payload_bytes} exceeds the exact f64 integer limit {MAX_EXACT_F64_INT}; remediation=repair the malformed audit row before re-measurement"
-            ),
-        ));
-    }
+    let payload_bytes = validated_action_request_payload_bytes(
+        record,
+        "request_snapshot_bytes",
+        "action preflight",
+    )?;
     Ok(Some(ActionRequestSource {
         payload,
         source: "action_preflight_request_snapshot",
@@ -9699,6 +9681,30 @@ fn validated_action_request_sha256<'a>(
         ));
     }
     Ok(digest)
+}
+
+fn validated_action_request_payload_bytes(
+    record: &Value,
+    field: &str,
+    row_kind: &str,
+) -> StorageResult<u64> {
+    let bytes = record.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        measurement_error(
+            "action request vector",
+            format!(
+                "{row_kind} row is missing unsigned {field}; remediation=repair the malformed audit row before re-measurement"
+            ),
+        )
+    })?;
+    if bytes > ACT_REQUEST_MAX_PAYLOAD_BYTES {
+        return Err(measurement_error(
+            "action request vector",
+            format!(
+                "{row_kind} {field}={bytes} exceeds the frozen authenticated-request ceiling {ACT_REQUEST_MAX_PAYLOAD_BYTES}; remediation=repair the malformed row, or raise the transport and lens bounds together under a new action panel generation"
+            ),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn insert_request_exact_feature(
@@ -9842,9 +9848,11 @@ fn action_request_features(
         );
     }
     if let Some(bytes) = request.payload_bytes {
+        let normalized_bytes = exact_u64_as_f64(bytes).ln_1p()
+            / exact_u64_as_f64(ACT_REQUEST_MAX_PAYLOAD_BYTES).ln_1p();
         features.insert(
-            "payload_bytes_log1p".to_owned(),
-            json!(exact_u64_as_f64(bytes).ln_1p()),
+            "payload_bytes_log1p_scaled".to_owned(),
+            json!(normalized_bytes),
         );
     }
     if let Some(truncated) = request.payload_truncated {

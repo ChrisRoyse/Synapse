@@ -50,7 +50,9 @@ show why conditioning on post-treatment variables biases causal inference.
    bounded, and hashes feature values into names so raw request content is not
    copied into the vector contract. Overflow is accepted only when the writer
    sealed the complete redacted payload with a digest; otherwise measurement
-   fails closed.
+   fails closed. Request byte length is log-normalized against the frozen 1 MiB
+   authenticated MCP request ceiling; a larger stored claim fails instead of
+   dominating the unit-field vector or being silently clamped.
 5. Target lookup removes terminal details fallthrough. Target hash/vector and
    the record vector become frozen v2 instruments. The record vector no longer
    counts terminal detail fields.
