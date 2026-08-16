@@ -415,8 +415,9 @@ impl SynapseService {
                     )
                 })?;
             (
-                Some(synapse_storage::constellations::hex_encode(
-                    &Sha256::digest(&bytes),
+                Some(format!(
+                    "sha256:{}",
+                    synapse_storage::constellations::hex_encode(&Sha256::digest(&bytes))
                 )),
                 Some(byte_count),
             )

@@ -9677,15 +9677,24 @@ fn validated_action_request_sha256<'a>(
                 ),
             )
         })?;
-    if digest.len() != 64
-        || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
-        || digest.bytes().any(|byte| byte.is_ascii_uppercase())
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(measurement_error(
+            "action request vector",
+            format!(
+                "{row_kind} {field} must use the writer's canonical sha256:<64 lowercase hex> representation; remediation=repair the malformed audit row before re-measurement"
+            ),
+        ));
+    };
+    if hex.len() != 64
+        || !hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || hex.bytes().any(|byte| byte.is_ascii_uppercase())
     {
         return Err(measurement_error(
             "action request vector",
             format!(
-                "{row_kind} {field} must be 64 lowercase hexadecimal characters, got length {}; remediation=repair the malformed audit row before re-measurement",
-                digest.len()
+                "{row_kind} {field} must use sha256:<64 lowercase hex>, got tagged length {} and digest length {}; remediation=repair the malformed audit row before re-measurement",
+                digest.len(),
+                hex.len()
             ),
         ));
     }

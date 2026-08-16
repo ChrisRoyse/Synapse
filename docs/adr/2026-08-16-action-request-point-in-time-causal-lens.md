@@ -41,9 +41,9 @@ show why conditioning on post-treatment variables biases causal inference.
    envelope. The digest preserves exact identity when the stored structural
    view is bounded.
 3. Action-audit writers persist `request_snapshot`, its byte length, and its
-   full SHA-256 only for preflight/started rows and persist null for all three on
-   every terminal outcome. Historical rows without this status-independent
-   field are explicitly absent. Terminal
+   canonical `sha256:<hex>` digest only for preflight/started rows and persist
+   null for all three on every terminal outcome. Historical rows without this
+   status-independent field are explicitly absent. Terminal
    `details`, `details.request`, response, status, error, and after-state are
    never request features.
 4. Structural request traversal is deterministic, key-sorted, depth/node
