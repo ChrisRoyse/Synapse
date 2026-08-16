@@ -214,6 +214,12 @@ const PANEL_COVERAGE_CURSOR_KEY_PREFIX: &str = "syn/panel-backfill-cursor/v1/";
 /// dropping everything beyond the cap.
 pub const WEAVE_INTERVAL_MAX_RECORDS: usize = 2_000;
 
+/// Durable consumer-offset row for one panel's association input stream.
+const ASSOCIATION_WEAVE_CURSOR_KEY_PREFIX: &str = "syn/association-weave-cursor/v1/";
+const ASSOCIATION_WEAVE_CURSOR_SCHEMA: &str = "synapse_association_weave_cursor/v1";
+const ASSOCIATION_WEAVE_SOURCE_CONTRACT: &str = "calyx_panel_change_log/v1";
+const ASSOCIATION_CHANGE_LOG_PRUNE_ROWS: usize = 2_000;
+
 /// Wall-clock budget for one panel's incremental weave in one maintenance tick.
 pub const WEAVE_PANEL_TICK_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
@@ -395,15 +401,116 @@ pub struct NoveltyDeliveryReadback {
 static DERIVED_STATE_LAST: LazyLock<Mutex<DerivedStateReadback>> =
     LazyLock::new(|| Mutex::new(DerivedStateReadback::default()));
 
-/// Inclusive MVCC sequence through which each panel's Base changes were
-/// completely woven.
-///
-/// Registration establishes the current vault sequence as a baseline before
-/// the daemon accepts live writes. Routine work then consumes the ordered Base
-/// change journal, never a repeated timestamp-filtered membership snapshot.
-/// Historical rows remain available to the explicit full-corpus weave.
-static WEAVE_BASE_SEQ: LazyLock<Mutex<BTreeMap<u32, u64>>> =
+/// Inclusive durable CDC sequence through which each panel's Base/slot input
+/// changes were completely woven. A missing durable cursor is never interpreted
+/// as current: registration leaves it absent and the first pass publishes an
+/// authoritative Base snapshot stream before advancing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WeaveCursorState {
+    covered_through_seq: u64,
+    bootstrap_through_seq: Option<u64>,
+    durable_present: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct DurableWeaveCursor {
+    schema: String,
+    panel_version: u32,
+    covered_through_seq: u64,
+    #[serde(default)]
+    bootstrap_through_seq: Option<u64>,
+    source_contract: String,
+    updated_at_unix_ms: Option<u64>,
+}
+
+static WEAVE_BASE_SEQ: LazyLock<Mutex<BTreeMap<u32, WeaveCursorState>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+fn association_weave_cursor_key(panel_version: u32) -> Vec<u8> {
+    format!("{ASSOCIATION_WEAVE_CURSOR_KEY_PREFIX}{panel_version}").into_bytes()
+}
+
+fn load_durable_weave_cursor(
+    db: &Arc<Db>,
+    panel_version: u32,
+) -> Result<Option<DurableWeaveCursor>, String> {
+    let Some(cursor) = read_durable_maintenance_row::<DurableWeaveCursor>(
+        db,
+        &association_weave_cursor_key(panel_version),
+        "association weave cursor",
+    )?
+    else {
+        return Ok(None);
+    };
+    if cursor.schema != ASSOCIATION_WEAVE_CURSOR_SCHEMA
+        || cursor.source_contract != ASSOCIATION_WEAVE_SOURCE_CONTRACT
+        || cursor.panel_version != panel_version
+        || cursor
+            .bootstrap_through_seq
+            .is_some_and(|through| through <= cursor.covered_through_seq)
+    {
+        return Err(format!(
+            "cursor contract mismatch: expected schema={ASSOCIATION_WEAVE_CURSOR_SCHEMA} source={ASSOCIATION_WEAVE_SOURCE_CONTRACT} panel={panel_version} covered>0 bootstrap>covered; actual={cursor:?}"
+        ));
+    }
+    Ok(Some(cursor))
+}
+
+fn persist_and_verify_weave_cursor(
+    db: &Arc<Db>,
+    cursor: &DurableWeaveCursor,
+) -> Result<(), String> {
+    let key = association_weave_cursor_key(cursor.panel_version);
+    write_durable_maintenance_row(db, key.clone(), cursor, "association weave cursor")?;
+    let physical = read_durable_maintenance_row::<DurableWeaveCursor>(
+        db,
+        &key,
+        "association weave cursor readback",
+    )?
+    .ok_or_else(|| {
+        format!(
+            "panel {} association weave cursor write returned but the independent CF_KV readback found no row",
+            cursor.panel_version
+        )
+    })?;
+    if physical != *cursor {
+        return Err(format!(
+            "panel {} association weave cursor readback differs from the committed candidate: expected={cursor:?} actual={physical:?}",
+            cursor.panel_version
+        ));
+    }
+    Ok(())
+}
+
+fn prune_acknowledged_weave_history(
+    db: &Arc<Db>,
+    panel_version: u32,
+    through_seq: u64,
+) -> Result<(), String> {
+    if through_seq == 0 {
+        return Ok(());
+    }
+    let report = db
+        .prune_panel_input_changes(
+            panel_version,
+            through_seq,
+            ASSOCIATION_CHANGE_LOG_PRUNE_ROWS,
+        )
+        .map_err(|error| {
+            format!(
+                "prune panel {panel_version} durable association-input history through acknowledged cursor {through_seq}: {error}"
+            )
+        })?;
+    tracing::debug!(
+        code = "STORAGE_DERIVED_STATE_WEAVE_HISTORY_PRUNED",
+        panel_version,
+        acknowledged_through_seq = through_seq,
+        rows_deleted = report.rows_deleted,
+        prune_commit_seq = report.committed_seq,
+        "pruned one bounded page only after the durable association cursor was independently reread"
+    );
+    Ok(())
+}
 
 /// Externally readable outcome of the derived-state maintainer, as published for
 /// `health` to read without touching the vault.
@@ -634,32 +741,35 @@ pub fn register_derived_state_source(db: &Arc<Db>) {
         Ok(mut guard) => *guard = Some(weak),
         Err(poisoned) => *poisoned.into_inner() = Some(weak),
     }
-    let baseline_seq = db
-        .calyx_vault_status()
-        .map_err(|error| error.to_string())
-        .and_then(|status| {
-            status.latest_seq.ok_or_else(|| {
-                "opened Calyx vault status omitted latest_seq while initializing incremental weave"
-                    .to_owned()
-            })
-        });
-    match baseline_seq {
-        Ok(baseline_seq) => {
-            let mut watermarks = match WEAVE_BASE_SEQ.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
-                watermarks.entry(panel_version).or_insert(baseline_seq);
+    let mut watermarks = match WEAVE_BASE_SEQ.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
+        match load_durable_weave_cursor(db, panel_version) {
+            Ok(Some(cursor)) => {
+                watermarks.insert(
+                    panel_version,
+                    WeaveCursorState {
+                        covered_through_seq: cursor.covered_through_seq,
+                        bootstrap_through_seq: cursor.bootstrap_through_seq,
+                        durable_present: true,
+                    },
+                );
             }
-        }
-        Err(error) => record_failure(
-            "STORAGE_DERIVED_STATE_WEAVE_BASELINE_UNAVAILABLE",
-            format!(
-                "could not read the live Calyx MVCC sequence while initializing incremental Loom cursors: {error}"
+            Ok(None) => {
+                // Absence is not permission to bless the current sequence as a
+                // baseline. The first maintenance pass publishes a complete
+                // durable snapshot stream and starts behind it.
+                watermarks.insert(panel_version, WeaveCursorState::default());
+            }
+            Err(error) => record_failure(
+                "STORAGE_DERIVED_STATE_WEAVE_CURSOR_INVALID",
+                format!("panel {panel_version} durable weave cursor is unusable: {error}"),
             ),
-        ),
+        }
     }
+    drop(watermarks);
     tracing::info!(
         code = "STORAGE_DERIVED_STATE_SOURCE_REGISTERED",
         db_path = %db.path.display(),
@@ -2937,6 +3047,7 @@ fn record_weave_backlog(panel_version: u32, backlog_seqs: u64) -> WeaveBacklogTr
 /// Committing the frontier makes every tick start strictly ahead of the last,
 /// which is the difference between a loop that converges and one that cannot.
 fn commit_weave_frontier(
+    db: &Arc<Db>,
     panel_version: u32,
     after_seq: u64,
     frontier_seq: u64,
@@ -2948,18 +3059,33 @@ fn commit_weave_frontier(
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    let watermark = watermarks
+    let state = watermarks
         .get_mut(&panel_version)
         .ok_or_else(|| format!("panel {panel_version} watermark disappeared before commit"))?;
-    if *watermark != after_seq {
+    if state.covered_through_seq != after_seq {
         return Err(format!(
             "panel {panel_version} Base-sequence cursor changed concurrently: expected={after_seq} \
-             actual={watermark}; refusing to overwrite a newer owner"
+             actual={}; refusing to overwrite a newer owner",
+            state.covered_through_seq
         ));
     }
-    *watermark = frontier_seq;
+    let bootstrap_through_seq = state
+        .bootstrap_through_seq
+        .filter(|through| frontier_seq < *through);
+    let durable = DurableWeaveCursor {
+        schema: ASSOCIATION_WEAVE_CURSOR_SCHEMA.to_owned(),
+        panel_version,
+        covered_through_seq: frontier_seq,
+        bootstrap_through_seq,
+        source_contract: ASSOCIATION_WEAVE_SOURCE_CONTRACT.to_owned(),
+        updated_at_unix_ms: now_unix_ms(),
+    };
+    persist_and_verify_weave_cursor(db, &durable)?;
+    state.covered_through_seq = frontier_seq;
+    state.bootstrap_through_seq = bootstrap_through_seq;
+    state.durable_present = true;
     drop(watermarks);
-    Ok(())
+    prune_acknowledged_weave_history(db, panel_version, frontier_seq)
 }
 
 /// Weaves every changed Base identity in one panel's new sequence interval
@@ -3053,14 +3179,7 @@ fn weave_panel_subpass(db: &Arc<Db>, panel_version: u32) -> WeaveSubpass {
               convergence classification are a single ordered sequence"
 )]
 fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProgress, String> {
-    let until_seq = db
-        .calyx_vault_status()
-        .map_err(|error| format!("read Calyx weave sequence tip: {error}"))?
-        .latest_seq
-        .ok_or_else(|| {
-            "opened Calyx vault status omitted latest_seq during incremental weave".to_owned()
-        })?;
-    let after_seq = {
+    let mut cursor = {
         let watermarks = match WEAVE_BASE_SEQ.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -3071,16 +3190,75 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             )
         })?
     };
-    if until_seq == after_seq {
+    if !cursor.durable_present {
+        let bootstrap = db
+            .publish_panel_input_snapshot(panel_version, WEAVE_INTERVAL_MAX_RECORDS)
+            .map_err(|error| {
+                format!(
+                    "publish panel {panel_version} durable association bootstrap stream: {error}"
+                )
+            })?;
+        let bootstrap_through_seq = (bootstrap.through_seq > bootstrap.source_snapshot_seq)
+            .then_some(bootstrap.through_seq);
+        let durable = DurableWeaveCursor {
+            schema: ASSOCIATION_WEAVE_CURSOR_SCHEMA.to_owned(),
+            panel_version,
+            covered_through_seq: bootstrap.source_snapshot_seq,
+            bootstrap_through_seq,
+            source_contract: ASSOCIATION_WEAVE_SOURCE_CONTRACT.to_owned(),
+            updated_at_unix_ms: now_unix_ms(),
+        };
+        persist_and_verify_weave_cursor(db, &durable)?;
+        let mut watermarks = match WEAVE_BASE_SEQ.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let state = watermarks.get_mut(&panel_version).ok_or_else(|| {
+            format!("panel {panel_version} watermark disappeared during durable bootstrap")
+        })?;
+        if state.durable_present {
+            return Err(format!(
+                "panel {panel_version} weave cursor was concurrently initialized while its bootstrap stream was being published"
+            ));
+        }
+        *state = WeaveCursorState {
+            covered_through_seq: bootstrap.source_snapshot_seq,
+            bootstrap_through_seq,
+            durable_present: true,
+        };
+        cursor = *state;
+        drop(watermarks);
+        tracing::warn!(
+            code = "STORAGE_DERIVED_STATE_WEAVE_BOOTSTRAP_PUBLISHED",
+            panel_version,
+            source_snapshot_seq = bootstrap.source_snapshot_seq,
+            bootstrap_through_seq = bootstrap.through_seq,
+            identities = bootstrap.identities,
+            chunks = bootstrap.chunks,
+            base_rows_scanned = bootstrap.base_rows_scanned,
+            membership_sha256 = %bootstrap.membership_sha256,
+            reader_lease_renewals = bootstrap.reader_lease_renewals,
+            "the durable association cursor was absent; published a complete resumable panel snapshot stream instead of silently treating current state as covered"
+        );
+    }
+    let panel_status = db
+        .calyx_search_generation_status_for_panel(panel_version, false)
+        .map_err(|error| format!("read panel {panel_version} content watermark: {error}"))?;
+    let panel_content_seq = panel_status.panel_content_seq.ok_or_else(|| {
+        format!("panel {panel_version} status omitted its exact panel_content_seq")
+    })?;
+    let until_seq = cursor
+        .bootstrap_through_seq
+        .map_or(panel_content_seq, |bootstrap| {
+            bootstrap.max(panel_content_seq)
+        });
+    let after_seq = cursor.covered_through_seq;
+    if until_seq <= after_seq {
+        prune_acknowledged_weave_history(db, panel_version, after_seq)?;
         return Ok(WeaveProgress {
             records_woven: 0,
             advisory: None,
         });
-    }
-    if until_seq < after_seq {
-        return Err(format!(
-            "regressed Calyx MVCC sequence at weave boundary: after_seq={after_seq} until_seq={until_seq}"
-        ));
     }
 
     let started = std::time::Instant::now();
@@ -3152,7 +3330,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
                 // the frontier because a LATER part failed would make every
                 // retry redo them, which is the divergence this function was
                 // repaired for — the failure itself is unchanged and still loud.
-                commit_weave_frontier(panel_version, after_seq, frontier_seq)?;
+                commit_weave_frontier(db, panel_version, after_seq, frontier_seq)?;
                 return Err(format!(
                     "{error}; Base-sequence frontier committed at {frontier_seq} after {completed_parts} \
                      completed interval part(s), so the retry resumes there rather than at \
@@ -3266,7 +3444,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         last_graph_readback = report.graph_cf_rows_readback;
     }
 
-    commit_weave_frontier(panel_version, after_seq, frontier_seq)?;
+    commit_weave_frontier(db, panel_version, after_seq, frontier_seq)?;
     let backlog_seqs = until_seq.saturating_sub(frontier_seq);
     let trend = record_weave_backlog(panel_version, backlog_seqs);
     let action = match &stop {

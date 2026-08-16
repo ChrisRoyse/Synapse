@@ -16,7 +16,7 @@ pub use abundance::{
 };
 pub use agreement_graph::{
     AgreementEdge, LoomStore, MAX_AGREEMENT_DISPATCH_BYTES, MAX_RECORDED_ZERO_NORM_SKIPS,
-    MaterializationBatchReport, ZeroNormAgreementSkip,
+    MaterializationBatchReport, ZeroNormAgreementSkip, decode_xterm_kv_row,
 };
 pub use blind_spot::{
     BlindSpotAlert, BlindSpotCalibration, BlindSpotCalibrationEvidence, BlindSpotCalibrationParams,

@@ -2404,6 +2404,9 @@ pub struct StorageIntelligenceWeaveResponse {
     pub panel_version: u32,
     pub records_scanned: u64,
     pub records_woven: u64,
+    /// Changed identities no longer present in this panel whose stale physical
+    /// XTerm prefixes were removed before the cursor could advance.
+    pub records_removed: u64,
     /// Lenses the panel declares (#1939).
     pub n_lenses: u64,
     /// Lenses that reached the corpus and could be woven.
@@ -2413,6 +2416,9 @@ pub struct StorageIntelligenceWeaveResponse {
     pub cross_terms_materialized: u64,
     pub agreement_edges_persisted: u64,
     pub between_record_edges_persisted: u64,
+    /// Hash of the independently reread Graph-CF pointer to the complete
+    /// search-generation-plus-live-delta between-record graph.
+    pub between_record_graph_reference_sha256: String,
     pub knn_zero_norm_exclusions: Vec<StorageIntelligenceKnnZeroNormExclusion>,
     pub xterm_cf_rows_after: u64,
     pub graph_cf_rows_after: u64,
@@ -4770,6 +4776,7 @@ pub fn run_intelligence_weave(
         panel_version: report.panel_version,
         records_scanned: report.records_scanned as u64,
         records_woven: report.records_woven as u64,
+        records_removed: report.records_removed as u64,
         n_lenses: report.n_lenses as u64,
         measurable_lenses: report.measurable_lenses as u64,
         slot_states: report
@@ -4781,6 +4788,7 @@ pub fn run_intelligence_weave(
         cross_terms_materialized: report.cross_terms_materialized as u64,
         agreement_edges_persisted: report.agreement_edges_persisted as u64,
         between_record_edges_persisted: report.between_record_edges_persisted as u64,
+        between_record_graph_reference_sha256: report.between_record_graph_reference_sha256,
         knn_zero_norm_exclusions: report
             .knn_zero_norm_exclusions
             .into_iter()

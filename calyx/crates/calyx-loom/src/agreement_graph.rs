@@ -26,6 +26,27 @@ pub struct XtermRow {
     pub tag: SignalProvenanceTag,
 }
 
+/// Decodes and key-verifies one physical Aster XTerm row.
+///
+/// Consumers that aggregate persisted cross-terms must prove the value's
+/// embedded identity matches the physical key.  Decoding JSON alone would let
+/// a misplaced/corrupt row silently contribute to the wrong panel or pair.
+pub fn decode_xterm_kv_row(key: &[u8], value: &[u8]) -> Result<XtermRow> {
+    let row: XtermRow = serde_json::from_slice(value).map_err(|error| {
+        loom_error(
+            CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
+            format!("decode panel-qualified xterm row: {error}"),
+        )
+    })?;
+    validate_panel_pair(&row.key)?;
+    if key != xterm_key(&row.key) {
+        return Err(CalyxError::aster_corrupt_shard(
+            "xterm CF key does not match the identity embedded in its row",
+        ));
+    }
+    Ok(row)
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AgreementEdge {
     pub a: PanelSlotId,
@@ -448,18 +469,7 @@ impl LoomStore {
     pub fn load_xterms_from_aster(router: &CfRouter, cache_capacity: usize) -> Result<Self> {
         let mut store = Self::new(cache_capacity);
         for entry in router.iter_cf(ColumnFamily::XTerm)? {
-            let row: XtermRow = serde_json::from_slice(&entry.value).map_err(|error| {
-                loom_error(
-                    CALYX_LOOM_XTERM_SCHEMA_UNSUPPORTED,
-                    format!("decode panel-qualified xterm row: {error}"),
-                )
-            })?;
-            validate_panel_pair(&row.key)?;
-            if entry.key != xterm_key(&row.key) {
-                return Err(CalyxError::aster_corrupt_shard(
-                    "xterm CF key does not match row key",
-                ));
-            }
+            let row = decode_xterm_kv_row(&entry.key, &entry.value)?;
             store.xterm_cf.insert(row.key, row);
         }
         Ok(store)

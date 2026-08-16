@@ -1149,6 +1149,17 @@ pub trait StorageBackend: Send + Sync {
         &self,
         params: SynapseCalyxWeaveParams,
     ) -> StorageResult<SynapseCalyxWeaveReport>;
+    fn publish_panel_input_snapshot(
+        &self,
+        panel_version: u32,
+        chunk_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputSnapshotReport>;
+    fn prune_panel_input_changes(
+        &self,
+        panel_version: u32,
+        through_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport>;
     fn commission_search_kernels(
         &self,
         params: &SynapseCalyxSearchCommissionParams,
@@ -6239,6 +6250,53 @@ impl StorageBackend for CalyxBackend {
                         &source,
                     )
                 })
+            },
+        )
+    }
+
+    fn publish_panel_input_snapshot(
+        &self,
+        panel_version: u32,
+        chunk_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputSnapshotReport> {
+        self.with_vault(
+            "calyx_loom",
+            "publish durable panel association-input snapshot",
+            true,
+            |vault| {
+                vault
+                    .publish_panel_input_snapshot(panel_version, chunk_rows)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_loom",
+                            "publish durable panel association-input snapshot",
+                            &source,
+                        )
+                    })
+            },
+        )
+    }
+
+    fn prune_panel_input_changes(
+        &self,
+        panel_version: u32,
+        through_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport> {
+        self.with_vault(
+            "calyx_loom",
+            "prune acknowledged panel association-input changes",
+            true,
+            |vault| {
+                vault
+                    .prune_panel_input_changes(panel_version, through_seq, max_rows)
+                    .map_err(|source| {
+                        calyx_write_failed(
+                            "calyx_loom",
+                            "prune acknowledged panel association-input changes",
+                            &source,
+                        )
+                    })
             },
         )
     }

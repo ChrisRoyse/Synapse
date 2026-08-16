@@ -1921,6 +1921,39 @@ impl Db {
         self.backend.weave_panel_intelligence(params)
     }
 
+    /// Emits a complete durable CDC bootstrap stream for one panel from an
+    /// exact authoritative Base snapshot, independent of search-delta history.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact storage/Calyx error when the snapshot walk or any
+    /// durable CDC publication/readback fails.
+    pub fn publish_panel_input_snapshot(
+        &self,
+        panel_version: u32,
+        chunk_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputSnapshotReport> {
+        self.backend
+            .publish_panel_input_snapshot(panel_version, chunk_rows)
+    }
+
+    /// Prunes a bounded page of durable association-input changes at or below
+    /// an already-persisted and independently reread consumer cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact storage/Calyx error when the acknowledgement boundary
+    /// is invalid or any physical tombstone/readback fails.
+    pub fn prune_panel_input_changes(
+        &self,
+        panel_version: u32,
+        through_seq: u64,
+        max_rows: usize,
+    ) -> StorageResult<synapse_calyx::SynapseCalyxPanelInputPruneReport> {
+        self.backend
+            .prune_panel_input_changes(panel_version, through_seq, max_rows)
+    }
+
     /// Runs the bounded production search-kernel commissioning suite and
     /// persists its byte-proven artifact to the native Calyx KV CF.
     ///

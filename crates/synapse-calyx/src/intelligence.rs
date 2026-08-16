@@ -26,6 +26,7 @@ use calyx_assay::{
     transfer_entropy_sweep, unmeasured_synergy_pair,
 };
 use calyx_aster::cf::ColumnFamily;
+use calyx_aster::mvcc::{is_tombstone_value, tombstone_value};
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
     AbsentReason, Anchor, AnchorKind, AnchorValue, Constellation, CxId,
@@ -40,8 +41,10 @@ use calyx_lodestar::{
     refine_kernel_with_recall_support, seal_completed_kernel_identity, write_kernel_artifact,
 };
 use calyx_loom::{
-    AbundanceReport, CeilingEstimate, LoomStore, MaterializationAction, MaterializationBatchReport,
-    NeffEstimate, StaticPairGainGate, cross_term_upper_bound, dda_signal_yield, plan_cross_terms,
+    AbundanceReport, CeilingEstimate, CrossTermKind, CrossTermValue, LoomStore,
+    MaterializationAction, MaterializationBatchReport, NeffEstimate, StaticPairGainGate,
+    agreement_weight, cross_term_upper_bound, dda_signal_yield, decode_xterm_kv_row,
+    plan_cross_terms,
 };
 use calyx_oracle::{AnnealConfig, DomainId, SlotSet, WardCompletionRegion};
 use calyx_paths::AssocGraph;
@@ -60,8 +63,6 @@ use crate::{
 pub const SYNAPSE_INTELLIGENCE_MAX_RECORDS: usize = 20_000;
 /// Default k for the between-record nearest-neighbor graph.
 pub const SYNAPSE_KNN_DEFAULT_K: usize = 8;
-/// Global cap on persisted between-record kNN edges per weave pass.
-pub const SYNAPSE_KNN_MAX_EDGES: usize = 200_000;
 /// Cap on the number of blind-spot lens pairs listed in one weave report.
 pub const SYNAPSE_WEAVE_MAX_BLIND_SPOTS: usize = 32;
 /// Structured code raised when an intelligence time window is empty/inverted.
@@ -109,7 +110,12 @@ pub const SYNAPSE_ENSEMBLE_ANCHOR_NOT_BINARY: &str = "SYNAPSE_CALYX_ENSEMBLE_ANC
 pub const SYNAPSE_ENSEMBLE_NO_COPRESENT_LENSES: &str = "SYNAPSE_CALYX_ENSEMBLE_NO_COPRESENT_LENSES";
 
 const GRAPH_AGREEMENT_PREFIX: &[u8; 5] = b"GAGR1";
-const GRAPH_KNN_PREFIX: &[u8; 5] = b"GKNN1";
+const GRAPH_AGREEMENT_MARKER_PREFIX: &[u8; 5] = b"GAGM2";
+const GRAPH_VIRTUAL_KNN_PREFIX: &[u8; 5] = b"GKNV1";
+const LOOM_XTERM_PREFIX: &[u8; 5] = b"CXTX2";
+const BETWEEN_RECORD_GRAPH_REFERENCE_SCHEMA: &str = "synapse_between_record_graph_reference/v1";
+const AGREEMENT_AGGREGATE_SCHEMA: &str = "synapse_agreement_aggregate/v2";
+const AGREEMENT_AGGREGATE_MARKER_SCHEMA: &str = "synapse_agreement_aggregate_marker/v2";
 
 /// Declares which physical math resource a weave is allowed to activate.
 ///
@@ -233,6 +239,32 @@ pub struct SynapseCalyxAgreementEdge {
     pub n: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct PersistedAgreementAggregate {
+    schema: String,
+    panel_version: u32,
+    slot_a: u16,
+    slot_b: u16,
+    sum_agreement: f64,
+    n: u64,
+    mean_agreement: f32,
+    agreement_weight: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PersistedAgreementAggregateMarker {
+    schema: String,
+    panel_version: u32,
+    source: String,
+}
+
+struct PreparedAgreementUpdate {
+    writes: Vec<SynapseCalyxCfWrite>,
+    edges: Vec<SynapseCalyxAgreementEdge>,
+    marker_key: Vec<u8>,
+    marker_value: Vec<u8>,
+}
+
 /// One directed nearest-neighbor edge in the between-record graph over a slot.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxBetweenRecordEdge {
@@ -241,6 +273,27 @@ pub struct SynapseCalyxBetweenRecordEdge {
     pub cx_b: String,
     pub score: f32,
     pub rank: usize,
+}
+
+/// Durable pointer to the complete on-demand between-record graph.
+///
+/// Persisting kNN edges for only the records changed in one interval creates a
+/// batch-local graph, not the panel graph: a new record can become the nearest
+/// neighbor of any existing record.  The exact maintained search generation
+/// plus its bounded current delta is already the complete graph substrate, so
+/// this row binds the association layer to that source instead of certifying a
+/// partial edge batch as global state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SynapseCalyxBetweenRecordGraphReference {
+    pub schema: String,
+    pub panel_version: u32,
+    pub search_manifest_sha256: String,
+    pub search_built_at_seq: u64,
+    pub panel_content_seq: u64,
+    pub delta_changed_keys: u64,
+    pub max_reconciled_delta_keys: u64,
+    pub default_k: usize,
+    pub source: String,
 }
 
 /// Serializable effective-rank estimate mirror of the Loom `NeffEstimate`.
@@ -319,6 +372,10 @@ pub struct SynapseCalyxWeaveReport {
     pub panel_version: u32,
     pub records_scanned: usize,
     pub records_woven: usize,
+    /// Changed identities physically absent from the current panel and whose
+    /// stale `XTerm` prefixes were tombstoned in this pass.
+    #[serde(default)]
+    pub records_removed: usize,
     /// Lenses the panel declares (#1939).
     pub n_lenses: usize,
     /// Lenses that reached the corpus and could be woven.
@@ -330,6 +387,10 @@ pub struct SynapseCalyxWeaveReport {
     pub cross_terms_materialized: usize,
     pub agreement_edges_persisted: usize,
     pub between_record_edges_persisted: usize,
+    /// SHA-256 of the physically reread Graph pointer selecting the complete
+    /// search-backed between-record graph.
+    #[serde(default)]
+    pub between_record_graph_reference_sha256: String,
     /// Valid exact measurements that have no direction and therefore cannot
     /// enter a cosine graph. They remain present for structured analysis and
     /// within-record cross-terms; only the geometric lane excludes them.
@@ -521,6 +582,7 @@ impl SynapseCalyxVault {
         let corpus_load_secs = corpus_load_started.elapsed().as_secs_f64();
         let records_scanned = corpus.records_scanned;
         let records_outside_window = corpus.records_outside_window;
+        let records_removed = corpus.removed_ids.len();
         let blind_spots = blind_spot_summary(&corpus);
 
         let mut store = LoomStore::new(params.cache_capacity.max(1));
@@ -638,6 +700,7 @@ impl SynapseCalyxVault {
             code = "SYNAPSE_CALYX_WEAVE_MATERIALIZATION_COMPLETED",
             panel_version = params.panel_version,
             records_woven,
+            records_removed,
             cross_terms_inserted = materialization.inserted,
             backend_dispatches = materialization.backend_dispatches,
             zero_norm_records = materialization.zero_norm_records,
@@ -664,13 +727,19 @@ impl SynapseCalyxVault {
             .collect::<Vec<_>>();
 
         let cross_terms_materialized = store.xterm_count();
-        let agreement_graph = store
-            .agreement_graph()
-            .map_err(|error| loom_math_error("aggregate agreement graph", &error))?;
         let xterm_rows = store
             .into_xterm_kv_rows()
             .map_err(|error| loom_math_error("encode XTerm rows", &error))?;
 
+        let mut agreement_delta = BTreeMap::<(u16, u16), (f64, i64)>::new();
+        for (key, value) in &xterm_rows {
+            accumulate_agreement_delta(params.panel_version, key, value, 1, &mut agreement_delta)?;
+        }
+
+        let desired_xterm_keys = xterm_rows
+            .iter()
+            .map(|(key, _)| key.clone())
+            .collect::<BTreeSet<_>>();
         let mut writes: Vec<SynapseCalyxCfWrite> = Vec::with_capacity(xterm_rows.len());
         for (key, value) in xterm_rows {
             writes.push(SynapseCalyxCfWrite {
@@ -679,45 +748,111 @@ impl SynapseCalyxVault {
                 value,
             });
         }
+        // A changed record can lose a lens pair or leave the panel entirely.
+        // Overwriting only its still-present keys would leave stale XTerms in
+        // the global agreement fold. Reconcile the complete physical prefix of
+        // every changed identity and tombstone anything absent from this
+        // interval's current-state materialization.
+        for cx_id in corpus
+            .records
+            .iter()
+            .map(|record| record.cx_id)
+            .chain(corpus.removed_ids.iter().copied())
+        {
+            let mut prefix = Vec::with_capacity(LOOM_XTERM_PREFIX.len() + 16);
+            prefix.extend_from_slice(LOOM_XTERM_PREFIX);
+            prefix.extend_from_slice(cx_id.as_bytes());
+            let existing = self
+                .vault
+                .scan_cf_range_latest(ColumnFamily::XTerm, &calyx_aster::cf::prefix_range(&prefix))
+                .map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        &format!("scan current XTerms for changed identity {cx_id}"),
+                        &error,
+                    )
+                })?;
+            for (key, value) in existing {
+                accumulate_agreement_delta(
+                    params.panel_version,
+                    &key,
+                    &value,
+                    -1,
+                    &mut agreement_delta,
+                )?;
+                if !desired_xterm_keys.contains(&key) {
+                    writes.push(SynapseCalyxCfWrite {
+                        cf: ColumnFamily::XTerm,
+                        key,
+                        value: tombstone_value(),
+                    });
+                }
+            }
+        }
 
-        let mut agreement_edges = Vec::with_capacity(agreement_graph.len());
-        for edge in &agreement_graph {
-            let slot_a = edge.a.slot_id().get();
-            let slot_b = edge.b.slot_id().get();
-            let out = SynapseCalyxAgreementEdge {
-                panel_version: params.panel_version,
-                slot_a,
-                slot_b,
-                mean_agreement: edge.mean_agreement,
-                agreement_weight: edge.agreement_weight,
-                n: edge.n,
-            };
-            writes.push(SynapseCalyxCfWrite {
-                cf: ColumnFamily::Graph,
-                key: agreement_edge_key(params.panel_version, slot_a, slot_b),
-                value: encode_json(&out)?,
-            });
-            agreement_edges.push(out);
+        let incremental_agreement =
+            self.prepare_incremental_agreement_update(params.panel_version, &agreement_delta)?;
+        if let Some(prepared) = &incremental_agreement {
+            writes.extend(prepared.writes.iter().cloned());
         }
 
         let knn_started = std::time::Instant::now();
-        let (between_record_edges, knn_zero_norm_exclusions) =
-            Self::build_between_record_edges(backend, &corpus, params.knn_k)?;
-        let between_record_edges_persisted = between_record_edges.len();
-        for edge in between_record_edges {
-            writes.push(SynapseCalyxCfWrite {
-                cf: ColumnFamily::Graph,
-                key: between_record_edge_key(&edge),
-                value: encode_json(&edge)?,
-            });
-        }
+        let graph_reference =
+            self.between_record_graph_reference(params.panel_version, params.knn_k)?;
+        let graph_reference_key = between_record_graph_reference_key(params.panel_version);
+        let graph_reference_bytes = encode_json(&graph_reference)?;
+        let graph_reference_sha256 = hex_sha256(&graph_reference_bytes);
+        writes.push(SynapseCalyxCfWrite {
+            cf: ColumnFamily::Graph,
+            key: graph_reference_key.clone(),
+            value: graph_reference_bytes.clone(),
+        });
+        let between_record_edges_persisted = 0;
+        let knn_zero_norm_exclusions = Vec::new();
         let knn_secs = knn_started.elapsed().as_secs_f64();
 
         let persist_started = std::time::Instant::now();
-        if !writes.is_empty() {
-            self.write_cf_batch(writes)?;
-            self.flush()?;
+        self.write_cf_batch(writes)?;
+        self.flush()?;
+        let physical_graph_reference = self
+            .read_cf_latest(ColumnFamily::Graph, &graph_reference_key)?
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_BETWEEN_RECORD_GRAPH_REFERENCE_MISSING",
+                    format!(
+                        "panel {} between-record graph pointer write returned but independent Graph readback found no row",
+                        params.panel_version
+                    ),
+                    "preserve the Graph CF and repair the failed pointer publication before advancing the weave cursor",
+                )
+            })?;
+        if physical_graph_reference != graph_reference_bytes {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BETWEEN_RECORD_GRAPH_REFERENCE_MISMATCH",
+                format!(
+                    "panel {} between-record graph pointer differs after physical readback: expected_sha256={} actual_sha256={}",
+                    params.panel_version,
+                    graph_reference_sha256,
+                    hex_sha256(&physical_graph_reference)
+                ),
+                "preserve both byte strings and repair the Graph publication path; the weave cursor was not advanced",
+            ));
         }
+        // The v2 accumulator updates in the same commit as the XTerms whose old
+        // contributions it subtracts and whose new contributions it adds. A
+        // pre-v2 vault has no marker, so its first pass performs one full
+        // physical fold after publishing XTerms; a crash before that marker is
+        // harmless because the next pass repeats the full fold.
+        let agreement_edges = if let Some(prepared) = incremental_agreement {
+            self.verify_agreement_update(params.panel_version, &prepared.writes)?;
+            self.verify_agreement_marker(
+                params.panel_version,
+                &prepared.marker_key,
+                &prepared.marker_value,
+            )?;
+            prepared.edges
+        } else {
+            self.rebuild_persisted_agreement_graph(params.panel_version)?
+        };
         let persist_secs = persist_started.elapsed().as_secs_f64();
 
         // #2114: still a physical readback of what this weave persisted, but no
@@ -750,9 +885,11 @@ impl SynapseCalyxVault {
             panel_version = params.panel_version,
             records_scanned,
             records_woven,
+            records_removed,
             backend_dispatches = materialization.backend_dispatches,
             cross_terms_materialized,
             between_record_edges_persisted,
+            between_record_graph_reference_sha256 = %graph_reference_sha256,
             corpus_load_secs,
             plan_secs,
             materialize_secs,
@@ -786,12 +923,14 @@ impl SynapseCalyxVault {
             panel_version: params.panel_version,
             records_scanned,
             records_woven,
+            records_removed,
             n_lenses: corpus.n_lenses(),
             measurable_lenses: lens_ids.len(),
             slot_states: corpus.slot_states(),
             cross_terms_materialized,
             agreement_edges_persisted: agreement_edges.len(),
             between_record_edges_persisted,
+            between_record_graph_reference_sha256: graph_reference_sha256,
             knn_zero_norm_exclusions,
             agreement_zero_norm_skips,
             agreement_zero_norm_records,
@@ -1088,15 +1227,17 @@ impl SynapseCalyxVault {
         self.load_panel_dense_corpus_in_window(panel_version, max_records, TimeWindowNs::default())
     }
 
-    /// Loads exactly the panel Base identities changed in
+    /// Loads exactly the panel association-input identities changed in
     /// `(after_base_seq, through_base_seq]` and hydrates them from the same
     /// pinned historical view.
     ///
-    /// The changed-key journal is the access path; the panel membership and
-    /// global Base families are never walked.  The complete identity set is
-    /// counted before any hydration or derived write.  An over-cap interval
-    /// therefore refuses with a split point still available to its caller and
-    /// cannot publish a partial association layer.
+    /// The durable, commit-atomic panel change log is the access path; the
+    /// process-local MVCC changed-key journal is deliberately not.  That
+    /// distinction lets a cursor survive both snapshot-delta rebases and
+    /// process recovery.  Base changes and quantized-slot-only changes are both
+    /// represented, and a final tombstone removes the identity from this pass.
+    /// An over-cap interval refuses before hydration or derived publication so
+    /// its caller can bisect without ever accepting a partial identity set.
     fn load_panel_dense_corpus_delta(
         &self,
         panel_version: u32,
@@ -1114,49 +1255,46 @@ impl SynapseCalyxVault {
             ));
         }
         let mut records = Vec::new();
+        let mut removed_ids = Vec::new();
         let mut panel_slots = BTreeMap::new();
         let mut sparse_support = BTreeMap::new();
-        self.with_read_snapshot_at(
-            through_base_seq,
+        self.with_panel_read_snapshot(
+            panel_version,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
             |snapshot| {
                 let scoped = self
                     .vault
-                    .changed_base_keys_after_snapshot_for_panel(
+                    .panel_input_changes_snapshot(
                         snapshot,
                         after_base_seq,
+                        through_base_seq,
                         panel_version,
+                        max_records,
                     )
                     .map_err(|error| {
                         SynapseCalyxError::from_calyx(
                             &format!(
-                                "enumerate panel {panel_version} Base changes in ({after_base_seq},{through_base_seq}]"
+                                "enumerate durable panel {panel_version} association-input changes in ({after_base_seq},{through_base_seq}]"
                             ),
                             &error,
                         )
                     })?;
-                if scoped.keys.len() > max_records {
+                if scoped.unique_limit_exceeded {
                     return Err(SynapseCalyxError::new(
                         SYNAPSE_INTELLIGENCE_DELTA_RECORD_LIMIT_EXCEEDED,
                         format!(
-                            "panel {panel_version} has {} changed Base identities in ({after_base_seq},{through_base_seq}], above max_records={max_records}; scanned_journal_keys={} other_panels={} unattributed={}",
-                            scoped.keys.len(), scoped.scanned, scoped.other_panels, scoped.unattributed
+                            "panel {panel_version} has more than {max_records} changed association-input identities in ({after_base_seq},{through_base_seq}]; durable_events_scanned={}",
+                            scoped.events_scanned
                         ),
                         "bisect the sequence interval and retry both contiguous halves; if one commit alone exceeds the bound, increase the cap only after measuring its memory and latency budget",
                     ));
                 }
-                for key in scoped.keys {
-                    let bytes: [u8; 16] = key.as_slice().try_into().map_err(|_| {
-                        SynapseCalyxError::new(
-                            "SYNAPSE_CALYX_CHANGED_BASE_KEY_INVALID",
-                            format!(
-                                "panel {panel_version} changed Base key at snapshot {} has {} bytes, expected 16",
-                                snapshot.seq(), key.len()
-                            ),
-                            "preserve the vault and repair the malformed Base key before retrying the delta weave",
-                        )
-                    })?;
-                    let cx_id = CxId::from_bytes(bytes);
+                for change in scoped.changes {
+                    if !change.present {
+                        removed_ids.push(change.cx_id);
+                        continue;
+                    }
+                    let cx_id = change.cx_id;
                     let _base = self.verified_panel_base_row_at_snapshot(
                         snapshot,
                         panel_version,
@@ -1174,7 +1312,10 @@ impl SynapseCalyxVault {
             },
         )?;
         let records_scanned = records.len();
-        finalize_dense_corpus(records, records_scanned, 0, panel_slots, &sparse_support)
+        let mut corpus =
+            finalize_dense_corpus(records, records_scanned, 0, panel_slots, &sparse_support)?;
+        corpus.removed_ids = removed_ids;
+        Ok(corpus)
     }
 
     /// Reads a bounded `Base` prefix and returns the panel corpus.
@@ -1281,97 +1422,423 @@ impl SynapseCalyxVault {
         )
     }
 
-    /// Builds the between-record nearest-neighbor graph: for every dense slot
-    /// with at least two records of a uniform dimension, a bounded cosine kNN
-    /// graph over the records that carry that slot.
-    fn build_between_record_edges(
-        backend: Option<&dyn Backend>,
-        corpus: &DenseCorpus,
-        knn_k: usize,
-    ) -> Result<
-        (
-            Vec<SynapseCalyxBetweenRecordEdge>,
-            Vec<SynapseCalyxKnnZeroNormExclusion>,
-        ),
-        SynapseCalyxError,
-    > {
-        let knn_k = knn_k.clamp(1, 64);
-        let mut by_slot: BTreeMap<SlotId, Vec<(CxId, &Vec<f32>)>> = BTreeMap::new();
-        for record in &corpus.records {
-            for (slot, vector) in &record.slots {
-                by_slot
-                    .entry(*slot)
-                    .or_default()
-                    .push((record.cx_id, vector));
+    fn between_record_graph_reference(
+        &self,
+        panel_version: u32,
+        default_k: usize,
+    ) -> Result<SynapseCalyxBetweenRecordGraphReference, SynapseCalyxError> {
+        if !(1..=64).contains(&default_k) {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BETWEEN_RECORD_GRAPH_K_INVALID",
+                format!(
+                    "panel {panel_version} between-record graph default_k={default_k} is outside 1..=64"
+                ),
+                "supply an explicit default neighbor count inside the reported inclusive bound",
+            ));
+        }
+        let status = self.search_generation_status_for_panel(panel_version, true)?;
+        if status.state != "built" {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_BETWEEN_RECORD_GRAPH_SOURCE_UNREADY",
+                format!(
+                    "panel {panel_version} complete between-record graph requires a queryable persisted search generation; state={} delta_changed_keys={:?} max_reconciled_delta_keys={} remediation={}",
+                    status.state,
+                    status.delta_changed_keys,
+                    status.max_reconciled_delta_keys,
+                    status.remediation
+                ),
+                "rebuild and independently verify the named panel search generation, then retry the association weave",
+            ));
+        }
+        Ok(SynapseCalyxBetweenRecordGraphReference {
+            schema: BETWEEN_RECORD_GRAPH_REFERENCE_SCHEMA.to_owned(),
+            panel_version,
+            search_manifest_sha256: status
+                .manifest_sha256
+                .ok_or_else(|| missing_graph_source_field(panel_version, "manifest_sha256"))?,
+            search_built_at_seq: status
+                .built_at_seq
+                .ok_or_else(|| missing_graph_source_field(panel_version, "built_at_seq"))?,
+            panel_content_seq: status
+                .panel_content_seq
+                .ok_or_else(|| missing_graph_source_field(panel_version, "panel_content_seq"))?,
+            delta_changed_keys: status
+                .delta_changed_keys
+                .ok_or_else(|| missing_graph_source_field(panel_version, "delta_changed_keys"))?,
+            max_reconciled_delta_keys: status.max_reconciled_delta_keys,
+            default_k,
+            source: "persisted_search_generation_plus_exact_panel_delta".to_owned(),
+        })
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "loading, validating, applying, and preparing one atomic aggregate delta is one fail-closed state transition"
+    )]
+    fn prepare_incremental_agreement_update(
+        &self,
+        panel_version: u32,
+        delta: &BTreeMap<(u16, u16), (f64, i64)>,
+    ) -> Result<Option<PreparedAgreementUpdate>, SynapseCalyxError> {
+        let marker_key = agreement_marker_key(panel_version);
+        let Some(marker_value) = self.read_cf_latest(ColumnFamily::Graph, &marker_key)? else {
+            return Ok(None);
+        };
+        let marker: PersistedAgreementAggregateMarker =
+            serde_json::from_slice(&marker_value).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_MARKER_DECODE_FAILED",
+                    format!(
+                        "panel {panel_version} agreement marker is not valid v2 JSON: {error}"
+                    ),
+                    "preserve the Graph row and rebuild the complete agreement aggregate from physical XTerms",
+                )
+            })?;
+        if marker.schema != AGREEMENT_AGGREGATE_MARKER_SCHEMA
+            || marker.panel_version != panel_version
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_AGREEMENT_MARKER_SCOPE_MISMATCH",
+                format!(
+                    "panel {panel_version} agreement marker declares schema={} panel={}",
+                    marker.schema, marker.panel_version
+                ),
+                "preserve the Graph row and rebuild the complete agreement aggregate; never reinterpret a mismatched generation",
+            ));
+        }
+
+        let mut prefix = Vec::with_capacity(GRAPH_AGREEMENT_PREFIX.len() + 4);
+        prefix.extend_from_slice(GRAPH_AGREEMENT_PREFIX);
+        prefix.extend_from_slice(&panel_version.to_be_bytes());
+        let rows = self
+            .vault
+            .scan_cf_range_latest(ColumnFamily::Graph, &calyx_aster::cf::prefix_range(&prefix))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "load current panel agreement aggregates for atomic delta",
+                    &error,
+                )
+            })?;
+        let mut aggregates = BTreeMap::<(u16, u16), PersistedAgreementAggregate>::new();
+        for (key, value) in rows {
+            let aggregate = decode_persisted_agreement(panel_version, &key, &value)?;
+            if aggregates
+                .insert((aggregate.slot_a, aggregate.slot_b), aggregate)
+                .is_some()
+            {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_DUPLICATE",
+                    format!("panel {panel_version} stores duplicate aggregate slot-pair rows"),
+                    "preserve the Graph CF and repair the duplicate physical aggregate identity",
+                ));
             }
         }
-        let mut edges = Vec::new();
-        let mut zero_norm_exclusions = Vec::new();
-        for (slot, members) in by_slot {
-            if edges.len() >= SYNAPSE_KNN_MAX_EDGES {
-                break;
+
+        let mut writes = Vec::with_capacity(delta.len() + 1);
+        for (&pair, &(sum_delta, count_delta)) in delta {
+            let (old_sum, old_n) = aggregates
+                .get(&pair)
+                .map_or((0.0, 0_u64), |row| (row.sum_agreement, row.n));
+            let next_n = i128::from(old_n) + i128::from(count_delta);
+            if next_n < 0 || next_n > i128::from(u64::MAX) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_COUNT_INVALID",
+                    format!(
+                        "panel {panel_version} pair {}:{} old_n={old_n} delta_n={count_delta} produces {next_n}",
+                        pair.0, pair.1
+                    ),
+                    "preserve the XTerm/Graph rows and rebuild the complete aggregate before advancing the cursor",
+                ));
             }
-            // Only records that share one dimension can be compared by cosine.
-            let mut by_dim: BTreeMap<usize, Vec<(CxId, &Vec<f32>)>> = BTreeMap::new();
-            for (cx, vector) in members {
-                by_dim.entry(vector.len()).or_default().push((cx, vector));
+            let next_sum = old_sum + sum_delta;
+            let key = agreement_edge_key(panel_version, pair.0, pair.1);
+            if next_n == 0 {
+                aggregates.remove(&pair);
+                writes.push(SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Graph,
+                    key,
+                    value: tombstone_value(),
+                });
+                continue;
             }
-            for (dim, group) in by_dim {
-                if dim == 0 {
-                    continue;
-                }
-                let mut geometric = Vec::with_capacity(group.len());
-                let mut excluded = Vec::new();
-                for (cx_id, vector) in group {
-                    let norm_squared = vector.iter().try_fold(0.0f64, |sum, value| {
-                        if !value.is_finite() {
-                            return Err(SynapseCalyxError::new(
-                                "SYNAPSE_CALYX_KNN_VECTOR_NON_FINITE",
-                                format!(
-                                    "panel slot {} record {cx_id} contains a non-finite value in its {dim}-dimensional between-record kNN vector",
-                                    slot.get()
-                                ),
-                                "repair or re-measure the named physical slot row; non-finite measurements cannot enter any association calculation",
-                            ));
-                        }
-                        let value = f64::from(*value);
-                        Ok(value.mul_add(value, sum))
-                    })?;
-                    if norm_squared == 0.0 {
-                        excluded.push(cx_id);
-                    } else {
-                        geometric.push((cx_id, vector));
-                    }
-                }
-                if !excluded.is_empty() {
-                    zero_norm_exclusions.push(SynapseCalyxKnnZeroNormExclusion {
-                        slot: slot.get(),
-                        records: excluded.len(),
-                        sample_cx_ids: excluded.iter().take(8).map(ToString::to_string).collect(),
-                    });
-                }
-                if geometric.len() < 2 {
-                    continue;
-                }
-                let backend = backend.ok_or_else(|| {
-                    SynapseCalyxError::new(
-                        "SYNAPSE_CALYX_WEAVE_MATH_BACKEND_MISSING",
+            if !next_sum.is_finite() {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_NON_FINITE",
+                    format!(
+                        "panel {panel_version} pair {}:{} delta produced non-finite sum {next_sum}",
+                        pair.0, pair.1
+                    ),
+                    "repair the named physical XTerms and rebuild the aggregate",
+                ));
+            }
+            let next_n = u64::try_from(next_n).map_err(|error| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_COUNT_RANGE",
+                    format!(
+                        "panel {panel_version} pair {}:{} count conversion failed: {error}",
+                        pair.0, pair.1
+                    ),
+                    "repair the aggregate count before publication",
+                )
+            })?;
+            let aggregate = persisted_agreement(panel_version, pair, next_sum, next_n)?;
+            writes.push(SynapseCalyxCfWrite {
+                cf: ColumnFamily::Graph,
+                key,
+                value: encode_json(&aggregate)?,
+            });
+            aggregates.insert(pair, aggregate);
+        }
+        writes.push(SynapseCalyxCfWrite {
+            cf: ColumnFamily::Graph,
+            key: marker_key.clone(),
+            value: marker_value.clone(),
+        });
+        let edges = aggregates
+            .values()
+            .map(public_agreement_edge)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Some(PreparedAgreementUpdate {
+            writes,
+            edges,
+            marker_key,
+            marker_value,
+        }))
+    }
+
+    fn verify_agreement_marker(
+        &self,
+        panel_version: u32,
+        key: &[u8],
+        expected: &[u8],
+    ) -> Result<(), SynapseCalyxError> {
+        let actual = self
+            .read_cf_latest(ColumnFamily::Graph, key)?
+            .ok_or_else(|| {
+                SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_MARKER_READBACK_MISSING",
+                    format!(
+                        "panel {panel_version} agreement marker is absent after its atomic XTerm/Graph commit"
+                    ),
+                    "preserve the WAL and repair the failed aggregate publication before advancing the weave cursor",
+                )
+            })?;
+        if actual != expected {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_AGREEMENT_MARKER_READBACK_MISMATCH",
+                format!(
+                    "panel {panel_version} agreement marker differs after publication: expected_sha256={} actual_sha256={}",
+                    hex_sha256(expected),
+                    hex_sha256(&actual)
+                ),
+                "preserve both Graph values and repair the atomic aggregate publication before advancing the weave cursor",
+            ));
+        }
+        Ok(())
+    }
+
+    fn verify_agreement_update(
+        &self,
+        panel_version: u32,
+        writes: &[SynapseCalyxCfWrite],
+    ) -> Result<(), SynapseCalyxError> {
+        for write in writes {
+            let actual = self.read_cf_latest(ColumnFamily::Graph, &write.key)?;
+            if is_tombstone_value(&write.value) {
+                if actual.is_some() {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_TOMBSTONE_READBACK_PRESENT",
                         format!(
-                            "slot {} dimension {dim} has {} kNN candidates but the weave owns no math backend",
-                            slot.get(),
-                            geometric.len()
+                            "panel {panel_version} aggregate key_sha256={} remains visible after its atomic tombstone",
+                            hex_sha256(&write.key)
                         ),
-                        "repair the declared execution-class backend initialization; Synapse refuses to omit between-record association math",
+                        "preserve the Graph CF and repair the failed tombstone before advancing the weave cursor",
+                    ));
+                }
+            } else if actual.as_deref() != Some(write.value.as_slice()) {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_UPDATE_READBACK_MISMATCH",
+                    format!(
+                        "panel {panel_version} aggregate key_sha256={} differs after atomic publication: expected_sha256={} actual_sha256={}",
+                        hex_sha256(&write.key),
+                        hex_sha256(&write.value),
+                        actual
+                            .as_deref()
+                            .map_or_else(|| "absent".to_owned(), hex_sha256)
+                    ),
+                    "preserve the Graph/WAL bytes and repair the failed atomic aggregate publication before advancing the weave cursor",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-folds every physical per-record agreement `XTerm` for one panel.
+    /// A delta-batch mean is never allowed to overwrite this global mean.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the one-time migration fold and its physical replacement/readback form one indivisible publication contract"
+    )]
+    fn rebuild_persisted_agreement_graph(
+        &self,
+        panel_version: u32,
+    ) -> Result<Vec<SynapseCalyxAgreementEdge>, SynapseCalyxError> {
+        let mut aggregate = BTreeMap::<(u16, u16), (f64, u64)>::new();
+        self.walk_cf_latest(
+            ColumnFamily::XTerm,
+            crate::SYNAPSE_CALYX_BASE_CF_WALK_PAGE_ROWS,
+            |key, value| {
+                let row = decode_xterm_kv_row(key, value).map_err(|error| {
+                    SynapseCalyxError::from_calyx(
+                        "decode physical XTerm while rebuilding the panel agreement graph",
+                        &error,
                     )
                 })?;
-                append_slot_knn_edges(backend, slot, dim, &geometric, knn_k, &mut edges)?;
-                if edges.len() >= SYNAPSE_KNN_MAX_EDGES {
-                    break;
+                if row.key.a.panel_version() != panel_version {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
                 }
+                if row.key.b.panel_version() != panel_version {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_GRAPH_CROSS_PANEL_XTERM",
+                        format!(
+                            "XTerm {}:{} -> {}:{} crosses panel {panel_version}",
+                            row.key.a.panel_version(),
+                            row.key.a.slot_id().get(),
+                            row.key.b.panel_version(),
+                            row.key.b.slot_id().get()
+                        ),
+                        "preserve and repair the cross-panel XTerm before rebuilding any aggregate edge",
+                    ));
+                }
+                if row.key.kind != CrossTermKind::Agreement {
+                    return Ok(crate::SynapseCalyxWalkStep::Continue);
+                }
+                let CrossTermValue::Scalar(value) = row.value else {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_GRAPH_VALUE_MISMATCH",
+                        format!(
+                            "panel {panel_version} agreement XTerm pair {}:{} is not scalar",
+                            row.key.a.slot_id().get(),
+                            row.key.b.slot_id().get()
+                        ),
+                        "repair or remeasure the typed XTerm before aggregating it",
+                    ));
+                };
+                if !value.is_finite() {
+                    return Err(SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_GRAPH_NON_FINITE",
+                        format!(
+                            "panel {panel_version} XTerm pair {}:{} stores non-finite agreement {value}",
+                            row.key.a.slot_id().get(),
+                            row.key.b.slot_id().get()
+                        ),
+                        "repair or remeasure the named XTerm before aggregating it",
+                    ));
+                }
+                let entry = aggregate
+                    .entry((row.key.a.slot_id().get(), row.key.b.slot_id().get()))
+                    .or_default();
+                entry.0 += f64::from(value);
+                entry.1 = entry.1.checked_add(1).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_GRAPH_COUNT_OVERFLOW",
+                        format!(
+                            "panel {panel_version} agreement count overflowed u64 for pair {}:{}",
+                            row.key.a.slot_id().get(),
+                            row.key.b.slot_id().get()
+                        ),
+                        "inspect the XTerm cardinality and repair the impossible aggregate size",
+                    )
+                })?;
+                Ok(crate::SynapseCalyxWalkStep::Continue)
+            },
+        )?;
+
+        let mut edges = Vec::with_capacity(aggregate.len());
+        let mut desired = BTreeMap::<Vec<u8>, Vec<u8>>::new();
+        for ((slot_a, slot_b), (sum, n)) in aggregate {
+            let persisted = persisted_agreement(panel_version, (slot_a, slot_b), sum, n)?;
+            let edge = public_agreement_edge(&persisted)?;
+            desired.insert(
+                agreement_edge_key(panel_version, slot_a, slot_b),
+                encode_json(&persisted)?,
+            );
+            edges.push(edge);
+        }
+
+        let marker_key = agreement_marker_key(panel_version);
+        let marker_value = encode_json(&PersistedAgreementAggregateMarker {
+            schema: AGREEMENT_AGGREGATE_MARKER_SCHEMA.to_owned(),
+            panel_version,
+            source: "physical_xterm_full_fold_then_commit_atomic_deltas".to_owned(),
+        })?;
+
+        let mut prefix = Vec::with_capacity(GRAPH_AGREEMENT_PREFIX.len() + 4);
+        prefix.extend_from_slice(GRAPH_AGREEMENT_PREFIX);
+        prefix.extend_from_slice(&panel_version.to_be_bytes());
+        let existing = self
+            .vault
+            .scan_cf_range_latest(ColumnFamily::Graph, &calyx_aster::cf::prefix_range(&prefix))
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    "scan current panel agreement edges before replacement",
+                    &error,
+                )
+            })?;
+        let mut writes = desired
+            .iter()
+            .map(|(key, value)| SynapseCalyxCfWrite {
+                cf: ColumnFamily::Graph,
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+        for (key, _) in existing {
+            if !desired.contains_key(&key) {
+                writes.push(SynapseCalyxCfWrite {
+                    cf: ColumnFamily::Graph,
+                    key,
+                    value: tombstone_value(),
+                });
             }
         }
-        edges.truncate(SYNAPSE_KNN_MAX_EDGES);
-        Ok((edges, zero_norm_exclusions))
+        writes.push(SynapseCalyxCfWrite {
+            cf: ColumnFamily::Graph,
+            key: marker_key.clone(),
+            value: marker_value.clone(),
+        });
+        if !writes.is_empty() {
+            self.write_cf_batch(writes)?;
+            self.flush()?;
+        }
+        for (key, expected) in &desired {
+            let actual = self
+                .read_cf_latest(ColumnFamily::Graph, key)?
+                .ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_AGREEMENT_GRAPH_READBACK_MISSING",
+                        format!(
+                            "panel {panel_version} aggregate edge key_sha256={} was absent after publication",
+                            hex_sha256(key)
+                        ),
+                        "preserve the Graph CF and repair the failed aggregate publication",
+                    )
+                })?;
+            if &actual != expected {
+                return Err(SynapseCalyxError::new(
+                    "SYNAPSE_CALYX_AGREEMENT_GRAPH_READBACK_MISMATCH",
+                    format!(
+                        "panel {panel_version} aggregate edge key_sha256={} readback differs: expected_sha256={} actual_sha256={}",
+                        hex_sha256(key),
+                        hex_sha256(expected),
+                        hex_sha256(&actual)
+                    ),
+                    "preserve both Graph values and repair the publication path before advancing the weave cursor",
+                ));
+            }
+        }
+        self.verify_agreement_marker(panel_version, &marker_key, &marker_value)?;
+        Ok(edges)
     }
 }
 
@@ -1559,6 +2026,7 @@ fn finalize_dense_corpus(
     }
     Ok(DenseCorpus {
         records,
+        removed_ids: Vec::new(),
         records_scanned,
         records_outside_window,
         panel_slots,
@@ -1569,6 +2037,9 @@ fn finalize_dense_corpus(
 
 struct DenseCorpus {
     records: Vec<DenseRecord>,
+    /// Changed identities absent from this panel at the current pinned view.
+    /// Their persisted `XTerms` are tombstoned before the consumer advances.
+    removed_ids: Vec<CxId>,
     records_scanned: usize,
     /// Panel rows excluded by the `created_at` window.
     records_outside_window: usize,
@@ -1816,51 +2287,6 @@ impl ContentSlotRejects {
     }
 }
 
-fn append_slot_knn_edges(
-    backend: &dyn Backend,
-    slot: SlotId,
-    dim: usize,
-    group: &[(CxId, &Vec<f32>)],
-    knn_k: usize,
-    edges: &mut Vec<SynapseCalyxBetweenRecordEdge>,
-) -> Result<(), SynapseCalyxError> {
-    let count = group.len();
-    let mut flat = Vec::with_capacity(count * dim);
-    for (_, vector) in group {
-        flat.extend_from_slice(vector);
-    }
-    // Ask for k+1 neighbors because the nearest neighbor of any record is
-    // itself; the self match is dropped below.
-    let k = (knn_k + 1).min(count);
-    let batch = backend
-        .knn(&flat, &flat, count, dim, k, KnnMetric::Cosine)
-        .map_err(|error| forge_math_error("between-record kNN", &error))?;
-    for (query_index, (query_cx, _)) in group.iter().enumerate() {
-        let base = query_index * batch.k;
-        let mut rank = 0usize;
-        for offset in 0..batch.k {
-            let candidate_index = batch.indices[base + offset];
-            if candidate_index == query_index {
-                continue;
-            }
-            let score = batch.scores[base + offset];
-            let (candidate_cx, _) = group[candidate_index];
-            rank += 1;
-            edges.push(SynapseCalyxBetweenRecordEdge {
-                slot: slot.get(),
-                cx_a: query_cx.to_string(),
-                cx_b: candidate_cx.to_string(),
-                score,
-                rank,
-            });
-            if rank >= knn_k || edges.len() >= SYNAPSE_KNN_MAX_EDGES {
-                break;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// The DPI ceiling proven by a completed bits pass, with the anchor it was
 /// measured against.
 struct MeasuredCeiling {
@@ -1979,15 +2405,236 @@ fn agreement_edge_key(panel_version: u32, slot_a: u16, slot_b: u16) -> Vec<u8> {
     key
 }
 
-fn between_record_edge_key(edge: &SynapseCalyxBetweenRecordEdge) -> Vec<u8> {
-    let mut key =
-        Vec::with_capacity(GRAPH_KNN_PREFIX.len() + 3 + edge.cx_a.len() + edge.cx_b.len());
-    key.extend_from_slice(GRAPH_KNN_PREFIX);
-    key.extend_from_slice(&edge.slot.to_be_bytes());
-    key.extend_from_slice(edge.cx_a.as_bytes());
-    key.push(0x00);
-    key.extend_from_slice(edge.cx_b.as_bytes());
+fn agreement_marker_key(panel_version: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(GRAPH_AGREEMENT_MARKER_PREFIX.len() + 4);
+    key.extend_from_slice(GRAPH_AGREEMENT_MARKER_PREFIX);
+    key.extend_from_slice(&panel_version.to_be_bytes());
     key
+}
+
+fn persisted_agreement(
+    panel_version: u32,
+    pair: (u16, u16),
+    sum_agreement: f64,
+    n: u64,
+) -> Result<PersistedAgreementAggregate, SynapseCalyxError> {
+    if n == 0 || !sum_agreement.is_finite() {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_INVALID",
+            format!(
+                "panel {panel_version} pair {}:{} cannot persist sum={sum_agreement} n={n}",
+                pair.0, pair.1
+            ),
+            "repair the named physical XTerms before publishing the aggregate",
+        ));
+    }
+    let n_f64 = n.to_f64().ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_COUNT_RANGE",
+            format!(
+                "panel {panel_version} pair {}:{} count {n} cannot be represented for mean calculation",
+                pair.0, pair.1
+            ),
+            "repair the aggregate count before publication",
+        )
+    })?;
+    let mean64 = sum_agreement / n_f64;
+    let mean_agreement = mean64.to_f32().ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_MEAN_RANGE",
+            format!(
+                "panel {panel_version} pair {}:{} mean {mean64} cannot be represented as f32",
+                pair.0, pair.1
+            ),
+            "repair the named physical XTerms before publishing the aggregate",
+        )
+    })?;
+    Ok(PersistedAgreementAggregate {
+        schema: AGREEMENT_AGGREGATE_SCHEMA.to_owned(),
+        panel_version,
+        slot_a: pair.0,
+        slot_b: pair.1,
+        sum_agreement,
+        n,
+        mean_agreement,
+        agreement_weight: agreement_weight(mean_agreement)
+            .map_err(|error| loom_math_error("weight global agreement edge", &error))?,
+    })
+}
+
+fn public_agreement_edge(
+    aggregate: &PersistedAgreementAggregate,
+) -> Result<SynapseCalyxAgreementEdge, SynapseCalyxError> {
+    Ok(SynapseCalyxAgreementEdge {
+        panel_version: aggregate.panel_version,
+        slot_a: aggregate.slot_a,
+        slot_b: aggregate.slot_b,
+        mean_agreement: aggregate.mean_agreement,
+        agreement_weight: aggregate.agreement_weight,
+        n: usize::try_from(aggregate.n).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_AGREEMENT_GRAPH_COUNT_RANGE",
+                format!(
+                    "panel {} pair {}:{} count {} does not fit usize: {error}",
+                    aggregate.panel_version, aggregate.slot_a, aggregate.slot_b, aggregate.n
+                ),
+                "repair the aggregate count before publishing the edge",
+            )
+        })?,
+    })
+}
+
+fn decode_persisted_agreement(
+    panel_version: u32,
+    key: &[u8],
+    value: &[u8],
+) -> Result<PersistedAgreementAggregate, SynapseCalyxError> {
+    let aggregate: PersistedAgreementAggregate =
+        serde_json::from_slice(value).map_err(|error| {
+            SynapseCalyxError::new(
+                "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_DECODE_FAILED",
+                format!(
+                    "panel {panel_version} agreement aggregate key_sha256={} is not valid v2 JSON: {error}",
+                    hex_sha256(key)
+                ),
+                "preserve the Graph row and rebuild the aggregate from physical XTerms",
+            )
+        })?;
+    let expected_key = agreement_edge_key(panel_version, aggregate.slot_a, aggregate.slot_b);
+    if aggregate.schema != AGREEMENT_AGGREGATE_SCHEMA
+        || aggregate.panel_version != panel_version
+        || expected_key != key
+        || aggregate.n == 0
+        || !aggregate.sum_agreement.is_finite()
+        || !aggregate.mean_agreement.is_finite()
+        || !aggregate.agreement_weight.is_finite()
+    {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_CONTRACT_MISMATCH",
+            format!(
+                "panel {panel_version} aggregate key_sha256={} declares schema={} panel={} pair={}:{} sum={} n={} mean={} weight={}",
+                hex_sha256(key),
+                aggregate.schema,
+                aggregate.panel_version,
+                aggregate.slot_a,
+                aggregate.slot_b,
+                aggregate.sum_agreement,
+                aggregate.n,
+                aggregate.mean_agreement,
+                aggregate.agreement_weight
+            ),
+            "preserve the Graph row and rebuild the complete aggregate from physical XTerms",
+        ));
+    }
+    let expected = persisted_agreement(
+        panel_version,
+        (aggregate.slot_a, aggregate.slot_b),
+        aggregate.sum_agreement,
+        aggregate.n,
+    )?;
+    if expected.mean_agreement.to_bits() != aggregate.mean_agreement.to_bits()
+        || expected.agreement_weight.to_bits() != aggregate.agreement_weight.to_bits()
+    {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_AGGREGATE_DERIVATION_MISMATCH",
+            format!(
+                "panel {panel_version} pair {}:{} stored mean/weight ({},{}) differs from derived ({},{})",
+                aggregate.slot_a,
+                aggregate.slot_b,
+                aggregate.mean_agreement,
+                aggregate.agreement_weight,
+                expected.mean_agreement,
+                expected.agreement_weight
+            ),
+            "rebuild the complete agreement aggregate from physical XTerms",
+        ));
+    }
+    Ok(aggregate)
+}
+
+fn accumulate_agreement_delta(
+    panel_version: u32,
+    key: &[u8],
+    value: &[u8],
+    direction: i64,
+    delta: &mut BTreeMap<(u16, u16), (f64, i64)>,
+) -> Result<(), SynapseCalyxError> {
+    let row = decode_xterm_kv_row(key, value).map_err(|error| {
+        SynapseCalyxError::from_calyx("decode changed physical XTerm for agreement delta", &error)
+    })?;
+    if row.key.kind != CrossTermKind::Agreement {
+        return Ok(());
+    }
+    if row.key.a.panel_version() != panel_version || row.key.b.panel_version() != panel_version {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_DELTA_PANEL_MISMATCH",
+            format!(
+                "panel {panel_version} change contains XTerm pair {}:{} -> {}:{}",
+                row.key.a.panel_version(),
+                row.key.a.slot_id().get(),
+                row.key.b.panel_version(),
+                row.key.b.slot_id().get()
+            ),
+            "preserve the XTerm row and repair its cross-panel identity before advancing the cursor",
+        ));
+    }
+    let CrossTermValue::Scalar(value) = row.value else {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_DELTA_VALUE_MISMATCH",
+            format!(
+                "panel {panel_version} agreement XTerm {}:{} is not scalar",
+                row.key.a.slot_id().get(),
+                row.key.b.slot_id().get()
+            ),
+            "preserve and repair the typed XTerm before advancing the cursor",
+        ));
+    };
+    if !value.is_finite() || !matches!(direction, -1 | 1) {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_DELTA_INVALID",
+            format!("panel {panel_version} agreement delta value={value} direction={direction}"),
+            "repair the non-finite XTerm or invalid delta direction before advancing the cursor",
+        ));
+    }
+    let entry = delta
+        .entry((row.key.a.slot_id().get(), row.key.b.slot_id().get()))
+        .or_default();
+    let direction_f64 = if direction > 0 { 1.0 } else { -1.0 };
+    entry.0 = f64::from(value).mul_add(direction_f64, entry.0);
+    entry.1 = entry.1.checked_add(direction).ok_or_else(|| {
+        SynapseCalyxError::new(
+            "SYNAPSE_CALYX_AGREEMENT_DELTA_COUNT_OVERFLOW",
+            format!("panel {panel_version} agreement delta count overflowed i64"),
+            "inspect the changed XTerm cardinality and repair the impossible count",
+        )
+    })?;
+    Ok(())
+}
+
+fn between_record_graph_reference_key(panel_version: u32) -> Vec<u8> {
+    let mut key = Vec::with_capacity(GRAPH_VIRTUAL_KNN_PREFIX.len() + 4);
+    key.extend_from_slice(GRAPH_VIRTUAL_KNN_PREFIX);
+    key.extend_from_slice(&panel_version.to_be_bytes());
+    key
+}
+
+fn missing_graph_source_field(panel_version: u32, field: &str) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_BETWEEN_RECORD_GRAPH_SOURCE_INCOMPLETE",
+        format!("panel {panel_version} search generation is classified built but omitted {field}"),
+        "repair and independently verify the persisted search generation before publishing a between-record graph reference",
+    )
+}
+
+fn hex_sha256(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut encoded = String::with_capacity(digest.len().saturating_mul(2));
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
 }
 
 fn encode_json<T: Serialize>(value: &T) -> Result<Vec<u8>, SynapseCalyxError> {

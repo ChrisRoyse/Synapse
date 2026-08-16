@@ -768,8 +768,14 @@ where
                 "the event-time IndexBtree keyspace is reserved derived state; caller-supplied rows are forbidden because they can forge temporal coverage",
             ));
         }
+        if rows.iter().any(super::panel_change_log::is_reserved_row) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "the panel-input change-log KV keyspace is reserved derived state; caller-supplied rows are forbidden because they can forge or erase the durable association change stream",
+            ));
+        }
         let predicted = self.rows.current_seq().saturating_add(1);
         let rows = self.augment_event_time_index_rows_locked(rows, predicted)?;
+        let rows = self.augment_panel_change_log_rows_locked(&rows, predicted)?;
         self.commit_rows_locked_inner(&rows)
     }
 
@@ -792,8 +798,14 @@ where
                 "trusted erasure supplied an event-time IndexBtree row directly; Base erasure must derive that tombstone atomically instead",
             ));
         }
+        if rows.iter().any(super::panel_change_log::is_reserved_row) {
+            return Err(CalyxError::aster_corrupt_shard(
+                "trusted erasure supplied a panel-input change-log row directly; Base/slot erasure must derive that change record atomically",
+            ));
+        }
         let predicted = self.rows.current_seq().saturating_add(1);
         let rows = self.augment_event_time_index_rows_locked(rows, predicted)?;
+        let rows = self.augment_panel_change_log_rows_locked(&rows, predicted)?;
         self.commit_rows_locked_inner(&rows)
     }
 

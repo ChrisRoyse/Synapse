@@ -1488,12 +1488,13 @@ pub(super) async fn handle(
             })??;
             let summary = if let Some(weave) = &response.weave {
                 format!(
-                    "intelligence weave panel={} records_woven={} cross_terms={} agreement_edges={} between_record_edges={} xterm_rows={} graph_rows={} dda_signal_yield={} blind_spot_pairs={}/{} blind_spot_records={} outside_window={}",
+                    "intelligence weave panel={} records_woven={} records_removed={} cross_terms={} agreement_edges={} between_record_graph_reference_sha256={} xterm_rows={} graph_rows={} dda_signal_yield={} blind_spot_pairs={}/{} blind_spot_records={} outside_window={}",
                     weave.panel_version,
                     weave.records_woven,
+                    weave.records_removed,
                     weave.cross_terms_materialized,
                     weave.agreement_edges_persisted,
-                    weave.between_record_edges_persisted,
+                    weave.between_record_graph_reference_sha256,
                     weave.xterm_cf_rows_after,
                     weave.graph_cf_rows_after,
                     weave.dda_signal_yield,

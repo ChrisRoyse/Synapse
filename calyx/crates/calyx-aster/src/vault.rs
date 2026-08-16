@@ -37,6 +37,7 @@ mod ledger_append;
 mod ledger_hook;
 mod open;
 mod orphan_slot_gc;
+mod panel_change_log;
 mod prepared;
 pub mod quota;
 mod raw_commitment;
@@ -118,6 +119,10 @@ pub use ledger_append::{
 pub(crate) use orphan_slot_gc::ORPHAN_SLOT_GC_PAGE_ROWS;
 pub use orphan_slot_gc::{
     AsterOrphanSlotCfRetirement, AsterOrphanSlotCfSkip, AsterOrphanSlotGcReport,
+};
+pub use panel_change_log::{
+    CALYX_PANEL_CHANGE_LOG_INVALID, PANEL_INPUT_SNAPSHOT_MAX_IDENTITIES, PanelInputChange,
+    PanelInputChangeBatch, PanelInputChangePrune, PanelInputSnapshotPublication,
 };
 pub use quota::{CALYX_QUOTA_EXCEEDED, QuotaConfig, QuotaGuard};
 pub use scan::AsterSnapshotCfRowWalk;

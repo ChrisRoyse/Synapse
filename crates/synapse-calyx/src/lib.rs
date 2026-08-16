@@ -171,8 +171,8 @@ pub use intelligence::{
     SYNAPSE_INTELLIGENCE_SOURCE_RANGE_INVALID, SYNAPSE_INTELLIGENCE_TIME_RANGE_UNINDEXED,
     SYNAPSE_KERNEL_DEFAULT_EDGE_COS, SYNAPSE_KERNEL_DEFAULT_KNN, SYNAPSE_KERNEL_DEFAULT_MAX_HOPS,
     SYNAPSE_KERNEL_DEFAULT_MIN_RECALL, SYNAPSE_KERNEL_MAX_REPORTED_MEMBERS, SYNAPSE_KNN_DEFAULT_K,
-    SYNAPSE_KNN_MAX_EDGES, SYNAPSE_KSG_DEFAULT_K, SYNAPSE_LENS_BLIND_SPOT_CEILING,
-    SYNAPSE_SYNERGY_MAX_LENSES, SYNAPSE_SYNERGY_MAX_RECORDS, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS,
+    SYNAPSE_KSG_DEFAULT_K, SYNAPSE_LENS_BLIND_SPOT_CEILING, SYNAPSE_SYNERGY_MAX_LENSES,
+    SYNAPSE_SYNERGY_MAX_RECORDS, SYNAPSE_TEMPORAL_DEFAULT_BIN_SECS,
     SYNAPSE_TEMPORAL_DEFAULT_MAX_LAG, SYNAPSE_TEMPORAL_MAX_PEAKS, SYNAPSE_TEMPORAL_MIN_EVENTS,
     SynapseCalyxAbundanceReport, SynapseCalyxAgreementEdge, SynapseCalyxAnchorSourceCarrier,
     SynapseCalyxAssayParams, SynapseCalyxBetweenRecordEdge, SynapseCalyxBitsReport,
@@ -939,14 +939,47 @@ fn parse_cx_id(raw: &str) -> Result<CxId, SynapseCalyxError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    lowercase_hex(&Sha256::digest(bytes))
+}
+
+fn lowercase_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    let digest = Sha256::digest(bytes);
-    let mut encoded = String::with_capacity(digest.len() * 2);
-    for byte in digest {
+    let mut encoded = String::with_capacity(bytes.len().saturating_mul(2));
+    for &byte in bytes {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+fn publish_panel_input_snapshot_chunk_checked(
+    vault: &AsterVault<SynapseCalyxClock>,
+    panel_version: u32,
+    ids: &[CxId],
+    prior_frontier: u64,
+    chunk_number: usize,
+) -> Result<u64, SynapseCalyxError> {
+    let publication = vault
+        .publish_panel_input_snapshot_chunk(panel_version, ids)
+        .map_err(|error| {
+            SynapseCalyxError::from_calyx(
+                &format!(
+                    "publish panel {panel_version} authoritative association-input snapshot chunk {chunk_number}"
+                ),
+                &error,
+            )
+        })?;
+    if publication.committed_seq <= prior_frontier {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_SEQUENCE_INVALID",
+            format!(
+                "panel {panel_version} snapshot chunk {chunk_number} committed seq {} after prior frontier {prior_frontier}",
+                publication.committed_seq
+            ),
+            "preserve the WAL and reconcile the sequence allocator before accepting the bootstrap stream",
+        ));
+    }
+    Ok(publication.committed_seq)
 }
 
 fn inspect_search_raw_sidecars(
@@ -1375,6 +1408,37 @@ pub struct SynapseCalyxPanelBaseWalk {
     pub reader_lease_initial_expires_at: u64,
     /// Authoritative expiry after the final successful renewal.
     pub reader_lease_final_expires_at: u64,
+}
+
+/// Durable bootstrap stream published from one exact panel membership view.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxPanelInputSnapshotReport {
+    pub panel_version: u32,
+    /// Snapshot whose complete membership was captured before chunk commits.
+    pub source_snapshot_seq: u64,
+    /// Last durable CDC chunk sequence, or `source_snapshot_seq` for an empty
+    /// panel.
+    pub through_seq: u64,
+    pub identities: usize,
+    pub chunks: usize,
+    /// Every physical Base row examined at the pinned source snapshot. This is
+    /// deliberately not a search-sidecar count: recovery must remain possible
+    /// when the sidecar delta itself is older than retained MVCC history.
+    pub base_rows_scanned: usize,
+    /// Ordered digest of the authoritative panel identities published.
+    pub membership_sha256: String,
+    /// Successful renewals of the same exact reader lease during the Base walk.
+    pub reader_lease_renewals: usize,
+}
+
+/// Physical retention result for durable association-input CDC already covered
+/// by the panel consumer cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SynapseCalyxPanelInputPruneReport {
+    pub panel_version: u32,
+    pub through_seq: u64,
+    pub rows_deleted: usize,
+    pub committed_seq: Option<u64>,
 }
 
 impl SynapseCalyxPanelBaseWalk {
@@ -4030,6 +4094,242 @@ pub struct SynapseCalyxBaseSourcePointer {
 }
 
 impl SynapseCalyxVault {
+    /// Publishes a complete, chunked `read` stream for one panel from its
+    /// hash-sealed membership generation.
+    ///
+    /// Normal Base/slot commits keep flowing into the same durable CDC log
+    /// while chunks are emitted.  Each chunk rechecks current Base presence
+    /// under the commit lock, so a concurrent deletion cannot be resurrected.
+    /// A consumer starts at `source_snapshot_seq` and drains through
+    /// `through_seq`, receiving both the snapshot events and every concurrent
+    /// real mutation in sequence order.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on an invalid panel/chunk bound, any malformed Base row,
+    /// reader-lease failure, durable chunk failure, or sequence divergence.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the exact snapshot walk, renewable lease, chunk commits, digest, and final report are one ordered bootstrap transaction"
+    )]
+    pub fn publish_panel_input_snapshot(
+        &self,
+        panel_version: u32,
+        chunk_rows: usize,
+    ) -> Result<SynapseCalyxPanelInputSnapshotReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("publish_panel_input_snapshot");
+        if panel_version == 0
+            || !(1..=calyx_aster::vault::PANEL_INPUT_SNAPSHOT_MAX_IDENTITIES).contains(&chunk_rows)
+        {
+            return Err(SynapseCalyxError::new(
+                "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_CHUNK_INVALID",
+                format!(
+                    "panel input snapshot requires panel_version>0 and chunk_rows in 1..={}; received panel_version={panel_version} chunk_rows={chunk_rows}",
+                    calyx_aster::vault::PANEL_INPUT_SNAPSHOT_MAX_IDENTITIES
+                ),
+                "supply the exact registered panel and a bounded positive chunk size",
+            ));
+        }
+        let (
+            source_snapshot_seq,
+            through_seq,
+            identities,
+            chunks,
+            base_rows_scanned,
+            membership_sha256,
+            reader_lease_renewals,
+        ) = self.with_read_snapshot(INTELLIGENCE_CORPUS_READER_LEASE_MS, |initial_snapshot| {
+            let source_snapshot_seq = initial_snapshot.seq();
+            let mut snapshot = initial_snapshot;
+            let mut through_seq = source_snapshot_seq;
+            let mut identities = 0usize;
+            let mut chunks = 0usize;
+            let mut base_rows_scanned = 0usize;
+            let mut reader_lease_renewals = 0usize;
+            let mut after_key = None::<Vec<u8>>;
+            let mut pending = Vec::<CxId>::with_capacity(chunk_rows);
+            let mut digest = Sha256::new();
+            digest.update(b"synapse-calyx-panel-input-snapshot/v1");
+            digest.update(panel_version.to_be_bytes());
+            digest.update(source_snapshot_seq.to_be_bytes());
+
+            loop {
+                let page = self
+                    .vault
+                    .scan_cf_range_page_snapshot(
+                        snapshot,
+                        ColumnFamily::Base,
+                        &KeyRange::all(),
+                        after_key.as_deref(),
+                        PANEL_BASE_SNAPSHOT_RENEW_ROWS,
+                    )
+                    .map_err(|error| {
+                        SynapseCalyxError::from_calyx(
+                            &format!(
+                                "scan authoritative Base rows for panel {panel_version} association bootstrap"
+                            ),
+                            &error,
+                        )
+                    })?;
+                if page.is_empty() {
+                    break;
+                }
+                after_key = page.last().map(|(key, _)| key.clone());
+                for (key, value) in page {
+                    base_rows_scanned = base_rows_scanned.checked_add(1).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_BASE_COUNT_OVERFLOW",
+                            format!(
+                                "panel {panel_version} authoritative Base row count overflowed usize"
+                            ),
+                            "preserve the vault and inspect the impossible Base cardinality",
+                        )
+                    })?;
+                    let base = vault_encode::decode_constellation_base_projection(&value)
+                        .map_err(|error| {
+                            SynapseCalyxError::from_calyx(
+                                &format!(
+                                    "decode authoritative Base row while bootstrapping panel {panel_version}"
+                                ),
+                                &error,
+                            )
+                        })?;
+                    if key.as_slice() != base.cx_id.as_bytes() {
+                        return Err(SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_BASE_ID_MISMATCH",
+                            format!(
+                                "panel {panel_version} bootstrap Base key (len={}) does not match payload {}",
+                                key.len(),
+                                base.cx_id
+                            ),
+                            "preserve and repair the malformed Base row; no recovery cursor was advanced",
+                        ));
+                    }
+                    if base.panel_version != panel_version {
+                        continue;
+                    }
+                    digest.update(base.cx_id.as_bytes());
+                    identities = identities.checked_add(1).ok_or_else(|| {
+                        SynapseCalyxError::new(
+                            "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_IDENTITY_COUNT_OVERFLOW",
+                            format!("panel {panel_version} identity count overflowed usize"),
+                            "preserve the vault and inspect the impossible panel cardinality",
+                        )
+                    })?;
+                    pending.push(base.cx_id);
+                    if pending.len() == chunk_rows {
+                        through_seq = publish_panel_input_snapshot_chunk_checked(
+                            &self.vault,
+                            panel_version,
+                            &pending,
+                            through_seq,
+                            chunks + 1,
+                        )?;
+                        chunks = chunks.checked_add(1).ok_or_else(|| {
+                            SynapseCalyxError::new(
+                                "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_CHUNK_OVERFLOW",
+                                format!(
+                                    "panel {panel_version} snapshot chunk counter overflowed usize"
+                                ),
+                                "inspect the authoritative Base row count; no completion cursor was published",
+                            )
+                        })?;
+                        pending.clear();
+                    }
+                }
+                snapshot = self.renew_read_snapshot(snapshot)?;
+                reader_lease_renewals = reader_lease_renewals.checked_add(1).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_RENEWAL_OVERFLOW",
+                        format!("panel {panel_version} reader renewal count overflowed usize"),
+                        "preserve the vault and inspect the impossible scan duration",
+                    )
+                })?;
+            }
+            if !pending.is_empty() {
+                through_seq = publish_panel_input_snapshot_chunk_checked(
+                    &self.vault,
+                    panel_version,
+                    &pending,
+                    through_seq,
+                    chunks + 1,
+                )?;
+                chunks = chunks.checked_add(1).ok_or_else(|| {
+                    SynapseCalyxError::new(
+                        "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_CHUNK_OVERFLOW",
+                        format!("panel {panel_version} snapshot chunk counter overflowed usize"),
+                        "inspect the authoritative Base row count; no completion cursor was published",
+                    )
+                })?;
+            }
+            digest.update(identities.to_be_bytes());
+            Ok((
+                source_snapshot_seq,
+                through_seq,
+                identities,
+                chunks,
+                base_rows_scanned,
+                lowercase_hex(&digest.finalize()),
+                reader_lease_renewals,
+            ))
+        })?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_PANEL_INPUT_SNAPSHOT_PUBLISHED",
+            panel_version,
+            source_snapshot_seq,
+            through_seq,
+            identities,
+            chunks,
+            base_rows_scanned,
+            membership_sha256 = %membership_sha256,
+            reader_lease_renewals,
+            "published a complete authoritative-Base association-input snapshot stream while ordinary change capture remained active"
+        );
+        Ok(SynapseCalyxPanelInputSnapshotReport {
+            panel_version,
+            source_snapshot_seq,
+            through_seq,
+            identities,
+            chunks,
+            base_rows_scanned,
+            membership_sha256,
+            reader_lease_renewals,
+        })
+    }
+
+    /// Physically tombstones a bounded page of durable panel-input events only
+    /// after their consumer acknowledgement has been committed and reread.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact Calyx error when the acknowledgement boundary is
+    /// invalid or any tombstone commit/readback fails.
+    pub fn prune_panel_input_changes(
+        &self,
+        panel_version: u32,
+        through_seq: u64,
+        max_rows: usize,
+    ) -> Result<SynapseCalyxPanelInputPruneReport, SynapseCalyxError> {
+        crate::lowering::hot_context::assert_cold_calyx("prune_panel_input_changes");
+        let report = self
+            .vault
+            .prune_panel_input_changes(panel_version, through_seq, max_rows)
+            .map_err(|error| {
+                SynapseCalyxError::from_calyx(
+                    &format!(
+                        "prune panel {panel_version} association-input changes through durable cursor {through_seq}"
+                    ),
+                    &error,
+                )
+            })?;
+        Ok(SynapseCalyxPanelInputPruneReport {
+            panel_version: report.panel_version,
+            through_seq: report.through_seq,
+            rows_deleted: report.rows_deleted,
+            committed_seq: report.committed_seq,
+        })
+    }
+
     /// Returns the fail-closed completeness state of the native ordered
     /// `(panel, source_event_ns, cx_id)` secondary index.
     ///
@@ -4149,28 +4449,6 @@ impl SynapseCalyxVault {
             Freshness::FreshDerived,
             max_age_ms,
             |error| SynapseCalyxError::from_calyx("pin the scoped Calyx read snapshot", &error),
-            read,
-        )
-    }
-
-    /// Runs a multi-read intelligence operation against one exact historical
-    /// sequence. The Aster scoped handle retains the physical snapshot for the
-    /// closure and releases it on success, error, or unwind.
-    pub(crate) fn with_read_snapshot_at<T>(
-        &self,
-        seq: u64,
-        max_age_ms: u64,
-        read: impl FnOnce(Snapshot) -> Result<T, SynapseCalyxError>,
-    ) -> Result<T, SynapseCalyxError> {
-        self.vault.with_scoped_snapshot_at(
-            seq,
-            max_age_ms,
-            |error| {
-                SynapseCalyxError::from_calyx(
-                    &format!("pin the scoped Calyx historical snapshot at seq {seq}"),
-                    &error,
-                )
-            },
             read,
         )
     }
