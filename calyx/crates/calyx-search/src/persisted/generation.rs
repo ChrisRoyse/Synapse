@@ -41,6 +41,7 @@ pub struct PersistedDenseQuantization {
     pub bits: u8,
     pub subvectors: usize,
     pub centroids: usize,
+    pub build_diagnostics: Option<calyx_sextant::index::DiskAnnPqBuildDiagnostics>,
     pub pq_sha256: String,
     pub raw_sha256: String,
 }
@@ -134,6 +135,7 @@ impl PersistedSearchSlot {
                     bits: quantization.bits,
                     subvectors: quantization.subvectors,
                     centroids: quantization.centroids,
+                    build_diagnostics: quantization.build_diagnostics.clone(),
                     pq_sha256: quantization.pq_sha256.clone(),
                     raw_sha256: quantization.raw_sha256.clone(),
                 }

@@ -208,6 +208,8 @@ pub(crate) struct DenseQuantizationEntry {
     bits: u8,
     subvectors: usize,
     centroids: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_diagnostics: Option<calyx_sextant::index::DiskAnnPqBuildDiagnostics>,
     pq_rel: String,
     pq_sha256: String,
     raw_rel: String,

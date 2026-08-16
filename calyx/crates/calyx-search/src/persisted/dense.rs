@@ -117,7 +117,7 @@ where
             Some(base_seq),
         ))?;
         let params = pq_params(rows.dim as usize, quant_bits)?;
-        DiskAnnSearch::build_with_pq_plan(
+        let built = DiskAnnSearch::build_with_pq_plan(
             slot,
             &graph_path,
             &rows.rows,
@@ -129,6 +129,12 @@ where
                 backend: build_policy.backend,
             },
         )?;
+        let build_diagnostics = built.pq_build_diagnostics().cloned().ok_or_else(|| {
+            crate::error::CliError::io(format!(
+                "CALYX_SEARCH_PQ_BUILD_DIAGNOSTICS_MISSING: slot {} completed quantized DiskANN construction without build diagnostics; refusing to publish an unauditable generation",
+                slot.get()
+            ))
+        })?;
         progress(RebuildProgress::slot(
             "slot.dense.quantized.done",
             panel_version,
@@ -142,6 +148,7 @@ where
             bits: quant_bits,
             subvectors: params.subvectors,
             centroids: params.centroids.min(rows.rows.len()),
+            build_diagnostics: Some(build_diagnostics),
             pq_rel: rel(vault_dir, &pq_path)?,
             pq_sha256: sha256_file(&pq_path)?,
             raw_rel: rel(vault_dir, &raw_path)?,
@@ -357,6 +364,45 @@ fn validate_quantization_artifacts(
         return Err(stale(format!(
             "persistent slot {slot} quantization bits {} disagree with generation config {}",
             quantization.bits, quant_bits
+        )));
+    }
+    let diagnostics = quantization.build_diagnostics.as_ref().ok_or_else(|| {
+        stale(format!(
+            "persistent slot {slot} quantization manifest has no PQ build diagnostics; rebuild the generation with the current runtime so its CPU/CUDA execution is physically auditable"
+        ))
+    })?;
+    let dim = entry.require_dim(slot)? as usize;
+    if diagnostics.row_count != entry.len
+        || diagnostics.dim != dim
+        || diagnostics.subvectors != quantization.subvectors
+        || diagnostics.centroids != quantization.centroids
+    {
+        return Err(stale(format!(
+            "persistent slot {slot} PQ build diagnostics disagree with the manifest: diagnostics rows={} dim={} subvectors={} centroids={}, manifest rows={} dim={} subvectors={} centroids={}",
+            diagnostics.row_count,
+            diagnostics.dim,
+            diagnostics.subvectors,
+            diagnostics.centroids,
+            entry.len,
+            dim,
+            quantization.subvectors,
+            quantization.centroids
+        )));
+    }
+    if diagnostics.backend.is_empty() || diagnostics.requested_execution.is_empty() {
+        return Err(stale(format!(
+            "persistent slot {slot} PQ build diagnostics omit the execution backend or request"
+        )));
+    }
+    if diagnostics.row_count > diagnostics.small_corpus_cpu_max_rows
+        && (!diagnostics.strict_gpu_required || !diagnostics.backend.starts_with("cuda-"))
+    {
+        return Err(stale(format!(
+            "persistent slot {slot} has {} PQ rows above the {}-row CPU ceiling but records backend={} strict_gpu_required={}; refusing an unproven large-corpus CPU generation",
+            diagnostics.row_count,
+            diagnostics.small_corpus_cpu_max_rows,
+            diagnostics.backend,
+            diagnostics.strict_gpu_required
         )));
     }
     for (kind, rel_path, expected_hash) in [
