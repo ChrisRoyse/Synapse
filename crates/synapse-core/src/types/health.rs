@@ -1361,6 +1361,19 @@ pub struct PerceptionDetectionHealth {
     pub bundled_materialized_verified: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundled_materialized_path: Option<String>,
+    /// Runtime state of the isolated persistent detector: `ready`,
+    /// `not_started`, or `busy` while an observation owns the runtime.
+    pub persistent_worker_status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_worker_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_worker_model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_worker_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_worker_session_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistent_worker_requests_started: Option<u64>,
 }
 
 /// Grounded-usage writer state (#1936).

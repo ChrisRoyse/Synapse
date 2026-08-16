@@ -1,7 +1,14 @@
 use chrono::{DateTime, Utc};
 use rmcp::ErrorData;
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf, process::ExitCode, time::Instant};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+    sync::OnceLock,
+    thread,
+    time::{Duration, Instant, UNIX_EPOCH},
+};
 use synapse_calyx::{SynapseCalyxGpuReservation, readback_gpu_reservations};
 use synapse_core::{
     DetectedEntity, Detection, DetectionBatch, PerceptionMode, ProfileDetection, Rect,
@@ -9,7 +16,7 @@ use synapse_core::{
 };
 use synapse_models::{
     DEFAULT_DETECTION_MODEL_ID, DetectOpts, DetectionFrame, Detector, ModelBackend, ModelLoader,
-    lightweight_cpu_detection_model, normalize_sha256, registered_model, sha256_file,
+    lightweight_cpu_detection_model, registered_model,
 };
 
 const DEFAULT_DETECTION_CONFIDENCE_THRESHOLD: f32 = 0.5;
@@ -17,6 +24,9 @@ const STALE_TRACK_MS: i64 = 3_000;
 const MIN_TRACK_MATCH_DISTANCE_PX: f32 = 96.0;
 const DETECTION_GPU_ADMISSION_MIB: u64 = 4_096;
 const DETECTION_WORKER_TIMEOUT_MS: u32 = 120_000;
+const DETECTION_WORKER_SHUTDOWN_TIMEOUT_MS: u32 = 5_000;
+const DETECTION_WORKER_POLL_MS: u64 = 2;
+const DETECTION_WORKER_PROTOCOL: &str = "synapse.detection.worker.v1";
 const DETECTION_BACKEND_ENV: &str = "SYNAPSE_DETECTION_BACKEND";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,6 +184,8 @@ pub fn registered_detection_model_ids() -> Vec<&'static str> {
 pub struct DetectionRuntime {
     tracker: EntityTracker,
     next_frame_seq: u64,
+    #[cfg(windows)]
+    worker: Option<PersistentDetectionWorker>,
 }
 
 impl DetectionRuntime {
@@ -181,11 +193,36 @@ impl DetectionRuntime {
         self.next_frame_seq = self.next_frame_seq.saturating_add(1);
         self.next_frame_seq
     }
+
+    #[must_use]
+    pub fn persistent_worker_readback(&self) -> Option<DetectionWorkerRuntimeReadback> {
+        #[cfg(windows)]
+        {
+            self.worker
+                .as_ref()
+                .map(PersistentDetectionWorker::readback)
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectionWorkerRuntimeReadback {
+    pub worker_pid: u32,
+    pub model_id: String,
+    pub backend: String,
+    pub session_id: u64,
+    pub requests_started: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DetectionWorkerRequest {
+    #[serde(default)]
+    request_id: u64,
     model_id: String,
     frame_seq: u64,
     width: u32,
@@ -198,6 +235,9 @@ struct DetectionWorkerRequest {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DetectionWorkerEnvelope {
+    request_id: u64,
+    worker_pid: u32,
+    session_id: u64,
     ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     batch: Option<DetectionBatch>,
@@ -207,6 +247,18 @@ struct DetectionWorkerEnvelope {
     error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error_detail: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct DetectionWorkerReady {
+    protocol: String,
+    worker_pid: u32,
+    model_id: String,
+    backend: String,
+    session_id: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reservation_id: Option<String>,
 }
 
 pub(crate) fn run_detection_worker_from_cli(
@@ -219,6 +271,9 @@ pub(crate) fn run_detection_worker_from_cli(
         response_path.ok_or_else(|| anyhow::anyhow!("--detection-worker-response is required"))?;
     let envelope = run_detection_worker(&request_path).unwrap_or_else(|(code, detail)| {
         DetectionWorkerEnvelope {
+            request_id: 0,
+            worker_pid: std::process::id(),
+            session_id: 0,
             ok: false,
             batch: None,
             reservation_id: None,
@@ -243,79 +298,82 @@ pub(crate) fn run_detection_worker_from_process_args() -> Option<anyhow::Result<
     if mode.as_deref() != Some("detection-worker") {
         return None;
     }
-    let value_after = |flag: &str| {
+    let path_after = |flag: &str| {
         args.windows(2)
             .find_map(|pair| (pair[0] == flag).then(|| PathBuf::from(&pair[1])))
     };
+    let string_after = |flag: &str| {
+        args.windows(2)
+            .find_map(|pair| (pair[0] == flag).then(|| pair[1].to_string_lossy().into_owned()))
+    };
+    if let Some(mailbox) = path_after("--detection-worker-mailbox") {
+        return Some(
+            string_after("--detection-worker-model-id")
+                .ok_or_else(|| anyhow::anyhow!("--detection-worker-model-id is required"))
+                .and_then(|model_id| run_persistent_detection_worker(&mailbox, &model_id)),
+        );
+    }
     Some(run_detection_worker_from_cli(
-        value_after("--detection-worker-request"),
-        value_after("--detection-worker-response"),
+        path_after("--detection-worker-request"),
+        path_after("--detection-worker-response"),
     ))
 }
 
 fn run_detection_worker(
     request_path: &std::path::Path,
 ) -> Result<DetectionWorkerEnvelope, (String, String)> {
-    let request_bytes = fs::read(request_path).map_err(|error| {
-        (
-            "DETECTION_WORKER_REQUEST_READ_FAILED".to_owned(),
-            error.to_string(),
-        )
-    })?;
-    let request: DetectionWorkerRequest =
-        serde_json::from_slice(&request_bytes).map_err(|error| {
-            (
-                "DETECTION_WORKER_REQUEST_INVALID".to_owned(),
-                error.to_string(),
-            )
-        })?;
+    let request = read_detection_worker_request(request_path)?;
     write_worker_progress(&request.progress_path, "request_validated")?;
-    let rgb = fs::read(&request.rgb_path).map_err(|error| {
-        (
-            "DETECTION_WORKER_FRAME_READ_FAILED".to_owned(),
-            error.to_string(),
-        )
-    })?;
-    write_worker_progress(&request.progress_path, "frame_read")?;
+    let worker = load_detection_worker_model(&request.model_id, &request.progress_path)?;
+    run_loaded_detection_request(&worker, request)
+}
+
+struct LoadedDetectionWorker {
+    model_id: String,
+    backend: ModelBackend,
+    model: synapse_models::LoadedModel,
+    _reservation: Option<SynapseCalyxGpuReservation>,
+    reservation_id: Option<String>,
+}
+
+fn load_detection_worker_model(
+    model_id: &str,
+    progress_path: &Path,
+) -> Result<LoadedDetectionWorker, (String, String)> {
     let backend = selected_detection_backend()?;
-    let registered =
-        if backend == ModelBackend::Cpu && request.model_id == DEFAULT_DETECTION_MODEL_ID {
-            lightweight_cpu_detection_model()
-        } else if request.model_id == DEFAULT_DETECTION_MODEL_ID {
-            synapse_models::default_detection_model()
-        } else {
-            registered_model(&request.model_id).ok_or_else(|| {
-                (
-                    error_codes::DETECTION_MODEL_NOT_LOADED.to_owned(),
-                    format!(
-                        "detection model id {:?} is not registered",
-                        request.model_id
-                    ),
-                )
-            })?
-        };
+    let registered = if backend == ModelBackend::Cpu && model_id == DEFAULT_DETECTION_MODEL_ID {
+        lightweight_cpu_detection_model()
+    } else if model_id == DEFAULT_DETECTION_MODEL_ID {
+        synapse_models::default_detection_model()
+    } else {
+        registered_model(model_id).ok_or_else(|| {
+            (
+                error_codes::DETECTION_MODEL_NOT_LOADED.to_owned(),
+                format!("detection model id {model_id:?} is not registered"),
+            )
+        })?
+    };
     let descriptor = registered
-        .materialize_embedded()
+        .materialize_embedded_verified()
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
-    write_worker_progress(&request.progress_path, "model_verified")?;
+    write_worker_progress(progress_path, "model_verified")?;
     let reservation = if backend == ModelBackend::Cuda {
         let reservation = SynapseCalyxGpuReservation::acquire(
             0,
             "synapse-mcp-detection-worker",
             format!("synapse-detection-worker-pid-{}", std::process::id()),
             format!(
-                "isolated ORT CUDA detector model={}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}",
-                request.model_id
+                "isolated ORT CUDA detector model={model_id}; declared_session_and_inference_envelope_mib={DETECTION_GPU_ADMISSION_MIB}"
             ),
             DETECTION_GPU_ADMISSION_MIB,
         )
         .map_err(|error| (error.code.to_owned(), error.to_string()))?;
-        write_worker_progress(&request.progress_path, "gpu_reservation_acquired")?;
+        write_worker_progress(progress_path, "gpu_reservation_acquired")?;
         configure_cuda_runtime_dlls()?;
-        write_worker_progress(&request.progress_path, "cuda_runtime_verified")?;
+        write_worker_progress(progress_path, "cuda_runtime_verified")?;
         Some(reservation)
     } else {
-        write_worker_progress(&request.progress_path, "cpu_backend_selected")?;
+        write_worker_progress(progress_path, "cpu_backend_selected")?;
         None
     };
     let reservation_id = reservation.as_ref().and_then(|reservation| {
@@ -328,17 +386,47 @@ fn run_detection_worker(
     });
     let loader = ModelLoader::new(vec![backend]);
     let model = loader
-        .load(descriptor)
+        .load_verified(descriptor)
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
     write_worker_progress(
-        &request.progress_path,
+        progress_path,
         if backend == ModelBackend::Cuda {
             "cuda_session_loaded"
         } else {
             "cpu_session_loaded"
         },
     )?;
-    let batch = model
+    Ok(LoadedDetectionWorker {
+        model_id: model_id.to_owned(),
+        backend,
+        model,
+        _reservation: reservation,
+        reservation_id,
+    })
+}
+
+fn run_loaded_detection_request(
+    worker: &LoadedDetectionWorker,
+    request: DetectionWorkerRequest,
+) -> Result<DetectionWorkerEnvelope, (String, String)> {
+    if request.model_id != worker.model_id {
+        return Err((
+            "DETECTION_WORKER_MODEL_MISMATCH".to_owned(),
+            format!(
+                "persistent worker loaded model {:?}, but request {} named {:?}",
+                worker.model_id, request.request_id, request.model_id
+            ),
+        ));
+    }
+    let rgb = fs::read(&request.rgb_path).map_err(|error| {
+        (
+            "DETECTION_WORKER_FRAME_READ_FAILED".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    write_worker_progress(&request.progress_path, "frame_read")?;
+    let batch = worker
+        .model
         .infer(
             DetectionFrame {
                 frame_seq: request.frame_seq,
@@ -350,18 +438,167 @@ fn run_detection_worker(
         )
         .map_err(|error| (error.code().to_owned(), error.to_string()))?;
     write_worker_progress(&request.progress_path, "inference_completed")?;
-    drop(model);
-    drop(reservation);
     Ok(DetectionWorkerEnvelope {
+        request_id: request.request_id,
+        worker_pid: std::process::id(),
+        session_id: worker.model.session_id(),
         ok: true,
         batch: Some(batch),
-        reservation_id,
+        reservation_id: worker.reservation_id.clone(),
         error_code: None,
         error_detail: None,
     })
 }
 
+fn read_detection_worker_request(
+    request_path: &Path,
+) -> Result<DetectionWorkerRequest, (String, String)> {
+    let request_bytes = fs::read(request_path).map_err(|error| {
+        (
+            "DETECTION_WORKER_REQUEST_READ_FAILED".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    serde_json::from_slice(&request_bytes).map_err(|error| {
+        (
+            "DETECTION_WORKER_REQUEST_INVALID".to_owned(),
+            error.to_string(),
+        )
+    })
+}
+
+fn write_worker_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), (String, String)> {
+    use std::io::Write as _;
+
+    if path.exists() {
+        return Err((
+            "DETECTION_WORKER_PROTOCOL_DIRTY".to_owned(),
+            format!(
+                "refusing to overwrite unread worker protocol file {}",
+                path.display()
+            ),
+        ));
+    }
+    let staging = path.with_extension(format!("staging-{}", std::process::id()));
+    let bytes = serde_json::to_vec(value).map_err(|error| {
+        (
+            "DETECTION_WORKER_PROTOCOL_ENCODE_FAILED".to_owned(),
+            error.to_string(),
+        )
+    })?;
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&staging)
+        .map_err(|error| {
+            (
+                "DETECTION_WORKER_PROTOCOL_STAGE_FAILED".to_owned(),
+                format!("create {}: {error}", staging.display()),
+            )
+        })?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            (
+                "DETECTION_WORKER_PROTOCOL_STAGE_FAILED".to_owned(),
+                format!("write/sync {}: {error}", staging.display()),
+            )
+        })?;
+    fs::rename(&staging, path).map_err(|error| {
+        (
+            "DETECTION_WORKER_PROTOCOL_COMMIT_FAILED".to_owned(),
+            format!(
+                "rename {} -> {}: {error}",
+                staging.display(),
+                path.display()
+            ),
+        )
+    })
+}
+
+fn run_persistent_detection_worker(mailbox: &Path, model_id: &str) -> anyhow::Result<ExitCode> {
+    if !mailbox.is_absolute() || !mailbox.is_dir() {
+        anyhow::bail!(
+            "detection worker mailbox must be an existing absolute directory: {}",
+            mailbox.display()
+        );
+    }
+    let ready_path = mailbox.join("ready.json");
+    let request_path = mailbox.join("request.json");
+    let response_path = mailbox.join("response.json");
+    let shutdown_path = mailbox.join("shutdown.json");
+    let progress_path = mailbox.join("progress.txt");
+    for path in [&ready_path, &request_path, &response_path, &shutdown_path] {
+        if path.exists() {
+            anyhow::bail!(
+                "detection worker mailbox contains stale protocol file {}",
+                path.display()
+            );
+        }
+    }
+    let worker = load_detection_worker_model(model_id, &progress_path)
+        .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+    let ready = DetectionWorkerReady {
+        protocol: DETECTION_WORKER_PROTOCOL.to_owned(),
+        worker_pid: std::process::id(),
+        model_id: worker.model_id.clone(),
+        backend: match worker.backend {
+            ModelBackend::Cuda => "cuda",
+            ModelBackend::Cpu => "cpu",
+        }
+        .to_owned(),
+        session_id: worker.model.session_id(),
+        reservation_id: worker.reservation_id.clone(),
+    };
+    write_worker_json_atomic(&ready_path, &ready)
+        .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+    write_worker_progress(&progress_path, "persistent_worker_ready")
+        .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+
+    loop {
+        if shutdown_path.exists() {
+            write_worker_progress(&progress_path, "shutdown_requested")
+                .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+            drop(worker);
+            return Ok(ExitCode::SUCCESS);
+        }
+        if response_path.exists() || !request_path.exists() {
+            thread::sleep(Duration::from_millis(DETECTION_WORKER_POLL_MS));
+            continue;
+        }
+        let request = read_detection_worker_request(&request_path)
+            .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+        fs::remove_file(&request_path).map_err(|error| {
+            anyhow::anyhow!(
+                "DETECTION_WORKER_PROTOCOL_CLEANUP_FAILED: remove {}: {error}",
+                request_path.display()
+            )
+        })?;
+        let request_id = request.request_id;
+        let envelope =
+            run_loaded_detection_request(&worker, request).unwrap_or_else(|(code, detail)| {
+                DetectionWorkerEnvelope {
+                    request_id,
+                    worker_pid: std::process::id(),
+                    session_id: worker.model.session_id(),
+                    ok: false,
+                    batch: None,
+                    reservation_id: worker.reservation_id.clone(),
+                    error_code: Some(code),
+                    error_detail: Some(detail),
+                }
+            });
+        write_worker_json_atomic(&response_path, &envelope)
+            .map_err(|(code, detail)| anyhow::anyhow!("{code}: {detail}"))?;
+    }
+}
+
 fn selected_detection_backend() -> Result<ModelBackend, (String, String)> {
+    static SELECTED: OnceLock<Result<ModelBackend, (String, String)>> = OnceLock::new();
+    SELECTED.get_or_init(probe_detection_backend).clone()
+}
+
+fn probe_detection_backend() -> Result<ModelBackend, (String, String)> {
     match std::env::var(DETECTION_BACKEND_ENV) {
         Ok(value) if value.eq_ignore_ascii_case("cuda") => return Ok(ModelBackend::Cuda),
         Ok(value) if value.eq_ignore_ascii_case("cpu") => return Ok(ModelBackend::Cpu),
@@ -423,6 +660,8 @@ pub struct DetectionBundleReadback {
     pub model_id: &'static str,
     pub materialized: bool,
     pub materialized_verified: bool,
+    pub materialized_bytes: Option<u64>,
+    pub materialized_modified_unix_ms: Option<u64>,
     pub materialized_path: String,
 }
 
@@ -434,10 +673,37 @@ pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (St
         synapse_models::default_detection_model()
     };
     let descriptor = model.descriptor();
-    let expected = normalize_sha256(model.sha256);
-    let materialized = descriptor.path.exists();
-    let materialized_verified =
-        materialized && sha256_file(&descriptor.path).ok().as_deref() == Some(expected.as_str());
+    let metadata = fs::metadata(&descriptor.path)
+        .ok()
+        .filter(|row| row.is_file());
+    let materialized = metadata.is_some();
+    let expected_bytes = synapse_models::embedded_model_bundle()
+        .map_err(|error| (error.code().to_owned(), error.to_string()))?
+        .slot(model.id)
+        .filter(|slot| slot.is_present())
+        .map(|slot| slot.length)
+        .ok_or_else(|| {
+            (
+                "DETECTION_BUNDLE_SLOT_ABSENT".to_owned(),
+                format!(
+                    "running executable has no populated model slot for {:?}; re-run scripts/synapse-setup.ps1",
+                    model.id
+                ),
+            )
+        })?;
+    // Health is an availability probe, not the model-load integrity boundary.
+    // It deliberately uses only cheap file identity metadata; the persistent
+    // worker performs the full SHA-256 verification immediately before it
+    // creates the one retained ONNX Runtime session.
+    let materialized_verified = metadata
+        .as_ref()
+        .is_some_and(|row| row.len() == expected_bytes);
+    let materialized_bytes = metadata.as_ref().map(std::fs::Metadata::len);
+    let materialized_modified_unix_ms = metadata
+        .as_ref()
+        .and_then(|row| row.modified().ok())
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .and_then(|elapsed| u64::try_from(elapsed.as_millis()).ok());
     Ok(DetectionBundleReadback {
         provider: match backend {
             ModelBackend::Cuda => "cuda",
@@ -446,6 +712,8 @@ pub(crate) fn detection_bundle_readback() -> Result<DetectionBundleReadback, (St
         model_id: model.id,
         materialized,
         materialized_verified,
+        materialized_bytes,
+        materialized_modified_unix_ms,
         materialized_path: descriptor.path.display().to_string(),
     })
 }
@@ -541,105 +809,412 @@ fn write_worker_progress(path: &std::path::Path, stage: &str) -> Result<(), (Str
 }
 
 #[cfg(windows)]
+#[derive(Debug)]
+struct PersistentDetectionWorker {
+    mailbox: tempfile::TempDir,
+    process: crate::desktop_worker::OwnedWorkerProcess,
+    model_id: String,
+    backend: String,
+    session_id: u64,
+    reservation_id: Option<String>,
+    next_request_id: u64,
+}
+
+#[cfg(windows)]
+impl PersistentDetectionWorker {
+    fn start(model_id: &str) -> synapse_models::ModelResult<Self> {
+        use synapse_models::detection_model_not_loaded;
+
+        let mailbox = tempfile::Builder::new()
+            .prefix("synapse-detection-worker-")
+            .tempdir()
+            .map_err(|error| {
+                detection_model_not_loaded(format!(
+                    "create persistent detector mailbox failed: {error}"
+                ))
+            })?;
+        let args = vec![
+            "--mode".to_owned(),
+            "detection-worker".to_owned(),
+            "--detection-worker-mailbox".to_owned(),
+            mailbox.path().to_string_lossy().into_owned(),
+            "--detection-worker-model-id".to_owned(),
+            model_id.to_owned(),
+        ];
+        let mut process =
+            crate::desktop_worker::spawn_owned_current_exe_worker(&args).map_err(|error| {
+                detection_model_not_loaded(format!(
+                    "start persistent owned detector process failed: {error}"
+                ))
+            })?;
+        let ready_path = mailbox.path().join("ready.json");
+        let progress_path = mailbox.path().join("progress.txt");
+        let started = Instant::now();
+        let ready = loop {
+            if ready_path.is_file() {
+                let bytes = fs::read(&ready_path).map_err(|error| {
+                    detection_model_not_loaded(format!(
+                        "persistent detector pid {} ready read failed: {error}",
+                        process.pid()
+                    ))
+                })?;
+                let ready: DetectionWorkerReady =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        detection_model_not_loaded(format!(
+                            "persistent detector pid {} ready JSON was invalid: {error}",
+                            process.pid()
+                        ))
+                    })?;
+                break ready;
+            }
+            if let Some(exit_code) = process.terminal_exit_code().map_err(|error| {
+                detection_model_not_loaded(format!(
+                    "persistent detector process status read failed: {error}"
+                ))
+            })? {
+                let progress = fs::read_to_string(&progress_path)
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
+                return Err(detection_model_not_loaded(format!(
+                    "persistent detector pid {} exited before ready with kernel exit_code={exit_code}; last_stage={progress:?}",
+                    process.pid()
+                )));
+            }
+            if started.elapsed() >= Duration::from_millis(u64::from(DETECTION_WORKER_TIMEOUT_MS)) {
+                let progress = fs::read_to_string(&progress_path)
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
+                let verdict = process.wait_for_exit(0).map_err(|error| {
+                    detection_model_not_loaded(format!(
+                        "persistent detector startup timed out and exact cleanup failed: {error}; last_stage={progress:?}"
+                    ))
+                })?;
+                return Err(detection_model_not_loaded(format!(
+                    "persistent detector pid {} did not become ready within {DETECTION_WORKER_TIMEOUT_MS} ms and was terminated with kernel exit_code={}; last_stage={progress:?}",
+                    verdict.pid, verdict.exit_code
+                )));
+            }
+            thread::sleep(Duration::from_millis(DETECTION_WORKER_POLL_MS));
+        };
+        if ready.protocol != DETECTION_WORKER_PROTOCOL
+            || ready.worker_pid != process.pid()
+            || ready.model_id != model_id
+            || !matches!(ready.backend.as_str(), "cpu" | "cuda")
+            || ready.session_id == 0
+            || (ready.backend == "cuda") != ready.reservation_id.is_some()
+        {
+            return Err(detection_model_not_loaded(format!(
+                "persistent detector ready attestation mismatch: expected protocol={DETECTION_WORKER_PROTOCOL:?} pid={} model={model_id:?}; actual={ready:?}",
+                process.pid()
+            )));
+        }
+        verify_persistent_worker_reservation(
+            ready.worker_pid,
+            &ready.backend,
+            ready.reservation_id.as_deref(),
+            true,
+        )
+        .map_err(detection_model_not_loaded)?;
+        fs::remove_file(&ready_path).map_err(|error| {
+            detection_model_not_loaded(format!(
+                "persistent detector pid {} ready acknowledgement cleanup failed for {}: {error}",
+                process.pid(),
+                ready_path.display()
+            ))
+        })?;
+
+        Ok(Self {
+            mailbox,
+            process,
+            model_id: model_id.to_owned(),
+            backend: ready.backend,
+            session_id: ready.session_id,
+            reservation_id: ready.reservation_id,
+            next_request_id: 0,
+        })
+    }
+
+    fn readback(&self) -> DetectionWorkerRuntimeReadback {
+        DetectionWorkerRuntimeReadback {
+            worker_pid: self.process.pid(),
+            model_id: self.model_id.clone(),
+            backend: self.backend.clone(),
+            session_id: self.session_id,
+            requests_started: self.next_request_id,
+        }
+    }
+
+    fn infer(
+        &mut self,
+        frame: DetectionFrame,
+        opts: DetectOpts,
+    ) -> synapse_models::ModelResult<DetectionBatch> {
+        use std::io::Write as _;
+        use synapse_models::{detection_infer_failed, detection_model_not_loaded};
+
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} exhausted request ids",
+                self.process.pid()
+            ))
+        })?;
+        let request_id = self.next_request_id;
+        let request_path = self.mailbox.path().join("request.json");
+        let response_path = self.mailbox.path().join("response.json");
+        let rgb_path = self.mailbox.path().join(format!("frame-{request_id}.rgb"));
+        let progress_path = self.mailbox.path().join("progress.txt");
+        for path in [&request_path, &response_path, &rgb_path] {
+            if path.exists() {
+                return Err(detection_infer_failed(format!(
+                    "persistent detector pid {} protocol is dirty before request {request_id}: {} already exists",
+                    self.process.pid(),
+                    path.display()
+                )));
+            }
+        }
+        let mut rgb_file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&rgb_path)
+            .map_err(|error| {
+                detection_infer_failed(format!(
+                    "create frame for persistent detector pid {} request {request_id}: {error}",
+                    self.process.pid()
+                ))
+            })?;
+        rgb_file
+            .write_all(&frame.rgb)
+            .and_then(|()| rgb_file.sync_all())
+            .map_err(|error| {
+                detection_infer_failed(format!(
+                    "write/sync frame for persistent detector pid {} request {request_id}: {error}",
+                    self.process.pid()
+                ))
+            })?;
+        drop(rgb_file);
+        let request = DetectionWorkerRequest {
+            request_id,
+            model_id: self.model_id.clone(),
+            frame_seq: frame.frame_seq,
+            width: frame.width,
+            height: frame.height,
+            rgb_path: rgb_path.clone(),
+            progress_path: progress_path.clone(),
+            opts,
+        };
+        write_worker_json_atomic(&request_path, &request).map_err(|(code, detail)| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} request {request_id} publish failed: {code}: {detail}",
+                self.process.pid()
+            ))
+        })?;
+
+        let started = Instant::now();
+        let response = loop {
+            if response_path.is_file() {
+                let bytes = fs::read(&response_path).map_err(|error| {
+                    detection_infer_failed(format!(
+                        "persistent detector pid {} response {request_id} read failed: {error}",
+                        self.process.pid()
+                    ))
+                })?;
+                let envelope: DetectionWorkerEnvelope =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        detection_infer_failed(format!(
+                            "persistent detector pid {} response {request_id} JSON was invalid: {error}",
+                            self.process.pid()
+                        ))
+                    })?;
+                break envelope;
+            }
+            if let Some(exit_code) = self.process.terminal_exit_code().map_err(|error| {
+                detection_infer_failed(format!(
+                    "persistent detector process status read failed during request {request_id}: {error}"
+                ))
+            })? {
+                let progress = fs::read_to_string(&progress_path)
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
+                return Err(detection_model_not_loaded(format!(
+                    "persistent detector pid {} exited during request {request_id} with kernel exit_code={exit_code}; last_stage={progress:?}",
+                    self.process.pid()
+                )));
+            }
+            if started.elapsed() >= Duration::from_millis(u64::from(DETECTION_WORKER_TIMEOUT_MS)) {
+                let progress = fs::read_to_string(&progress_path)
+                    .unwrap_or_else(|error| format!("unavailable ({error})"));
+                return Err(detection_infer_failed(format!(
+                    "persistent detector pid {} request {request_id} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms; last_stage={progress:?}",
+                    self.process.pid()
+                )));
+            }
+            thread::sleep(Duration::from_millis(DETECTION_WORKER_POLL_MS));
+        };
+
+        fs::remove_file(&response_path).map_err(|error| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} response {request_id} acknowledgement cleanup failed: {error}",
+                self.process.pid()
+            ))
+        })?;
+        fs::remove_file(&rgb_path).map_err(|error| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} frame {request_id} cleanup failed: {error}",
+                self.process.pid()
+            ))
+        })?;
+        if request_path.exists() {
+            return Err(detection_infer_failed(format!(
+                "persistent detector pid {} published response {request_id} without consuming {}",
+                self.process.pid(),
+                request_path.display()
+            )));
+        }
+        if response.request_id != request_id
+            || response.worker_pid != self.process.pid()
+            || response.session_id != self.session_id
+            || response.reservation_id != self.reservation_id
+        {
+            return Err(detection_infer_failed(format!(
+                "persistent detector response attestation mismatch for request {request_id}: expected pid={} session_id={} reservation={:?}; actual={response:?}",
+                self.process.pid(),
+                self.session_id,
+                self.reservation_id
+            )));
+        }
+        if !response.ok {
+            return Err(detection_model_not_loaded(format!(
+                "persistent detector pid {} request {request_id} failed code={} detail={}",
+                self.process.pid(),
+                response.error_code.as_deref().unwrap_or("<missing>"),
+                response.error_detail.as_deref().unwrap_or("<missing>")
+            )));
+        }
+        response.batch.ok_or_else(|| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} request {request_id} returned ok without a detection batch",
+                self.process.pid()
+            ))
+        })
+    }
+
+    fn shutdown(mut self) -> synapse_models::ModelResult<()> {
+        use synapse_models::detection_infer_failed;
+
+        let shutdown_path = self.mailbox.path().join("shutdown.json");
+        write_worker_json_atomic(
+            &shutdown_path,
+            &serde_json::json!({
+                "protocol": DETECTION_WORKER_PROTOCOL,
+                "requested_by_pid": std::process::id(),
+            }),
+        )
+        .map_err(|(code, detail)| {
+            detection_infer_failed(format!(
+                "persistent detector pid {} shutdown publish failed: {code}: {detail}",
+                self.process.pid()
+            ))
+        })?;
+        let verdict = self
+            .process
+            .wait_for_exit(DETECTION_WORKER_SHUTDOWN_TIMEOUT_MS)
+            .map_err(|error| {
+                detection_infer_failed(format!(
+                    "persistent detector pid {} shutdown/cleanup failed: {error}",
+                    self.process.pid()
+                ))
+            })?;
+        let reservation_cleanup = verify_persistent_worker_reservation(
+            verdict.pid,
+            &self.backend,
+            self.reservation_id.as_deref(),
+            false,
+        );
+        if verdict.timed_out || verdict.exit_code != 0 {
+            return Err(detection_infer_failed(format!(
+                "persistent detector pid {} shutdown verdict was timed_out={} exit_code={}; reservation_cleanup={}",
+                verdict.pid,
+                verdict.timed_out,
+                verdict.exit_code,
+                reservation_cleanup
+                    .as_ref()
+                    .map_or_else(|error| error.as_str(), |()| "verified_absent")
+            )));
+        }
+        reservation_cleanup.map_err(detection_infer_failed)
+    }
+}
+
+#[cfg(windows)]
+fn verify_persistent_worker_reservation(
+    worker_pid: u32,
+    backend: &str,
+    reservation_id: Option<&str>,
+    should_exist: bool,
+) -> Result<(), String> {
+    if backend == "cpu" {
+        if reservation_id.is_some() {
+            return Err(format!(
+                "CPU persistent detector pid {worker_pid} unexpectedly reported GPU reservation {reservation_id:?}"
+            ));
+        }
+        return Ok(());
+    }
+    let snapshot = readback_gpu_reservations(0).map_err(|error| {
+        format!("persistent detector pid {worker_pid} GPU reservation readback failed: {error}")
+    })?;
+    let matching = snapshot
+        .reservations
+        .iter()
+        .find(|row| row.pid == worker_pid && reservation_id == Some(row.reservation_id.as_str()));
+    if matching.is_some() != should_exist {
+        return Err(format!(
+            "persistent detector pid {worker_pid} reservation expectation failed: expected_exists={should_exist} reservation_id={reservation_id:?} state_path={} matching={matching:?}",
+            snapshot.state_path
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
 fn infer_in_owned_worker(
+    runtime: &mut DetectionRuntime,
     model_id: &str,
     frame: DetectionFrame,
     opts: DetectOpts,
 ) -> synapse_models::ModelResult<DetectionBatch> {
-    use synapse_models::{detection_infer_failed, detection_model_not_loaded};
-
-    let temp = tempfile::Builder::new()
-        .prefix("synapse-detection-worker-")
-        .tempdir()
-        .map_err(|error| {
-            detection_infer_failed(format!("create worker temp directory: {error}"))
-        })?;
-    let request_path = temp.path().join("request.json");
-    let response_path = temp.path().join("response.json");
-    let rgb_path = temp.path().join("frame.rgb");
-    let progress_path = temp.path().join("progress.txt");
-    fs::write(&rgb_path, &frame.rgb)
-        .map_err(|error| detection_infer_failed(format!("write worker RGB frame: {error}")))?;
-    let request = DetectionWorkerRequest {
-        model_id: model_id.to_owned(),
-        frame_seq: frame.frame_seq,
-        width: frame.width,
-        height: frame.height,
-        rgb_path,
-        progress_path: progress_path.clone(),
-        opts,
-    };
-    fs::write(
-        &request_path,
-        serde_json::to_vec(&request)
-            .map_err(|error| detection_infer_failed(format!("encode worker request: {error}")))?,
-    )
-    .map_err(|error| detection_infer_failed(format!("write worker request: {error}")))?;
-    let args = vec![
-        "--mode".to_owned(),
-        "detection-worker".to_owned(),
-        "--detection-worker-request".to_owned(),
-        request_path.to_string_lossy().into_owned(),
-        "--detection-worker-response".to_owned(),
-        response_path.to_string_lossy().into_owned(),
-    ];
-    let verdict =
-        crate::desktop_worker::run_owned_current_exe_worker(&args, DETECTION_WORKER_TIMEOUT_MS)
-            .map_err(|error| {
-                detection_infer_failed(format!("owned detector process failed: {error}"))
-            })?;
-    let reservation_readback = readback_gpu_reservations(0).map_err(|error| {
-        detection_infer_failed(format!(
-            "isolated detector pid {} reached a terminal process state, but Calyx reservation cleanup readback failed: {error}",
-            verdict.pid
-        ))
-    })?;
-    if reservation_readback
-        .reservations
-        .iter()
-        .any(|row| row.pid == verdict.pid)
+    if runtime
+        .worker
+        .as_ref()
+        .is_some_and(|worker| worker.model_id != model_id)
     {
-        return Err(detection_infer_failed(format!(
-            "isolated detector pid {} reached kernel exit_code={}, but its Calyx reservation remains in {} after separate cleanup readback",
-            verdict.pid, verdict.exit_code, reservation_readback.state_path
-        )));
-    }
-    if verdict.timed_out {
-        let last_stage = fs::read_to_string(&progress_path)
-            .unwrap_or_else(|error| format!("unavailable ({error})"));
-        return Err(detection_infer_failed(format!(
-            "isolated CUDA detector pid {} timed out after {DETECTION_WORKER_TIMEOUT_MS} ms at stage {:?} and was terminated with kernel exit_code={}",
-            verdict.pid, last_stage, verdict.exit_code
-        )));
-    }
-    let response_bytes = fs::read(&response_path).map_err(|error| {
-        detection_infer_failed(format!(
-            "isolated detector pid {} exited {} without readable response: {error}",
-            verdict.pid, verdict.exit_code
-        ))
-    })?;
-    let response: DetectionWorkerEnvelope =
-        serde_json::from_slice(&response_bytes).map_err(|error| {
-            detection_infer_failed(format!(
-                "isolated detector pid {} returned invalid response JSON: {error}",
-                verdict.pid
-            ))
+        let previous = runtime.worker.take().ok_or_else(|| {
+            synapse_models::detection_infer_failed(
+                "persistent detector model-change invariant was violated",
+            )
         })?;
-    if verdict.exit_code != 0 || !response.ok {
-        return Err(detection_model_not_loaded(format!(
-            "isolated detector pid {} failed exit_code={} code={} detail={}",
-            verdict.pid,
-            verdict.exit_code,
-            response.error_code.as_deref().unwrap_or("<missing>"),
-            response.error_detail.as_deref().unwrap_or("<missing>")
-        )));
+        previous.shutdown()?;
     }
-    response.batch.ok_or_else(|| {
-        detection_infer_failed(format!(
-            "isolated detector pid {} returned ok without a detection batch",
-            verdict.pid
-        ))
-    })
+    if runtime.worker.is_none() {
+        runtime.worker = Some(PersistentDetectionWorker::start(model_id)?);
+    }
+    let result = match runtime.worker.as_mut() {
+        Some(worker) => worker.infer(frame, opts),
+        None => Err(synapse_models::detection_infer_failed(
+            "persistent detector startup returned without an owned worker",
+        )),
+    };
+    if result.is_err() {
+        if let Some(worker) = runtime.worker.take() {
+            if let Err(cleanup_error) = worker.shutdown() {
+                let inference_error = match &result {
+                    Ok(_) => "<missing inference error>".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                return Err(synapse_models::detection_infer_failed(format!(
+                    "persistent detector inference failed ({inference_error}); cleanup also failed ({cleanup_error})"
+                )));
+            }
+        }
+    }
+    result
 }
 
 pub fn default_detection_config() -> DetectionRuntimeConfig {
@@ -806,6 +1381,7 @@ pub fn populate_detection_from_state(
     };
     #[cfg(windows)]
     let inference = infer_in_owned_worker(
+        runtime,
         config
             .model_id
             .as_deref()

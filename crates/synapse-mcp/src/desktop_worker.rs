@@ -1451,15 +1451,175 @@ pub(crate) struct OwnedWorkerVerdict {
     pub exit_code: u32,
 }
 
-/// Runs this executable as a suspended, current-desktop worker after assigning
-/// it to a verified kill-on-close Job Object. The returned verdict is backed
-/// by a separate kernel wait and exit-code readback; timeout cleanup is complete
-/// before this function returns.
+/// Process-global ownership for a long-lived worker that remains inside the
+/// same verified kill-on-close Job Object used by one-shot desktop workers.
+///
+/// `windows::HANDLE` is deliberately not stored here: the windows bindings do
+/// not make it `Send`, while kernel handles are process-wide.  The raw values
+/// stay exclusively owned by this object and are reconstructed only for
+/// checked Win32 calls or finalization.  This lets an owning runtime move
+/// between Tokio worker threads without weakening the exact-process/job
+/// teardown contract.
 #[cfg(windows)]
-pub(crate) fn run_owned_current_exe_worker(
+#[derive(Debug)]
+pub(crate) struct OwnedWorkerProcess {
+    process_handle: Option<isize>,
+    thread_handle: Option<isize>,
+    job_handle: Option<isize>,
+    job_assigned: bool,
+    terminal_verified: bool,
+    terminal_exit_code: Option<u32>,
+    pid: u32,
+}
+
+#[cfg(windows)]
+impl OwnedWorkerProcess {
+    fn from_handles(handles: &mut WorkerProcessHandles) -> Self {
+        let process = Self {
+            process_handle: handles.process.map(|handle| handle.0 as isize),
+            thread_handle: handles.thread.map(|handle| handle.0 as isize),
+            job_handle: handles.job.map(|handle| handle.0 as isize),
+            job_assigned: handles.job_assigned,
+            terminal_verified: handles.terminal_verified,
+            terminal_exit_code: handles.terminal_exit_code,
+            pid: handles.pid,
+        };
+        handles.process = None;
+        handles.thread = None;
+        handles.job = None;
+        handles.job_assigned = false;
+        process
+    }
+
+    fn take_handles(&mut self) -> WorkerProcessHandles {
+        fn restore(raw: isize) -> windows::Win32::Foundation::HANDLE {
+            windows::Win32::Foundation::HANDLE(raw as *mut core::ffi::c_void)
+        }
+
+        WorkerProcessHandles {
+            process: self.process_handle.take().map(restore),
+            thread: self.thread_handle.take().map(restore),
+            job: self.job_handle.take().map(restore),
+            job_assigned: std::mem::take(&mut self.job_assigned),
+            terminal_verified: self.terminal_verified,
+            terminal_exit_code: self.terminal_exit_code,
+            child_created: true,
+            retained_owner_id: None,
+            pid: self.pid,
+        }
+    }
+
+    #[must_use]
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Returns `None` only when the exact process handle is still unsignaled.
+    /// A signaled process is followed by a separate kernel exit-code read.
+    pub fn terminal_exit_code(&mut self) -> Result<Option<u32>, String> {
+        use windows::Win32::{
+            Foundation::{HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT},
+            System::Threading::{GetExitCodeProcess, WaitForSingleObject},
+        };
+
+        if self.terminal_verified {
+            return Ok(self.terminal_exit_code);
+        }
+        let raw = self.process_handle.ok_or_else(|| {
+            format!(
+                "persistent owned worker pid {} has no process handle",
+                self.pid
+            )
+        })?;
+        let process = HANDLE(raw as *mut core::ffi::c_void);
+        let wait = unsafe { WaitForSingleObject(process, 0) };
+        if wait == WAIT_TIMEOUT {
+            return Ok(None);
+        }
+        if wait != WAIT_OBJECT_0 {
+            let last_error = (wait == WAIT_FAILED)
+                .then(windows::core::Error::from_thread)
+                .map_or_else(|| "not available".to_owned(), |error| error.to_string());
+            return Err(format!(
+                "WaitForSingleObject returned {wait:?} for persistent owned worker pid {}; last_error={last_error}",
+                self.pid
+            ));
+        }
+        let mut exit_code = STILL_ACTIVE_EXIT_CODE;
+        unsafe { GetExitCodeProcess(process, &raw mut exit_code) }.map_err(|error| {
+            format!(
+                "GetExitCodeProcess failed for signaled persistent owned worker pid {}: {error}",
+                self.pid
+            )
+        })?;
+        if exit_code == STILL_ACTIVE_EXIT_CODE {
+            return Err(format!(
+                "persistent owned worker pid {} was signaled but returned STILL_ACTIVE",
+                self.pid
+            ));
+        }
+        self.terminal_verified = true;
+        self.terminal_exit_code = Some(exit_code);
+        Ok(Some(exit_code))
+    }
+
+    /// Waits for a requested graceful exit, terminating the exact job on
+    /// timeout, and consumes every kernel handle through the common checked
+    /// finalizer before returning.
+    pub fn wait_for_exit(&mut self, timeout_ms: u32) -> Result<OwnedWorkerVerdict, String> {
+        let mut handles = self.take_handles();
+        let result = wait_for_worker_process(&mut handles, timeout_ms);
+        let finalization =
+            finalize_worker_process_handles(&mut handles, "persistent_worker_result_cleanup");
+        let verdict = result?;
+        if !finalization.failures.is_empty() {
+            return Err(format!(
+                "persistent owned worker pid {} reached exit_code={} timed_out={}, but handle finalization failed: {}; retained={}",
+                verdict.pid,
+                verdict.exit_code,
+                verdict.timed_out,
+                finalization.failures.join("; "),
+                finalization.retained
+            ));
+        }
+        self.terminal_verified = true;
+        self.terminal_exit_code = Some(verdict.exit_code);
+        Ok(OwnedWorkerVerdict {
+            pid: verdict.pid,
+            timed_out: verdict.timed_out,
+            exit_code: verdict.exit_code,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for OwnedWorkerProcess {
+    fn drop(&mut self) {
+        if self.process_handle.is_none()
+            && self.thread_handle.is_none()
+            && self.job_handle.is_none()
+        {
+            return;
+        }
+        let mut handles = self.take_handles();
+        let report = finalize_worker_process_handles(&mut handles, "persistent_worker_drop");
+        if !report.failures.is_empty() {
+            report_worker_process_lifecycle_failure(
+                "MCP_PERSISTENT_WORKER_HANDLE_DROP_FAILED",
+                self.pid,
+                "persistent_worker_drop",
+                &report.failures.join("; "),
+            );
+        }
+    }
+}
+
+/// Starts this executable as a long-lived suspended worker, proves Job Object
+/// assignment, resumes it, and transfers exact kernel ownership to the caller.
+#[cfg(windows)]
+pub(crate) fn spawn_owned_current_exe_worker(
     args: &[String],
-    timeout_ms: u32,
-) -> Result<OwnedWorkerVerdict, String> {
+) -> Result<OwnedWorkerProcess, String> {
     use windows::{
         Win32::System::Threading::{
             CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
@@ -1513,24 +1673,7 @@ pub(crate) fn run_owned_current_exe_worker(
             handles.pid, finalization.failures, finalization.retained
         ));
     }
-    let result = wait_for_worker_process(&mut handles, timeout_ms);
-    let finalization = finalize_worker_process_handles(&mut handles, "owned_worker_result_cleanup");
-    let verdict = result?;
-    if !finalization.failures.is_empty() {
-        return Err(format!(
-            "owned worker pid {} reached exit_code={} timed_out={}, but handle finalization failed: {}; retained={}",
-            verdict.pid,
-            verdict.exit_code,
-            verdict.timed_out,
-            finalization.failures.join("; "),
-            finalization.retained
-        ));
-    }
-    Ok(OwnedWorkerVerdict {
-        pid: verdict.pid,
-        timed_out: verdict.timed_out,
-        exit_code: verdict.exit_code,
-    })
+    Ok(OwnedWorkerProcess::from_handles(&mut handles))
 }
 
 #[cfg(windows)]

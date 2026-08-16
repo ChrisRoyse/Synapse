@@ -2789,6 +2789,25 @@ impl SynapseService {
                 // when the active profile requested none.
                 let bundle = crate::m1::detection_bundle_readback();
                 let mut detection = perception_detection_health(&state);
+                match state
+                    .detection_runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.persistent_worker_readback())
+                {
+                    Some(worker) => {
+                        detection.persistent_worker_status = "ready".to_owned();
+                        detection.persistent_worker_pid = Some(worker.worker_pid);
+                        detection.persistent_worker_model_id = Some(worker.model_id);
+                        detection.persistent_worker_backend = Some(worker.backend);
+                        detection.persistent_worker_session_id = Some(worker.session_id);
+                        detection.persistent_worker_requests_started =
+                            Some(worker.requests_started);
+                    }
+                    None if state.detection_runtime.is_none() => {
+                        detection.persistent_worker_status = "busy".to_owned();
+                    }
+                    None => {}
+                }
                 let bundled_blob = match &bundle {
                     Ok(bundle) => {
                         detection.bundled_model_id = Some(bundle.model_id.to_owned());
@@ -2799,11 +2818,13 @@ impl SynapseService {
                         detection.bundled_materialized_path =
                             Some(bundle.materialized_path.clone());
                         format!(
-                            "bundled_detection_provider={} bundled_detection_model={} model_source=executable_bundle bundled_materialized={} bundled_materialized_verified={} bundled_materialized_path={}",
+                            "bundled_detection_provider={} bundled_detection_model={} model_source=executable_bundle bundled_materialized={} bundled_materialized_verified={} bundled_materialized_bytes={:?} bundled_materialized_modified_unix_ms={:?} bundled_materialized_verification_basis=len_mtime_availability_only_full_sha256_before_session_load bundled_materialized_path={}",
                             bundle.provider,
                             bundle.model_id,
                             bundle.materialized,
                             bundle.materialized_verified,
+                            bundle.materialized_bytes,
+                            bundle.materialized_modified_unix_ms,
                             bundle.materialized_path
                         )
                     }
@@ -3338,6 +3359,12 @@ fn perception_detection_health(state: &crate::m1::M1State) -> PerceptionDetectio
         bundled_materialized: None,
         bundled_materialized_verified: None,
         bundled_materialized_path: None,
+        persistent_worker_status: "not_started".to_owned(),
+        persistent_worker_pid: None,
+        persistent_worker_model_id: None,
+        persistent_worker_backend: None,
+        persistent_worker_session_id: None,
+        persistent_worker_requests_started: None,
     }
 }
 

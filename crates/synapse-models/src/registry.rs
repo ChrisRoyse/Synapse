@@ -1,5 +1,5 @@
 use crate::{ModelDescriptor, default_model_dir};
-use crate::{ModelError, ModelResult, normalize_sha256, sha256_file};
+use crate::{ModelError, ModelResult, VerifiedModelDescriptor, normalize_sha256, sha256_file};
 use sha2::Digest;
 use std::{
     fmt::Write as _,
@@ -358,12 +358,25 @@ impl RegisteredModel {
     /// Returns a structured model-load error when the embedded bytes or the
     /// materialized file do not match the pinned registry hash.
     pub fn materialize_embedded(self) -> ModelResult<ModelDescriptor> {
+        self.materialize_embedded_verified()
+            .map(VerifiedModelDescriptor::into_descriptor)
+    }
+
+    /// Materializes and cryptographically verifies this model, carrying the
+    /// verification proof into session construction so the same file is not
+    /// hashed again immediately by [`crate::ModelLoader`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a structured model-load error when the embedded bytes or the
+    /// materialized file do not match the pinned registry hash.
+    pub fn materialize_embedded_verified(self) -> ModelResult<VerifiedModelDescriptor> {
         let descriptor = self.descriptor();
         let expected = normalize_sha256(self.sha256);
         if descriptor.path.exists()
             && sha256_file(&descriptor.path).ok().as_deref() == Some(expected.as_str())
         {
-            return Ok(descriptor);
+            return Ok(VerifiedModelDescriptor::new(descriptor));
         }
         let bytes = self.embedded_bytes()?;
         let mut embedded_actual = String::with_capacity(64);
@@ -420,7 +433,7 @@ impl RegisteredModel {
                 actual,
             });
         }
-        Ok(descriptor)
+        Ok(VerifiedModelDescriptor::new(descriptor))
     }
 }
 

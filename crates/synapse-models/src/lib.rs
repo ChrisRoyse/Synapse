@@ -30,6 +30,7 @@ pub use registry::{
 };
 pub use session::{
     LoadedModel, ModelLoader, OrtSessionFactory, SessionBuildResult, SessionFactory, SessionHandle,
+    VerifiedModelDescriptor,
 };
 pub use verify::{normalize_sha256, sha256_file};
 
