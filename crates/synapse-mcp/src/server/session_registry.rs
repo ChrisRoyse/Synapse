@@ -509,6 +509,16 @@ impl SessionRegistry {
             .collect()
     }
 
+    pub(crate) fn read_for_session(
+        &self,
+        session_id: &str,
+        now_unix_ms: u64,
+    ) -> Option<SessionRegistryRead> {
+        self.entries
+            .get(session_id)
+            .map(|entry| self.entry_read(entry, now_unix_ms))
+    }
+
     pub(crate) fn entry_read(
         &self,
         entry: &SessionRegistryEntry,

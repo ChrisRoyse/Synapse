@@ -294,10 +294,25 @@ impl ServerHandler for SynapseService {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, ErrorData> {
         let mcp_session_id = super::context::mcp_session_id_from_request_context(&context)?;
+        let _authority_gate = if let Some(session_id) = mcp_session_id.as_deref() {
+            let gate = self.lock_session_authority(session_id).await?;
+            self.reject_terminated_session_tool_call("tools/list", session_id)?;
+            Some(gate)
+        } else {
+            None
+        };
         // Normalize schemas before they reach the client, then apply the
         // session's durable tool profile. The policy gate in `call_tool` uses
         // the same profile row so hand-written calls cannot bypass discovery.
         let tools = self.tools_for_session_profile(mcp_session_id.as_deref())?;
+        if let Some(session_id) = mcp_session_id.as_deref() {
+            // The 2025-11-25 Streamable-HTTP transport binds tools/list and
+            // later tools/call requests with Mcp-Session-Id. Persist the exact
+            // sanitized response surface before returning it. A 2026-07-28
+            // stateless transport must use a different request-scoped design;
+            // this row never claims to cover that future protocol boundary.
+            self.persist_session_tool_surface_attestation(session_id, &tools)?;
+        }
         Ok(rmcp::model::ListToolsResult {
             tools,
             meta: None,

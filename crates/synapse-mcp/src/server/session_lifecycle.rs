@@ -337,6 +337,9 @@ pub struct SessionContinuityCleanupReport {
     pub profile_row_existed_before: bool,
     pub profile_row_deleted: bool,
     pub profile_row_exists_after: bool,
+    pub tool_surface_attestation_row_existed_before: bool,
+    pub tool_surface_attestation_row_deleted: bool,
+    pub tool_surface_attestation_row_exists_after: bool,
     pub failed: bool,
     pub error_message: Option<String>,
 }
@@ -2037,6 +2040,27 @@ impl SessionLifecycleState {
                 let detail = error.message.to_string();
                 report.error_message = Some(match report.error_message.take() {
                     Some(existing) => format!("{existing}; profile cleanup: {detail}"),
+                    None => detail,
+                });
+            }
+        }
+        match self
+            .authority_service
+            .delete_session_tool_surface_attestation_for_terminated_session(session_id)
+        {
+            Ok((existed_before, deleted)) => {
+                report.tool_surface_attestation_row_existed_before = existed_before;
+                report.tool_surface_attestation_row_deleted = deleted;
+                report.tool_surface_attestation_row_exists_after = false;
+            }
+            Err(error) => {
+                report.failed = true;
+                report.tool_surface_attestation_row_exists_after = true;
+                let detail = error.message.to_string();
+                report.error_message = Some(match report.error_message.take() {
+                    Some(existing) => {
+                        format!("{existing}; tool-surface attestation cleanup: {detail}")
+                    }
                     None => detail,
                 });
             }

@@ -24,6 +24,10 @@ const TOOL_PROFILE_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-profile/v1/<ses
 const PROFILE_REGISTRY_QUERY_SOURCE_OF_TRUTH: &str = "CF_PROFILES profile_registry/v1/* + CF_KV profile_registry/v1/head/* and audit-export consent rows + bounded CF_ACTION_LOG/CF_OBSERVATIONS/CF_EVENTS report reads";
 const TOOL_PROFILE_ROW_KIND: &str = "mcp_tool_profile";
 const TOOL_PROFILE_SCHEMA_VERSION: u32 = 1;
+const SESSION_TOOL_SURFACE_ATTESTATION_PREFIX: &str = "mcp/tool-surface-attestation/v1/";
+const SESSION_TOOL_SURFACE_ATTESTATION_SOURCE_OF_TRUTH: &str = "CF_SESSIONS mcp/tool-surface-attestation/v1/<session_id> + live sanitized tools/list + MCP session registry";
+const SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND: &str = "mcp_session_tool_surface_attestation";
+const SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION: u32 = 1;
 const MAX_PROFILE_REASON_CHARS: usize = 1024;
 /// #1559: source of truth for the runtime reality-write opt-in overlay.
 const REALITY_WRITE_GRANT_SOURCE_OF_TRUTH: &str =
@@ -57,8 +61,8 @@ const FACADE_SCHEMA_PARITY_REMEDIATION: &str = "add an op(...) entry to that fac
 /// A cycle or an unexpectedly deep indirection resolves to `unresolved`, which
 /// fails the gate rather than passing it.
 const FACADE_SCHEMA_MAX_REF_DEPTH: usize = 8;
-const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "%APPDATA%\\synapse\\codex-tool-surface.json + live daemon health.tool_surface_sha256 + %LOCALAPPDATA%\\synapse\\codex-restart-handoffs + live OS process table";
-const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff; rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing, missing public tools, or hash-mismatched with the live daemon surface";
+const CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH: &str = "caller: CF_SESSIONS mcp/tool-surface-attestation/v1/<session_id> + MCP session registry; host diagnostic: %APPDATA%\\synapse\\codex-tool-surface.json + live daemon health.tool_surface_sha256 + %LOCALAPPDATA%\\synapse\\codex-restart-handoffs + live OS process table";
+const CODEX_CLIENT_SURFACE_REMEDIATION: &str = "when status=caller_session_attested_current, use the caller-session attestation as the effective verdict and retain host_status only as a separate host diagnostic; otherwise restart Codex through the patched launcher when a live stale codex.exe PID is named by the latest handoff, or rerun scripts\\synapse-setup.ps1 if the host tool-surface snapshot is missing, missing public tools, or hash-mismatched with the live daemon surface";
 const CODEX_CLIENT_SURFACE_SCHEMA_STALE_DOCTOR_COMMAND: &str = "pwsh -NoProfile -File .\\scripts\\synapse-codex-doctor.ps1 -ProjectDir C:\\code\\Synapse -ObservedSynapseSchemaStale -ActiveIssue <issue>";
 const CODEX_CLIENT_SURFACE_SCHEMA_STALE_READBACK_COMMAND: &str = "Get-Content .\\STATE\\RECOVERY_NOTES.md; Get-ChildItem \"$env:LOCALAPPDATA\\synapse\\codex-restart-handoffs\" -Filter 'codex-restart-handoff-*.json' | Sort-Object LastWriteTime -Descending | Select-Object -First 1";
 
@@ -4018,6 +4022,8 @@ pub(crate) struct ToolProfileSnapshot {
 #[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CodexClientSurfaceStatus {
+    CallerSessionAttestedCurrent,
+    CallerSessionAttestationStale,
     HostSnapshotMatchesLiveToolSurface,
     HostSnapshotMissing,
     HostSnapshotReadError,
@@ -4118,6 +4124,8 @@ pub(crate) struct CodexClientSurfaceSnapshot {
     pub source_of_truth: &'static str,
     pub status: CodexClientSurfaceStatus,
     pub diagnostic_code: &'static str,
+    pub host_status: CodexClientSurfaceStatus,
+    pub host_diagnostic_code: &'static str,
     pub remediation: &'static str,
     pub live_tool_count: usize,
     pub live_tool_surface_sha256: String,
@@ -4135,6 +4143,45 @@ pub(crate) struct CodexClientSurfaceSnapshot {
     pub live_stale_codex_process: Option<CodexProcessReadback>,
     pub public_tools_missing_from_host_snapshot: Vec<String>,
     pub host_snapshot_tools_missing_from_public_registry: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_session_attestation: Option<Box<SessionToolSurfaceAttestationReadback>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionToolSurfaceAttestation {
+    pub schema_version: u32,
+    pub row_kind: String,
+    pub session_id: String,
+    pub transport: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol_version: Option<String>,
+    pub agent_kind: String,
+    pub request_observed_at_unix_ms: u64,
+    pub listed_at_unix_ms: u64,
+    pub tool_count: usize,
+    pub tool_surface_sha256: String,
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SessionToolSurfaceAttestationReadback {
+    pub source_of_truth: &'static str,
+    pub cf_name: &'static str,
+    pub key_hex: String,
+    pub value_len_bytes: u64,
+    pub value_sha256: String,
+    pub record: SessionToolSurfaceAttestation,
+    pub live_tool_count: usize,
+    pub live_tool_surface_sha256: String,
+    pub matches_live_tool_surface: bool,
+    pub subsequent_tool_call_observed: bool,
+    pub session_registry: super::session_registry::SessionRegistryRead,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -4980,6 +5027,184 @@ impl SynapseService {
         Ok(tools)
     }
 
+    pub(crate) fn persist_session_tool_surface_attestation(
+        &self,
+        session_id: &str,
+        tools: &[Tool],
+    ) -> Result<SessionToolSurfaceAttestationReadback, ErrorData> {
+        let fingerprint = session_tool_surface_fingerprint(session_id, tools)?;
+        let registry = self.session_registry_read_for_attestation(session_id)?;
+        if registry.lifecycle != "live" || registry.last_action.as_deref() != Some("tools/list") {
+            return Err(session_tool_surface_attestation_error(
+                error_codes::HTTP_SESSION_INVALID,
+                session_id,
+                format!(
+                    "tools/list attestation requires a live initialized session whose current request is tools/list; lifecycle={} last_action={:?}",
+                    registry.lifecycle, registry.last_action
+                ),
+                "initialize a fresh Streamable-HTTP MCP session and issue tools/list through that session before calling any tool",
+            ));
+        }
+        let record = SessionToolSurfaceAttestation {
+            schema_version: SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION,
+            row_kind: SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND.to_owned(),
+            session_id: session_id.to_owned(),
+            transport: registry.transport.clone(),
+            client_name: registry.client_name.clone(),
+            client_version: registry.client_version.clone(),
+            protocol_version: registry.protocol_version.clone(),
+            agent_kind: registry.agent_kind.clone(),
+            request_observed_at_unix_ms: registry.last_seen_unix_ms,
+            listed_at_unix_ms: unix_ms_now().max(registry.last_seen_unix_ms),
+            tool_count: fingerprint.names.len(),
+            tool_surface_sha256: fingerprint.sha256.clone(),
+            tool_names: fingerprint.names,
+        };
+        let encoded = synapse_storage::encode_json(&record).map_err(|error| {
+            session_tool_surface_attestation_error(
+                error_codes::TOOL_INTERNAL_ERROR,
+                session_id,
+                format!("encode tools/list attestation row failed: {error}"),
+                "repair the attestation serializer; tools/list is refused until the exact served surface can be persisted",
+            )
+        })?;
+        let expected_value_sha256 = sha256_hex(&encoded);
+        let key = session_tool_surface_attestation_key(session_id);
+        self.m3_storage()?
+            .put_batch_pressure_bypass(cf::CF_SESSIONS, [(key, encoded)])
+            .map_err(|error| {
+                session_tool_surface_attestation_error(
+                    error.code(),
+                    session_id,
+                    format!("persist tools/list attestation row failed: {error}"),
+                    "repair CF_SESSIONS write availability; tools/list is refused until its exact surface can be persisted and read back",
+                )
+            })?;
+        let readback = self.read_session_tool_surface_attestation_for_tools(session_id, tools)?;
+        if readback.value_sha256 != expected_value_sha256
+            || !readback.matches_live_tool_surface
+            || readback.record != record
+        {
+            return Err(session_tool_surface_attestation_error(
+                error_codes::STORAGE_CORRUPTED,
+                session_id,
+                format!(
+                    "tools/list attestation write/readback mismatch: expected_value_sha256={expected_value_sha256} actual_value_sha256={} matches_live_tool_surface={}",
+                    readback.value_sha256, readback.matches_live_tool_surface
+                ),
+                "inspect the exact CF_SESSIONS row and storage write path; do not serve tools until byte identity and the live surface match",
+            ));
+        }
+        tracing::info!(
+            code = "MCP_SESSION_TOOL_SURFACE_ATTESTED",
+            session_id,
+            client_name = ?record.client_name,
+            protocol_version = ?record.protocol_version,
+            tool_count = record.tool_count,
+            tool_surface_sha256 = %record.tool_surface_sha256,
+            value_sha256 = %readback.value_sha256,
+            key_hex = %readback.key_hex,
+            "persisted and independently read back the exact session tools/list surface"
+        );
+        Ok(readback)
+    }
+
+    fn session_registry_read_for_attestation(
+        &self,
+        session_id: &str,
+    ) -> Result<super::session_registry::SessionRegistryRead, ErrorData> {
+        self.session_registry_ref()
+            .lock()
+            .map_err(|_| {
+                session_tool_surface_attestation_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    session_id,
+                    "MCP session registry lock poisoned while binding tools/list attestation",
+                    "restart the daemon and inspect the first panic that poisoned the session registry",
+                )
+            })?
+            .read_for_session(session_id, unix_ms_now())
+            .ok_or_else(|| {
+                session_tool_surface_attestation_error(
+                    error_codes::HTTP_SESSION_INVALID,
+                    session_id,
+                    "MCP session registry has no initialized row for tools/list attestation",
+                    "initialize a fresh Streamable-HTTP MCP session before issuing tools/list",
+                )
+            })
+    }
+
+    fn read_session_tool_surface_attestation_for_tools(
+        &self,
+        session_id: &str,
+        tools: &[Tool],
+    ) -> Result<SessionToolSurfaceAttestationReadback, ErrorData> {
+        let fingerprint = session_tool_surface_fingerprint(session_id, tools)?;
+        let key = session_tool_surface_attestation_key(session_id);
+        let value = self
+            .m3_storage()?
+            .get_cf(cf::CF_SESSIONS, &key)
+            .map_err(|error| {
+                session_tool_surface_attestation_error(
+                    error.code(),
+                    session_id,
+                    format!("read tools/list attestation row failed: {error}"),
+                    "repair CF_SESSIONS read availability and retry the exact same MCP session",
+                )
+            })?
+            .ok_or_else(|| {
+                session_tool_surface_attestation_error(
+                    error_codes::MCP_TOOL_SURFACE_ATTESTATION_MISSING,
+                    session_id,
+                    "no physical tools/list attestation row exists for this MCP session",
+                    "make the production client issue tools/list in this initialized session before calling a tool; do not substitute a direct tools/call",
+                )
+            })?;
+        let record = synapse_storage::decode_json::<SessionToolSurfaceAttestation>(&value)
+            .map_err(|error| {
+                session_tool_surface_attestation_error(
+                    error_codes::STORAGE_CORRUPTED,
+                    session_id,
+                    format!(
+                        "decode tools/list attestation row failed for key_hex={}: {error}",
+                        hex_lower(&key)
+                    ),
+                    "inspect and repair the exact CF_SESSIONS row; never infer a surface from a corrupt attestation",
+                )
+            })?;
+        validate_session_tool_surface_attestation_record(session_id, &record)?;
+        let registry = self.session_registry_read_for_attestation(session_id)?;
+        let subsequent_tool_call_observed = registry
+            .last_action
+            .as_deref()
+            .is_some_and(|action| action.starts_with("tools/call:"))
+            && registry.last_seen_unix_ms >= record.request_observed_at_unix_ms;
+        let matches_live_tool_surface = record.tool_count == fingerprint.names.len()
+            && tool_surface_hashes_match(&record.tool_surface_sha256, &fingerprint.sha256)
+            && record.tool_names == fingerprint.names;
+        Ok(SessionToolSurfaceAttestationReadback {
+            source_of_truth: SESSION_TOOL_SURFACE_ATTESTATION_SOURCE_OF_TRUTH,
+            cf_name: cf::CF_SESSIONS,
+            key_hex: hex_lower(&key),
+            value_len_bytes: value.len() as u64,
+            value_sha256: sha256_hex(&value),
+            record,
+            live_tool_count: fingerprint.names.len(),
+            live_tool_surface_sha256: fingerprint.sha256,
+            matches_live_tool_surface,
+            subsequent_tool_call_observed,
+            session_registry: registry,
+        })
+    }
+
+    fn current_session_tool_surface_attestation(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionToolSurfaceAttestationReadback, ErrorData> {
+        let tools = self.tools_for_session_profile(Some(session_id))?;
+        self.read_session_tool_surface_attestation_for_tools(session_id, &tools)
+    }
+
     pub(crate) fn tool_profile_snapshot(
         &self,
         session_id: Option<&str>,
@@ -5030,6 +5255,24 @@ impl SynapseService {
                 .clone(),
         )?;
         snapshot.session_id = session_id.map(ToOwned::to_owned);
+        if let Some(session_id) = session_id {
+            let attestation = self.current_session_tool_surface_attestation(session_id)?;
+            snapshot.codex_client_surface.host_status = snapshot.codex_client_surface.status;
+            snapshot.codex_client_surface.host_diagnostic_code =
+                snapshot.codex_client_surface.diagnostic_code;
+            if attestation.matches_live_tool_surface && attestation.subsequent_tool_call_observed {
+                snapshot.codex_client_surface.status =
+                    CodexClientSurfaceStatus::CallerSessionAttestedCurrent;
+                snapshot.codex_client_surface.diagnostic_code =
+                    "CODEX_CLIENT_SURFACE_CALLER_SESSION_ATTESTED_CURRENT";
+            } else {
+                snapshot.codex_client_surface.status =
+                    CodexClientSurfaceStatus::CallerSessionAttestationStale;
+                snapshot.codex_client_surface.diagnostic_code =
+                    error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE;
+            }
+            snapshot.codex_client_surface.caller_session_attestation = Some(Box::new(attestation));
+        }
         snapshot.source = source;
         snapshot.foreground_route = foreground_route_readiness(session_id, profile);
         snapshot.policy_row = policy_row;
@@ -5063,6 +5306,22 @@ impl SynapseService {
         let full_tool_names = self.full_tool_names();
         if !full_tool_names.iter().any(|name| name == tool_name) {
             return Ok(());
+        }
+        let attestation = self.current_session_tool_surface_attestation(session_id)?;
+        if !attestation.matches_live_tool_surface || !attestation.subsequent_tool_call_observed {
+            return Err(session_tool_surface_attestation_error(
+                error_codes::MCP_TOOL_SURFACE_ATTESTATION_STALE,
+                session_id,
+                format!(
+                    "caller session has not accepted the current tools/list surface: attested_count={} live_count={} attested_sha256={} live_sha256={} subsequent_tool_call_observed={}",
+                    attestation.record.tool_count,
+                    attestation.live_tool_count,
+                    attestation.record.tool_surface_sha256,
+                    attestation.live_tool_surface_sha256,
+                    attestation.subsequent_tool_call_observed
+                ),
+                "honor notifications/tools/list_changed or reconnect, then issue tools/list in this same MCP session before retrying the tool call",
+            ));
         }
         let row = self.ensure_tool_profile_assignment(session_id)?;
         if row.record.profile.is_visible(tool_name) {
@@ -5386,6 +5645,41 @@ impl SynapseService {
             row_existed_before,
             row_exists_after,
             "readback=CF_SESSIONS after=terminated_session_profile_absent"
+        );
+        Ok((row_existed_before, row_existed_before && !row_exists_after))
+    }
+
+    pub(super) fn delete_session_tool_surface_attestation_for_terminated_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(bool, bool), ErrorData> {
+        let db = self.m3_storage()?;
+        let key = session_tool_surface_attestation_key(session_id);
+        let row_existed_before = db
+            .get_cf(cf::CF_SESSIONS, &key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .is_some();
+        db.delete_batch(cf::CF_SESSIONS, [key.clone()])
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?;
+        let row_exists_after = db
+            .get_cf(cf::CF_SESSIONS, &key)
+            .map_err(|error| mcp_error(error.code(), error.to_string()))?
+            .is_some();
+        if row_exists_after {
+            return Err(session_tool_surface_attestation_error(
+                error_codes::STORAGE_CORRUPTED,
+                session_id,
+                "tools/list attestation row still exists after terminated-session teardown",
+                "inspect the exact CF_SESSIONS delete failure before considering session teardown complete",
+            ));
+        }
+        tracing::info!(
+            code = "MCP_SESSION_TOOL_SURFACE_ATTESTATION_DELETED",
+            session_id,
+            row_existed_before,
+            row_exists_after,
+            key_hex = %hex_lower(&key),
+            "readback=CF_SESSIONS after=terminated_session_tool_surface_attestation_absent"
         );
         Ok((row_existed_before, row_existed_before && !row_exists_after))
     }
@@ -6563,6 +6857,107 @@ fn tool_profile_key(session_id: &str) -> Vec<u8> {
     format!("{TOOL_PROFILE_PREFIX}{session_id}").into_bytes()
 }
 
+fn session_tool_surface_attestation_key(session_id: &str) -> Vec<u8> {
+    format!("{SESSION_TOOL_SURFACE_ATTESTATION_PREFIX}{session_id}").into_bytes()
+}
+
+fn session_tool_surface_fingerprint(
+    session_id: &str,
+    tools: &[Tool],
+) -> Result<super::health::ToolSurfaceFingerprint, ErrorData> {
+    let fingerprint = super::health::tool_surface_fingerprint_for_tools(tools.to_vec());
+    if let Some(detail) = fingerprint.error.as_deref() {
+        return Err(session_tool_surface_attestation_error(
+            error_codes::TOOL_INTERNAL_ERROR,
+            session_id,
+            format!("fingerprint sanitized tools/list surface failed: {detail}"),
+            "repair the exact tool schema that cannot be canonically serialized; tools/list is refused until the surface has a stable SHA-256",
+        ));
+    }
+    Ok(fingerprint)
+}
+
+fn validate_session_tool_surface_attestation_record(
+    session_id: &str,
+    record: &SessionToolSurfaceAttestation,
+) -> Result<(), ErrorData> {
+    let names_are_strictly_sorted = record.tool_names.windows(2).all(|pair| pair[0] < pair[1]);
+    let hash_is_sha256 = record.tool_surface_sha256.len() == 64
+        && record
+            .tool_surface_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit());
+    let valid = record.schema_version == SESSION_TOOL_SURFACE_ATTESTATION_SCHEMA_VERSION
+        && record.row_kind == SESSION_TOOL_SURFACE_ATTESTATION_ROW_KIND
+        && record.session_id == session_id
+        && !record.transport.trim().is_empty()
+        && record
+            .client_name
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && record
+            .client_version
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && record
+            .protocol_version
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        && !record.agent_kind.trim().is_empty()
+        && record.request_observed_at_unix_ms != 0
+        && record.listed_at_unix_ms >= record.request_observed_at_unix_ms
+        && record.tool_count != 0
+        && record.tool_count == record.tool_names.len()
+        && record.tool_names.iter().all(|name| !name.trim().is_empty())
+        && names_are_strictly_sorted
+        && hash_is_sha256;
+    if valid {
+        return Ok(());
+    }
+    Err(session_tool_surface_attestation_error(
+        error_codes::STORAGE_CORRUPTED,
+        session_id,
+        format!(
+            "invalid tools/list attestation row: schema_version={} row_kind={:?} row_session_id={:?} transport={:?} client_name={:?} client_version={:?} protocol_version={:?} agent_kind={:?} request_observed_at_unix_ms={} listed_at_unix_ms={} tool_count={} tool_names_len={} names_strictly_sorted={} hash_is_sha256={}",
+            record.schema_version,
+            record.row_kind,
+            record.session_id,
+            record.transport,
+            record.client_name,
+            record.client_version,
+            record.protocol_version,
+            record.agent_kind,
+            record.request_observed_at_unix_ms,
+            record.listed_at_unix_ms,
+            record.tool_count,
+            record.tool_names.len(),
+            names_are_strictly_sorted,
+            hash_is_sha256
+        ),
+        "inspect and repair the exact CF_SESSIONS attestation row; never infer or normalize a malformed caller surface",
+    ))
+}
+
+fn session_tool_surface_attestation_error(
+    code: &str,
+    session_id: &str,
+    message: impl Into<String>,
+    remediation: &str,
+) -> ErrorData {
+    let message = message.into();
+    ErrorData::new(
+        ErrorCode(-32099),
+        message.clone(),
+        Some(json!({
+            "code": code,
+            "message": message,
+            "remediation": remediation,
+            "session_id": session_id,
+            "source_of_truth": SESSION_TOOL_SURFACE_ATTESTATION_SOURCE_OF_TRUTH,
+        })),
+    )
+}
+
 fn audit_readback(
     readback: super::command_audit::CommandAuditRowReadback,
 ) -> ToolProfileAuditReadback {
@@ -6726,6 +7121,8 @@ fn codex_client_surface_snapshot(
         source_of_truth: CODEX_CLIENT_SURFACE_SOURCE_OF_TRUTH,
         status,
         diagnostic_code,
+        host_status: status,
+        host_diagnostic_code: diagnostic_code,
         remediation: CODEX_CLIENT_SURFACE_REMEDIATION,
         live_tool_count,
         live_tool_surface_sha256,
@@ -6739,6 +7136,7 @@ fn codex_client_surface_snapshot(
         live_stale_codex_process,
         public_tools_missing_from_host_snapshot,
         host_snapshot_tools_missing_from_public_registry,
+        caller_session_attestation: None,
     }
 }
 
