@@ -275,16 +275,23 @@ async fn run_periodic_vault_verify_once(service: &SynapseService) {
     // guard prevents tree rewrites, but it does not bound independent readers'
     // aggregate resident sets. The owned permit remains inside the blocking
     // task if this scheduler future is cancelled during shutdown.
-    let result = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
-        "periodic_vault_verify",
-        move || {
-            crate::m3::hygiene::run_vault_verify_typed(
-                &db,
-                &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
-            )
-        },
-    )
-    .await;
+    // This is a scheduler-owned convergence pass, not a foreground MCP
+    // request. It has no client transport deadline, so cancelling its fair
+    // semaphore wait after the foreground one-second budget would permanently
+    // skip verification whenever startup derived-state legitimately owns the
+    // lane. Keep one whole-corpus owner, but wait for that owner to finish and
+    // then run this pass to completion on the blocking pool.
+    let result =
+        synapse_storage::maintenance::run_background_admitted_maintenance_preserving_error(
+            "periodic_vault_verify",
+            move || {
+                crate::m3::hygiene::run_vault_verify_typed(
+                    &db,
+                    &crate::m3::hygiene::HygieneVaultVerifyParams::default(),
+                )
+            },
+        )
+        .await;
     let outcome = match result {
         Ok(Ok(outcome)) => outcome,
         // The verification could not be read at all — neither a pass nor a
@@ -610,7 +617,7 @@ pub(super) async fn handle(
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_grounding_gap",
                     move || crate::m3::hygiene::run_grounding_gap_spec(&db, &grounding_gap_spec),
                 ),
@@ -660,7 +667,7 @@ pub(super) async fn handle(
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_blind_spot",
                     move || crate::m3::hygiene::run_blind_spot_spec(&db, &blind_spot_spec),
                 ),
@@ -720,7 +727,7 @@ pub(super) async fn handle(
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
             let mut response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_drift",
                     move || crate::m3::hygiene::run_drift_spec(&db, &drift_spec),
                 ),
@@ -824,7 +831,7 @@ pub(super) async fn handle(
             // whole-vault reader from multiplying the working set of search,
             // GC, derived state, backup, or another public corpus request.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_vault_verify",
                     move || {
                         crate::m3::hygiene::run_vault_verify_prepared(&db, &vault_verify_spec)
@@ -957,7 +964,7 @@ pub(super) async fn handle(
             // into the blocking owner, so a disconnected/timed-out client
             // cannot detach unadmitted work that later overlaps the scheduler.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_kernel_rebuild",
                     move || {
                         crate::m3::hygiene::run_kernel_rebuild_spec(&db, &kernel_rebuild_spec)
@@ -1031,7 +1038,7 @@ pub(super) async fn handle(
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_guard_calibrate",
                     move || {
                         crate::m3::hygiene::run_guard_calibrate_spec(&db, &guard_calibrate_spec)
@@ -1086,7 +1093,7 @@ pub(super) async fn handle(
             })?;
             let source_id = format!("panel_{}", spec.panel_version);
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "hygiene_guard_verify",
                     move || {
                         let mut response = crate::m3::hygiene::run_guard_verify(&db, &spec)?;
@@ -1263,7 +1270,7 @@ pub(super) async fn handle(
             candidate.index_quant_bits_by_slot = spec.index_quant_bits_by_slot;
             let panel_version = spec.panel_version;
             let description = spec.description;
-            let report = synapse_storage::maintenance::run_admitted_maintenance(
+            let report = synapse_storage::maintenance::run_foreground_admitted_maintenance(
                 "hygiene_anneal_search_propose",
                 move || db.propose_calyx_search_tuning(panel_version, candidate, &description),
             )

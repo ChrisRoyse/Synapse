@@ -92,7 +92,7 @@ pub(super) async fn handle(
             // it exactly like every other scan-bound storage operation in this
             // file.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_inspect",
                     move || crate::m3::storage::inspect_storage(&db, &spec),
                 ),
@@ -316,7 +316,7 @@ pub(super) async fn handle(
             // is strictly blocking work and must never occupy a runtime worker
             // serving MCP requests.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_panel_coverage",
                     move || crate::m3::storage::inspect_panel_coverage(&db, &spec),
                 ),
@@ -504,7 +504,7 @@ pub(super) async fn handle(
             // facade permit remains held while this call waits for and owns that
             // lane, so a concurrent explicit rebuild still fails closed.
             let expected_panel_version = spec.expected_panel_version;
-            let report = synapse_storage::maintenance::run_admitted_maintenance(
+            let report = synapse_storage::maintenance::run_foreground_admitted_maintenance(
                 "storage_search_rebuild",
                 move || {
                     let _permit = permit;
@@ -579,7 +579,7 @@ pub(super) async fn handle(
             )?;
             let db = service.m3_storage()?;
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_transcript_order_status",
                     move || crate::server::transcript_order::projection_status(&db),
                 ),
@@ -664,7 +664,7 @@ pub(super) async fn handle(
             let db = service.m3_storage()?;
             let token = spec.expected_repair_token;
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_transcript_order_rebuild",
                     move || {
                         let _permit = permit;
@@ -902,7 +902,7 @@ pub(super) async fn handle(
             // drop: strictly blocking, CPU/IO-bound work that must not occupy a
             // Tokio runtime worker. Offload it and hold the permit for the task's
             // lifetime so a concurrent caller keeps failing closed until it ends.
-            let report = synapse_storage::maintenance::run_admitted_maintenance(
+            let report = synapse_storage::maintenance::run_foreground_admitted_maintenance(
                 "storage_retire_orphan_slot_cfs",
                 move || {
                     let _permit = permit;
@@ -1066,7 +1066,7 @@ pub(super) async fn handle(
             // overlap search, GC, derived state, or a live verifier and multiply
             // their independent working sets.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_backup",
                     move || {
                         let _permit = permit;
@@ -1140,7 +1140,7 @@ pub(super) async fn handle(
             // Read-only does not mean resource-free: share the same exclusive
             // whole-corpus owner as live verification and maintenance.
             let response = Box::pin(
-                synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                     "storage_restore_verify",
                     move || crate::m3::storage::run_storage_restore_verify(&db, &spec),
                 ),
@@ -1472,7 +1472,7 @@ pub(super) async fn handle(
                 .await
             } else {
                 Box::pin(
-                    synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+                    synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
                         "storage_intelligence",
                         work,
                     ),
@@ -1751,7 +1751,7 @@ async fn handle_corpus_histogram(
             "repair storage/Calyx initialization and retry storage operation=corpus_histogram",
         )
     })?;
-    let response = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+    let response = synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
         "storage_corpus_histogram",
         move || crate::m3::storage::inspect_corpus_histogram(&db, &spec),
     )
@@ -1993,7 +1993,7 @@ async fn handle_gc_once(
     )?;
     let db = service.m3_storage()?;
     let source_id = spec.cf_name.clone();
-    let response = synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
+    let response = synapse_storage::maintenance::run_foreground_admitted_maintenance_preserving_error(
         "storage_gc_once",
         move || crate::m3::storage::run_storage_gc_once(&db, &spec),
     )

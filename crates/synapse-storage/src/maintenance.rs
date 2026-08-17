@@ -167,7 +167,7 @@ static STORAGE_BOUNDED_READ_PERMITS: LazyLock<Arc<Semaphore>> =
 /// owner outlives the foreground admission budget, or a structured storage
 /// error if the semaphore closes or the blocking task fails to join. Scheduled
 /// tasks must use [`run_background_admitted_maintenance`] instead.
-pub async fn run_admitted_maintenance<T, F>(operation: &'static str, work: F) -> StorageResult<T>
+async fn run_admitted_maintenance<T, F>(operation: &'static str, work: F) -> StorageResult<T>
 where
     F: FnOnce() -> StorageResult<T> + Send + 'static,
     T: Send + 'static,
@@ -197,7 +197,7 @@ where
 /// the blocking task fails to join. The operation's own error is returned
 /// unchanged in the nested result. Scheduled tasks must use
 /// [`run_background_admitted_maintenance_preserving_error`] instead.
-pub async fn run_admitted_maintenance_preserving_error<T, E, F>(
+async fn run_admitted_maintenance_preserving_error<T, E, F>(
     operation: &'static str,
     work: F,
 ) -> StorageResult<Result<T, E>>
