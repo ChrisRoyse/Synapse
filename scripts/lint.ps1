@@ -780,7 +780,7 @@ catch {
 }
 
 # ---------------------------------------------------------------------------
-# Gate 0d -- setup source encoding and dual-parser contract (#2216)
+# Gate 0d -- setup source encoding and PowerShell 5.1/7 compatibility (#2216)
 # ---------------------------------------------------------------------------
 #
 # The public setup facade deliberately launches the Windows-inbox PowerShell
@@ -794,10 +794,13 @@ catch {
 # Keep this shipping script 7-bit ASCII so its bytes mean the same thing under
 # every Windows ANSI code page and UTF-8, then parse those physical bytes with
 # both the current PowerShell engine and the exact Windows PowerShell launcher
-# used by the MCP facade. This is a structural source gate only: it executes no
-# setup behavior and is not FSV.
+# used by the MCP facade. Parsing alone cannot detect a PowerShell 7-only
+# command parameter or .NET API. PSScriptAnalyzer's official compatibility
+# rules therefore validate the complete command/type surface against the
+# Windows PowerShell 5.1 Desktop profile. This is a structural source gate only:
+# it executes no setup behavior and is not FSV.
 
-Write-Gate 'Gate 0d    setup ASCII and PowerShell 5.1/7 parser contract (#2216)'
+Write-Gate 'Gate 0d    setup ASCII and PowerShell 5.1/7 compatibility contract (#2216)'
 try {
     $setupContractFailureCountBefore = $script:Failures.Count
     $setupPath = Join-Path $RepoRoot 'scripts/synapse-setup.ps1'
@@ -890,8 +893,53 @@ exit 0
         }
     }
 
+    $requiredAnalyzerVersion = [version]'1.25.0'
+    $analyzerModule = Get-Module -ListAvailable PSScriptAnalyzer |
+        Where-Object { $_.Version -ge $requiredAnalyzerVersion } |
+        Sort-Object Version -Descending |
+        Select-Object -First 1
+    if ($null -eq $analyzerModule) {
+        Add-Failure 'SYNAPSE_LINT_SETUP_COMPATIBILITY_ANALYZER_MISSING' `
+            "PSScriptAnalyzer >= $requiredAnalyzerVersion is required to validate the production setup runtime surface" `
+            "install the official module for the current user with: Install-Module PSScriptAnalyzer -RequiredVersion $requiredAnalyzerVersion -Scope CurrentUser; then rerun scripts/lint.ps1 -PolicyOnly"
+    }
+    else {
+        Import-Module $analyzerModule.Path -Force -ErrorAction Stop
+        $windowsPowerShellProfile = 'win-48_x64_10.0.17763.0_5.1.17763.316_x64_4.0.30319.42000_framework'
+        $compatibilitySettings = @{
+            IncludeRules = @(
+                'PSUseCompatibleSyntax',
+                'PSUseCompatibleCommands',
+                'PSUseCompatibleTypes'
+            )
+            Rules = @{
+                PSUseCompatibleSyntax = @{
+                    Enable = $true
+                    TargetVersions = @('5.1')
+                }
+                PSUseCompatibleCommands = @{
+                    Enable = $true
+                    TargetProfiles = @($windowsPowerShellProfile)
+                }
+                PSUseCompatibleTypes = @{
+                    Enable = $true
+                    TargetProfiles = @($windowsPowerShellProfile)
+                }
+            }
+        }
+        $compatibilityFindings = @(Invoke-ScriptAnalyzer `
+                -Path $setupPath `
+                -Settings $compatibilitySettings `
+                -ErrorAction Stop)
+        foreach ($finding in $compatibilityFindings) {
+            Add-Failure 'SYNAPSE_LINT_SETUP_WINDOWS_POWERSHELL_RUNTIME_INCOMPATIBLE' `
+                ("{0}:{1}:{2} rule={3} {4}" -f $setupPath, $finding.Line, $finding.Column, $finding.RuleName, $finding.Message) `
+                'replace the incompatible command parameter, syntax, or .NET API with one available in both Windows PowerShell 5.1/.NET Framework and PowerShell 7; do not suppress the compatibility rule'
+        }
+    }
+
     if ($script:Failures.Count -eq $setupContractFailureCountBefore) {
-        Write-Host "   OK   $($setupBytes.Length) ASCII bytes parse under PowerShell $($PSVersionTable.PSVersion) and Windows PowerShell 5.1" -ForegroundColor Green
+        Write-Host "   OK   $($setupBytes.Length) ASCII bytes parse and use compatible command/type surfaces under PowerShell $($PSVersionTable.PSVersion) and Windows PowerShell 5.1" -ForegroundColor Green
     }
 }
 catch {
@@ -902,7 +950,7 @@ catch {
 if ($PolicyOnly) {
     Write-Host ''
     if ($script:Failures.Count -eq 0) {
-        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, Gate 0c proved the Chrome error/body-budget contract, and Gate 0d proved the setup ASCII/dual-parser contract.' -ForegroundColor Green
+        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, Gate 0c proved the Chrome error/body-budget contract, and Gate 0d proved the setup ASCII/PowerShell 5.1+ runtime compatibility contract.' -ForegroundColor Green
         exit 0
     }
 

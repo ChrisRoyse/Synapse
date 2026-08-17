@@ -24,6 +24,22 @@ cargo build
 Use `cargo build --release` only when shipping or running the optimized daemon,
 not as compile feedback during edits.
 
+The local structural gate also requires Microsoft's `PSScriptAnalyzer` 1.25.0
+or newer. Gate 0d analyzes the complete shipping setup script against the
+Windows PowerShell 5.1 Desktop compatibility profile, in addition to parsing
+the exact ASCII bytes under both Windows PowerShell 5.1 and PowerShell 7. A
+missing analyzer or any incompatible command parameter, syntax, or .NET API is
+a hard failure:
+
+```powershell
+Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser
+pwsh -NoProfile -File .\scripts\lint.ps1 -PolicyOnly
+```
+
+Do not suppress compatibility findings. `scripts\synapse-setup.ps1` is
+deliberately launched by the MCP setup facade through the inbox Windows
+PowerShell 5.1 executable, so PowerShell 7-only APIs are production failures.
+
 `codegen-units = 16` parallelizes LLVM backend work; it does not make stable
 rustc's front end parallel. If a release timing report shows one large crate
 occupying the critical path, first locate a real high-cohesion ownership seam

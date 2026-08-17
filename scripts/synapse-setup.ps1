@@ -472,6 +472,37 @@ function Step($m) {
     Write-Host "`n=== $m === (t+${sinceStart}s)" -ForegroundColor Cyan
 }
 
+function Get-SynapseByteArraySha256Hex {
+    param([Parameter(Mandatory=$true)][byte[]]$Bytes)
+
+    # Windows PowerShell 5.1 runs on .NET Framework, where the static
+    # SHA256.HashData and Convert.ToHexString APIs do not exist. The instance
+    # ComputeHash contract is available on both .NET Framework and modern .NET.
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hash = $sha.ComputeHash($Bytes)
+    } finally {
+        $sha.Dispose()
+    }
+    return [BitConverter]::ToString($hash).Replace('-', '')
+}
+
+function Test-SynapseByteArraysEqual {
+    param(
+        [AllowNull()][byte[]]$Left,
+        [AllowNull()][byte[]]$Right
+    )
+
+    if ($null -eq $Left -or $null -eq $Right -or $Left.Length -ne $Right.Length) {
+        return $false
+    }
+    $difference = 0
+    for ($i = 0; $i -lt $Left.Length; $i++) {
+        $difference = $difference -bor ($Left[$i] -bxor $Right[$i])
+    }
+    return $difference -eq 0
+}
+
 function Write-SynapseSetupPhaseLedger {
     <#
       Durable per-phase wall-clock readback. Never throws: a ledger-write
@@ -505,14 +536,21 @@ function Write-SynapseSetupPhaseLedger {
         New-Item -ItemType Directory -Force -Path $ledgerDir -ErrorAction Stop | Out-Null
         $ledgerPath = Join-Path $ledgerDir 'setup-phase-timings.json'
         $phases = @($script:SynapseSetupPhaseLedger)
-        # Numeric conversion makes the ordering independent of formatting, and
-        # -Stable keeps the original phase order when durations tie.
+        # Numeric conversion makes the ordering independent of formatting. The
+        # explicit phase index is the deterministic tie-breaker because
+        # Sort-Object -Stable does not exist in Windows PowerShell 5.1.
         $slowest = @(
             $phases |
-                Sort-Object -Stable -Property @{
-                    Expression = { [double]$_.elapsed_seconds }
-                    Descending = $true
-                } |
+                Sort-Object -Property @(
+                    @{
+                        Expression = { [double]$_.elapsed_seconds }
+                        Descending = $true
+                    },
+                    @{
+                        Expression = { [int]$_.index }
+                        Ascending = $true
+                    }
+                ) |
                 Select-Object -First 5
         )
         $ledger = [ordered]@{
@@ -536,7 +574,7 @@ function Write-SynapseSetupPhaseLedger {
         }
         $json = ($ledger | ConvertTo-Json -Depth 12) + "`n"
         $expectedBytes = [System.Text.UTF8Encoding]::new($false).GetBytes($json)
-        $expectedSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($expectedBytes))
+        $expectedSha256 = Get-SynapseByteArraySha256Hex -Bytes $expectedBytes
         $temporaryPath = "$ledgerPath.tmp.$PID.$([guid]::NewGuid().ToString('N'))"
         $replacementBackupPath = "$ledgerPath.replace-backup.$PID.$([guid]::NewGuid().ToString('N'))"
 
@@ -567,10 +605,10 @@ function Write-SynapseSetupPhaseLedger {
 
         $publishPhase = 'readback'
         $actualBytes = [System.IO.File]::ReadAllBytes($ledgerPath)
-        $actualSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($actualBytes))
+        $actualSha256 = Get-SynapseByteArraySha256Hex -Bytes $actualBytes
         if ($actualBytes.Length -ne $expectedBytes.Length -or
             $actualSha256 -cne $expectedSha256 -or
-            -not [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($actualBytes, $expectedBytes)) {
+            -not (Test-SynapseByteArraysEqual -Left $actualBytes -Right $expectedBytes)) {
             throw "published bytes differ from the exact serialized ledger expected_length=$($expectedBytes.Length) actual_length=$($actualBytes.Length) expected_sha256=$expectedSha256 actual_sha256=$actualSha256"
         }
         $readback = [System.Text.Encoding]::UTF8.GetString($actualBytes) | ConvertFrom-Json -ErrorAction Stop
@@ -604,11 +642,11 @@ function Write-SynapseSetupPhaseLedger {
             if (Test-Path -LiteralPath $ledgerPath -PathType Leaf) {
                 try {
                     $failureTargetBytes = [System.IO.File]::ReadAllBytes($ledgerPath)
-                    $failureTargetSha256 = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData($failureTargetBytes))
+                    $failureTargetSha256 = Get-SynapseByteArraySha256Hex -Bytes $failureTargetBytes
                     $exactExpected = (
                         $null -ne $expectedBytes -and
                         $failureTargetBytes.Length -eq $expectedBytes.Length -and
-                        [System.Security.Cryptography.CryptographicOperations]::FixedTimeEquals($failureTargetBytes, $expectedBytes)
+                        (Test-SynapseByteArraysEqual -Left $failureTargetBytes -Right $expectedBytes)
                     )
                     $targetState = "file length=$($failureTargetBytes.Length) sha256=$failureTargetSha256 exact_expected=$exactExpected"
                     if ($exactExpected) {
@@ -9259,8 +9297,17 @@ function Write-SynapseCandidateFailureEvidence {
 
     $exit = Get-SynapseCandidateExitReadback -Process $Process
     $evidence = @()
+    $candidateRootFull = [System.IO.Path]::GetFullPath($CandidateRoot).TrimEnd('\')
+    $candidateRootPrefix = "$candidateRootFull\"
     foreach ($file in @(Get-ChildItem -LiteralPath $CandidateRoot -File -Recurse -Force -ErrorAction Stop | Sort-Object FullName)) {
-        $relative = [System.IO.Path]::GetRelativePath($CandidateRoot, $file.FullName)
+        $fileFull = [System.IO.Path]::GetFullPath($file.FullName)
+        if (-not $fileFull.StartsWith($candidateRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            Die "SYNAPSE_CANDIDATE_EVIDENCE_SCOPE_ESCAPE root=$candidateRootFull path=$fileFull remediation=refuse to retain candidate evidence outside the exact isolated candidate directory"
+        }
+        $relative = $fileFull.Substring($candidateRootPrefix.Length).Replace('\', '/')
+        if ([string]::IsNullOrWhiteSpace($relative) -or $relative -match '(^|/)\.\.?(?:/|$)') {
+            Die "SYNAPSE_CANDIDATE_EVIDENCE_RELATIVE_PATH_INVALID root=$candidateRootFull path=$fileFull relative_path=$relative remediation=retain only non-empty descendant paths without current-directory or parent-directory segments"
+        }
         $evidence += [ordered]@{
             relative_path = $relative
             length = [int64]$file.Length
@@ -9875,7 +9922,7 @@ function Write-SynapseCandidateJsonEvidence {
     try {
         $json = $Value | ConvertTo-Json -Depth 30
         [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
-        $readback = Get-Content -Raw -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json -Depth 30 -ErrorAction Stop
+        $readback = Get-Content -Raw -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         $sha256 = Get-SynapseFileSha256 -Path $path
         $length = (Get-Item -LiteralPath $path -ErrorAction Stop).Length
     } catch {
