@@ -2987,8 +2987,9 @@ pub struct SynapseCalyxSlotBits {
     /// What this slot needs before it can be measured, when it was not.
     /// `None` when `state` is `Measured`.
     pub unmeasured_reason: Option<String>,
-    /// Which estimator produced `marginal_bits` — `discrete_plugin` or
-    /// `continuous_ksg` (#1672).
+    /// Which estimator produced `marginal_bits` — `discrete_plugin`,
+    /// `continuous_ksg`, or the held-out `logistic_probe` lower bound
+    /// (#1672/#1690).
     ///
     /// A panel deliberately mixes explicit encoders (one-hot, hash, cyclic)
     /// with continuous ones (record vectors, rank scalars), and the two need
@@ -3005,6 +3006,12 @@ pub struct SynapseCalyxSlotBits {
     /// Largest exact-duplicate class within one outcome label — the quantity
     /// that drives KSG's k-th radius to zero.
     pub max_same_label_multiplicity: Option<usize>,
+    /// Occupied cells in the exact `(whole coordinate tuple, outcome)` table.
+    pub occupied_joint_cells: Option<usize>,
+    /// Independently addressable coordinates in each input row.
+    pub input_dim: Option<usize>,
+    /// Exact outcome levels observed by estimator selection.
+    pub label_levels: Option<usize>,
     /// This lens's declared source fields intersect the anchor's determining
     /// fields, so `marginal_bits` here is the label reading itself (#1959).
     ///
@@ -3783,6 +3790,9 @@ impl SynapseCalyxVault {
                 estimator_reason: None,
                 distinct_values: None,
                 max_same_label_multiplicity: None,
+                occupied_joint_cells: None,
+                input_dim: None,
+                label_levels: None,
                 anchor_source_carrier: false,
                 anchor_source_shared_fields: Vec::new(),
             };
@@ -5234,6 +5244,9 @@ const fn unmeasured_slot_bits(
         estimator_reason: None,
         distinct_values: None,
         max_same_label_multiplicity: None,
+        occupied_joint_cells: None,
+        input_dim: None,
+        label_levels: None,
         anchor_source_carrier: false,
         anchor_source_shared_fields: Vec::new(),
     }
@@ -5284,13 +5297,13 @@ struct SynergyTerms {
 /// (Kraskov et al. 2004), and the difference estimates nothing.
 ///
 /// So: resolve all three under `Auto`; if they already agree, measure with
-/// `Auto`. If they disagree, try to *pin* all three to one instrument — the
-/// discrete plug-in first (exact for a genuinely discrete column, and its
-/// sparsity guard refuses a concatenation too wide for its bias correction),
-/// then KSG (whose degenerate-radius guard refuses a categorical column). The
-/// first pinning under which all three columns yield an estimate wins. When
-/// neither does, the pair is genuinely unmeasurable as a gain and is refused
-/// with the reason, never reported as a number.
+/// `Auto`. When one term selects the held-out logistic lower bound, pin all
+/// three terms to that one instrument before measuring: the terms share one
+/// binary label vector, and subtraction is then between like-for-like held-out
+/// estimates. Otherwise retain the established ordered pinning contract for a
+/// mixed discrete/KSG trio. Every candidate is selected before its measurement;
+/// an estimator failure is preserved and never retried as a different
+/// instrument for the same candidate.
 #[allow(
     clippy::too_many_lines,
     reason = "the estimator agreement check, the ordered pinning attempts and the two refusal messages are one decision: splitting them would let a caller take a pinned measurement without the homogeneity check that makes it a measurement"
@@ -5331,9 +5344,18 @@ fn synergy_pair_bits(
     // Candidate pinnings, most-preferred first. `Auto` is first only when it is
     // already homogeneous, so a pin never overrides an instrument the columns
     // themselves agreed on.
-    let mut attempts: Vec<MiEstimatorChoice> = Vec::with_capacity(3);
+    let any_logistic = auto_picks
+        .iter()
+        .any(|(_, pick)| pick.estimator == MiEstimator::LogisticProbe);
+    let mut attempts: Vec<MiEstimatorChoice> = Vec::with_capacity(2);
     if homogeneous_auto {
         attempts.push(MiEstimatorChoice::Auto);
+    } else if any_logistic {
+        // A logistic Auto pick proves this shared outcome is binary. Use one
+        // held-out lower-bound instrument for the pair and both marginals;
+        // mixing it with plug-in/KSG estimates would make the subtraction
+        // meaningless, while retrying after failure would be a fallback.
+        attempts.push(MiEstimatorChoice::LogisticProbe);
     } else {
         attempts.push(MiEstimatorChoice::DiscretePlugin);
         attempts.push(MiEstimatorChoice::ContinuousKsg);
@@ -5440,6 +5462,9 @@ fn apply_estimator_pick(bits: &mut SynapseCalyxSlotBits, pick: &MiEstimatorPick)
     bits.estimator_reason = Some(pick.reason.clone());
     bits.distinct_values = Some(pick.distinct_values);
     bits.max_same_label_multiplicity = Some(pick.max_same_label_multiplicity);
+    bits.occupied_joint_cells = Some(pick.occupied_joint_cells);
+    bits.input_dim = Some(pick.input_dim);
+    bits.label_levels = Some(pick.label_levels);
 }
 
 /// Classify an estimator refusal into a per-slot unmeasured state.

@@ -30,11 +30,23 @@
 //! removes only the first-order term, and higher-order terms survive in sparse
 //! tables, so "not enough samples for this support" is a real answer.
 //!
+//! A third instrument is required for a multivariate column whose complete row
+//! identities are categorical but whose shared coordinates are the information
+//! carrier. Interning a 512-dimensional signed feature hash as one contingency-
+//! table symbol discards that shared structure; when almost every row is unique,
+//! the plug-in support guard correctly refuses it. For a binary outcome, a
+//! deterministic multi-seed logistic probe instead learns from the coordinates
+//! on training folds and measures only held-out predictions. Because the
+//! prediction is a deterministic post-processing of the column, its measured
+//! information is a data-processing-inequality-safe lower bound on `I(X;Y)`,
+//! not a replacement estimate that can claim more information than `X` holds.
+//! Power calibration and convergence checks remain binding.
+//!
 //! Selection mirrors [`transfer_entropy::resolve_estimator`] deliberately: the
-//! auto rule keys on the exact data property that breaks KSG, records the counts
-//! it saw in a human-readable reason, and **never re-tries the other estimator
-//! after a failure**. A silent second attempt would make the reported estimator
-//! a function of which one happened to fail first.
+//! auto rule keys on the exact data properties that select an instrument,
+//! records the counts it saw in a human-readable reason, and **never re-tries a
+//! different estimator after a failure**. A silent second attempt would make
+//! the reported estimator a function of which one happened to fail first.
 
 use std::collections::BTreeMap;
 
@@ -47,6 +59,9 @@ use crate::bootstrap::{BootstrapConfig, DEFAULT_BOOTSTRAP_RESAMPLES, DEFAULT_BOO
 use crate::estimate::{EstimatorKind, MiEstimate, TrustTag, trust_for_anchor};
 use crate::ksg::{
     MIN_ASSAY_SAMPLES, ksg_mi_continuous_discrete, ksg_mi_continuous_discrete_with_anchor,
+};
+use crate::logistic::{
+    logistic_probe_mi_multiseed_calibrated, logistic_probe_mi_multiseed_calibrated_with_anchor,
 };
 use crate::samples::validate_rectangular_finite;
 
@@ -70,6 +85,8 @@ pub enum MiEstimator {
     DiscretePlugin,
     /// Kraskov-Stögbauer-Grassberger k-nearest-neighbour mutual information.
     ContinuousKsg,
+    /// Held-out, calibrated logistic-probe lower bound for a binary outcome.
+    LogisticProbe,
 }
 
 impl MiEstimator {
@@ -78,6 +95,7 @@ impl MiEstimator {
         match self {
             Self::DiscretePlugin => "discrete_plugin",
             Self::ContinuousKsg => "continuous_ksg",
+            Self::LogisticProbe => "logistic_probe",
         }
     }
 }
@@ -93,6 +111,9 @@ pub enum MiEstimatorChoice {
     DiscretePlugin,
     /// Always use the continuous KSG estimator.
     ContinuousKsg,
+    /// Always use the held-out calibrated logistic probe. The outcome must be
+    /// binary; unsupported outcomes fail closed.
+    LogisticProbe,
 }
 
 /// Why the estimator that ran was chosen.
@@ -101,12 +122,17 @@ pub enum MiEstimatorChoice {
 pub enum MiEstimatorSelection {
     RequestedDiscretePlugin,
     RequestedContinuousKsg,
+    RequestedLogisticProbe,
     /// At least one sample shares its exact coordinates with `k` or more
     /// same-label samples, so KSG's k-th radius is zero by construction.
     AutoDuplicateSaturatedColumn,
     /// No exact-duplicate class within a label reaches `k`, so KSG's k-th
     /// radius is strictly positive for every sample.
     AutoDistinctValuedColumn,
+    /// The complete coordinate tuples are duplicate-saturated for KSG and too
+    /// sparse for the plug-in support contract, while the multivariate column
+    /// has a binary outcome that can be measured as a held-out lower bound.
+    AutoSparseHighDimensionalBinary,
 }
 
 impl MiEstimatorSelection {
@@ -115,8 +141,10 @@ impl MiEstimatorSelection {
         match self {
             Self::RequestedDiscretePlugin => "requested_discrete_plugin",
             Self::RequestedContinuousKsg => "requested_continuous_ksg",
+            Self::RequestedLogisticProbe => "requested_logistic_probe",
             Self::AutoDuplicateSaturatedColumn => "auto_duplicate_saturated_column",
             Self::AutoDistinctValuedColumn => "auto_distinct_valued_column",
+            Self::AutoSparseHighDimensionalBinary => "auto_sparse_high_dimensional_binary",
         }
     }
 }
@@ -132,6 +160,12 @@ pub struct MiEstimatorPick {
     /// Largest exact-duplicate class **within one outcome label**. This is the
     /// quantity KSG's k-th radius depends on.
     pub max_same_label_multiplicity: usize,
+    /// Occupied cells in the exact `(whole coordinate tuple, outcome)` table.
+    pub occupied_joint_cells: usize,
+    /// Number of independently addressable coordinates in each input row.
+    pub input_dim: usize,
+    /// Number of exact outcome levels observed.
+    pub label_levels: usize,
 }
 
 /// Resolves the estimator for one column measured against discrete `labels`.
@@ -170,15 +204,35 @@ fn resolve_from_column(
             MiEstimatorSelection::RequestedContinuousKsg,
             "the caller pinned the continuous KSG estimator".to_string(),
         ),
+        MiEstimatorChoice::LogisticProbe => (
+            MiEstimator::LogisticProbe,
+            MiEstimatorSelection::RequestedLogisticProbe,
+            "the caller pinned the held-out calibrated logistic-probe lower bound".to_string(),
+        ),
         MiEstimatorChoice::Auto => {
             if max_same_label_multiplicity >= k {
-                (
-                    MiEstimator::DiscretePlugin,
-                    MiEstimatorSelection::AutoDuplicateSaturatedColumn,
-                    format!(
-                        "auto: the column holds {distinct_values} distinct value(s) over {n} sample(s) and its largest exact-duplicate class within one outcome label holds {max_same_label_multiplicity} sample(s) at k={k}, so the continuous KSG k-th radius is zero by construction"
-                    ),
-                )
+                let required_plugin_samples = column
+                    .occupied_joint_cells
+                    .saturating_mul(MIN_SAMPLES_PER_OCCUPIED_CELL);
+                if column.input_dim > 1 && column.label_levels == 2 && n < required_plugin_samples {
+                    (
+                        MiEstimator::LogisticProbe,
+                        MiEstimatorSelection::AutoSparseHighDimensionalBinary,
+                        format!(
+                            "auto: the {dim}-dimensional column holds {distinct_values} distinct whole-row value(s) and {occupied} occupied exact joint cell(s) over {n} sample(s); its largest same-label duplicate multiplicity is {max_same_label_multiplicity} at k={k}, so KSG has zero radius, while the discrete plug-in requires {required_plugin_samples} samples. The binary outcome selects a calibrated multi-seed logistic probe over held-out predictions, whose information is a DPI-safe lower bound",
+                            dim = column.input_dim,
+                            occupied = column.occupied_joint_cells,
+                        ),
+                    )
+                } else {
+                    (
+                        MiEstimator::DiscretePlugin,
+                        MiEstimatorSelection::AutoDuplicateSaturatedColumn,
+                        format!(
+                            "auto: the column holds {distinct_values} distinct value(s) over {n} sample(s) and its largest exact-duplicate class within one outcome label holds {max_same_label_multiplicity} sample(s) at k={k}, so the continuous KSG k-th radius is zero by construction"
+                        ),
+                    )
+                }
             } else {
                 (
                     MiEstimator::ContinuousKsg,
@@ -196,6 +250,9 @@ fn resolve_from_column(
         reason,
         distinct_values,
         max_same_label_multiplicity,
+        occupied_joint_cells: column.occupied_joint_cells,
+        input_dim: column.input_dim,
+        label_levels: column.label_levels,
     }
 }
 
@@ -230,8 +287,38 @@ pub fn mi_about_labels(
             Some(anchor) => ksg_mi_continuous_discrete_with_anchor(x, labels, k, anchor),
             None => ksg_mi_continuous_discrete(x, labels, k),
         },
+        MiEstimator::LogisticProbe => mi_logistic_probe(x, &column, anchor),
     };
     Ok(MiOutcome { pick, estimate })
+}
+
+/// Measures a binary outcome through held-out predictions from the complete
+/// multivariate column. This is an explicit estimator, not a retry path: the
+/// selection is fixed before training and every training/calibration refusal is
+/// returned unchanged.
+fn mi_logistic_probe(
+    x: &[Vec<f32>],
+    column: &DiscreteColumn,
+    anchor: Option<&Anchor>,
+) -> Result<MiEstimate> {
+    if column.label_levels != 2 {
+        return Err(CalyxError::assay_degenerate_input(format!(
+            "logistic-probe mutual information requires exactly two outcome levels; got {}",
+            column.label_levels
+        )));
+    }
+    let labels = column
+        .labels
+        .iter()
+        .map(|label| *label == 1)
+        .collect::<Vec<_>>();
+    let report = match anchor {
+        Some(anchor) => {
+            logistic_probe_mi_multiseed_calibrated_with_anchor(x, &labels, None, anchor)
+        }
+        None => logistic_probe_mi_multiseed_calibrated(x, &labels, None),
+    }?;
+    Ok(report.estimate)
 }
 
 /// One measurement attempt: which instrument was chosen, and what it returned.
@@ -259,6 +346,8 @@ struct DiscreteColumn {
     max_same_label_multiplicity: usize,
     /// Occupied cells of the joint contingency table.
     occupied_joint_cells: usize,
+    /// Width of the original rectangular input matrix.
+    input_dim: usize,
 }
 
 /// Miller-Madow corrected contingency-table plug-in `I(x; labels)` in bits.
@@ -492,6 +581,7 @@ impl DiscreteColumn {
             label_levels,
             max_same_label_multiplicity,
             occupied_joint_cells: cells.len(),
+            input_dim: x.first().map_or(0, Vec::len),
         })
     }
 }

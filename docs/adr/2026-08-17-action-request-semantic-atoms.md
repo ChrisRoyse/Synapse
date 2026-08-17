@@ -56,9 +56,10 @@ declaration therefore keep structural target-leakage checks binding.
 - Ten active typed slots produce `10 + C(10,2) + 1 = 56` base signals per
   complete action record, ten more than generation `2_185_003`; the DPI ceiling
   still bounds any information claim.
-- The semantic lens automatically enters bits, sufficiency, redundancy,
-  synergy, exhaustive typed causal maps, kernel composition, and optional Ward
-  calibration without flattening the constellation.
+- The semantic lens enters bits, sufficiency, redundancy, synergy, exhaustive
+  typed causal maps, kernel composition, and optional Ward calibration without
+  flattening the constellation. Its sparse multivariate assay contract is
+  defined by `2026-08-17-sparse-multivariate-mi-routing.md`.
 - Guard, kernel, validation, readiness, search, and causal-map artifacts must be
   rebuilt from physical `2_185_004` rows. No prior derived state is inherited.
 - Production acceptance requires strict-client MCP triggers and separate

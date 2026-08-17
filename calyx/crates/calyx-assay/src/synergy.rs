@@ -267,7 +267,7 @@ pub fn synergy_gain(
                 estimators.left.as_str(),
                 estimators.right.as_str()
             ),
-            remediation: "pin all three columns to one estimator (MiEstimatorChoice::DiscretePlugin or ::ContinuousKsg) and re-measure, or report the pair unmeasured",
+            remediation: "pin all three columns to one estimator (MiEstimatorChoice::DiscretePlugin, ::ContinuousKsg, or ::LogisticProbe) and re-measure, or report the pair unmeasured",
         });
     }
     Ok(gain)
