@@ -2099,7 +2099,13 @@ pub struct SynapseCalyxReproduceReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_hash: Option<String>,
     pub entry_self_verifies: bool,
+    /// Literal `SubjectId::Cx` equality. Batch members legitimately leave this false.
     pub subject_matches: bool,
+    /// Stable shared Base-row binding mode (`subject`, `enumerated_member`,
+    /// `batch_member`, `batch_scope`, or `entry_absent`).
+    pub coverage: String,
+    /// Whether the referenced entry covers this record under the shared contract.
+    pub coverage_matches: bool,
     /// `none` when the record reproduces, else a fail-closed drift reason.
     pub drift: String,
 }
@@ -2118,7 +2124,7 @@ impl SynapseCalyxReproduceReport {
                 "ledger entry at seq {} does not re-hash to its stored hash",
                 reproduction.recorded_seq
             )
-        } else if !reproduction.subject_matches {
+        } else if !reproduction.coverage_matches {
             format!(
                 "ledger entry at seq {} does not bind back to this record",
                 reproduction.recorded_seq
@@ -2139,6 +2145,11 @@ impl SynapseCalyxReproduceReport {
             entry_hash: reproduction.entry_hash.map(|hash| hex_bytes(&hash)),
             entry_self_verifies: reproduction.entry_self_verifies,
             subject_matches: reproduction.subject_matches,
+            coverage: reproduction
+                .coverage
+                .map_or("entry_absent", calyx_ledger::CxCoverage::tag)
+                .to_owned(),
+            coverage_matches: reproduction.coverage_matches,
             drift,
         }
     }

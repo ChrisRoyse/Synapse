@@ -4,10 +4,10 @@ use crate::ledger_view::parse_aster_ledger_seq;
 use crate::mvcc::SnapshotCfRowStream;
 use calyx_core::{Anchor, CalyxError, Clock, CxId, LedgerRef, Result, SystemClock, VaultStore};
 use calyx_ledger::{
-    ActorId, AnchorDiscipline, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry,
+    ActorId, AnchorDiscipline, CxCoverage, EntryKind, LedgerAppender, LedgerCfStore, LedgerEntry,
     LedgerHeadAnchor, LedgerRow, RedactionPolicy, StagedLedgerRow, StreamingChainVerifier,
     StreamingStart, SubjectId, VerifyResult, decode as decode_ledger_entry,
-    decode_ref as decode_ledger_entry_ref,
+    decode_ref as decode_ledger_entry_ref, entry_cx_coverage,
 };
 use std::ops::Range;
 
@@ -64,8 +64,12 @@ pub struct AsterProvenanceReproduction {
     pub entry_hash: Option<[u8; 32]>,
     /// Whether the entry re-hashes to its stored hash (self-consistent bytes).
     pub entry_self_verifies: bool,
-    /// Whether the entry's subject binds back to this record.
+    /// Whether the entry literally names this record as its subject.
     pub subject_matches: bool,
+    /// Shared Base-row coverage mode, when the entry exists.
+    pub coverage: Option<CxCoverage>,
+    /// Whether the entry covers this record under the shared Base-row contract.
+    pub coverage_matches: bool,
     /// Overall verdict: the record re-derives to a genuine, matching entry.
     pub reproduced: bool,
 }
@@ -408,8 +412,8 @@ where
     /// Reads the constellation, follows its recorded provenance pointer into the
     /// physical Ledger, re-decodes that entry, and re-hashes it from its own
     /// sealed fields. The record reproduces only when the referenced entry
-    /// exists, self-verifies, binds back to this record's subject, and its hash
-    /// matches the record's stored provenance ref.
+    /// exists, self-verifies, covers this record under the shared Base-row
+    /// contract, and its hash matches the record's stored provenance ref.
     ///
     /// # Errors
     ///
@@ -421,18 +425,21 @@ where
         let recorded_hash = constellation.provenance.hash;
         let input_hash = constellation.input_ref.hash;
         let entry = self.read_ledger_entry(recorded_seq)?;
-        let (entry_present, entry_hash, entry_self_verifies, subject_matches) = match &entry {
-            Some(entry) => (
-                true,
-                Some(entry.entry_hash),
-                entry.verify(),
-                entry.subject == SubjectId::Cx(id),
-            ),
-            None => (false, None, false, false),
-        };
+        let (entry_present, entry_hash, entry_self_verifies, subject_matches, coverage) =
+            match &entry {
+                Some(entry) => (
+                    true,
+                    Some(entry.entry_hash),
+                    entry.verify(),
+                    entry.subject == SubjectId::Cx(id),
+                    Some(entry_cx_coverage(entry, id)?),
+                ),
+                None => (false, None, false, false, None),
+            };
+        let coverage_matches = coverage.is_some_and(CxCoverage::binds);
         let reproduced = entry_present
             && entry_self_verifies
-            && subject_matches
+            && coverage_matches
             && entry_hash == Some(recorded_hash);
         Ok(AsterProvenanceReproduction {
             cx_id: id,
@@ -443,6 +450,8 @@ where
             entry_hash,
             entry_self_verifies,
             subject_matches,
+            coverage,
+            coverage_matches,
             reproduced,
         })
     }

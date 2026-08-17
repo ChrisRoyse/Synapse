@@ -27,8 +27,8 @@ pub use audit::{
     get_answer_trace_from_snapshot, get_provenance, get_provenance_from_snapshot,
 };
 pub use base_stamp::{
-    CALYX_LEDGER_BASE_STAMP_UNDECLARED, CoverageRule, SubjectShape, coverage_rule,
-    require_base_stamp_declared,
+    CALYX_LEDGER_BASE_COVERAGE_UNDECLARED, CALYX_LEDGER_BASE_STAMP_UNDECLARED, CoverageRule,
+    CxCoverage, SubjectShape, coverage_rule, entry_cx_coverage, require_base_stamp_declared,
 };
 pub use batch_members::{
     BATCH_MEMBERS_AUTHORITY, BATCH_MEMBERS_FIELD, BATCH_MEMBERS_VERSION, BatchMembers,

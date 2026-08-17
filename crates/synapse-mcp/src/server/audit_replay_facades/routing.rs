@@ -732,6 +732,8 @@ fn reproduce_response(
         entry_hash: report.entry_hash.clone(),
         entry_self_verifies: report.entry_self_verifies,
         subject_matches: report.subject_matches,
+        coverage: report.coverage.clone(),
+        coverage_matches: report.coverage_matches,
         drift: report.drift.clone(),
     }
 }

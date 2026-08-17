@@ -444,6 +444,11 @@ fn declared_enum_verdict(kind: &AnchorKind, value: &str) -> Option<bool> {
 struct AdjudicatedRecord {
     cx_id: CxId,
     slots: BTreeMap<u16, Vec<f32>>,
+    /// Source-row pointer used only while building calibration diagnostics.
+    /// Trusted serving artifacts deliberately omit it: online scoring needs
+    /// vectors and constellation identity, not a source-system address.
+    #[serde(skip)]
+    source_pointer: Option<String>,
 }
 
 /// Frozen trusted-region vectors used by the online guard. The profile hash is
@@ -1699,6 +1704,7 @@ impl SynapseCalyxVault {
                         let record = AdjudicatedRecord {
                             cx_id: constellation.cx_id,
                             slots,
+                            source_pointer: constellation.input_ref.pointer,
                         };
                         if good {
                             corpus.good.push(record);
@@ -1879,6 +1885,10 @@ fn collect_slot_matrix(
             continue;
         };
         let cx_id = record.cx_id.to_string();
+        let row_identity = record
+            .source_pointer
+            .as_deref()
+            .map_or_else(|| cx_id.clone(), |pointer| format!("{cx_id}@{pointer}"));
         if vector.is_empty() {
             return Err(guard_error(
                 "SYNAPSE_CALYX_GUARD_VECTOR_EMPTY",
@@ -1940,7 +1950,7 @@ fn collect_slot_matrix(
             )
         })?;
         flat.extend_from_slice(vector);
-        row_ids.push(cx_id);
+        row_ids.push(row_identity);
     }
     let Some(dim) = dim.filter(|_| !row_ids.is_empty()) else {
         return Ok(None);

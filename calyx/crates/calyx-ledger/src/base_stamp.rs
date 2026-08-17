@@ -25,9 +25,11 @@
 //! and `calyx-search` cannot host it (`calyx-aster` does not depend on
 //! `calyx-search`, and must not — the writer would then need the reader).
 
-use calyx_core::{CalyxError, Result};
+use calyx_core::{CalyxError, CxId, Result};
+use serde_json::Value;
 
-use crate::entry::SubjectId;
+use crate::batch_members::{MemberVerdict, read_batch_members};
+use crate::entry::{LedgerEntry, SubjectId};
 use crate::kind::EntryKind;
 
 /// A writer asked to stamp a Base row's provenance with a `(kind, subject)`
@@ -37,6 +39,9 @@ use crate::kind::EntryKind;
 /// It is a contract violation caught at the only place it can still be repaired
 /// cheaply — inside the writer, before the row exists (#2095).
 pub const CALYX_LEDGER_BASE_STAMP_UNDECLARED: &str = "CALYX_LEDGER_BASE_STAMP_UNDECLARED";
+
+/// A stored Base row points at a ledger-entry shape that cannot lawfully cover it.
+pub const CALYX_LEDGER_BASE_COVERAGE_UNDECLARED: &str = "CALYX_LEDGER_BASE_COVERAGE_UNDECLARED";
 
 const BASE_STAMP_UNDECLARED_REMEDIATION: &str = "declare this (entry kind, subject) shape in calyx_ledger::base_stamp::coverage_rule and \
      state how it names the constellations it covers, or mint the entry under a shape that is \
@@ -102,6 +107,44 @@ pub enum CoverageRule {
     /// No writer in this workspace stamps a Base row's provenance with this
     /// shape. Fail closed naming the shape rather than guess at its membership.
     Unregistered,
+}
+
+/// How a verified ledger entry binds one constellation.
+///
+/// This is the shared read-side counterpart of [`CoverageRule`]. Keeping the
+/// decision in `calyx-ledger` prevents search, audit reproduction, and future
+/// readers from independently reimplementing batch membership semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CxCoverage {
+    /// The entry directly names this constellation as its subject.
+    Subject,
+    /// An enumerating entry names this constellation in its payload.
+    EnumeratedMember,
+    /// A post-#2096 batch declaration positively lists this constellation.
+    BatchMember,
+    /// A historical or truncated batch declaration cannot decide membership;
+    /// the Base row's exact entry hash and chain link remain authoritative.
+    BatchScope,
+    /// The declared entry shape positively excludes this constellation.
+    NotCovered,
+}
+
+impl CxCoverage {
+    /// Whether the entry is permitted to bind the Base row.
+    pub const fn binds(self) -> bool {
+        !matches!(self, Self::NotCovered)
+    }
+
+    /// Stable audit label for the binding mode.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Subject => "subject",
+            Self::EnumeratedMember => "enumerated_member",
+            Self::BatchMember => "batch_member",
+            Self::BatchScope => "batch_scope",
+            Self::NotCovered => "not_covered",
+        }
+    }
 }
 
 impl CoverageRule {
@@ -230,6 +273,96 @@ pub const fn coverage_rule(kind: EntryKind, subject: SubjectShape) -> CoverageRu
             | SubjectShape::Guard
             | SubjectShape::Query => CoverageRule::Unregistered,
         },
+    }
+}
+
+/// Decides whether one ledger entry covers one constellation under the same
+/// contract that gates Base-row writers.
+///
+/// Direct subjects, enumerated ingest payloads, complete batch declarations,
+/// historical batch scope, and truncated declarations are handled explicitly.
+/// A malformed declaration or unregistered shape returns a structured error;
+/// it never degrades into an assumed match.
+pub fn entry_cx_coverage(entry: &LedgerEntry, cx_id: CxId) -> Result<CxCoverage> {
+    if entry.subject == SubjectId::Cx(cx_id) {
+        return Ok(CxCoverage::Subject);
+    }
+    let shape = SubjectShape::of(&entry.subject);
+    match coverage_rule(entry.kind, shape) {
+        CoverageRule::SubjectCx => Ok(CxCoverage::NotCovered),
+        CoverageRule::EnumeratedCxList => {
+            match read_batch_members(&entry.payload)?.verdict(cx_id) {
+                MemberVerdict::Listed => Ok(CxCoverage::EnumeratedMember),
+                MemberVerdict::NotListed => Ok(CxCoverage::NotCovered),
+                MemberVerdict::Undecided => {
+                    if payload_names_cx(entry, cx_id)? {
+                        Ok(CxCoverage::EnumeratedMember)
+                    } else {
+                        Ok(CxCoverage::NotCovered)
+                    }
+                }
+            }
+        }
+        CoverageRule::BatchScoped => match read_batch_members(&entry.payload)?.verdict(cx_id) {
+            MemberVerdict::Listed => Ok(CxCoverage::BatchMember),
+            MemberVerdict::NotListed => Ok(CxCoverage::NotCovered),
+            MemberVerdict::Undecided => Ok(CxCoverage::BatchScope),
+        },
+        CoverageRule::Unregistered => Err(CalyxError {
+            code: CALYX_LEDGER_BASE_COVERAGE_UNDECLARED,
+            message: format!(
+                "ledger seq {} carries the {}/{} shape, which the shared Base-row coverage \
+                 contract does not permit to bind constellation {cx_id}",
+                entry.seq,
+                entry.kind,
+                shape.tag()
+            ),
+            remediation: "inspect the writer that stamped this Base row and declare its exact \
+                membership semantics in calyx_ledger::base_stamp::coverage_rule; do not accept \
+                or rewrite the row until the entry-to-record binding is decidable",
+        }),
+    }
+}
+
+fn payload_names_cx(entry: &LedgerEntry, cx_id: CxId) -> Result<bool> {
+    let payload = serde_json::from_slice::<Value>(&entry.payload).map_err(|error| {
+        CalyxError::ledger_corrupt(format!(
+            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
+             its payload is not valid JSON: {error}",
+            entry.seq, entry.kind
+        ))
+    })?;
+    let members = payload.get("cx_id").ok_or_else(|| {
+        CalyxError::ledger_corrupt(format!(
+            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
+             its payload carries no cx_id member declaration",
+            entry.seq, entry.kind
+        ))
+    })?;
+    let target = cx_id.to_string();
+    match members {
+        Value::String(single) => Ok(single == &target),
+        Value::Array(ids) => Ok(ids
+            .iter()
+            .any(|value| value.as_str() == Some(target.as_str()))),
+        other => Err(CalyxError::ledger_corrupt(format!(
+            "ledger seq {} carries the {} shape, but its payload cx_id member declaration is \
+             neither a constellation id nor a list of them ({})",
+            entry.seq,
+            entry.kind,
+            json_type_name(other)
+        ))),
+    }
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 

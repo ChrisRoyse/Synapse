@@ -6,17 +6,14 @@ use calyx_aster::ledger_view::read_ledger_seqs_traced;
 use calyx_aster::mvcc::Snapshot;
 use calyx_aster::vault::AsterVault;
 use calyx_core::{CalyxError, Clock, Constellation, CxId, LedgerRef};
-use calyx_ledger::base_stamp::CoverageRule;
 use calyx_ledger::{
-    BatchMembers, LedgerEntry, MemberVerdict, SubjectId, SubjectShape, coverage_rule, decode,
-    read_batch_members,
+    CxCoverage, LedgerEntry, SubjectShape, decode, entry_cx_coverage, read_batch_members,
 };
 use calyx_sextant::{
     CALYX_SEXTANT_PROVENANCE_MISSING, CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
     CALYX_SEXTANT_PROVENANCE_SUBJECT_UNRESOLVED, FreshnessTag, Hit, ProvenanceSource,
     sextant_error,
 };
-use serde_json::Value;
 
 use crate::error::CliResult;
 
@@ -256,7 +253,7 @@ impl TargetedLedgerVerifier {
                         "cx={cx_id} seq={} kind={entry_kind} subject={} members={}",
                         expected.seq,
                         subject.tag(),
-                        declared_members(entry)?
+                        read_batch_members(&entry.payload)?
                             .total()
                             .map_or_else(|| "?".to_owned(), |total| total.to_string()),
                     )),
@@ -414,115 +411,26 @@ enum Coverage {
 /// required of their writers. A truncated declaration is likewise never read as
 /// a negative: absence from a bounded prefix proves nothing.
 fn entry_coverage(entry: &LedgerEntry, cx_id: CxId) -> CliResult<Coverage> {
-    if entry.subject == SubjectId::Cx(cx_id) {
-        return Ok(Coverage::Subject);
-    }
-    let subject = SubjectShape::of(&entry.subject);
-    match coverage_rule(entry.kind, subject) {
-        CoverageRule::SubjectCx => Ok(Coverage::NotCovered),
-        CoverageRule::EnumeratedCxList => match declared_members(entry)?.verdict(cx_id) {
-            MemberVerdict::Listed => Ok(Coverage::PayloadList),
-            MemberVerdict::NotListed => Ok(Coverage::NotCovered),
-            // Pre-#2096 entries of an enumerating shape carry their members in
-            // the top-level `cx_id` convention instead. A shape declared to
-            // enumerate that names its members NOWHERE is malformed, and
-            // `payload_names_cx` keeps that loud corruption verdict.
-            MemberVerdict::Undecided => {
-                if payload_names_cx(entry, cx_id)? {
-                    Ok(Coverage::PayloadList)
-                } else {
-                    Ok(Coverage::NotCovered)
-                }
-            }
-        },
-        CoverageRule::BatchScoped => match declared_members(entry)?.verdict(cx_id) {
-            MemberVerdict::Listed => Ok(Coverage::BatchMemberList),
-            MemberVerdict::NotListed => Ok(Coverage::NotCovered),
-            MemberVerdict::Undecided => Ok(Coverage::BatchScope),
-        },
-        CoverageRule::Unregistered => Err(sextant_error(
-            CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
-            format!(
-                "search hit {cx_id} ledger seq {} carries the {}/{} shape, which no declared \
-                 writer stamps onto a Base row's provenance; the entry hash matches the stored \
-                 Base provenance, so the ledger row itself is intact",
-                entry.seq,
-                entry.kind,
-                subject.tag()
-            ),
-        )
-        .into()),
-    }
-}
-
-/// Reads the entry's versioned batch membership declaration.
-///
-/// A declaration that is present but unreadable is a writer defect in a shape
-/// that promised to be decidable, so it fails closed naming the shape rather
-/// than degrading into the trusting path it was introduced to replace.
-fn declared_members(entry: &LedgerEntry) -> CliResult<BatchMembers> {
-    Ok(read_batch_members(&entry.payload).map_err(|error| {
+    let coverage = entry_cx_coverage(entry, cx_id).map_err(|error| {
         sextant_error(
             CALYX_SEXTANT_PROVENANCE_SHAPE_UNREGISTERED,
             format!(
-                "ledger seq {} carries the {}/{} shape with a batch membership declaration this \
-                 build cannot read ({}); the entry hash matches the stored Base provenance, so \
-                 the ledger row itself is intact",
+                "search hit {cx_id} cannot resolve ledger seq {} {}/{} coverage through the \
+                 shared Base-row contract ({}: {}); the entry hash matches the stored Base \
+                 provenance, so the ledger row itself is intact",
                 entry.seq,
                 entry.kind,
                 SubjectShape::of(&entry.subject).tag(),
+                error.code,
                 error.message
             ),
         )
-    })?)
-}
-
-/// Reads the `cx_id` member declaration of an enumerating batch entry.
-///
-/// Both observed conventions are accepted: the single-constellation writers
-/// carry `cx_id` as a string, batch ingest carries it as an array. Anything else
-/// is a malformed entry of a shape declared to enumerate — the one condition in
-/// this file that is genuinely a ledger-content defect, so it keeps the loud
-/// corruption verdict and its restore remediation.
-fn payload_names_cx(entry: &LedgerEntry, cx_id: CxId) -> CliResult<bool> {
-    let payload = serde_json::from_slice::<Value>(&entry.payload).map_err(|error| {
-        CalyxError::ledger_corrupt(format!(
-            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
-             its payload is not valid JSON: {error}",
-            entry.seq, entry.kind
-        ))
     })?;
-    let members = payload.get("cx_id").ok_or_else(|| {
-        CalyxError::ledger_corrupt(format!(
-            "ledger seq {} carries the {} shape, declared to enumerate its constellations, but \
-             its payload carries no cx_id member declaration",
-            entry.seq, entry.kind
-        ))
-    })?;
-    let target = cx_id.to_string();
-    match members {
-        Value::String(single) => Ok(single == &target),
-        Value::Array(ids) => Ok(ids
-            .iter()
-            .any(|value| value.as_str() == Some(target.as_str()))),
-        other => Err(CalyxError::ledger_corrupt(format!(
-            "ledger seq {} carries the {} shape, but its payload cx_id member declaration is \
-             neither a constellation id nor a list of them ({})",
-            entry.seq,
-            entry.kind,
-            json_type_name(other)
-        ))
-        .into()),
-    }
-}
-
-fn json_type_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
+    Ok(match coverage {
+        CxCoverage::Subject => Coverage::Subject,
+        CxCoverage::EnumeratedMember => Coverage::PayloadList,
+        CxCoverage::BatchMember => Coverage::BatchMemberList,
+        CxCoverage::BatchScope => Coverage::BatchScope,
+        CxCoverage::NotCovered => Coverage::NotCovered,
+    })
 }

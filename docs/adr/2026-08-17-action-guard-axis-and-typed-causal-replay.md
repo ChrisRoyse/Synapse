@@ -89,7 +89,11 @@ adapter now retains each bad row's nearest-good identity through exact Forge
 kNN and appends a bounded bad-cx-id to good-cx-id collision list to the
 structured calibration error. The diagnostic is read-only, contains no action
 payload, does not change score selection, and makes the physical rows needing
-an immutable lens repair directly inspectable.
+an immutable lens repair directly inspectable. Calibration-time corpus rows
+also retain their canonical `input_ref.pointer` only long enough to render that
+diagnostic, so each collision names the exact source CF/key that can be read
+back. The pointer is excluded from the serialized serving profile and no raw
+request or output enters the guard artifact.
 
 The conformal design remains deliberately fail-closed. Finite-sample coverage
 or risk control calibrates a supplied score; it does not make an

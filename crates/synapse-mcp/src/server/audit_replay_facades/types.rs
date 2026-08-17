@@ -419,6 +419,8 @@ pub struct AuditReproduceResponse {
     pub entry_hash: Option<String>,
     pub entry_self_verifies: bool,
     pub subject_matches: bool,
+    pub coverage: String,
+    pub coverage_matches: bool,
     pub drift: String,
 }
 
