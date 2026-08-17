@@ -245,3 +245,10 @@ focused, activated, stopped, restarted, or otherwise mutated.
 
 The physical artifact, process, strict-client, daemon-row, durable-log, repair
 ledger, and boundary evidence jointly satisfy #2216.
+
+After the hashes and durable daemon-log rows above were recorded, the two
+issue-owned temporary native-host telemetry directories and four exact
+issue-owned setup-repair run directories were deleted and separately read back
+as absent. The operational daemon log, setup phase ledger/checkpoint, and
+startup-error log were retained; no unrelated process, Chrome state, build
+target, or Synapse state directory was removed.
