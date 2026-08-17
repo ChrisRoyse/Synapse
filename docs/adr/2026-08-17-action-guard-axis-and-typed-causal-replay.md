@@ -2,7 +2,7 @@
 
 Date: 2026-08-17
 
-Status: accepted for implementation; production FSV pending
+Status: implemented; production guard separability repair in progress
 
 Issue: #1690
 
@@ -79,3 +79,24 @@ payloads. The native Anneal reader now selects the exact
 preserves every append-only historical row, keeps malformed native rows fatal,
 and prevents another subsystem sharing the stable wire kind from poisoning
 Anneal health.
+
+The first real `action_guard_region` calibration then refused with
+`CALYX_GUARD_PROVISIONAL`: at least one known-bad slot vector had cosine `1.0`
+to a trusted vector, so the only zero-accept threshold was greater than the
+maximum legal cosine. This is evidence that the pre-trigger lens collapses
+different causal contexts, not permission to weaken FAR. Ward's Synapse
+adapter now retains each bad row's nearest-good identity through exact Forge
+kNN and appends a bounded bad-cx-id to good-cx-id collision list to the
+structured calibration error. The diagnostic is read-only, contains no action
+payload, does not change score selection, and makes the physical rows needing
+an immutable lens repair directly inspectable.
+
+The conformal design remains deliberately fail-closed. Finite-sample coverage
+or risk control calibrates a supplied score; it does not make an
+outcome-insensitive representation separable. Exact good/bad feature collisions
+must be corrected at measurement time or treated as missing evidence, while
+the real bad-case corpus and Clopper-Pearson requirements remain unchanged.
+Primary references:
+
+- https://proceedings.iclr.cc/paper_files/paper/2024/hash/f3549ef9b5ff520a7e41ff3cc306ab2b-Abstract-Conference.html
+- https://proceedings.mlr.press/v267/zhang25dn.html

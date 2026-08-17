@@ -799,13 +799,21 @@ impl SynapseCalyxVault {
         let scoring_backend = backend.device_info().kind.to_string();
         let mut inputs = Vec::with_capacity(params.slots.len());
         let mut evidence = Vec::with_capacity(params.slots.len());
+        let mut collision_diagnostics = Vec::new();
         for spec in &params.slots {
             let target_far = match params.target_far {
                 Some(target_far) => target_far,
                 None => self.configured_guard_target_far(spec.aspect)?,
             };
-            let (good_scores, bad_scores) =
+            let score_report =
                 calibration_slot_scores(backend, &corpus.good, &corpus.bad, spec.slot)?;
+            if let Some(diagnostic) =
+                calibration_collision_diagnostic(spec.slot, &score_report.nearest_good)
+            {
+                collision_diagnostics.push(diagnostic);
+            }
+            let good_scores = score_report.good_scores;
+            let bad_scores = score_report.bad_scores;
             if good_scores.len() < SYNAPSE_GUARD_MIN_GOOD_SCORES {
                 return Err(guard_error(
                     "SYNAPSE_CALYX_GUARD_GOOD_CORPUS_INSUFFICIENT",
@@ -876,13 +884,19 @@ impl SynapseCalyxVault {
             calibration: None,
             novelty_action: params.novelty_action.clone(),
         };
-        let profile = calibrate(template, inputs.clone(), params.alpha, &clock).map_err(|error| {
-            guard_error(
-                error.code(),
-                format!("ward conformal calibration failed: {error}"),
-                "inspect the reported corpus counts; never relax the calibration minimums to force a profile",
-            )
-        })?;
+        let profile =
+            calibrate(template, inputs.clone(), params.alpha, &clock).map_err(|error| {
+                let collision_suffix = if collision_diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!("; {}", collision_diagnostics.join("; "))
+                };
+                guard_error(
+                    error.code(),
+                    format!("ward conformal calibration failed: {error}{collision_suffix}"),
+                    "inspect the named physical good/bad collision rows and repair the immutable pre-trigger lens or its missing-state semantics; never add outcome/error/after-state leakage, relax calibration minimums, or synthesize cases to force a profile",
+                )
+            })?;
 
         let mut slots = Vec::with_capacity(inputs.len());
         for (input, (spec, target_far, certifiable_min)) in inputs.iter().zip(evidence) {
@@ -1753,6 +1767,51 @@ struct WardSlotMatrix {
     dim: usize,
 }
 
+/// One bad record's exact nearest trusted exemplar. Keeping this provenance
+/// beside the score makes an inseparable calibration corpus actionable: Ward
+/// can name the physical rows whose pre-trigger measurements collide instead
+/// of returning only an unreachable scalar threshold.
+#[derive(Clone, Debug)]
+struct NearestGoodMatch {
+    bad_cx_id: String,
+    good_cx_id: String,
+    score: f32,
+}
+
+struct CalibrationSlotScores {
+    good_scores: Vec<f32>,
+    bad_scores: Vec<f32>,
+    nearest_good: Vec<NearestGoodMatch>,
+}
+
+/// Bounded physical-row evidence for the exact failure mode behind an
+/// unreachable cosine threshold. A score of `1.0` means the selected lens gave
+/// a known-bad record the same direction as a trusted record; no legal tau can
+/// reject the former while accepting the latter. Record ids are safe audit
+/// identifiers and the example list is deliberately capped.
+fn calibration_collision_diagnostic(slot: u16, matches: &[NearestGoodMatch]) -> Option<String> {
+    const MAX_EXAMPLES: usize = 4;
+    let exact = matches
+        .iter()
+        // Backend scores have already passed the shared cosine validator,
+        // which clamps only reduction-order excess to the legal maximum.
+        .filter(|nearest| nearest.score >= 1.0)
+        .collect::<Vec<_>>();
+    if exact.is_empty() {
+        return None;
+    }
+    let examples = exact
+        .iter()
+        .take(MAX_EXAMPLES)
+        .map(|nearest| format!("{}->{}", nearest.bad_cx_id, nearest.good_cx_id))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!(
+        "slot {slot} has {} exact bad-to-good cosine collision(s) at score 1.0; physical cx_id examples=[{examples}]",
+        exact.len()
+    ))
+}
+
 impl WardSlotMatrix {
     const fn rows(&self) -> usize {
         self.row_ids.len()
@@ -1772,7 +1831,7 @@ fn calibration_slot_scores(
     good: &[AdjudicatedRecord],
     bad: &[AdjudicatedRecord],
     slot: u16,
-) -> Result<(Vec<f32>, Vec<f32>), SynapseCalyxError> {
+) -> Result<CalibrationSlotScores, SynapseCalyxError> {
     let mut good_matrix = collect_slot_matrix(good, slot, "good", None)?;
     let good_dim = good_matrix.as_ref().map(|matrix| matrix.dim);
     let mut bad_matrix = collect_slot_matrix(bad, slot, "bad", good_dim)?;
@@ -1780,7 +1839,11 @@ fn calibration_slot_scores(
     let Some(good_matrix) = good_matrix.as_mut() else {
         // Without one trusted vector there is no candidate space. The caller's
         // existing GOOD_CORPUS_INSUFFICIENT gate names that evidence deficit.
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(CalibrationSlotScores {
+            good_scores: Vec::new(),
+            bad_scores: Vec::new(),
+            nearest_good: Vec::new(),
+        });
     };
     normalize_slot_matrix(backend, good_matrix, slot, "good")?;
     if let Some(matrix) = bad_matrix.as_mut() {
@@ -1788,11 +1851,15 @@ fn calibration_slot_scores(
     }
 
     let good_scores = leave_one_out_scores(backend, good_matrix, slot)?;
-    let bad_scores = match bad_matrix.as_ref() {
+    let (bad_scores, nearest_good) = match bad_matrix.as_ref() {
         Some(matrix) => nearest_good_scores(backend, matrix, good_matrix, slot)?,
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
-    Ok((good_scores, bad_scores))
+    Ok(CalibrationSlotScores {
+        good_scores,
+        bad_scores,
+        nearest_good,
+    })
 }
 
 /// Compacts every physical record carrying `slot` into a uniform row-major
@@ -1976,9 +2043,9 @@ fn nearest_good_scores(
     bad: &WardSlotMatrix,
     good: &WardSlotMatrix,
     slot: u16,
-) -> Result<Vec<f32>, SynapseCalyxError> {
+) -> Result<(Vec<f32>, Vec<NearestGoodMatch>), SynapseCalyxError> {
     if bad.rows() == 0 || good.rows() == 0 {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let batch = backend
         .knn(
@@ -2003,8 +2070,9 @@ fn nearest_good_scores(
         })?;
     validate_knn_shape(&batch, bad.rows(), good.rows(), 1, slot, "bad×good")?;
     let mut scores = Vec::with_capacity(bad.rows());
+    let mut nearest_good = Vec::with_capacity(bad.rows());
     for query_index in 0..bad.rows() {
-        let (_, score) = batch
+        let (candidate_index, score) = batch
             .row(query_index)
             .and_then(|mut row| row.next())
             .ok_or_else(|| {
@@ -2017,14 +2085,15 @@ fn nearest_good_scores(
                     "inspect the exact Forge kNN result shape; every bad query requires one trusted candidate score",
                 )
             })?;
-        scores.push(validate_backend_cosine(
+        let score = validate_backend_cosine(score, slot, query_index, "bad×good")?;
+        scores.push(score);
+        nearest_good.push(NearestGoodMatch {
+            bad_cx_id: bad.row_ids[query_index].clone(),
+            good_cx_id: good.row_ids[candidate_index].clone(),
             score,
-            slot,
-            query_index,
-            "bad×good",
-        )?);
+        });
     }
-    Ok(scores)
+    Ok((scores, nearest_good))
 }
 
 fn validate_knn_shape(
