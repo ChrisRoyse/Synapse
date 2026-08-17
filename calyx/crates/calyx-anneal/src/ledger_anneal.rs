@@ -15,6 +15,7 @@ use crate::propose::AdmissionRecord;
 use crate::{ChangeId, LogicalTime, MetricSnapshot};
 
 pub const ANNEAL_LEDGER_PAYLOAD_TAG: &str = "anneal_event_v1";
+const ANNEAL_LEDGER_SUBJECT_PREFIX: &[u8] = b"anneal\0";
 pub const MAX_ANNEAL_LEDGER_PAYLOAD_BYTES: usize = 16 * 1024;
 pub const CALYX_LEDGER_ENTRY_TOO_LARGE: &str = "CALYX_LEDGER_ENTRY_TOO_LARGE";
 pub const CALYX_ANNEAL_LEDGER_INVALID_ENTRY: &str = "CALYX_ANNEAL_LEDGER_INVALID_ENTRY";
@@ -219,7 +220,9 @@ where
         self.appender
             .scan_entries()?
             .into_iter()
-            .filter(|entry| entry.kind == EntryKind::Anneal)
+            .filter(|entry| {
+                entry.kind == EntryKind::Anneal && is_native_anneal_subject(&entry.subject)
+            })
             .map(decode_readback)
             .collect()
     }
@@ -459,13 +462,15 @@ where
                     entry.seq
                 )));
             }
-            decoded.push((seq, entry.kind));
+            decoded.push((seq, entry.kind, entry.subject));
         }
         newest_first.extend(
             decoded
                 .into_iter()
                 .rev()
-                .filter_map(|(seq, kind)| (kind == EntryKind::Anneal).then_some(seq)),
+                .filter_map(|(seq, kind, subject)| {
+                    (kind == EntryKind::Anneal && is_native_anneal_subject(&subject)).then_some(seq)
+                }),
         );
 
         if page_first == 0 {
@@ -523,7 +528,7 @@ where
                     entry.seq
                 )));
             }
-            if entry.kind == EntryKind::Anneal {
+            if entry.kind == EntryKind::Anneal && is_native_anneal_subject(&entry.subject) {
                 anneal_sequences.push(seq);
             }
             last_seen = Some(seq);
@@ -659,7 +664,13 @@ where
                 .scan()?
                 .into_iter()
                 .filter_map(|row| match decode(&row.bytes) {
-                    Ok(entry) if entry.kind == kind => Some(Ok(row)),
+                    Ok(entry)
+                        if entry.kind == kind
+                            && (kind != EntryKind::Anneal
+                                || is_native_anneal_subject(&entry.subject)) =>
+                    {
+                        Some(Ok(row))
+                    }
                     Ok(_) => None,
                     Err(error) => Some(Err(error)),
                 })
@@ -690,10 +701,15 @@ where
                         ))
                     })?;
                 let entry = decode(&bytes)?;
-                if entry.seq != seq || entry.kind != EntryKind::Anneal {
+                if entry.seq != seq
+                    || entry.kind != EntryKind::Anneal
+                    || !is_native_anneal_subject(&entry.subject)
+                {
                     return Err(CalyxError::ledger_corrupt(format!(
-                        "Anneal ledger delta index points at seq {seq} encoded as seq {} kind {:?}",
-                        entry.seq, entry.kind
+                        "Anneal ledger delta index points at seq {seq} encoded as seq {} kind {:?} native_subject={}",
+                        entry.seq,
+                        entry.kind,
+                        is_native_anneal_subject(&entry.subject)
                     )));
                 }
                 Ok(LedgerRow { seq, bytes })
@@ -813,10 +829,19 @@ pub fn decode_anneal_ledger_payload(payload: &[u8]) -> Result<AnnealLedgerEntry>
 }
 
 fn anneal_subject(change_id: ChangeId) -> SubjectId {
-    let mut subject = Vec::with_capacity(15);
-    subject.extend_from_slice(b"anneal\0");
+    let mut subject = Vec::with_capacity(ANNEAL_LEDGER_SUBJECT_PREFIX.len() + 8);
+    subject.extend_from_slice(ANNEAL_LEDGER_SUBJECT_PREFIX);
     subject.extend_from_slice(&change_id.0.to_be_bytes());
     SubjectId::Kernel(subject)
+}
+
+fn is_native_anneal_subject(subject: &SubjectId) -> bool {
+    matches!(
+        subject,
+        SubjectId::Kernel(bytes)
+            if bytes.len() == ANNEAL_LEDGER_SUBJECT_PREFIX.len() + 8
+                && bytes.starts_with(ANNEAL_LEDGER_SUBJECT_PREFIX)
+    )
 }
 
 fn parse_aster_ledger_seq(key: &[u8]) -> Result<u64> {

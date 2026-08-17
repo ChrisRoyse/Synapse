@@ -70,3 +70,12 @@ axes. Existing rows without executable preflight remain visibly
 `legacy_unknown`; they are never rewritten from current filesystem state.
 Panel, profile, assay, kernel, derived-state, and validation artifacts must be
 rebuilt and physically read back for `2_185_006` before readiness can pass.
+
+Deployment also exposed an independent ledger-type ambiguity: action
+validation and Forge promotion receipts legitimately use the broad
+`EntryKind::Anneal`, but their payloads are not native `AnnealLedgerEntry`
+payloads. The native Anneal reader now selects the exact
+`Kernel("anneal\\0" + change_id)` subject namespace before decoding. This
+preserves every append-only historical row, keeps malformed native rows fatal,
+and prevents another subsystem sharing the stable wire kind from poisoning
+Anneal health.
