@@ -333,7 +333,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "usage",
         ],
     ),
-    // The action panel's slots move to generation 2_185_002 together. The
+    // The action panel's slots move to generation 2_185_003 together. The
     // version column is load-bearing, not documentary: `syn_anchor_source_
     // provenance` filters this table by `version == panel_version`, so a slot
     // left on the superseded generation is invisible to the leakage check for
@@ -342,7 +342,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // panel, exactly as the timeline rows name 1_963_001 and not 1_900_001.
     (
         48,
-        2_185_002,
+        2_185_003,
         "syn.action.kind_onehot.v2",
         &["row_kind", "tool", "verb"],
     ),
@@ -353,7 +353,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // unaudited measurement this table exists to make impossible.
     (
         49,
-        2_185_002,
+        2_185_003,
         "syn.action.target_hash.v2",
         &[
             "agent_logical_foreground.target",
@@ -368,7 +368,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // transitively and declares them too.
     (
         50,
-        2_185_002,
+        2_185_003,
         "syn.action.record_vector.v2",
         &[
             "agent_logical_foreground.target",
@@ -382,8 +382,8 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
-    (51, 2_185_002, "syn.action.hour_cyclic.v1", &["ts_ns"]),
-    (52, 2_185_002, "syn.action.dow_cyclic.v1", &["ts_ns"]),
+    (51, 2_185_003, "syn.action.hour_cyclic.v1", &["ts_ns"]),
+    (52, 2_185_003, "syn.action.dow_cyclic.v1", &["ts_ns"]),
     // #2050's dense target-identity lane. It resolves the target through the
     // SAME `ACTION_TARGET_POINTERS` precedence slot 49 uses and then decomposes
     // the resolved value per field, so its declared source set is identical to
@@ -399,7 +399,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // claim in a comment.
     (
         117,
-        2_185_002,
+        2_185_003,
         "syn.action.target_vector.v2",
         &[
             "agent_logical_foreground.target",
@@ -414,7 +414,7 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
     // status/error/after and response fields are intentionally absent.
     (
         118,
-        2_185_002,
+        2_185_003,
         "syn.action.request_vector.v1",
         &[
             "agent_logical_foreground.target",
@@ -431,6 +431,41 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "target",
             "tool",
             "verb",
+        ],
+    ),
+    // Bounded request magnitude. The source-selection envelope is declared as
+    // well as the byte count because malformed or post-treatment-only rows are
+    // refused before the size class is measured.
+    (
+        119,
+        2_185_003,
+        "syn.action.request_size_class.v1",
+        &[
+            "payload_bytes",
+            "payload_bounded",
+            "payload_sha256",
+            "payload_truncated",
+            "request_snapshot",
+            "request_snapshot_bytes",
+            "request_snapshot_sha256",
+            "row_kind",
+        ],
+    ),
+    // Bounded structural summary. Scalar values, request identity, source key,
+    // time and all terminal fields are absent from the class signature.
+    (
+        120,
+        2_185_003,
+        "syn.action.request_shape_class.v1",
+        &[
+            "payload_bytes",
+            "payload_bounded",
+            "payload_sha256",
+            "payload_truncated",
+            "request_snapshot",
+            "request_snapshot_bytes",
+            "request_snapshot_sha256",
+            "row_kind",
         ],
     ),
     (53, 1_965_004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
@@ -696,8 +731,8 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
 
 pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // `action_outcome_anchor`: command rows use `outcome`; legacy action rows
-    // use `status`. No active 2_185_002 lens reads either post-treatment field.
-    ("reward", 2_185_002, &["outcome", "status"]),
+    // use `status`. No active 2_185_003 lens reads either post-treatment field.
+    ("reward", 2_185_003, &["outcome", "status"]),
     // `record.status`, and `error_type` which is `Some` exactly when the call
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (

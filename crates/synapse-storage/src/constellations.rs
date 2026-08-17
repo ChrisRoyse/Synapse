@@ -169,7 +169,22 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// immutable generation because adding the slot to `2_185_001` would silently
 /// reinterpret every already-persisted constellation under a layout it never
 /// carried.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_002;
+///
+/// Generation `2_185_003` keeps that exact, audit-grade lane and adds two
+/// independently measurable bounded causes: payload-size class and structural-
+/// shape class. The exact request lane took 217 values over 457 paired records
+/// in the first physical assay. Repeated values correctly selected the discrete
+/// estimator, but 225 occupied outcome cells required 1,125 samples for its
+/// Miller-Madow bias bound, so the lane was honestly unmeasured. Flattening or
+/// deleting exact identity would lose audit truth. These two coarser lenses are
+/// separate slots instead: each is point-in-time, target-blind, finite-support,
+/// and suitable for bits, Ward, and the exhaustive association maps.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_003;
+/// The exact request-vector generation superseded by the bounded request-cause lanes.
+///
+/// It remains readable history and is always re-measured from its source
+/// rows rather than having new slot meanings grafted onto it.
+pub const SYN_ACTION_PANEL_VERSION_PRE_REQUEST_CLASSES: u32 = 2_185_002;
 /// The target-vector-only generation superseded by the request-cause lane.
 pub const SYN_ACTION_PANEL_VERSION_PRE_REQUEST: u32 = 2_185_001;
 /// The contaminated generation #2185 superseded. It remains readable history,
@@ -724,6 +739,14 @@ const ACT_REQUEST_MAX_NODES: usize = 64;
 const ACT_REQUEST_EXACT_WEIGHT: f64 = 1.0;
 const ACT_REQUEST_ENVELOPE_WEIGHT: f64 = 0.75;
 const ACT_REQUEST_SHAPE_WEIGHT: f64 = 0.5;
+/// Frozen finite support for the request byte-length lens. Eight domain
+/// thresholds keep the worst-case binary-outcome contingency table to sixteen
+/// occupied cells instead of one cell per exact byte count.
+const ACT_REQUEST_SIZE_CLASS_LEVELS: u32 = 8;
+/// Frozen finite support for the structural request lens. Thirty signed-hash
+/// buckets cap its worst-case binary-outcome table at sixty occupied cells;
+/// the exact structural summary is defined below and never includes values.
+const ACT_REQUEST_SHAPE_CLASS_LEVELS: u32 = 30;
 /// Weight of a whole-field exact-value feature. The identity carrier: two rows
 /// naming the same value for the same field share this feature exactly.
 const ACT_TARGET_EXACT_WEIGHT: f64 = 1.0;
@@ -797,6 +820,12 @@ const ACT_SLOT_TARGET_VECTOR: SlotId = SlotId::new(117);
 /// Dense point-in-time request-cause lane. Slot 118 is in the action panel's
 /// reserved second block and has never carried another meaning.
 const ACT_SLOT_REQUEST_VECTOR: SlotId = SlotId::new(118);
+/// Bounded log-scale payload-size category. Slot 119 has never carried another
+/// meaning and is independently assayable from exact request identity.
+const ACT_SLOT_REQUEST_SIZE_CLASS: SlotId = SlotId::new(119);
+/// Bounded structural-shape category. Slot 120 has never carried another
+/// meaning and is independently assayable from exact request identity.
+const ACT_SLOT_REQUEST_SHAPE_CLASS: SlotId = SlotId::new(120);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -957,9 +986,9 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         first: 48,
         last: 52,
     },
-    // The action panel's second block (#2050). Holds `ACT_SLOT_TARGET_VECTOR`
-    // (117) and `ACT_SLOT_REQUEST_VECTOR` (118); 119..=120 are unallocated headroom inside this panel's own range,
-    // so the next action lens needs no third block. `48..=52` could not be
+    // The action panel's second block (#2050/#1690). Holds the dense target,
+    // exact request, bounded request-size and bounded request-shape lanes
+    // (117..=120). `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
     PanelSlotBlock {
@@ -2448,6 +2477,14 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
     (ACT_SLOT_DOW_CYCLIC, "syn.action.dow_cyclic.v1"),
     (ACT_SLOT_TARGET_VECTOR, "syn.action.target_vector.v2"),
     (ACT_SLOT_REQUEST_VECTOR, "syn.action.request_vector.v1"),
+    (
+        ACT_SLOT_REQUEST_SIZE_CLASS,
+        "syn.action.request_size_class.v1",
+    ),
+    (
+        ACT_SLOT_REQUEST_SHAPE_CLASS,
+        "syn.action.request_shape_class.v1",
+    ),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2884,6 +2921,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_2050,
                 SYN_ACTION_PANEL_VERSION_PRE_2185,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST,
+                SYN_ACTION_PANEL_VERSION_PRE_REQUEST_CLASSES,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5312,10 +5350,11 @@ pub fn build_action_constellation(
         ACT_SLOT_TARGET_VECTOR,
         action_target_vector_slot(source_key, record)?,
     );
-    slots.insert(
-        ACT_SLOT_REQUEST_VECTOR,
-        action_request_vector_slot(source_key, record)?,
-    );
+    let (request_vector, request_size_class, request_shape_class) =
+        action_request_slots(source_key, record)?;
+    slots.insert(ACT_SLOT_REQUEST_VECTOR, request_vector);
+    slots.insert(ACT_SLOT_REQUEST_SIZE_CLASS, request_size_class);
+    slots.insert(ACT_SLOT_REQUEST_SHAPE_CLASS, request_shape_class);
     slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
@@ -8191,7 +8230,7 @@ pub fn syn_path_hierarchy_panel_contract(
 }
 
 fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageResult<Vec<Slot>> {
-    Ok(vec![
+    let mut slots = vec![
         syn_content_slot(
             ACT_SLOT_KIND_ONEHOT,
             "syn.action.kind_onehot.v2",
@@ -8247,10 +8286,7 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
             panel_version,
             registry,
         )?,
-        // #2050's dense target-identity lane. Declared beside the `syn_hash`
-        // lane rather than replacing it: slot 49 stays the exact-match lane
-        // (one value, one cell, no false positives beyond a bucket collision),
-        // and 117 is the graded lane Ward can actually score.
+        // #2050's graded dense target lane beside slot 49's exact-match hash.
         syn_content_slot(
             ACT_SLOT_TARGET_VECTOR,
             "syn.action.target_vector.v2",
@@ -8262,9 +8298,7 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
             panel_version,
             registry,
         )?,
-        // Point-in-time request cause. This deliberately coexists with target
-        // identity: target says what entity the action addressed; request says
-        // what operation-specific input was supplied to that entity.
+        // Point-in-time request cause, independently of target identity.
         syn_content_slot(
             ACT_SLOT_REQUEST_VECTOR,
             "syn.action.request_vector.v1",
@@ -8272,6 +8306,38 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
                 "syn.action.request_vector.v1",
                 Modality::Structured,
                 ACT_REQUEST_VECTOR_DIM,
+            ),
+            panel_version,
+            registry,
+        )?,
+    ];
+    slots.extend(action_request_class_panel_slots(panel_version, registry)?);
+    Ok(slots)
+}
+
+fn action_request_class_panel_slots(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<[Slot; 2]> {
+    Ok([
+        syn_content_slot(
+            ACT_SLOT_REQUEST_SIZE_CLASS,
+            "syn.action.request_size_class.v1",
+            RegistryAlgorithmicLens::syn_one_hot_index(
+                "syn.action.request_size_class.v1",
+                Modality::Structured,
+                ACT_REQUEST_SIZE_CLASS_LEVELS,
+            ),
+            panel_version,
+            registry,
+        )?,
+        syn_content_slot(
+            ACT_SLOT_REQUEST_SHAPE_CLASS,
+            "syn.action.request_shape_class.v1",
+            RegistryAlgorithmicLens::syn_one_hot_index(
+                "syn.action.request_shape_class.v1",
+                Modality::Structured,
+                ACT_REQUEST_SHAPE_CLASS_LEVELS,
             ),
             panel_version,
             registry,
@@ -9741,18 +9807,23 @@ fn collect_action_request_nodes(
     depth: usize,
     visited: &mut usize,
     features: &mut serde_json::Map<String, Value>,
+    shape: &mut ActionRequestShapeStats,
 ) -> bool {
     const MAX_DEPTH: usize = 16;
     if depth > MAX_DEPTH || *visited >= ACT_REQUEST_MAX_NODES {
+        shape.overflowed = true;
         return true;
     }
     *visited += 1;
+    shape.visited_nodes = *visited;
+    shape.max_depth = shape.max_depth.max(depth);
     let path_digest = action_target_feature_digest(path);
     match value {
         Value::Object(map) => {
+            shape.objects += 1;
             let mut keys = map.keys().collect::<Vec<_>>();
             keys.sort();
-            let shape = keys
+            let field_shape = keys
                 .iter()
                 .map(|key| key.as_str())
                 .collect::<Vec<_>>()
@@ -9760,7 +9831,7 @@ fn collect_action_request_nodes(
             features.insert(
                 format!(
                     "node|{path_digest}|object|{}",
-                    action_target_feature_digest(&shape)
+                    action_target_feature_digest(&field_shape)
                 ),
                 json!(ACT_REQUEST_SHAPE_WEIGHT),
             );
@@ -9773,11 +9844,13 @@ fn collect_action_request_nodes(
                     depth + 1,
                     visited,
                     features,
+                    shape,
                 );
             }
             overflowed
         }
         Value::Array(items) => {
+            shape.arrays += 1;
             features.insert(
                 format!("node|{path_digest}|array|len={}", items.len()),
                 json!(ACT_REQUEST_SHAPE_WEIGHT),
@@ -9785,12 +9858,27 @@ fn collect_action_request_nodes(
             let mut overflowed = false;
             for (index, item) in items.iter().enumerate() {
                 let child_path = format!("{path}/{index}");
-                overflowed |=
-                    collect_action_request_nodes(item, &child_path, depth + 1, visited, features);
+                overflowed |= collect_action_request_nodes(
+                    item,
+                    &child_path,
+                    depth + 1,
+                    visited,
+                    features,
+                    shape,
+                );
             }
             overflowed
         }
         scalar => {
+            match scalar {
+                Value::Null => shape.nulls += 1,
+                Value::Bool(_) => shape.booleans += 1,
+                Value::Number(_) => shape.numbers += 1,
+                Value::String(_) => shape.strings += 1,
+                Value::Array(_) | Value::Object(_) => {
+                    unreachable!("container request values are handled before the scalar branch")
+                }
+            }
             let text = json_value_text(scalar).unwrap_or_else(|| request_value_kind(scalar).into());
             features.insert(
                 format!(
@@ -9805,10 +9893,77 @@ fn collect_action_request_nodes(
     }
 }
 
+#[derive(Default)]
+struct ActionRequestShapeStats {
+    visited_nodes: usize,
+    max_depth: usize,
+    objects: usize,
+    arrays: usize,
+    strings: usize,
+    numbers: usize,
+    booleans: usize,
+    nulls: usize,
+    overflowed: bool,
+}
+
+const fn request_shape_count_class(value: usize) -> u8 {
+    match value {
+        0 => 0,
+        1 => 1,
+        2..=4 => 2,
+        5..=16 => 3,
+        _ => 4,
+    }
+}
+
+/// Eight frozen magnitude regimes spanning an empty payload through the 1 MiB
+/// authenticated request ceiling. These are domain thresholds, not empirical
+/// quantiles, so replaying the same row never depends on what else is present in
+/// the vault.
+const fn action_request_size_class(bytes: u64) -> u32 {
+    match bytes {
+        0 => 0,
+        1..=63 => 1,
+        64..=255 => 2,
+        256..=1_023 => 3,
+        1_024..=4_095 => 4,
+        4_096..=16_383 => 5,
+        16_384..=65_535 => 6,
+        _ => 7,
+    }
+}
+
+/// Compresses only the structural atoms of a request into a bounded category.
+///
+/// This is feature hashing used as a cardinality contract: the signature names
+/// root value kind, binned node/depth counts, binned container/scalar counts,
+/// and explicit traversal overflow. It includes no scalar value, digest, time,
+/// source key, status, response, or outcome. The 30-bucket collision boundary
+/// is therefore disclosed and deterministic while the exact request remains in
+/// slot 118 for audit and similarity.
+fn action_request_shape_class(payload: &Value, shape: &ActionRequestShapeStats) -> u32 {
+    let signature = format!(
+        "root={}|nodes={}|depth={}|objects={}|arrays={}|strings={}|numbers={}|bools={}|nulls={}|overflow={}",
+        request_value_kind(payload),
+        request_shape_count_class(shape.visited_nodes),
+        request_shape_count_class(shape.max_depth),
+        request_shape_count_class(shape.objects),
+        request_shape_count_class(shape.arrays),
+        request_shape_count_class(shape.strings),
+        request_shape_count_class(shape.numbers),
+        request_shape_count_class(shape.booleans),
+        request_shape_count_class(shape.nulls),
+        u8::from(shape.overflowed),
+    );
+    let digest = Sha256::digest(signature.as_bytes());
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
+        % ACT_REQUEST_SHAPE_CLASS_LEVELS
+}
+
 fn action_request_features(
     record: &Value,
     request: &ActionRequestSource<'_>,
-) -> StorageResult<serde_json::Map<String, Value>> {
+) -> StorageResult<(serde_json::Map<String, Value>, ActionRequestShapeStats)> {
     let mut features = serde_json::Map::new();
     insert_request_exact_feature(
         &mut features,
@@ -9866,8 +10021,15 @@ fn action_request_features(
     }
 
     let mut visited = 0_usize;
-    let overflowed =
-        collect_action_request_nodes(request.payload, "$", 0, &mut visited, &mut features);
+    let mut shape = ActionRequestShapeStats::default();
+    let overflowed = collect_action_request_nodes(
+        request.payload,
+        "$",
+        0,
+        &mut visited,
+        &mut features,
+        &mut shape,
+    );
     if overflowed {
         let Some(digest) = request.full_payload_sha256 else {
             return Err(measurement_error(
@@ -9884,18 +10046,26 @@ fn action_request_features(
             ACT_REQUEST_EXACT_WEIGHT,
         );
     }
-    Ok(features)
+    Ok((features, shape))
 }
 
-/// Measures the pre-execution request cause, or explicit absence when the
-/// historical row did not persist a request independently of its outcome.
-fn action_request_vector_slot(source_key: &[u8], record: &Value) -> StorageResult<SlotVector> {
+/// Measures the exact, size-class and shape-class pre-execution request causes,
+/// or explicit absence on all three when a historical row did not persist a
+/// request independently of its outcome.
+fn action_request_slots(
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<(SlotVector, SlotVector, SlotVector)> {
     let Some(request) = action_request_source(record)? else {
-        return Ok(absent(AbsentReason::NotApplicable));
+        return Ok((
+            absent(AbsentReason::NotApplicable),
+            absent(AbsentReason::NotApplicable),
+            absent(AbsentReason::NotApplicable),
+        ));
     };
-    let features = action_request_features(record, &request).map_err(|error| {
+    let (features, shape) = action_request_features(record, &request).map_err(|error| {
         measurement_error(
-            "action request vector",
+            "action request causes",
             format!(
                 "source_cf={} source_key_hex={} action={}: {error}",
                 cf::CF_ACTION_LOG,
@@ -9904,7 +10074,7 @@ fn action_request_vector_slot(source_key: &[u8], record: &Value) -> StorageResul
             ),
         )
     })?;
-    measure_json(
+    let request_vector = measure_json(
         SYN_ACTION_PANEL_NAME,
         AlgorithmicLens::syn_record_vector_unit_fields(
             "syn.action.request_vector.v1",
@@ -9912,7 +10082,32 @@ fn action_request_vector_slot(source_key: &[u8], record: &Value) -> StorageResul
             ACT_REQUEST_VECTOR_DIM,
         ),
         &Value::Object(features),
-    )
+    )?;
+    let payload_bytes = request.payload_bytes.ok_or_else(|| {
+        measurement_error(
+            "action request size class",
+            "a measurable request source omitted its authenticated payload byte length; remediation=repair the source contract rather than inventing a size class",
+        )
+    })?;
+    let request_size_class = measure_number(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_one_hot_index(
+            "syn.action.request_size_class.v1",
+            Modality::Structured,
+            ACT_REQUEST_SIZE_CLASS_LEVELS,
+        ),
+        action_request_size_class(payload_bytes),
+    )?;
+    let request_shape_class = measure_number(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_one_hot_index(
+            "syn.action.request_shape_class.v1",
+            Modality::Structured,
+            ACT_REQUEST_SHAPE_CLASS_LEVELS,
+        ),
+        action_request_shape_class(request.payload, &shape),
+    )?;
+    Ok((request_vector, request_size_class, request_shape_class))
 }
 
 /// Reports a terminal action SUCCESS whose own foreground state says a target
