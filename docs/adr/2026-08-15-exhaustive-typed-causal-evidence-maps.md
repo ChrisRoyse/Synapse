@@ -52,6 +52,16 @@ Primary sources constrain the interpretation:
     field and rejects over-budget or mismatched bytes. Resource refusal happens
     before estimator publication and never licenses sampling, pair omission, or
     conditioning-set omission.
+17. One configured Synapse math lease spans the complete admitted estimator
+    workflow. Under CUDA, legacy strict Calyx Assay constructors resolve a
+    thread-local scoped clone of that lease's exact CUDA context, so all lanes
+    reuse one driver context plus its module/function caches. The scope is
+    synchronous, accepts nested entry only for the identical context, poisons
+    ownership mismatches, and is destroyed before artifact persistence. It is
+    intentionally not a process-global primary-context holder: the existing
+    lazy-release and host-reservation owner remains authoritative. Individual
+    estimator kernels retain their live-VRAM checks; no CPU fallback, sampled
+    pair set, or extended transport timeout is permitted.
 
 ## Consequences
 
@@ -75,6 +85,10 @@ Primary sources constrain the interpretation:
   a smaller but extremely long/high-lag universe can still refuse on the actual
   cell, evidence-point, PC-test, allocation, or serialized-byte dimension. The
   persisted accounting makes that boundary auditable by consumers and health.
+- A complete map no longer pays CUDA context creation and lazy module/function
+  resolution once per estimator invocation and pair. The configured runtime is
+  now observably active for the operation and returns to dormant state after
+  the scoped lease drops, without retaining hidden process-global GPU state.
 
 ## References
 
@@ -93,3 +107,12 @@ Primary sources constrain the interpretation:
   <https://doc.rust-lang.org/std/vec/struct.Vec.html>.
 - `serde_json::to_writer` (serialization into an explicit bounded writer):
   <https://docs.rs/serde_json/latest/serde_json/fn.to_writer.html>.
+- NVIDIA, *CUDA Programming Guide — CUDA Graphs* (reusing a defined workflow
+  avoids repeated host setup and launch overhead):
+  <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html>.
+- NVIDIA, *CUDA Driver API — Difference between the Driver and Runtime APIs*
+  (contexts carry significant resources and context switching has cost):
+  <https://docs.nvidia.com/cuda/cuda-driver-api/driver-vs-runtime-api.html>.
+- NVIDIA, *CUDA Programming Guide — Lazy Loading* (module/kernel loading can
+  occur at first use and affect operation latency):
+  <https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/lazy-loading.html>.

@@ -9,6 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
+use std::time::Instant;
 
 use calyx_assay::{
     CcmConfig, HawkesConfig, HawkesEventSeries, PartialNetworkSeries, PcSeries,
@@ -322,106 +323,150 @@ impl SynapseCalyxVault {
             max_artifact_bytes = resource_accounting.max_artifact_bytes_budget,
             "admitted the complete causal-map scope against measured work dimensions"
         );
-        let lags = (1..=max_lag).collect::<Vec<_>>();
-        let mut granger_hypotheses = Vec::new();
-        try_reserve_causal(
-            &mut granger_hypotheses,
-            resource_accounting.granger_hypotheses_upper_bound,
-            "all bidirectional Granger hypotheses",
-        )?;
-        let mut ccf_hypotheses = Vec::new();
-        try_reserve_causal(
-            &mut ccf_hypotheses,
-            resource_accounting.cross_correlation_hypotheses_upper_bound,
-            "all signed cross-correlation hypotheses",
-        )?;
-        let mut pairs = Vec::new();
-        try_reserve_causal(
-            &mut pairs,
-            resource_accounting.pair_count,
-            "all causal stream-pair evidence rows",
-        )?;
+        let configured_math = self.math_runtime.backend()?;
+        let assay_backend = configured_math.assay_backend();
+        let assay_backend_label = assay_backend.as_str();
+        let assay_started = Instant::now();
+        tracing::info!(
+            code = "SYNAPSE_CALYX_CAUSAL_MAP_ASSAY_SCOPE_STARTED",
+            backend = assay_backend_label,
+            stream_count = resource_accounting.stream_count,
+            pair_count = resource_accounting.pair_count,
+            "leased the configured math runtime for the complete causal-estimator scope"
+        );
+        let compute = || {
+            let lags = (1..=max_lag).collect::<Vec<_>>();
+            let mut granger_hypotheses = Vec::new();
+            try_reserve_causal(
+                &mut granger_hypotheses,
+                resource_accounting.granger_hypotheses_upper_bound,
+                "all bidirectional Granger hypotheses",
+            )?;
+            let mut ccf_hypotheses = Vec::new();
+            try_reserve_causal(
+                &mut ccf_hypotheses,
+                resource_accounting.cross_correlation_hypotheses_upper_bound,
+                "all signed cross-correlation hypotheses",
+            )?;
+            let mut pairs = Vec::new();
+            try_reserve_causal(
+                &mut pairs,
+                resource_accounting.pair_count,
+                "all causal stream-pair evidence rows",
+            )?;
 
-        for left in 0..selected.len() {
-            for right in (left + 1)..selected.len() {
-                let group_a = &selected[left];
-                let group_b = &selected[right];
-                let stream_a = &binned[group_a];
-                let stream_b = &binned[group_b];
-                let times_a = &by_group[group_a];
-                let times_b = &by_group[group_b];
-                let transfer_entropy = transfer_entropy_evidence(stream_a, stream_b, &lags)?;
-                let granger_a_to_b = granger_evidence(
-                    group_a,
-                    group_b,
-                    stream_a,
-                    stream_b,
-                    &lags,
-                    &mut granger_hypotheses,
-                );
-                let granger_b_to_a = granger_evidence(
-                    group_b,
-                    group_a,
-                    stream_b,
-                    stream_a,
-                    &lags,
-                    &mut granger_hypotheses,
-                );
-                let cross_correlation = cross_correlation_evidence(
-                    group_a,
-                    group_b,
-                    stream_a,
-                    stream_b,
-                    max_lag,
-                    &mut ccf_hypotheses,
-                );
-                let convergent_cross_mapping = ccm_evidence(group_a, group_b, stream_a, stream_b);
-                let temporal_cross_k = cross_k_evidence(
-                    group_a,
-                    group_b,
-                    times_a,
-                    times_b,
-                    origin,
-                    bin_seconds,
-                    max_lag,
-                )?;
-                pairs.push(SynapseCalyxCausalPairEvidence {
-                    group_a: group_a.clone(),
-                    group_b: group_b.clone(),
-                    events_a: times_a.len(),
-                    events_b: times_b.len(),
-                    transfer_entropy,
-                    granger_a_to_b,
-                    granger_b_to_a,
-                    cross_correlation,
-                    convergent_cross_mapping,
-                    temporal_cross_k,
-                });
+            for left in 0..selected.len() {
+                for right in (left + 1)..selected.len() {
+                    let group_a = &selected[left];
+                    let group_b = &selected[right];
+                    let stream_a = &binned[group_a];
+                    let stream_b = &binned[group_b];
+                    let times_a = &by_group[group_a];
+                    let times_b = &by_group[group_b];
+                    let transfer_entropy = transfer_entropy_evidence(stream_a, stream_b, &lags)?;
+                    let granger_a_to_b = granger_evidence(
+                        group_a,
+                        group_b,
+                        stream_a,
+                        stream_b,
+                        &lags,
+                        &mut granger_hypotheses,
+                    );
+                    let granger_b_to_a = granger_evidence(
+                        group_b,
+                        group_a,
+                        stream_b,
+                        stream_a,
+                        &lags,
+                        &mut granger_hypotheses,
+                    );
+                    let cross_correlation = cross_correlation_evidence(
+                        group_a,
+                        group_b,
+                        stream_a,
+                        stream_b,
+                        max_lag,
+                        &mut ccf_hypotheses,
+                    );
+                    let convergent_cross_mapping =
+                        ccm_evidence(group_a, group_b, stream_a, stream_b);
+                    let temporal_cross_k = cross_k_evidence(
+                        group_a,
+                        group_b,
+                        times_a,
+                        times_b,
+                        origin,
+                        bin_seconds,
+                        max_lag,
+                    )?;
+                    pairs.push(SynapseCalyxCausalPairEvidence {
+                        group_a: group_a.clone(),
+                        group_b: group_b.clone(),
+                        events_a: times_a.len(),
+                        events_b: times_b.len(),
+                        transfer_entropy,
+                        granger_a_to_b,
+                        granger_b_to_a,
+                        cross_correlation,
+                        convergent_cross_mapping,
+                        temporal_cross_k,
+                    });
+                }
             }
-        }
 
-        let (pc_stable_skeleton, pc_hypotheses) = pc_evidence(&selected, &binned, fdr_alpha);
-        let (partial_correlation_network, partial_hypotheses) =
-            partial_network_evidence(&selected, &binned, fdr_alpha);
-        let hawkes_branching_graph = hawkes_evidence(&selected, &by_group, origin, bin_seconds);
-        let fdr_families = vec![
-            fdr_family(
-                "granger_all_pairs_directions_lags",
-                fdr_alpha,
-                granger_hypotheses,
-            )?,
-            fdr_family(
-                "cross_correlation_all_pairs_lags",
-                fdr_alpha,
-                ccf_hypotheses,
-            )?,
-            fdr_family("pc_stable_removed_edge_tests", fdr_alpha, pc_hypotheses)?,
-            fdr_family(
-                "partial_correlation_all_pairs",
-                fdr_alpha,
-                partial_hypotheses,
-            )?,
-        ];
+            let (pc_stable_skeleton, pc_hypotheses) = pc_evidence(&selected, &binned, fdr_alpha);
+            let (partial_correlation_network, partial_hypotheses) =
+                partial_network_evidence(&selected, &binned, fdr_alpha);
+            let hawkes_branching_graph = hawkes_evidence(&selected, &by_group, origin, bin_seconds);
+            let fdr_families = vec![
+                fdr_family(
+                    "granger_all_pairs_directions_lags",
+                    fdr_alpha,
+                    granger_hypotheses,
+                )?,
+                fdr_family(
+                    "cross_correlation_all_pairs_lags",
+                    fdr_alpha,
+                    ccf_hypotheses,
+                )?,
+                fdr_family("pc_stable_removed_edge_tests", fdr_alpha, pc_hypotheses)?,
+                fdr_family(
+                    "partial_correlation_all_pairs",
+                    fdr_alpha,
+                    partial_hypotheses,
+                )?,
+            ];
+            Ok::<_, SynapseCalyxError>((
+                pairs,
+                pc_stable_skeleton,
+                partial_correlation_network,
+                hawkes_branching_graph,
+                fdr_families,
+            ))
+        };
+        let computed = match assay_backend {
+            crate::math::SynapseCalyxAssayBackend::Cpu(_) => compute(),
+            #[cfg(feature = "calyx-cuda")]
+            crate::math::SynapseCalyxAssayBackend::Cuda(backend) => backend
+                .with_assay_context_scope("synapse_causal_map", compute)
+                .map_err(|error| causal_math_scope_error(&error))?,
+        };
+        let (
+            pairs,
+            pc_stable_skeleton,
+            partial_correlation_network,
+            hawkes_branching_graph,
+            fdr_families,
+        ) = computed?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_CAUSAL_MAP_ASSAY_SCOPE_COMPLETED",
+            backend = assay_backend_label,
+            stream_count = resource_accounting.stream_count,
+            pair_count = resource_accounting.pair_count,
+            elapsed_ms = assay_started.elapsed().as_millis(),
+            "completed every causal estimator while one configured math lease and CUDA module cache remained live"
+        );
+        drop(configured_math);
         let earliest_event_ns =
             records
                 .iter()
@@ -2527,6 +2572,18 @@ fn hex_encode(bytes: &[u8]) -> String {
         out.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     out
+}
+
+#[cfg(feature = "calyx-cuda")]
+fn causal_math_scope_error(error: &calyx_forge::ForgeError) -> SynapseCalyxError {
+    SynapseCalyxError::new(
+        "SYNAPSE_CALYX_CAUSAL_MAP_MATH_SCOPE_FAILED",
+        format!(
+            "the configured causal-estimator CUDA context scope failed with {}: {error}",
+            error.code()
+        ),
+        "inspect the SYNAPSE_CALYX_MATH_* and CALYX_FORGE_* lifecycle events; repair the configured backend/context ownership invariant and retry the identical complete scope",
+    )
 }
 
 fn causal_error(

@@ -79,6 +79,9 @@ pub struct CudaBackend {
 
 impl CudaBackend {
     pub fn new() -> Result<Self> {
+        if let Some(ctx) = context::current_scoped_cuda_context("CudaBackend::new")? {
+            return Ok(Self { ctx });
+        }
         init_cuda(0, false).map(|ctx| Self { ctx })
     }
 

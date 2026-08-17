@@ -258,6 +258,22 @@ impl VramBudgetedCudaBackend {
         })
     }
 
+    /// Shares this proved backend's exact CUDA context and module/function
+    /// caches with nested strict Calyx Assay entry points for one synchronous
+    /// caller-owned operation.
+    ///
+    /// This is a context-lifetime scope, not a device-buffer reservation. Each
+    /// nested Assay kernel retains its own fail-closed live-VRAM check. The
+    /// outer Synapse math lease remains alive for the entire call and owns the
+    /// context/module host reservation; no process-global context survives it.
+    pub fn with_assay_context_scope<T>(
+        &self,
+        operation: &'static str,
+        dispatch: impl FnOnce() -> T,
+    ) -> Result<T> {
+        crate::cuda::context::with_cuda_context_scope(self.inner.context(), operation, dispatch)
+    }
+
     /// Uploads one immutable candidate matrix and retains both its exact
     /// process-local VRAM reservation and, when configured, its host-wide
     /// reservation for the handle's lifetime.

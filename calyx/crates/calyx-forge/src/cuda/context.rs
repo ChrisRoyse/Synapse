@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -9,6 +10,52 @@ use crate::{BackendKind, DeviceInfo, ForgeError, Result};
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 const MIN_FREE_VRAM_MIB: u64 = 4096;
 const CUDA_REMEDIATION: &str = "Check that CUDA is installed at /usr/local/cuda-13.3 and nvidia-smi shows an available CUDA GPU";
+const CUDA_SCOPE_REMEDIATION: &str = "keep one proved CUDA backend lease alive for the complete caller-owned operation; do not nest a different device context or let scoped work escape its owning thread";
+
+#[derive(Default)]
+struct ScopedCudaContextState {
+    context: Option<CudaContext>,
+    depth: usize,
+    poisoned: bool,
+}
+
+thread_local! {
+    /// One caller-owned CUDA context shared only across a synchronous operation
+    /// on this exact host thread. Calyx Assay's legacy strict entry points create
+    /// a `CudaBackend` internally; resolving that constructor through this
+    /// scope preserves the outer backend's module/function caches without
+    /// turning a released vault lease into a process-global context.
+    static SCOPED_CUDA_CONTEXT: RefCell<ScopedCudaContextState> = RefCell::new(ScopedCudaContextState::default());
+}
+
+struct ScopedCudaContextGuard {
+    identity: usize,
+    closed: bool,
+}
+
+impl ScopedCudaContextGuard {
+    fn close(mut self) -> Result<()> {
+        close_scoped_cuda_context(self.identity)?;
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for ScopedCudaContextGuard {
+    fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
+        if let Err(error) = close_scoped_cuda_context(self.identity) {
+            tracing::error!(
+                target: "calyx_forge::cuda::context",
+                code = error.code(),
+                error = %error,
+                "CUDA context scope unwind cleanup failed; this thread is poisoned and future scoped resolution fails closed"
+            );
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct CudaContext {
@@ -58,6 +105,10 @@ impl CudaContext {
 
     pub fn free_mem_mib_at_init(&self) -> u64 {
         self.free_mem_mib_at_init
+    }
+
+    fn runtime_identity(&self) -> usize {
+        Arc::as_ptr(&self.inner) as usize
     }
 
     /// Live free device VRAM in bytes via `cudaMemGetInfo` (in-process — never
@@ -134,6 +185,123 @@ impl CudaContext {
         let function = Arc::new(module.load_function(function_name)?);
         functions.insert(cache_key, function.clone());
         Ok(function)
+    }
+}
+
+/// Runs one synchronous caller-owned workflow with all nested
+/// [`CudaBackend`](crate::CudaBackend) constructors resolving to `context`.
+///
+/// The scope is thread-local rather than process-global: the outer Synapse math
+/// lease remains the sole lifetime owner, so its reservation and CUDA context
+/// can still be destroyed immediately after the workflow. A nested scope is
+/// accepted only for the identical runtime context. Every mismatch or poisoned
+/// scope fails closed.
+pub(crate) fn with_cuda_context_scope<T>(
+    context: &CudaContext,
+    operation: &'static str,
+    dispatch: impl FnOnce() -> T,
+) -> Result<T> {
+    let identity = context.runtime_identity();
+    SCOPED_CUDA_CONTEXT.with(|state| {
+        let mut state = state.try_borrow_mut().map_err(|_| {
+            scope_error(
+                operation,
+                "the thread-local CUDA context scope is already mutably borrowed",
+            )
+        })?;
+        if state.poisoned {
+            return Err(scope_error(
+                operation,
+                "the thread-local CUDA context scope was poisoned by an earlier ownership mismatch",
+            ));
+        }
+        match state.context.as_ref() {
+            Some(active) if active.runtime_identity() != identity => {
+                return Err(scope_error(
+                    operation,
+                    "a different CUDA runtime context is already active on this thread",
+                ));
+            }
+            Some(_) => {
+                state.depth = state.depth.checked_add(1).ok_or_else(|| {
+                    scope_error(operation, "the nested CUDA context scope depth overflowed")
+                })?;
+            }
+            None => {
+                state.context = Some(context.clone());
+                state.depth = 1;
+            }
+        }
+        Ok(())
+    })?;
+
+    let guard = ScopedCudaContextGuard {
+        identity,
+        closed: false,
+    };
+    let output = dispatch();
+    guard.close()?;
+    Ok(output)
+}
+
+pub(crate) fn current_scoped_cuda_context(operation: &'static str) -> Result<Option<CudaContext>> {
+    SCOPED_CUDA_CONTEXT.with(|state| {
+        let state = state.try_borrow().map_err(|_| {
+            scope_error(
+                operation,
+                "the thread-local CUDA context scope is mutably borrowed during resolution",
+            )
+        })?;
+        if state.poisoned {
+            return Err(scope_error(
+                operation,
+                "the thread-local CUDA context scope is poisoned",
+            ));
+        }
+        if state.context.is_some() != (state.depth != 0) {
+            return Err(scope_error(
+                operation,
+                "the thread-local CUDA context and depth disagree",
+            ));
+        }
+        Ok(state.context.clone())
+    })
+}
+
+fn close_scoped_cuda_context(identity: usize) -> Result<()> {
+    SCOPED_CUDA_CONTEXT.with(|state| {
+        let mut state = state.try_borrow_mut().map_err(|_| {
+            scope_error(
+                "close_cuda_context_scope",
+                "the thread-local CUDA context scope is already borrowed during close",
+            )
+        })?;
+        let matches = state
+            .context
+            .as_ref()
+            .is_some_and(|active| active.runtime_identity() == identity);
+        if !matches || state.depth == 0 {
+            state.poisoned = true;
+            state.context = None;
+            state.depth = 0;
+            return Err(scope_error(
+                "close_cuda_context_scope",
+                "the active CUDA context identity/depth changed before its owner closed the scope",
+            ));
+        }
+        state.depth -= 1;
+        if state.depth == 0 {
+            state.context = None;
+        }
+        Ok(())
+    })
+}
+
+fn scope_error(operation: &str, detail: &str) -> ForgeError {
+    ForgeError::NumericalInvariant {
+        op: operation.to_owned(),
+        detail: detail.to_owned(),
+        remediation: CUDA_SCOPE_REMEDIATION.to_owned(),
     }
 }
 
