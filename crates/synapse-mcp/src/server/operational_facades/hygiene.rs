@@ -588,6 +588,10 @@ pub(super) async fn handle(
                 .0
                 .grounding_gap
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "grounding_gap"))?;
+            // Cheap syntactic/range validation happens before permissions,
+            // storage access, and exclusive whole-corpus admission. The
+            // executor receives only this validated typed request.
+            let grounding_gap_spec = crate::m3::hygiene::prepare_grounding_gap_spec(&spec)?;
             service.require_m3_permissions(
                 HYGIENE_TOOL,
                 &crate::m3::hygiene::required_permissions_grounding_gap(&spec),
@@ -608,7 +612,7 @@ pub(super) async fn handle(
             let response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_grounding_gap",
-                    move || crate::m3::hygiene::run_grounding_gap(&db, &spec),
+                    move || crate::m3::hygiene::run_grounding_gap_spec(&db, &grounding_gap_spec),
                 ),
             )
             .await
@@ -639,6 +643,7 @@ pub(super) async fn handle(
                 .0
                 .blind_spot
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "blind_spot"))?;
+            let blind_spot_spec = crate::m3::hygiene::prepare_blind_spot_spec(&spec)?;
             service.require_m3_permissions(
                 HYGIENE_TOOL,
                 &crate::m3::hygiene::required_permissions_blind_spot(&spec),
@@ -657,7 +662,7 @@ pub(super) async fn handle(
             let response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_blind_spot",
-                    move || crate::m3::hygiene::run_blind_spot(&db, &spec),
+                    move || crate::m3::hygiene::run_blind_spot_spec(&db, &blind_spot_spec),
                 ),
             )
             .await
@@ -798,6 +803,7 @@ pub(super) async fn handle(
                 .0
                 .vault_verify
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "vault_verify"))?;
+            let vault_verify_spec = crate::m3::hygiene::prepare_vault_verify_spec(&spec)?;
             service.require_m3_permissions(
                 HYGIENE_TOOL,
                 &crate::m3::hygiene::required_permissions_vault_verify(&spec),
@@ -820,7 +826,9 @@ pub(super) async fn handle(
             let response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_vault_verify",
-                    move || crate::m3::hygiene::run_vault_verify(&db, &spec),
+                    move || {
+                        crate::m3::hygiene::run_vault_verify_prepared(&db, &vault_verify_spec)
+                    },
                 ),
             )
             .await
@@ -914,6 +922,7 @@ pub(super) async fn handle(
                 .0
                 .kernel_rebuild
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "kernel_rebuild"))?;
+            let kernel_rebuild_spec = crate::m3::hygiene::prepare_kernel_rebuild_spec(&spec)?;
             // The rebuild persists Kernel artifacts: maintenance-gated exactly
             // like the other mutating hygiene operations. This gate is also what
             // keeps kernel selection off any latency-critical caller — the pass
@@ -950,7 +959,9 @@ pub(super) async fn handle(
             let response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_kernel_rebuild",
-                    move || crate::m3::hygiene::run_kernel_rebuild(&db, &spec),
+                    move || {
+                        crate::m3::hygiene::run_kernel_rebuild_spec(&db, &kernel_rebuild_spec)
+                    },
                 ),
             )
             .await
@@ -983,6 +994,7 @@ pub(super) async fn handle(
                 .0
                 .guard_calibrate
                 .ok_or_else(|| missing_spec(HYGIENE_TOOL, "guard_calibrate"))?;
+            let guard_calibrate_spec = crate::m3::hygiene::prepare_guard_calibrate_spec(&spec)?;
             if spec.persist.unwrap_or(true) {
                 // #2077: classified deliberately as control, not measurement. A
                 // persisted profile changes what every profile-backed guarded
@@ -1021,7 +1033,9 @@ pub(super) async fn handle(
             let response = Box::pin(
                 synapse_storage::maintenance::run_admitted_maintenance_preserving_error(
                     "hygiene_guard_calibrate",
-                    move || crate::m3::hygiene::run_guard_calibrate(&db, &spec),
+                    move || {
+                        crate::m3::hygiene::run_guard_calibrate_spec(&db, &guard_calibrate_spec)
+                    },
                 ),
             )
             .await

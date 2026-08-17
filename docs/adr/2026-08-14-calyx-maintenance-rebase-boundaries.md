@@ -162,12 +162,18 @@ the authority.
     bytes before and after every release. An unavailable reclaimer or unreadable
     process-memory Source of Truth fails the tick with a named diagnostic; this
     is lifecycle ownership, not a memory limit or degraded execution path.
-11. Drift's complete typed parameter validator is one authoritative Calyx
-    function. The MCP facade builds and validates that typed request before
-    maintenance admission; Calyx validates it again before its first physical
-    read so non-MCP callers retain the same invariant. Invalid input never opens
-    storage, acquires the exclusive lane, allocates a corpus, or changes a
-    bound, and preserves its exact named error and remediation.
+11. Every whole-corpus hygiene operation separates wire parsing from execution.
+    The MCP facade constructs its complete typed/prepared request before
+    permission checks, storage access, control-authority acquisition, or
+    maintenance admission; only that request crosses into the blocking owner.
+    This applies to grounding gap, blind spot, drift, kernel rebuild, guard
+    calibration, and vault verification, including every record/alert/domain/
+    ledger bound, finite probability, and physical `u16` slot conversion.
+    Inner Calyx executors retain their contextual validation so non-MCP callers
+    and physical panel/corpus invariants remain defended. Invalid input never
+    queues behind unrelated maintenance, opens storage, dispatches CUDA,
+    allocates a corpus, mutates control state, or changes a bound, and preserves
+    its exact named error and remediation.
 12. A retained #1540 probe row is repaired only through a maintenance-gated,
     content-specific migration. The caller must re-submit the diagnostic's
     exact key/value lengths and SHA-256 identities plus the physical envelope
@@ -254,8 +260,9 @@ the authority.
   instant with a panel watermark or delta from another.
 - Derived-state peak private memory is the largest live phase rather than the
   accumulated committed pages of unrelated completed phases.
-- Structurally invalid drift requests fail at the public admission boundary
-  instead of waiting behind unrelated whole-vault maintenance.
+- Structurally invalid hygiene requests fail deterministically at the public
+  admission boundary instead of waiting behind unrelated whole-vault
+  maintenance or activating storage/GPU/control resources.
 - Older/restored vaults can remove the one positively identified #1540 probe
   without teaching audit readers to omit corruption or exposing a general raw
   delete surface. The repair itself remains a canonical, queryable audit fact.
@@ -291,6 +298,8 @@ the authority.
 - [Rust iterators](https://doc.rust-lang.org/std/iter/) and [`FromIterator<Vec<_>>`](https://doc.rust-lang.org/std/iter/trait.FromIterator.html): iterator consumption is lazy, while `collect` creates a collection whose allocation strategy and retained capacity are not a streaming-memory guarantee.
 - [Materialize isolation levels](https://materialize.com/docs/reference/isolation-level/): readers are served the freshest consistent snapshot and fail or wait when no qualifying consistent view exists.
 - [Tower HTTP request validation](https://docs.rs/tower-http/latest/tower_http/validate_request/): validation middleware rejects an invalid request before allowing it through to the wrapped service.
+- [UK NCSC API input-validation guidance](https://www.ncsc.gov.uk/collection/securing-http-based-apis/4-input-validation): validate ranges and structure as early as possible at the external boundary, then validate consistently at every layer for defence in depth.
+- [OWASP Denial of Service Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html): perform cheap validation before expensive CPU, memory, bandwidth, threading, or input-driven resource allocation.
 - [Model Context Protocol tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools): servers must validate tool inputs, and out-of-range values are tool execution errors with actionable feedback.
 - [RocksDB transactions](https://github.com/facebook/rocksdb/wiki/Transactions): optimistic and pessimistic transactions detect conflicting writes and leave failed transactions unapplied, supporting revision-guarded destructive maintenance.
 - [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations): a write batch applies its contained updates atomically, supporting one commit for the exact delete and its canonical audit record.

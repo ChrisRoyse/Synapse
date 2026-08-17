@@ -496,6 +496,16 @@ pub struct HygieneGroundingGapResponse {
     pub base_cf_rows: u64,
 }
 
+/// Fully validated, allocation-free execution request for a grounding-gap
+/// pass. Public facades construct this before entering the exclusive
+/// whole-corpus maintenance lane; the executor accepts no unvalidated wire
+/// request.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedGroundingGapSpec {
+    panel_version: u32,
+    max_records: usize,
+}
+
 #[must_use]
 pub fn required_permissions_grounding_gap(
     _params: &HygieneGroundingGapParams,
@@ -518,21 +528,29 @@ fn map_slot_grounding(
     }
 }
 
-/// Reports grounding gaps for one panel: per-anchor-kind and per-lens grounded
-/// coverage, the largest ungrounded regions, and the domain's provisional
-/// verdict. Read-only physical `Base` CF readback.
+/// Validates every bounded grounding-gap field at the public admission edge.
 ///
 /// # Errors
 ///
-/// Returns a structured error when the `Base` CF cannot be scanned or a
-/// constellation row fails to decode.
-pub fn run_grounding_gap(
-    db: &Db,
+/// Returns `TOOL_PARAMS_INVALID` without opening storage or acquiring the
+/// whole-corpus maintenance lane.
+pub fn prepare_grounding_gap_spec(
     params: &HygieneGroundingGapParams,
+) -> Result<PreparedGroundingGapSpec, ErrorData> {
+    Ok(PreparedGroundingGapSpec {
+        panel_version: params.panel_version,
+        max_records: intelligence_hygiene_records("grounding_gap", params.max_records)?,
+    })
+}
+
+/// Executes one already-validated grounding-gap request and reports per-anchor
+/// and per-lens gaps from the physical Base/slot CFs.
+pub fn run_grounding_gap_spec(
+    db: &Db,
+    spec: &PreparedGroundingGapSpec,
 ) -> Result<HygieneGroundingGapResponse, ErrorData> {
-    let max_records = intelligence_hygiene_records("grounding_gap", params.max_records)?;
     let report = db
-        .grounding_gap_intelligence(params.panel_version, max_records)
+        .grounding_gap_intelligence(spec.panel_version, spec.max_records)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneGroundingGapResponse {
         source_of_truth: "Calyx Base CF anchors + hydrated per-slot CF lens vectors",
@@ -1066,17 +1084,16 @@ pub fn run_kernel(
     })
 }
 
-/// Runs the COLD per-domain kernel rebuild sweep and reads the `Kernel` CF back.
+/// Builds the complete bounded Calyx kernel request before maintenance
+/// admission. No field is clamped or narrowed implicitly.
 ///
 /// # Errors
 ///
-/// Returns a structured error when the panel has no grounded outcome domain,
-/// when every domain refused the recall gate, or when the CF write/readback
-/// fails.
-pub fn run_kernel_rebuild(
-    db: &Db,
+/// Returns `TOOL_PARAMS_INVALID` for an invalid slot, record/domain bound, or
+/// non-finite recall gate.
+pub fn prepare_kernel_rebuild_spec(
     params: &HygieneKernelRebuildParams,
-) -> Result<HygieneKernelRebuildResponse, ErrorData> {
+) -> Result<synapse_calyx::SynapseCalyxKernelRebuildParams, ErrorData> {
     let content_slot = kernel_content_slot(params.content_slot)?;
     let mut spec =
         synapse_calyx::SynapseCalyxKernelRebuildParams::new(params.panel_version, content_slot);
@@ -1101,8 +1118,17 @@ pub fn run_kernel_rebuild(
         }
         spec.max_domains = max_domains as usize;
     }
+    Ok(spec)
+}
+
+/// Executes one already-validated COLD kernel rebuild request and reads the
+/// resulting Kernel CF generation back.
+pub fn run_kernel_rebuild_spec(
+    db: &Db,
+    spec: &synapse_calyx::SynapseCalyxKernelRebuildParams,
+) -> Result<HygieneKernelRebuildResponse, ErrorData> {
     let report = db
-        .rebuild_domain_kernels_intelligence(&spec)
+        .rebuild_domain_kernels_intelligence(spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneKernelRebuildResponse {
         source_of_truth: "Calyx Kernel CF persisted kernel artifacts",
@@ -1160,18 +1186,22 @@ fn kernel_rebuild_max_records(requested: Option<u32>) -> Result<usize, ErrorData
     Ok(value as usize)
 }
 
-/// Calibrates the Ward guard profile from the vault's adjudicated corpus and
-/// persists it to the `Guard` CF the guarded-search consumer reads.
+/// Builds the complete typed Ward request before storage access, authority
+/// acquisition, or whole-corpus maintenance admission.
 ///
 /// # Errors
 ///
-/// Fails closed when the adjudicated bad-case corpus is absent, below ward's
-/// minimum, or too small to certify the requested target FAR - never with a
-/// fabricated corpus.
-pub fn run_guard_calibrate(
-    db: &Db,
+/// Returns `TOOL_PARAMS_INVALID` for an empty slot roster, lossy slot
+/// narrowing, invalid record bound, or invalid finite probability.
+pub fn prepare_guard_calibrate_spec(
     params: &HygieneGuardCalibrateParams,
-) -> Result<HygieneGuardCalibrateResponse, ErrorData> {
+) -> Result<synapse_calyx::SynapseCalyxGuardCalibrateParams, ErrorData> {
+    if params.slots.is_empty() {
+        return Err(mcp_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "hygiene guard_calibrate slots must name at least one dense active panel slot; an empty guard would accept everything",
+        ));
+    }
     let slots = params
         .slots
         .iter()
@@ -1196,7 +1226,25 @@ pub fn run_guard_calibrate(
         spec.domain.clone_from(domain);
     }
     if let Some(alpha) = params.alpha {
+        if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "hygiene guard_calibrate alpha={alpha} must be finite and strictly within 0..1"
+                ),
+            ));
+        }
         spec.alpha = alpha;
+    }
+    if let Some(target_far) = params.target_far {
+        if !target_far.is_finite() || !(0.0..=1.0).contains(&target_far) {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!(
+                    "hygiene guard_calibrate target_far={target_far} must be finite and within 0..=1"
+                ),
+            ));
+        }
     }
     spec.target_far = params.target_far;
     spec.max_records = intelligence_hygiene_records("guard_calibrate", params.max_records)?;
@@ -1209,8 +1257,17 @@ pub fn run_guard_calibrate(
         HygieneGuardNoveltyAction::NewRegion => calyx_ward::NoveltyAction::NewRegion,
         HygieneGuardNoveltyAction::Quarantine => calyx_ward::NoveltyAction::Quarantine,
     };
+    Ok(spec)
+}
+
+/// Executes one already-validated Ward calibration request against the real
+/// adjudicated corpus and reads the Guard CF serving generation back.
+pub fn run_guard_calibrate_spec(
+    db: &Db,
+    spec: &synapse_calyx::SynapseCalyxGuardCalibrateParams,
+) -> Result<HygieneGuardCalibrateResponse, ErrorData> {
     let report = db
-        .guard_calibrate_intelligence(&spec)
+        .guard_calibrate_intelligence(spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneGuardCalibrateResponse {
         source_of_truth: "Calyx Guard CF atomic profile + immutable trusted-exemplar serving generation",
@@ -1357,17 +1414,16 @@ pub fn required_permissions_drift(_params: &HygieneDriftParams) -> RequiredPermi
     required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
-/// Scans a panel for cross-lens blind spots and lists the flagged records with
-/// the disagreeing lens pair and calibration evidence. Read-only.
+/// Builds and validates the typed Calyx blind-spot request at the public
+/// admission edge.
 ///
 /// # Errors
 ///
-/// Returns a structured error when the corpus cannot be read, the math backend
-/// is unavailable, or the calibrated detector fails closed.
-pub fn run_blind_spot(
-    db: &Db,
+/// Returns `TOOL_PARAMS_INVALID` without opening storage, acquiring the
+/// maintenance lane, or dispatching a math backend.
+pub fn prepare_blind_spot_spec(
     params: &HygieneBlindSpotParams,
-) -> Result<HygieneBlindSpotResponse, ErrorData> {
+) -> Result<synapse_calyx::SynapseCalyxBlindSpotParams, ErrorData> {
     let mut spec = synapse_calyx::SynapseCalyxBlindSpotParams::new(params.panel_version);
     spec.max_records = intelligence_hygiene_records("blind_spot", params.max_records)?;
     if let Some(max_alerts) = params.max_alerts {
@@ -1382,8 +1438,17 @@ pub fn run_blind_spot(
         }
         spec.max_alerts = max_alerts as usize;
     }
+    Ok(spec)
+}
+
+/// Executes one already-validated blind-spot request and returns the physical
+/// per-slot disagreement/calibration evidence.
+pub fn run_blind_spot_spec(
+    db: &Db,
+    spec: &synapse_calyx::SynapseCalyxBlindSpotParams,
+) -> Result<HygieneBlindSpotResponse, ErrorData> {
     let report = db
-        .blind_spot_intelligence(&spec)
+        .blind_spot_intelligence(spec)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     Ok(HygieneBlindSpotResponse {
         source_of_truth: "Calyx per-slot CF lens vectors (hydrated; the Base CF row carries only slot ids and hashes)",
@@ -4605,6 +4670,13 @@ pub enum VaultVerifyOutcome {
     Corrupt(Box<HygieneVaultVerifyResponse>),
 }
 
+/// Fully validated execution request for physical vault verification.
+#[derive(Clone, Copy, Debug)]
+pub struct PreparedVaultVerifySpec {
+    full_chain: bool,
+    tail_entries: u64,
+}
+
 impl VaultVerifyOutcome {
     #[must_use]
     pub fn response(&self) -> &HygieneVaultVerifyResponse {
@@ -4635,29 +4707,15 @@ pub fn required_permissions_anneal_mutation() -> RequiredPermissions {
     required([Permission::ReadStorage, Permission::WriteStorage])
 }
 
-/// Verifies the live vault and fails closed on any non-green surface.
-///
-/// Delegates to the existing `verify_vault_restore` and `verify_ledger_chain`
-/// paths — nothing is re-implemented here — and converts a non-green verdict
-/// into a code naming exactly what failed. A scheduled verification that
-/// returned a cheerful report on a broken vault would be worse than no
-/// verification at all.
-///
-/// The two non-green outcomes carry different codes and different remediations
-/// (#2059): `SYNAPSE_HYGIENE_VAULT_VERIFY_FAILED` for failed integrity evidence,
-/// `SYNAPSE_HYGIENE_VAULT_VERIFY_UNVERIFIABLE` for a scan a resource budget
-/// refused. Only the first one says restore from backup.
-///
-/// # Errors
-///
-/// Returns a structured error when the vault cannot be read, when the vault
-/// maintenance guard is already held by a backup/erase/compaction pass, or when
-/// the verdict is not green.
-pub fn run_vault_verify(
+/// Executes one prevalidated vault-verification request and converts its typed
+/// non-green outcome into the public fail-closed error contract. It delegates
+/// to the existing restore and ledger-chain verifiers; no integrity predicate
+/// is duplicated here.
+pub fn run_vault_verify_prepared(
     db: &Db,
-    params: &HygieneVaultVerifyParams,
+    spec: &PreparedVaultVerifySpec,
 ) -> Result<HygieneVaultVerifyResponse, ErrorData> {
-    match run_vault_verify_typed(db, params)? {
+    match run_vault_verify_spec(db, spec)? {
         VaultVerifyOutcome::Verified(response) => Ok(*response),
         VaultVerifyOutcome::Unverifiable(response) => Err(mcp_error_with_remediation(
             error_codes::HYGIENE_VAULT_VERIFY_UNVERIFIABLE,
@@ -4705,7 +4763,7 @@ pub fn run_vault_verify(
 
 /// Verifies the live vault and returns the typed verdict without alarming.
 ///
-/// Separated from [`run_vault_verify`] so the scheduled verifier can choose its
+/// Separated from [`run_vault_verify_prepared`] so the scheduled verifier can choose its
 /// own log severity and remediation per verdict. The only `Err` here is a vault
 /// that could not be read at all.
 ///
@@ -4717,6 +4775,19 @@ pub fn run_vault_verify_typed(
     db: &Db,
     params: &HygieneVaultVerifyParams,
 ) -> Result<VaultVerifyOutcome, ErrorData> {
+    let spec = prepare_vault_verify_spec(params)?;
+    run_vault_verify_spec(db, &spec)
+}
+
+/// Validates the bounded ledger window before maintenance admission.
+///
+/// # Errors
+///
+/// Returns `TOOL_PARAMS_INVALID` without opening the vault or taking any
+/// maintenance ownership.
+pub fn prepare_vault_verify_spec(
+    params: &HygieneVaultVerifyParams,
+) -> Result<PreparedVaultVerifySpec, ErrorData> {
     let tail_entries = params
         .tail_entries
         .unwrap_or(synapse_calyx::VAULT_VERIFY_DEFAULT_TAIL_ENTRIES);
@@ -4725,8 +4796,19 @@ pub fn run_vault_verify_typed(
             "hygiene vault_verify tail_entries={tail_entries} is outside 1..={MAX_VAULT_VERIFY_TAIL_ENTRIES}; request bounds are never clamped"
         )));
     }
+    Ok(PreparedVaultVerifySpec {
+        full_chain: params.full_chain,
+        tail_entries,
+    })
+}
+
+/// Executes one already-validated physical vault verification request.
+pub fn run_vault_verify_spec(
+    db: &Db,
+    spec: &PreparedVaultVerifySpec,
+) -> Result<VaultVerifyOutcome, ErrorData> {
     let report = db
-        .verify_calyx_vault(params.full_chain, tail_entries)
+        .verify_calyx_vault(spec.full_chain, spec.tail_entries)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
     let verdict = report.verdict();
     let response = HygieneVaultVerifyResponse {
