@@ -10480,7 +10480,7 @@ function Write-SynapseChromeBridgeCheckpoint {
     New-Item -ItemType Directory -Force -Path $directory | Out-Null
 
     $now = [DateTime]::UtcNow.ToString('o')
-    $Checkpoint['schema'] = 'synapse_setup_bridge_pending/v3'
+    $Checkpoint['schema'] = 'synapse_setup_bridge_pending/v4'
     $Checkpoint['phase'] = 'chrome_bridge_activation'
     if (-not $Checkpoint.Contains('checkpoint_generation_id') -or [string]::IsNullOrWhiteSpace([string]$Checkpoint['checkpoint_generation_id'])) {
         throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_GENERATION_MISSING path=$resolvedPath state=$($Checkpoint['state']) remediation=a bridge checkpoint must retain the exact setup generation that created the pending transaction"
@@ -10529,11 +10529,11 @@ function Write-SynapseChromeBridgeCheckpoint {
     } catch {
         throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_FAILED path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint storage device; the atomically written JSON could not be read back"
     }
-    if ([string]$readback.schema -ne 'synapse_setup_bridge_pending/v3' -or
+    if ([string]$readback.schema -ne 'synapse_setup_bridge_pending/v4' -or
         [string]$readback.phase -ne 'chrome_bridge_activation' -or
         [string]$readback.state -ne [string]$Checkpoint['state'] -or
         [string]$readback.checkpoint_generation_id -ne [string]$Checkpoint['checkpoint_generation_id']) {
-        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_MISMATCH path=$resolvedPath expected_schema=synapse_setup_bridge_pending/v3 actual_schema=$($readback.schema) expected_phase=chrome_bridge_activation actual_phase=$($readback.phase) expected_state=$($Checkpoint['state']) actual_state=$($readback.state) expected_generation=$($Checkpoint['checkpoint_generation_id']) actual_generation=$($readback.checkpoint_generation_id) remediation=repair the checkpoint storage path before retrying"
+        throw "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_READBACK_MISMATCH path=$resolvedPath expected_schema=synapse_setup_bridge_pending/v4 actual_schema=$($readback.schema) expected_phase=chrome_bridge_activation actual_phase=$($readback.phase) expected_state=$($Checkpoint['state']) actual_state=$($readback.state) expected_generation=$($Checkpoint['checkpoint_generation_id']) actual_generation=$($readback.checkpoint_generation_id) remediation=repair the checkpoint storage path before retrying"
     }
     return [pscustomobject]([ordered]@{
         Path = $resolvedPath
@@ -10567,8 +10567,8 @@ function Read-SynapseChromeBridgeCheckpoint {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_JSON_INVALID path=$resolvedPath error=$($_.Exception.Message) remediation=inspect the checkpoint bytes; resume refuses to infer state from malformed JSON"
     }
 
-    if ([string]$checkpoint.schema -ne 'synapse_setup_bridge_pending/v3') {
-        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID path=$resolvedPath expected=synapse_setup_bridge_pending/v3 actual=$($checkpoint.schema) remediation=v2 and unknown checkpoints have no trustworthy deployment-generation binding; preserve them and run a new full setup"
+    if ([string]$checkpoint.schema -ne 'synapse_setup_bridge_pending/v4') {
+        Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID path=$resolvedPath expected=synapse_setup_bridge_pending/v4 actual=$($checkpoint.schema) remediation=older checkpoints do not bind the Chrome native host bytes to the deployment generation; preserve them and run a new full setup"
     }
     if ([string]$checkpoint.phase -ne 'chrome_bridge_activation') {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_PHASE_INVALID path=$resolvedPath expected=chrome_bridge_activation actual=$($checkpoint.phase) remediation=resume refuses to infer or replay an unknown phase"
@@ -10596,6 +10596,7 @@ function Read-SynapseChromeBridgeCheckpoint {
         'chrome_bridge_installer_path',
         'chrome_bridge_installer_sha256',
         'chrome_native_host_exe_path',
+        'chrome_native_host_exe_sha256',
         'task_name',
         'task_definition_sha256',
         'task_action_execute',
@@ -10713,6 +10714,10 @@ function Invoke-SynapseChromeBridgePendingResume {
         -Kind 'CHROME_INSTALLER' `
         -ExpectedPath ([string]$checkpoint.chrome_bridge_installer_path) `
         -ExpectedSha256 ([string]$checkpoint.chrome_bridge_installer_sha256)
+    $nativeHostIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
+        -Kind 'CHROME_NATIVE_HOST' `
+        -ExpectedPath ([string]$checkpoint.chrome_native_host_exe_path) `
+        -ExpectedSha256 ([string]$checkpoint.chrome_native_host_exe_sha256)
     $binaryIdentity = Assert-SynapseChromeBridgeCheckpointFileIdentity `
         -Kind 'INSTALLED_BINARY' `
         -ExpectedPath ([string]$checkpoint.installed_binary_path) `
@@ -10731,7 +10736,7 @@ function Invoke-SynapseChromeBridgePendingResume {
     $ExePath = $binaryIdentity.Path
     $TokenPath = $tokenIdentity.Path
     $TaskName = [string]$checkpoint.task_name
-    $ChromeNativeHostExePath = [string]$checkpoint.chrome_native_host_exe_path
+    $ChromeNativeHostExePath = $nativeHostIdentity.Path
 
     $token = (Get-Content -Raw -LiteralPath $TokenPath).Trim()
     if ([string]::IsNullOrWhiteSpace($token)) {
@@ -10788,6 +10793,8 @@ function Invoke-SynapseChromeBridgePendingResume {
         token_sha256 = $tokenIdentity.Sha256
         setup_script_sha256 = $scriptIdentity.Sha256
         chrome_bridge_installer_sha256 = $installerIdentity.Sha256
+        chrome_native_host_exe_path = $nativeHostIdentity.Path
+        chrome_native_host_exe_sha256 = $nativeHostIdentity.Sha256
         task_definition_sha256 = $taskIdentity.DefinitionSha256
         chrome_bridge_status = [string]$bridge.status
         chrome_bridge_detail = [string]$bridge.detail
@@ -10823,6 +10830,8 @@ function Complete-SynapseObsoleteChromeBridgeCheckpoint {
         [Parameter(Mandatory=$true)][string]$DbPath,
         [Parameter(Mandatory=$true)][string]$InstalledBinaryPath,
         [Parameter(Mandatory=$true)][string]$InstalledBinarySha256,
+        [Parameter(Mandatory=$true)][string]$ChromeNativeHostExePath,
+        [Parameter(Mandatory=$true)][string]$ChromeNativeHostExeSha256,
         [Parameter(Mandatory=$true)]$ToolSurface,
         [Parameter(Mandatory=$true)]$ChromeBridge
     )
@@ -10841,7 +10850,7 @@ function Complete-SynapseObsoleteChromeBridgeCheckpoint {
     $priorSha256 = Get-SynapseFileSha256 -Path $resolvedPath
     $priorSchema = [string]$prior.schema
     $priorState = [string]$prior.state
-    if ($priorSchema -notin @('synapse_setup_bridge_pending/v2','synapse_setup_bridge_pending/v3')) {
+    if ($priorSchema -notin @('synapse_setup_bridge_pending/v2','synapse_setup_bridge_pending/v3','synapse_setup_bridge_pending/v4')) {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_SCHEMA_UNKNOWN path=$resolvedPath schema=$priorSchema sha256=$priorSha256 remediation=setup refuses to reinterpret or delete an unknown transaction schema"
     }
     if ($priorState -in @('completed','superseded')) {
@@ -10865,6 +10874,8 @@ function Complete-SynapseObsoleteChromeBridgeCheckpoint {
         Die "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_TERMINALIZE_DAEMON_RUN_MISSING path=$daemonRunPath daemon_pid=$DaemonPid remediation=the newer deployment generation is not physically proven; repair its lifecycle ledger before terminalizing older work"
     }
     $checkpointMap['state'] = 'superseded'
+    $checkpointMap['chrome_native_host_exe_path'] = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+    $checkpointMap['chrome_native_host_exe_sha256'] = $ChromeNativeHostExeSha256
     $checkpointMap['terminal_generation_id'] = $script:SynapseSetupInvocationId
     $checkpointMap['terminalized_at_utc'] = [DateTime]::UtcNow.ToString('o')
     $checkpointMap['supersession'] = [ordered]@{
@@ -10881,6 +10892,8 @@ function Complete-SynapseObsoleteChromeBridgeCheckpoint {
         daemon_run_current_sha256 = (Get-SynapseFileSha256 -Path $daemonRunPath)
         installed_binary_path = $InstalledBinaryPath
         installed_binary_sha256 = $InstalledBinarySha256
+        chrome_native_host_exe_path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+        chrome_native_host_exe_sha256 = $ChromeNativeHostExeSha256
         tool_count = $ToolSurface.tool_count
         tool_surface_sha256 = $ToolSurface.tool_surface_sha256
         chrome_bridge_status = [string]$ChromeBridge.status
@@ -14995,6 +15008,7 @@ if (-not $SkipBuild) {
     # Preserve the last failure diagnostics across later successful retries;
     # each new failure also writes an immutable per-attempt archive below.
     $built = Join-Path $CargoTarget 'release\synapse-mcp.exe'
+    $builtNativeHost = Join-Path $CargoTarget 'release\synapse-chrome-native-host.exe'
     Info "Build process tree is job-owned; log: $buildLog"
     $buildInvocationDiagnostics = $null
     $cargoBuildArgs = @('build','--release','-p','synapse-mcp')
@@ -15244,15 +15258,20 @@ if (-not $SkipBuild) {
             $crashHistoryText)
     }
     if (-not (Test-Path $built)) { Die "Build reported success but $built is missing." }
+    if (-not (Test-Path -LiteralPath $builtNativeHost -PathType Leaf)) {
+        Die "SYNAPSE_BUILD_NATIVE_HOST_MISSING path=$builtNativeHost remediation=cargo build -p synapse-mcp must emit every declared package binary; inspect the Cargo target inventory and setup-build.log"
+    }
     Info "Built: $built ($([math]::Round((Get-Item $built).Length/1MB,1)) MB)"
+    Info "Built Chrome native host: $builtNativeHost ($([math]::Round((Get-Item $builtNativeHost).Length/1MB,1)) MB)"
 
     # Durable readback naming the EXACT build tree and feature set used, so an
     # operator can prove after the fact where artifacts landed (#1857) and which
     # acceleration was compiled in (#1859) without re-deriving it from logs.
     $buildTargetReadbackPath = Join-Path $LogDir 'setup-build-target.json'
     $builtArtifact = Get-Item -LiteralPath $built
+    $builtNativeHostArtifact = Get-Item -LiteralPath $builtNativeHost
     $buildTargetReadback = [ordered]@{
-        schema = 'synapse_setup_build_target_readback/v1'
+        schema = 'synapse_setup_build_target_readback/v2'
         observed_at_utc = (Get-Date).ToUniversalTime().ToString('o')
         source_dir = $cargoTargetResolution.source_dir
         cargo_target_dir = $cargoTargetResolution.path
@@ -15268,14 +15287,19 @@ if (-not $SkipBuild) {
         artifact_byte_len = $builtArtifact.Length
         artifact_sha256 = (Get-SynapseFileSha256 -Path $built)
         artifact_last_write_utc = $builtArtifact.LastWriteTimeUtc.ToString('o')
+        chrome_native_host_artifact_path = $builtNativeHost
+        chrome_native_host_artifact_byte_len = $builtNativeHostArtifact.Length
+        chrome_native_host_artifact_sha256 = (Get-SynapseFileSha256 -Path $builtNativeHost)
+        chrome_native_host_artifact_last_write_utc = $builtNativeHostArtifact.LastWriteTimeUtc.ToString('o')
     }
     $buildTargetReadback | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $buildTargetReadbackPath -Encoding UTF8
-    Info ("Build target readback -> {0} (cargo_target_dir={1} kind={2} cuda_kernels={3} artifact_sha256={4})" -f `
+    Info ("Build target readback -> {0} (cargo_target_dir={1} kind={2} cuda_kernels={3} artifact_sha256={4} chrome_native_host_sha256={5})" -f `
         $buildTargetReadbackPath,
         $buildTargetReadback.cargo_target_dir,
         $buildTargetReadback.cargo_target_dir_kind,
         $cudaBuildCapability.enabled,
-        $buildTargetReadback.artifact_sha256)
+        $buildTargetReadback.artifact_sha256,
+        $buildTargetReadback.chrome_native_host_artifact_sha256)
     $embeddedModels = @(Install-SynapsePinnedDetectionModels -Root $embeddedModelRoot -SourceDir $SourceDir)
     foreach ($slotName in $script:SynapseEmbeddedModelSlotOrder) {
         if (-not @($embeddedModels | Where-Object { $_.Name -eq $slotName })[0]) {
@@ -15353,6 +15377,8 @@ Info "Candidate profiles verified path=$candidateProfilesDir count=$candidatePro
 Step "Validating candidate daemon before handoff"
 $installSourcePath = $ExePath
 $installSourceHash = $null
+$nativeHostInstallSourcePath = $ChromeNativeHostExePath
+$nativeHostInstallSourceHash = $null
 if ($SkipBuild) {
     if (-not (Test-Path -LiteralPath $ExePath)) {
         Die "SYNAPSE_SKIP_BUILD_BINARY_MISSING path=$ExePath remediation=-SkipBuild requires a real local synapse-mcp.exe at -ExePath before setup can touch the live daemon"
@@ -15373,10 +15399,20 @@ if ($SkipBuild) {
     [void](Assert-SynapseExecutableModelBundle -ExecutablePath $ExePath -Models $skipBuildModels)
     $installSourceHash = Get-SynapseFileSha256 -Path $ExePath
     Info "SkipBuild candidate binary path=$ExePath sha256=$installSourceHash"
+    if (-not (Test-Path -LiteralPath $ChromeNativeHostExePath -PathType Leaf)) {
+        Die "SYNAPSE_SKIP_BUILD_NATIVE_HOST_MISSING path=$ChromeNativeHostExePath remediation=-SkipBuild reuses an already installed release generation and requires its real Chrome native host executable"
+    }
+    $nativeHostInstallSourceHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+    Info "SkipBuild Chrome native host path=$ChromeNativeHostExePath sha256=$nativeHostInstallSourceHash"
 } else {
     $stagedBinary = New-SynapseStagedDaemonBinary -BuiltPath $built -LogDir $LogDir -RuntimeDir $ortRuntime.NativeDir
     $installSourcePath = $stagedBinary.Path
     $installSourceHash = $stagedBinary.Sha256
+    $nativeHostInstallSourcePath = $builtNativeHost
+    $nativeHostInstallSourceHash = Get-SynapseFileSha256 -Path $nativeHostInstallSourcePath
+}
+if ([string]::IsNullOrWhiteSpace($nativeHostInstallSourceHash)) {
+    Die "SYNAPSE_NATIVE_HOST_CANDIDATE_HASH_MISSING path=$nativeHostInstallSourcePath remediation=setup requires a physical SHA-256 identity for the Chrome native host before handoff"
 }
 $candidateRuntimeFiles = @(Get-SynapseOrtRuntimeCompanions -ExecutablePath $installSourcePath)
 $candidateRuntimeSummary = ($candidateRuntimeFiles | ForEach-Object { "{0}:{1}" -f $_.Name, $_.Sha256 }) -join ','
@@ -15565,6 +15601,16 @@ New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ExePath) | Out-Nu
 $backupPath = $null
 $oldInstalledHash = $null
 $runtimeCompanionBackups = @()
+$nativeHostBackup = [pscustomobject]@{
+    Path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+    BackupPath = "$ChromeNativeHostExePath.bak"
+    Existed = (Test-Path -LiteralPath $ChromeNativeHostExePath -PathType Leaf)
+    Sha256 = $null
+}
+$nativeHostInstalledAlreadyVerified = (
+    $nativeHostBackup.Existed -and
+    ((Get-SynapseFileSha256 -Path $ChromeNativeHostExePath) -eq $nativeHostInstallSourceHash)
+)
 if ($installedBinaryAlreadyVerified) {
     $oldInstalledHash = $installSourceHash
     Info "Installed binary already matches verified SkipBuild candidate; no backup/copy needed. path=$ExePath sha256=$oldInstalledHash"
@@ -15595,6 +15641,36 @@ $installedHash = Get-SynapseFileSha256 -Path $ExePath
 if ($installedHash -ne $installSourceHash) {
     Die "SYNAPSE_INSTALLED_BINARY_HASH_MISMATCH path=$ExePath expected_sha256=$installSourceHash actual_sha256=$installedHash remediation=installed daemon bytes do not match the candidate that passed health preflight"
 }
+$nativeHostInstallDir = Split-Path -Parent $ChromeNativeHostExePath
+New-Item -ItemType Directory -Force -Path $nativeHostInstallDir | Out-Null
+if ($nativeHostInstalledAlreadyVerified) {
+    Info "Installed Chrome native host already matches verified generation path=$ChromeNativeHostExePath sha256=$nativeHostInstallSourceHash"
+} else {
+    Stop-SynapseChromeNativeHostProcesses -Reason 'deploy_native_host' -NativeHostExePath $ChromeNativeHostExePath -TimeoutSeconds 10
+    Assert-SynapseInstallPathUnlocked -Path $ChromeNativeHostExePath -Bind $Bind -DbPath $DbPath -TimeoutSeconds 30
+    if ($nativeHostBackup.Existed) {
+        $nativeHostBackup.Sha256 = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+        Copy-Item -LiteralPath $ChromeNativeHostExePath -Destination $nativeHostBackup.BackupPath -Force
+        $nativeHostBackupReadback = Get-SynapseFileSha256 -Path $nativeHostBackup.BackupPath
+        if ($nativeHostBackupReadback -ne $nativeHostBackup.Sha256) {
+            Die "SYNAPSE_NATIVE_HOST_BACKUP_HASH_MISMATCH installed=$ChromeNativeHostExePath backup=$($nativeHostBackup.BackupPath) installed_hash=$($nativeHostBackup.Sha256) backup_hash=$nativeHostBackupReadback remediation=backup bytes changed during copy; refusing to install the candidate native host"
+        }
+    }
+    $nativeHostSourceResolved = [System.IO.Path]::GetFullPath($nativeHostInstallSourcePath)
+    $nativeHostDestinationResolved = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+    if ($nativeHostSourceResolved -ine $nativeHostDestinationResolved) {
+        Copy-Item -LiteralPath $nativeHostInstallSourcePath -Destination $ChromeNativeHostExePath -Force
+    }
+}
+if (-not (Test-Path -LiteralPath $ChromeNativeHostExePath -PathType Leaf)) {
+    Die "SYNAPSE_INSTALLED_NATIVE_HOST_MISSING path=$ChromeNativeHostExePath remediation=setup could not find the Chrome native host after the generation handoff"
+}
+$installedNativeHostHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+if ($installedNativeHostHash -ne $nativeHostInstallSourceHash) {
+    Die "SYNAPSE_INSTALLED_NATIVE_HOST_HASH_MISMATCH path=$ChromeNativeHostExePath expected_sha256=$nativeHostInstallSourceHash actual_sha256=$installedNativeHostHash remediation=installed Chrome native host bytes do not match the package generation built alongside the daemon"
+}
+$installedNativeHostItem = Get-Item -LiteralPath $ChromeNativeHostExePath
+Info "Installed Chrome native host verified path=$ChromeNativeHostExePath byte_len=$($installedNativeHostItem.Length) sha256=$installedNativeHostHash previous_sha256=$($nativeHostBackup.Sha256)"
 $runtimeInstallDir = Split-Path -Parent $ExePath
 foreach ($companion in $candidateRuntimeFiles) {
     $destination = Join-Path $runtimeInstallDir $companion.Name
@@ -16178,6 +16254,21 @@ if (-not $ok) {
         if ($rollbackHash -ne $oldInstalledHash) {
             Die "SYNAPSE_INSTALL_HEALTH_FAILED_ROLLBACK_HASH_MISMATCH expected_sha256=$oldInstalledHash actual_sha256=$rollbackHash backup=$backupPath install_path=$ExePath original_failure=[$failureDetail]"
         }
+        if (-not $nativeHostInstalledAlreadyVerified) {
+            Stop-SynapseChromeNativeHostProcesses -Reason 'install_health_failed_rollback' -NativeHostExePath $ChromeNativeHostExePath -TimeoutSeconds 10
+            if ($nativeHostBackup.Existed) {
+                Copy-Item -LiteralPath $nativeHostBackup.BackupPath -Destination $ChromeNativeHostExePath -Force
+                $nativeHostRollbackHash = Get-SynapseFileSha256 -Path $ChromeNativeHostExePath
+                if ($nativeHostRollbackHash -ne $nativeHostBackup.Sha256) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_NATIVE_HOST_ROLLBACK_HASH_MISMATCH path=$ChromeNativeHostExePath expected_sha256=$($nativeHostBackup.Sha256) actual_sha256=$nativeHostRollbackHash original_failure=[$failureDetail]"
+                }
+            } elseif (Test-Path -LiteralPath $ChromeNativeHostExePath -PathType Leaf) {
+                Remove-Item -LiteralPath $ChromeNativeHostExePath -Force
+                if (Test-Path -LiteralPath $ChromeNativeHostExePath) {
+                    Die "SYNAPSE_INSTALL_HEALTH_FAILED_NATIVE_HOST_ROLLBACK_REMOVE_FAILED path=$ChromeNativeHostExePath original_failure=[$failureDetail]"
+                }
+            }
+        }
         foreach ($runtimeBackup in $runtimeCompanionBackups) {
             if ($runtimeBackup.Existed) {
                 Copy-Item -LiteralPath $runtimeBackup.BackupPath -Destination $runtimeBackup.Path -Force
@@ -16386,6 +16477,7 @@ try {
         chrome_bridge_installer_path = [System.IO.Path]::GetFullPath($chromeBridgeInstaller)
         chrome_bridge_installer_sha256 = Get-SynapseFileSha256 -Path $chromeBridgeInstaller
         chrome_native_host_exe_path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+        chrome_native_host_exe_sha256 = $installedNativeHostHash
         task_name = $TaskName
         task_definition_sha256 = $pendingTask.DefinitionSha256
         task_action_execute = $pendingTask.ActionExecute
@@ -16524,6 +16616,8 @@ $checkpointTerminalization = Complete-SynapseObsoleteChromeBridgeCheckpoint `
     -DbPath $DbPath `
     -InstalledBinaryPath $ExePath `
     -InstalledBinarySha256 $installedHash `
+    -ChromeNativeHostExePath $ChromeNativeHostExePath `
+    -ChromeNativeHostExeSha256 $installedNativeHostHash `
     -ToolSurface $toolSurface `
     -ChromeBridge $h.subsystems.chrome_bridge
 
@@ -16535,6 +16629,8 @@ if ($script:SynapsePostExitStartOnly) {
         daemon_run_current_path = (Join-Path $DbPath 'daemon-run-current.json')
         installed_binary_path = $ExePath
         installed_binary_sha256 = $installedHash
+        chrome_native_host_exe_path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+        chrome_native_host_exe_sha256 = $installedNativeHostHash
         codex_tool_surface_snapshot_path = $CodexToolSurfaceSnapshotPath
         tool_count = $toolSurface.tool_count
         tool_surface_sha256 = $toolSurface.tool_surface_sha256
@@ -16557,6 +16653,8 @@ $setupRepairCompletionReadback = [ordered]@{
     daemon_run_current_path = (Join-Path $DbPath 'daemon-run-current.json')
     installed_binary_path = $ExePath
     installed_binary_sha256 = $installedHash
+    chrome_native_host_exe_path = [System.IO.Path]::GetFullPath($ChromeNativeHostExePath)
+    chrome_native_host_exe_sha256 = $installedNativeHostHash
     codex_tool_surface_snapshot_path = $CodexToolSurfaceSnapshotPath
     tool_count = $toolSurface.tool_count
     tool_surface_sha256 = $toolSurface.tool_surface_sha256

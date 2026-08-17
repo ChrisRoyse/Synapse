@@ -250,6 +250,10 @@ struct SetupBridgeCheckpointEnvelope {
     setup_script_path: String,
     #[serde(default)]
     setup_script_sha256: String,
+    #[serde(default)]
+    chrome_native_host_exe_path: String,
+    #[serde(default)]
+    chrome_native_host_exe_sha256: String,
 }
 
 fn launch_setup_repair(
@@ -539,13 +543,16 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
                 "inspect and repair the checkpoint JSON; setup refuses to replace a possibly pending phase with an unrelated full repair",
             )
         })?;
-    if checkpoint.schema == "synapse_setup_bridge_pending/v2" {
-        // v2 predates deployment-generation binding. Its identity fields can
-        // describe real bytes, but cannot prove which later successful setup
-        // owns the file. It is historical evidence, never resumable authority.
+    if matches!(
+        checkpoint.schema.as_str(),
+        "synapse_setup_bridge_pending/v2" | "synapse_setup_bridge_pending/v3"
+    ) {
+        // v2 predates deployment-generation binding; v3 does not bind the
+        // installed native-host bytes. Both are historical evidence, never
+        // resumable authority for a current package generation.
         return Ok(SetupRepairPlan::Full);
     }
-    if checkpoint.schema != "synapse_setup_bridge_pending/v3" {
+    if checkpoint.schema != "synapse_setup_bridge_pending/v4" {
         return Err(setup_repair_error(
             "SYNAPSE_SETUP_BRIDGE_CHECKPOINT_SCHEMA_INVALID",
             "chrome_bridge_checkpoint",
@@ -624,6 +631,11 @@ fn setup_repair_plan() -> Result<SetupRepairPlan, ErrorData> {
             "setup_script",
             checkpoint.setup_script_path.as_str(),
             checkpoint.setup_script_sha256.as_str(),
+        ),
+        (
+            "chrome_native_host",
+            checkpoint.chrome_native_host_exe_path.as_str(),
+            checkpoint.chrome_native_host_exe_sha256.as_str(),
         ),
     ] {
         if path.trim().is_empty() || expected_sha256.trim().is_empty() {
