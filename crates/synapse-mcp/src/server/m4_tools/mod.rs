@@ -44,6 +44,7 @@ use crate::m4::{
     ActLaunchOutput, ActLaunchOutputArtifactReadback, ActLaunchOutputLaunchReadback,
     ActRunShellExecutionMode, LaunchProcessExitObservation, LaunchTerminalCapture,
     launch_process_terminal_history_row, launch_process_terminal_history_row_key,
+    run_shell_precondition_snapshot, run_shell_start_precondition_snapshot,
 };
 
 use super::{
@@ -831,10 +832,12 @@ impl SynapseService {
         let params = prepare_run_shell_params_for_context(raw_params, &shell_context)?;
         let command_payload =
             run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms());
+        let preconditions = run_shell_precondition_snapshot(&params, Some(&shell_context));
         let command_before = json!({
             "source_of_truth": "durable shell registry/log files or inline child process",
             "session_id": &session_id,
             "execution_mode": params.execution_mode.as_str(),
+            "preconditions": preconditions,
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "act_run_shell",
@@ -948,10 +951,12 @@ impl SynapseService {
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_start_params_for_context(raw_params, &shell_context)?;
         let command_payload = run_shell_start_request_details(&params);
+        let preconditions = run_shell_start_precondition_snapshot(&params, Some(&shell_context));
         let command_before = json!({
             "source_of_truth": "durable shell registry/log files/process table",
             "session_id": &session_id,
             "job_id": &params.job_id,
+            "preconditions": preconditions,
         });
         self.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
             "act_run_shell_start",

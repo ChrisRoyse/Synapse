@@ -15709,6 +15709,101 @@ fn shell_job_environment_diagnostics(
     diagnostics
 }
 
+/// Captures only non-secret, point-in-time shell preconditions for the command
+/// audit `before` state. The snapshot is derived from the same child-environment
+/// construction and configured-host diagnostics used by execution; values are
+/// deliberately omitted so causal measurement cannot become credential
+/// storage.
+pub fn run_shell_precondition_snapshot(
+    params: &ActRunShellParams,
+    context: Option<&ShellExecutionContext>,
+) -> Value {
+    shell_precondition_snapshot(
+        &params.env,
+        params.working_dir.as_deref(),
+        context,
+        &params.command,
+        &params.args,
+    )
+}
+
+/// Durable-shell counterpart to [`run_shell_precondition_snapshot`].
+pub fn run_shell_start_precondition_snapshot(
+    params: &ActRunShellStartParams,
+    context: Option<&ShellExecutionContext>,
+) -> Value {
+    shell_precondition_snapshot(
+        &params.env,
+        params.working_dir.as_deref(),
+        context,
+        &params.command,
+        &params.args,
+    )
+}
+
+fn shell_precondition_snapshot(
+    requested_env: &BTreeMap<String, String>,
+    effective_working_dir: Option<&str>,
+    context: Option<&ShellExecutionContext>,
+    command: &str,
+    args: &[String],
+) -> Value {
+    let mut env = child_base_environment();
+    ensure_child_temp_environment(&mut env);
+    apply_requested_shell_environment(&mut env, requested_env);
+    apply_shell_session_environment(&mut env, effective_working_dir, context);
+    let delivered: BTreeMap<String, String> = env.clone().into_values().collect();
+    let required_missing: Vec<&str> = if cfg!(windows) {
+        REQUIRED_CHILD_ENVIRONMENT_KEYS
+            .into_iter()
+            .filter(|key| {
+                !delivered
+                    .iter()
+                    .any(|(name, value)| name.eq_ignore_ascii_case(key) && !value.trim().is_empty())
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut diagnostics = configured_host_environment_diagnostics(&env, requested_env);
+    let start_params = ActRunShellStartParams {
+        command: command.to_owned(),
+        args: args.to_vec(),
+        working_dir: effective_working_dir.map(ToOwned::to_owned),
+        env: requested_env.clone(),
+        timeout_ms: None,
+        job_id: None,
+    };
+    if let Some(skip) = cuda_precondition_skip_diagnostic(&env, requested_env, &start_params) {
+        diagnostics.push(skip);
+    }
+    let diagnostic_facts: Vec<Value> = diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            json!({
+                "variable": diagnostic.variable,
+                "diagnostic_code": diagnostic.diagnostic_code,
+                "severity": diagnostic.severity,
+                "explicit_override": diagnostic.explicit_override,
+                "source_of_truth": diagnostic.source_of_truth,
+            })
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "source_of_truth": "child_base_environment + durable Windows environment + shell session context",
+        "platform": if cfg!(windows) { "windows" } else { "non_windows" },
+        "delivered_environment_count": delivered.len(),
+        "required_environment_count": if cfg!(windows) { REQUIRED_CHILD_ENVIRONMENT_KEYS.len() } else { 0 },
+        "required_environment_missing": required_missing,
+        "requested_environment_key_count": requested_env.len(),
+        "working_directory_present": effective_working_dir.is_some(),
+        "working_directory_exists": effective_working_dir.is_some_and(|path| Path::new(path).is_dir()),
+        "configured_host_diagnostics": diagnostic_facts,
+        "secret_values_persisted": false,
+    })
+}
+
 /// Reports, in the structured result, that this command was classified
 /// CUDA-relevant and its durable-`CUDA_PATH` precondition was **not** enforced
 /// because NVML proved the host has no CUDA device (#1887).

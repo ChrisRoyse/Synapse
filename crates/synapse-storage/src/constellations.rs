@@ -189,7 +189,20 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// lexical components as a separate dense lens. It never reads terminal
 /// status, error, response or after-state, and historical rows without an
 /// authenticated request remain explicitly Absent.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_004;
+///
+/// Generation `2_185_005` repairs the outcome unit and adds an independent
+/// precondition lane. A command completion and the physical action completion
+/// it requested are two observations, not two labels for one classifier:
+/// command-final rows retain the readiness `reward`, while action-terminal
+/// rows carry `action_execution_reward`. The new precondition lens reads only
+/// the immutable command `before` snapshot. It never reads `after`, `outcome`,
+/// `status`, or `error`, so host state can explain a result without containing
+/// it. This generation is immutable because changing the anchor population or
+/// adding slot 122 would reinterpret already-persisted `2_185_004` rows.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_005;
+/// The mixed-outcome generation superseded by causal-unit separation and the
+/// precondition lane.
+pub const SYN_ACTION_PANEL_VERSION_PRE_PRECONDITIONS: u32 = 2_185_004;
 /// The bounded request class generation superseded by request semantic atoms.
 pub const SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS: u32 = 2_185_003;
 /// The exact request-vector generation superseded by the bounded request-cause lanes.
@@ -739,6 +752,11 @@ const ACT_REQUEST_VECTOR_DIM: u32 = 512;
 /// 512 dimensions keeps signed-hash projection noise at about 0.044 without
 /// flattening this lens into the exact-identity lane.
 const ACT_REQUEST_ATOM_VECTOR_DIM: u32 = 512;
+/// Dimension of the bounded pre-action state projection. The command writer's
+/// `before` object is already bounded and redacted; the semantic traversal has
+/// the same 128-atom ceiling as the request-atom lens. Keeping it separate is
+/// load-bearing: request intent and host preconditions are distinct causes.
+const ACT_PRECONDITION_ATOM_VECTOR_DIM: u32 = 512;
 /// Frozen byte-length scale for the pre-action request lane.
 ///
 /// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
@@ -850,6 +868,9 @@ const ACT_SLOT_REQUEST_SHAPE_CLASS: SlotId = SlotId::new(120);
 /// Bounded semantic atoms of the pre-execution request. Slot 121 has never
 /// carried another meaning.
 const ACT_SLOT_REQUEST_ATOMS: SlotId = SlotId::new(121);
+/// Bounded semantic atoms of the immutable command `before` snapshot. Slot 122
+/// has never carried another meaning.
+const ACT_SLOT_PRECONDITION_ATOMS: SlotId = SlotId::new(122);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -1011,14 +1032,14 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         last: 52,
     },
     // The action panel's second block (#2050/#1690). Holds the dense target,
-    // exact request, bounded request-size/request-shape and semantic-atom lanes
-    // (117..=121). `48..=52` could not be
+    // exact request, bounded request-size/request-shape, semantic request and
+    // precondition lanes (117..=122). `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
         first: 117,
-        last: 121,
+        last: 122,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2510,6 +2531,10 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         "syn.action.request_shape_class.v1",
     ),
     (ACT_SLOT_REQUEST_ATOMS, "syn.action.request_atoms.v1"),
+    (
+        ACT_SLOT_PRECONDITION_ATOMS,
+        "syn.action.precondition_atoms.v1",
+    ),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2948,6 +2973,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_CLASSES,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS,
+                SYN_ACTION_PANEL_VERSION_PRE_PRECONDITIONS,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5383,6 +5409,10 @@ pub fn build_action_constellation(
     slots.insert(ACT_SLOT_REQUEST_SHAPE_CLASS, request_shape_class);
     slots.insert(ACT_SLOT_REQUEST_ATOMS, request_atoms);
     slots.insert(
+        ACT_SLOT_PRECONDITION_ATOMS,
+        action_precondition_atom_slot(source_key, record)?,
+    );
+    slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
             SYN_ACTION_PANEL_NAME,
@@ -5415,26 +5445,45 @@ pub fn build_action_constellation(
         scalars,
         metadata,
     )?;
-    if let Some(anchor) = action_outcome_anchor(source_key, record)? {
-        let value = match anchor.value {
-            GroundingAnchorValue::Bool(value) => AnchorValue::Bool(value),
-            _ => {
-                return Err(StorageError::WriteFailed {
-                    cf_name: cf::CF_ACTION_LOG.to_owned(),
-                    detail: "action outcome adjudication emitted a non-boolean reward; remediation=repair action_outcome_anchor to preserve the declared binary contract".to_owned(),
-                });
-            }
-        };
-        constellation.anchors.push(Anchor {
-            kind: AnchorKind::Reward,
-            value,
-            source: anchor.source,
-            observed_at: anchor.observed_at_ms,
-            confidence: anchor.confidence,
-        });
-        constellation.flags.ungrounded = false;
-    }
+    append_action_outcome_anchor(&mut constellation, source_key, record)?;
     Ok(constellation)
+}
+
+fn append_action_outcome_anchor(
+    constellation: &mut Constellation,
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<()> {
+    let Some(anchor) = action_outcome_anchor(source_key, record)? else {
+        return Ok(());
+    };
+    let GroundingAnchorValue::Bool(outcome) = anchor.value else {
+        return Err(StorageError::WriteFailed {
+            cf_name: cf::CF_ACTION_LOG.to_owned(),
+            detail: "action outcome adjudication emitted a non-boolean reward; remediation=repair action_outcome_anchor to preserve the declared binary contract".to_owned(),
+        });
+    };
+    let kind = match anchor.kind_label.as_str() {
+        "reward" => AnchorKind::Reward,
+        "action_execution_reward" => AnchorKind::Label("action_execution_reward".to_owned()),
+        other => {
+            return Err(StorageError::WriteFailed {
+                cf_name: cf::CF_ACTION_LOG.to_owned(),
+                detail: format!(
+                    "action outcome adjudication emitted unsupported anchor kind {other:?}; remediation=declare the grounded axis explicitly before persisting it"
+                ),
+            });
+        }
+    };
+    constellation.anchors.push(Anchor {
+        kind,
+        value: AnchorValue::Bool(outcome),
+        source: anchor.source,
+        observed_at: anchor.observed_at_ms,
+        confidence: anchor.confidence,
+    });
+    constellation.flags.ungrounded = false;
+    Ok(())
 }
 
 /// Build the Calyx constellation for a reflex audit row.
@@ -6973,7 +7022,10 @@ fn action_metadata(
     metadata
 }
 
-/// Derives the one declared terminal action outcome. Nonterminal audit rows
+/// Derives one declared terminal outcome on its causal axis.
+///
+/// Command-final rows ground command readiness as `reward`; action-terminal rows ground
+/// physical execution as `action_execution_reward`. Nonterminal audit rows
 /// remain measurable but ungrounded; no other status is assigned a polarity.
 ///
 /// # Errors
@@ -6985,12 +7037,12 @@ pub fn action_outcome_anchor(
     record: &Value,
 ) -> StorageResult<Option<GroundingAnchor>> {
     let row_kind = json_string(record, &["row_kind"]);
-    let outcome = match row_kind.as_deref() {
+    let (kind_label, outcome) = match row_kind.as_deref() {
         Some("command_audit") => match json_string(record, &["phase"]).as_deref() {
             Some("intent") => return Ok(None),
             Some("final") => match json_string(record, &["outcome"]).as_deref() {
-                Some("ok") => true,
-                Some("error") => false,
+                Some("ok") => ("reward", true),
+                Some("error") => ("reward", false),
                 value => {
                     return Err(StorageError::ReadFailed {
                         cf_name: cf::CF_ACTION_LOG.to_owned(),
@@ -7010,8 +7062,8 @@ pub fn action_outcome_anchor(
             }
         },
         None | Some("action_audit") => match json_string(record, &["status"]).as_deref() {
-            Some("ok") => true,
-            Some("error" | "denied") => false,
+            Some("ok") => ("action_execution_reward", true),
+            Some("error" | "denied") => ("action_execution_reward", false),
             _ => return Ok(None),
         },
         Some(_) => return Ok(None),
@@ -7023,7 +7075,7 @@ pub fn action_outcome_anchor(
         })?
         / 1_000_000;
     Ok(Some(GroundingAnchor {
-        kind_label: "reward".to_owned(),
+        kind_label: kind_label.to_owned(),
         value: GroundingAnchorValue::Bool(outcome),
         source: source_pointer(cf::CF_ACTION_LOG, source_key),
         observed_at_ms,
@@ -8350,7 +8402,25 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         panel_version,
         registry,
     )?);
+    slots.push(action_precondition_panel_slot(panel_version, registry)?);
     Ok(slots)
+}
+
+fn action_precondition_panel_slot(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Slot> {
+    syn_content_slot(
+        ACT_SLOT_PRECONDITION_ATOMS,
+        "syn.action.precondition_atoms.v1",
+        RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.precondition_atoms.v1",
+            Modality::Structured,
+            ACT_PRECONDITION_ATOM_VECTOR_DIM,
+        ),
+        panel_version,
+        registry,
+    )
 }
 
 fn action_request_class_panel_slots(
@@ -10212,6 +10282,70 @@ fn action_request_atom_features(
         );
     }
     features
+}
+
+/// Builds bounded semantic atoms from the command writer's immutable `before`
+/// snapshot. This is deliberately a separate lens from request intent: a host
+/// precondition and the operation requested under it are independently
+/// measurable causes. Terminal `after`, `outcome`, `status`, and `error` fields
+/// are never consulted.
+fn action_precondition_atom_features(
+    record: &Value,
+) -> StorageResult<Option<serde_json::Map<String, Value>>> {
+    if json_string(record, &["row_kind"]).as_deref() != Some("command_audit") {
+        return Ok(None);
+    }
+    let before = record.get("before").ok_or_else(|| {
+        measurement_error(
+            "action precondition atoms",
+            "command_audit row is missing required point-in-time before state; remediation=repair or quarantine the malformed authoritative audit row",
+        )
+    })?;
+    if before.is_null() {
+        return Ok(None);
+    }
+    let mut features = serde_json::Map::new();
+    let mut budget = ActionRequestAtomBudget::default();
+    collect_action_request_atoms(before, "$before", 0, &mut features, &mut budget);
+    if budget.overflowed {
+        features.insert(
+            format!(
+                "bounded_traversal|{}",
+                action_target_feature_digest("precondition_overflow")
+            ),
+            json!(ACT_REQUEST_SHAPE_WEIGHT),
+        );
+    }
+    Ok(Some(features))
+}
+
+/// Measures the immutable precondition state for a command row, or explicit
+/// absence for action-audit rows and historical commands that declared no
+/// precondition state.
+fn action_precondition_atom_slot(source_key: &[u8], record: &Value) -> StorageResult<SlotVector> {
+    let Some(features) = action_precondition_atom_features(record).map_err(|error| {
+        measurement_error(
+            "action precondition atoms",
+            format!(
+                "source_cf={} source_key_hex={} action={}: {error}",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                action_identity(record)
+            ),
+        )
+    })?
+    else {
+        return Ok(absent(AbsentReason::NotApplicable));
+    };
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.precondition_atoms.v1",
+            Modality::Structured,
+            ACT_PRECONDITION_ATOM_VECTOR_DIM,
+        ),
+        &Value::Object(features),
+    )
 }
 
 const fn request_shape_count_class(value: usize) -> u8 {

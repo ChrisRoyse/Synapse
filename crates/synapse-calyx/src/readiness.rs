@@ -42,7 +42,7 @@ const READINESS_SCHEMA_VERSION: u32 = 3;
 const EVIDENCE_CF: &str = "AnnealReport";
 const LEDGER_SOURCE: &str = "Ledger/anneal";
 const GUARD_SOURCE: &str = "Guard/profile\\0panel\\0<panel_version>";
-const CORPUS_SOURCE: &str = "Base/panel=2185004,oracle.domain=synapse.action";
+const CORPUS_SOURCE: &str = "Base/panel=2185005,oracle.domain=synapse.action";
 
 /// Freshness lease on held-out action evidence, in milliseconds (7 days).
 ///
