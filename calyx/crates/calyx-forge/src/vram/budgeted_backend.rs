@@ -266,6 +266,11 @@ impl VramBudgetedCudaBackend {
     /// nested Assay kernel retains its own fail-closed live-VRAM check. The
     /// outer Synapse math lease remains alive for the entire call and owns the
     /// context/module host reservation; no process-global context survives it.
+    ///
+    /// This public boundary is consumed from the root `synapse-calyx`
+    /// workspace, which is intentionally not a member of the vendored Calyx
+    /// workspace. Calyx's workspace-local unreached-API scanner therefore
+    /// cannot observe that production caller.
     pub fn with_assay_context_scope<T>(
         &self,
         operation: &'static str,
