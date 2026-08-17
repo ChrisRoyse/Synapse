@@ -136,11 +136,14 @@ pub use backup::{
     SynapseCalyxBackupReport, SynapseCalyxVerifyReport, verify_vault_restore,
 };
 pub use causal_map::{
-    SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA, SYNAPSE_CAUSAL_MAP_MAX_STREAMS,
+    SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA, SYNAPSE_CAUSAL_MAP_MAX_ALIGNED_CELLS,
+    SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES, SYNAPSE_CAUSAL_MAP_MAX_PAIR_LAG_EVIDENCE_POINTS,
+    SYNAPSE_CAUSAL_MAP_MAX_PAIR_ROWS, SYNAPSE_CAUSAL_MAP_MAX_PC_CI_TESTS,
     SYNAPSE_CAUSAL_MAP_PC_MAX_CONDITIONING, SynapseCalyxCausalEstimatorError,
     SynapseCalyxCausalEstimatorEvidence, SynapseCalyxCausalMapArtifact,
-    SynapseCalyxCausalMapReport, SynapseCalyxCausalPairEvidence, SynapseCalyxCausalStream,
-    SynapseCalyxFdrDecision, SynapseCalyxFdrFamily,
+    SynapseCalyxCausalMapReport, SynapseCalyxCausalPairEvidence,
+    SynapseCalyxCausalResourceAccounting, SynapseCalyxCausalStream, SynapseCalyxFdrDecision,
+    SynapseCalyxFdrFamily,
 };
 pub use drift::{
     SYNAPSE_BLIND_SPOT_ALPHA, SYNAPSE_BLIND_SPOT_MAX_ALERTS, SYNAPSE_BLIND_SPOT_MIN_SAMPLES,

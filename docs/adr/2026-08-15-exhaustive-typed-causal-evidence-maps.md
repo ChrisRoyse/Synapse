@@ -28,7 +28,7 @@ Primary sources constrain the interpretation:
 7. The complete artifact is content-addressed under the native Calyx Graph CF (`GCMP1...`). Runtime-only estimator timestamps are excluded from the semantic bytes; source-data time remains explicit in `earliest_event_ns` / `latest_event_ns`, and upstream projection drift fails closed instead of reintroducing nondeterminism. The write is flushed and separately read byte-for-byte before the response exposes its key, SHA-256, byte count, Graph row count, and readback verdict.
 8. A second Graph row (`GCMI1...`) is the materialized-view pointer for a normalized panel/group/pair/window-shape/bin/lag/FDR scope. The immutable artifact and pointer publish in one Aster batch guarded by the pointer's physical revision. An older or concurrent computation cannot regress the serving frontier.
 9. `causal_map_read` is the read-only serving path. It follows the pointer, derives and hashes the artifact key, validates the complete typed artifact contract, then independently reloads and fingerprints every source event in the artifact's closed window. Missing, corrupt, cross-scope, incomplete, or source-stale state is an error; reads never recompute or fall back.
-10. The derived-state owner refreshes declared native temporal populations hourly over a six-hour closed window. It does not sample high-cardinality populations: empty, one-stream, and over-16-stream scopes are named non-publications, while storage/schema/invariant failures fail the maintenance tick. Health exposes the exact pointer/artifact/source identities only after the independent read succeeds.
+10. The derived-state owner refreshes declared native temporal populations hourly over a six-hour closed window. It does not sample high-cardinality populations: empty, one-stream, and scopes exceeding a declared measured work/storage budget are named non-publications, while storage/schema/invariant failures fail the maintenance tick. Health exposes the exact pointer/artifact/source identities only after the independent read succeeds.
 11. BH adjustments are family-local and explicitly disclose their validity boundary: FDR control assumes independent or positive-regression-dependent p-values within the named family. No arbitrary-dependence or cross-family error-rate claim is made.
 12. Exact panel membership is independent of retrieval admission. Queryable panels use their normal search generation. For a finite-only panel, the mutating producer first ensures a hash-sealed membership-only generation whose manifest has zero retrieval slots. It is built when absent; otherwise it is reopened and validated before reconciliation. A valid generation whose bounded delta cannot be reconstructed because it predates the recovered change-history floor, or whose measured delta exceeds the hard reconciliation bound, is rebuilt from authoritative Base rows and reconciled again. The read-only serving path never builds or repairs it. A present corrupt, wrong-panel, future, or otherwise invalid generation fails closed and remains preserved. This removes the accidental requirement that a temporal population possess meaningful ANN geometry before exact analytics can read it.
 13. Foreground MCP whole-corpus calls and autonomous maintenance share the same one-permit semaphore but not the same wait contract. Autonomous GC, pressure, and derived-state passes wait fairly until admitted. A foreground tool waits at most one second for admission and then returns `STORAGE_MAINTENANCE_BUSY`, naming the active operation, its observed ownership duration, the admission budget, and proving its closure was not dispatched. The active owner is tracked under a generation-guarded RAII record and cleared before its owned permit drops. This keeps the single-working-set memory invariant while preventing an MCP transport timeout from erasing a queued causal request before it starts.
@@ -42,6 +42,16 @@ Primary sources constrain the interpretation:
     observational arrows to rewrite empirical success posteriors. A never-built
     generation is named provisional; stale, corrupt, cross-bound, or incomplete
     state fails the recommendation rather than falling back.
+16. Artifact v3 removes the unrelated 16-stream ceiling. Admission derives and
+    persists checked `C(n,2)` pair rows, aligned stream cells, pair/lag evidence
+    points, Granger and signed-correlation hypothesis capacities, and a
+    conservative PC-stable conditional-test upper bound over both frozen
+    endpoint neighborhoods. Every output vector is fallibly pre-reserved. A
+    bounded JSON writer refuses before 32 MiB, leaving headroom inside Aster's
+    64-MiB WAL record boundary; an independent reader re-derives every resource
+    field and rejects over-budget or mismatched bytes. Resource refusal happens
+    before estimator publication and never licenses sampling, pair omission, or
+    conditioning-set omission.
 
 ## Consequences
 
@@ -60,6 +70,11 @@ Primary sources constrain the interpretation:
   placeholder. The response still labels these arrows observational/predictive;
   a tool appearing before a failed tool is not thereby declared a structural
   cause of failure.
+- Stream names are no longer treated as a proxy for cost. A 19-stream action
+  universe is admissible when its exact 171 pairs and conditioning work fit;
+  a smaller but extremely long/high-lag universe can still refuse on the actual
+  cell, evidence-point, PC-test, allocation, or serialized-byte dimension. The
+  persisted accounting makes that boundary auditable by consumers and health.
 
 ## References
 
@@ -72,3 +87,9 @@ Primary sources constrain the interpretation:
 - Tokio `Semaphore` and `time::timeout` API documentation (fair queueing, owned-permit lifetime, and acquire cancellation semantics).
 - NVIDIA, *CUDA Programming Guide*, histogram/shared-memory/atomics guidance: <https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/writing-cuda-kernels.html>.
 - NVIDIA, *CUDA C++ Best Practices Guide*, coalescing and shared-memory guidance: <https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/>.
+- Colombo and Maathuis, “Order-Independent Constraint-Based Causal Structure
+  Learning,” JMLR 15 (2014): <https://www.jmlr.org/papers/volume15/colombo14a/colombo14a.pdf>.
+- Rust standard library `Vec::try_reserve_exact` (fallible preallocation):
+  <https://doc.rust-lang.org/std/vec/struct.Vec.html>.
+- `serde_json::to_writer` (serialization into an explicit bounded writer):
+  <https://docs.rs/serde_json/latest/serde_json/fn.to_writer.html>.

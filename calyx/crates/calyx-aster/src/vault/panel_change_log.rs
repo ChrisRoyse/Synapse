@@ -696,7 +696,7 @@ where
         let mut latest = BTreeMap::<CxId, PanelInputChange>::new();
         let mut unique_limit_exceeded = false;
         let mut events_scanned = 0usize;
-        let page_rows = max_unique.min(1_024).max(1);
+        let page_rows = max_unique.clamp(1, 1_024);
         let prefixes = if mutations_only {
             vec![PANEL_CHANGE_PREFIX]
         } else {

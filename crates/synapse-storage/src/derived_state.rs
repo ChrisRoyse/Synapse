@@ -2681,7 +2681,11 @@ fn drive_one_scheduled_causal_map(
                     error.code(),
                     "SYNAPSE_CALYX_CAUSAL_MAP_EMPTY_SCOPE"
                         | "SYNAPSE_CALYX_CAUSAL_MAP_STREAMS_INSUFFICIENT"
-                        | "SYNAPSE_CALYX_CAUSAL_MAP_STREAM_LIMIT_EXCEEDED"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_PAIR_WORK_BUDGET_EXCEEDED"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_ALIGNED_CELL_BUDGET_EXCEEDED"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_PAIR_LAG_WORK_BUDGET_EXCEEDED"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_PC_WORK_BUDGET_EXCEEDED"
+                        | "SYNAPSE_CALYX_CAUSAL_MAP_ARTIFACT_BYTE_BUDGET_EXCEEDED"
                 ) =>
             {
                 clear_causal_map_physical_readback(&target_id);
@@ -2768,9 +2772,18 @@ fn drive_one_scheduled_causal_map(
     state.last_causal_map_actions.insert(
         target_id.clone(),
         format!(
-            "published source_recompute_attempts={source_recompute_attempts} window_since_ns={since_ns} window_until_ns={until_ns} streams={} pairs={} evidence_statuses={status_counts:?} estimator_error_codes={error_codes:?} source_records={} latest_event_ns={}",
+            "published source_recompute_attempts={source_recompute_attempts} window_since_ns={since_ns} window_until_ns={until_ns} streams={} pairs={} aligned_cells={} pair_lag_evidence_points_upper_bound={} pc_ci_tests_upper_bound={} evidence_statuses={status_counts:?} estimator_error_codes={error_codes:?} source_records={} latest_event_ns={}",
             readback.artifact.streams.len(),
             readback.artifact.pairs.len(),
+            readback.artifact.resource_accounting.aligned_cells,
+            readback
+                .artifact
+                .resource_accounting
+                .pair_lag_evidence_points_upper_bound,
+            readback
+                .artifact
+                .resource_accounting
+                .pc_ci_tests_upper_bound,
             readback.artifact.source_records,
             readback.artifact.latest_event_ns
         ),

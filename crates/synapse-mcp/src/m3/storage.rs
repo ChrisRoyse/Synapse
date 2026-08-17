@@ -2888,7 +2888,7 @@ pub struct StorageIntelligenceCausalityReport {
 #[serde(deny_unknown_fields)]
 pub struct StorageIntelligenceCausalMapReport {
     pub source_of_truth: &'static str,
-    /// Native `synapse.calyx.causal_map.v2` artifact. Its evidence lanes remain
+    /// Native `synapse.calyx.causal_map.v3` artifact. Its evidence lanes remain
     /// separate; callers must not collapse them into one causal score.
     pub artifact: serde_json::Value,
     pub graph_key_hex: String,

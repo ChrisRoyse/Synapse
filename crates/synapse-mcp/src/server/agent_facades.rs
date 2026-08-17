@@ -1736,6 +1736,7 @@ fn steering_causal_evidence(
             "expected_pair_count": report.artifact.expected_pair_count,
             "all_requested_records_loaded": report.artifact.all_requested_records_loaded,
             "all_stream_pairs_enumerated": report.artifact.all_stream_pairs_enumerated,
+            "resource_accounting": report.artifact.resource_accounting,
         },
         "global_estimators": {
             "pc_stable_skeleton": report.artifact.pc_stable_skeleton,

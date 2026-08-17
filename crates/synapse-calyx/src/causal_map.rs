@@ -8,6 +8,7 @@
 //! the artifact to an identified structural causal effect.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Write};
 
 use calyx_assay::{
     CcmConfig, HawkesConfig, HawkesEventSeries, PartialNetworkSeries, PcSeries,
@@ -29,9 +30,26 @@ use crate::intelligence::{
 };
 use crate::{SynapseCalyxError, SynapseCalyxVault};
 
-/// Maximum stream count for one exhaustive map. The request fails rather than
-/// sampling when the complete `C(n,2)` family cannot fit this declared budget.
-pub const SYNAPSE_CAUSAL_MAP_MAX_STREAMS: usize = 16;
+/// Maximum complete pair rows retained in one causal-map artifact. Admission
+/// is based on the actual `C(n,2)` work, never an unrelated stream-count cap.
+pub const SYNAPSE_CAUSAL_MAP_MAX_PAIR_ROWS: usize = 4_096;
+/// Maximum `stream_count * aligned_bin_count` cells held by the shared binned
+/// representation (64 MiB of `f32` values before map/vector overhead).
+pub const SYNAPSE_CAUSAL_MAP_MAX_ALIGNED_CELLS: usize = 16_777_216;
+/// Maximum conservative PC-stable conditional-independence tests.
+///
+/// The count is an upper bound at the declared conditioning depth over both
+/// frozen endpoint neighborhoods; accepted runs may stop an edge earlier.
+pub const SYNAPSE_CAUSAL_MAP_MAX_PC_CI_TESTS: usize = 8_388_608;
+/// Maximum pair/lag evidence points computed across TE, bidirectional Granger,
+/// signed cross-correlation, CCM, and cross-K for one complete artifact.
+pub const SYNAPSE_CAUSAL_MAP_MAX_PAIR_LAG_EVIDENCE_POINTS: usize = 1_048_576;
+/// Maximum compact JSON artifact bytes.
+///
+/// This stays below half of Aster's 64-MiB WAL-record ceiling so the paired
+/// pointer and batch envelope retain explicit headroom instead of discovering
+/// the physical limit at commit.
+pub const SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES: usize = 32 * 1024 * 1024;
 /// Default false-discovery-rate threshold for p-value families.
 pub const SYNAPSE_CAUSAL_MAP_DEFAULT_FDR_ALPHA: f32 = 0.05;
 /// Gaussian PC-stable conditioning depth. Calyx's present implementation is a
@@ -40,7 +58,7 @@ pub const SYNAPSE_CAUSAL_MAP_PC_MAX_CONDITIONING: usize = 3;
 
 const GRAPH_CAUSAL_MAP_PREFIX: &[u8; 5] = b"GCMP1";
 const GRAPH_CAUSAL_MAP_INDEX_PREFIX: &[u8; 5] = b"GCMI1";
-const CAUSAL_MAP_ARTIFACT_SCHEMA: &str = "synapse.calyx.causal_map.v2";
+const CAUSAL_MAP_ARTIFACT_SCHEMA: &str = "synapse.calyx.causal_map.v3";
 const CAUSAL_MAP_POINTER_SCHEMA: &str = "synapse.calyx.causal_map_pointer.v1";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -63,6 +81,28 @@ pub struct SynapseCalyxCausalEstimatorEvidence {
 pub struct SynapseCalyxCausalStream {
     pub name: String,
     pub event_count: usize,
+}
+
+/// Checked work and storage accounting for one exhaustive causal-map
+/// generation. A reader re-derives every field from the artifact roster,
+/// timeline, and lag contract before serving it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SynapseCalyxCausalResourceAccounting {
+    pub stream_count: usize,
+    pub pair_count: usize,
+    pub aligned_bin_count: usize,
+    pub aligned_cells: usize,
+    pub max_lag: usize,
+    pub pair_lag_evidence_points_upper_bound: usize,
+    pub granger_hypotheses_upper_bound: usize,
+    pub cross_correlation_hypotheses_upper_bound: usize,
+    pub pc_conditioning_depth: usize,
+    pub pc_ci_tests_upper_bound: usize,
+    pub max_pair_rows_budget: usize,
+    pub max_aligned_cells_budget: usize,
+    pub max_pair_lag_evidence_points_budget: usize,
+    pub max_pc_ci_tests_budget: usize,
+    pub max_artifact_bytes_budget: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +166,7 @@ pub struct SynapseCalyxCausalMapArtifact {
     pub structural_effect_identified: bool,
     pub structural_identification_reason: String,
     pub identification_requirements: Vec<String>,
+    pub resource_accounting: SynapseCalyxCausalResourceAccounting,
     pub streams: Vec<SynapseCalyxCausalStream>,
     pub expected_pair_count: usize,
     pub pairs: Vec<SynapseCalyxCausalPairEvidence>,
@@ -202,11 +243,11 @@ impl SynapseCalyxVault {
     /// # Errors
     ///
     /// Fails closed for an invalid window/FDR, missing group values, an
-    /// incomplete one-sided pair scope, too many streams, over-limit source
-    /// coverage, an empty/one-stream scope, persistence failure, or readback
-    /// mismatch. Individual statistical lanes retain typed estimator errors in
-    /// the complete artifact because non-applicability is itself causal evidence;
-    /// it is never silently replaced by another estimator.
+    /// incomplete one-sided pair scope, over-budget exhaustive work, over-limit
+    /// source coverage, an empty/one-stream scope, persistence failure, or
+    /// readback mismatch. Individual statistical lanes retain typed estimator
+    /// errors in the complete artifact because non-applicability is itself
+    /// causal evidence; it is never silently replaced by another estimator.
     #[allow(clippy::too_many_lines)]
     pub fn temporal_causal_map(
         &self,
@@ -265,23 +306,41 @@ impl SynapseCalyxVault {
             by_group.entry(group.clone()).or_default().push(record.secs);
         }
         let selected = select_streams(&by_group, pair_scope.as_ref())?;
-        if selected.len() > SYNAPSE_CAUSAL_MAP_MAX_STREAMS {
-            return Err(causal_error(
-                "SYNAPSE_CALYX_CAUSAL_MAP_STREAM_LIMIT_EXCEEDED",
-                format!(
-                    "the complete scope contains {} streams, exceeding the exhaustive-map limit {SYNAPSE_CAUSAL_MAP_MAX_STREAMS}; sampling streams is forbidden",
-                    selected.len()
-                ),
-                "supply both group_a and group_b for an explicit pair or narrow the source-event-time scope so every stream pair fits the declared exhaustive budget",
-            ));
-        }
         let bin_seconds = scope.bin_seconds;
         let max_lag = scope.max_lag;
-        let (origin, n_bins, binned) = aligned_binned_streams(&selected, &by_group, bin_seconds)?;
+        let (origin, n_bins, binned, resource_accounting) =
+            aligned_binned_streams(&selected, &by_group, bin_seconds, max_lag)?;
+        tracing::info!(
+            code = "SYNAPSE_CALYX_CAUSAL_MAP_RESOURCE_ADMITTED",
+            stream_count = resource_accounting.stream_count,
+            pair_count = resource_accounting.pair_count,
+            aligned_bin_count = resource_accounting.aligned_bin_count,
+            aligned_cells = resource_accounting.aligned_cells,
+            pair_lag_evidence_points_upper_bound =
+                resource_accounting.pair_lag_evidence_points_upper_bound,
+            pc_ci_tests_upper_bound = resource_accounting.pc_ci_tests_upper_bound,
+            max_artifact_bytes = resource_accounting.max_artifact_bytes_budget,
+            "admitted the complete causal-map scope against measured work dimensions"
+        );
         let lags = (1..=max_lag).collect::<Vec<_>>();
         let mut granger_hypotheses = Vec::new();
+        try_reserve_causal(
+            &mut granger_hypotheses,
+            resource_accounting.granger_hypotheses_upper_bound,
+            "all bidirectional Granger hypotheses",
+        )?;
         let mut ccf_hypotheses = Vec::new();
+        try_reserve_causal(
+            &mut ccf_hypotheses,
+            resource_accounting.cross_correlation_hypotheses_upper_bound,
+            "all signed cross-correlation hypotheses",
+        )?;
         let mut pairs = Vec::new();
+        try_reserve_causal(
+            &mut pairs,
+            resource_accounting.pair_count,
+            "all causal stream-pair evidence rows",
+        )?;
 
         for left in 0..selected.len() {
             for right in (left + 1)..selected.len() {
@@ -325,7 +384,7 @@ impl SynapseCalyxVault {
                     origin,
                     bin_seconds,
                     max_lag,
-                );
+                )?;
                 pairs.push(SynapseCalyxCausalPairEvidence {
                     group_a: group_a.clone(),
                     group_b: group_b.clone(),
@@ -387,7 +446,7 @@ impl SynapseCalyxVault {
                 event_count: by_group[name].len(),
             })
             .collect::<Vec<_>>();
-        let expected_pair_count = selected.len() * selected.len().saturating_sub(1) / 2;
+        let expected_pair_count = resource_accounting.pair_count;
         let source_fingerprint_sha256 = source_fingerprint(&records)?;
         let artifact = SynapseCalyxCausalMapArtifact {
             schema: CAUSAL_MAP_ARTIFACT_SCHEMA.to_owned(),
@@ -417,6 +476,7 @@ impl SynapseCalyxVault {
                 "positivity".to_owned(),
                 "no unmodeled interference for the declared estimand".to_owned(),
             ],
+            resource_accounting,
             streams,
             expected_pair_count,
             pairs,
@@ -436,13 +496,7 @@ impl SynapseCalyxVault {
                 "inspect the deterministic stream-pair enumeration before publishing any causal artifact",
             ));
         }
-        let bytes = serde_json::to_vec(&artifact).map_err(|error| {
-            causal_error(
-                "SYNAPSE_CALYX_CAUSAL_MAP_ENCODE_FAILED",
-                format!("encode causal-map artifact: {error}"),
-                "inspect the causal-map report for a non-serializable or non-finite field",
-            )
-        })?;
+        let bytes = encode_causal_map_artifact(&artifact)?;
         let digest = Sha256::digest(&bytes);
         let graph_key = causal_map_key(params.panel_version, &digest);
         let graph_key_hex = hex_encode(&graph_key);
@@ -683,6 +737,17 @@ impl SynapseCalyxVault {
                     "restore or rebuild the exact immutable artifact; reads never recompute a missing generation",
                 )
             })?;
+        if artifact_bytes.len() > SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES {
+            return Err(causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_ARTIFACT_BYTE_BUDGET_EXCEEDED",
+                format!(
+                    "pointed Graph artifact {} contains {} bytes, above the versioned budget {SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES}",
+                    pointer.artifact_key_hex,
+                    artifact_bytes.len()
+                ),
+                "preserve the incompatible row for diagnosis and rebuild it under the current bounded artifact contract",
+            ));
+        }
         let actual_digest = Sha256::digest(&artifact_bytes);
         if actual_digest.as_slice() != artifact_digest {
             return Err(causal_error(
@@ -1092,6 +1157,13 @@ fn validate_artifact_contract(
             "the pointed causal-map artifact carries an invalid max-records contract or more source records than that contract permits",
         ));
     }
+    let expected_resource_accounting =
+        causal_resource_accounting(artifact.streams.len(), artifact.n_bins, artifact.max_lag)?;
+    if artifact.resource_accounting != expected_resource_accounting {
+        return Err(artifact_contract_error(
+            "the pointed causal-map artifact's persisted resource accounting does not reproduce from its stream/bin/lag contract",
+        ));
+    }
     decode_sha256(&artifact.source_fingerprint_sha256)?;
     if !artifact.all_requested_records_loaded
         || !artifact.all_stream_pairs_enumerated
@@ -1146,7 +1218,7 @@ fn validate_stream_and_pair_coverage(
         ));
     }
 
-    let expected_pair_count = artifact.streams.len() * artifact.streams.len().saturating_sub(1) / 2;
+    let expected_pair_count = checked_pair_count(artifact.streams.len())?;
     if artifact.expected_pair_count != expected_pair_count
         || artifact.pairs.len() != expected_pair_count
     {
@@ -1477,12 +1549,287 @@ fn validate_bin_seconds(bin: f64) -> Result<f64, SynapseCalyxError> {
     }
 }
 
-type AlignedBinnedStreams = (f64, usize, BTreeMap<String, Vec<f32>>);
+type AlignedBinnedStreams = (
+    f64,
+    usize,
+    BTreeMap<String, Vec<f32>>,
+    SynapseCalyxCausalResourceAccounting,
+);
+
+fn checked_causal_product(
+    left: usize,
+    right: usize,
+    dimension: &str,
+) -> Result<usize, SynapseCalyxError> {
+    left.checked_mul(right).ok_or_else(|| {
+        causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+            format!(
+                "causal-map {dimension} overflowed usize while multiplying {left} by {right}"
+            ),
+            "reduce the exact source scope or deploy on a wider supported platform; no cardinality is saturated or truncated",
+        )
+    })
+}
+
+fn checked_pair_count(stream_count: usize) -> Result<usize, SynapseCalyxError> {
+    let product = checked_causal_product(
+        stream_count,
+        stream_count.saturating_sub(1),
+        "C(stream_count,2) numerator",
+    )?;
+    Ok(product / 2)
+}
+
+fn checked_combination(n: usize, k: usize) -> Result<usize, SynapseCalyxError> {
+    if k > n {
+        return Ok(0);
+    }
+    let k = k.min(n - k);
+    let mut value = 1_usize;
+    for index in 1..=k {
+        value = checked_causal_product(value, n - k + index, "binomial coefficient")? / index;
+    }
+    Ok(value)
+}
+
+fn pc_work_accounting(
+    stream_count: usize,
+    pair_count: usize,
+) -> Result<(usize, usize), SynapseCalyxError> {
+    let pc_conditioning_depth =
+        SYNAPSE_CAUSAL_MAP_PC_MAX_CONDITIONING.min(stream_count.saturating_sub(2));
+    let pc_neighbors = stream_count.saturating_sub(2);
+    let mut conditioning_sets_per_pair = 0_usize;
+    for depth in 0..=pc_conditioning_depth {
+        let combinations = checked_combination(pc_neighbors, depth)?;
+        let endpoint_upper_bound = if depth == 0 {
+            combinations
+        } else {
+            checked_causal_product(combinations, 2, "PC endpoint conditioning sets")?
+        };
+        conditioning_sets_per_pair = conditioning_sets_per_pair
+            .checked_add(endpoint_upper_bound)
+            .ok_or_else(|| {
+                causal_error(
+                    "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+                    "PC conditioning-set upper bound overflowed usize",
+                    "reduce the complete variable scope or conditioning-depth contract; no conditional-independence tests are omitted silently",
+                )
+            })?;
+    }
+    let pc_ci_tests_upper_bound = checked_causal_product(
+        pair_count,
+        conditioning_sets_per_pair,
+        "PC conditional-independence test upper bound",
+    )?;
+    if pc_ci_tests_upper_bound > SYNAPSE_CAUSAL_MAP_MAX_PC_CI_TESTS {
+        return Err(causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_PC_WORK_BUDGET_EXCEEDED",
+            format!(
+                "PC-stable depth {pc_conditioning_depth} over the complete {stream_count}-stream scope has a conservative {pc_ci_tests_upper_bound}-test upper bound, above the declared budget {SYNAPSE_CAUSAL_MAP_MAX_PC_CI_TESTS}"
+            ),
+            "raise the measured PC conditional-test budget under an explicit deployment-capacity change, or reduce the declared conditioning depth in a versioned estimator contract; dropping variables or conditioning sets silently is forbidden",
+        ));
+    }
+    Ok((pc_conditioning_depth, pc_ci_tests_upper_bound))
+}
+
+fn causal_resource_accounting(
+    stream_count: usize,
+    n_bins: usize,
+    max_lag: usize,
+) -> Result<SynapseCalyxCausalResourceAccounting, SynapseCalyxError> {
+    let pair_count = checked_pair_count(stream_count)?;
+    if pair_count > SYNAPSE_CAUSAL_MAP_MAX_PAIR_ROWS {
+        return Err(causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_PAIR_WORK_BUDGET_EXCEEDED",
+            format!(
+                "the complete {stream_count}-stream scope requires {pair_count} pair rows, above the declared exhaustive artifact budget {SYNAPSE_CAUSAL_MAP_MAX_PAIR_ROWS}"
+            ),
+            "increase the measured pair-row budget under a new artifact contract, or request an explicit pair only when that pair is the complete intended scope; sampling or truncating a complete scope is forbidden",
+        ));
+    }
+
+    let aligned_cells = checked_causal_product(stream_count, n_bins, "aligned stream-cell count")?;
+    if aligned_cells > SYNAPSE_CAUSAL_MAP_MAX_ALIGNED_CELLS {
+        return Err(causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_ALIGNED_CELL_BUDGET_EXCEEDED",
+            format!(
+                "the complete aligned representation requires {aligned_cells} f32 cells ({stream_count} streams x {n_bins} bins), above the declared budget {SYNAPSE_CAUSAL_MAP_MAX_ALIGNED_CELLS}"
+            ),
+            "increase bin_seconds or narrow the exact time window, or raise the measured aligned-cell budget under an explicit deployment-capacity change; the timeline will not be sampled",
+        ));
+    }
+
+    let evidence_points_per_pair = max_lag
+        .checked_mul(6)
+        .and_then(|value| value.checked_add(2))
+        .ok_or_else(|| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+                "pair/lag evidence-point cardinality overflowed usize",
+                "reduce max_lag inside the declared supported range; no evidence family is omitted",
+            )
+        })?;
+    let pair_lag_evidence_points_upper_bound = checked_causal_product(
+        pair_count,
+        evidence_points_per_pair,
+        "pair/lag evidence-point upper bound",
+    )?;
+    if pair_lag_evidence_points_upper_bound > SYNAPSE_CAUSAL_MAP_MAX_PAIR_LAG_EVIDENCE_POINTS {
+        return Err(causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_PAIR_LAG_WORK_BUDGET_EXCEEDED",
+            format!(
+                "the complete estimator family requires at most {pair_lag_evidence_points_upper_bound} pair/lag evidence points, above the declared budget {SYNAPSE_CAUSAL_MAP_MAX_PAIR_LAG_EVIDENCE_POINTS}"
+            ),
+            "reduce max_lag only if that remains the intended causal horizon, or raise the measured evidence-point budget under an explicit deployment-capacity change; no estimator lane is sampled",
+        ));
+    }
+
+    let granger_hypotheses_upper_bound = checked_causal_product(
+        checked_causal_product(pair_count, 2, "Granger direction count")?,
+        max_lag,
+        "Granger lag-hypothesis count",
+    )?;
+    let cross_correlation_lags = max_lag
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+                "signed cross-correlation lag cardinality overflowed usize",
+                "reduce max_lag inside the declared supported range",
+            )
+        })?;
+    let cross_correlation_hypotheses_upper_bound = checked_causal_product(
+        pair_count,
+        cross_correlation_lags,
+        "signed cross-correlation hypothesis count",
+    )?;
+
+    let (pc_conditioning_depth, pc_ci_tests_upper_bound) =
+        pc_work_accounting(stream_count, pair_count)?;
+
+    Ok(SynapseCalyxCausalResourceAccounting {
+        stream_count,
+        pair_count,
+        aligned_bin_count: n_bins,
+        aligned_cells,
+        max_lag,
+        pair_lag_evidence_points_upper_bound,
+        granger_hypotheses_upper_bound,
+        cross_correlation_hypotheses_upper_bound,
+        pc_conditioning_depth,
+        pc_ci_tests_upper_bound,
+        max_pair_rows_budget: SYNAPSE_CAUSAL_MAP_MAX_PAIR_ROWS,
+        max_aligned_cells_budget: SYNAPSE_CAUSAL_MAP_MAX_ALIGNED_CELLS,
+        max_pair_lag_evidence_points_budget: SYNAPSE_CAUSAL_MAP_MAX_PAIR_LAG_EVIDENCE_POINTS,
+        max_pc_ci_tests_budget: SYNAPSE_CAUSAL_MAP_MAX_PC_CI_TESTS,
+        max_artifact_bytes_budget: SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES,
+    })
+}
+
+fn try_reserve_causal<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    allocation: &str,
+) -> Result<(), SynapseCalyxError> {
+    values.try_reserve_exact(additional).map_err(|error| {
+        causal_error(
+            "SYNAPSE_CALYX_CAUSAL_MAP_ALLOCATION_FAILED",
+            format!(
+                "could not reserve {additional} element(s) for {allocation}: {error}"
+            ),
+            "reduce the exact source/time/lag scope or provision sufficient memory, then rerun; no partial causal artifact was published",
+        )
+    })
+}
+
+#[derive(Debug)]
+enum CausalArtifactWriteFailure {
+    ByteBudget { attempted_bytes: usize },
+    Allocation { detail: String },
+}
+
+struct CausalArtifactWriter {
+    bytes: Vec<u8>,
+    failure: Option<CausalArtifactWriteFailure>,
+}
+
+impl CausalArtifactWriter {
+    const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            failure: None,
+        }
+    }
+}
+
+impl Write for CausalArtifactWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let Some(attempted_bytes) = self.bytes.len().checked_add(buffer.len()) else {
+            self.failure = Some(CausalArtifactWriteFailure::ByteBudget {
+                attempted_bytes: usize::MAX,
+            });
+            return Err(io::Error::other(
+                "causal-map artifact byte count overflowed usize",
+            ));
+        };
+        if attempted_bytes > SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES {
+            self.failure = Some(CausalArtifactWriteFailure::ByteBudget { attempted_bytes });
+            return Err(io::Error::other(
+                "causal-map artifact exceeded its declared byte budget",
+            ));
+        }
+        if let Err(error) = self.bytes.try_reserve_exact(buffer.len()) {
+            self.failure = Some(CausalArtifactWriteFailure::Allocation {
+                detail: error.to_string(),
+            });
+            return Err(io::Error::other("causal-map artifact allocation failed"));
+        }
+        self.bytes.extend_from_slice(buffer);
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_causal_map_artifact(
+    artifact: &SynapseCalyxCausalMapArtifact,
+) -> Result<Vec<u8>, SynapseCalyxError> {
+    let mut writer = CausalArtifactWriter::new();
+    if let Err(error) = serde_json::to_writer(&mut writer, artifact) {
+        return Err(match writer.failure {
+            Some(CausalArtifactWriteFailure::ByteBudget { attempted_bytes }) => causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_ARTIFACT_BYTE_BUDGET_EXCEEDED",
+                format!(
+                    "the complete compact JSON artifact reached {attempted_bytes} bytes, above the declared publication budget {SYNAPSE_CAUSAL_MAP_MAX_ARTIFACT_BYTES}"
+                ),
+                "raise the measured artifact/WAL budget together under a versioned storage contract, or reduce only the exact intended time/lag scope; no pair or estimator lane is removed",
+            ),
+            Some(CausalArtifactWriteFailure::Allocation { detail }) => causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_ALLOCATION_FAILED",
+                format!("could not allocate the complete causal-map artifact: {detail}"),
+                "provision sufficient memory or reduce the exact intended time/lag scope, then rerun; no partial Graph generation was published",
+            ),
+            None => causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_ENCODE_FAILED",
+                format!("encode causal-map artifact: {error}"),
+                "inspect the causal-map report for a non-serializable or non-finite field",
+            ),
+        });
+    }
+    Ok(writer.bytes)
+}
 
 fn aligned_binned_streams(
     selected: &[String],
     by_group: &BTreeMap<String, Vec<f64>>,
     bin: f64,
+    max_lag: usize,
 ) -> Result<AlignedBinnedStreams, SynapseCalyxError> {
     let mut all = selected
         .iter()
@@ -1523,9 +1870,12 @@ fn aligned_binned_streams(
             "increase bin_seconds or narrow since_ts_ns/until_ts_ns; the full timeline is required and will not be sampled",
         ));
     }
+    let resource_accounting = causal_resource_accounting(selected.len(), n_bins, max_lag)?;
     let mut binned = BTreeMap::new();
     for name in selected {
-        let mut counts = vec![0.0_f32; n_bins];
+        let mut counts = Vec::new();
+        try_reserve_causal(&mut counts, n_bins, "one aligned causal stream")?;
+        counts.resize(n_bins, 0.0_f32);
         for time in &by_group[name] {
             let index = temporal_bin_index((*time - min_time) / bin)?;
             let value = counts.get_mut(index).ok_or_else(|| {
@@ -1539,7 +1889,7 @@ fn aligned_binned_streams(
         }
         binned.insert(name.clone(), counts);
     }
-    Ok((min_time, n_bins, binned))
+    Ok((min_time, n_bins, binned, resource_accounting))
 }
 
 fn temporal_bin_index(value: f64) -> Result<usize, SynapseCalyxError> {
@@ -1564,18 +1914,30 @@ fn transfer_entropy_evidence(
     b: &[f32],
     lags: &[usize],
 ) -> Result<SynapseCalyxCausalEstimatorEvidence, SynapseCalyxError> {
-    let a_stream = a
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v))
-        .collect::<Vec<_>>();
-    let b_stream = b
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, v)| (i as u64, v))
-        .collect::<Vec<_>>();
+    let mut a_stream = Vec::new();
+    try_reserve_causal(&mut a_stream, a.len(), "transfer-entropy source stream")?;
+    let mut b_stream = Vec::new();
+    try_reserve_causal(&mut b_stream, b.len(), "transfer-entropy target stream")?;
+    for (index, value) in a.iter().copied().enumerate() {
+        let timestamp = u64::try_from(index).map_err(|_| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+                "transfer-entropy source index cannot be represented as u64",
+                "reduce the exact aligned timeline to the supported integer domain",
+            )
+        })?;
+        a_stream.push((timestamp, value));
+    }
+    for (index, value) in b.iter().copied().enumerate() {
+        let timestamp = u64::try_from(index).map_err(|_| {
+            causal_error(
+                "SYNAPSE_CALYX_CAUSAL_MAP_CARDINALITY_OVERFLOW",
+                "transfer-entropy target index cannot be represented as u64",
+                "reduce the exact aligned timeline to the supported integer domain",
+            )
+        })?;
+        b_stream.push((timestamp, value));
+    }
     // The causal map is content-addressed. A wall-clock timestamp inside one
     // estimator result would make identical source rows produce different
     // Graph keys, so the estimator runs under a fixed clock and its runtime-only
@@ -1784,9 +2146,13 @@ fn cross_k_evidence(
     origin: f64,
     bin_seconds: f64,
     max_lag: usize,
-) -> SynapseCalyxCausalEstimatorEvidence {
-    let a_relative = a.iter().map(|time| *time - origin).collect::<Vec<_>>();
-    let b_relative = b.iter().map(|time| *time - origin).collect::<Vec<_>>();
+) -> Result<SynapseCalyxCausalEstimatorEvidence, SynapseCalyxError> {
+    let mut a_relative = Vec::new();
+    try_reserve_causal(&mut a_relative, a.len(), "cross-K first event stream")?;
+    a_relative.extend(a.iter().map(|time| *time - origin));
+    let mut b_relative = Vec::new();
+    try_reserve_causal(&mut b_relative, b.len(), "cross-K second event stream")?;
+    b_relative.extend(b.iter().map(|time| *time - origin));
     let max_event = a_relative
         .iter()
         .chain(&b_relative)
@@ -1798,31 +2164,33 @@ fn cross_k_evidence(
         .filter(|radius| *radius <= observation_end)
         .collect::<Vec<_>>();
     if radii.is_empty() {
-        return unresolved_evidence(
+        return Ok(unresolved_evidence(
             "temporal_cross_type_ripley_k",
             vec!["descriptive event co-intensity; no edge correction".to_owned()],
             json!({ "a": a_name, "b": b_name }),
             "CALYX_CROSS_K_RADIUS_EMPTY",
             "no requested lag radius fits the physical observation window",
             "use a smaller bin_seconds/max_lag or widen the source-event window",
-        );
+        ));
     }
-    match temporal_cross_k(&a_relative, &b_relative, &radii, 0.0, observation_end) {
-        Ok(report) => measured_serializable_evidence(
-            "temporal_cross_type_ripley_k",
-            vec![
+    Ok(
+        match temporal_cross_k(&a_relative, &b_relative, &radii, 0.0, observation_end) {
+            Ok(report) => measured_serializable_evidence(
+                "temporal_cross_type_ripley_k",
+                vec![
                 "descriptive co-intensity, not causal direction".to_owned(),
                 "no boundary correction; interpretation is limited to the declared window/radii"
                     .to_owned(),
             ],
-            &report,
-        ),
-        Err(error) => failed_evidence(
-            "temporal_cross_type_ripley_k",
-            vec!["descriptive co-intensity, not causal direction".to_owned()],
-            &error,
-        ),
-    }
+                &report,
+            ),
+            Err(error) => failed_evidence(
+                "temporal_cross_type_ripley_k",
+                vec!["descriptive co-intensity, not causal direction".to_owned()],
+                &error,
+            ),
+        },
+    )
 }
 
 fn pc_evidence(

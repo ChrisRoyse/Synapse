@@ -476,7 +476,8 @@ pub(crate) const SYN_ASSOCIATION_MAINTENANCE_TARGETS: &[(u32, u16)] = &[
 /// lane and a metadata field that is present on every active row. The causal
 /// map itself enforces complete source coverage and complete `C(n,2)` stream
 /// enumeration; a field whose cardinality exceeds the estimator budget is
-/// reported as explicitly unmaintainable and is never sampled.
+/// exceeds a measured pair/cell/lag/conditioning/artifact budget is reported as
+/// explicitly unmaintainable and is never sampled.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SynCausalMapMaintenanceTarget {
     pub panel_name: &'static str,
