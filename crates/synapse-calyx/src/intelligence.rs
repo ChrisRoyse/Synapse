@@ -113,6 +113,7 @@ const GRAPH_AGREEMENT_PREFIX: &[u8; 5] = b"GAGR1";
 const GRAPH_AGREEMENT_MARKER_PREFIX: &[u8; 5] = b"GAGM2";
 const GRAPH_VIRTUAL_KNN_PREFIX: &[u8; 5] = b"GKNV1";
 const LOOM_XTERM_PREFIX: &[u8; 5] = b"CXTX2";
+const LOOM_XTERM_KEY_BYTES: usize = 5 + 16 + 4 + 2 + 4 + 2 + 1;
 const BETWEEN_RECORD_GRAPH_REFERENCE_SCHEMA: &str = "synapse_between_record_graph_reference/v1";
 const AGREEMENT_AGGREGATE_SCHEMA: &str = "synapse_agreement_aggregate/v2";
 const AGREEMENT_AGGREGATE_MARKER_SCHEMA: &str = "synapse_agreement_aggregate_marker/v2";
@@ -750,44 +751,74 @@ impl SynapseCalyxVault {
         }
         // A changed record can lose a lens pair or leave the panel entirely.
         // Overwriting only its still-present keys would leave stale XTerms in
-        // the global agreement fold. Reconcile the complete physical prefix of
-        // every changed identity and tombstone anything absent from this
-        // interval's current-state materialization.
-        for cx_id in corpus
+        // the global agreement fold. XTerms are ordered by `(schema, CxId, ..)`;
+        // opening one independent LSM merge/range seek per changed identity made
+        // a 2,000-record recovery chunk perform 2,000 complete seek setups. Walk
+        // the schema range once at one snapshot and filter the exact identity
+        // set in memory. This preserves complete stale-row reconciliation while
+        // making the physical read cost one sorted stream rather than N seeks.
+        let changed_xterm_identities = corpus
             .records
             .iter()
             .map(|record| record.cx_id)
             .chain(corpus.removed_ids.iter().copied())
-        {
-            let mut prefix = Vec::with_capacity(LOOM_XTERM_PREFIX.len() + 16);
-            prefix.extend_from_slice(LOOM_XTERM_PREFIX);
-            prefix.extend_from_slice(cx_id.as_bytes());
-            let existing = self
-                .vault
-                .scan_cf_range_latest(ColumnFamily::XTerm, &calyx_aster::cf::prefix_range(&prefix))
-                .map_err(|error| {
-                    SynapseCalyxError::from_calyx(
-                        &format!("scan current XTerms for changed identity {cx_id}"),
-                        &error,
-                    )
-                })?;
-            for (key, value) in existing {
-                accumulate_agreement_delta(
-                    params.panel_version,
-                    &key,
-                    &value,
-                    -1,
-                    &mut agreement_delta,
-                )?;
-                if !desired_xterm_keys.contains(&key) {
-                    writes.push(SynapseCalyxCfWrite {
-                        cf: ColumnFamily::XTerm,
+            .collect::<BTreeSet<_>>();
+        let reconciliation_started = std::time::Instant::now();
+        let mut reconciled_xterm_rows = 0usize;
+        let reconciliation_walk = if changed_xterm_identities.is_empty() {
+            None
+        } else {
+            let range = calyx_aster::cf::prefix_range(LOOM_XTERM_PREFIX);
+            Some(self.walk_cf_range_latest_snapshot(
+                ColumnFamily::XTerm,
+                &range,
+                crate::SYNAPSE_CALYX_CF_WALK_PAGE_ROWS,
+                |key, value| {
+                    let cx_id = xterm_key_cx_id(key)?;
+                    if !changed_xterm_identities.contains(&cx_id) {
+                        return Ok(crate::SynapseCalyxWalkStep::Continue);
+                    }
+                    reconciled_xterm_rows =
+                        reconciled_xterm_rows.checked_add(1).ok_or_else(|| {
+                            SynapseCalyxError::new(
+                                "SYNAPSE_CALYX_XTERM_RECONCILIATION_COUNT_OVERFLOW",
+                                format!(
+                                    "panel {} changed-identity XTerm reconciliation exceeded usize while visiting {cx_id}",
+                                    params.panel_version
+                                ),
+                                "inspect the physical XTerm cardinality and repair the impossible host-sized count before retrying",
+                            )
+                        })?;
+                    accumulate_agreement_delta(
+                        params.panel_version,
                         key,
-                        value: tombstone_value(),
-                    });
-                }
-            }
-        }
+                        value,
+                        -1,
+                        &mut agreement_delta,
+                    )?;
+                    if !desired_xterm_keys.contains(key) {
+                        writes.push(SynapseCalyxCfWrite {
+                            cf: ColumnFamily::XTerm,
+                            key: key.to_vec(),
+                            value: tombstone_value(),
+                        });
+                    }
+                    Ok(crate::SynapseCalyxWalkStep::Continue)
+                },
+            )?)
+        };
+        let reconciliation_secs = reconciliation_started.elapsed().as_secs_f64();
+        tracing::info!(
+            code = "SYNAPSE_CALYX_XTERM_RECONCILIATION_COMPLETED",
+            panel_version = params.panel_version,
+            changed_identities = changed_xterm_identities.len(),
+            physical_rows_examined = reconciliation_walk
+                .as_ref()
+                .map_or(0, |walk| walk.rows_examined),
+            physical_rows_matched = reconciled_xterm_rows,
+            reconciliation_secs,
+            "reconciled every changed identity through one coherent ordered XTerm stream"
+        );
 
         let incremental_agreement =
             self.prepare_incremental_agreement_update(params.panel_version, &agreement_delta)?;
@@ -2609,6 +2640,23 @@ fn accumulate_agreement_delta(
         )
     })?;
     Ok(())
+}
+
+fn xterm_key_cx_id(key: &[u8]) -> Result<CxId, SynapseCalyxError> {
+    if key.len() != LOOM_XTERM_KEY_BYTES || !key.starts_with(LOOM_XTERM_PREFIX) {
+        return Err(SynapseCalyxError::new(
+            "SYNAPSE_CALYX_XTERM_KEY_SCHEMA_INVALID",
+            format!(
+                "physical XTerm key has bytes={} prefix={:02x?}; expected bytes={LOOM_XTERM_KEY_BYTES} prefix=CXTX2",
+                key.len(),
+                key.get(..LOOM_XTERM_PREFIX.len()).unwrap_or(key)
+            ),
+            "preserve the malformed XTerm row and repair its CXTX2 key before advancing the association cursor",
+        ));
+    }
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&key[LOOM_XTERM_PREFIX.len()..LOOM_XTERM_PREFIX.len() + 16]);
+    Ok(CxId::from_bytes(bytes))
 }
 
 fn between_record_graph_reference_key(panel_version: u32) -> Vec<u8> {
