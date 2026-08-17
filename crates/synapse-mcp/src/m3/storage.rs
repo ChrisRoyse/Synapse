@@ -2479,8 +2479,9 @@ pub struct StorageIntelligenceSlotBits {
     /// `None` when `state` is `measured`.
     pub unmeasured_reason: Option<String>,
     /// Which estimator produced `marginal_bits`: `discrete_plugin` (a
-    /// contingency-table plug-in with a Miller-Madow bias correction) or
-    /// `continuous_ksg` (#1672).
+    /// contingency-table plug-in with a Miller-Madow bias correction),
+    /// `continuous_ksg`, or the held-out `logistic_probe` lower bound
+    /// (#1672/#1690).
     ///
     /// The panel mixes explicit encoders — one-hot, hash, cyclic — with
     /// continuous ones, and KSG's k-th neighbour radius is zero by construction
@@ -2490,7 +2491,8 @@ pub struct StorageIntelligenceSlotBits {
     /// single continuous lens's bits as its total.
     pub estimator: Option<String>,
     /// Why that estimator was chosen: `auto_duplicate_saturated_column`,
-    /// `auto_distinct_valued_column`, or a `requested_*` pin.
+    /// `auto_distinct_valued_column`, `auto_sparse_high_dimensional_binary`,
+    /// or a `requested_*` pin.
     pub estimator_selection: Option<String>,
     /// The selection rule's own words, carrying the counts it keyed on.
     pub estimator_reason: Option<String>,
@@ -2499,6 +2501,12 @@ pub struct StorageIntelligenceSlotBits {
     /// Largest exact-duplicate class within one outcome label — the quantity
     /// that drives KSG's k-th radius to zero.
     pub max_same_label_multiplicity: Option<u64>,
+    /// Occupied cells in the exact `(whole coordinate tuple, outcome)` table.
+    pub occupied_joint_cells: Option<u64>,
+    /// Independently addressable coordinates in each input row.
+    pub input_dim: Option<u64>,
+    /// Exact outcome levels observed by estimator selection.
+    pub label_levels: Option<u64>,
     /// This lens is declared to read the anchor's own determining record
     /// fields, so `marginal_bits` on this row is the label reading itself
     /// (#1959).
@@ -5782,6 +5790,9 @@ pub fn run_intelligence_bits(
                 max_same_label_multiplicity: slot
                     .max_same_label_multiplicity
                     .map(|value| value as u64),
+                occupied_joint_cells: slot.occupied_joint_cells.map(|value| value as u64),
+                input_dim: slot.input_dim.map(|value| value as u64),
+                label_levels: slot.label_levels.map(|value| value as u64),
                 anchor_source_carrier: slot.anchor_source_carrier,
                 anchor_source_shared_fields: slot.anchor_source_shared_fields,
             })
