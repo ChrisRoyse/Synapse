@@ -483,12 +483,12 @@ fn setup_repair_command_args(
         "Bypass".to_owned(),
         "-File".to_owned(),
         setup_script_path.display().to_string(),
+        "-SourceDir".to_owned(),
+        source_dir.display().to_string(),
     ];
     match plan {
         SetupRepairPlan::Full => {
             args.extend([
-                "-SourceDir".to_owned(),
-                source_dir.display().to_string(),
                 "-Bind".to_owned(),
                 bind.to_owned(),
                 "-ForceRestart".to_owned(),
