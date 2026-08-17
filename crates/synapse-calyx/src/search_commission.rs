@@ -38,6 +38,25 @@ pub struct SynapseCalyxSearchCommissionParams {
     pub seed: u64,
 }
 
+impl SynapseCalyxSearchCommissionParams {
+    /// Validates the complete bounded commissioning contract without opening a
+    /// vault, reserving compute, or constructing an index.
+    ///
+    /// Public admission surfaces call this before acquiring their exclusive
+    /// corpus lane; [`SynapseCalyxVault::commission_search_kernels`] calls the
+    /// same validator again immediately before execution. One validator is the
+    /// source of truth for both boundaries, so their accepted shapes cannot
+    /// drift.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SYNAPSE_CALYX_SEARCH_COMMISSION_INVALID` for an invalid bound,
+    /// dimension, finite-value invariant, or kernel parameter.
+    pub fn validate(&self) -> Result<(), SynapseCalyxError> {
+        validate(self)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SynapseCalyxSearchCommissionArtifact {
@@ -85,7 +104,7 @@ impl SynapseCalyxVault {
         &self,
         params: &SynapseCalyxSearchCommissionParams,
     ) -> Result<SynapseCalyxSearchCommissionReport, SynapseCalyxError> {
-        validate(params)?;
+        params.validate()?;
         let input_bytes = serde_json::to_vec(params).map_err(|error| {
             invalid(format!(
                 "serialize search commissioning input canonically: {error}"

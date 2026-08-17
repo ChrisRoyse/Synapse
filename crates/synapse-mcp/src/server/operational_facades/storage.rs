@@ -1177,9 +1177,9 @@ pub(super) async fn handle(
                 .0
                 .intelligence
                 .ok_or_else(|| missing_spec(STORAGE_TOOL, "intelligence"))?;
-            crate::m3::storage::validate_intelligence_numeric_ranges(&spec)?;
-            let sub_operation = spec.operation;
-            let source_id = format!("panel_{}", spec.panel_version);
+            let prepared = crate::m3::storage::prepare_intelligence_spec(spec)?;
+            let sub_operation = prepared.operation();
+            let source_id = format!("panel_{}", prepared.params().panel_version);
             // #2077: a state-changing sub-operation clears the gate its declared
             // class demands, never a gate inferred here. Control-class
             // sub-operations (weave, kernel, oracle_complete) keep break_glass +
@@ -1204,7 +1204,7 @@ pub(super) async fn handle(
             }
             service.require_m3_permissions(
                 STORAGE_TOOL,
-                &crate::m3::storage::required_permissions_intelligence(&spec),
+                &crate::m3::storage::required_permissions_intelligence(prepared.params()),
             )?;
             let db = service.m3_storage().map_err(|error| {
                 facade_delegate_error(
@@ -1232,6 +1232,9 @@ pub(super) async fn handle(
                 use crate::m3::storage::{
                     StorageIntelligenceOperation, StorageIntelligenceResponse,
                 };
+                // Only a request that completed the entire operation-specific
+                // preparation contract may cross into the admitted owner.
+                let spec = prepared.into_inner();
                 let base = StorageIntelligenceResponse {
                     operation: sub_operation,
                     weave: None,

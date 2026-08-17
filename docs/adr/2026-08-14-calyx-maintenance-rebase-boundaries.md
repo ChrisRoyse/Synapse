@@ -162,13 +162,20 @@ the authority.
     bytes before and after every release. An unavailable reclaimer or unreadable
     process-memory Source of Truth fails the tick with a named diagnostic; this
     is lifecycle ownership, not a memory limit or degraded execution path.
-11. Every whole-corpus hygiene operation separates wire parsing from execution.
+11. Every public whole-corpus operation separates wire parsing from execution.
     The MCP facade constructs its complete typed/prepared request before
     permission checks, storage access, control-authority acquisition, or
     maintenance admission; only that request crosses into the blocking owner.
-    This applies to grounding gap, blind spot, drift, kernel rebuild, guard
-    calibration, and vault verification, including every record/alert/domain/
-    ledger bound, finite probability, and physical `u16` slot conversion.
+    Hygiene applies this to grounding gap, blind spot, drift, kernel rebuild,
+    guard calibration, and vault verification. Storage intelligence additionally
+    uses one compile-exhaustive operation/field matrix for all 22 variants and
+    validates panel generations, relevant/forbidden fields, temporal windows
+    and pair scopes, exact CxIds, unique/lossless slot ids, finite probabilities,
+    OLAP requirements, and the complete bounded real search-commission shape.
+    Adding a request field or operation therefore forces an explicit admission
+    decision. Search commissioning exposes one pure Calyx validator used both
+    before admission and immediately before execution, rather than duplicating
+    a contract that can drift.
     Inner Calyx executors retain their contextual validation so non-MCP callers
     and physical panel/corpus invariants remain defended. Invalid input never
     queues behind unrelated maintenance, opens storage, dispatches CUDA,
@@ -263,6 +270,9 @@ the authority.
 - Structurally invalid hygiene requests fail deterministically at the public
   admission boundary instead of waiting behind unrelated whole-vault
   maintenance or activating storage/GPU/control resources.
+- Structurally or semantically invalid storage-intelligence requests likewise
+  fail before permission, DB, bounded-read, whole-corpus, and GPU acquisition;
+  their errors no longer vary with the maintenance owner's timing.
 - Older/restored vaults can remove the one positively identified #1540 probe
   without teaching audit readers to omit corruption or exposing a general raw
   delete surface. The repair itself remains a canonical, queryable audit fact.
@@ -300,6 +310,8 @@ the authority.
 - [Tower HTTP request validation](https://docs.rs/tower-http/latest/tower_http/validate_request/): validation middleware rejects an invalid request before allowing it through to the wrapped service.
 - [UK NCSC API input-validation guidance](https://www.ncsc.gov.uk/collection/securing-http-based-apis/4-input-validation): validate ranges and structure as early as possible at the external boundary, then validate consistently at every layer for defence in depth.
 - [OWASP Denial of Service Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Denial_of_Service_Cheat_Sheet.html): perform cheap validation before expensive CPU, memory, bandwidth, threading, or input-driven resource allocation.
+- [JSON Schema boolean composition](https://json-schema.org/understanding-json-schema/reference/combining): alternative request shapes are a closed logical union; exactly-one (`oneOf`) semantics motivate Synapse's exhaustive operation discriminator even where the compact public schema cannot afford 22 duplicated branches.
+- [OWASP Business Logic Security Cheat Sheet](https://cheatsheetseries.owasp.org/cheatsheets/Business_Logic_Security_Cheat_Sheet.html): validate legal combinations for business meaning, not merely individual field syntax; the operation/field and temporal-pair matrices enforce those cross-field combinations server-side.
 - [Model Context Protocol tool errors](https://modelcontextprotocol.io/specification/2025-11-25/server/tools): servers must validate tool inputs, and out-of-range values are tool execution errors with actionable feedback.
 - [RocksDB transactions](https://github.com/facebook/rocksdb/wiki/Transactions): optimistic and pessimistic transactions detect conflicting writes and leave failed transactions unapplied, supporting revision-guarded destructive maintenance.
 - [RocksDB basic operations](https://github.com/facebook/rocksdb/wiki/Basic-Operations): a write batch applies its contained updates atomically, supporting one commit for the exact delete and its canonical audit record.

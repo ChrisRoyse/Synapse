@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -4837,25 +4837,7 @@ pub fn run_intelligence_search_kernel_commission(
     db: &synapse_storage::Db,
     params: &StorageIntelligenceParams,
 ) -> Result<StorageSearchKernelCommissionReport, ErrorData> {
-    let input = params.search_commission.as_ref().ok_or_else(|| {
-        mcp_error_with_remediation(
-            error_codes::TOOL_PARAMS_INVALID,
-            "storage intelligence search_kernel_commission requires search_commission",
-            "supply the bounded real rows/query, PQ parameters, MaxSim tokens, SPANN cluster count, and seed; Synapse never substitutes mock inputs",
-        )
-    })?;
-    let commission = synapse_calyx::SynapseCalyxSearchCommissionParams {
-        panel_version: params.panel_version,
-        rows: input.rows.clone(),
-        query: input.query.clone(),
-        pq_subvectors: input.pq_subvectors as usize,
-        pq_centroids: input.pq_centroids as usize,
-        pq_iterations: input.pq_iterations as usize,
-        maxsim_query: input.maxsim_query.clone(),
-        maxsim_document: input.maxsim_document.clone(),
-        spann_clusters: input.spann_clusters as usize,
-        seed: input.seed,
-    };
+    let commission = search_commission_params(params)?;
     let report = db
         .commission_search_kernels(&commission)
         .map_err(|error| mcp_error(error.code(), error.to_string()))?;
@@ -4889,6 +4871,51 @@ pub fn run_intelligence_search_kernel_commission(
     })
 }
 
+fn search_commission_params(
+    params: &StorageIntelligenceParams,
+) -> Result<synapse_calyx::SynapseCalyxSearchCommissionParams, ErrorData> {
+    let input = params.search_commission.as_ref().ok_or_else(|| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage intelligence search_kernel_commission requires search_commission",
+            "supply the bounded real rows/query, PQ parameters, MaxSim tokens, SPANN cluster count, and seed; Synapse never substitutes mock inputs",
+        )
+    })?;
+    Ok(synapse_calyx::SynapseCalyxSearchCommissionParams {
+        panel_version: params.panel_version,
+        rows: input.rows.clone(),
+        query: input.query.clone(),
+        pq_subvectors: input.pq_subvectors as usize,
+        pq_centroids: input.pq_centroids as usize,
+        pq_iterations: input.pq_iterations as usize,
+        maxsim_query: input.maxsim_query.clone(),
+        maxsim_document: input.maxsim_document.clone(),
+        spann_clusters: input.spann_clusters as usize,
+        seed: input.seed,
+    })
+}
+
+fn validate_excluded_slots(params: &StorageIntelligenceParams) -> Result<(), ErrorData> {
+    let mut unique = BTreeSet::new();
+    for slot in &params.excluded_slots {
+        u16::try_from(*slot).map_err(|_| {
+            mcp_error_with_remediation(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("storage intelligence excluded_slots entry {slot} exceeds u16"),
+                "supply only real panel slot ids in 0..=65535; no corpus lane was acquired",
+            )
+        })?;
+        if !unique.insert(*slot) {
+            return Err(mcp_error_with_remediation(
+                error_codes::TOOL_PARAMS_INVALID,
+                format!("storage intelligence excluded_slots contains duplicate slot {slot}"),
+                "supply each excluded slot exactly once; no corpus lane was acquired",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Reads the derived-data abundance report for a panel back from the physical
 /// `Base`/`XTerm`/`Graph` CFs.
 pub fn run_intelligence_abundance(
@@ -4906,9 +4933,573 @@ fn intelligence_record_limit(requested: Option<u32>) -> usize {
     requested.unwrap_or(MAX_INTELLIGENCE_RECORDS) as usize
 }
 
+/// A complete storage-intelligence request whose caller-controlled shape has
+/// been validated without opening storage or acquiring any execution lane.
+///
+/// The inner request is deliberately private. The public facade may inspect
+/// the operation and permission class, but only [`Self::into_inner`] inside the
+/// admitted blocking owner can recover the executable request.
+#[derive(Debug)]
+pub struct PreparedStorageIntelligenceParams {
+    params: StorageIntelligenceParams,
+}
+
+impl PreparedStorageIntelligenceParams {
+    #[must_use]
+    pub const fn operation(&self) -> StorageIntelligenceOperation {
+        self.params.operation
+    }
+
+    #[must_use]
+    pub const fn params(&self) -> &StorageIntelligenceParams {
+        &self.params
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> StorageIntelligenceParams {
+        self.params
+    }
+}
+
+/// Validates and types a complete intelligence request before permissions,
+/// storage access, control authority, bounded-read admission, whole-corpus
+/// admission, GPU reservation, or blocking dispatch.
+pub fn prepare_intelligence_spec(
+    params: StorageIntelligenceParams,
+) -> Result<PreparedStorageIntelligenceParams, ErrorData> {
+    validate_intelligence_numeric_ranges(&params)?;
+    validate_intelligence_field_relevance(&params)?;
+    if params.panel_version == 0 {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage operation=intelligence panel_version must be positive",
+            "supply the exact positive frozen panel generation; no storage or execution resource was acquired",
+        ));
+    }
+
+    match params.operation {
+        StorageIntelligenceOperation::Weave => validate_weave_request(&params)?,
+        StorageIntelligenceOperation::Abundance | StorageIntelligenceOperation::Redundancy => {}
+        StorageIntelligenceOperation::Bits
+        | StorageIntelligenceOperation::Sufficiency
+        | StorageIntelligenceOperation::Synergy
+        | StorageIntelligenceOperation::EnsembleCard => {
+            require_nonblank(
+                params.anchor_kind.as_deref(),
+                "anchor_kind",
+                params.operation.as_str(),
+            )?;
+            validate_excluded_slots(&params)?;
+            let _ = assay_params(&params)?;
+        }
+        StorageIntelligenceOperation::Causality => {
+            validate_temporal_request(&params, true, true)?;
+        }
+        StorageIntelligenceOperation::CausalMap | StorageIntelligenceOperation::CausalMapRead => {
+            validate_temporal_request(&params, true, true)?;
+        }
+        StorageIntelligenceOperation::Periodicity | StorageIntelligenceOperation::Drift => {
+            validate_temporal_request(&params, false, false)?;
+        }
+        StorageIntelligenceOperation::Hazard => {
+            validate_temporal_request(&params, false, false)?;
+        }
+        StorageIntelligenceOperation::Kernel => {
+            validate_optional_nonblank(
+                params.anchor_kind.as_deref(),
+                params.operation.as_str(),
+                "anchor_kind",
+            )?;
+            let _ = kernel_params(&params)?;
+        }
+        StorageIntelligenceOperation::KernelAnswer => {
+            validate_optional_nonblank(
+                params.anchor_kind.as_deref(),
+                params.operation.as_str(),
+                "anchor_kind",
+            )?;
+            let _ = kernel_params(&params)?;
+            validate_cx_id_field(&params, "kernel_answer")?;
+        }
+        StorageIntelligenceOperation::OraclePredict => {
+            require_action_panel(&params, "oracle_predict")?;
+            require_nonblank(params.action_id.as_deref(), "action_id", "oracle_predict")?;
+        }
+        StorageIntelligenceOperation::OracleReverse => {
+            require_action_panel(&params, "oracle_reverse")?;
+            if params.outcome.is_none() {
+                return Err(required_intelligence_field("oracle_reverse", "outcome"));
+            }
+        }
+        StorageIntelligenceOperation::OracleComplete => {
+            require_action_panel(&params, "oracle_complete")?;
+            validate_cx_id_field(&params, "oracle_complete")?;
+            validate_unique_slots(&params.free_slots, "free_slots", "oracle_complete")?;
+        }
+        StorageIntelligenceOperation::OracleValidate => {
+            require_action_panel(&params, "oracle_validate")?;
+        }
+        StorageIntelligenceOperation::OracleReadiness => {
+            require_action_panel(&params, "oracle_readiness")?;
+        }
+        StorageIntelligenceOperation::OlapAggregate => validate_olap_request(&params)?,
+        StorageIntelligenceOperation::SearchKernelCommission => {
+            let commission = search_commission_params(&params)?;
+            commission.validate().map_err(|error| {
+                mcp_error_with_remediation(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!("{}: {}", error.code, error.message),
+                    error.remediation,
+                )
+            })?;
+        }
+    }
+
+    Ok(PreparedStorageIntelligenceParams { params })
+}
+
+fn validate_intelligence_field_relevance(
+    params: &StorageIntelligenceParams,
+) -> Result<(), ErrorData> {
+    let StorageIntelligenceParams {
+        operation,
+        panel_version: _,
+        max_records,
+        knn_k,
+        since_ts_ns,
+        until_ts_ns,
+        after_base_seq,
+        through_base_seq,
+        search_commission,
+        excluded_slots,
+        min_gate_lenses,
+        anchor_kind,
+        ksg_k,
+        group_key,
+        group_a,
+        group_b,
+        filter_value,
+        bin_seconds,
+        max_lag,
+        causal_fdr_alpha,
+        now_secs,
+        overdue_alpha,
+        content_slot,
+        edge_cos_threshold,
+        min_recall_ratio,
+        query_cx_id,
+        max_hops,
+        action_id,
+        outcome,
+        free_slots,
+        value_column,
+        group_by_column,
+        olap_max_rows,
+        olap_max_groups,
+    } = params;
+    let present = [
+        ("max_records", max_records.is_some()),
+        ("knn_k", knn_k.is_some()),
+        ("since_ts_ns", since_ts_ns.is_some()),
+        ("until_ts_ns", until_ts_ns.is_some()),
+        ("after_base_seq", after_base_seq.is_some()),
+        ("through_base_seq", through_base_seq.is_some()),
+        ("search_commission", search_commission.is_some()),
+        ("excluded_slots", !excluded_slots.is_empty()),
+        ("min_gate_lenses", min_gate_lenses.is_some()),
+        ("anchor_kind", anchor_kind.is_some()),
+        ("ksg_k", ksg_k.is_some()),
+        ("group_key", group_key.is_some()),
+        ("group_a", group_a.is_some()),
+        ("group_b", group_b.is_some()),
+        ("filter_value", filter_value.is_some()),
+        ("bin_seconds", bin_seconds.is_some()),
+        ("max_lag", max_lag.is_some()),
+        ("causal_fdr_alpha", causal_fdr_alpha.is_some()),
+        ("now_secs", now_secs.is_some()),
+        ("overdue_alpha", overdue_alpha.is_some()),
+        ("content_slot", content_slot.is_some()),
+        ("edge_cos_threshold", edge_cos_threshold.is_some()),
+        ("min_recall_ratio", min_recall_ratio.is_some()),
+        ("query_cx_id", query_cx_id.is_some()),
+        ("max_hops", max_hops.is_some()),
+        ("action_id", action_id.is_some()),
+        ("outcome", outcome.is_some()),
+        ("free_slots", !free_slots.is_empty()),
+        ("value_column", value_column.is_some()),
+        ("group_by_column", group_by_column.is_some()),
+        ("olap_max_rows", olap_max_rows.is_some()),
+        ("olap_max_groups", olap_max_groups.is_some()),
+    ];
+
+    let allowed: &[&str] = match operation {
+        StorageIntelligenceOperation::Weave => &[
+            "max_records",
+            "knn_k",
+            "since_ts_ns",
+            "until_ts_ns",
+            "after_base_seq",
+            "through_base_seq",
+        ],
+        StorageIntelligenceOperation::Abundance | StorageIntelligenceOperation::Redundancy => {
+            &["max_records"]
+        }
+        StorageIntelligenceOperation::Bits
+        | StorageIntelligenceOperation::Sufficiency
+        | StorageIntelligenceOperation::Synergy => {
+            &["max_records", "excluded_slots", "anchor_kind", "ksg_k"]
+        }
+        StorageIntelligenceOperation::EnsembleCard => &[
+            "max_records",
+            "excluded_slots",
+            "min_gate_lenses",
+            "anchor_kind",
+            "ksg_k",
+        ],
+        StorageIntelligenceOperation::Causality => &[
+            "max_records",
+            "since_ts_ns",
+            "until_ts_ns",
+            "group_key",
+            "group_a",
+            "group_b",
+            "bin_seconds",
+            "max_lag",
+        ],
+        StorageIntelligenceOperation::CausalMap | StorageIntelligenceOperation::CausalMapRead => &[
+            "max_records",
+            "since_ts_ns",
+            "until_ts_ns",
+            "group_key",
+            "group_a",
+            "group_b",
+            "bin_seconds",
+            "max_lag",
+            "causal_fdr_alpha",
+        ],
+        StorageIntelligenceOperation::Periodicity | StorageIntelligenceOperation::Drift => &[
+            "max_records",
+            "since_ts_ns",
+            "until_ts_ns",
+            "group_key",
+            "filter_value",
+            "bin_seconds",
+        ],
+        StorageIntelligenceOperation::Hazard => &[
+            "max_records",
+            "since_ts_ns",
+            "until_ts_ns",
+            "group_key",
+            "filter_value",
+            "now_secs",
+            "overdue_alpha",
+        ],
+        StorageIntelligenceOperation::Kernel => &[
+            "max_records",
+            "knn_k",
+            "anchor_kind",
+            "content_slot",
+            "edge_cos_threshold",
+            "min_recall_ratio",
+        ],
+        StorageIntelligenceOperation::KernelAnswer => &[
+            "max_records",
+            "knn_k",
+            "anchor_kind",
+            "content_slot",
+            "edge_cos_threshold",
+            "min_recall_ratio",
+            "query_cx_id",
+            "max_hops",
+        ],
+        StorageIntelligenceOperation::OraclePredict => &["action_id"],
+        StorageIntelligenceOperation::OracleReverse => &["outcome"],
+        StorageIntelligenceOperation::OracleComplete => &["query_cx_id", "free_slots"],
+        StorageIntelligenceOperation::OracleValidate
+        | StorageIntelligenceOperation::OracleReadiness => &[],
+        StorageIntelligenceOperation::OlapAggregate => &[
+            "content_slot",
+            "value_column",
+            "group_by_column",
+            "olap_max_rows",
+            "olap_max_groups",
+        ],
+        StorageIntelligenceOperation::SearchKernelCommission => &["search_commission"],
+    };
+
+    if let Some((field, _)) = present
+        .into_iter()
+        .find(|(field, is_present)| *is_present && !allowed.contains(field))
+    {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage operation=intelligence sub_operation={} does not accept field {field}",
+                operation.as_str()
+            ),
+            &format!(
+                "remove {field} or select the operation that owns it; no permission, storage, admission, or compute resource was acquired"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_weave_request(params: &StorageIntelligenceParams) -> Result<(), ErrorData> {
+    if params.since_ts_ns.is_some() || params.until_ts_ns.is_some() {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage intelligence weave does not accept timestamp selectors because no durable timestamp access path owns that query",
+            "use the paired after_base_seq/through_base_seq delta selector, or omit all selectors for a bounded full-panel weave; no corpus lane was acquired",
+        ));
+    }
+    match (params.after_base_seq, params.through_base_seq) {
+        (None, None) => Ok(()),
+        (Some(after), Some(through)) if after <= through => Ok(()),
+        (Some(after), Some(through)) => Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage intelligence weave requires after_base_seq <= through_base_seq; received {after} > {through}"
+            ),
+            "supply one ordered inclusive Base-commit interval; no corpus lane was acquired",
+        )),
+        _ => Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            "storage intelligence weave requires after_base_seq and through_base_seq together",
+            "supply both sequence bounds or omit both; no corpus lane was acquired",
+        )),
+    }
+}
+
+fn validate_temporal_request(
+    params: &StorageIntelligenceParams,
+    require_group_key: bool,
+    allow_pair: bool,
+) -> Result<(), ErrorData> {
+    if let Some(since) = params.since_ts_ns
+        && since < 0
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "since_ts_ns",
+            &since.to_string(),
+            "a non-negative Unix-nanosecond timestamp",
+        ));
+    }
+    if let Some(until) = params.until_ts_ns
+        && until < 0
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "until_ts_ns",
+            &until.to_string(),
+            "a non-negative Unix-nanosecond timestamp",
+        ));
+    }
+    if let (Some(since), Some(until)) = (params.since_ts_ns, params.until_ts_ns)
+        && since >= until
+    {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage intelligence temporal window is empty or inverted: since_ts_ns={since} until_ts_ns={until}"
+            ),
+            "supply a half-open source-event-time window with since_ts_ns < until_ts_ns; no corpus lane was acquired",
+        ));
+    }
+    let group_key = params
+        .group_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if params.group_key.is_some() && group_key.is_none() {
+        return Err(nonblank_intelligence_field(
+            params.operation.as_str(),
+            "group_key",
+        ));
+    }
+    if require_group_key && group_key.is_none() {
+        return Err(required_intelligence_field(
+            params.operation.as_str(),
+            "group_key",
+        ));
+    }
+    if params.filter_value.is_some() && group_key.is_none() {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage intelligence {} requires a nonblank group_key when filter_value is supplied",
+                params.operation.as_str()
+            ),
+            "supply the metadata key that owns the requested filter value, or remove filter_value; no corpus lane was acquired",
+        ));
+    }
+    if let Some(filter) = params.filter_value.as_deref()
+        && filter.trim().is_empty()
+    {
+        return Err(nonblank_intelligence_field(
+            params.operation.as_str(),
+            "filter_value",
+        ));
+    }
+    if allow_pair {
+        let left = params
+            .group_a
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let right = params
+            .group_b
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        if params.group_a.is_some() && left.is_none() {
+            return Err(nonblank_intelligence_field(
+                params.operation.as_str(),
+                "group_a",
+            ));
+        }
+        if params.group_b.is_some() && right.is_none() {
+            return Err(nonblank_intelligence_field(
+                params.operation.as_str(),
+                "group_b",
+            ));
+        }
+        match (left, right) {
+            (None, None) => {}
+            (Some(left), Some(right)) if left != right => {}
+            (Some(_), Some(_)) => {
+                return Err(mcp_error_with_remediation(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "storage intelligence {} requires two distinct stream values",
+                        params.operation.as_str()
+                    ),
+                    "supply distinct group_a/group_b values or omit both to request the complete scope; no corpus lane was acquired",
+                ));
+            }
+            _ => {
+                return Err(mcp_error_with_remediation(
+                    error_codes::TOOL_PARAMS_INVALID,
+                    format!(
+                        "storage intelligence {} requires group_a and group_b together",
+                        params.operation.as_str()
+                    ),
+                    "supply both stream values or omit both; no corpus lane was acquired",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_optional_nonblank(
+    value: Option<&str>,
+    operation: &str,
+    field: &str,
+) -> Result<(), ErrorData> {
+    if value.is_some_and(|value| value.trim().is_empty()) {
+        return Err(nonblank_intelligence_field(operation, field));
+    }
+    Ok(())
+}
+
+fn validate_cx_id_field(
+    params: &StorageIntelligenceParams,
+    operation: &str,
+) -> Result<(), ErrorData> {
+    let value = require_nonblank(params.query_cx_id.as_deref(), "query_cx_id", operation)?;
+    let decoded = hex_decode(value).map_err(|detail| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage intelligence {operation} query_cx_id is not hexadecimal: {detail}"
+            ),
+            "supply the exact 32-hex-character CxId from a physical Base read; no corpus lane was acquired",
+        )
+    })?;
+    if decoded.len() != 16 {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!(
+                "storage intelligence {operation} query_cx_id decodes to {} bytes; a CxId is exactly 16",
+                decoded.len()
+            ),
+            "supply the exact 32-hex-character CxId from a physical Base read; no corpus lane was acquired",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_unique_slots(slots: &[u16], field: &str, operation: &str) -> Result<(), ErrorData> {
+    if slots.is_empty() {
+        return Err(required_intelligence_field(operation, field));
+    }
+    let mut unique = BTreeSet::new();
+    if let Some(duplicate) = slots.iter().copied().find(|slot| !unique.insert(*slot)) {
+        return Err(mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage intelligence {operation} {field} contains duplicate slot {duplicate}"),
+            &format!("supply each {field} slot exactly once; no corpus lane was acquired"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_olap_request(params: &StorageIntelligenceParams) -> Result<(), ErrorData> {
+    let slot = params
+        .content_slot
+        .ok_or_else(|| required_intelligence_field("olap_aggregate", "content_slot"))?;
+    u16::try_from(slot).map_err(|_| {
+        mcp_error_with_remediation(
+            error_codes::TOOL_PARAMS_INVALID,
+            format!("storage intelligence olap_aggregate content_slot={slot} exceeds u16"),
+            "supply a real panel slot id in 0..=65535; no corpus lane was acquired",
+        )
+    })?;
+    if params.value_column.is_none() {
+        return Err(required_intelligence_field(
+            "olap_aggregate",
+            "value_column",
+        ));
+    }
+    Ok(())
+}
+
+fn required_intelligence_field(operation: &str, field: &str) -> ErrorData {
+    mcp_error_with_remediation(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!("storage intelligence {operation} requires {field}"),
+        &format!(
+            "supply {field} with the operation-specific request; no permission, storage, admission, or compute resource was acquired"
+        ),
+    )
+}
+
+fn nonblank_intelligence_field(operation: &str, field: &str) -> ErrorData {
+    mcp_error_with_remediation(
+        error_codes::TOOL_PARAMS_INVALID,
+        format!("storage intelligence {operation} requires nonblank {field}"),
+        &format!(
+            "supply a nonblank {field}; no permission, storage, admission, or compute resource was acquired"
+        ),
+    )
+}
+
+fn require_nonblank<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    operation: &str,
+) -> Result<&'a str, ErrorData> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| nonblank_intelligence_field(operation, field))
+}
+
 /// Enforces every numeric range published by [`StorageIntelligenceParams`].
 /// Schemars describes the wire contract but does not validate serde input.
-pub fn validate_intelligence_numeric_ranges(
+fn validate_intelligence_numeric_ranges(
     params: &StorageIntelligenceParams,
 ) -> Result<(), ErrorData> {
     match (params.operation, params.search_commission.as_ref()) {
@@ -4992,6 +5583,26 @@ pub fn validate_intelligence_numeric_ranges(
         return Err(numeric_range_error(
             "intelligence",
             "causal_fdr_alpha",
+            &value.to_string(),
+            "a finite number strictly inside (0,1)",
+        ));
+    }
+    if let Some(value) = params.now_secs
+        && value < 0
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "now_secs",
+            &value.to_string(),
+            "a non-negative Unix-second timestamp",
+        ));
+    }
+    if let Some(value) = params.overdue_alpha
+        && (!value.is_finite() || value <= 0.0 || value >= 1.0)
+    {
+        return Err(numeric_range_error(
+            "intelligence",
+            "overdue_alpha",
             &value.to_string(),
             "a finite number strictly inside (0,1)",
         ));
@@ -5749,18 +6360,20 @@ fn kernel_params(
     params: &StorageIntelligenceParams,
 ) -> Result<synapse_calyx::SynapseCalyxKernelParams, ErrorData> {
     let content_slot = params.content_slot.ok_or_else(|| {
-        mcp_error(
+        mcp_error_with_remediation(
             error_codes::TOOL_PARAMS_INVALID,
             format!(
                 "storage operation=intelligence sub_operation={} requires content_slot (the dense semantic-lens slot id)",
                 params.operation.as_str()
             ),
+            "supply the exact dense semantic-lens slot from the frozen panel; no corpus operation can run without an explicit content coordinate",
         )
     })?;
     let content_slot = u16::try_from(content_slot).map_err(|_| {
-        mcp_error(
+        mcp_error_with_remediation(
             error_codes::TOOL_PARAMS_INVALID,
             format!("content_slot {content_slot} exceeds the 16-bit slot id range"),
+            "supply a real panel slot id in 0..=65535; integer narrowing is never lossy",
         )
     })?;
     let mut kernel =
@@ -5961,12 +6574,16 @@ fn require_action_panel(
     if params.panel_version == synapse_storage::SYN_ACTION_PANEL_VERSION {
         return Ok(());
     }
-    Err(mcp_error(
+    Err(mcp_error_with_remediation(
         error_codes::TOOL_PARAMS_INVALID,
         format!(
             "storage operation=intelligence sub_operation={operation} requires action panel_version {}; received {}",
             synapse_storage::SYN_ACTION_PANEL_VERSION,
             params.panel_version
+        ),
+        &format!(
+            "supply exact frozen action panel_version {}; readiness, Guard, kernel, and held-out evidence are generation-bound and are never inferred across panels",
+            synapse_storage::SYN_ACTION_PANEL_VERSION
         ),
     ))
 }
