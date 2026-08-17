@@ -28,12 +28,12 @@ pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
 /// `synapse-storage/src/constellations.rs` (no dependency edge exists in this
 /// direction, so the value is duplicated by hand). A mismatch fails loud
 /// (`SYNAPSE_CALYX_ACTION_VALIDATION_PANEL_MISMATCH`) rather than reading
-/// evidence measured under a different frozen slot layout: bumped `2_185_002`
-/// -> `2_185_003` for the bounded request size/shape causal lenses. This deliberately
+/// evidence measured under a different frozen slot layout: bumped `2_185_003`
+/// -> `2_185_004` for the bounded request semantic-atom lens. This deliberately
 /// re-arms readiness — held-out evidence and the Ward boundary must be
 /// re-measured on the new generation rather than inherited from a panel that
-/// could not estimate the exact request lane's high-cardinality support.
-pub const ACTION_PANEL_VERSION: u32 = 2_185_003;
+/// omitted shared semantic atoms from distinct pre-execution requests.
+pub const ACTION_PANEL_VERSION: u32 = 2_185_004;
 const MIN_ACTION_RECORDS: usize = 50;
 pub const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;

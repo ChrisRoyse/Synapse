@@ -179,7 +179,19 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// deleting exact identity would lose audit truth. These two coarser lenses are
 /// separate slots instead: each is point-in-time, target-blind, finite-support,
 /// and suitable for bits, Ward, and the exhaustive association maps.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_003;
+///
+/// Generation `2_185_004` adds a fourth, independently measurable request
+/// cause: bounded semantic atoms from the pre-execution payload. Slot 118 must
+/// keep whole-value identity for audit and Ward similarity, but whole-value
+/// hashes make two distinct executable paths unrelated even when both name the
+/// same command family or share path/lexical components. Slot 121 retains
+/// value kind, field/path identity, magnitude class and bounded normalized
+/// lexical components as a separate dense lens. It never reads terminal
+/// status, error, response or after-state, and historical rows without an
+/// authenticated request remain explicitly Absent.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_004;
+/// The bounded request class generation superseded by request semantic atoms.
+pub const SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS: u32 = 2_185_003;
 /// The exact request-vector generation superseded by the bounded request-cause lanes.
 ///
 /// It remains readable history and is always re-measured from its source
@@ -722,6 +734,11 @@ const ACT_TARGET_VECTOR_DIM: u32 = 256;
 /// is TTL-managed, so this doubles one short-lived dense lane rather than
 /// creating an unbounded permanent corpus. Frozen with the lens id.
 const ACT_REQUEST_VECTOR_DIM: u32 = 512;
+/// Dimension of the bounded request-atom projection. One request may emit at
+/// most [`ACT_REQUEST_MAX_ATOMS`] semantic atoms plus its bounded envelope.
+/// 512 dimensions keeps signed-hash projection noise at about 0.044 without
+/// flattening this lens into the exact-identity lane.
+const ACT_REQUEST_ATOM_VECTOR_DIM: u32 = 512;
 /// Frozen byte-length scale for the pre-action request lane.
 ///
 /// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
@@ -736,6 +753,10 @@ const ACT_REQUEST_MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 /// remains identity-complete and is explicitly marked in the vector. Legacy
 /// rows have no such digest and therefore fail closed instead of truncating.
 const ACT_REQUEST_MAX_NODES: usize = 64;
+/// Maximum semantic atoms emitted from one authenticated request. Crossing the
+/// bound is represented by an explicit overflow atom; the complete request
+/// remains audit-bound by slot 118's writer-sealed digest.
+const ACT_REQUEST_MAX_ATOMS: usize = 128;
 const ACT_REQUEST_EXACT_WEIGHT: f64 = 1.0;
 const ACT_REQUEST_ENVELOPE_WEIGHT: f64 = 0.75;
 const ACT_REQUEST_SHAPE_WEIGHT: f64 = 0.5;
@@ -826,6 +847,9 @@ const ACT_SLOT_REQUEST_SIZE_CLASS: SlotId = SlotId::new(119);
 /// Bounded structural-shape category. Slot 120 has never carried another
 /// meaning and is independently assayable from exact request identity.
 const ACT_SLOT_REQUEST_SHAPE_CLASS: SlotId = SlotId::new(120);
+/// Bounded semantic atoms of the pre-execution request. Slot 121 has never
+/// carried another meaning.
+const ACT_SLOT_REQUEST_ATOMS: SlotId = SlotId::new(121);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -987,14 +1011,14 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
         last: 52,
     },
     // The action panel's second block (#2050/#1690). Holds the dense target,
-    // exact request, bounded request-size and bounded request-shape lanes
-    // (117..=120). `48..=52` could not be
+    // exact request, bounded request-size/request-shape and semantic-atom lanes
+    // (117..=121). `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
         first: 117,
-        last: 120,
+        last: 121,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2485,6 +2509,7 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         ACT_SLOT_REQUEST_SHAPE_CLASS,
         "syn.action.request_shape_class.v1",
     ),
+    (ACT_SLOT_REQUEST_ATOMS, "syn.action.request_atoms.v1"),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2922,6 +2947,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_2185,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_CLASSES,
+                SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5350,11 +5376,12 @@ pub fn build_action_constellation(
         ACT_SLOT_TARGET_VECTOR,
         action_target_vector_slot(source_key, record)?,
     );
-    let (request_vector, request_size_class, request_shape_class) =
+    let (request_vector, request_size_class, request_shape_class, request_atoms) =
         action_request_slots(source_key, record)?;
     slots.insert(ACT_SLOT_REQUEST_VECTOR, request_vector);
     slots.insert(ACT_SLOT_REQUEST_SIZE_CLASS, request_size_class);
     slots.insert(ACT_SLOT_REQUEST_SHAPE_CLASS, request_shape_class);
+    slots.insert(ACT_SLOT_REQUEST_ATOMS, request_atoms);
     slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
@@ -8312,6 +8339,17 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         )?,
     ];
     slots.extend(action_request_class_panel_slots(panel_version, registry)?);
+    slots.push(syn_content_slot(
+        ACT_SLOT_REQUEST_ATOMS,
+        "syn.action.request_atoms.v1",
+        RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.request_atoms.v1",
+            Modality::Structured,
+            ACT_REQUEST_ATOM_VECTOR_DIM,
+        ),
+        panel_version,
+        registry,
+    )?);
     Ok(slots)
 }
 
@@ -9906,6 +9944,276 @@ struct ActionRequestShapeStats {
     overflowed: bool,
 }
 
+#[derive(Default)]
+struct ActionRequestAtomBudget {
+    visited_nodes: usize,
+    emitted_atoms: usize,
+    overflowed: bool,
+}
+
+fn insert_action_request_atom(
+    features: &mut serde_json::Map<String, Value>,
+    budget: &mut ActionRequestAtomBudget,
+    namespace: &str,
+    value: &str,
+    weight: f64,
+) {
+    let key = format!(
+        "{namespace}|{}",
+        action_target_feature_digest(&value.to_lowercase())
+    );
+    if features.contains_key(&key) {
+        return;
+    }
+    if budget.emitted_atoms >= ACT_REQUEST_MAX_ATOMS {
+        budget.overflowed = true;
+        return;
+    }
+    features.insert(key, json!(weight));
+    budget.emitted_atoms += 1;
+}
+
+fn request_atom_string_class(value: &str) -> &'static str {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "empty"
+    } else if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        "url"
+    } else if trimmed.len() >= 3
+        && trimmed.as_bytes()[1] == b':'
+        && matches!(trimmed.as_bytes()[2], b'/' | b'\\')
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+    {
+        "windows_absolute_path"
+    } else if trimmed.starts_with('/') {
+        "absolute_path"
+    } else if trimmed.contains(['/', '\\']) {
+        "path_like"
+    } else if trimmed.eq_ignore_ascii_case("true") || trimmed.eq_ignore_ascii_case("false") {
+        "boolean_text"
+    } else if trimmed.parse::<f64>().is_ok() {
+        "number_text"
+    } else {
+        "text"
+    }
+}
+
+fn request_atom_component_class(value: &str) -> &'static str {
+    if value.chars().all(|character| character.is_ascii_digit()) {
+        "number"
+    } else if value.len() >= 8 && value.chars().all(|character| character.is_ascii_hexdigit()) {
+        "hex"
+    } else {
+        "lexeme"
+    }
+}
+
+fn request_atom_number_class(value: &serde_json::Number) -> &'static str {
+    let Some(value) = value.as_f64() else {
+        return "number_unrepresentable";
+    };
+    let magnitude = value.abs();
+    if value == 0.0 {
+        "zero"
+    } else if magnitude < 1.0 {
+        "fractional"
+    } else if magnitude < 10.0 {
+        "unit"
+    } else if magnitude < 1_000.0 {
+        "small"
+    } else if magnitude < 1_000_000.0 {
+        "medium"
+    } else {
+        "large"
+    }
+}
+
+fn collect_action_request_string_atoms(
+    text: &str,
+    path_digest: &str,
+    features: &mut serde_json::Map<String, Value>,
+    budget: &mut ActionRequestAtomBudget,
+) {
+    insert_action_request_atom(
+        features,
+        budget,
+        "string_class",
+        &format!("{path_digest}:{}", request_atom_string_class(text)),
+        ACT_REQUEST_SHAPE_WEIGHT,
+    );
+    insert_action_request_atom(
+        features,
+        budget,
+        "string_size",
+        &format!(
+            "{path_digest}:{}",
+            request_shape_count_class(text.chars().count())
+        ),
+        ACT_REQUEST_SHAPE_WEIGHT,
+    );
+    for component in text.split(|character: char| {
+        ACT_TARGET_COMPONENT_SEPARATORS.contains(&character)
+            || matches!(
+                character,
+                '_' | '-' | '(' | ')' | '[' | ']' | '{' | '}' | '@' | '+'
+            )
+    }) {
+        let Some(component) = non_empty(component) else {
+            continue;
+        };
+        let lowered = component.to_lowercase();
+        let class = request_atom_component_class(&lowered);
+        let normalized = if class == "lexeme" {
+            lowered.as_str()
+        } else {
+            class
+        };
+        insert_action_request_atom(
+            features,
+            budget,
+            "lexeme",
+            normalized,
+            ACT_REQUEST_ENVELOPE_WEIGHT,
+        );
+        insert_action_request_atom(
+            features,
+            budget,
+            "field_lexeme",
+            &format!("{path_digest}:{normalized}"),
+            ACT_REQUEST_ENVELOPE_WEIGHT,
+        );
+    }
+}
+
+/// Adds bounded independently measurable atoms from one request value.
+///
+/// Raw scalar values never appear in a feature key: only short SHA-256
+/// digests do. Numeric identifiers and long hexadecimal ids are normalized to
+/// classes so request-instance entropy cannot drown out shared causal
+/// semantics. Object traversal is ordered, and both node and atom overflow are
+/// explicit features rather than silent truncation.
+fn collect_action_request_atoms(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    features: &mut serde_json::Map<String, Value>,
+    budget: &mut ActionRequestAtomBudget,
+) {
+    const MAX_DEPTH: usize = 16;
+    if depth > MAX_DEPTH || budget.visited_nodes >= ACT_REQUEST_MAX_NODES {
+        budget.overflowed = true;
+        return;
+    }
+    budget.visited_nodes += 1;
+    let path_digest = action_target_feature_digest(path);
+    insert_action_request_atom(
+        features,
+        budget,
+        "node_kind",
+        &format!("{path_digest}:{}", request_value_kind(value)),
+        ACT_REQUEST_SHAPE_WEIGHT,
+    );
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                insert_action_request_atom(
+                    features,
+                    budget,
+                    "field",
+                    &format!("{path_digest}:{key}"),
+                    ACT_REQUEST_ENVELOPE_WEIGHT,
+                );
+                collect_action_request_atoms(
+                    &map[key],
+                    &format!("{path}/{key}"),
+                    depth + 1,
+                    features,
+                    budget,
+                );
+            }
+        }
+        Value::Array(items) => {
+            insert_action_request_atom(
+                features,
+                budget,
+                "array_size",
+                &request_shape_count_class(items.len()).to_string(),
+                ACT_REQUEST_SHAPE_WEIGHT,
+            );
+            for item in items {
+                collect_action_request_atoms(
+                    item,
+                    &format!("{path}/[]"),
+                    depth + 1,
+                    features,
+                    budget,
+                );
+            }
+        }
+        Value::String(text) => {
+            collect_action_request_string_atoms(text, &path_digest, features, budget);
+        }
+        Value::Number(number) => insert_action_request_atom(
+            features,
+            budget,
+            "number_class",
+            &format!("{path_digest}:{}", request_atom_number_class(number)),
+            ACT_REQUEST_SHAPE_WEIGHT,
+        ),
+        Value::Bool(value) => insert_action_request_atom(
+            features,
+            budget,
+            "bool_value",
+            &format!("{path_digest}:{value}"),
+            ACT_REQUEST_SHAPE_WEIGHT,
+        ),
+        Value::Null => {}
+    }
+}
+
+fn action_request_atom_features(
+    record: &Value,
+    request: &ActionRequestSource<'_>,
+) -> serde_json::Map<String, Value> {
+    let mut features = serde_json::Map::new();
+    let mut budget = ActionRequestAtomBudget::default();
+    insert_action_request_atom(
+        &mut features,
+        &mut budget,
+        "source",
+        request.source,
+        ACT_REQUEST_ENVELOPE_WEIGHT,
+    );
+    for (namespace, value) in [
+        ("tool", json_string(record, &["tool"])),
+        ("verb", json_string(record, &["verb"])),
+        ("channel", json_string(record, &["channel"])),
+    ] {
+        if let Some(value) = value.as_deref() {
+            insert_action_request_atom(
+                &mut features,
+                &mut budget,
+                namespace,
+                value,
+                ACT_REQUEST_ENVELOPE_WEIGHT,
+            );
+        }
+    }
+    collect_action_request_atoms(request.payload, "$", 0, &mut features, &mut budget);
+    if budget.overflowed {
+        features.insert(
+            format!(
+                "bounded_traversal|{}",
+                action_target_feature_digest("overflow_with_complete_exact_digest")
+            ),
+            json!(ACT_REQUEST_SHAPE_WEIGHT),
+        );
+    }
+    features
+}
+
 const fn request_shape_count_class(value: usize) -> u8 {
     match value {
         0 => 0,
@@ -10055,9 +10363,10 @@ fn action_request_features(
 fn action_request_slots(
     source_key: &[u8],
     record: &Value,
-) -> StorageResult<(SlotVector, SlotVector, SlotVector)> {
+) -> StorageResult<(SlotVector, SlotVector, SlotVector, SlotVector)> {
     let Some(request) = action_request_source(record)? else {
         return Ok((
+            absent(AbsentReason::NotApplicable),
             absent(AbsentReason::NotApplicable),
             absent(AbsentReason::NotApplicable),
             absent(AbsentReason::NotApplicable),
@@ -10107,7 +10416,21 @@ fn action_request_slots(
         ),
         action_request_shape_class(request.payload, &shape),
     )?;
-    Ok((request_vector, request_size_class, request_shape_class))
+    let request_atoms = measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.request_atoms.v1",
+            Modality::Structured,
+            ACT_REQUEST_ATOM_VECTOR_DIM,
+        ),
+        &Value::Object(action_request_atom_features(record, &request)),
+    )?;
+    Ok((
+        request_vector,
+        request_size_class,
+        request_shape_class,
+        request_atoms,
+    ))
 }
 
 /// Reports a terminal action SUCCESS whose own foreground state says a target

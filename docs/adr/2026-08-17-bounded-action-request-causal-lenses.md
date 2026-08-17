@@ -1,7 +1,8 @@
 # ADR: Preserve exact requests and add bounded causal measurement lanes
 
 Date: 2026-08-17  
-Status: accepted for implementation; production FSV pending
+Status: superseded by `2026-08-17-action-request-semantic-atoms.md` after
+production measurement exposed the remaining semantic deficit
 
 ## Context
 
