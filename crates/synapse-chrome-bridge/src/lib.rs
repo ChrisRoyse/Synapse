@@ -5200,10 +5200,11 @@ impl ChromeDebuggerBridge {
                 request.bridge_protocol_version, BRIDGE_PROTOCOL_VERSION
             ));
         }
-        if !request.origin.starts_with("chrome-extension://") || !request.origin.ends_with('/') {
+        let expected_origin = format!("{EXTENSION_ORIGIN}/");
+        if request.origin != expected_origin {
             return Err(format!(
-                "native host origin must be a chrome-extension:// origin with trailing slash, got {:?}",
-                request.origin
+                "SYNAPSE_CHROME_NATIVE_HOST_ORIGIN_INVALID expected={expected_origin:?} actual={:?} remediation=launch the host only through the pinned Synapse Chrome extension identity",
+                request.origin,
             ));
         }
         let now = now_unix_ms();
@@ -8515,11 +8516,19 @@ pub fn is_direct_http_extension_bridge_register_or_probe_request(
     ) {
         return false;
     }
+    // The direct HTTP extension bridge and the native-messaging executable
+    // share these daemon endpoints but intentionally use different bootstrap
+    // credentials. A browser fetch carries the pinned extension Origin and
+    // authenticates with the derived bridge-register header. The native host
+    // is a separate stdio process, carries no HTTP Origin, and authenticates
+    // with the daemon bearer token. Treating a missing Origin as an extension
+    // fetch misroutes every real native-host registration to the wrong
+    // credential verifier and produces an opaque 401.
     headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
-        .is_none_or(|origin| origin == EXTENSION_ORIGIN)
+        .is_some_and(|origin| origin == EXTENSION_ORIGIN)
 }
 
 pub fn is_direct_http_extension_bridge_cors_preflight_request(
