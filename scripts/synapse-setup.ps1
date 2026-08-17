@@ -9,8 +9,8 @@
   HTTP daemon. It is the only process that can do real Win32 SendInput / UI
   Automation / WGC-DXGI capture, and it controls BOTH Windows programs (native
   windows) and WSL programs (WSLg GUI apps render as real Windows windows;
-  act_run_shell / act_launch reach WSL CLIs via wsl.exe). Every MCP client — on
-  Windows or in WSL — connects to this one daemon.
+  act_run_shell / act_launch reach WSL CLIs via wsl.exe). Every MCP client -- on
+  Windows or in WSL -- connects to this one daemon.
 
   This script makes that body exist and run, then points the Windows-side
   clients at it. The WSL-side entry (scripts/synapse-install.sh) calls this same
@@ -4789,7 +4789,7 @@ function Ensure-SynapseFileSizeProbeType {
       performance tweak for directory enumeration, and since Vista that
       replication only happens when the LAST handle to the file object closes.
       Get-ChildItem/Get-Item read the directory entry, so any file a live writer
-      holds open reports an arbitrarily stale size — on this host the current
+      holds open reports an arbitrarily stale size -- on this host the current
       daemon log read 0 bytes from the directory entry while its handle reported
       1,400,283. Microsoft documents the remedy on FindFirstFile: "To be assured
       of getting the current NTFS file system file attributes, call the
@@ -5493,7 +5493,7 @@ function Get-SynapseVaultRecoveryFingerprint {
         if (Test-Path -LiteralPath $currentPath -PathType Leaf) {
             $currentPointer = ((Get-Content -LiteralPath $currentPath -Raw -ErrorAction Stop) -replace '\s+', '')
         }
-        # Issue #1877: this fingerprint is the stall detector — it decides whether
+        # Issue #1877: this fingerprint is the stall detector -- it decides whether
         # a starting daemon is making physical progress. Directory-entry sizes go
         # stale precisely on the file that proves progress (the WAL the daemon
         # holds open), which makes a growing vault look frozen. Size from handles.
@@ -9083,7 +9083,7 @@ function Assert-SynapseExecutableModelBundle {
         }
         if (-not $slot.Present) {
             if ($model.Required) {
-                Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_REQUIRED_SLOT_ABSENT path=$ExecutablePath slot=$($slot.Name) remediation=a required model was not packaged; the executable is unusable — reacquire the model and repackage"
+                Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_REQUIRED_SLOT_ABSENT path=$ExecutablePath slot=$($slot.Name) remediation=a required model was not packaged; the executable is unusable -- reacquire the model and repackage"
             }
             if ($model.Present) {
                 Die "SYNAPSE_EMBEDDED_MODEL_BUNDLE_SLOT_LOST path=$ExecutablePath slot=$($slot.Name) expected_length=$($model.Length) remediation=the model was acquired but is absent from the packaged bundle; the packaging step is defective"

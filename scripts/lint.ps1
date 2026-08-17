@@ -779,10 +779,130 @@ catch {
         'repair the contract markers/parser inputs; canonical lint cannot certify machine error identity while the cross-language source contract is unreadable'
 }
 
+# ---------------------------------------------------------------------------
+# Gate 0d -- setup source encoding and dual-parser contract (#2216)
+# ---------------------------------------------------------------------------
+#
+# The public setup facade deliberately launches the Windows-inbox PowerShell
+# 5.1 executable. That engine decodes BOM-less source through the active ANSI
+# code page, while PowerShell 7 decodes the same bytes as UTF-8. In #2216 one
+# UTF-8 em dash decoded as three Windows-1252 characters ending in a typographic
+# quote. That last character closed a string, so the production repair child
+# failed before setup could update its durable repair manifest while a
+# PowerShell 7 parser check stayed green.
+#
+# Keep this shipping script 7-bit ASCII so its bytes mean the same thing under
+# every Windows ANSI code page and UTF-8, then parse those physical bytes with
+# both the current PowerShell engine and the exact Windows PowerShell launcher
+# used by the MCP facade. This is a structural source gate only: it executes no
+# setup behavior and is not FSV.
+
+Write-Gate 'Gate 0d    setup ASCII and PowerShell 5.1/7 parser contract (#2216)'
+try {
+    $setupContractFailureCountBefore = $script:Failures.Count
+    $setupPath = Join-Path $RepoRoot 'scripts/synapse-setup.ps1'
+    if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
+        throw "SYNAPSE_LINT_SETUP_SOURCE_MISSING path=$setupPath"
+    }
+
+    $setupBytes = [IO.File]::ReadAllBytes($setupPath)
+    $nonAsciiOffsets = [System.Collections.Generic.List[int]]::new()
+    for ($i = 0; $i -lt $setupBytes.Length; $i++) {
+        if ($setupBytes[$i] -gt 0x7f) {
+            $nonAsciiOffsets.Add($i)
+            if ($nonAsciiOffsets.Count -ge 16) { break }
+        }
+    }
+    if ($nonAsciiOffsets.Count -gt 0) {
+        Add-Failure 'SYNAPSE_LINT_SETUP_SOURCE_NOT_ASCII' `
+            "scripts/synapse-setup.ps1 contains non-ASCII bytes; first_byte_offsets=$($nonAsciiOffsets -join ',')" `
+            'replace non-ASCII source characters with exact ASCII equivalents; the shipping script must decode identically under Windows PowerShell ANSI code pages and PowerShell 7 UTF-8'
+    }
+
+    $tokens = $null
+    $parseErrors = $null
+    [void][Management.Automation.Language.Parser]::ParseFile(
+        $setupPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors.Count -gt 0) {
+        $diagnostics = @($parseErrors | ForEach-Object {
+                '{0}:{1}:{2} {3}' -f $setupPath, $_.Extent.StartLineNumber, $_.Extent.StartColumnNumber, $_.Message
+            })
+        Add-Failure 'SYNAPSE_LINT_SETUP_POWERSHELL_CURRENT_PARSE_FAILED' `
+            ($diagnostics -join [Environment]::NewLine) `
+            'repair every reported syntax error in scripts/synapse-setup.ps1 under the current PowerShell engine'
+    }
+
+    $windowsPowerShell = if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+        $null
+    }
+    else {
+        Join-Path $env:SystemRoot 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    }
+    if ([string]::IsNullOrWhiteSpace($windowsPowerShell) -or
+        -not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+        Add-Failure 'SYNAPSE_LINT_SETUP_WINDOWS_POWERSHELL_MISSING' `
+            "the production setup-repair parser is unavailable; SystemRoot=$($env:SystemRoot) expected_path=$windowsPowerShell" `
+            'run the structural gate on Windows with the inbox Windows PowerShell 5.1 installation intact; the shipping parser contract cannot be inferred from PowerShell 7'
+    }
+    else {
+        $windowsParserCommand = @'
+$path = $env:SYNAPSE_LINT_SETUP_PARSE_PATH
+if ($PSVersionTable.PSVersion.Major -ne 5 -or $PSVersionTable.PSVersion.Minor -ne 1) {
+    [Console]::Error.WriteLine(('expected Windows PowerShell 5.1, found {0}' -f $PSVersionTable.PSVersion))
+    exit 2
+}
+$tokens = $null
+$errors = $null
+[void][Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+if ($errors.Count -gt 0) {
+    foreach ($errorRecord in $errors) {
+        [Console]::Error.WriteLine(
+            ('{0}:{1}:{2} {3}' -f $path, $errorRecord.Extent.StartLineNumber, $errorRecord.Extent.StartColumnNumber, $errorRecord.Message)
+        )
+    }
+    exit 1
+}
+exit 0
+'@
+        $encodedParserCommand = [Convert]::ToBase64String(
+            [Text.Encoding]::Unicode.GetBytes($windowsParserCommand)
+        )
+        $priorParsePath = $env:SYNAPSE_LINT_SETUP_PARSE_PATH
+        try {
+            $env:SYNAPSE_LINT_SETUP_PARSE_PATH = $setupPath
+            $windowsParseOutput = @(& $windowsPowerShell `
+                    -NoLogo `
+                    -NoProfile `
+                    -NonInteractive `
+                    -EncodedCommand $encodedParserCommand 2>&1)
+            $windowsParseExitCode = $LASTEXITCODE
+        }
+        finally {
+            $env:SYNAPSE_LINT_SETUP_PARSE_PATH = $priorParsePath
+        }
+        if ($windowsParseExitCode -ne 0) {
+            Add-Failure 'SYNAPSE_LINT_SETUP_WINDOWS_POWERSHELL_PARSE_FAILED' `
+                "Windows PowerShell parser exited $windowsParseExitCode`n$($windowsParseOutput -join [Environment]::NewLine)" `
+                'repair every reported Windows PowerShell 5.1 syntax/encoding error in scripts/synapse-setup.ps1; do not substitute a PowerShell 7-only parser check'
+        }
+    }
+
+    if ($script:Failures.Count -eq $setupContractFailureCountBefore) {
+        Write-Host "   OK   $($setupBytes.Length) ASCII bytes parse under PowerShell $($PSVersionTable.PSVersion) and Windows PowerShell 5.1" -ForegroundColor Green
+    }
+}
+catch {
+    Add-Failure 'SYNAPSE_LINT_SETUP_PARSER_CONTRACT_SWEEP_FAILED' $_.Exception.Message `
+        'repair the setup source inventory or dual-parser gate; canonical lint cannot certify the production setup launcher while this structural sweep is incomplete'
+}
+
 if ($PolicyOnly) {
     Write-Host ''
     if ($script:Failures.Count -eq 0) {
-        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, and Gate 0c proved the Chrome error/body-budget contract.' -ForegroundColor Green
+        Write-Host 'POLICY OK: Gate 0 found no automated-test/FSV-driver surface, Gate 0b found no forbidden public tool projection, Gate 0c proved the Chrome error/body-budget contract, and Gate 0d proved the setup ASCII/dual-parser contract.' -ForegroundColor Green
         exit 0
     }
 
