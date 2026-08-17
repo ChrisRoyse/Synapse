@@ -713,7 +713,8 @@ pub struct DerivedStateReadback {
     pub last_weave_global_xterm_cf_rows_readback: BTreeMap<u32, String>,
     pub last_weave_global_graph_cf_rows_readback: BTreeMap<u32, String>,
     /// Committed Base sequences this panel's weave has not reached yet, the
-    /// parts still owed, and how many consecutive ticks the backlog has grown.
+    /// parts still owed, and how many consecutive ticks that sequence-distance
+    /// gauge has grown.
     ///
     /// `last_weave_through_seq` is the committed **frontier**, not the vault tip
     /// the tick aimed at, so these fields distinguish a frozen cursor from a
@@ -3029,10 +3030,12 @@ enum WeaveStop {
 
 /// One panel's incremental-weave backlog across ticks (#2085).
 ///
-/// The convergence question cannot be answered from a single tick: a tick that
-/// wove 30 seconds of backlog is making progress if ingest produced 10 seconds
-/// in the meantime and losing ground if it produced 60. Only the trend answers
-/// it, so the trend is measured and kept.
+/// The trend is operational pressure telemetry, not a terminal convergence
+/// verdict. A commit sequence has variable cardinality: one old sequence can
+/// contain thousands of Base identities while many new sequences contain one
+/// identity each. Therefore sequence distance may grow while the consumer is
+/// retiring much more real work than ingest creates. The physically verified
+/// frontier is the binding progress signal.
 #[derive(Clone, Copy, Debug, Default)]
 struct WeaveBacklogTrend {
     backlog_seqs: u64,
@@ -3042,17 +3045,14 @@ struct WeaveBacklogTrend {
 static WEAVE_BACKLOG_TREND: LazyLock<Mutex<BTreeMap<u32, WeaveBacklogTrend>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-/// Consecutive ticks a panel's weave backlog may grow before the condition is a
-/// named fault rather than an advisory (#2085).
-///
-/// Three, matching every other "this has now happened often enough to be a
-/// property of the work rather than of the moment" threshold in this module. One
-/// tick of growth is an ingest burst; three in a row is a panel that will never
-/// catch up on the budget it has, and an operator has to be told the difference.
-const WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT: u32 = 3;
+/// Consecutive growing sequence-distance observations after which the advisory
+/// explicitly calls out sustained pressure. This never stops a physically
+/// advancing durable consumer; zero frontier progress and indivisible
+/// over-cap commits are the fail-closed conditions.
+const WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_PRESSURE_ADVISORY: u32 = 3;
 
-/// Records the frontier this tick reached and answers whether the panel is
-/// converging on its backlog or losing ground to it.
+/// Records the sequence-distance pressure observed after this tick's physically
+/// verified frontier advance.
 ///
 /// Returns the backlog trend after this tick.
 fn record_weave_backlog(panel_version: u32, backlog_seqs: u64) -> WeaveBacklogTrend {
@@ -3687,12 +3687,12 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
 
     // --- Classifying the stop: progress, or a wall (#2085) ---
     //
-    // A partial pass that moved the frontier is *progress under a budget*, and
-    // reporting it as a maintenance failure is what made `success=0` structural:
-    // it was the reason there were never any successes to count, not an
-    // accounting artifact. A pass that moved nothing, or a backlog that has
-    // grown for three consecutive ticks, is the genuinely non-convergent case
-    // and stays a loud failure with the numbers that prove it.
+    // A partial pass that moved the frontier is *progress under a budget*.
+    // Commit-sequence distance cannot prove non-convergence because commits have
+    // variable record cardinality. Stopping a verified advancing consumer after
+    // three growing distance observations permanently strands exactly the
+    // recovery backlog this loop owns. A pass that moved nothing, or an
+    // indivisible over-cap commit, remains a loud fail-closed wall.
     match stop {
         None => Ok(WeaveProgress {
             records_woven,
@@ -3721,30 +3721,41 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
                     trend.consecutive_growth,
                 ));
             }
-            if trend.consecutive_growth >= WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_FAULT {
-                return Err(format!(
-                    "panel {panel_version} weave backlog has grown on {} consecutive ticks and now \
-                     stands at {backlog_seqs} sequence(s) ({stop:?}); the frontier advanced from \
-                     {after_seq} to {frontier_seq} this tick, so the pass is making progress but slower than \
-                     ingest, and the derived association layer for this panel falls further behind \
-                     every tick",
-                    trend.consecutive_growth,
-                ));
-            }
-            Ok(WeaveProgress {
-                records_woven,
-                backlog_seqs,
-                pending_parts,
-                advisory: Some((
+            let (advisory_code, advisory_detail) = if trend.consecutive_growth
+                >= WEAVE_BACKLOG_GROWTH_TICKS_BEFORE_PRESSURE_ADVISORY
+            {
+                (
+                    "STORAGE_DERIVED_STATE_WEAVE_BACKLOG_PRESSURE",
+                    format!(
+                        "panel {panel_version} wove {completed_parts} bounded interval part(s), \
+                         physically advanced its Base cursor from {after_seq} to {frontier_seq}, \
+                         and left {backlog_seqs} sequence(s) across {pending_parts} pending part(s) \
+                         ({stop:?}); the sequence-distance gauge has grown on {} consecutive \
+                         observations, but commit cardinality is variable, so this is sustained \
+                         pressure rather than proof of non-convergence; the successful \
+                         completion-relative continuation remains scheduled until the durable \
+                         frontier settles",
+                        trend.consecutive_growth,
+                    ),
+                )
+            } else {
+                (
                     "STORAGE_DERIVED_STATE_WEAVE_BACKLOG",
                     format!(
                         "panel {panel_version} wove {completed_parts} bounded interval part(s) and \
                          advanced its Base cursor from {after_seq} to {frontier_seq}, leaving \
                          {backlog_seqs} sequence(s) of backlog across {pending_parts} pending part(s) \
-                         ({stop:?}); the next tick resumes at the frontier rather than re-weaving \
-                         the prefix, so this is bounded catch-up work and not a maintenance failure"
+                         ({stop:?}); the next continuation resumes at the frontier rather than \
+                         re-weaving the prefix, so this is bounded catch-up work and not a \
+                         maintenance failure"
                     ),
-                )),
+                )
+            };
+            Ok(WeaveProgress {
+                records_woven,
+                backlog_seqs,
+                pending_parts,
+                advisory: Some((advisory_code, advisory_detail)),
             })
         }
     }

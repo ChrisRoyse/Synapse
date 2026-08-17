@@ -90,6 +90,14 @@ Primary references:
 14. Snapshot publication, Loom interval work, and drift sampling own separate
     record-limit constants. They currently share a measured value of 2,000 but
     cannot silently retune one another.
+15. Sequence-distance growth is pressure telemetry, not a terminal convergence
+    verdict. Commit sequence cardinality varies: one historical sequence may
+    carry thousands of identities while many live sequences carry one each.
+    Therefore an independently reread frontier advance remains a successful
+    bounded continuation even when the sequence gap grows. Zero frontier
+    movement and an indivisible over-cap commit remain fail-closed walls; three
+    consecutive growth observations raise a named pressure advisory without
+    stranding the durable consumer.
 
 ## Consequences
 
