@@ -30,6 +30,8 @@ Primary references:
 - https://www.postgresql.org/docs/19/view-pg-replication-slots.html
 - https://www.postgresql.org/docs/current/runtime-config-replication.html
 - https://debezium.io/documentation/reference/3.0/configuration/signalling.html
+- https://docs.rs/tokio/latest/tokio/time/struct.Interval.html#method.reset_after
+- https://docs.rs/tokio/latest/tokio/time/enum.MissedTickBehavior.html
 
 ## Decision
 
@@ -73,6 +75,21 @@ Primary references:
     excluded before identity coalescing. The first CDC publication seals its
     pre-commit sequence as the coverage floor, preventing an upgraded vault
     from interpreting absent pre-install history as an empty delta.
+12. A successful full derived-state tick that physically reports association
+    backlog schedules an association-only continuation after a five-second
+    foreground-admission window. The continuation runs no already-completed
+    search, coverage, graph, kernel, causal-map, or relay phase. A failure or a
+    settled frontier always restores the normal five-minute cadence. Tokio's
+    `reset_after` supplies the required completion-relative deadline and
+    explicitly ignores missed-tick policy, so cadence debt cannot create a
+    burst.
+13. Post-ingest drift is measured only when the association cursor reaches its
+    target. A partial bootstrap is a knowingly incomplete population; treating
+    it as a drift corpus is both scientifically invalid and a redundant corpus
+    pass. The final continuation performs the one settled-frontier assay.
+14. Snapshot publication, Loom interval work, and drift sampling own separate
+    record-limit constants. They currently share a measured value of 2,000 but
+    cannot silently retune one another.
 
 ## Consequences
 
@@ -86,3 +103,6 @@ Primary references:
   either growing forever or being pruned ahead of search or association state.
 - Between-record traversal must resolve the complete graph reference on demand;
   materializing a partial neighbour batch is explicitly invalid.
+- Large first-install/rebase snapshots converge at the measured Loom rate
+  rather than adding five minutes of scheduler latency per chunk, while every
+  chunk still leaves a real idle/admission boundary for foreground work.

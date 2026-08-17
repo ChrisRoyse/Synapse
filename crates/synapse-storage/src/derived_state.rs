@@ -62,6 +62,17 @@ use synapse_core::types::{AgentEventKind, AgentEventRecord, TimelineKind, Timeli
 /// cadence and keeps the two heavy periodic passes on the same rhythm.
 pub const DERIVED_STATE_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
+/// Idle/admission window between association-only recovery continuations.
+///
+/// A durable CDC bootstrap can span many bounded Loom calls. Waiting the full
+/// five-minute inspection cadence between those calls makes recovery time a
+/// function of the scheduler rather than of the measured work. Five seconds
+/// leaves a real foreground-admission window after the previous blocking pass
+/// releases every corpus allocation; it is never used after an error or when
+/// no proven backlog remains.
+pub const ASSOCIATION_BACKLOG_CONTINUATION_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
 /// Records hydrated per panel when measuring lens coverage.
 ///
 /// This is a **sample**, and it is reported as one. Lens coverage is a property
@@ -213,6 +224,20 @@ const PANEL_COVERAGE_CURSOR_KEY_PREFIX: &str = "syn/panel-backfill-cursor/v1/";
 /// not, [`drive_incremental_weave`] bisects the time range instead of silently
 /// dropping everything beyond the cap.
 pub const WEAVE_INTERVAL_MAX_RECORDS: usize = 2_000;
+
+/// Authoritative Base identities published per atomic bootstrap commit.
+///
+/// This is deliberately independent from [`WEAVE_INTERVAL_MAX_RECORDS`]: the
+/// publisher's transaction/memory bound and Loom's math bound are different
+/// contracts even though their measured defaults currently coincide.
+pub const WEAVE_SNAPSHOT_PUBLISH_MAX_RECORDS: usize = 2_000;
+
+/// Records sampled by one settled-frontier post-ingest drift measurement.
+///
+/// Drift is a corpus assay rather than CDC consumption. Keeping its cap
+/// independent prevents a future recovery tuning change from silently changing
+/// the MMD population.
+pub const POST_INGEST_DRIFT_MAX_RECORDS: usize = 2_000;
 
 /// Durable consumer-offset row for one panel's association input stream.
 const ASSOCIATION_WEAVE_CURSOR_KEY_PREFIX: &str = "syn/association-weave-cursor/v1/";
@@ -3123,6 +3148,8 @@ fn commit_weave_frontier(
 /// serial tick's.
 struct WeaveProgress {
     records_woven: u64,
+    backlog_seqs: u64,
+    pending_parts: usize,
     advisory: Option<(&'static str, String)>,
 }
 
@@ -3170,9 +3197,22 @@ fn weave_panel_subpass(db: &Arc<Db>, panel_version: u32) -> WeaveSubpass {
                 release_elapsed_us = release.elapsed_us,
                 "released completed weave ownership before starting post-ingest drift"
             );
-            // Identical to the serial driver's `Ok(0) => {}` / `Ok(_) => drift`:
-            // a panel that wove nothing has nothing new to measure drift over.
-            let drift_error = if progress.records_woven == 0 {
+            // Drift is meaningful only at a settled association frontier. A
+            // bootstrap prefix is knowingly incomplete; measuring MMD there
+            // both spends a second corpus pass on every recovery chunk and
+            // publishes a transient prefix as though it were the panel. The
+            // final continuation (backlog=0) measures exactly once.
+            let drift_error = if progress.records_woven == 0 || progress.backlog_seqs > 0 {
+                if progress.backlog_seqs > 0 {
+                    tracing::info!(
+                        code = "STORAGE_DERIVED_STATE_DRIFT_DEFERRED_FOR_WEAVE_BACKLOG",
+                        panel_version,
+                        records_woven = progress.records_woven,
+                        backlog_seqs = progress.backlog_seqs,
+                        pending_parts = progress.pending_parts,
+                        "deferred post-ingest drift until the durable association frontier is settled"
+                    );
+                }
                 None
             } else {
                 drive_post_ingest_drift(db, panel_version).err()
@@ -3188,6 +3228,104 @@ fn weave_panel_subpass(db: &Arc<Db>, panel_version: u32) -> WeaveSubpass {
             advisory: None,
             drift_error: None,
         },
+    }
+}
+
+/// Whether the last physical association pass proved that a registered panel
+/// still owes CDC sequence coverage.
+///
+/// Absence is not guessed into backlog: before the first full derived-state
+/// pass the normal five-minute cadence performs bootstrap discovery. This
+/// predicate becomes true only from numbers published by
+/// [`drive_incremental_weave`].
+#[must_use]
+pub fn association_weave_backlog_pending() -> bool {
+    let readback = match DERIVED_STATE_LAST.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS
+        .iter()
+        .any(|(panel_version, _)| {
+            readback
+                .last_weave_backlog_seqs
+                .get(panel_version)
+                .is_some_and(|backlog| *backlog > 0)
+                || readback
+                    .last_weave_pending_parts
+                    .get(panel_version)
+                    .is_some_and(|parts| *parts > 0)
+        })
+}
+
+/// Runs only the durable association consumer while a prior full tick has
+/// proved bounded backlog remains.
+///
+/// This is not a retry of a failed full tick. It omits the unrelated graph,
+/// search, coverage, kernel, causal-map, and relay phases that already
+/// completed, advances each panel's own durable cursor once, and lets the
+/// scheduler restore the normal cadence as soon as both frontiers settle.
+/// Every Loom write is still committed and physically read back by the same
+/// [`drive_incremental_weave`] path as a normal tick.
+///
+/// # Errors
+///
+/// Returns one fail-closed storage error naming every panel sub-pass that did
+/// not complete. The scheduler never requests an immediate continuation after
+/// this error.
+pub fn run_association_weave_catch_up() -> crate::StorageResult<()> {
+    hot_context::assert_cold_calyx("maintenance_association_weave_catch_up");
+    let source = match DERIVED_STATE_SOURCE.lock() {
+        Ok(guard) => guard.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    let db = source.as_ref().and_then(Weak::upgrade).ok_or_else(|| {
+        crate::StorageError::WriteFailed {
+            cf_name: "storage_derived_state".to_owned(),
+            detail: "STORAGE_DERIVED_STATE_SOURCE_UNREGISTERED: a scheduled association catch-up was requested after a prior pass proved backlog, but the registered storage handle is no longer live; reopen storage and let the normal derived-state tick re-establish its durable cursors"
+                .to_owned(),
+        }
+    })?;
+
+    let started = std::time::Instant::now();
+    let mut records_woven = 0_u64;
+    let mut failures = Vec::new();
+    for &(panel_version, _) in crate::constellations::SYN_ASSOCIATION_MAINTENANCE_TARGETS {
+        let outcome = weave_panel_subpass(&db, panel_version);
+        if let Some((code, detail)) = outcome.advisory {
+            record_advisory(code, detail);
+        }
+        match outcome.weave {
+            Ok(records) => {
+                records_woven = records_woven.saturating_add(records);
+                if let Some(error) = outcome.drift_error {
+                    failures.push(format!(
+                        "panel {panel_version} settled its association frontier but post-ingest drift failed: {error}"
+                    ));
+                }
+            }
+            Err(error) => failures.push(format!("panel {panel_version} weave failed: {error}")),
+        }
+    }
+    let backlog_remaining = association_weave_backlog_pending();
+    tracing::info!(
+        code = "STORAGE_DERIVED_STATE_ASSOCIATION_CATCH_UP_COMPLETED",
+        records_woven,
+        backlog_remaining,
+        failures = failures.len(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "completed one association-only durable CDC continuation and independently published each panel frontier"
+    );
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(crate::StorageError::WriteFailed {
+            cf_name: "storage_derived_state".to_owned(),
+            detail: format!(
+                "STORAGE_DERIVED_STATE_ASSOCIATION_CATCH_UP_FAILED: {} panel sub-pass(es) did not complete: {failures:?}; no failed panel cursor advanced past its last physically verified frontier",
+                failures.len()
+            ),
+        })
     }
 }
 
@@ -3210,7 +3348,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
     };
     if !cursor.durable_present {
         let bootstrap = db
-            .publish_panel_input_snapshot(panel_version, WEAVE_INTERVAL_MAX_RECORDS)
+            .publish_panel_input_snapshot(panel_version, WEAVE_SNAPSHOT_PUBLISH_MAX_RECORDS)
             .map_err(|error| {
                 format!(
                     "publish panel {panel_version} durable association bootstrap stream: {error}"
@@ -3275,6 +3413,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
         prune_acknowledged_weave_history(db, panel_version, after_seq)?;
         return Ok(WeaveProgress {
             records_woven: 0,
+            backlog_seqs: 0,
+            pending_parts: 0,
             advisory: None,
         });
     }
@@ -3556,6 +3696,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
     match stop {
         None => Ok(WeaveProgress {
             records_woven,
+            backlog_seqs,
+            pending_parts,
             advisory: None,
         }),
         Some(WeaveStop::IndivisibleInterval {
@@ -3591,6 +3733,8 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
             }
             Ok(WeaveProgress {
                 records_woven,
+                backlog_seqs,
+                pending_parts,
                 advisory: Some((
                     "STORAGE_DERIVED_STATE_WEAVE_BACKLOG",
                     format!(
@@ -3608,7 +3752,7 @@ fn drive_incremental_weave(db: &Arc<Db>, panel_version: u32) -> Result<WeaveProg
 
 fn drive_post_ingest_drift(db: &Arc<Db>, panel_version: u32) -> Result<(), String> {
     let mut params = synapse_calyx::SynapseCalyxPanelDriftParams::new(panel_version);
-    params.max_records = WEAVE_INTERVAL_MAX_RECORDS;
+    params.max_records = POST_INGEST_DRIFT_MAX_RECORDS;
     params.math_execution_class = synapse_calyx::SynapseCalyxMathExecutionClass::BackgroundCpu;
     let report = db
         .panel_drift_intelligence(&params)

@@ -9,7 +9,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -3006,7 +3006,10 @@ impl pressure::PressureCompaction for CalyxPressureCompaction {
 /// storage handle through a `Weak`, exactly like the guard-threshold lowering
 /// publisher, so a closed vault is observed as a recorded skip rather than kept
 /// alive by the scheduler.
-struct CalyxDerivedStateRunner;
+#[derive(Default)]
+struct CalyxDerivedStateRunner {
+    association_catch_up_next: AtomicBool,
+}
 
 impl gc::GcRunner for CalyxDerivedStateRunner {
     /// Returns the tick's real outcome, so `STORAGE_MAINTENANCE_COMPLETED
@@ -3023,8 +3026,23 @@ impl gc::GcRunner for CalyxDerivedStateRunner {
     /// zeroed `last_successful_*` CF aggregates from a report that carries none
     /// (#2088 ask 3) — the same discipline `source_census` already had.
     fn run_once(&self) -> StorageResult<gc::GcReport> {
-        crate::derived_state::run_derived_state_maintenance()?;
+        let catch_up_only = self.association_catch_up_next.swap(false, Ordering::AcqRel);
+        if catch_up_only {
+            crate::derived_state::run_association_weave_catch_up()?;
+        } else {
+            crate::derived_state::run_derived_state_maintenance()?;
+        }
+        self.association_catch_up_next.store(
+            crate::derived_state::association_weave_backlog_pending(),
+            Ordering::Release,
+        );
         Ok(gc::GcReport::default())
+    }
+
+    fn successful_continuation_delay(&self) -> Option<Duration> {
+        self.association_catch_up_next
+            .load(Ordering::Acquire)
+            .then_some(crate::derived_state::ASSOCIATION_BACKLOG_CONTINUATION_DELAY)
     }
 }
 
@@ -4199,7 +4217,7 @@ impl StorageBackend for CalyxBackend {
 
     fn spawn_derived_state_task(&self) -> StorageResult<gc::GcTask> {
         gc::spawn_runner(
-            Arc::new(CalyxDerivedStateRunner),
+            Arc::new(CalyxDerivedStateRunner::default()),
             crate::derived_state::DERIVED_STATE_INTERVAL,
             gc::MaintenanceTaskKind::DerivedState,
         )

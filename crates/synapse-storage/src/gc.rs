@@ -370,6 +370,19 @@ impl GcConfig {
 
 pub trait GcRunner: Send + Sync + 'static {
     fn run_once(&self) -> StorageResult<GcReport>;
+
+    /// Requests one completion-relative continuation sooner than the runner's
+    /// normal cadence after a successful pass.
+    ///
+    /// The default keeps the configured cadence byte-for-byte. A runner may
+    /// override this only when the pass itself proved that bounded,
+    /// state-convergent work remains. Failures never consume this hint: their
+    /// retry remains the normal cadence so an invariant failure cannot become
+    /// a hot loop. Returning a duration instead of a boolean makes the idle
+    /// admission window explicit at the owner that understands the work.
+    fn successful_continuation_delay(&self) -> Option<Duration> {
+        None
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -396,6 +409,30 @@ impl MaintenanceTaskKind {
             Self::Checkpoint => "checkpoint",
             Self::DerivedState => "derived_state",
         }
+    }
+}
+
+fn schedule_next_runner_tick(
+    interval: &mut tokio::time::Interval,
+    runner: &dyn GcRunner,
+    task_kind: MaintenanceTaskKind,
+    cadence: Duration,
+    succeeded: bool,
+) {
+    let next_delay = if succeeded {
+        runner.successful_continuation_delay().unwrap_or(cadence)
+    } else {
+        cadence
+    };
+    interval.reset_after(next_delay);
+    if next_delay != cadence {
+        tracing::info!(
+            code = "STORAGE_MAINTENANCE_CONTINUATION_SCHEDULED",
+            task = task_kind.label(),
+            continuation_after_ms = next_delay.as_millis(),
+            normal_cadence_ms = cadence.as_millis(),
+            "successful storage maintenance proved bounded work remains and scheduled one completion-relative continuation"
+        );
     }
 }
 
@@ -488,7 +525,7 @@ pub fn spawn_runner(
                     // This is completion-relative scheduling, not a disabled or
                     // skipped capability; every runner still executes forever,
                     // with a real idle/admission window between passes.
-                    interval.reset_after(cadence);
+                    schedule_next_runner_tick(&mut interval, &*runner, task_kind, cadence, result.is_ok());
                     if let Err(error) = result {
                         match deferral {
                             Some(deferral) if !deferral.escalated => tracing::warn!(
