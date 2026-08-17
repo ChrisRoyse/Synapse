@@ -694,6 +694,12 @@ struct ActCommandAuditGuard {
     service: SynapseService,
     operation_name: &'static str,
     actor_session_id: Option<String>,
+    /// Immutable target context captured before the durable intent row.
+    ///
+    /// The authority gate later proves this is still the session target before
+    /// dispatch. Both audit phases use these bytes; finalization never reads
+    /// mutable session state after the action or during a retry.
+    command_target: Option<SessionTarget>,
     command_payload: Value,
     command_before: Value,
     pending_final: Option<super::command_audit::CommandAuditInput>,
@@ -705,10 +711,11 @@ impl ActCommandAuditGuard {
         service: &SynapseService,
         operation_name: &'static str,
         actor_session_id: Option<String>,
+        command_target: Option<SessionTarget>,
         command_payload: Value,
         command_before: Value,
     ) -> Result<Self, ErrorData> {
-        service.command_audit_intent(super::command_audit::CommandAuditInput::mcp(
+        let intent = super::command_audit::CommandAuditInput::mcp(
             "act",
             operation_name,
             actor_session_id.clone(),
@@ -717,11 +724,13 @@ impl ActCommandAuditGuard {
             command_before.clone(),
             Value::Null,
             "pending",
-        ))?;
+        );
+        service.command_audit_intent(bind_act_command_target(intent, command_target.as_ref()))?;
         Ok(Self {
             service: service.clone(),
             operation_name,
             actor_session_id,
+            command_target,
             command_payload,
             command_before,
             pending_final: None,
@@ -745,11 +754,16 @@ impl ActCommandAuditGuard {
             after,
             outcome,
         );
+        let input = bind_act_command_target(input, self.command_target.as_ref());
         error.map_or(input.clone(), |error| {
             input.with_error(super::command_audit::command_audit_error_from_error_data(
                 error,
             ))
         })
+    }
+
+    fn target(&self) -> Option<&SessionTarget> {
+        self.command_target.as_ref()
     }
 
     fn finalize(
@@ -779,6 +793,61 @@ impl ActCommandAuditGuard {
         self.armed = false;
         Ok(())
     }
+}
+
+fn bind_act_command_target(
+    input: super::command_audit::CommandAuditInput,
+    target: Option<&SessionTarget>,
+) -> super::command_audit::CommandAuditInput {
+    match target {
+        Some(target) => input.with_target(json!(super::target_claims::target_wire(target))),
+        None => input,
+    }
+}
+
+/// Resolve only targets the selected action can actually consume.
+///
+/// `run_shell` is deliberately target-independent even when its session has a
+/// bound window. Attaching that ambient target would manufacture a causal
+/// association. Every other `target_act` verb routes through the session target
+/// contract; unknown verbs are still bound to their attempted context and then
+/// fail the dispatcher instead of silently being classified as shell work.
+fn act_command_target_snapshot(
+    service: &SynapseService,
+    operation: ActOperation,
+    action: Option<&TargetActParams>,
+    actor_session_id: Option<&str>,
+) -> Result<Option<SessionTarget>, ErrorData> {
+    if !matches!(operation, ActOperation::Invoke | ActOperation::Foreground)
+        || action.is_none_or(|action| action.verb.as_str() == "run_shell")
+    {
+        return Ok(None);
+    }
+    service.session_target(actor_session_id)
+}
+
+fn act_command_target_changed_error(
+    operation: ActOperation,
+    intent_target: Option<&SessionTarget>,
+    admitted_target: Option<&SessionTarget>,
+) -> ErrorData {
+    ErrorData::new(
+        ErrorCode(-32099),
+        format!(
+            "act operation={} session target changed while the command waited for authority; no action was dispatched",
+            act_operation_name(operation)
+        ),
+        Some(json!({
+            "code": error_codes::ACTION_TARGET_INVALID,
+            "detail_code": "ACT_COMMAND_TARGET_CHANGED_BEFORE_DISPATCH",
+            "operation": act_operation_name(operation),
+            "intent_target": intent_target.map(super::target_claims::target_wire),
+            "admitted_target": admitted_target.map(super::target_claims::target_wire),
+            "foreground_work_dispatched": false,
+            "source_of_truth": ACT_FACADE_SOURCE_OF_TRUTH,
+            "remediation": "retry after target operation=get confirms the intended stable session target; do not reconstruct target context after execution",
+        })),
+    )
 }
 
 fn write_act_command_audit_final_with_retries(
@@ -1985,10 +2054,17 @@ impl SynapseService {
         // mutation, independent readback, and final audit.
         let command_payload = act_command_audit_payload(&params);
         let command_before = act_command_audit_before(operation);
+        let command_target = act_command_target_snapshot(
+            self,
+            operation,
+            params.action.as_ref(),
+            actor_session_id.as_deref(),
+        )?;
         let mut command_audit_guard = ActCommandAuditGuard::begin(
             self,
             operation_name,
             actor_session_id.clone(),
+            command_target,
             command_payload.clone(),
             command_before.clone(),
         )?;
@@ -2035,6 +2111,35 @@ impl SynapseService {
                 return Err(error);
             }
         };
+        let admitted_target = match act_command_target_snapshot(
+            self,
+            operation,
+            params.action.as_ref(),
+            actor_session_id.as_deref(),
+        ) {
+            Ok(target) => target,
+            Err(error) => {
+                command_audit_guard.finalize(
+                    act_command_audit_error_after(operation),
+                    "error",
+                    Some(&error),
+                )?;
+                return Err(error);
+            }
+        };
+        if admitted_target.as_ref() != command_audit_guard.target() {
+            let error = act_command_target_changed_error(
+                operation,
+                command_audit_guard.target(),
+                admitted_target.as_ref(),
+            );
+            command_audit_guard.finalize(
+                act_command_audit_error_after(operation),
+                "error",
+                Some(&error),
+            )?;
+            return Err(error);
+        }
 
         let transaction = std::panic::AssertUnwindSafe(Box::pin(async {
             if let Some(operator_panic_epoch) = operator_panic_epoch_at_entry {

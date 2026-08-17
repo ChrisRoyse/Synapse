@@ -62,6 +62,13 @@ show why conditioning on post-treatment variables biases causal inference.
 7. The immutable panel change invalidates inherited Ward and held-out evidence.
    Backfill, calibration, sufficiency, kernel recall, and held-out validation
    must be re-measured from physical generation `2_185_002`.
+8. Public `act` command-audit intent and final rows carry the same immutable
+   target snapshot for every target-consuming verb. The target is captured
+   before the durable intent, re-read after the per-session authority gate, and
+   must still match before dispatch. Finalization and its retries reuse the
+   captured value; they never reconstruct it from mutable post-action session
+   state. `run_shell`, lease, and operator-panic operations remain explicitly
+   target-independent even when the session happens to have a bound window.
 
 ## Consequences
 
@@ -78,6 +85,11 @@ show why conditioning on post-treatment variables biases causal inference.
   contradiction where the row claims a target-bearing foreground state but
   every exact target field is absent. Unknown foreground status vocabulary
   fails measurement and requires an explicitly versioned contract.
+- Target-bearing `act` outcomes retain the actual operation target after the
+  caller clears or changes its session binding. A target change while the
+  command is queued refuses before dispatch and records both immutable intent
+  and admitted snapshots instead of attributing the outcome to whichever
+  window exists later.
 - Changed frozen instruments have new lens names even though their slot ids stay
   stable inside the new panel generation.
 - Readiness can remain false after deployment. That is the correct result until
@@ -88,3 +100,6 @@ show why conditioning on post-treatment variables biases causal inference.
 - Google Cloud, “Feature serving — Point-in-time correctness”: <https://docs.cloud.google.com/bigquery/docs/feature-serving>
 - Microsoft Azure ML, “Point-in-time join concepts”: <https://learn.microsoft.com/en-us/azure/machine-learning/offline-retrieval-point-in-time-join-concepts?view=azureml-api-2>
 - Montgomery, Nyhan, and Torres, “How Conditioning on Posttreatment Variables Can Ruin Your Experiment and What to Do about It,” *American Journal of Political Science* (2018): <https://doi.org/10.1111/ajps.12357>
+- OpenTelemetry, “Logs Data Model”: <https://opentelemetry.io/docs/specs/otel/logs/data-model/>
+- OpenTelemetry, “Context”: <https://opentelemetry.io/docs/specs/otel/context/>
+- OWASP, “Logging Cheat Sheet”: <https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html>
