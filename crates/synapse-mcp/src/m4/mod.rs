@@ -15717,7 +15717,7 @@ fn shell_job_environment_diagnostics(
 pub fn run_shell_precondition_snapshot(
     params: &ActRunShellParams,
     context: Option<&ShellExecutionContext>,
-) -> Value {
+) -> Result<Value, ErrorData> {
     shell_precondition_snapshot(
         &params.env,
         params.working_dir.as_deref(),
@@ -15731,7 +15731,7 @@ pub fn run_shell_precondition_snapshot(
 pub fn run_shell_start_precondition_snapshot(
     params: &ActRunShellStartParams,
     context: Option<&ShellExecutionContext>,
-) -> Value {
+) -> Result<Value, ErrorData> {
     shell_precondition_snapshot(
         &params.env,
         params.working_dir.as_deref(),
@@ -15747,12 +15747,13 @@ fn shell_precondition_snapshot(
     context: Option<&ShellExecutionContext>,
     command: &str,
     args: &[String],
-) -> Value {
+) -> Result<Value, ErrorData> {
     let mut env = child_base_environment();
     ensure_child_temp_environment(&mut env);
     apply_requested_shell_environment(&mut env, requested_env);
     apply_shell_session_environment(&mut env, effective_working_dir, context);
     let delivered: BTreeMap<String, String> = env.clone().into_values().collect();
+    let executable = shell_executable_preflight(command, effective_working_dir, &delivered)?;
     let required_missing: Vec<&str> = if cfg!(windows) {
         REQUIRED_CHILD_ENVIRONMENT_KEYS
             .into_iter()
@@ -15789,9 +15790,9 @@ fn shell_precondition_snapshot(
             })
         })
         .collect();
-    json!({
-        "schema_version": 1,
-        "source_of_truth": "child_base_environment + durable Windows environment + shell session context",
+    Ok(json!({
+        "schema_version": 2,
+        "source_of_truth": "child_base_environment + durable Windows environment + shell session context + point-in-time executable file metadata",
         "platform": if cfg!(windows) { "windows" } else { "non_windows" },
         "delivered_environment_count": delivered.len(),
         "required_environment_count": if cfg!(windows) { REQUIRED_CHILD_ENVIRONMENT_KEYS.len() } else { 0 },
@@ -15800,7 +15801,200 @@ fn shell_precondition_snapshot(
         "working_directory_present": effective_working_dir.is_some(),
         "working_directory_exists": effective_working_dir.is_some_and(|path| Path::new(path).is_dir()),
         "configured_host_diagnostics": diagnostic_facts,
+        "requested_command_path_class": shell_command_path_class(command),
+        "spawn_command_path_class": executable.spawn_command_path_class,
+        "executable_resolution": executable.state,
+        "executable_resolution_source": executable.source,
+        "resolved_path_sha256": executable.resolved_path_sha256,
         "secret_values_persisted": false,
+    }))
+}
+
+struct ShellExecutablePreflight {
+    state: &'static str,
+    source: Option<&'static str>,
+    spawn_command_path_class: &'static str,
+    resolved_path_sha256: Option<String>,
+}
+
+fn shell_command_path_class(command: &str) -> &'static str {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        "empty"
+    } else if Path::new(trimmed).is_absolute() {
+        "absolute"
+    } else if trimmed.len() >= 2
+        && trimmed.as_bytes()[1] == b':'
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+    {
+        "drive_relative"
+    } else if trimmed.contains(['/', '\\']) {
+        "relative_path"
+    } else {
+        "bare_name"
+    }
+}
+
+fn delivered_environment_value<'a>(
+    delivered: &'a BTreeMap<String, String>,
+    wanted: &str,
+) -> Option<&'a str> {
+    delivered
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+        .map(|(_, value)| value.as_str())
+}
+
+fn executable_candidate_paths(path: PathBuf) -> Vec<PathBuf> {
+    let mut candidates = vec![path.clone()];
+    #[cfg(windows)]
+    if path.extension().is_none() {
+        let mut with_exe = path;
+        with_exe.set_extension("exe");
+        candidates.push(with_exe);
+    }
+    candidates
+}
+
+fn shell_path_sha256(path: &Path) -> String {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+
+        let mut bytes = Vec::new();
+        for unit in path.as_os_str().encode_wide() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        sha256_hex(&bytes)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        sha256_hex(path.as_os_str().as_bytes())
+    }
+}
+
+fn resolved_executable_candidate(
+    candidates: impl IntoIterator<Item = (PathBuf, &'static str)>,
+) -> Result<Option<(PathBuf, &'static str)>, ErrorData> {
+    for (path, source) in candidates {
+        for candidate in executable_candidate_paths(path) {
+            match fs::metadata(&candidate) {
+                Ok(metadata) if metadata.is_file() => return Ok(Some((candidate, source))),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(shell_tool_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "act_run_shell executable preflight could not read candidate metadata: {error}"
+                        ),
+                        json!({
+                            "code": error_codes::TOOL_INTERNAL_ERROR,
+                            "reason": "executable_preflight_metadata_failed",
+                            "candidate_sha256": shell_path_sha256(&candidate),
+                            "candidate_source": source,
+                            "os_error": error.raw_os_error(),
+                        }),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn shell_executable_preflight(
+    command: &str,
+    effective_working_dir: Option<&str>,
+    delivered: &BTreeMap<String, String>,
+) -> Result<ShellExecutablePreflight, ErrorData> {
+    let spawn_command = prepared_shell_spawn_command(command, effective_working_dir)?;
+    let path_class = shell_command_path_class(spawn_command.as_ref());
+    if spawn_command.trim().is_empty() {
+        return Ok(ShellExecutablePreflight {
+            state: "invalid",
+            source: None,
+            spawn_command_path_class: path_class,
+            resolved_path_sha256: None,
+        });
+    }
+    let spawn_path = PathBuf::from(spawn_command.as_ref());
+    let mut candidates = Vec::new();
+    if spawn_path.is_absolute() {
+        candidates.push((spawn_path, "explicit_absolute_path"));
+    } else if spawn_command.contains(['/', '\\']) {
+        let base = match effective_working_dir {
+            Some(path) => PathBuf::from(path),
+            None => std::env::current_dir().map_err(|error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("act_run_shell executable preflight could not read current directory: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "executable_preflight_current_directory_failed",
+                        "os_error": error.raw_os_error(),
+                    }),
+                )
+            })?,
+        };
+        candidates.push((base.join(spawn_path), "effective_working_directory"));
+    } else {
+        if let Some(path) = delivered_environment_value(delivered, "PATH") {
+            candidates.extend(
+                std::env::split_paths(path).map(|dir| (dir.join(&spawn_path), "child_path")),
+            );
+        }
+        #[cfg(windows)]
+        {
+            let current_exe = std::env::current_exe().map_err(|error| {
+                shell_tool_error(
+                    error_codes::TOOL_INTERNAL_ERROR,
+                    format!("act_run_shell executable preflight could not read current executable: {error}"),
+                    json!({
+                        "code": error_codes::TOOL_INTERNAL_ERROR,
+                        "reason": "executable_preflight_current_executable_failed",
+                        "os_error": error.raw_os_error(),
+                    }),
+                )
+            })?;
+            if let Some(dir) = current_exe.parent() {
+                candidates.push((dir.join(&spawn_path), "current_executable_directory"));
+            }
+            if let Some(root) = delivered_environment_value(delivered, "SystemRoot") {
+                let root = PathBuf::from(root);
+                candidates.push((root.join("System32").join(&spawn_path), "system_directory"));
+                candidates.push((root.join(&spawn_path), "windows_directory"));
+            }
+            if let Some(path) = std::env::var_os("PATH") {
+                candidates.extend(
+                    std::env::split_paths(&path).map(|dir| (dir.join(&spawn_path), "parent_path")),
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        if delivered_environment_value(delivered, "PATH").is_none() {
+            candidates.extend(
+                ["/bin", "/usr/bin"]
+                    .into_iter()
+                    .map(|dir| (PathBuf::from(dir).join(&spawn_path), "os_default_path")),
+            );
+        }
+    }
+    let Some((resolved, source)) = resolved_executable_candidate(candidates)? else {
+        return Ok(ShellExecutablePreflight {
+            state: "not_found",
+            source: None,
+            spawn_command_path_class: path_class,
+            resolved_path_sha256: None,
+        });
+    };
+    Ok(ShellExecutablePreflight {
+        state: "resolved",
+        source: Some(source),
+        spawn_command_path_class: path_class,
+        resolved_path_sha256: Some(shell_path_sha256(&resolved)),
     })
 }
 
@@ -19907,6 +20101,63 @@ fn shell_spawn_command(command: &str) -> Cow<'_, str> {
     Cow::Borrowed(command)
 }
 
+/// Resolve the documented `Command::current_dir` + relative-program ambiguity
+/// before both causal measurement and execution. The exact request remains in
+/// the command audit; only the program passed to `Command::new` is normalized.
+fn prepared_shell_spawn_command<'a>(
+    command: &'a str,
+    effective_working_dir: Option<&str>,
+) -> Result<Cow<'a, str>, ErrorData> {
+    let spawn_command = shell_spawn_command(command);
+    match shell_command_path_class(spawn_command.as_ref()) {
+        "drive_relative" => Err(shell_tool_error(
+            error_codes::TOOL_PARAMS_INVALID,
+            "act_run_shell refuses drive-relative executable paths because their resolution depends on ambient per-drive process state",
+            json!({
+                "code": error_codes::TOOL_PARAMS_INVALID,
+                "reason": "drive_relative_executable_ambiguous",
+                "requested_path_class": "drive_relative",
+                "remediation": "use an absolute executable path, a bare executable name, or a relative path rooted by working_dir",
+            }),
+        )),
+        "relative_path" => {
+            let base = match effective_working_dir {
+                Some(path) => PathBuf::from(path),
+                None => std::env::current_dir().map_err(|error| {
+                    shell_tool_error(
+                        error_codes::TOOL_INTERNAL_ERROR,
+                        format!(
+                            "act_run_shell could not resolve its relative executable against the current directory: {error}"
+                        ),
+                        json!({
+                            "code": error_codes::TOOL_INTERNAL_ERROR,
+                            "reason": "relative_executable_current_directory_failed",
+                            "os_error": error.raw_os_error(),
+                        }),
+                    )
+                })?,
+            };
+            let resolved = base
+                .join(spawn_command.as_ref())
+                .into_os_string()
+                .into_string()
+                .map_err(|_| {
+                    shell_tool_error(
+                        error_codes::TOOL_PARAMS_INVALID,
+                        "act_run_shell relative executable resolved to a non-Unicode path",
+                        json!({
+                            "code": error_codes::TOOL_PARAMS_INVALID,
+                            "reason": "relative_executable_non_unicode",
+                            "remediation": "use an absolute Unicode executable path",
+                        }),
+                    )
+                })?;
+            Ok(Cow::Owned(resolved))
+        }
+        _ => Ok(spawn_command),
+    }
+}
+
 #[cfg(windows)]
 fn trusted_ssh_automatic_replay_executable(command: &str) -> Option<PathBuf> {
     let mut candidates = windows_git_ssh_dir_candidates()
@@ -23760,7 +24011,9 @@ fn spawn_shell_job_child(
     stderr_file: fs::File,
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, SpawnShellJobChildFailure> {
-    let spawn_command = shell_spawn_command(&spawn_plan.command);
+    let spawn_command =
+        prepared_shell_spawn_command(&spawn_plan.command, params.working_dir.as_deref())
+            .map_err(SpawnShellJobChildFailure::BeforeSpawn)?;
     let mut command = TokioCommand::new(spawn_command.as_ref());
     command.args(&spawn_plan.args);
     if let Some(working_dir) = &params.working_dir {
@@ -28322,7 +28575,8 @@ fn spawn_shell_child(
     params: &ActRunShellParams,
     context: Option<&ShellExecutionContext>,
 ) -> Result<SpawnedShellChild, ErrorData> {
-    let spawn_command = shell_spawn_command(&params.command);
+    let spawn_command =
+        prepared_shell_spawn_command(&params.command, params.working_dir.as_deref())?;
     let mut command = TokioCommand::new(spawn_command.as_ref());
     command.args(&params.args);
     if let Some(working_dir) = &params.working_dir {

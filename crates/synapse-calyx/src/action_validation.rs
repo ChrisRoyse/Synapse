@@ -7,7 +7,7 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{AnchorKind, AnchorValue, CxId, SlotId, SlotVector};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
-use calyx_ward::GuardProfile;
+use calyx_ward::{GuardPolicy, GuardProfile};
 use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -22,19 +22,22 @@ pub const ACTION_DOMAIN: &str = "synapse.action";
 /// Goodhart boundary recalibrated after this was measured", so it is not
 /// upgraded in place: it is simply not read, and readiness reports absent
 /// evidence with a rerun remediation instead of a false pass.
-pub const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v2/synapse.action";
-pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 2;
+pub const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v3/synapse.action";
+pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 3;
 /// Must track `SYN_ACTION_PANEL_VERSION` in
 /// `synapse-storage/src/constellations.rs` (no dependency edge exists in this
 /// direction, so the value is duplicated by hand). A mismatch fails loud
 /// (`SYNAPSE_CALYX_ACTION_VALIDATION_PANEL_MISMATCH`) rather than reading
-/// evidence measured under a different frozen slot layout: bumped `2_185_004`
-/// -> `2_185_005` to separate command reward from physical action-execution
-/// reward and add the immutable precondition lens. This deliberately re-arms
+/// evidence measured under a different frozen slot layout: bumped `2_185_005`
+/// -> `2_185_006` to add the compact admission-context lane and separate Ward's
+/// OOD calibration axis from command reward. This deliberately re-arms
 /// readiness — held-out evidence and the Ward boundary must be re-measured on
-/// the causally coherent command population, never inherited from the mixed
-/// outcome generation.
-pub const ACTION_PANEL_VERSION: u32 = 2_185_005;
+/// the causally coherent population, never inherited from the memorizing exact
+/// request boundary.
+pub const ACTION_PANEL_VERSION: u32 = 2_185_006;
+pub const ACTION_GUARD_ANCHOR_KIND: &str = "action_guard_region";
+const ACTION_CAUSAL_PREDICTOR: &str = "typed_slot_rrf_knn.v1";
+const ACTION_CAUSAL_PREDICTOR_SLOTS: &[u16] = &[48, 117, 118, 119, 120, 121, 122, 123];
 const MIN_ACTION_RECORDS: usize = 50;
 pub const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
@@ -60,6 +63,8 @@ pub struct SynapseCalyxActionValidationEvidence {
     pub guard_profile_sha256: String,
     pub regression_evaluated: usize,
     pub mistake_count: usize,
+    pub predictor: String,
+    pub predictor_slots: Vec<u16>,
     pub goodhart: GoodhartReport,
     pub mistakes: RegressionReport,
     pub ledger_seq: u64,
@@ -78,6 +83,7 @@ struct ActionObservation {
     created_at: u64,
     action: String,
     outcome: bool,
+    causes: BTreeMap<SlotId, Vec<f32>>,
 }
 
 impl SynapseCalyxVault {
@@ -142,6 +148,8 @@ impl SynapseCalyxVault {
             guard_profile_sha256: guard_profile_sha256.clone(),
             regression_evaluated,
             mistake_count,
+            predictor: ACTION_CAUSAL_PREDICTOR.to_owned(),
+            predictor_slots: ACTION_CAUSAL_PREDICTOR_SLOTS.to_vec(),
             goodhart,
             mistakes,
             ledger_seq: 0,
@@ -159,6 +167,8 @@ impl SynapseCalyxVault {
             "goodhart_passed": draft.goodhart.passed,
             "mistakes_passed": draft.mistakes.passed,
             "mistake_count": mistake_count,
+            "predictor": ACTION_CAUSAL_PREDICTOR,
+            "predictor_slots": ACTION_CAUSAL_PREDICTOR_SLOTS,
         }))
         .map_err(|error| validation_encode_error("ledger payload", &error))?;
         let mut persisted: Option<SynapseCalyxActionValidationEvidence> = None;
@@ -298,7 +308,7 @@ impl SynapseCalyxVault {
         self.with_panel_read_snapshot(
             ACTION_PANEL_VERSION,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
-            |snapshot| self.walk_panel_base_snapshot(snapshot, ACTION_PANEL_VERSION, |_snapshot, _key, value| {
+            |snapshot| self.walk_panel_base_snapshot(snapshot, ACTION_PANEL_VERSION, |snapshot, _key, value| {
             let base = decode_constellation_base(value).map_err(|error| {
                 SynapseCalyxError::from_calyx("decode action validation Base row", &error)
             })?;
@@ -338,7 +348,25 @@ impl SynapseCalyxVault {
                 format!("action record {} has no grounded Bool reward", base.cx_id),
                 "publish the real terminal action outcome before validation",
             ))?;
-            observations.push(ActionObservation { cx_id: base.cx_id, created_at: base.created_at, action: action.to_owned(), outcome });
+            let hydrated = self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
+            let mut causes = BTreeMap::new();
+            for raw_slot in ACTION_CAUSAL_PREDICTOR_SLOTS {
+                let slot = SlotId::new(*raw_slot);
+                if let Some(SlotVector::Dense { data, .. }) = hydrated.slots.get(&slot)
+                    && !data.is_empty()
+                    && data.iter().all(|value| value.is_finite())
+                {
+                    causes.insert(slot, data.clone());
+                }
+            }
+            if !causes.contains_key(&SlotId::new(123)) {
+                return Err(validation_error(
+                    "SYNAPSE_CALYX_ACTION_VALIDATION_ADMISSION_CONTEXT_MISSING",
+                    format!("action reward record {} lacks finite dense admission-context slot 123", base.cx_id),
+                    "repair the action-panel backfill before validating autonomy; the causal predictor never falls back to action-name majority",
+                ));
+            }
+            observations.push(ActionObservation { cx_id: base.cx_id, created_at: base.created_at, action: action.to_owned(), outcome, causes });
             if observations.len() > MAX_ACTION_RECORDS {
                 return Err(validation_error(
                     "SYNAPSE_CALYX_ACTION_VALIDATION_CORPUS_LIMIT",
@@ -384,11 +412,12 @@ impl SynapseCalyxVault {
         if profile.panel_version != panel_version
             || !profile.is_calibrated()
             || profile.required_slots.is_empty()
+            || profile.calibration_anchor_kind.as_deref() != Some(ACTION_GUARD_ANCHOR_KIND)
         {
             return Err(validation_error(
                 "SYNAPSE_CALYX_ACTION_VALIDATION_GUARD_PROVISIONAL",
-                "action-panel Ward profile is uncalibrated, mismatched, or has no required slots",
-                "calibrate a non-empty per-slot action guard before oracle_validate",
+                "action-panel Ward profile is uncalibrated, mismatched, has no required slots, or is not bound to action_guard_region",
+                "calibrate a non-empty per-slot action guard with anchor_kind=action_guard_region before oracle_validate",
             ));
         }
         let training_good = training
@@ -420,20 +449,28 @@ impl SynapseCalyxVault {
         let mut accepted = 0usize;
         for row in &held_out_good {
             let query = self.action_dense_slots(row.cx_id, &profile.required_slots)?;
-            let passes = profile.required_slots.iter().all(|slot| {
-                let Some(query_vector) = query.get(slot) else {
-                    return false;
-                };
-                let Some(tau) = profile.tau_for(slot) else {
-                    return false;
-                };
-                trusted
-                    .iter()
-                    .filter_map(|candidate| candidate.get(slot))
-                    .filter_map(|candidate| dense_cosine(query_vector, candidate))
-                    .max_by(f32::total_cmp)
-                    .is_some_and(|score| score >= tau)
-            });
+            let pass_count = profile
+                .required_slots
+                .iter()
+                .filter(|slot| {
+                    let Some(query_vector) = query.get(slot) else {
+                        return false;
+                    };
+                    let Some(tau) = profile.tau_for(slot) else {
+                        return false;
+                    };
+                    trusted
+                        .iter()
+                        .filter_map(|candidate| candidate.get(slot))
+                        .filter_map(|candidate| dense_cosine(query_vector, candidate))
+                        .max_by(f32::total_cmp)
+                        .is_some_and(|score| score >= tau)
+                })
+                .count();
+            let passes = match &profile.policy {
+                GuardPolicy::AllRequired => pass_count == profile.required_slots.len(),
+                GuardPolicy::KofN { k } => pass_count >= *k,
+            };
             accepted += usize::from(passes);
         }
         let accepted = accepted.to_f64().ok_or_else(|| {
@@ -515,78 +552,138 @@ fn action_mistake_report(
     held_out: &[ActionObservation],
     all: &[ActionObservation],
 ) -> Result<(RegressionReport, usize, usize), SynapseCalyxError> {
-    let mut prior = outcome_counts(training);
-    let current = outcome_counts(all);
+    let mut prior = training.iter().collect::<Vec<_>>();
     let mut results = Vec::new();
     let mut evaluated = 0usize;
     for row in held_out {
-        let counts = prior.entry(row.action.clone()).or_default();
-        if counts.0 + counts.1 > 0 {
+        if let Some(old) = typed_causal_prediction(row, prior.iter().copied())? {
             evaluated += 1;
-            let old = majority(*counts);
             if old != row.outcome {
-                let now = current
-                    .get(&row.action)
-                    .copied()
-                    .map(majority)
-                    .ok_or_else(|| {
-                        validation_error(
-                            "SYNAPSE_CALYX_ACTION_VALIDATION_REPLAY_SOURCE_MISSING",
-                            format!("current evidence lost action identity for {}", row.action),
-                            "preserve the action corpus and rerun validation",
+                let now = typed_causal_prediction(row, all.iter())?;
+                let (new_prediction, new_surprise, recurred, prediction_error) = now.map_or_else(
+                    || {
+                        (
+                            f64::from(u8::from(old)),
+                            1.0,
+                            true,
+                            Some(
+                                "typed causal predictor has no non-tied current neighbor evidence"
+                                    .to_owned(),
+                            ),
                         )
-                    })?;
+                    },
+                    |now| {
+                        (
+                            f64::from(u8::from(now)),
+                            if now == row.outcome { 0.0 } else { 1.0 },
+                            now != row.outcome,
+                            None,
+                        )
+                    },
+                );
                 results.push(RegressionResult {
                     cx_id: row.cx_id,
                     old_prediction: f64::from(u8::from(old)),
                     observed: f64::from(u8::from(row.outcome)),
                     old_surprise: 1.0,
-                    new_prediction: f64::from(u8::from(now)),
-                    new_surprise: if now == row.outcome { 0.0 } else { 1.0 },
-                    recurred: now != row.outcome,
+                    new_prediction,
+                    new_surprise,
+                    recurred,
                     anchor: AnchorKind::Reward,
-                    prediction_error: None,
+                    prediction_error,
                 });
             }
         }
-        if row.outcome {
-            counts.1 += 1;
-        } else {
-            counts.0 += 1;
-        }
+        prior.push(row);
     }
     if evaluated < MIN_HELD_OUT_RECORDS {
         return Err(validation_error(
             "SYNAPSE_CALYX_ACTION_VALIDATION_REPLAY_INSUFFICIENT",
             format!("only {evaluated} held-out actions had prior evidence for real replay"),
-            "collect repeated terminal outcomes for the same actions before validating autonomy",
+            "collect terminal outcomes with comparable pre-trigger causal slots before validating autonomy",
         ));
     }
     let mistake_count = results.len();
     Ok((RegressionReport::new(results), evaluated, mistake_count))
 }
 
-fn outcome_counts(rows: &[ActionObservation]) -> BTreeMap<String, (usize, usize)> {
-    let mut counts = BTreeMap::new();
-    for row in rows {
-        let entry = counts.entry(row.action.clone()).or_insert((0, 0));
-        if row.outcome {
-            entry.1 += 1;
-        } else {
-            entry.0 += 1;
+fn typed_causal_prediction<'a>(
+    query: &ActionObservation,
+    candidates: impl IntoIterator<Item = &'a ActionObservation>,
+) -> Result<Option<bool>, SynapseCalyxError> {
+    const RRF_K: f64 = 60.0;
+    const TOP_NEIGHBORS: usize = 11;
+    let candidates = candidates
+        .into_iter()
+        .filter(|candidate| candidate.cx_id != query.cx_id)
+        .collect::<Vec<_>>();
+    let mut fused: BTreeMap<CxId, (f64, bool)> = BTreeMap::new();
+    for raw_slot in ACTION_CAUSAL_PREDICTOR_SLOTS {
+        let slot = SlotId::new(*raw_slot);
+        let Some(query_vector) = query.causes.get(&slot) else {
+            continue;
+        };
+        let mut ranking = candidates
+            .iter()
+            .filter_map(|candidate| {
+                let score = dense_cosine(query_vector, candidate.causes.get(&slot)?)?;
+                (score > 0.0).then_some((score, candidate.cx_id, candidate.outcome))
+            })
+            .collect::<Vec<_>>();
+        ranking.sort_by(|left, right| {
+            right
+                .0
+                .total_cmp(&left.0)
+                .then_with(|| left.1.cmp(&right.1))
+        });
+        for (rank, (_, cx_id, outcome)) in ranking.into_iter().enumerate() {
+            let rank = rank.to_f64().ok_or_else(|| {
+                validation_error(
+                    "SYNAPSE_CALYX_ACTION_VALIDATION_RANK_OUT_OF_RANGE",
+                    "causal neighbor rank cannot be represented as f64",
+                    "reduce the bounded action validation corpus",
+                )
+            })? + 1.0;
+            let contribution = 1.0 / (RRF_K + rank);
+            let entry = fused.entry(cx_id).or_insert((0.0, outcome));
+            if entry.1 != outcome {
+                return Err(validation_error(
+                    "SYNAPSE_CALYX_ACTION_VALIDATION_OUTCOME_IDENTITY_CONFLICT",
+                    format!("causal neighbor {cx_id} carries conflicting outcomes"),
+                    "repair the action corpus; one content-addressed observation cannot carry two outcomes",
+                ));
+            }
+            entry.0 += contribution;
         }
     }
-    counts
-}
-
-// Oracle outcome labels sort `bool:false` before `bool:true`, so ties resolve false.
-const fn majority((failed, succeeded): (usize, usize)) -> bool {
-    succeeded > failed
+    let mut ranking = fused
+        .into_iter()
+        .map(|(cx_id, (score, outcome))| (score, cx_id, outcome))
+        .collect::<Vec<_>>();
+    ranking.sort_by(|left, right| {
+        right
+            .0
+            .total_cmp(&left.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+    let mut failed = 0.0;
+    let mut succeeded = 0.0;
+    for (score, _, outcome) in ranking.into_iter().take(TOP_NEIGHBORS) {
+        if outcome {
+            succeeded += score;
+        } else {
+            failed += score;
+        }
+    }
+    if succeeded == 0.0 && failed == 0.0 || (succeeded - failed).abs() <= f64::EPSILON {
+        return Ok(None);
+    }
+    Ok(Some(succeeded > failed))
 }
 
 fn action_corpus_hash(rows: &[ActionObservation]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"synapse-action-validation-corpus-v1");
+    hasher.update(b"synapse-action-validation-corpus-v2-typed-slot-rrf-knn");
     for row in rows {
         hasher.update(row.cx_id.as_bytes());
         hasher.update(row.created_at.to_be_bytes());

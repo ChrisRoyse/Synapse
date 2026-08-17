@@ -215,6 +215,9 @@ pub struct SynapseCalyxGuardCalibrateParams {
     pub panel_version: u32,
     pub slots: Vec<SynapseCalyxGuardSlotSpec>,
     pub domain: String,
+    /// Optional exact grounded anchor axis used for good/bad adjudication.
+    /// Omitting it preserves the legacy all-adjudicable-anchor behavior.
+    pub anchor_kind: Option<String>,
     pub alpha: f32,
     /// Per-slot target false-accept rate. `None` uses the aspect's maximum.
     pub target_far: Option<f32>,
@@ -255,6 +258,7 @@ impl SynapseCalyxGuardCalibrateParams {
             panel_version,
             slots,
             domain: "default".to_owned(),
+            anchor_kind: None,
             alpha: SYNAPSE_GUARD_DEFAULT_ALPHA,
             target_far: None,
             max_records: crate::SYNAPSE_INTELLIGENCE_MAX_RECORDS,
@@ -290,6 +294,7 @@ pub struct SynapseCalyxGuardSlotCalibration {
 pub struct SynapseCalyxGuardCalibrateReport {
     pub panel_version: u32,
     pub domain: String,
+    pub anchor_kind: Option<String>,
     pub guard_id: String,
     pub alpha: f32,
     pub novelty_action: String,
@@ -356,6 +361,7 @@ pub struct SynapseCalyxGuardVerifyReport {
     pub query_cx_id: String,
     pub guard_id: String,
     pub domain: String,
+    pub calibration_anchor_kind: Option<String>,
     pub high_stakes: bool,
     pub overall_pass: bool,
     pub provisional: bool,
@@ -741,6 +747,20 @@ impl SynapseCalyxVault {
                 "name at least one dense active panel slot with its aspect (identity/stylistic/content)",
             ));
         }
+        if params
+            .anchor_kind
+            .as_deref()
+            .is_some_and(|kind| kind.trim().is_empty() || kind.len() > 128 || kind.trim() != kind)
+        {
+            return Err(guard_error(
+                "SYNAPSE_CALYX_GUARD_ANCHOR_KIND_INVALID",
+                format!(
+                    "guard calibration anchor_kind {:?} must be a non-blank, trimmed identifier of at most 128 bytes",
+                    params.anchor_kind
+                ),
+                "name the exact grounded anchor kind, for example reward or action_guard_region",
+            ));
+        }
         if !params.alpha.is_finite() || !(0.0..1.0).contains(&params.alpha) {
             return Err(guard_error(
                 "SYNAPSE_CALYX_GUARD_INVALID_ALPHA",
@@ -849,6 +869,7 @@ impl SynapseCalyxVault {
             guard_id: GuardId::new(Uuid::new_v4()),
             panel_version: params.panel_version,
             domain: params.domain.clone(),
+            calibration_anchor_kind: params.anchor_kind.clone(),
             tau: BTreeMap::new(),
             required_slots: Vec::new(),
             policy: GuardPolicy::AllRequired,
@@ -1078,6 +1099,7 @@ impl SynapseCalyxVault {
         Ok(SynapseCalyxGuardCalibrateReport {
             panel_version: params.panel_version,
             domain: params.domain.clone(),
+            anchor_kind: params.anchor_kind.clone(),
             guard_id: profile.guard_id.to_string(),
             alpha: params.alpha,
             novelty_action: match params.novelty_action {
@@ -1335,6 +1357,7 @@ impl SynapseCalyxVault {
             query_cx_id: query_cx.to_string(),
             guard_id: verdict.guard_id.to_string(),
             domain: profile.domain.clone(),
+            calibration_anchor_kind: profile.calibration_anchor_kind.clone(),
             high_stakes: params.high_stakes,
             overall_pass: verdict.overall_pass,
             provisional: verdict.provisional,
@@ -1577,6 +1600,11 @@ impl SynapseCalyxVault {
                         let mut adjudicated = false;
                         for anchor in &constellation.anchors {
                             if anchor.confidence <= 0.0 {
+                                continue;
+                            }
+                            if params.anchor_kind.as_deref().is_some_and(|wanted| {
+                                crate::grounding::anchor_kind_label(&anchor.kind) != wanted
+                            }) {
                                 continue;
                             }
                             match anchor.value {

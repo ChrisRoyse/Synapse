@@ -256,6 +256,7 @@ fn civic_profile(corpus_hash: [u8; 32]) -> GuardProfile {
         guard_id: GUARD_UUID.parse::<GuardId>().expect("static guard id"),
         panel_version: 70,
         domain: "polis-civic-synthetic-personas".to_string(),
+        calibration_anchor_kind: None,
         tau,
         required_slots: required_slots(),
         policy: GuardPolicy::AllRequired,

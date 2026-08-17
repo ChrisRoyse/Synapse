@@ -379,9 +379,9 @@ fn oracle_clean_fix(result: &OracleSelfConsistency) -> String {
 fn panel_sufficiency_fix(panel: &Panel, report: &PanelSufficiency) -> String {
     match max_deficit_lens(panel, report) {
         Some((lens_id, deficit)) => {
-            format!("add outcome/execution-derived lens for {lens_id} (deficit {deficit:.6} bits)")
+            format!("add a pre-trigger causal lens for {lens_id} (deficit {deficit:.6} bits)")
         }
-        None => "add outcome/execution-derived lens for unassigned sensor".to_string(),
+        None => "add a pre-trigger causal lens for the unassigned sensor".to_string(),
     }
 }
 

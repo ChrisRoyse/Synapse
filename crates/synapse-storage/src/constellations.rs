@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::path::Path;
 use std::time::Duration;
 
 use calyx_core::{
@@ -29,6 +30,7 @@ use synapse_calyx::panel_lifecycle::{
     SynapseCalyxDerivedGraphRow, SynapseCalyxDerivedSnapshotReadback,
     SynapseCalyxDerivedSnapshotRequest,
 };
+use synapse_core::error_codes;
 use synapse_core::types::{
     AgentEndState, AgentEventKind, AgentEventRecord, AgentTranscriptRecord, EpisodeBoundary,
     EpisodeRecord, GenAiOperationName, SensorStatus, StoredObservation, StoredReflexAudit,
@@ -199,7 +201,19 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// `status`, or `error`, so host state can explain a result without containing
 /// it. This generation is immutable because changing the anchor population or
 /// adding slot 122 would reinterpret already-persisted `2_185_004` rows.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_005;
+///
+/// Generation `2_185_006` adds the compact admission-context lane and a
+/// dedicated `action_guard_region` anchor axis. Ward previously pooled every
+/// Bool anchor, so an in-distribution execution failure was mislabeled as OOD;
+/// its only calibratable slot was then the exact request fingerprint, which
+/// rejected legitimate unseen requests. Slot 123 keeps only pre-trigger finite
+/// facts (tool/verb/request structure plus shell executable-resolution state),
+/// while the new anchor distinguishes region membership from command reward.
+/// Neither meaning is grafted onto the already-written `2_185_005` generation.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_006;
+/// The causal-unit/precondition generation superseded by guard-axis separation
+/// and the compact admission-context lane.
+pub const SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT: u32 = 2_185_005;
 /// The mixed-outcome generation superseded by causal-unit separation and the
 /// precondition lane.
 pub const SYN_ACTION_PANEL_VERSION_PRE_PRECONDITIONS: u32 = 2_185_004;
@@ -757,6 +771,11 @@ const ACT_REQUEST_ATOM_VECTOR_DIM: u32 = 512;
 /// the same 128-atom ceiling as the request-atom lens. Keeping it separate is
 /// load-bearing: request intent and host preconditions are distinct causes.
 const ACT_PRECONDITION_ATOM_VECTOR_DIM: u32 = 512;
+/// Compact, dense pre-trigger context used by Ward and chronological replay.
+/// At most 64 typed finite facts enter this signed feature-hash projection;
+/// 128 dimensions keeps collision noise below 0.09 without reproducing the
+/// exact 512-dimensional request identity lane.
+const ACT_ADMISSION_CONTEXT_DIM: u32 = 128;
 /// Frozen byte-length scale for the pre-action request lane.
 ///
 /// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
@@ -871,6 +890,9 @@ const ACT_SLOT_REQUEST_ATOMS: SlotId = SlotId::new(121);
 /// Bounded semantic atoms of the immutable command `before` snapshot. Slot 122
 /// has never carried another meaning.
 const ACT_SLOT_PRECONDITION_ATOMS: SlotId = SlotId::new(122);
+/// Compact admission context over request shape and point-in-time preflight.
+/// Slot 123 has never carried another meaning.
+const ACT_SLOT_ADMISSION_CONTEXT: SlotId = SlotId::new(123);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -1033,13 +1055,13 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
     },
     // The action panel's second block (#2050/#1690). Holds the dense target,
     // exact request, bounded request-size/request-shape, semantic request and
-    // precondition lanes (117..=122). `48..=52` could not be
+    // precondition and admission-context lanes (117..=123). `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
         first: 117,
-        last: 122,
+        last: 123,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2535,6 +2557,10 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         ACT_SLOT_PRECONDITION_ATOMS,
         "syn.action.precondition_atoms.v1",
     ),
+    (
+        ACT_SLOT_ADMISSION_CONTEXT,
+        "syn.action.admission_context.v1",
+    ),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -2974,6 +3000,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_CLASSES,
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS,
                 SYN_ACTION_PANEL_VERSION_PRE_PRECONDITIONS,
+                SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5413,6 +5440,10 @@ pub fn build_action_constellation(
         action_precondition_atom_slot(source_key, record)?,
     );
     slots.insert(
+        ACT_SLOT_ADMISSION_CONTEXT,
+        action_admission_context_slot(source_key, record)?,
+    );
+    slots.insert(
         ACT_SLOT_RECORD_VECTOR,
         measure_json(
             SYN_ACTION_PANEL_NAME,
@@ -5454,9 +5485,28 @@ fn append_action_outcome_anchor(
     source_key: &[u8],
     record: &Value,
 ) -> StorageResult<()> {
-    let Some(anchor) = action_outcome_anchor(source_key, record)? else {
-        return Ok(());
+    let outcome_appended = if let Some(anchor) = action_outcome_anchor(source_key, record)? {
+        append_typed_action_anchor(constellation, anchor)?;
+        true
+    } else {
+        false
     };
+    let guard_appended = if let Some(anchor) = action_guard_region_anchor(source_key, record)? {
+        append_typed_action_anchor(constellation, anchor)?;
+        true
+    } else {
+        false
+    };
+    if outcome_appended || guard_appended {
+        constellation.flags.ungrounded = false;
+    }
+    Ok(())
+}
+
+fn append_typed_action_anchor(
+    constellation: &mut Constellation,
+    anchor: GroundingAnchor,
+) -> StorageResult<()> {
     let GroundingAnchorValue::Bool(outcome) = anchor.value else {
         return Err(StorageError::WriteFailed {
             cf_name: cf::CF_ACTION_LOG.to_owned(),
@@ -5466,6 +5516,7 @@ fn append_action_outcome_anchor(
     let kind = match anchor.kind_label.as_str() {
         "reward" => AnchorKind::Reward,
         "action_execution_reward" => AnchorKind::Label("action_execution_reward".to_owned()),
+        "action_guard_region" => AnchorKind::Label("action_guard_region".to_owned()),
         other => {
             return Err(StorageError::WriteFailed {
                 cf_name: cf::CF_ACTION_LOG.to_owned(),
@@ -5482,7 +5533,6 @@ fn append_action_outcome_anchor(
         observed_at: anchor.observed_at_ms,
         confidence: anchor.confidence,
     });
-    constellation.flags.ungrounded = false;
     Ok(())
 }
 
@@ -7083,6 +7133,64 @@ pub fn action_outcome_anchor(
     }))
 }
 
+/// Grounds the OOD/admission axis independently from command reward.
+///
+/// A successful command proves its pre-trigger request was admitted. An error
+/// is labeled outside the trusted region only when the terminal code names a
+/// request/target/policy boundary. Runtime, transport, timeout, cancellation,
+/// and internal failures remain unadjudicated on this axis: treating them as
+/// OOD is the category error that previously forced Ward to memorize requests.
+fn action_guard_region_anchor(
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<Option<GroundingAnchor>> {
+    if json_string(record, &["row_kind"]).as_deref() != Some("command_audit")
+        || json_string(record, &["phase"]).as_deref() != Some("final")
+    {
+        return Ok(None);
+    }
+    let outcome = match json_string(record, &["outcome"]).as_deref() {
+        Some("ok") => true,
+        Some("error") => {
+            let Some(code) = json_string(record, &["error_code"]) else {
+                return Ok(None);
+            };
+            if !matches!(
+                code.as_str(),
+                error_codes::ACTION_TARGET_INVALID
+                    | error_codes::TOOL_PARAMS_INVALID
+                    | error_codes::ACTION_LAUNCH_WINDOW_NOT_FOUND
+                    | error_codes::ACTION_LAUNCH_CDP_ATTESTATION_FAILED
+                    | error_codes::SAFETY_SHELL_DENIED_BY_POLICY
+            ) {
+                return Ok(None);
+            }
+            false
+        }
+        value => {
+            return Err(StorageError::ReadFailed {
+                cf_name: cf::CF_ACTION_LOG.to_owned(),
+                detail: format!(
+                    "terminal command_audit row has unsupported guard-region outcome {value:?}; remediation=repair the authoritative row to outcome=ok|error or extend the versioned guard-region adjudication contract"
+                ),
+            });
+        }
+    };
+    let observed_at_ms = json_u64(record, &["ts_ns"])
+        .ok_or_else(|| StorageError::ReadFailed {
+            cf_name: cf::CF_ACTION_LOG.to_owned(),
+            detail: "terminal action guard-region outcome has no finite u64 ts_ns; remediation=repair the authoritative action audit row before grounding it".to_owned(),
+        })?
+        / 1_000_000;
+    Ok(Some(GroundingAnchor {
+        kind_label: "action_guard_region".to_owned(),
+        value: GroundingAnchorValue::Bool(outcome),
+        source: source_pointer(cf::CF_ACTION_LOG, source_key),
+        observed_at_ms,
+        confidence: 1.0,
+    }))
+}
+
 fn reflex_metadata(
     source_key: &[u8],
     raw_bytes: &[u8],
@@ -8403,7 +8511,28 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         registry,
     )?);
     slots.push(action_precondition_panel_slot(panel_version, registry)?);
+    slots.push(action_admission_context_panel_slot(
+        panel_version,
+        registry,
+    )?);
     Ok(slots)
+}
+
+fn action_admission_context_panel_slot(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Slot> {
+    syn_content_slot(
+        ACT_SLOT_ADMISSION_CONTEXT,
+        "syn.action.admission_context.v1",
+        RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.admission_context.v1",
+            Modality::Structured,
+            ACT_ADMISSION_CONTEXT_DIM,
+        ),
+        panel_version,
+        registry,
+    )
 }
 
 fn action_precondition_panel_slot(
@@ -10343,6 +10472,242 @@ fn action_precondition_atom_slot(source_key: &[u8], record: &Value) -> StorageRe
             "syn.action.precondition_atoms.v1",
             Modality::Structured,
             ACT_PRECONDITION_ATOM_VECTOR_DIM,
+        ),
+        &Value::Object(features),
+    )
+}
+
+const ACT_ADMISSION_MAX_FEATURES: usize = 64;
+const ACT_ADMISSION_MAX_DEPTH: usize = 8;
+
+fn insert_action_admission_feature(
+    features: &mut serde_json::Map<String, Value>,
+    namespace: &str,
+    value: &str,
+) {
+    const OVERFLOW_KEY: &str = "bounded_structure_overflow|v1";
+    if features.contains_key(OVERFLOW_KEY) {
+        return;
+    }
+    let key = format!(
+        "{namespace}|{}",
+        action_target_feature_digest(&value.to_lowercase())
+    );
+    if features.contains_key(&key) {
+        return;
+    }
+    if features.len() >= ACT_ADMISSION_MAX_FEATURES - 1 {
+        // The exact request remains in slot 118. This separate compact lens
+        // declares structural overflow as a measured state instead of silently
+        // dropping fields or refusing an otherwise auditable source row.
+        features.insert(OVERFLOW_KEY.to_owned(), json!(1.0));
+        return;
+    }
+    features.insert(key, json!(1.0));
+}
+
+fn collect_action_admission_structure(
+    value: &Value,
+    path: &str,
+    depth: usize,
+    features: &mut serde_json::Map<String, Value>,
+) {
+    if depth > ACT_ADMISSION_MAX_DEPTH {
+        insert_action_admission_feature(features, "request_structure", "depth_overflow");
+        return;
+    }
+    insert_action_admission_feature(
+        features,
+        "request_node_kind",
+        &format!("{path}:{}", request_value_kind(value)),
+    );
+    match value {
+        Value::Object(map) => {
+            let mut keys = map.keys().collect::<Vec<_>>();
+            keys.sort();
+            for key in keys {
+                insert_action_admission_feature(
+                    features,
+                    "request_field",
+                    &format!("{path}:{key}"),
+                );
+                collect_action_admission_structure(
+                    &map[key],
+                    &format!("{path}/{key}"),
+                    depth + 1,
+                    features,
+                );
+            }
+        }
+        Value::Array(items) => {
+            insert_action_admission_feature(
+                features,
+                "request_array_size",
+                &request_shape_count_class(items.len()).to_string(),
+            );
+            for item in items {
+                collect_action_admission_structure(
+                    item,
+                    &format!("{path}/[]"),
+                    depth + 1,
+                    features,
+                );
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+    }
+}
+
+fn action_command_path_class(command: &str) -> &'static str {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        "empty"
+    } else if Path::new(trimmed).is_absolute() {
+        "absolute"
+    } else if trimmed.len() >= 2
+        && trimmed.as_bytes()[1] == b':'
+        && trimmed.as_bytes()[0].is_ascii_alphabetic()
+    {
+        "drive_relative"
+    } else if trimmed.contains(['/', '\\']) {
+        "relative_path"
+    } else {
+        "bare_name"
+    }
+}
+
+fn collect_shell_action_admission_features(
+    payload: &Value,
+    before: &Value,
+    features: &mut serde_json::Map<String, Value>,
+) {
+    insert_action_admission_feature(features, "scope", "shell");
+    let command = payload.get("command").and_then(Value::as_str).unwrap_or("");
+    insert_action_admission_feature(
+        features,
+        "shell_command_path_class",
+        action_command_path_class(command),
+    );
+    let preconditions = before.get("preconditions");
+    let resolution = preconditions
+        .and_then(|value| value.get("executable_resolution"))
+        .and_then(Value::as_str)
+        .unwrap_or("legacy_unknown");
+    // Resolution is the direct point-in-time cause of spawn admission, so it
+    // deliberately carries more L2 mass than incidental request shape.
+    for index in 0..8 {
+        insert_action_admission_feature(
+            features,
+            &format!("shell_executable_resolution_{index}"),
+            resolution,
+        );
+    }
+    let working_directory_state = match (
+        preconditions
+            .and_then(|value| value.get("working_directory_present"))
+            .and_then(Value::as_bool),
+        preconditions
+            .and_then(|value| value.get("working_directory_exists"))
+            .and_then(Value::as_bool),
+    ) {
+        (Some(false), _) => "absent",
+        (Some(true), Some(true)) => "existing",
+        (Some(true), Some(false)) => "missing",
+        _ => "legacy_unknown",
+    };
+    insert_action_admission_feature(features, "shell_working_directory", working_directory_state);
+    let required_environment_state = preconditions
+        .and_then(|value| value.get("required_environment_missing"))
+        .and_then(Value::as_array)
+        .map_or("legacy_unknown", |missing| {
+            if missing.is_empty() {
+                "complete"
+            } else {
+                "missing"
+            }
+        });
+    insert_action_admission_feature(
+        features,
+        "shell_required_environment",
+        required_environment_state,
+    );
+}
+
+fn action_admission_context_slot(source_key: &[u8], record: &Value) -> StorageResult<SlotVector> {
+    if json_string(record, &["row_kind"]).as_deref() != Some("command_audit") {
+        return Ok(absent(AbsentReason::NotApplicable));
+    }
+    let payload = record.get("payload_bounded").ok_or_else(|| {
+        measurement_error(
+            "action admission context",
+            format!(
+                "source_cf={} source_key_hex={} command row is missing payload_bounded; remediation=repair or quarantine the malformed authoritative audit row",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key)
+            ),
+        )
+    })?;
+    let before = record.get("before").ok_or_else(|| {
+        measurement_error(
+            "action admission context",
+            format!(
+                "source_cf={} source_key_hex={} command row is missing before; remediation=repair or quarantine the malformed authoritative audit row",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key)
+            ),
+        )
+    })?;
+    let mut features = serde_json::Map::new();
+    insert_action_admission_feature(&mut features, "scope", "command");
+    for (namespace, value) in [
+        ("tool", json_string(record, &["tool"])),
+        ("verb", json_string(record, &["verb"])),
+        ("channel", json_string(record, &["channel"])),
+    ] {
+        insert_action_admission_feature(
+            &mut features,
+            namespace,
+            value.as_deref().unwrap_or("absent"),
+        );
+    }
+    insert_action_admission_feature(
+        &mut features,
+        "payload_truncated",
+        if record
+            .get("payload_truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "true"
+        } else {
+            "false"
+        },
+    );
+    insert_action_admission_feature(
+        &mut features,
+        "target_state",
+        if record.get("target").is_some_and(|value| !value.is_null()) {
+            "present"
+        } else {
+            "absent"
+        },
+    );
+    let shell = json_string(record, &["tool"]).as_deref() == Some("act_run_shell")
+        || json_string(record, &["verb"]).as_deref() == Some("shell_run");
+    if shell {
+        collect_shell_action_admission_features(payload, before, &mut features);
+    } else {
+        insert_action_admission_feature(&mut features, "scope", "non_shell");
+        insert_action_admission_feature(&mut features, "before_kind", request_value_kind(before));
+    }
+    collect_action_admission_structure(payload, "$", 0, &mut features);
+
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.admission_context.v1",
+            Modality::Structured,
+            ACT_ADMISSION_CONTEXT_DIM,
         ),
         &Value::Object(features),
     )

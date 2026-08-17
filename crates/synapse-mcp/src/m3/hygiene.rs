@@ -869,6 +869,10 @@ pub struct HygieneGuardCalibrateParams {
     pub slots: Vec<HygieneGuardSlotSpec>,
     #[serde(default)]
     pub domain: Option<String>,
+    /// Exact grounded anchor axis to adjudicate. Omit only for legacy panels
+    /// whose records carry a single unambiguous outcome axis.
+    #[serde(default)]
+    pub anchor_kind: Option<String>,
     /// Conformal miscoverage budget; the tau bounds the true FAR at `target_far`
     /// with confidence `1 - alpha`.
     #[serde(default)]
@@ -920,6 +924,7 @@ pub struct HygieneGuardCalibrateResponse {
     pub source_of_truth: &'static str,
     pub panel_version: u32,
     pub domain: String,
+    pub anchor_kind: Option<String>,
     pub guard_id: String,
     pub alpha: f32,
     pub novelty_action: String,
@@ -928,6 +933,7 @@ pub struct HygieneGuardCalibrateResponse {
     pub adjudicated_bad: u64,
     pub unadjudicated: u64,
     pub conflicting: u64,
+    pub adjudicated_without_guarded_slots: u64,
     pub estimator: String,
     pub slots: Vec<HygieneGuardSlotCalibration>,
     pub persisted: bool,
@@ -983,6 +989,7 @@ pub struct HygieneGuardVerifyResponse {
     pub query_cx_id: String,
     pub guard_id: String,
     pub domain: String,
+    pub calibration_anchor_kind: Option<String>,
     pub high_stakes: bool,
     pub overall_pass: bool,
     pub provisional: bool,
@@ -1225,6 +1232,18 @@ pub fn prepare_guard_calibrate_spec(
     if let Some(domain) = &params.domain {
         spec.domain.clone_from(domain);
     }
+    if let Some(anchor_kind) = &params.anchor_kind {
+        if anchor_kind.trim().is_empty()
+            || anchor_kind.trim() != anchor_kind
+            || anchor_kind.len() > 128
+        {
+            return Err(mcp_error(
+                error_codes::TOOL_PARAMS_INVALID,
+                "hygiene guard_calibrate anchor_kind must be a non-blank, trimmed identifier of at most 128 bytes",
+            ));
+        }
+        spec.anchor_kind = Some(anchor_kind.clone());
+    }
     if let Some(alpha) = params.alpha {
         if !alpha.is_finite() || !(0.0..1.0).contains(&alpha) {
             return Err(mcp_error(
@@ -1273,6 +1292,7 @@ pub fn run_guard_calibrate_spec(
         source_of_truth: "Calyx Guard CF atomic profile + immutable trusted-exemplar serving generation",
         panel_version: report.panel_version,
         domain: report.domain,
+        anchor_kind: report.anchor_kind,
         guard_id: report.guard_id,
         alpha: report.alpha,
         novelty_action: report.novelty_action,
@@ -1281,6 +1301,7 @@ pub fn run_guard_calibrate_spec(
         adjudicated_bad: report.adjudicated_bad as u64,
         unadjudicated: report.unadjudicated as u64,
         conflicting: report.conflicting as u64,
+        adjudicated_without_guarded_slots: report.adjudicated_without_guarded_slots as u64,
         estimator: report.estimator,
         slots: report
             .slots
@@ -1350,6 +1371,7 @@ pub fn run_guard_verify(
         query_cx_id: report.query_cx_id,
         guard_id: report.guard_id,
         domain: report.domain,
+        calibration_anchor_kind: report.calibration_anchor_kind,
         high_stakes: report.high_stakes,
         overall_pass: report.overall_pass,
         provisional: report.provisional,

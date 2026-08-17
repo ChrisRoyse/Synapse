@@ -74,7 +74,9 @@ impl OracleError {
 
     pub fn remediation(&self) -> &'static str {
         match self {
-            Self::Insufficient { .. } => "add outcome/execution lenses before prediction",
+            Self::Insufficient { .. } => {
+                "add pre-trigger causal lenses or grounded samples before prediction"
+            }
             Self::FlakyAnchor { .. } => {
                 "re-measure the grounded oracle anchor and quarantine flaky outcomes"
             }

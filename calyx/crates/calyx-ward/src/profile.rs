@@ -140,6 +140,13 @@ pub struct GuardProfile {
     pub guard_id: GuardId,
     pub panel_version: u32,
     pub domain: String,
+    /// Exact grounded outcome axis used to split calibration examples.
+    ///
+    /// `None` preserves legacy profiles that pooled every adjudicable anchor.
+    /// New high-stakes profiles should bind one axis so an execution failure,
+    /// an OOD verdict, and a user reward cannot silently become the same label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibration_anchor_kind: Option<String>,
     pub tau: BTreeMap<SlotId, f32>,
     pub required_slots: Vec<SlotId>,
     pub policy: GuardPolicy,
