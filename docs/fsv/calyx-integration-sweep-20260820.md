@@ -26,17 +26,17 @@ separately returned `advisories ok, bans ok, licenses ok, sources ok`.
 ## Exact final runtime precondition
 
 The standard `setup operation=repair` transaction built, candidate-verified,
-installed, and started the clean release from commit
-`66b399e6887b29414f34f45be7e32acda5bcc84f`.
+installed, and started the clean runtime-bearing release from commit
+`b73ebc173ef0fdb0b89c5943d3fde011c58fbdb5`.
 
 ```text
 installed executable: C:\Users\hotra\.cargo\bin\synapse-mcp.exe
-installed bytes:      263,884,617
-installed SHA-256:    13840B79A51C1ECB74118ECD384155454D3B5C84A345ADEAF02721D2A94C9698
-daemon PID/listener:  48780 / 127.0.0.1:7700
+installed bytes:      263,942,985
+installed SHA-256:    0A2FF8B8D4417862B44BBA3C5171B361FCDA78C4EC8FAECF982C415EA9A36D6A
+daemon PID/listener:  48924 / 127.0.0.1:7700
 build profile:        release + calyx-cuda
 build tree:           clean; changed input count 0
-health:               ok=true, build=66b399e6887b
+health:               ok=true, build=b73ebc173ef0
 strict public tools:  40
 tool-surface SHA-256: 24a072513372f2a2093e9a4d67c485f5285592fcf7465d7101a1671e7ed08034
 vault id/path:        01KXPT5BE11Y45CXD4D90CTX7D / %LOCALAPPDATA%\synapse\db-daemon
@@ -48,14 +48,18 @@ The caller-session attestation in `CF_SESSIONS` matched the live sanitized
 subsequent tool call. This is the schema-valid production client path; direct
 HTTP/stdio callers were not substituted.
 
-The final setup repair Source of Truth is
-`%LOCALAPPDATA%\synapse\setup-repair-runs\repair-53380-1787247282883\repair-run.json`:
-state `completed`, exit `0`, 13,776 bytes, SHA-256
-`DFA2B1E0B356BF672F4FC806D7BB5AF092F9592B8C8706F78A5A239C55E951B0`;
-its owned child PID 50096 is absent. The Chrome activation checkpoint remains a
+The full repair installed the verified bytes and then truthfully terminated as
+`bridge_pending` when its preflight host retained a maintenance pause across
+restart. A fresh debugger-free normal host satisfied that real prerequisite;
+`setup operation=repair` resumed only the checkpointed activation, without
+replaying installation or task registration. Its final Source of Truth is
+`%LOCALAPPDATA%\synapse\setup-repair-runs\repair-48924-1787249874938\repair-run.json`:
+state `completed`, exit `0`, 14,063 bytes, SHA-256
+`F06BCA687462279852081F85F6783F89D7579FB71C24F42EC6F22F5715175E95`;
+its owned child PID 72480 is absent. The Chrome activation checkpoint is a
 terminal schema-v4 record (`completed`, generation
-`setup-52096-9ceb0c3be6774d458e08fbad5a7c4f1b`, 31,379 bytes, SHA-256
-`04D7CA546A7A3D3FD38975A7D2BF906C3CD7EBFE011251A4D8396D88BADD6094`).
+`repair-48780-1787249259159`, resume count 1, 27,035 bytes, SHA-256
+`3C1CBB20157DF1A52FEE069DD178C4A72A2B8DD63E9A2D4E998E45A66BD4F85E`).
 
 ## Exhaustive causal maps: producer, durable bytes, and consumer
 
@@ -76,7 +80,7 @@ Aster snapshot read proved:
 | content-addressed artifact | `47434d50310021572a33d339b029ee059b607e3f4002157f85` | 4,129,539 | `33d339b029ee059b607e3f4002157f85adb6e4b8e418df23374c9dded936d527` | true / true |
 | normalized-scope pointer | `47434d49310021572a415cad90413aee704c3c47adfb5ccd5a` | 793 | `5bf4850991eb7acd79fbe8ca1d6e6b282d02b96a3890a354c5eeb2e4a4e21d02` | true / true |
 
-Snapshot lease 5185 pinned sequence 4,339,074, read both exact rows, and was
+Post-install snapshot lease 2257 pinned sequence 4,340,366, read both exact rows, and was
 released to `active_lease_count=0`. The map preserves separate evidence lanes;
 no aggregate “causal score” flattens their assumptions:
 
@@ -101,14 +105,14 @@ confounding.
 ### MCP tool-steering integration
 
 A fresh strict `agent operation=recommend_tools` call for task class
-`issue-1682-final-causal-integration-fsv` consumed the rolling MCP-usage causal
+`issue-1682-final-causal-integration-fsv-b73ebc17` consumed the rolling MCP-usage causal
 map through `synapse.steering.causal_map_context.v1`:
 
 ```text
 context status:       physically_verified
 panel/group:          syn-mcp-usage-v1:1965007 / mcp_usage_tool
 coverage:             15 streams / 105 expected pairs; all rows and pairs complete
-window records/bins:  328 / 345
+window records/bins:  360 / 360
 evidence class:       observational_predictive
 structural effect:    false
 BH families:          Granger, cross-correlation, PC-stable, partial correlation
@@ -122,10 +126,10 @@ one-event `agent` stream while PC-stable and partial correlation remained
 measured; no fallback or hidden omission occurred.
 
 The call persisted
-`CF_KV steering/v1/decision/tool/1787248113796241000/698fbb8c2e6afbd913e77d6ed54df2e2affce316bf1180f2610993421e92518c`.
-Separate snapshot lease 5388 found the row physical and logical at sequence
-4,339,104: 45,797 bytes, SHA-256
-`5c433f60136d1a055b637cc7a8a2cc41c5c46791bf868ef5a041692f4ee636b5`,
+`CF_KV steering/v1/decision/tool/1787250014063211600/0e97e0980878ae52a85b164e208ff5c11fe552f80f9cf5737e975926f7e68958`.
+Separate snapshot lease 5504 found the row physical and logical at sequence
+4,340,378: 46,607 bytes, SHA-256
+`aa5ade3e5a4f3da538de648468dc3fe5a522a35ff85de41f91873c35c46518db`,
 exactly matching the consumer response. Release returned the reader count to
 zero.
 
@@ -229,7 +233,7 @@ The normal host refused raw debugger evaluation with
 Three navigation edges retained the exact 544-byte DOM before/after: empty URL
 (`TOOL_PARAMS_INVALID`), nonexistent target (`ACTION_TARGET_INVALID`), and raw
 debugger request (`A11Y_CDP_EXTENSION_UNAVAILABLE`). Three final process-launch
-edges on release `66b399e6` also proved zero OS processes and zero
+edges on release `b73ebc17` also proved zero OS processes and zero
 `CF_PROCESS_HISTORY` rows before/after:
 
 | `cdp_debug=false` input | Exact causal refusal |
