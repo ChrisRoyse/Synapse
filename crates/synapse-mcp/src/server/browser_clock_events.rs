@@ -32,6 +32,8 @@ pub enum BrowserClockOperation {
     Status,
     /// Install the fake clock shim into the current and future page documents.
     Install,
+    /// Restore the exact page descriptors captured by install and remove future-document installation.
+    Uninstall,
     /// Set Date/time to `time_unix_ms` without firing timers.
     SetFixedTime,
     /// Advance fake time by `delta_ms`, firing due timers/intervals/RAF callbacks.
@@ -45,6 +47,7 @@ impl BrowserClockOperation {
         match self {
             Self::Status => "status",
             Self::Install => "install",
+            Self::Uninstall => "uninstall",
             Self::SetFixedTime => "setFixedTime",
             Self::FastForward => "fastForward",
             Self::PauseAt => "pauseAt",
@@ -57,6 +60,7 @@ impl From<BrowserClockOperation> for synapse_a11y::CdpClockOperation {
         match value {
             BrowserClockOperation::Status => Self::Status,
             BrowserClockOperation::Install => Self::Install,
+            BrowserClockOperation::Uninstall => Self::Uninstall,
             BrowserClockOperation::SetFixedTime => Self::SetFixedTime,
             BrowserClockOperation::FastForward => Self::FastForward,
             BrowserClockOperation::PauseAt => Self::PauseAt,
@@ -300,7 +304,7 @@ struct NormalizedBrowserPageEventsParams {
 #[tool_router(router = browser_clock_events_tool_router, vis = "pub(super)")]
 impl SynapseService {
     #[tool(
-        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script for current/future documents; the normal Chrome bridge uses one exact documentId-bound MAIN-world descriptor transaction for chrome-tab:* targets, refuses collisions, verifies every installed/restored descriptor, and reconciles ownership when navigation destroys the document. set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status returns current ownership state. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
+        description = "Control a fake Playwright-style page clock in the calling session's owned browser tab. Raw CDP injects a target-scoped init-script for current/future documents; the normal Chrome bridge uses one exact documentId-bound MAIN-world descriptor transaction for chrome-tab:* targets, refuses collisions, verifies every installed/restored descriptor, and reconciles ownership when navigation destroys the document. uninstall restores the captured descriptors and removes future-document installation; set_fixed_time changes Date without firing timers; fast_forward advances virtual time and fires due timers; pause_at advances to an epoch-ms timestamp and freezes there; status is read-only and returns current ownership state without installing a controller. Target-scoped and background-safe: never activates the tab, never uses OS foreground input, and never falls back to the human foreground tab."
     )]
     pub async fn browser_clock(
         &self,
@@ -739,6 +743,10 @@ fn validate_browser_clock_params(
         BrowserClockOperation::Status => {
             reject_field(params.time_unix_ms, "time_unix_ms", "status")?;
             reject_field(params.delta_ms, "delta_ms", "status")?;
+        }
+        BrowserClockOperation::Uninstall => {
+            reject_field(params.time_unix_ms, "time_unix_ms", "uninstall")?;
+            reject_field(params.delta_ms, "delta_ms", "uninstall")?;
         }
         BrowserClockOperation::Install => {
             reject_field(params.delta_ms, "delta_ms", "install")?;
