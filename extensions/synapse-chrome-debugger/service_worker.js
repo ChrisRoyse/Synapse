@@ -1185,6 +1185,9 @@ async function handleWebSocketMessage(raw) {
     await acknowledgeCommandTerminal(message);
     return;
   }
+  if (message?.type === "command_diagnostic_ack") {
+    return;
+  }
   if (message?.type === "command_terminal_nack") {
     disableBridgePermanently(
       `daemon rejected a durable command terminal: ${JSON.stringify(message)}`,
@@ -29363,6 +29366,74 @@ function sendCommandTerminal(socket, entry) {
   socket.send(serialized);
 }
 
+function sendCommandDiagnostic(socket, envelope) {
+  if (webSocket !== socket || socket.readyState !== WebSocket.OPEN) {
+    throw bridgeError(
+      ERROR_DAEMON_UNAVAILABLE,
+      `read-only command diagnostic cannot send on a non-open authoritative WebSocket; ` +
+        `command_id=${envelope.command_id} ready_state=${String(socket?.readyState ?? "missing")}`
+    );
+  }
+  const serialized = JSON.stringify(envelope);
+  const wireBytes = new TextEncoder().encode(serialized).byteLength;
+  if (wireBytes > NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES) {
+    throw bridgeError(
+      ERROR_RESPONSE_TOO_LARGE,
+      `read-only command diagnostic envelope exceeds the server WebSocket bound; ` +
+        `command_id=${envelope.command_id} wire_bytes=${wireBytes} ` +
+        `limit_bytes=${NATIVE_MESSAGE_HTTP_BODY_LIMIT_BYTES}`
+    );
+  }
+  socket.send(serialized);
+}
+
+async function postReadOnlyOwnerStateDiagnostic(command, ok, result, error) {
+  const id = String(command?.id || "").trim();
+  const kind = String(command?.kind || "").trim();
+  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
+  const loadError = String(DURABLE_OWNER_STATE_LOAD_ERROR || "").trim();
+  if (kind !== "operatorPanicReadback" || !id || !originalHostId || !loadError ||
+      !DURABLE_OWNER_WORKER_BOOT_ID) {
+    throw bridgeError(
+      ERROR_TERMINAL_PROTOCOL,
+      `read-only owner-state diagnostic admission is incomplete; command_id=${id || "missing"} ` +
+        `command_kind=${kind || "missing"} original_host_id=${originalHostId || "missing"} ` +
+        `load_error_present=${Boolean(loadError)} worker_boot_id_present=${Boolean(DURABLE_OWNER_WORKER_BOOT_ID)}`
+    );
+  }
+  const loadErrorBytes = new TextEncoder().encode(loadError).byteLength;
+  const loadErrorSha256 = await sha256HexText(loadError);
+  const diagnosticResult = result && typeof result === "object" && !Array.isArray(result)
+    ? {
+        ...result,
+        diagnostic_transport: {
+          kind: "operator_panic_readback",
+          durability: "unavailable",
+          persistence: "not_attempted",
+          durable_state_load_error_sha256: loadErrorSha256,
+          durable_state_load_error_bytes: loadErrorBytes
+        }
+      }
+    : result;
+  const payload = await commandTerminalPayload(command, ok, diagnosticResult, error);
+  sendCommandDiagnostic(webSocket, {
+    type: "command_diagnostic",
+    protocol_version: PROTOCOL_VERSION,
+    original_host_id: originalHostId,
+    command_id: id,
+    command_kind: kind,
+    durability: "unavailable",
+    payload_json: payload.payloadJson,
+    payload_sha256: payload.payloadSha256,
+    payload_bytes: payload.payloadBytes,
+    durable_state_load_error: loadError,
+    durable_state_load_error_sha256: loadErrorSha256,
+    durable_state_load_error_bytes: loadErrorBytes,
+    created_at_unix_ms: Date.now(),
+    worker_boot_id: DURABLE_OWNER_WORKER_BOOT_ID
+  });
+}
+
 async function flushCommandTerminalOutbox(socket) {
   await DURABLE_OWNER_STATE_READY;
   for (const entry of DURABLE_OWNER_LEDGER.commandTerminalOutbox) {
@@ -29489,10 +29560,17 @@ async function acknowledgeCommandTerminal(message) {
 
 async function postResponse(command, ok, result, error) {
   await DURABLE_OWNER_STATE_READY;
+  const id = String(command?.id || "").trim();
+  const kind = String(command?.kind || "").trim();
+  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
   if (!DURABLE_OWNER_STATE_LOADED || DURABLE_OWNER_STATE_LOAD_ERROR) {
+    if (kind === "operatorPanicReadback") {
+      await postReadOnlyOwnerStateDiagnostic(command, ok, result, error);
+      return;
+    }
     throw bridgeError(
       ERROR_TERMINAL_PROTOCOL,
-      `command terminal persistence is unavailable; command_id=${String(command?.id || "missing")} ` +
+      `command terminal persistence is unavailable; command_id=${id || "missing"} ` +
         `load_error=${String(DURABLE_OWNER_STATE_LOAD_ERROR || "none")}`
     );
   }
@@ -29504,9 +29582,6 @@ async function postResponse(command, ok, result, error) {
         `limit=${COMMAND_TERMINAL_OUTBOX_MAX_ENTRIES}`
     );
   }
-  const id = String(command?.id || "").trim();
-  const kind = String(command?.kind || "").trim();
-  const originalHostId = String(command?.__synapseOriginalHostId || "").trim();
   if (!id || !kind || !originalHostId || !DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID) {
     throw bridgeError(
       ERROR_TERMINAL_PROTOCOL,

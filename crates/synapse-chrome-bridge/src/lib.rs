@@ -3823,6 +3823,26 @@ struct CommandTerminalEnvelope {
     worker_boot_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CommandDiagnosticEnvelope {
+    #[serde(rename = "type")]
+    message_type: String,
+    protocol_version: u32,
+    original_host_id: String,
+    command_id: String,
+    command_kind: String,
+    durability: String,
+    payload_json: String,
+    payload_sha256: String,
+    payload_bytes: usize,
+    durable_state_load_error: String,
+    durable_state_load_error_sha256: String,
+    durable_state_load_error_bytes: usize,
+    created_at_unix_ms: u64,
+    worker_boot_id: String,
+}
+
 #[derive(Clone, Debug)]
 struct CommandTerminalReceipt {
     command_id: String,
@@ -4037,6 +4057,8 @@ pub struct ChromeDebuggerExtensionOwnerReadback {
     pub storage_state_load_error: Option<String>,
     #[serde(default)]
     pub storage_state_failure_diagnostic: Option<serde_json::Value>,
+    #[serde(default)]
+    pub diagnostic_transport: Option<serde_json::Value>,
     #[serde(default)]
     pub persisted_schema_version: u64,
     pub persisted_state_revision: u64,
@@ -6322,7 +6344,6 @@ impl ChromeDebuggerBridge {
                 ),
             );
         }
-
         let mut inner = match self.inner.lock() {
             Ok(inner) => inner,
             Err(_) => {
@@ -6497,6 +6518,241 @@ impl ChromeDebuggerBridge {
             "terminal_sequence": envelope.terminal_sequence,
             "payload_sha256": envelope.payload_sha256,
             "payload_bytes": envelope.payload_bytes,
+            "deduplicated": false,
+        })
+    }
+
+    fn accept_command_diagnostic(&self, socket_host_id: &str, raw: &str) -> Value {
+        let nack = |command_id: &str, detail: String| {
+            tracing::error!(
+                code = error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                host_id = %socket_host_id,
+                command_id,
+                detail = %detail,
+                "Chrome read-only command diagnostic rejected"
+            );
+            json!({
+                "type": "command_terminal_nack",
+                "ok": false,
+                "code": error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                "command_id": command_id,
+                "detail": detail,
+            })
+        };
+        let envelope = match serde_json::from_str::<CommandDiagnosticEnvelope>(raw) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                return nack(
+                    "",
+                    format!("decode read-only command diagnostic envelope: {error}"),
+                );
+            }
+        };
+        let command_id = envelope.command_id.clone();
+        if envelope.message_type != "command_diagnostic"
+            || envelope.protocol_version != BRIDGE_PROTOCOL_VERSION
+            || envelope.original_host_id.is_empty()
+            || envelope.command_id.is_empty()
+            || envelope.command_kind != "operatorPanicReadback"
+            || envelope.durability != "unavailable"
+            || envelope.payload_bytes == 0
+            || envelope.payload_bytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES
+            || envelope.durable_state_load_error.is_empty()
+            || envelope.durable_state_load_error_bytes == 0
+            || envelope.durable_state_load_error_bytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES
+            || envelope.created_at_unix_ms == 0
+            || envelope.worker_boot_id.is_empty()
+        {
+            return nack(
+                &command_id,
+                format!(
+                    "invalid read-only command diagnostic fields protocol_version={} original_host_id={:?} command_kind={:?} durability={:?} payload_bytes={} payload_limit_bytes={} durable_error_bytes={} created_at_unix_ms={} worker_boot_id_present={}",
+                    envelope.protocol_version,
+                    envelope.original_host_id,
+                    envelope.command_kind,
+                    envelope.durability,
+                    envelope.payload_bytes,
+                    COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES,
+                    envelope.durable_state_load_error_bytes,
+                    envelope.created_at_unix_ms,
+                    !envelope.worker_boot_id.is_empty(),
+                ),
+            );
+        }
+        let actual_payload_bytes = envelope.payload_json.len();
+        let actual_payload_sha256 = sha256_hex_lower(envelope.payload_json.as_bytes());
+        let actual_load_error_bytes = envelope.durable_state_load_error.len();
+        let actual_load_error_sha256 =
+            sha256_hex_lower(envelope.durable_state_load_error.as_bytes());
+        if actual_payload_bytes != envelope.payload_bytes
+            || actual_payload_sha256 != envelope.payload_sha256
+            || actual_load_error_bytes != envelope.durable_state_load_error_bytes
+            || actual_load_error_sha256 != envelope.durable_state_load_error_sha256
+        {
+            return nack(
+                &command_id,
+                format!(
+                    "read-only command diagnostic evidence mismatch recorded_payload_bytes={} actual_payload_bytes={} recorded_payload_sha256={} actual_payload_sha256={} recorded_error_bytes={} actual_error_bytes={} recorded_error_sha256={} actual_error_sha256={}",
+                    envelope.payload_bytes,
+                    actual_payload_bytes,
+                    envelope.payload_sha256,
+                    actual_payload_sha256,
+                    envelope.durable_state_load_error_bytes,
+                    actual_load_error_bytes,
+                    envelope.durable_state_load_error_sha256,
+                    actual_load_error_sha256,
+                ),
+            );
+        }
+        let response = match serde_json::from_str::<ChromeResponse>(&envelope.payload_json) {
+            Ok(response) => response,
+            Err(error) => {
+                return nack(
+                    &command_id,
+                    format!("decode read-only command diagnostic payload: {error}"),
+                );
+            }
+        };
+        if response.id != command_id {
+            return nack(
+                &command_id,
+                format!(
+                    "read-only command diagnostic response id mismatch envelope_id={command_id:?} response_id={:?}",
+                    response.id
+                ),
+            );
+        }
+        let Some(result) = response.result.as_ref().and_then(Value::as_object) else {
+            return nack(
+                &command_id,
+                "read-only command diagnostic did not carry an object owner-state readback"
+                    .to_owned(),
+            );
+        };
+        let diagnostic_transport = result
+            .get("diagnostic_transport")
+            .and_then(Value::as_object);
+        let diagnostic_evidence_matches = response.ok
+            && response.error.is_none()
+            && result.get("storage_state_loaded").and_then(Value::as_bool) == Some(false)
+            && result
+                .get("storage_state_load_error")
+                .and_then(Value::as_str)
+                == Some(envelope.durable_state_load_error.as_str())
+            && diagnostic_transport
+                .and_then(|transport| transport.get("kind"))
+                .and_then(Value::as_str)
+                == Some("operator_panic_readback")
+            && diagnostic_transport
+                .and_then(|transport| transport.get("durability"))
+                .and_then(Value::as_str)
+                == Some("unavailable")
+            && diagnostic_transport
+                .and_then(|transport| transport.get("persistence"))
+                .and_then(Value::as_str)
+                == Some("not_attempted")
+            && diagnostic_transport
+                .and_then(|transport| transport.get("durable_state_load_error_sha256"))
+                .and_then(Value::as_str)
+                == Some(envelope.durable_state_load_error_sha256.as_str())
+            && diagnostic_transport
+                .and_then(|transport| transport.get("durable_state_load_error_bytes"))
+                .and_then(Value::as_u64)
+                == u64::try_from(envelope.durable_state_load_error_bytes).ok();
+        if !diagnostic_evidence_matches {
+            return nack(
+                &command_id,
+                "read-only command diagnostic payload did not prove the exact unavailable durable-state failure and non-persistent transport boundary"
+                    .to_owned(),
+            );
+        }
+
+        let mut inner = match self.inner.lock() {
+            Ok(inner) => inner,
+            Err(_) => {
+                return nack(
+                    &command_id,
+                    "chrome debugger bridge lock poisoned during diagnostic acceptance".to_owned(),
+                );
+            }
+        };
+        if inner.active_host_id.as_deref() != Some(socket_host_id)
+            || inner
+                .hosts
+                .get(socket_host_id)
+                .and_then(|host| host.transport.as_deref())
+                != Some("direct_http")
+        {
+            return nack(
+                &command_id,
+                "read-only command diagnostic arrived on a non-active or non-direct authenticated host"
+                    .to_owned(),
+            );
+        }
+        let Some(pending) = inner.pending.get(&command_id) else {
+            return nack(
+                &command_id,
+                "read-only command diagnostic has no matching pending delivered command".to_owned(),
+            );
+        };
+        if !pending.delivered
+            || pending.host_id != envelope.original_host_id
+            || pending.kind != envelope.command_kind
+            || pending.mutation_capable
+        {
+            return nack(
+                &command_id,
+                format!(
+                    "read-only command diagnostic ownership mismatch delivered={} mutation_capable={} expected_host_id={:?} actual_host_id={:?} expected_kind={:?} actual_kind={:?}",
+                    pending.delivered,
+                    pending.mutation_capable,
+                    pending.host_id,
+                    envelope.original_host_id,
+                    pending.kind,
+                    envelope.command_kind,
+                ),
+            );
+        }
+        let Some(pending) = inner.pending.remove(&command_id) else {
+            return nack(
+                &command_id,
+                "pending command disappeared while accepting its read-only diagnostic".to_owned(),
+            );
+        };
+        let response_error = response.error.as_ref();
+        tracing::warn!(
+            code = "CHROME_DEBUGGER_READ_ONLY_DIAGNOSTIC_ACCEPTED",
+            host_id = %socket_host_id,
+            original_host_id = %envelope.original_host_id,
+            command_id = %command_id,
+            command_kind = %pending.kind,
+            worker_boot_id = %envelope.worker_boot_id,
+            payload_sha256 = %envelope.payload_sha256,
+            payload_bytes = envelope.payload_bytes,
+            durable_state_load_error = %envelope.durable_state_load_error,
+            durable_state_load_error_sha256 = %envelope.durable_state_load_error_sha256,
+            durable_state_load_error_bytes = envelope.durable_state_load_error_bytes,
+            response_ok = response.ok,
+            response_error_code = response_error
+                .and_then(|error| error.code.as_deref())
+                .unwrap_or(""),
+            response_error_detail = response_error
+                .and_then(|error| error.detail.as_deref())
+                .unwrap_or(""),
+            "non-durable operator panic readback accepted from the authenticated extension while durable terminal storage was unavailable"
+        );
+        if let Some(sender) = pending.sender {
+            let _ = sender.send(response);
+        }
+        json!({
+            "type": "command_diagnostic_ack",
+            "ok": true,
+            "host_id": socket_host_id,
+            "command_id": command_id,
+            "command_kind": envelope.command_kind,
+            "payload_sha256": envelope.payload_sha256,
+            "payload_bytes": envelope.payload_bytes,
+            "durability": "unavailable",
             "deduplicated": false,
         })
     }
@@ -8826,7 +9082,24 @@ async fn direct_http_ws_loop(socket: WebSocket, host_id: String) {
                         if message_type.as_deref() == Some("keepalive") {
                             continue;
                         }
-                        let acknowledgement = bridge().accept_command_terminal(&host_id, raw.as_str());
+                        let acknowledgement = match message_type.as_deref() {
+                            Some("command_terminal") => {
+                                bridge().accept_command_terminal(&host_id, raw.as_str())
+                            }
+                            Some("command_diagnostic") => {
+                                bridge().accept_command_diagnostic(&host_id, raw.as_str())
+                            }
+                            _ => json!({
+                                "type": "command_terminal_nack",
+                                "ok": false,
+                                "code": error_codes::CHROME_BRIDGE_TERMINAL_PROTOCOL_ERROR,
+                                "command_id": "",
+                                "detail": format!(
+                                    "unsupported direct HTTP WebSocket message type={:?}",
+                                    message_type
+                                ),
+                            }),
+                        };
                         let terminal_rejected = acknowledgement.get("ok").and_then(Value::as_bool) == Some(false);
                         if let Err(error) = sender.send(Message::Text(acknowledgement.to_string().into())).await {
                             disconnect_detail = format!("failed to send command-terminal acknowledgement: {error}");
