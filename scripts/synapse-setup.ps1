@@ -5744,6 +5744,9 @@ function Get-SynapseDaemonStartupWatchdogRemediation {
         'daemon_not_running' {
             return "no $Phase daemon process for this bind/db was alive across two consecutive 30s samples after it had been seen running; the daemon exited instead of finishing startup. Inspect daemon-stderr-gen*.log for the exit and the launcher log for relaunch attempts."
         }
+        'daemon_exited' {
+            return "the exact owned $Phase daemon process exited before health became readable. The signed/hex exit code and bounded terminal_failure_line in this envelope are authoritative; inspect the retained stderr and candidate diagnostic named by the failure. Waiting longer or taking a stack dump of the dead PID cannot help."
+        }
         'daemon_restart_loop' {
             return "the $Phase daemon process id changed repeatedly during the startup gate, i.e. it is crash-looping under the supervisor rather than opening. Inspect daemon-stderr-gen*.log for the crash and daemon-supervisor-events.jsonl for the relaunch cadence."
         }
@@ -5768,6 +5771,32 @@ function Get-SynapseDaemonStartupWatchdogRemediation {
         default {
             return "unclassified $Phase startup watchdog verdict '$Verdict'; treat as a setup defect and report it with the full watchdog block."
         }
+    }
+}
+
+function Get-SynapseCandidateTerminalFailureLine {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [ValidateRange(256,4096)][int]$MaxChars = 4096
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        $lines = @(Get-Content -LiteralPath $Path -Tail 256 -ErrorAction Stop)
+        $terminal = @($lines | Where-Object {
+            -not [string]::IsNullOrWhiteSpace([string]$_) -and
+            (([string]$_ -match '\bERROR\b') -or ([string]$_ -match '^synapse-mcp (?:error|shutdown error):'))
+        } | Select-Object -Last 1)
+        if ($terminal.Count -eq 0) {
+            $terminal = @($lines | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } | Select-Object -Last 1)
+        }
+        if ($terminal.Count -eq 0) { return $null }
+        $line = (([string]$terminal[0]) -replace '\s+', ' ').Trim()
+        if ($line.Length -le $MaxChars) { return $line }
+        $suffix = ' <truncated>'
+        return $line.Substring(0, $MaxChars - $suffix.Length) + $suffix
+    } catch {
+        return ("terminal stderr read failed: {0}" -f ((($_.Exception.Message) -replace '\s+', ' ').Trim()))
     }
 }
 
@@ -10063,6 +10092,19 @@ function Test-SynapseCandidateDaemon {
                 break
             }
             $lastHealthError = $read.Error
+            $candidate.Refresh()
+            if ($candidate.HasExited) {
+                $candidateGateVerdict = 'daemon_exited'
+                $candidateWatchdog.Verdict = 'daemon_exited'
+                $candidateWatchdog.TerminalFailureLine = Get-SynapseCandidateTerminalFailureLine -Path $candidateStderr
+                $candidateExit = Get-SynapseCandidateExitReadback -Process $candidate
+                Info ("SYNAPSE_CANDIDATE_PROCESS_EXITED_BEFORE_HEALTH pid={0} exit_code_signed={1} exit_code_hex={2} terminal_failure_line={3} remediation=fix the retained terminal cause; setup will not wait, retry, or take a stack dump of an exited process" -f `
+                    $candidate.Id,
+                    $(if ($null -eq $candidateExit.ExitCodeSigned) { '<unavailable>' } else { $candidateExit.ExitCodeSigned }),
+                    $(if ($null -eq $candidateExit.ExitCodeHex) { '<unavailable>' } else { $candidateExit.ExitCodeHex }),
+                    $(if ([string]::IsNullOrWhiteSpace($candidateWatchdog.TerminalFailureLine)) { '<empty stderr>' } else { $candidateWatchdog.TerminalFailureLine }))
+                break
+            }
             $candidateTick = Update-SynapseDaemonStartupWatchdog -Watchdog $candidateWatchdog
             if (-not $candidateTick.Continue) {
                 $candidateGateVerdict = $candidateTick.Verdict

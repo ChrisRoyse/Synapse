@@ -796,10 +796,10 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
 pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // `action_outcome_anchor`: command-final readiness uses `outcome`; physical
     // action completion is a separate grounded axis determined by `status`.
-    // No active 2_185_006 lens reads these post-treatment fields.
-    ("reward", 2_185_006, &["outcome"]),
-    ("action_execution_reward", 2_185_006, &["status"]),
-    ("action_guard_region", 2_185_006, &["outcome", "error_code"]),
+    // No active 2_185_007 lens reads these post-treatment fields.
+    ("reward", 2_185_007, &["outcome"]),
+    ("action_execution_reward", 2_185_007, &["status"]),
+    ("action_guard_region", 2_185_007, &["outcome", "error_code"]),
     // `record.status`, and `error_type` which is `Some` exactly when the call
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (
