@@ -255,15 +255,19 @@ async fn install_clock(
         Err(install_error) if newly_added => {
             let current_cleanup =
                 run_existing_clock_js(endpoint, target_id, "uninstall", json!({})).await;
+            let current_owned_after_cleanup = match &current_cleanup {
+                Ok(readback) => Ok(readback.installed),
+                Err(_) => current_document_has_owned_clock(endpoint, target_id).await,
+            };
             let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
                 endpoint,
                 target_id,
                 &slot.init_script_identifier,
             )
             .await;
-            let effect_cleanup = if current_cleanup
+            let effect_cleanup = if current_owned_after_cleanup
                 .as_ref()
-                .is_ok_and(|readback| !readback.installed)
+                .is_ok_and(|owned| !owned)
                 && future_cleanup.is_ok()
             {
                 crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
@@ -291,7 +295,7 @@ async fn install_clock(
             };
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!(
-                    "browser clock current-document install failed for target {target_id:?}: {install_error}; rollback_current={current_cleanup:?}; rollback_future={future_cleanup:?}; rollback_effect={effect_cleanup}; rollback_owner={owner_cleanup}"
+                    "browser clock current-document install failed for target {target_id:?}: {install_error}; rollback_current={current_cleanup:?}; current_owned_after_cleanup={current_owned_after_cleanup:?}; rollback_future={future_cleanup:?}; rollback_effect={effect_cleanup}; rollback_owner={owner_cleanup}"
                 ),
             });
         }
@@ -492,6 +496,24 @@ async fn run_clock_js(
             detail: format!("browser clock readback decode: {error}"),
         }
     })
+}
+
+async fn current_document_has_owned_clock(endpoint: &str, target_id: &str) -> A11yResult<bool> {
+    let expression = format!(
+        "(() => {{
+            const clock = globalThis.__synapseClock;
+            return Boolean(clock && clock.version === {CLOCK_VERSION:?} && typeof clock.call === \"function\");
+        }})()"
+    );
+    let evaluated =
+        crate::cdp_action::cdp_evaluate_expression(endpoint, target_id, &expression, false, true)
+            .await?;
+    evaluated
+        .value
+        .as_bool()
+        .ok_or_else(|| A11yError::CdpAxtreeFailed {
+            detail: "browser clock ownership probe did not return a boolean".to_owned(),
+        })
 }
 
 async fn run_existing_clock_js(
