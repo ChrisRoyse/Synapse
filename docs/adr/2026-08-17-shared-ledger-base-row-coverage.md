@@ -2,7 +2,7 @@
 
 Date: 2026-08-17
 
-Status: implemented; strict-client production verification pending
+Status: implemented and strict-client production verified
 
 Issue: #2257
 
