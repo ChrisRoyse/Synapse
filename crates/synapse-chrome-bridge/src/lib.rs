@@ -188,6 +188,7 @@ const BACKGROUND_DEPLOY_JSON_PREFIX: &str = "SYNAPSE_CHROME_BRIDGE_INSTALLER_JSO
 const CHROME_PROFILE_SCAN_CACHE_TTL: Duration = Duration::from_secs(5);
 const MAINTENANCE_RECONNECT_PAUSE_COMMAND: &str = "maintenancePauseReconnect";
 const BACKGROUND_RUNTIME_RELOAD_COMMAND: &str = "reloadSelf";
+const OPERATOR_PANIC_READBACK_COMMAND: &str = "operatorPanicReadback";
 const DEFAULT_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 120_000;
 const MIN_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 1_000;
 const MAX_MAINTENANCE_RECONNECT_PAUSE_MS: u64 = 900_000;
@@ -6115,7 +6116,8 @@ impl ChromeDebuggerBridge {
                     host_id: host_id.clone(),
                     kind: kind.to_owned(),
                     sender: Some(sender),
-                    mutation_capable: kind != MAINTENANCE_RECONNECT_PAUSE_COMMAND,
+                    mutation_capable: kind != MAINTENANCE_RECONNECT_PAUSE_COMMAND
+                        && kind != OPERATOR_PANIC_READBACK_COMMAND,
                     delivered: false,
                     caller_timed_out: false,
                     transport_lost: false,
@@ -6553,7 +6555,7 @@ impl ChromeDebuggerBridge {
             || envelope.protocol_version != BRIDGE_PROTOCOL_VERSION
             || envelope.original_host_id.is_empty()
             || envelope.command_id.is_empty()
-            || envelope.command_kind != "operatorPanicReadback"
+            || envelope.command_kind != OPERATOR_PANIC_READBACK_COMMAND
             || envelope.durability != "unavailable"
             || envelope.payload_bytes == 0
             || envelope.payload_bytes > COMMAND_TERMINAL_PAYLOAD_BUDGET_BYTES
