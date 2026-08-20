@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-reload-contract-v23";
-const BRIDGE_DECLARED_BUILD_SHA256 = "0a7bb3c99dc96d70bede872735bfb5d934f40de8a2a7fdcdb631e38676403ba2";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v24";
+const BRIDGE_DECLARED_BUILD_SHA256 = "9e64f7dce8b2d310aed2e503fb4732d777118543f13446bb937da35d1c9df9ba";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -65,6 +65,11 @@ const COMMAND_CAPABILITIES = Object.freeze([
   "keyDispatch",
   "maintenancePauseReconnect",
   "reloadSelf",
+  "operatorPanicDisable",
+  "operatorPanicCleanup",
+  "operatorPanicCloseTab",
+  "operatorPanicReadback",
+  "operatorPanicEnable",
   "domAction",
   "coordinateClick",
   "typeActiveElement",
@@ -4110,17 +4115,24 @@ async function handleCommand(command) {
       result = await handleTypeActiveElement(params);
     } else if (kind === "setFieldValue") {
       result = await handleSetFieldValue(params);
+    } else if (kind === "operatorPanicDisable") {
+      result = await handleOperatorPanicDisable(
+        command.__operatorPanicDisableAdmission
+      );
+    } else if (kind === "operatorPanicCleanup") {
+      result = await handleOperatorPanicCleanup(params);
+    } else if (kind === "operatorPanicCloseTab") {
+      result = await handleOperatorPanicCloseTab(params);
+    } else if (kind === "operatorPanicReadback") {
+      result = operatorPanicOwnerReadback();
+    } else if (kind === "operatorPanicEnable") {
+      result = await handleOperatorPanicEnable(params);
     } else if (
       kind === "evaluateScript" ||
       kind === "initScript" ||
       kind === "exposeBinding" ||
       kind === "handleDialog" ||
-      kind === "fileUpload" ||
-      kind === "operatorPanicDisable" ||
-      kind === "operatorPanicCleanup" ||
-      kind === "operatorPanicCloseTab" ||
-      kind === "operatorPanicReadback" ||
-      kind === "operatorPanicEnable"
+      kind === "fileUpload"
     ) {
       result = rejectAttachCommand(kind, params);
     } else if (kind === "pageVitals") {

@@ -52,9 +52,10 @@ const DIRECT_HTTP_BRIDGE_CORS_ALLOW_METHODS: &str = "GET, POST, OPTIONS";
 const DIRECT_HTTP_BRIDGE_CORS_ALLOW_HEADERS: &str =
     "content-type, x-synapse-bridge-token, x-synapse-bridge-register-token";
 const BRIDGE_PROTOCOL_VERSION: u32 = 2;
-const EXPECTED_EXTENSION_BUILD_ID: &str = "synapse-chrome-bridge-2026-08-20-reload-contract-v23";
+const EXPECTED_EXTENSION_BUILD_ID: &str =
+    "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v24";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
-    "0a7bb3c99dc96d70bede872735bfb5d934f40de8a2a7fdcdb631e38676403ba2";
+    "9e64f7dce8b2d310aed2e503fb4732d777118543f13446bb937da35d1c9df9ba";
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;
@@ -101,6 +102,11 @@ const REQUIRED_DIRECT_HTTP_CAPABILITIES: &[&str] = &[
     "keyDispatch",
     "maintenancePauseReconnect",
     "reloadSelf",
+    "operatorPanicDisable",
+    "operatorPanicCleanup",
+    "operatorPanicCloseTab",
+    "operatorPanicReadback",
+    "operatorPanicEnable",
     "targetInfo",
     "targetInfoPageText",
     "typeActiveElement",
