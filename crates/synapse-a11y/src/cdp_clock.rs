@@ -202,9 +202,20 @@ async fn install_clock(
                     &slot.init_script_identifier,
                 )
                 .await;
+                let effect_cleanup = if cleanup.is_ok() {
+                    crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
+                        endpoint,
+                        target_id,
+                        &slot.init_script_identifier,
+                    )
+                    .map(|()| "resolved".to_owned())
+                    .unwrap_or_else(|error| format!("failed: {error}"))
+                } else {
+                    "not_attempted_without_future-removal_ack".to_owned()
+                };
                 return Err(A11yError::CdpAxtreeFailed {
                     detail: format!(
-                        "browser clock init-script owner commit failed for target {target_id:?}: {owner_error}; future_cleanup={cleanup:?}"
+                        "browser clock init-script owner commit failed for target {target_id:?}: {owner_error}; future_cleanup={cleanup:?}; effect_cleanup={effect_cleanup}"
                     ),
                 });
             }
@@ -233,6 +244,21 @@ async fn install_clock(
                 &slot.init_script_identifier,
             )
             .await;
+            let effect_cleanup = if current_cleanup
+                .as_ref()
+                .is_ok_and(|readback| !readback.installed)
+                && future_cleanup.is_ok()
+            {
+                crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
+                    endpoint,
+                    target_id,
+                    &slot.init_script_identifier,
+                )
+                .map(|()| "resolved".to_owned())
+                .unwrap_or_else(|error| format!("failed: {error}"))
+            } else {
+                "not_attempted_without_current+future_ack".to_owned()
+            };
             let owner_cleanup = match registry().lock() {
                 Ok(mut slots)
                     if slots.get(target_id).is_some_and(|owner| {
@@ -248,7 +274,7 @@ async fn install_clock(
             };
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!(
-                    "browser clock current-document install failed for target {target_id:?}: {install_error}; rollback_current={current_cleanup:?}; rollback_future={future_cleanup:?}; rollback_owner={owner_cleanup}"
+                    "browser clock current-document install failed for target {target_id:?}: {install_error}; rollback_current={current_cleanup:?}; rollback_future={future_cleanup:?}; rollback_effect={effect_cleanup}; rollback_owner={owner_cleanup}"
                 ),
             });
         }
@@ -332,7 +358,14 @@ async fn uninstall_clock(endpoint: &str, target_id: &str) -> A11yResult<CdpClock
     )
     .await;
     let readback = match (current, future) {
-        (Ok(readback), Ok(_)) if !readback.installed => readback,
+        (Ok(readback), Ok(_)) if !readback.installed => {
+            crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
+                endpoint,
+                target_id,
+                &slot.init_script_identifier,
+            )?;
+            readback
+        }
         (current, future) => {
             return Err(A11yError::CdpAxtreeFailed {
                 detail: format!(
@@ -516,7 +549,10 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
     for (target_id, slot) in slots {
         let current_cleanup =
             run_clock_js(&slot.endpoint, &target_id, "uninstall", json!({})).await;
-        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target(
+        // The outer operator-panic drain already owns the global durable
+        // mutation guard. Use the exact-session removal body directly to avoid
+        // recursively acquiring the same non-reentrant guard.
+        let future_cleanup = crate::cdp_action::cdp_remove_init_script_target_while_guarded(
             &slot.endpoint,
             &target_id,
             &slot.init_script_identifier,
@@ -524,6 +560,19 @@ pub async fn durable_clocks_disable_and_drain_all() -> CdpClockDurableDrainReadb
         .await;
         match (current_cleanup, future_cleanup) {
             (Ok(readback), Ok(_)) if !readback.installed => {
+                if let Err(error) =
+                    crate::cdp_action::resolve_persisted_init_script_effect_after_current_teardown(
+                        &slot.endpoint,
+                        &target_id,
+                        &slot.init_script_identifier,
+                    )
+                {
+                    failures.push(format!(
+                        "resolve browser clock init-script effect for target {target_id:?}: {error}"
+                    ));
+                    failed_slots.push((target_id, slot));
+                    continue;
+                }
                 uninstalled = uninstalled.saturating_add(1);
             }
             (current, future) => {
@@ -637,13 +686,15 @@ const CLOCK_INIT_SCRIPT: &str = r#"
         throw new Error("Synapse browser clock loop limit exceeded while draining timers");
       }
       state.nowMs = next.due;
-      state.timers.delete(next.id);
       state.firedTimerCount += 1;
       runHandler(next);
-      if (next.kind === "interval" && !next.cancelled) {
+      const stillOwned = state.timers.get(next.id) === next;
+      if (next.kind === "interval" && stillOwned && !next.cancelled) {
         const step = Math.max(1, next.delay);
         next.due = state.nowMs + step;
         state.timers.set(next.id, next);
+      } else if (stillOwned) {
+        state.timers.delete(next.id);
       }
     }
     state.nowMs = target;

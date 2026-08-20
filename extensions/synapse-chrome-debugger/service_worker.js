@@ -22441,13 +22441,15 @@ function runClockInPage(request) {
           throw new Error("Synapse browser clock loop limit exceeded while draining timers");
         }
         state.nowMs = next.due;
-        state.timers.delete(next.id);
         state.firedTimerCount += 1;
         runHandler(next);
-        if (next.kind === "interval" && !next.cancelled) {
+        const stillOwned = state.timers.get(next.id) === next;
+        if (next.kind === "interval" && stillOwned && !next.cancelled) {
           const step = Math.max(1, next.delay);
           next.due = state.nowMs + step;
           state.timers.set(next.id, next);
+        } else if (stillOwned) {
+          state.timers.delete(next.id);
         }
       }
       state.nowMs = target;

@@ -59,20 +59,26 @@ use chromiumoxide::{Browser, Page};
 use futures_util::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-#[derive(Clone, Debug)]
-struct DurableInitScriptEntry {
+#[derive(Debug)]
+struct DurableInitScriptSession {
     endpoint: String,
     target_id: String,
-    identifier: String,
+    // Page.addScriptToEvaluateOnNewDocument registrations belong to the CDP
+    // page session that created them. Retain that exact physical session until
+    // removal; an identifier alone is not transferable to a fresh session.
+    _browser: Browser,
+    page: Page,
+    handler_task: tokio::task::JoinHandle<()>,
+    identifiers: HashSet<String>,
 }
 
-fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptEntry>> {
-    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptEntry>>> = OnceLock::new();
+fn durable_init_script_registry() -> &'static Mutex<HashMap<String, DurableInitScriptSession>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<String, DurableInitScriptSession>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn durable_init_script_key(endpoint: &str, target_id: &str, identifier: &str) -> String {
-    format!("{endpoint}\n{target_id}\n{identifier}")
+fn durable_init_script_key(endpoint: &str, target_id: &str) -> String {
+    format!("{endpoint}\n{target_id}")
 }
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -2356,31 +2362,6 @@ fn mark_persisted_init_script_registration_removed(
     Ok(())
 }
 
-fn persisted_init_script_registration_removed_readback(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<bool> {
-    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
-    if !snapshot.failures.is_empty() {
-        return Err(cdp_owner_ledger_error(format!(
-            "cannot read init-script registration state: {}",
-            snapshot.failures.join(" | ")
-        )));
-    }
-    Ok(snapshot.rows.iter().any(|row| {
-        row.owner.endpoint == endpoint
-            && row.owner.target_id == target_id
-            && matches!(
-                &row.owner.mutation,
-                PersistedCdpMutationKind::InitScriptEffect {
-                    registration_identifier: Some(row_identifier),
-                    registration_removed: true,
-                } if row_identifier == identifier
-            )
-    }))
-}
-
 fn transition_persisted_init_script_registration_removed(
     owner: &PersistedCdpMutationOwner,
 ) -> A11yResult<PersistedCdpMutationOwner> {
@@ -2404,6 +2385,62 @@ fn transition_persisted_init_script_registration_removed(
     )?;
     resolve_persisted_cdp_mutation_owner(owner)?;
     Ok(removed_owner)
+}
+
+pub fn resolve_persisted_init_script_effect_after_current_teardown(
+    endpoint: &str,
+    target_id: &str,
+    identifier: &str,
+) -> A11yResult<()> {
+    let snapshot = read_persisted_cdp_mutation_owner_snapshot();
+    if !snapshot.failures.is_empty() {
+        return Err(cdp_owner_ledger_error(format!(
+            "cannot resolve init-script effect after current-document teardown: {}",
+            snapshot.failures.join(" | ")
+        )));
+    }
+    let matching = snapshot
+        .rows
+        .into_iter()
+        .filter(|row| {
+            row.owner.endpoint == endpoint
+                && row.owner.target_id == target_id
+                && matches!(
+                    &row.owner.mutation,
+                    PersistedCdpMutationKind::InitScriptEffect {
+                        registration_identifier: Some(row_identifier),
+                        registration_removed: true,
+                    } if row_identifier == identifier
+                )
+        })
+        .collect::<Vec<_>>();
+    if matching.len() != 1 {
+        return Err(cdp_owner_ledger_error(format!(
+            "expected exactly one registration-removed init-script effect for endpoint {endpoint:?}, target {target_id:?}, identifier {identifier:?}; found {}",
+            matching.len()
+        )));
+    }
+    resolve_persisted_cdp_mutation_owner(&matching[0].owner)?;
+    let after = read_persisted_cdp_mutation_owner_snapshot();
+    if !after.failures.is_empty()
+        || after.rows.iter().any(|row| {
+            row.owner.endpoint == endpoint
+                && row.owner.target_id == target_id
+                && matches!(
+                    &row.owner.mutation,
+                    PersistedCdpMutationKind::InitScriptEffect {
+                        registration_identifier: Some(row_identifier),
+                        ..
+                    } if row_identifier == identifier
+                )
+        })
+    {
+        return Err(cdp_owner_ledger_error(format!(
+            "init-script effect terminal readback failed for endpoint {endpoint:?}, target {target_id:?}, identifier {identifier:?}; failures={:?}",
+            after.failures
+        )));
+    }
+    Ok(())
 }
 
 async fn remove_init_script_registration_for_recovery(
@@ -3204,103 +3241,324 @@ async fn cdp_add_init_script_target_owned(
             detail: "durable browser mutation owners are disabled by operator panic; refusing init-script install".to_owned(),
         });
     }
-    let source = source.to_owned();
-    let world_name = world_name.map(ToOwned::to_owned);
-    let owner_endpoint = endpoint.to_owned();
-    let result = with_target_page(endpoint, target_id, |page| async move {
-        let target_id = page.target_id().inner().clone();
-        let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source);
-        if let Some(world_name) = world_name {
-            builder = builder.world_name(world_name);
-        }
-        if let Some(include_command_line_api) = include_command_line_api {
-            builder = builder.include_command_line_api(include_command_line_api);
-        }
-        if let Some(run_immediately) = run_immediately {
-            builder = builder.run_immediately(run_immediately);
-        }
-        let params = builder.build().map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {err}"),
+    let mut builder = AddScriptToEvaluateOnNewDocumentParams::builder().source(source.to_owned());
+    if let Some(world_name) = world_name {
+        builder = builder.world_name(world_name.to_owned());
+    }
+    if let Some(include_command_line_api) = include_command_line_api {
+        builder = builder.include_command_line_api(include_command_line_api);
+    }
+    if let Some(run_immediately) = run_immediately {
+        builder = builder.run_immediately(run_immediately);
+    }
+    let params = builder
+        .build()
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!("build Page.addScriptToEvaluateOnNewDocument params: {error}"),
         })?;
-        // Persist a conservative unknown-registration effect owner before the
-        // physical command. If the response is lost, K2 cannot safely infer an
-        // identifier and must close the exact target rather than reload a
-        // possibly still-registered script.
-        let pending_effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: None,
-                registration_removed: false,
-            },
-        )?;
-        let added = page
-            .execute(params)
-            .await
-            .map_err(|err| A11yError::CdpAxtreeFailed {
-                detail: format!("Page.addScriptToEvaluateOnNewDocument: {err}"),
-            })?
-            .result;
-        let identifier = added.identifier.inner().clone();
-        // Commit the identifier-bearing owner before retiring the conservative
-        // pending row. Normal registration removal intentionally leaves this
-        // effect owner active until a new-document reload readback terminates
-        // page-world code which may already have executed.
-        let _effect_owner = persist_cdp_mutation_owner(
-            &owner_endpoint,
-            &target_id,
-            PersistedCdpMutationKind::InitScriptEffect {
-                registration_identifier: Some(identifier.clone()),
-                registration_removed: false,
-            },
-        )?;
-        resolve_persisted_cdp_mutation_owner(&pending_effect_owner)?;
-        let state = read_page_state(&page).await?;
-        Ok(CdpInitScriptResult {
+
+    let key = durable_init_script_key(endpoint, target_id);
+    let existing = durable_init_script_registry()
+        .lock()
+        .map_err(|_| A11yError::CdpAttachFailed {
+            detail: "durable init-script session registry lock is poisoned before install"
+                .to_owned(),
+        })?
+        .remove(&key);
+    let mut session = match existing {
+        Some(session) => session,
+        None => connect_durable_init_script_session(endpoint, target_id).await?,
+    };
+    if session.handler_task.is_finished() {
+        return finish_durable_init_script_session(
+            session,
+            Err(A11yError::CdpAttachFailed {
+                detail: format!(
+                    "durable init-script CDP session for target {target_id:?} ended before install; refusing to allocate a session-local identifier"
+                ),
+            }),
+            "init-script stale-session rejection",
+        )
+        .await;
+    }
+
+    // Persist a conservative unknown-registration effect owner before the
+    // physical command. If the response is lost, K2 cannot safely infer an
+    // identifier and must close the exact target rather than reload a possibly
+    // still-registered script.
+    let pending_effect_owner = match persist_cdp_mutation_owner(
+        endpoint,
+        target_id,
+        PersistedCdpMutationKind::InitScriptEffect {
+            registration_identifier: None,
+            registration_removed: false,
+        },
+    ) {
+        Ok(owner) => owner,
+        Err(error) => return return_failed_init_script_session(session, error).await,
+    };
+    let added = match session.page.execute(params).await {
+        Ok(added) => added.result,
+        Err(error) => {
+            let primary = A11yError::CdpAxtreeFailed {
+                detail: format!("Page.addScriptToEvaluateOnNewDocument: {error}"),
+            };
+            return return_failed_init_script_session(session, primary).await;
+        }
+    };
+    let identifier = added.identifier.inner().clone();
+    if session.identifiers.contains(&identifier) {
+        let primary = A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Page.addScriptToEvaluateOnNewDocument reused live session-local identifier {identifier:?}; refusing to guess which registration the protocol map retained"
+            ),
+        };
+        return return_failed_init_script_session(session, primary).await;
+    }
+    session.identifiers.insert(identifier.clone());
+
+    // Commit the identifier-bearing owner before retiring the conservative
+    // pending row. Normal registration removal intentionally leaves this
+    // effect owner active until a new-document reload readback terminates
+    // page-world code which may already have executed.
+    if let Err(error) = persist_cdp_mutation_owner(
+        endpoint,
+        target_id,
+        PersistedCdpMutationKind::InitScriptEffect {
+            registration_identifier: Some(identifier.clone()),
+            registration_removed: false,
+        },
+    ) {
+        return rollback_unpublished_init_script(
+            session,
+            endpoint,
             target_id,
-            identifier,
-            state,
-        })
-    })
-    .await?;
+            &identifier,
+            &pending_effect_owner,
+            false,
+            error,
+        )
+        .await;
+    }
+    if let Err(error) = resolve_persisted_cdp_mutation_owner(&pending_effect_owner) {
+        return rollback_unpublished_init_script(
+            session,
+            endpoint,
+            target_id,
+            &identifier,
+            &pending_effect_owner,
+            false,
+            error,
+        )
+        .await;
+    }
+    let state = match read_page_state(&session.page).await {
+        Ok(state) => state,
+        Err(error) => {
+            return rollback_unpublished_init_script(
+                session,
+                endpoint,
+                target_id,
+                &identifier,
+                &pending_effect_owner,
+                true,
+                error,
+            )
+            .await;
+        }
+    };
     if !crate::cdp_network::durable_browser_mutation_owners_enabled() {
-        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
+        let primary = A11yError::CdpAttachFailed {
+            detail: "operator panic crossed init-script installation; refusing publication"
+                .to_owned(),
+        };
+        let (cleanup, retained, _) =
+            remove_init_script_from_session(session, endpoint, target_id, &identifier).await;
+        let retention = retain_init_script_session_after_cleanup(retained).await;
         return Err(A11yError::CdpAttachFailed {
-            detail:
-                "operator panic crossed init-script installation; the new identifier was removed"
-                    .to_owned(),
+            detail: format!(
+                "{primary}; exact registration cleanup={cleanup:?}; session={retention}"
+            ),
         });
     }
-    let entry = DurableInitScriptEntry {
+    if let Err(failure) = store_durable_init_script_session(session) {
+        let (registry_error, session) = *failure;
+        let (cleanup, retained, _) =
+            remove_init_script_from_session(session, endpoint, target_id, &identifier).await;
+        let retention = retain_init_script_session_after_cleanup(retained).await;
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!(
+                "{registry_error}; exact untracked init-script cleanup={cleanup:?}; session={retention}"
+            ),
+        });
+    }
+    Ok(CdpInitScriptResult {
+        target_id: target_id.to_owned(),
+        identifier,
+        state,
+    })
+}
+
+async fn connect_durable_init_script_session(
+    endpoint: &str,
+    target_id: &str,
+) -> A11yResult<DurableInitScriptSession> {
+    let target_id = target_id.trim();
+    if target_id.is_empty() {
+        return Err(A11yError::CdpAttachFailed {
+            detail: "CDP target id must not be empty".to_owned(),
+        });
+    }
+    let (browser, mut handler) =
+        Browser::connect(endpoint)
+            .await
+            .map_err(|error| A11yError::CdpAttachFailed {
+                detail: format!("connect durable init-script session to {endpoint}: {error}"),
+            })?;
+    let handler_task = tokio::spawn(async move { while handler.next().await.is_some() {} });
+    let page = match async {
+        let page = get_target_page_with_discovery(&browser, target_id).await?;
+        prime_target_page_for_input(&page, target_id).await?;
+        Ok::<Page, A11yError>(page)
+    }
+    .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            finish_chromiumoxide_handler::<()>(
+                Err(error),
+                handler_task,
+                "durable init-script session connect",
+            )
+            .await?;
+            unreachable!("an error input cannot become a successful handler verdict")
+        }
+    };
+    Ok(DurableInitScriptSession {
         endpoint: endpoint.to_owned(),
         target_id: target_id.to_owned(),
-        identifier: result.identifier.clone(),
-    };
-    let key = durable_init_script_key(endpoint, target_id, &result.identifier);
-    let registered = match durable_init_script_registry().lock() {
-        Ok(mut registry) => {
-            if crate::cdp_network::durable_browser_mutation_owners_enabled() {
-                registry.insert(key, entry);
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+        _browser: browser,
+        page,
+        handler_task,
+        identifiers: HashSet::new(),
+    })
+}
+
+fn store_durable_init_script_session(
+    session: DurableInitScriptSession,
+) -> Result<(), Box<(String, DurableInitScriptSession)>> {
+    let key = durable_init_script_key(&session.endpoint, &session.target_id);
+    let mut registry = match durable_init_script_registry().lock() {
+        Ok(registry) => registry,
+        Err(_) => {
+            return Err(Box::new((
+                "durable init-script session registry lock is poisoned while returning exact session ownership"
+                    .to_owned(),
+                session,
+            )));
         }
-        Err(_) => Err(()),
     };
-    if registered != Ok(true) {
-        let _ = cdp_remove_init_script_target_owned(endpoint, target_id, &result.identifier).await;
-        return Err(A11yError::CdpAttachFailed {
-            detail: if registered == Ok(false) {
-                "operator panic crossed init-script registration; the new identifier was removed"
-                    .to_owned()
-            } else {
-                "durable init-script registry lock is poisoned; the untracked physical identifier was removed"
-                    .to_owned()
-            },
-        });
+    if registry.contains_key(&key) {
+        return Err(Box::new((
+            format!(
+                "durable init-script session registry already owns endpoint {:?}, target {:?}; refusing to overwrite either physical owner",
+                session.endpoint, session.target_id
+            ),
+            session,
+        )));
     }
-    Ok(result)
+    registry.insert(key, session);
+    Ok(())
+}
+
+async fn finish_durable_init_script_session<T>(
+    session: DurableInitScriptSession,
+    result: A11yResult<T>,
+    operation: &str,
+) -> A11yResult<T> {
+    let DurableInitScriptSession { handler_task, .. } = session;
+    finish_chromiumoxide_handler(result, handler_task, operation).await
+}
+
+async fn return_failed_init_script_session<T>(
+    session: DurableInitScriptSession,
+    primary: A11yError,
+) -> A11yResult<T> {
+    if session.handler_task.is_finished() || session.identifiers.is_empty() {
+        return finish_durable_init_script_session(
+            session,
+            Err(primary),
+            "failed durable init-script command",
+        )
+        .await;
+    }
+    match store_durable_init_script_session(session) {
+        Ok(()) => Err(primary),
+        Err(failure) => {
+            let (registry_error, session) = *failure;
+            finish_durable_init_script_session(
+                session,
+                Err(A11yError::CdpAttachFailed {
+                    detail: format!(
+                        "durable init-script command failed: {primary}; exact session retention also failed: {registry_error}"
+                    ),
+                }),
+                "failed durable init-script session retention",
+            )
+            .await
+        }
+    }
+}
+
+async fn rollback_unpublished_init_script<T>(
+    session: DurableInitScriptSession,
+    endpoint: &str,
+    target_id: &str,
+    identifier: &str,
+    pending_effect_owner: &PersistedCdpMutationOwner,
+    pending_already_resolved: bool,
+    primary: A11yError,
+) -> A11yResult<T> {
+    let (cleanup, retained, physical_removed) =
+        remove_init_script_from_session(session, endpoint, target_id, identifier).await;
+    let pending_cleanup = if physical_removed && !pending_already_resolved {
+        resolve_persisted_cdp_mutation_owner(pending_effect_owner)
+            .map(|()| "resolved".to_owned())
+            .unwrap_or_else(|error| format!("failed: {error}"))
+    } else if pending_already_resolved {
+        "already_resolved".to_owned()
+    } else {
+        "retained_because_physical_removal_was_not_acknowledged".to_owned()
+    };
+    let retention = retain_init_script_session_after_cleanup(retained).await;
+    Err(A11yError::CdpAxtreeFailed {
+        detail: format!(
+            "init-script publication failed: {primary}; exact registration rollback={cleanup:?}; pending owner={pending_cleanup}; session={retention}"
+        ),
+    })
+}
+
+async fn retain_init_script_session_after_cleanup(
+    retained: Option<DurableInitScriptSession>,
+) -> String {
+    let Some(retained) = retained else {
+        return "session_terminated".to_owned();
+    };
+    match store_durable_init_script_session(retained) {
+        Ok(()) => "retained".to_owned(),
+        Err(failure) => {
+            let (registry_error, retained) = *failure;
+            let shutdown = finish_durable_init_script_session(
+                retained,
+                Err::<(), _>(A11yError::CdpAttachFailed {
+                    detail: registry_error,
+                }),
+                "init-script session retention failure",
+            )
+            .await;
+            format!("failed_and_session_terminated: {shutdown:?}")
+        }
+    }
 }
 
 /// Removes a script previously installed with
@@ -3316,122 +3574,243 @@ pub async fn cdp_remove_init_script_target(
     target_id: &str,
     identifier: &str,
 ) -> A11yResult<CdpInitScriptResult> {
-    let result = cdp_remove_init_script_target_owned(endpoint, target_id, identifier).await?;
-    let key = durable_init_script_key(endpoint, target_id, identifier);
-    let mut registry =
-        durable_init_script_registry()
-            .lock()
-            .map_err(|_| A11yError::CdpAttachFailed {
-                detail: "durable init-script registry lock is poisoned after physical removal"
-                    .to_owned(),
-            })?;
-    registry.remove(&key);
-    drop(registry);
-    Ok(result)
-}
-
-async fn cdp_remove_init_script_target_owned(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<CdpInitScriptResult> {
-    cdp_remove_init_script_target_physical(endpoint, target_id, identifier).await
-}
-
-async fn cdp_remove_init_script_target_physical(
-    endpoint: &str,
-    target_id: &str,
-    identifier: &str,
-) -> A11yResult<CdpInitScriptResult> {
-    let owner_endpoint = endpoint.to_owned();
-    let owner_target_id = target_id.to_owned();
+    let endpoint = endpoint.to_owned();
+    let target_id = target_id.to_owned();
     let identifier = identifier.to_owned();
-    with_target_page(endpoint, target_id, |page| async move {
-        let target_id = page.target_id().inner().clone();
-        page.execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
-            ScriptIdentifier::new(identifier.clone()),
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let _operation_guard = crate::cdp_network::durable_browser_mutation_operation_guard().await;
+        let result =
+            cdp_remove_init_script_target_while_guarded(&endpoint, &target_id, &identifier).await;
+        let _ = result_tx.send(result);
+    });
+    result_rx.await.map_err(|_| A11yError::CdpAttachFailed {
+        detail: "owned init-script removal task terminated before publishing a verdict".to_owned(),
+    })?
+}
+
+pub async fn cdp_remove_init_script_target_while_guarded(
+    endpoint: &str,
+    target_id: &str,
+    identifier: &str,
+) -> A11yResult<CdpInitScriptResult> {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        return Err(A11yError::CdpAxtreeFailed {
+            detail: "init-script identifier must not be empty".to_owned(),
+        });
+    }
+    let key = durable_init_script_key(endpoint, target_id);
+    let session = durable_init_script_registry()
+        .lock()
+        .map_err(|_| A11yError::CdpAttachFailed {
+            detail: "durable init-script session registry lock is poisoned before removal"
+                .to_owned(),
+        })?
+        .remove(&key);
+    let Some(session) = session else {
+        let snapshot = read_persisted_cdp_mutation_owner_snapshot();
+        if !snapshot.failures.is_empty() {
+            return Err(cdp_owner_ledger_error(format!(
+                "cannot reconcile missing live init-script session: {}",
+                snapshot.failures.join(" | ")
+            )));
+        }
+        let already_removed = snapshot
+            .rows
+            .iter()
+            .filter(|row| {
+                row.owner.endpoint == endpoint
+                    && row.owner.target_id == target_id
+                    && matches!(
+                        &row.owner.mutation,
+                        PersistedCdpMutationKind::InitScriptEffect {
+                            registration_identifier: Some(row_identifier),
+                            registration_removed: true,
+                        } if row_identifier == identifier
+                    )
+            })
+            .count();
+        if already_removed == 1 {
+            let identifier = identifier.to_owned();
+            return with_target_page(endpoint, target_id, |page| async move {
+                let state = read_page_state(&page).await?;
+                Ok(CdpInitScriptResult {
+                    target_id: page.target_id().inner().clone(),
+                    identifier,
+                    state,
+                })
+            })
+            .await;
+        }
+        return Err(A11yError::CdpAttachFailed {
+            detail: format!(
+                "no exact live CDP session owns init-script identifier {identifier:?} for endpoint {endpoint:?}, target {target_id:?}, and the durable ledger has {already_removed} acknowledged removed owner(s); refusing removal through a different session"
+            ),
+        });
+    };
+    if !session.identifiers.contains(identifier) {
+        let known = session.identifiers.iter().cloned().collect::<Vec<_>>();
+        let primary = A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "init-script identifier {identifier:?} is not owned by the exact live CDP session for target {target_id:?}; owned identifiers={known:?}"
+            ),
+        };
+        return return_failed_init_script_session(session, primary).await;
+    }
+    let (result, retained, _) =
+        remove_init_script_from_session(session, endpoint, target_id, identifier).await;
+    if let Some(retained) = retained
+        && let Err(failure) = store_durable_init_script_session(retained)
+    {
+        let (registry_error, retained) = *failure;
+        return finish_durable_init_script_session(
+                retained,
+                Err(A11yError::CdpAttachFailed {
+                    detail: format!(
+                        "init-script removal verdict={result:?}; exact session retention failed: {registry_error}"
+                    ),
+                }),
+                "init-script removal session retention",
+            )
+            .await;
+    }
+    result
+}
+
+async fn remove_init_script_from_session(
+    mut session: DurableInitScriptSession,
+    endpoint: &str,
+    target_id: &str,
+    identifier: &str,
+) -> (
+    A11yResult<CdpInitScriptResult>,
+    Option<DurableInitScriptSession>,
+    bool,
+) {
+    let physical = session
+        .page
+        .execute(RemoveScriptToEvaluateOnNewDocumentParams::new(
+            ScriptIdentifier::new(identifier.to_owned()),
         ))
         .await
-        .map_err(|err| A11yError::CdpAxtreeFailed {
-            detail: format!("Page.removeScriptToEvaluateOnNewDocument({identifier:?}): {err}"),
-        })?;
-        mark_persisted_init_script_registration_removed(
-            &owner_endpoint,
-            &owner_target_id,
-            &identifier,
-        )?;
-        let state = read_page_state(&page).await?;
+        .map_err(|error| A11yError::CdpAxtreeFailed {
+            detail: format!(
+                "Page.removeScriptToEvaluateOnNewDocument({identifier:?}) on exact owning session: {error}"
+            ),
+        });
+    if let Err(error) = physical {
+        if session.handler_task.is_finished() {
+            let result = finish_durable_init_script_session(
+                session,
+                Err(error),
+                "init-script exact-session removal failure",
+            )
+            .await;
+            return (result, None, false);
+        }
+        return (Err(error), Some(session), false);
+    }
+
+    session.identifiers.remove(identifier);
+    let result = async {
+        mark_persisted_init_script_registration_removed(endpoint, target_id, identifier)?;
+        let state = read_page_state(&session.page).await?;
         Ok(CdpInitScriptResult {
-            target_id,
-            identifier,
+            target_id: target_id.to_owned(),
+            identifier: identifier.to_owned(),
             state,
         })
-    })
-    .await
+    }
+    .await;
+    if session.identifiers.is_empty() {
+        let result = finish_durable_init_script_session(
+            session,
+            result,
+            "last init-script exact-session removal",
+        )
+        .await;
+        (result, None, true)
+    } else {
+        (result, Some(session), true)
+    }
 }
 
 pub fn durable_init_script_active_count_readback() -> Result<usize, String> {
     durable_init_script_registry()
         .lock()
-        .map(|entries| entries.len())
-        .map_err(|_| "durable init-script registry lock is poisoned".to_owned())
+        .map(|sessions| {
+            sessions
+                .values()
+                .map(|session| session.identifiers.len())
+                .sum()
+        })
+        .map_err(|_| "durable init-script session registry lock is poisoned".to_owned())
 }
 
 pub async fn durable_init_scripts_disable_and_drain_all() -> CdpDurableInitScriptDrainReadback {
-    let entries = match durable_init_script_registry().lock() {
-        Ok(mut entries) => std::mem::take(&mut *entries),
+    let sessions = match durable_init_script_registry().lock() {
+        Ok(mut sessions) => std::mem::take(&mut *sessions),
         Err(_) => {
             return CdpDurableInitScriptDrainReadback {
-                failures: vec!["durable init-script registry lock is poisoned".to_owned()],
+                failures: vec!["durable init-script session registry lock is poisoned".to_owned()],
                 active_after: usize::MAX,
                 ..Default::default()
             };
         }
     };
-    let found = entries.len();
+    let found = sessions
+        .values()
+        .map(|session| session.identifiers.len())
+        .sum();
     let mut removed = 0usize;
     let mut failures = Vec::new();
-    let mut failed_entries = Vec::new();
-    for (key, entry) in entries {
-        let removal = match persisted_init_script_registration_removed_readback(
-            &entry.endpoint,
-            &entry.target_id,
-            &entry.identifier,
-        ) {
-            Ok(true) => Ok(()),
-            Ok(false) => remove_init_script_registration_for_recovery(
-                &entry.endpoint,
-                &entry.target_id,
-                &entry.identifier,
-            )
-            .await
-            .and_then(|()| {
-                mark_persisted_init_script_registration_removed(
-                    &entry.endpoint,
-                    &entry.target_id,
-                    &entry.identifier,
+    for mut session in sessions.into_values() {
+        loop {
+            let Some(identifier) = session.identifiers.iter().next().cloned() else {
+                let shutdown = finish_durable_init_script_session(
+                    session,
+                    Ok(()),
+                    "drained init-script exact session",
                 )
-            }),
-            Err(error) => Err(error),
-        };
-        match removal {
-            Ok(()) => removed = removed.saturating_add(1),
-            Err(error) => {
-                failures.push(format!(
-                    "remove init script {:?} from target {:?}: {error}",
-                    entry.identifier, entry.target_id
-                ));
-                failed_entries.push((key, entry));
+                .await;
+                if let Err(error) = shutdown {
+                    failures.push(error.to_string());
+                }
+                break;
+            };
+            let endpoint = session.endpoint.clone();
+            let target_id = session.target_id.clone();
+            let (removal, retained, _) =
+                remove_init_script_from_session(session, &endpoint, &target_id, &identifier).await;
+            let removal_failed = removal.is_err();
+            match removal {
+                Ok(_) => removed = removed.saturating_add(1),
+                Err(error) => failures.push(format!(
+                    "remove init script {identifier:?} from target {target_id:?} on its exact owning session: {error}"
+                )),
             }
-        }
-    }
-    if !failed_entries.is_empty() {
-        match durable_init_script_registry().lock() {
-            Ok(mut registry) => registry.extend(failed_entries),
-            Err(_) => failures.push(
-                "durable init-script registry lock poisoned while retaining failed removals"
-                    .to_owned(),
-            ),
+            let Some(retained) = retained else {
+                break;
+            };
+            session = retained;
+            if removal_failed {
+                if let Err(failure) = store_durable_init_script_session(session) {
+                    let (registry_error, retained) = *failure;
+                    let teardown = finish_durable_init_script_session(
+                        retained,
+                        Err::<(), _>(A11yError::CdpAttachFailed {
+                            detail: registry_error,
+                        }),
+                        "failed init-script drain retention",
+                    )
+                    .await;
+                    if let Err(error) = teardown {
+                        failures.push(error.to_string());
+                    }
+                }
+                break;
+            }
         }
     }
     let active_after = durable_init_script_active_count_readback().unwrap_or(usize::MAX);
