@@ -188,7 +188,7 @@ impl SynapseCalyxVault {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         let (goodhart, guard_training_successes, guard_held_out_successes, guard_profile_sha256) =
-            self.action_goodhart_report(panel_version, training, held_out)?;
+            self.action_goodhart_report(panel_version, observations)?;
         let (mistakes, regression_evaluated, mistake_count) =
             action_mistake_report(training, held_out, observations)?;
 
@@ -484,8 +484,7 @@ impl SynapseCalyxVault {
     fn action_goodhart_report(
         &self,
         panel_version: u32,
-        training: &[ActionObservation],
-        held_out: &[ActionObservation],
+        observations: &[ActionObservation],
     ) -> Result<(GoodhartReport, usize, usize, String), SynapseCalyxError> {
         let profile_key = guard_profile_key(panel_version);
         let bytes = self.read_cf_latest(ColumnFamily::Guard, &profile_key)?.ok_or_else(|| validation_error(
@@ -523,26 +522,41 @@ impl SynapseCalyxVault {
                 )
             },
         )?;
-        let training_good = training
+        // Goodhart stability is a conditional question over successful
+        // actions: among actions that achieved their outcome, does the frozen
+        // trusted region still admit later successes? Splitting the full,
+        // failure-dominated stream first lets class prevalence choose the
+        // success boundary and can leave every success on one side. Select the
+        // outcome cohort first, retain chronological order, then hold out its
+        // newest fifth (with the same finite floor/cap). Mistake replay below
+        // deliberately retains the full-stream chronological split.
+        let successful = observations
             .iter()
             .filter(|row| row.outcome)
+            .collect::<Vec<_>>();
+        let success_held_out_count = (successful.len() / 5)
+            .clamp(MIN_HELD_OUT_RECORDS, MAX_HELD_OUT_RECORDS)
+            .min(successful.len());
+        let success_split = successful.len() - success_held_out_count;
+        let (success_training, held_out_good) = successful.split_at(success_split);
+        let training_good = success_training
+            .iter()
+            .copied()
             .rev()
             .take(MAX_GUARD_TRAINING_RECORDS)
-            .collect::<Vec<_>>();
-        let held_out_good = held_out
-            .iter()
-            .filter(|row| row.outcome)
             .collect::<Vec<_>>();
         if training_good.len() < MIN_HELD_OUT_RECORDS || held_out_good.len() < MIN_HELD_OUT_RECORDS
         {
             return Err(validation_error(
                 "SYNAPSE_CALYX_ACTION_VALIDATION_GOODHART_INSUFFICIENT",
                 format!(
-                    "Goodhart guard holdout has {} training successes and {} held-out successes",
+                    "Goodhart success cohort has {} total successes, {} training successes, and {} held-out successes across {} complete-cause action records",
+                    successful.len(),
                     training_good.len(),
-                    held_out_good.len()
+                    held_out_good.len(),
+                    observations.len()
                 ),
-                "collect at least ten real successful actions on both sides of the chronological split",
+                "collect at least twenty real complete-cause successful actions so the chronological success cohort has ten on both sides",
             ));
         }
         let mut trusted = Vec::with_capacity(training_good.len());
@@ -550,7 +564,7 @@ impl SynapseCalyxVault {
             trusted.push(self.action_dense_slots(row.cx_id, &profile.required_slots)?);
         }
         let mut accepted = 0usize;
-        for row in &held_out_good {
+        for row in held_out_good {
             let query = self.action_dense_slots(row.cx_id, &profile.required_slots)?;
             let pass_count = profile
                 .required_slots

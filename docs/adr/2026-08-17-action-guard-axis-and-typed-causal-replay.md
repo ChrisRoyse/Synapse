@@ -203,3 +203,33 @@ Primary research consulted after the physical missing-cause diagnosis:
 - https://pmc.ncbi.nlm.nih.gov/articles/PMC7705610/
 - https://pmc.ncbi.nlm.nih.gov/articles/PMC3414599/
 - https://pmc.ncbi.nlm.nih.gov/articles/PMC10089074/
+
+The first v4 production trigger exposed an independent split-order defect. The
+Goodhart question is conditional—among actions that actually succeeded, do
+later successes remain inside the trusted region—but the implementation split
+the failure-dominated full stream before selecting successes. It therefore
+reported one training success and fifteen held-out successes even though the
+successful cohort itself had enough observations to form a useful boundary;
+hundreds of unrelated failures, rather than success chronology, chose the cut.
+
+Goodhart validation now selects the complete-cause success cohort first and
+then splits that cohort chronologically, using earlier successes as trusted
+examples and the newest fifth (with the ten-record floor) as holdout. It never
+shuffles and never trains on a later success to score an earlier one. Full-stream
+chronology remains unchanged for mistake replay because that question concerns
+all action outcomes. The structured insufficiency error now reports total
+successes, training successes, held-out successes, and complete-cause record
+count, so the acquisition deficit is exact instead of encouraging blind corpus
+inflation.
+
+Temporal validation guidance supports preserving past-to-future ordering, and
+empirical work on severe outcome imbalance demonstrates that class/event
+prevalence must be inspected independently in derivation and validation
+populations. Those principles require a chronological split over the actual
+conditional population being measured here, not over unrelated failure rows.
+
+Additional references:
+
+- https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC11610218/
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC12219301/
