@@ -15,6 +15,14 @@ row, fallback estimator, sampled pair set, alternate database, branch, worktree,
 or alternate Cargo target directory was used as acceptance evidence. Format,
 compile, and warning-denying lint are structural checks only.
 
+The first final pre-push security gate discovered the newly published
+RUSTSEC-2026-0258 advisory in the locked HTTP/2 transport dependency (`h2
+0.4.14`): unbounded empty DATA-frame queuing. The dependency was upgraded at
+the source to patched `h2 0.4.16`; the lockfile changed only that package's
+version and checksum. No advisory suppression was added. A locked workspace
+compile traversed all Hyper/Axum/Reqwest consumers and `cargo deny check`
+separately returned `advisories ok, bans ok, licenses ok, sources ok`.
+
 ## Exact final runtime precondition
 
 The standard `setup operation=repair` transaction built, candidate-verified,
@@ -289,6 +297,9 @@ primary-source research was completed through the native web lane:
   admission, rather than overlap or timeout inflation.
 - RocksDB iterator/snapshot guidance supports one allocation-reusing forward
   walk over an explicit pinned snapshot rather than repeated page materialization.
+- RustSec RUSTSEC-2026-0258 and Hyper's GHSA-q83h-524g-xf6h identify `h2
+  0.4.16` as the patched floor for the empty-DATA-frame resource-exhaustion
+  defect; this was fixed by dependency upgrade, not ignored in policy.
 
 Exact source links and how they constrained implementation are retained in the
 causal, bounded-read, critical-surface, ADR, and issue-specific evidence files.
