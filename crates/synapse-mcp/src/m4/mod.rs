@@ -9817,22 +9817,7 @@ fn chromium_cdp_launch(params: &ActLaunchParams) -> Result<Option<ChromiumCdpLau
         .iter()
         .any(|arg| is_switch_arg(arg, "--user-data-dir"));
     let has_cdp_switch = has_remote_debugging_switch || has_profile_switch;
-    if params.cdp_debug == Some(false) {
-        if has_remote_debugging_switch {
-            return Err(cdp_config_error(
-                "cdp_disabled_with_debug_switches",
-                params,
-                "remove Chromium remote-debugging switches or set cdp_debug=true; an explicit --user-data-dir remains valid for a debugger-free normal-extension launch",
-            ));
-        }
-        if has_profile_switch {
-            // `--user-data-dir` is a general Chromium isolation switch, not a
-            // debugger switch.  Validate its cardinality/value even on the
-            // explicitly debugger-free lane so malformed launches still fail
-            // before process creation, then leave the caller's dedicated
-            // profile argument intact for the normal extension bridge.
-            let _ = unique_switch_value(&params.args, "--user-data-dir")?;
-        }
+    if validate_explicit_cdp_disabled_args(params)? {
         return Ok(None);
     }
     if !is_chromium && params.cdp_debug != Some(true) && !has_cdp_switch {
@@ -9910,6 +9895,44 @@ fn chromium_cdp_launch(params: &ActLaunchParams) -> Result<Option<ChromiumCdpLau
             "pair the single --user-data-dir switch with one --remote-debugging-port switch",
         )),
     }
+}
+
+/// Validate the explicit debugger-free Chromium lane at the public parameter
+/// boundary as well as at launch construction. This keeps malformed mode/switch
+/// combinations from being reclassified by the later popup-safety policy and
+/// guarantees their causal diagnostic is emitted before permissions, process
+/// history, profile ownership, or OS process creation can be touched.
+fn validate_explicit_cdp_disabled_args(params: &ActLaunchParams) -> Result<bool, ErrorData> {
+    if params.cdp_debug != Some(false) {
+        return Ok(false);
+    }
+
+    let has_remote_debugging_switch = params.args.iter().any(|arg| {
+        is_switch_arg(arg, "--remote-debugging-port")
+            || is_switch_arg(arg, "--remote-debugging-pipe")
+    });
+    if has_remote_debugging_switch {
+        return Err(cdp_config_error(
+            "cdp_disabled_with_debug_switches",
+            params,
+            "remove Chromium remote-debugging switches or set cdp_debug=true; an explicit --user-data-dir remains valid for a debugger-free normal-extension launch",
+        ));
+    }
+
+    if params
+        .args
+        .iter()
+        .any(|arg| is_switch_arg(arg, "--user-data-dir"))
+    {
+        // `--user-data-dir` is a general Chromium isolation switch, not a
+        // debugger switch. Validate its cardinality/value even on the
+        // explicitly debugger-free lane so malformed launches fail before any
+        // authority or resource admission, then leave it intact for the normal
+        // extension bridge.
+        let _ = unique_switch_value(&params.args, "--user-data-dir")?;
+    }
+
+    Ok(true)
 }
 
 fn unique_switch_value(args: &[String], switch: &str) -> Result<Option<String>, ErrorData> {
@@ -13513,6 +13536,9 @@ fn launch_desktop_params_error(
 }
 
 fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(), ErrorData> {
+    if validate_explicit_cdp_disabled_args(params)? {
+        return Ok(());
+    }
     let is_chromium =
         synapse_a11y::is_chromium_family(&launch_target_effective_file_name(&params.target));
     if !is_chromium && params.cdp_debug != Some(true) {
