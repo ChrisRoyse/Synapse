@@ -56,6 +56,154 @@ const EXPECTED_EXTENSION_BUILD_ID: &str =
     "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v26";
 const EXPECTED_EXTENSION_DECLARED_BUILD_SHA256: &str =
     "fb7ba5c83b01ec7c7e8be32a620f882fbefbc152da810e53b66abcf60902cf24";
+
+/// Physical proof that a caller-supplied Chromium extension directory is the
+/// installed, debugger-free Synapse normal bridge rather than an arbitrary
+/// unpacked extension.
+#[derive(Clone, Debug, Serialize)]
+pub struct PopupFreeBridgeLaunchAttestation {
+    pub canonical_extension_dir: String,
+    pub manifest_sha256: String,
+    pub service_worker_sha256: String,
+    pub extension_build_id: &'static str,
+    pub extension_declared_build_sha256: &'static str,
+    pub debugger_api_available: bool,
+}
+
+/// Attest the only unpacked extension Synapse may load beside a caller-supplied
+/// remote-debugging Chromium launch.
+///
+/// The launch policy otherwise forbids every extension-loading flag. This
+/// narrow admission is bound to the canonical `%LOCALAPPDATA%\synapse\chrome-extension\active`
+/// directory, its physical manifest, the exact compiled bridge identity, and
+/// an explicit debugger-free runtime contract. Unknown, malformed, moved, or
+/// hazard-permission state fails closed with an exact diagnostic.
+pub fn attest_popup_free_bridge_launch_dir(
+    extension_dir: &Path,
+) -> Result<PopupFreeBridgeLaunchAttestation, String> {
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "LOCALAPPDATA is missing from the daemon environment".to_owned())?;
+    let expected_dir = PathBuf::from(local_app_data)
+        .join("synapse")
+        .join("chrome-extension")
+        .join("active");
+    let expected_dir = expected_dir.canonicalize().map_err(|error| {
+        format!(
+            "canonical popup-free bridge directory is unreadable path={} error={error}",
+            expected_dir.display()
+        )
+    })?;
+    let actual_dir = extension_dir.canonicalize().map_err(|error| {
+        format!(
+            "requested extension directory is unreadable path={} error={error}",
+            extension_dir.display()
+        )
+    })?;
+    if !paths_equal_for_host(&actual_dir, &expected_dir) {
+        return Err(format!(
+            "requested extension directory is not the canonical Synapse bridge expected={} actual={}",
+            expected_dir.display(),
+            actual_dir.display()
+        ));
+    }
+
+    let manifest_path = actual_dir.join("manifest.json");
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|error| {
+        format!(
+            "popup-free bridge manifest is unreadable path={} error={error}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).map_err(|error| {
+        format!(
+            "popup-free bridge manifest is invalid JSON path={} error={error}",
+            manifest_path.display()
+        )
+    })?;
+    if manifest.get("manifest_version").and_then(Value::as_u64) != Some(3) {
+        return Err("popup-free bridge manifest_version must be exactly 3".to_owned());
+    }
+    if manifest
+        .pointer("/background/service_worker")
+        .and_then(Value::as_str)
+        != Some("service_worker.js")
+    {
+        return Err(
+            "popup-free bridge background.service_worker must be service_worker.js".to_owned(),
+        );
+    }
+    for field in ["permissions", "optional_permissions"] {
+        let Some(values) = manifest.get(field) else {
+            continue;
+        };
+        let values = values
+            .as_array()
+            .ok_or_else(|| format!("popup-free bridge manifest field {field} must be an array"))?;
+        for value in values {
+            let permission = value.as_str().ok_or_else(|| {
+                format!("popup-free bridge manifest field {field} contains a non-string value")
+            })?;
+            if matches!(permission, "debugger" | "nativeMessaging" | "management") {
+                return Err(format!(
+                    "popup-free bridge manifest field {field} contains forbidden permission {permission}"
+                ));
+            }
+        }
+    }
+
+    let worker_path = actual_dir.join("service_worker.js");
+    let worker_bytes = std::fs::read(&worker_path).map_err(|error| {
+        format!(
+            "popup-free bridge service worker is unreadable path={} error={error}",
+            worker_path.display()
+        )
+    })?;
+    let worker = std::str::from_utf8(&worker_bytes).map_err(|error| {
+        format!(
+            "popup-free bridge service worker is not UTF-8 path={} error={error}",
+            worker_path.display()
+        )
+    })?;
+    let build_marker = format!("const BRIDGE_BUILD_ID = \"{EXPECTED_EXTENSION_BUILD_ID}\";");
+    let declared_marker = format!(
+        "const BRIDGE_DECLARED_BUILD_SHA256 = \"{EXPECTED_EXTENSION_DECLARED_BUILD_SHA256}\";"
+    );
+    if !worker.contains(&build_marker) || !worker.contains(&declared_marker) {
+        return Err(format!(
+            "popup-free bridge service worker identity does not match compiled build_id={EXPECTED_EXTENSION_BUILD_ID} declared_build_sha256={EXPECTED_EXTENSION_DECLARED_BUILD_SHA256}"
+        ));
+    }
+    if !worker.contains("function runtimeDebuggerApiAvailable()")
+        || !worker.contains("function runtimeDebuggerApiAvailable() {\n  return false;\n}")
+    {
+        return Err(
+            "popup-free bridge service worker lacks the exact debugger_api_available=false runtime contract"
+                .to_owned(),
+        );
+    }
+
+    Ok(PopupFreeBridgeLaunchAttestation {
+        canonical_extension_dir: actual_dir.display().to_string(),
+        manifest_sha256: sha256_hex_lower(&manifest_bytes),
+        service_worker_sha256: sha256_hex_lower(&worker_bytes),
+        extension_build_id: EXPECTED_EXTENSION_BUILD_ID,
+        extension_declared_build_sha256: EXPECTED_EXTENSION_DECLARED_BUILD_SHA256,
+        debugger_api_available: false,
+    })
+}
+
+fn paths_equal_for_host(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
+}
 // >>> SHARED-CHROME-NATIVE-MESSAGE-BUDGET-CONTRACT
 pub const NATIVE_MESSAGE_HTTP_BODY_LIMIT_MIB: usize = 64;
 pub const PAGE_SCREENSHOT_NATIVE_MESSAGE_BUDGET_MIB: usize = 60;

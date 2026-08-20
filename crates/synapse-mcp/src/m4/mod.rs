@@ -13526,6 +13526,8 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
             "has_silent_debugger_extension_api": violation.silent_debugger,
             "has_disable_extensions": violation.disable_extensions,
             "has_extension_loading_flags": violation.loads_extensions,
+            "popup_free_synapse_bridge_attested": violation.popup_free_synapse_bridge_attested,
+            "popup_free_synapse_bridge_attestation_error": violation.popup_free_synapse_bridge_attestation_error,
             "has_layout_shifting_infobar_flags": !violation.layout_infobar_flags.is_empty(),
             "layout_shifting_infobar_flags": violation.layout_infobar_flags,
             "required_invariant": CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT,
@@ -13534,7 +13536,7 @@ fn validate_chromium_debug_launch_policy(params: &ActLaunchParams) -> Result<(),
     ))
 }
 
-const CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT: &str = "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, --disable-extensions, no extension-loading flags, and no known layout-shifting Chrome warning flags such as --disable-blink-features=AutomationControlled";
+const CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT: &str = "remote-debugging Chromium launches must use a non-default dedicated user-data-dir, --silent-debugger-extension-api, and no known layout-shifting Chrome warning flags; they must either disable all extensions or load only the byte-attested debugger-free Synapse bridge from its canonical active directory";
 
 #[derive(Debug)]
 struct ChromiumDebugPolicyViolation {
@@ -13544,6 +13546,8 @@ struct ChromiumDebugPolicyViolation {
     silent_debugger: bool,
     disable_extensions: bool,
     loads_extensions: bool,
+    popup_free_synapse_bridge_attested: bool,
+    popup_free_synapse_bridge_attestation_error: Option<String>,
     layout_infobar_flags: Vec<String>,
 }
 
@@ -13569,11 +13573,19 @@ fn chromium_debug_args_policy_violation(
     let loads_extensions = args.iter().any(|arg| {
         is_switch_arg(arg, "--load-extension") || is_switch_arg(arg, "--disable-extensions-except")
     });
+    let (popup_free_synapse_bridge_attested, popup_free_synapse_bridge_attestation_error) =
+        if loads_extensions {
+            match attest_popup_free_synapse_bridge_launch_args(args) {
+                Ok(()) => (true, None),
+                Err(error) => (false, Some(error)),
+            }
+        } else {
+            (false, None)
+        };
     let layout_infobar_flags = chromium_layout_infobar_flags(args);
 
     if silent_debugger
-        && disable_extensions
-        && !loads_extensions
+        && ((disable_extensions && !loads_extensions) || popup_free_synapse_bridge_attested)
         && layout_infobar_flags.is_empty()
         && matches!(user_data_dir_state, ChromiumUserDataDirSafety::Dedicated)
     {
@@ -13587,8 +13599,85 @@ fn chromium_debug_args_policy_violation(
         silent_debugger,
         disable_extensions,
         loads_extensions,
+        popup_free_synapse_bridge_attested,
+        popup_free_synapse_bridge_attestation_error,
         layout_infobar_flags,
     })
+}
+
+fn attest_popup_free_synapse_bridge_launch_args(args: &[String]) -> Result<(), String> {
+    let loaded = chromium_switch_path_values(args, "--load-extension")?;
+    let except = chromium_switch_path_values(args, "--disable-extensions-except")?;
+    if loaded.len() != 1 || except.len() != 1 {
+        return Err(format!(
+            "popup-free bridge launch requires exactly one --load-extension path and one matching --disable-extensions-except path; load_count={} except_count={}",
+            loaded.len(),
+            except.len()
+        ));
+    }
+    let loaded_path = PathBuf::from(&loaded[0]);
+    let except_path = PathBuf::from(&except[0]);
+    let loaded_canonical = loaded_path.canonicalize().map_err(|error| {
+        format!(
+            "--load-extension path is unreadable path={} error={error}",
+            loaded_path.display()
+        )
+    })?;
+    let except_canonical = except_path.canonicalize().map_err(|error| {
+        format!(
+            "--disable-extensions-except path is unreadable path={} error={error}",
+            except_path.display()
+        )
+    })?;
+    if !paths_equal_for_launch_policy(&loaded_canonical, &except_canonical) {
+        return Err(format!(
+            "extension-loading paths do not identify one exact directory load={} except={}",
+            loaded_canonical.display(),
+            except_canonical.display()
+        ));
+    }
+    synapse_chrome_bridge::attest_popup_free_bridge_launch_dir(&loaded_canonical).map(|_| ())
+}
+
+fn chromium_switch_path_values(args: &[String], switch: &str) -> Result<Vec<String>, String> {
+    let prefix = format!("{switch}=");
+    let mut values = Vec::new();
+    for arg in args {
+        let Some(raw) = arg.strip_prefix(&prefix) else {
+            if arg.eq_ignore_ascii_case(switch) {
+                return Err(format!(
+                    "{switch} must use the explicit {switch}=<absolute-path> form"
+                ));
+            }
+            continue;
+        };
+        for value in raw.split(',') {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(format!("{switch} contains an empty extension path"));
+            }
+            let path = Path::new(value);
+            if !path.is_absolute() {
+                return Err(format!(
+                    "{switch} extension path must be absolute path={value}"
+                ));
+            }
+            values.push(value.to_owned());
+        }
+    }
+    Ok(values)
+}
+
+fn paths_equal_for_launch_policy(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        left.to_string_lossy()
+            .eq_ignore_ascii_case(&right.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        left == right
+    }
 }
 
 fn validate_run_shell_chromium_debug_policy(params: &ActRunShellParams) -> Result<(), ErrorData> {
@@ -13798,6 +13887,8 @@ fn run_shell_chromium_debug_error(
         silent_debugger,
         disable_extensions,
         loads_extensions,
+        popup_free_synapse_bridge_attested,
+        popup_free_synapse_bridge_attestation_error,
         layout_infobar_flags,
     ) = if let Some(violation) = direct_violation {
         (
@@ -13806,12 +13897,16 @@ fn run_shell_chromium_debug_error(
             Some(violation.silent_debugger),
             Some(violation.disable_extensions),
             Some(violation.loads_extensions),
+            Some(violation.popup_free_synapse_bridge_attested),
+            violation.popup_free_synapse_bridge_attestation_error,
             violation.layout_infobar_flags,
         )
     } else {
         (
             None,
             "unknown_shell_wrapped".to_owned(),
+            None,
+            None,
             None,
             None,
             None,
@@ -13843,6 +13938,8 @@ fn run_shell_chromium_debug_error(
             "has_silent_debugger_extension_api": silent_debugger,
             "has_disable_extensions": disable_extensions,
             "has_extension_loading_flags": loads_extensions,
+            "popup_free_synapse_bridge_attested": popup_free_synapse_bridge_attested,
+            "popup_free_synapse_bridge_attestation_error": popup_free_synapse_bridge_attestation_error,
             "has_layout_shifting_infobar_flags": !layout_infobar_flags.is_empty(),
             "layout_shifting_infobar_flags": layout_infobar_flags,
             "required_invariant": CHROMIUM_DEBUG_LAUNCH_REQUIRED_INVARIANT,
