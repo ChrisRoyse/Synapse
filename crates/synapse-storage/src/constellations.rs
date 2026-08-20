@@ -210,7 +210,18 @@ pub const SYN_ACTION_PANEL_NAME: &str = "syn-action-v1";
 /// facts (tool/verb/request structure plus shell executable-resolution state),
 /// while the new anchor distinguishes region membership from command reward.
 /// Neither meaning is grafted onto the already-written `2_185_005` generation.
-pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_006;
+///
+/// Generation `2_185_007` repairs the admission representation without
+/// mutating slot 123. Production calibration found exact good/bad collisions:
+/// v1 retained request structure but discarded scalar request values even
+/// though the independent request-atom lane distinguished the rows. Slot 124
+/// combines the bounded semantic atoms of the authenticated request with the
+/// bounded semantic atoms of the immutable `before` snapshot. It remains
+/// pre-trigger-only and explicitly absent when either causal side is absent.
+pub const SYN_ACTION_PANEL_VERSION: u32 = 2_185_007;
+/// The structural admission-context generation superseded by the value-aware
+/// request × precondition causal context.
+pub const SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT_V2: u32 = 2_185_006;
 /// The causal-unit/precondition generation superseded by guard-axis separation
 /// and the compact admission-context lane.
 pub const SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT: u32 = 2_185_005;
@@ -776,6 +787,11 @@ const ACT_PRECONDITION_ATOM_VECTOR_DIM: u32 = 512;
 /// 128 dimensions keeps collision noise below 0.09 without reproducing the
 /// exact 512-dimensional request identity lane.
 const ACT_ADMISSION_CONTEXT_DIM: u32 = 128;
+/// Value-aware request × precondition context used by Ward and chronological
+/// replay. Each causal side contributes at most 128 bounded semantic atoms.
+/// The 512-dimensional signed projection keeps their namespaces separate and
+/// has the same disclosed ~0.044 projection-noise scale as each source lens.
+const ACT_ADMISSION_CONTEXT_V2_DIM: u32 = 512;
 /// Frozen byte-length scale for the pre-action request lane.
 ///
 /// One authenticated Streamable-HTTP MCP request is capped at 1 MiB by
@@ -893,6 +909,9 @@ const ACT_SLOT_PRECONDITION_ATOMS: SlotId = SlotId::new(122);
 /// Compact admission context over request shape and point-in-time preflight.
 /// Slot 123 has never carried another meaning.
 const ACT_SLOT_ADMISSION_CONTEXT: SlotId = SlotId::new(123);
+/// Value-aware conjunction of authenticated request semantics and immutable
+/// precondition semantics. Slot 124 has never carried another meaning.
+const ACT_SLOT_ADMISSION_CONTEXT_V2: SlotId = SlotId::new(124);
 
 const RF_SLOT_REFLEX_HASH: SlotId = SlotId::new(53);
 const RF_SLOT_OUTCOME_ONEHOT: SlotId = SlotId::new(54);
@@ -1055,13 +1074,13 @@ const PANEL_SLOT_BLOCKS: &[PanelSlotBlock] = &[
     },
     // The action panel's second block (#2050/#1690). Holds the dense target,
     // exact request, bounded request-size/request-shape, semantic request and
-    // precondition and admission-context lanes (117..=123). `48..=52` could not be
+    // precondition and admission-context lanes (117..=124). `48..=52` could not be
     // extended because 53 belongs to the reflex panel and a block is contiguous
     // by construction.
     PanelSlotBlock {
         panel: SYN_ACTION_PANEL_NAME,
         first: 117,
-        last: 123,
+        last: 124,
     },
     PanelSlotBlock {
         panel: SYN_REFLEX_PANEL_NAME,
@@ -2561,6 +2580,10 @@ const SYN_SLOT_LENS_NAMES: &[(SlotId, &str)] = &[
         ACT_SLOT_ADMISSION_CONTEXT,
         "syn.action.admission_context.v1",
     ),
+    (
+        ACT_SLOT_ADMISSION_CONTEXT_V2,
+        "syn.action.admission_context.v2",
+    ),
     (RF_SLOT_REFLEX_HASH, "syn.reflex.reflex_hash.v1"),
     (RF_SLOT_OUTCOME_ONEHOT, "syn.reflex.outcome_onehot.v1"),
     (RF_SLOT_LATENCY_LOG1P, "syn.reflex.latency_ms_log1p.v1"),
@@ -3001,6 +3024,7 @@ pub fn builtin_panel_catalog() -> Vec<PanelCatalogEntry> {
                 SYN_ACTION_PANEL_VERSION_PRE_REQUEST_ATOMS,
                 SYN_ACTION_PANEL_VERSION_PRE_PRECONDITIONS,
                 SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT,
+                SYN_ACTION_PANEL_VERSION_PRE_ADMISSION_CONTEXT_V2,
             ],
             backfill_source_cf: Some(cf::CF_ACTION_LOG),
         },
@@ -5442,6 +5466,10 @@ pub fn build_action_constellation(
     slots.insert(
         ACT_SLOT_ADMISSION_CONTEXT,
         action_admission_context_slot(source_key, record)?,
+    );
+    slots.insert(
+        ACT_SLOT_ADMISSION_CONTEXT_V2,
+        action_admission_context_v2_slot(source_key, record)?,
     );
     slots.insert(
         ACT_SLOT_RECORD_VECTOR,
@@ -8510,12 +8538,36 @@ fn action_panel_slots(panel_version: u32, registry: &mut Registry) -> StorageRes
         panel_version,
         registry,
     )?);
-    slots.push(action_precondition_panel_slot(panel_version, registry)?);
-    slots.push(action_admission_context_panel_slot(
+    slots.extend(action_causal_context_panel_slots(panel_version, registry)?);
+    Ok(slots)
+}
+
+fn action_causal_context_panel_slots(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<[Slot; 3]> {
+    Ok([
+        action_precondition_panel_slot(panel_version, registry)?,
+        action_admission_context_panel_slot(panel_version, registry)?,
+        action_admission_context_v2_panel_slot(panel_version, registry)?,
+    ])
+}
+
+fn action_admission_context_v2_panel_slot(
+    panel_version: u32,
+    registry: &mut Registry,
+) -> StorageResult<Slot> {
+    syn_content_slot(
+        ACT_SLOT_ADMISSION_CONTEXT_V2,
+        "syn.action.admission_context.v2",
+        RegistryAlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.admission_context.v2",
+            Modality::Structured,
+            ACT_ADMISSION_CONTEXT_V2_DIM,
+        ),
         panel_version,
         registry,
-    )?);
-    Ok(slots)
+    )
 }
 
 fn action_admission_context_panel_slot(
@@ -10708,6 +10760,95 @@ fn action_admission_context_slot(source_key: &[u8], record: &Value) -> StorageRe
             "syn.action.admission_context.v1",
             Modality::Structured,
             ACT_ADMISSION_CONTEXT_DIM,
+        ),
+        &Value::Object(features),
+    )
+}
+
+/// Measures the value-aware request × precondition causal context.
+///
+/// This is deliberately a new lens rather than a mutation of v1. It composes
+/// the same bounded semantic atoms already measured independently in slots 121
+/// and 122, but prefixes each side before projecting so a request fact can
+/// never alias an equal-looking host fact by key identity. The function calls
+/// only pre-trigger extractors: terminal `status`, `error`, `outcome`, `after`,
+/// response bytes, and action results are unreachable from this path.
+fn action_admission_context_v2_slot(
+    source_key: &[u8],
+    record: &Value,
+) -> StorageResult<SlotVector> {
+    if json_string(record, &["row_kind"]).as_deref() != Some("command_audit") {
+        return Ok(absent(AbsentReason::NotApplicable));
+    }
+
+    let Some(request) = action_request_source(record).map_err(|error| {
+        measurement_error(
+            "action admission context v2",
+            format!(
+                "source_cf={} source_key_hex={} action={}: {error}",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                action_identity(record)
+            ),
+        )
+    })?
+    else {
+        return Ok(absent(AbsentReason::NotApplicable));
+    };
+    let Some(preconditions) = action_precondition_atom_features(record).map_err(|error| {
+        measurement_error(
+            "action admission context v2",
+            format!(
+                "source_cf={} source_key_hex={} action={}: {error}",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                action_identity(record)
+            ),
+        )
+    })?
+    else {
+        // Historical rows with no independently persisted `before` state are
+        // missing evidence. Reconstructing it from the current host would leak
+        // future state into a frozen causal measurement.
+        return Ok(absent(AbsentReason::NotApplicable));
+    };
+
+    let request_features = action_request_atom_features(record, &request);
+    let mut features = serde_json::Map::new();
+    for (namespace, causal_features) in [("request", request_features), ("before", preconditions)] {
+        for (key, value) in causal_features {
+            let prefixed = format!("{namespace}|{key}");
+            if features.insert(prefixed.clone(), value).is_some() {
+                return Err(measurement_error(
+                    "action admission context v2",
+                    format!(
+                        "source_cf={} source_key_hex={} produced duplicate causal feature {prefixed}; remediation=repair the frozen feature namespace before publishing the panel",
+                        cf::CF_ACTION_LOG,
+                        hex_encode(source_key)
+                    ),
+                ));
+            }
+        }
+    }
+    let maximum_features = 2 * (ACT_REQUEST_MAX_ATOMS + 1);
+    if features.len() > maximum_features {
+        return Err(measurement_error(
+            "action admission context v2",
+            format!(
+                "source_cf={} source_key_hex={} produced {} causal features above the frozen {maximum_features}-feature bound; remediation=allocate a new bounded lens generation instead of silently truncating",
+                cf::CF_ACTION_LOG,
+                hex_encode(source_key),
+                features.len()
+            ),
+        ));
+    }
+
+    measure_json(
+        SYN_ACTION_PANEL_NAME,
+        AlgorithmicLens::syn_record_vector_unit_fields(
+            "syn.action.admission_context.v2",
+            Modality::Structured,
+            ACT_ADMISSION_CONTEXT_V2_DIM,
         ),
         &Value::Object(features),
     )

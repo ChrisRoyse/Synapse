@@ -514,6 +514,24 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
+    // Value-aware authenticated request × immutable-precondition context.
+    // Terminal result fields remain structurally excluded.
+    (
+        124,
+        2_185_007,
+        "syn.action.admission_context.v2",
+        &[
+            "before",
+            "channel",
+            "payload_bounded",
+            "payload_bytes",
+            "payload_sha256",
+            "payload_truncated",
+            "row_kind",
+            "tool",
+            "verb",
+        ],
+    ),
     (53, 1_965_004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
     (54, 1_965_004, "syn.reflex.outcome_onehot.v1", &["status"]),
     (

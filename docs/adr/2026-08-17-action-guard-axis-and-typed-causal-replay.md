@@ -2,7 +2,7 @@
 
 Date: 2026-08-17
 
-Status: implemented; production guard separability repair in progress
+Status: implemented; production FSV pending
 
 Issue: #1690
 
@@ -47,6 +47,16 @@ declared grounded axis.
   neighbours fused by reciprocal rank. Typed slots are ranked separately and
   never flattened. Ties or absent evidence are `Insufficient`, never an
   implicit negative prediction.
+- Preserve slot 123 and generation `2_185_006` as immutable history. Production
+  calibration physically proved that v1 collapsed different good/bad scalar
+  requests: their request-vector and request-atom bytes differed while slot 123
+  was identical. Generation `2_185_007` therefore adds slot 124,
+  `syn.action.admission_context.v2`, a 512-dimensional signed projection over
+  separately namespaced bounded request-semantic and immutable-`before`
+  semantic atoms. It is explicitly absent unless both causal sides were
+  persisted before the trigger. It never reconstructs historical host state,
+  imports terminal fields, weakens Ward's FAR, or uses exact request identity as
+  the calibration boundary.
 
 ## Research basis
 
@@ -66,10 +76,12 @@ Primary references:
 
 Guard calibration, Goodhart validation, mistake closure, causal-map
 publication, kernel construction, and readiness now consume explicit grounded
-axes. Existing rows without executable preflight remain visibly
-`legacy_unknown`; they are never rewritten from current filesystem state.
-Panel, profile, assay, kernel, derived-state, and validation artifacts must be
-rebuilt and physically read back for `2_185_006` before readiness can pass.
+axes. Existing v1 rows retain their historical `legacy_unknown` measurement.
+The v2 slot is instead `Absent` when an independently persisted request or
+immutable precondition is unavailable; it is never rewritten from current
+filesystem state. Panel, profile, assay, kernel, derived-state, and validation
+artifacts must be rebuilt and physically read back for `2_185_007` before
+readiness can pass.
 
 Deployment also exposed an independent ledger-type ambiguity: action
 validation and Forge promotion receipts legitimately use the broad
