@@ -830,8 +830,11 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_params_for_context(raw_params, &shell_context)?;
-        let command_payload =
-            run_shell_request_details(&params, self.m4_config.run_shell_inline_await_limit_ms());
+        let command_payload = run_shell_request_details(
+            &self.m4_config,
+            &params,
+            self.m4_config.run_shell_inline_await_limit_ms(),
+        );
         let preconditions = match run_shell_precondition_snapshot(&params, Some(&shell_context)) {
             Ok(preconditions) => preconditions,
             Err(error) => {
@@ -964,7 +967,7 @@ impl SynapseService {
         let session_id = require_shell_session_id(&request_context)?;
         let shell_context = shell_execution_context_for_session(&session_id)?;
         let params = prepare_run_shell_start_params_for_context(raw_params, &shell_context)?;
-        let command_payload = run_shell_start_request_details(&params);
+        let command_payload = run_shell_start_request_details(&self.m4_config, &params);
         let preconditions =
             match run_shell_start_precondition_snapshot(&params, Some(&shell_context)) {
                 Ok(preconditions) => preconditions,

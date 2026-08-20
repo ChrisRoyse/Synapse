@@ -532,6 +532,25 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
             "verb",
         ],
     ),
+    // Complete writer-sealed admission facts × authenticated request ×
+    // immutable preconditions. The nested admission_facts snapshot is part of
+    // payload_bounded; terminal result fields remain structurally excluded.
+    (
+        125,
+        2_185_008,
+        "syn.action.admission_context.v3",
+        &[
+            "before",
+            "channel",
+            "payload_bounded",
+            "payload_bytes",
+            "payload_sha256",
+            "payload_truncated",
+            "row_kind",
+            "tool",
+            "verb",
+        ],
+    ),
     (53, 1_965_004, "syn.reflex.reflex_hash.v1", &["reflex_id"]),
     (54, 1_965_004, "syn.reflex.outcome_onehot.v1", &["status"]),
     (
@@ -796,10 +815,10 @@ pub const SYN_SLOT_SOURCE_FIELDS: &[(u16, u32, &str, &[&str])] = &[
 pub const SYN_ANCHOR_DETERMINING_FIELDS: &[(&str, u32, &[&str])] = &[
     // `action_outcome_anchor`: command-final readiness uses `outcome`; physical
     // action completion is a separate grounded axis determined by `status`.
-    // No active 2_185_007 lens reads these post-treatment fields.
-    ("reward", 2_185_007, &["outcome"]),
-    ("action_execution_reward", 2_185_007, &["status"]),
-    ("action_guard_region", 2_185_007, &["outcome", "error_code"]),
+    // No active 2_185_008 lens reads these post-treatment fields.
+    ("reward", 2_185_008, &["outcome"]),
+    ("action_execution_reward", 2_185_008, &["status"]),
+    ("action_guard_region", 2_185_008, &["outcome", "error_code"]),
     // `record.status`, and `error_type` which is `Some` exactly when the call
     // failed (`mcp_usage.rs`, `finish_tool_call`).
     (

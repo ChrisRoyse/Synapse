@@ -35,12 +35,15 @@ pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 3;
 /// the causally coherent population, never inherited from the memorizing exact
 /// request boundary. Bumped `2_185_006` -> `2_185_007` after physical guard
 /// calibration proved that the structural v1 admission lens collapsed
-/// different good/bad scalar requests. The causal predictor now consumes the
-/// immutable value-aware slot 124 and leaves slot 123 as readable history.
-pub const ACTION_PANEL_VERSION: u32 = 2_185_007;
+/// different good/bad scalar requests. Bumped `2_185_007` -> `2_185_008` after
+/// physical calibration then proved slot 124 collapsed valid 256-byte and
+/// invalid 257-byte idempotency keys because the audit payload retained only
+/// key presence. The causal predictor consumes complete point-in-time slot 125
+/// and leaves slots 123/124 as readable history.
+pub const ACTION_PANEL_VERSION: u32 = 2_185_008;
 pub const ACTION_GUARD_ANCHOR_KIND: &str = "action_guard_region";
 const ACTION_CAUSAL_PREDICTOR: &str = "typed_slot_rrf_knn.v1";
-const ACTION_CAUSAL_PREDICTOR_SLOTS: &[u16] = &[48, 117, 118, 119, 120, 121, 122, 124];
+const ACTION_CAUSAL_PREDICTOR_SLOTS: &[u16] = &[48, 117, 118, 119, 120, 121, 122, 125];
 const MIN_ACTION_RECORDS: usize = 50;
 pub const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
@@ -362,10 +365,10 @@ impl SynapseCalyxVault {
                     causes.insert(slot, data.clone());
                 }
             }
-            if !causes.contains_key(&SlotId::new(124)) {
+            if !causes.contains_key(&SlotId::new(125)) {
                 return Err(validation_error(
                     "SYNAPSE_CALYX_ACTION_VALIDATION_ADMISSION_CONTEXT_MISSING",
-                    format!("action reward record {} lacks finite dense value-aware admission-context slot 124", base.cx_id),
+                    format!("action reward record {} lacks finite dense complete admission-context slot 125", base.cx_id),
                     "repair the action-panel backfill before validating autonomy; the causal predictor never falls back to action-name majority",
                 ));
             }

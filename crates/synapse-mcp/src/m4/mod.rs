@@ -2416,6 +2416,7 @@ fn act_run_shell_background_response(
 }
 
 pub fn run_shell_request_details(
+    config: &M4ServiceConfig,
     params: &ActRunShellParams,
     inline_await_limit_ms: u64,
 ) -> serde_json::Value {
@@ -2458,8 +2459,110 @@ pub fn run_shell_request_details(
         } else {
             "inline_timeout_only"
         },
+        "admission_facts": shell_admission_facts(config, params),
         "idempotency_key_present": params.idempotency_key.is_some(),
         "request_sha256": run_shell_request_sha256(params).ok(),
+    })
+}
+
+/// Frozen non-secret facts consumed by the action panel's point-in-time
+/// admission lens.
+///
+/// This snapshot is written before authorization and before any child process
+/// can start. It deliberately records the independently measurable predicates
+/// the validator reads, not the validator's eventual return value or any
+/// terminal action field. A future validator predicate requires a new schema
+/// and action-panel generation; consumers never infer missing facts from an
+/// error response.
+fn shell_admission_facts(config: &M4ServiceConfig, params: &ActRunShellParams) -> Value {
+    let command = params.command.as_str();
+    let trimmed_command = command.trim();
+    let command_shape = if trimmed_command.is_empty() {
+        "empty"
+    } else if trimmed_command != command {
+        "outer_whitespace"
+    } else if is_wrapped_in_quotes(command) {
+        "wrapped_in_quotes"
+    } else if starts_with_unclosed_quote(command) {
+        "unclosed_quote"
+    } else if first_command_token(command).is_some_and(|first| first != command)
+        && !command_exists_verbatim(command, params.working_dir.as_deref())
+    {
+        "contains_arguments"
+    } else {
+        "executable_name_or_path"
+    };
+    let environment_state = if params
+        .env
+        .iter()
+        .any(|(key, value)| key.is_empty() || key.contains(['=', '\0']) || value.contains('\0'))
+    {
+        "invalid_entry"
+    } else if params.env.keys().any(|key| {
+        SHELL_RESERVED_ENV_KEYS
+            .iter()
+            .any(|reserved| key.eq_ignore_ascii_case(reserved))
+    }) {
+        "reserved_session_key"
+    } else if params.env.is_empty() {
+        "empty"
+    } else {
+        "valid"
+    };
+    let idempotency_key_state = params.idempotency_key.as_deref().map_or("absent", |key| {
+        if key.trim().is_empty() {
+            "blank"
+        } else if key.len() <= MAX_SHELL_IDEMPOTENCY_KEY_BYTES {
+            "within_256_byte_bound"
+        } else {
+            "above_256_byte_bound"
+        }
+    });
+    let command_line = shell_command_line(params);
+    let allow_shell_policy_state = match config.shell_match(&command_line) {
+        Some(ANY_PERMITTED_SENTINEL) => "permissive_any",
+        Some(_) => "allowlist_match",
+        None if config.allow_shell_count() == 0 => "no_allowlist_policy",
+        None => "allowlist_miss",
+    };
+    json!({
+        "schema": "synapse.shell_admission_facts.v1",
+        "command_bytes": command.len(),
+        "command_trimmed_bytes": trimmed_command.len(),
+        "command_shape": command_shape,
+        "environment_entries": params.env.len(),
+        "environment_state": environment_state,
+        "chromium_debug_policy_state": if validate_run_shell_chromium_debug_policy(params).is_ok() {
+            "clear"
+        } else {
+            "violation"
+        },
+        "global_input_state": if detect_shell_global_input(&command_line).is_some() {
+            "detected"
+        } else {
+            "clear"
+        },
+        "reserved_variable_assignment_state": if detect_shell_reserved_variable_assignment(&command_line).is_some() {
+            "detected"
+        } else {
+            "clear"
+        },
+        "uncontained_recursive_delete_state": if detect_uncontained_recursive_delete(&command_line).is_some() {
+            "detected"
+        } else {
+            "clear"
+        },
+        "timeout_state": if params.timeout_ms == 0 { "zero" } else { "positive" },
+        "durable_timeout_state": match params.durable_timeout_ms {
+            None => "absent",
+            Some(0) => "zero",
+            Some(_) => "positive",
+        },
+        "execution_mode": params.execution_mode.as_str(),
+        "idempotency_key_bytes": params.idempotency_key.as_deref().map(str::len),
+        "idempotency_key_state": idempotency_key_state,
+        "allow_shell_patterns": config.allow_shell_count(),
+        "allow_shell_policy_state": allow_shell_policy_state,
     })
 }
 
@@ -2476,8 +2579,34 @@ pub fn authorize_run_shell_start(
     authorize_run_shell(config, &shell_params)
 }
 
-pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde_json::Value {
+pub fn run_shell_start_request_details(
+    config: &M4ServiceConfig,
+    params: &ActRunShellStartParams,
+) -> serde_json::Value {
     let command_metadata = shell_command_metadata(&params.command, &params.args);
+    let shell_params = run_shell_params_for_start_validation(params);
+    let mut admission_facts = shell_admission_facts(config, &shell_params);
+    if let Some(facts) = admission_facts.as_object_mut() {
+        let job_id_state = params.job_id.as_deref().map_or("absent", |job_id| {
+            if job_id.is_empty() {
+                "empty"
+            } else if job_id.len() > SHELL_JOB_ID_MAX_BYTES {
+                "above_128_byte_bound"
+            } else if job_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+            {
+                "valid"
+            } else {
+                "invalid_characters"
+            }
+        });
+        facts.insert("job_id_state".to_owned(), json!(job_id_state));
+        facts.insert(
+            "job_id_bytes".to_owned(),
+            json!(params.job_id.as_deref().map(str::len)),
+        );
+    }
     json!({
         "command": params.command,
         "command_metadata_policy": SHELL_COMMAND_METADATA_POLICY,
@@ -2498,6 +2627,7 @@ pub fn run_shell_start_request_details(params: &ActRunShellStartParams) -> serde
         } else {
             "unbounded_until_exit_or_cancel"
         },
+        "admission_facts": admission_facts,
         "job_id": params.job_id,
         "request_sha256": run_shell_start_request_sha256(params).ok(),
     })

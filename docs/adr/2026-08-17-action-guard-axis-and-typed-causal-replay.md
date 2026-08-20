@@ -57,6 +57,20 @@ declared grounded axis.
   persisted before the trigger. It never reconstructs historical host state,
   imports terminal fields, weakens Ward's FAR, or uses exact request identity as
   the calibration boundary.
+- Preserve slot 124 and generation `2_185_007` as immutable history. The next
+  physical calibration isolated another exact collision: an accepted 256-byte
+  idempotency key and a refused 257-byte key had different authenticated
+  request digests but the same v2 causal vector. The writer had persisted only
+  `idempotency_key_present`, so the boundary fact did not exist at measurement
+  time. Generation `2_185_008` adds slot 125,
+  `syn.action.admission_context.v3`. The command writer now seals
+  `synapse.shell_admission_facts.v1` before authorization or execution: bounded
+  non-secret facts for command shape, environment validity, prohibited-command
+  predicates, timeout modes, idempotency boundary class, execution mode, and
+  allow-shell policy state. Slot 125 separately namespaces that snapshot,
+  authenticated request atoms, and immutable host preconditions. A historical
+  row without the complete snapshot is `Absent`; terminal errors and current
+  host state are never substitutes.
 
 ## Research basis
 
@@ -71,6 +85,10 @@ Primary references:
 - https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessw
 - https://doc.rust-lang.org/std/process/struct.Command.html
 - https://www.hsph.harvard.edu/miguel-hernan/causal-inference-book/
+- https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/bigqueryml-syntax-feature-time
+- https://docs.cloud.google.com/bigquery/docs/feature-serving
+- https://learn.microsoft.com/azure/machine-learning/offline-retrieval-point-in-time-join-concepts
+- https://airc.nist.gov/airmf-resources/airmf/5-sec-core/
 
 ## Consequences
 
@@ -80,7 +98,7 @@ axes. Existing v1 rows retain their historical `legacy_unknown` measurement.
 The v2 slot is instead `Absent` when an independently persisted request or
 immutable precondition is unavailable; it is never rewritten from current
 filesystem state. Panel, profile, assay, kernel, derived-state, and validation
-artifacts must be rebuilt and physically read back for `2_185_007` before
+artifacts must be rebuilt and physically read back for `2_185_008` before
 readiness can pass.
 
 Deployment also exposed an independent ledger-type ambiguity: action
