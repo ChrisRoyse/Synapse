@@ -1636,6 +1636,15 @@ const FACADE_TOOL_CONTRACTS: &[FacadeToolContractSpec] = &[
                 error_codes::TOOL_PROFILE_POLICY_DENIED,
                 "switch to browser_debugger and verify drop target status",
             ),
+            op(
+                "clock",
+                true,
+                true,
+                "browser_debugger profile row + document-scoped clock ownership/readback",
+                Some("same-target clock descriptor and document-generation readback"),
+                error_codes::TOOL_PROFILE_POLICY_DENIED,
+                "switch to browser_debugger and verify install/effect/uninstall against the exact owned document",
+            ),
         ],
     ),
     facade_contract(

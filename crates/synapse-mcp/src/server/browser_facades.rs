@@ -10,6 +10,7 @@ use super::{
     BrowserExposeBindingResponse, BrowserPdfParams, BrowserPdfResponse, BrowserScreenshotParams,
     BrowserScreenshotResponse, CdpBridgeReloadParams, CdpBridgeReloadResponse, ErrorData, Json,
     Parameters, SynapseService,
+    browser_clock_events::{BrowserClockParams, BrowserClockResponse},
     browser_dialog::{BrowserHandleDialogParams, BrowserHandleDialogResponse},
     browser_dnd::{BrowserDndParams, BrowserDndResponse},
     browser_emulate::{BrowserEmulateParams, BrowserEmulateResponse},
@@ -89,6 +90,7 @@ pub enum BrowserDebuggerOperation {
     ExposeBinding,
     Drag,
     Drop,
+    Clock,
 }
 
 impl BrowserDebuggerOperation {
@@ -111,6 +113,7 @@ impl BrowserDebuggerOperation {
             Self::ExposeBinding => "expose_binding",
             Self::Drag => "drag",
             Self::Drop => "drop",
+            Self::Clock => "clock",
         }
     }
 }
@@ -152,7 +155,7 @@ pub struct BrowserDebuggerParams {
     #[serde(default)]
     pub network: Option<BrowserNetworkParams>,
     #[serde(default)]
-    pub network_har: Option<BrowserNetworkHarParams>,
+    pub network_har: Option<Box<BrowserNetworkHarParams>>,
     #[serde(default)]
     pub network_overrides: Option<BrowserNetworkOverridesParams>,
     #[serde(default)]
@@ -165,6 +168,8 @@ pub struct BrowserDebuggerParams {
     pub drag: Option<BrowserDndParams>,
     #[serde(default)]
     pub drop: Option<BrowserDndParams>,
+    #[serde(default)]
+    pub clock: Option<Box<BrowserClockParams>>,
 }
 
 #[derive(Clone, Debug, Serialize, JsonSchema)]
@@ -194,7 +199,7 @@ pub struct BrowserDebuggerResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<BrowserNetworkResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network_har: Option<BrowserNetworkHarResponse>,
+    pub network_har: Option<Box<BrowserNetworkHarResponse>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_overrides: Option<BrowserNetworkOverridesResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -207,6 +212,8 @@ pub struct BrowserDebuggerResponse {
     pub drag: Option<BrowserDndResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drop: Option<BrowserDndResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Box<BrowserClockResponse>>,
 }
 
 fn loose_object_schema(description: &'static str) -> Value {
@@ -242,7 +249,8 @@ fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
                     "emulate",
                     "expose_binding",
                     "drag",
-                    "drop"
+                    "drop",
+                    "clock"
                 ],
                 "description": "Debugger facade operation. Supply exactly the same-named spec object."
             },
@@ -272,7 +280,8 @@ fn browser_debugger_input_schema() -> Arc<Map<String, Value>> {
             "emulate": loose_object_schema("Spec for operation=emulate."),
             "expose_binding": loose_object_schema("Spec for operation=expose_binding."),
             "drag": loose_object_schema("Spec for operation=drag."),
-            "drop": loose_object_schema("Spec for operation=drop.")
+            "drop": loose_object_schema("Spec for operation=drop."),
+            "clock": loose_object_schema("Spec for operation=clock.")
         }
     });
     match schema {
@@ -563,7 +572,7 @@ impl SynapseService {
                     .network_har
                     .ok_or_else(|| missing_debugger_spec("network_har"))?;
                 let response = self
-                    .browser_network_har(Parameters(delegate), request_context)
+                    .browser_network_har(Parameters(*delegate), request_context)
                     .await?
                     .0;
                 Ok(Json(browser_debugger_response(
@@ -575,7 +584,7 @@ impl SynapseService {
                         response.har_bytes,
                         response.route_count
                     ),
-                    |out| out.network_har = Some(response),
+                    |out| out.network_har = Some(Box::new(response)),
                 )))
             }
             BrowserDebuggerOperation::NetworkOverrides => {
@@ -687,6 +696,26 @@ impl SynapseService {
                     |out| out.drop = Some(response),
                 )))
             }
+            BrowserDebuggerOperation::Clock => {
+                let delegate = params
+                    .0
+                    .clock
+                    .ok_or_else(|| missing_debugger_spec("clock"))?;
+                let response = Box::pin(self.browser_clock(Parameters(*delegate), request_context))
+                    .await?
+                    .0;
+                Ok(Json(browser_debugger_response(
+                    BrowserDebuggerOperation::Clock,
+                    format!(
+                        "clock target={} operation={:?} installed={} backend={}",
+                        response.cdp_target_id,
+                        response.operation,
+                        response.clock.installed,
+                        response.readback_backend
+                    ),
+                    |out| out.clock = Some(Box::new(response)),
+                )))
+            }
         }
     }
 }
@@ -744,6 +773,7 @@ fn merge_browser_debugger_top_level_target(
     fold!(params.expose_binding);
     fold!(params.drag);
     fold!(params.drop);
+    fold!(params.clock);
     Ok(())
 }
 
@@ -780,6 +810,7 @@ fn validate_browser_debugger_params(params: &BrowserDebuggerParams) -> Result<()
             ("expose_binding", params.expose_binding.is_some()),
             ("drag", params.drag.is_some()),
             ("drop", params.drop.is_some()),
+            ("clock", params.clock.is_some()),
         ],
     )
 }
@@ -970,6 +1001,7 @@ fn browser_debugger_response(
         expose_binding: None,
         drag: None,
         drop: None,
+        clock: None,
     };
     populate(&mut response);
     response
