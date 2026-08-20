@@ -22,8 +22,8 @@ pub const ACTION_DOMAIN: &str = "synapse.action";
 /// Goodhart boundary recalibrated after this was measured", so it is not
 /// upgraded in place: it is simply not read, and readiness reports absent
 /// evidence with a rerun remediation instead of a false pass.
-pub const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v3/synapse.action";
-pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 3;
+pub const ACTION_VALIDATION_KEY: &[u8] = b"oracle-validation/v4/synapse.action";
+pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 4;
 /// Must track `SYN_ACTION_PANEL_VERSION` in
 /// `synapse-storage/src/constellations.rs` (no dependency edge exists in this
 /// direction, so the value is duplicated by hand). A mismatch fails loud
@@ -42,6 +42,16 @@ pub const ACTION_VALIDATION_SCHEMA_VERSION: u32 = 3;
 /// and leaves slots 123/124 as readable history.
 pub const ACTION_PANEL_VERSION: u32 = 2_185_008;
 pub const ACTION_GUARD_ANCHOR_KIND: &str = "action_guard_region";
+/// Frozen target-population contract for chronological validation.
+///
+/// Slot 125 is intentionally `Absent` for source rows written before the
+/// writer-sealed `synapse.shell_admission_facts.v1` snapshot existed. Those
+/// rows cannot be repaired without inventing point-in-time validator facts.
+/// Validation therefore measures the explicitly named complete-cause cohort,
+/// while binding and surfacing the entire excluded identity set. This is not
+/// imputation or a fallback to weaker slots.
+pub const ACTION_CAUSAL_POPULATION_CONTRACT: &str =
+    "reward_rows_with_finite_dense_admission_context_v3_slot_125";
 const ACTION_CAUSAL_PREDICTOR: &str = "typed_slot_rrf_knn.v1";
 const ACTION_CAUSAL_PREDICTOR_SLOTS: &[u16] = &[48, 117, 118, 119, 120, 121, 122, 125];
 const MIN_ACTION_RECORDS: usize = 50;
@@ -49,6 +59,7 @@ pub const MIN_HELD_OUT_RECORDS: usize = 10;
 const MAX_ACTION_RECORDS: usize = 20_000;
 const MAX_HELD_OUT_RECORDS: usize = 200;
 const MAX_GUARD_TRAINING_RECORDS: usize = 1_000;
+const MAX_EXCLUDED_DIAGNOSTIC_SAMPLE: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SynapseCalyxActionValidationEvidence {
@@ -56,8 +67,22 @@ pub struct SynapseCalyxActionValidationEvidence {
     pub domain: String,
     pub panel_version: u32,
     pub measured_at_seq: u64,
+    pub causal_population_contract: String,
+    /// Every grounded reward row encountered before causal eligibility is
+    /// applied. This equals `action_record_count +
+    /// excluded_incomplete_causal_records`.
+    pub source_reward_record_count: usize,
+    /// Grounded reward rows used by the chronological split. Every one carries
+    /// finite dense slot 125; no missing cause is imputed.
     pub action_record_count: usize,
     pub action_corpus_sha256: String,
+    /// Rows retained for history but excluded because the writer had not yet
+    /// sealed the complete admission snapshot required by slot 125.
+    pub excluded_incomplete_causal_records: usize,
+    pub excluded_incomplete_causal_sha256: String,
+    /// Bounded diagnostic sample; the complete excluded set is committed by
+    /// `excluded_incomplete_causal_sha256`.
+    pub excluded_incomplete_causal_sample: Vec<String>,
     pub held_out_count: usize,
     pub held_out_sha256: String,
     pub guard_training_successes: usize,
@@ -92,6 +117,22 @@ struct ActionObservation {
     causes: BTreeMap<SlotId, Vec<f32>>,
 }
 
+#[derive(Clone, Debug)]
+struct ActionObservationCorpus {
+    observations: Vec<ActionObservation>,
+    source_reward_record_count: usize,
+    excluded_incomplete_causal: Vec<CxId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ActionCausalPopulationBinding {
+    pub eligible_count: usize,
+    pub eligible_sha256: String,
+    pub source_reward_record_count: usize,
+    pub excluded_incomplete_causal_records: usize,
+    pub excluded_incomplete_causal_sha256: String,
+}
+
 impl SynapseCalyxVault {
     /// Builds and atomically persists held-out action validation plus its native
     /// Anneal ledger binding. Readiness never generates this evidence itself.
@@ -118,35 +159,51 @@ impl SynapseCalyxVault {
             ));
         }
         let measured_at_seq = self.latest_seq();
-        let observations = self.action_observations()?;
+        let corpus = self.action_observations()?;
+        let observations = &corpus.observations;
         if observations.len() < MIN_ACTION_RECORDS {
             return Err(validation_error(
                 "SYNAPSE_CALYX_ACTION_VALIDATION_INSUFFICIENT",
                 format!(
-                    "action validation found {} grounded action records; at least {MIN_ACTION_RECORDS} are required",
-                    observations.len()
+                    "action validation found {} complete-cause records from {} grounded reward records ({} historical records lacked writer-sealed admission context); at least {MIN_ACTION_RECORDS} complete-cause records are required",
+                    observations.len(),
+                    corpus.source_reward_record_count,
+                    corpus.excluded_incomplete_causal.len()
                 ),
-                "collect real terminal action outcomes before validating autonomy",
+                "collect real terminal action outcomes written by the current action publisher before validating autonomy; historical missing causes are never imputed",
             ));
         }
         let held_out_count =
             (observations.len() / 5).clamp(MIN_HELD_OUT_RECORDS, MAX_HELD_OUT_RECORDS);
         let split = observations.len() - held_out_count;
         let (training, held_out) = observations.split_at(split);
-        let corpus_hash = action_corpus_hash(&observations);
+        let corpus_hash = action_corpus_hash(observations);
         let held_out_hash = action_corpus_hash(held_out);
+        let excluded_incomplete_causal_sha256 =
+            cx_id_population_hash(&corpus.excluded_incomplete_causal);
+        let excluded_incomplete_causal_sample = corpus
+            .excluded_incomplete_causal
+            .iter()
+            .take(MAX_EXCLUDED_DIAGNOSTIC_SAMPLE)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
         let (goodhart, guard_training_successes, guard_held_out_successes, guard_profile_sha256) =
             self.action_goodhart_report(panel_version, training, held_out)?;
         let (mistakes, regression_evaluated, mistake_count) =
-            action_mistake_report(training, held_out, &observations)?;
+            action_mistake_report(training, held_out, observations)?;
 
         let draft = SynapseCalyxActionValidationEvidence {
             schema_version: ACTION_VALIDATION_SCHEMA_VERSION,
             domain: ACTION_DOMAIN.to_owned(),
             panel_version,
             measured_at_seq,
+            causal_population_contract: ACTION_CAUSAL_POPULATION_CONTRACT.to_owned(),
+            source_reward_record_count: corpus.source_reward_record_count,
             action_record_count: observations.len(),
             action_corpus_sha256: corpus_hash.clone(),
+            excluded_incomplete_causal_records: corpus.excluded_incomplete_causal.len(),
+            excluded_incomplete_causal_sha256: excluded_incomplete_causal_sha256.clone(),
+            excluded_incomplete_causal_sample,
             held_out_count,
             held_out_sha256: held_out_hash.clone(),
             guard_training_successes,
@@ -165,8 +222,13 @@ impl SynapseCalyxVault {
             "schema_version": ACTION_VALIDATION_SCHEMA_VERSION,
             "panel_version": panel_version,
             "measured_at_seq": measured_at_seq,
+            "causal_population_contract": ACTION_CAUSAL_POPULATION_CONTRACT,
+            "source_reward_record_count": corpus.source_reward_record_count,
             "action_record_count": observations.len(),
             "action_corpus_sha256": corpus_hash,
+            "excluded_incomplete_causal_records": corpus.excluded_incomplete_causal.len(),
+            "excluded_incomplete_causal_sha256": excluded_incomplete_causal_sha256,
+            "excluded_incomplete_causal_sample": draft.excluded_incomplete_causal_sample,
             "held_out_count": held_out_count,
             "held_out_sha256": held_out_hash,
             "guard_profile_sha256": guard_profile_sha256,
@@ -291,9 +353,17 @@ impl SynapseCalyxVault {
 
     pub(crate) fn current_action_corpus_binding(
         &self,
-    ) -> Result<(usize, String), SynapseCalyxError> {
-        let observations = self.action_observations()?;
-        Ok((observations.len(), action_corpus_hash(&observations)))
+    ) -> Result<ActionCausalPopulationBinding, SynapseCalyxError> {
+        let corpus = self.action_observations()?;
+        Ok(ActionCausalPopulationBinding {
+            eligible_count: corpus.observations.len(),
+            eligible_sha256: action_corpus_hash(&corpus.observations),
+            source_reward_record_count: corpus.source_reward_record_count,
+            excluded_incomplete_causal_records: corpus.excluded_incomplete_causal.len(),
+            excluded_incomplete_causal_sha256: cx_id_population_hash(
+                &corpus.excluded_incomplete_causal,
+            ),
+        })
     }
 
     /// Digests the action panel's live Ward profile row exactly as validation
@@ -309,8 +379,10 @@ impl SynapseCalyxVault {
             .map(|bytes| hex(&Sha256::digest(&bytes))))
     }
 
-    fn action_observations(&self) -> Result<Vec<ActionObservation>, SynapseCalyxError> {
+    fn action_observations(&self) -> Result<ActionObservationCorpus, SynapseCalyxError> {
         let mut observations = Vec::new();
+        let mut source_reward_record_count = 0usize;
+        let mut excluded_incomplete_causal = Vec::new();
         self.with_panel_read_snapshot(
             ACTION_PANEL_VERSION,
             crate::INTELLIGENCE_CORPUS_READER_LEASE_MS,
@@ -354,6 +426,20 @@ impl SynapseCalyxVault {
                 format!("action record {} has no grounded Bool reward", base.cx_id),
                 "publish the real terminal action outcome before validation",
             ))?;
+            source_reward_record_count = source_reward_record_count.checked_add(1).ok_or_else(|| {
+                validation_error(
+                    "SYNAPSE_CALYX_ACTION_VALIDATION_CORPUS_LIMIT",
+                    "action reward-record count overflowed usize",
+                    "preserve the vault and inspect the action corpus cardinality",
+                )
+            })?;
+            if source_reward_record_count > MAX_ACTION_RECORDS {
+                return Err(validation_error(
+                    "SYNAPSE_CALYX_ACTION_VALIDATION_CORPUS_LIMIT",
+                    format!("action reward corpus exceeds the bounded {MAX_ACTION_RECORDS}-record validation budget"),
+                    "add a versioned incremental validation window before enabling autonomy on a larger corpus",
+                ));
+            }
             let hydrated = self.hydrated_constellation_at_snapshot(base.cx_id, snapshot)?;
             let mut causes = BTreeMap::new();
             for raw_slot in ACTION_CAUSAL_PREDICTOR_SLOTS {
@@ -366,20 +452,15 @@ impl SynapseCalyxVault {
                 }
             }
             if !causes.contains_key(&SlotId::new(125)) {
-                return Err(validation_error(
-                    "SYNAPSE_CALYX_ACTION_VALIDATION_ADMISSION_CONTEXT_MISSING",
-                    format!("action reward record {} lacks finite dense complete admission-context slot 125", base.cx_id),
-                    "repair the action-panel backfill before validating autonomy; the causal predictor never falls back to action-name majority",
-                ));
+                // Historical rows written before admission-facts v1 have no
+                // point-in-time validator snapshot to reconstruct. Preserve
+                // them as an explicitly named, completely hash-bound excluded
+                // population. Never impute the missing cause and never fall
+                // back to outcome-adjacent or action-name predictors.
+                excluded_incomplete_causal.push(base.cx_id);
+                return Ok(SynapseCalyxWalkStep::Continue);
             }
             observations.push(ActionObservation { cx_id: base.cx_id, created_at: base.created_at, action: action.to_owned(), outcome, causes });
-            if observations.len() > MAX_ACTION_RECORDS {
-                return Err(validation_error(
-                    "SYNAPSE_CALYX_ACTION_VALIDATION_CORPUS_LIMIT",
-                    format!("action corpus exceeds the bounded {MAX_ACTION_RECORDS}-record validation budget"),
-                    "add a versioned incremental validation window before enabling autonomy on a larger corpus",
-                ));
-            }
             Ok(SynapseCalyxWalkStep::Continue)
         }),
         )?;
@@ -388,7 +469,12 @@ impl SynapseCalyxVault {
                 .cmp(&right.created_at)
                 .then_with(|| left.cx_id.cmp(&right.cx_id))
         });
-        Ok(observations)
+        excluded_incomplete_causal.sort_unstable();
+        Ok(ActionObservationCorpus {
+            observations,
+            source_reward_record_count,
+            excluded_incomplete_causal,
+        })
     }
 
     #[expect(
@@ -700,13 +786,44 @@ fn typed_causal_prediction<'a>(
 
 fn action_corpus_hash(rows: &[ActionObservation]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(b"synapse-action-validation-corpus-v2-typed-slot-rrf-knn");
+    hasher.update(b"synapse-action-validation-corpus-v4-complete-cause");
+    hasher.update(u64::try_from(rows.len()).unwrap_or(u64::MAX).to_be_bytes());
     for row in rows {
         hasher.update(row.cx_id.as_bytes());
         hasher.update(row.created_at.to_be_bytes());
-        hasher.update((row.action.len() as u64).to_be_bytes());
+        hasher.update(
+            u64::try_from(row.action.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
         hasher.update(row.action.as_bytes());
         hasher.update([u8::from(row.outcome)]);
+        hasher.update(
+            u64::try_from(row.causes.len())
+                .unwrap_or(u64::MAX)
+                .to_be_bytes(),
+        );
+        for (slot, values) in &row.causes {
+            hasher.update(slot.get().to_be_bytes());
+            hasher.update(
+                u64::try_from(values.len())
+                    .unwrap_or(u64::MAX)
+                    .to_be_bytes(),
+            );
+            for value in values {
+                hasher.update(value.to_bits().to_be_bytes());
+            }
+        }
+    }
+    hex(&hasher.finalize())
+}
+
+fn cx_id_population_hash(ids: &[CxId]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synapse-action-validation-excluded-population-v1");
+    hasher.update(u64::try_from(ids.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for id in ids {
+        hasher.update(id.as_bytes());
     }
     hex(&hasher.finalize())
 }

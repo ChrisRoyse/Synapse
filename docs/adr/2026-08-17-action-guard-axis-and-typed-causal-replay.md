@@ -164,3 +164,42 @@ Primary references:
 - https://docs.nvidia.com/cuda/archive/12.1.1/floating-point/index.html
 - https://www.nist.gov/programs-projects/numerical-reproducibility
 - https://www.nist.gov/srd/critical-evaluation-criteria
+
+## Complete-cause target population
+
+Production validation then exposed a historical-schema defect rather than an
+action-data defect. Panel backfill correctly preserved slot 125 as `Absent` for
+reward rows written before `synapse.shell_admission_facts.v1`; those
+point-in-time authorization facts never existed and cannot be reconstructed
+from a later host state. The validator nevertheless required slot 125 on every
+historical reward row and aborted at the first absence. Consequently no amount
+of new, correctly measured evidence could ever produce a readiness report while
+even one pre-schema record remained.
+
+Validation v4 defines its target population explicitly as grounded reward rows
+with a finite dense slot 125. It does not impute historical causes, substitute a
+weaker slot, delete history, or label excluded rows as eligible. Every source
+reward row is accounted for exactly once as eligible or excluded. The evidence
+and its Anneal ledger payload persist the source count, eligible count and
+complete typed-cause corpus hash, excluded count, complete sorted excluded-ID
+hash, and a bounded diagnostic sample. Readiness v4 re-reads all of those
+bindings; any eligible feature change, newly eligible backfill, new reward, or
+excluded-identity change invalidates the report exactly.
+
+The v4 eligible-corpus digest includes every predictor slot id, vector length,
+and IEEE-754 bit pattern rather than only record identity and outcome. This
+closes a separate stale-evidence path where an immutable record identity could
+remain constant while its hydrated causal measurement changed.
+
+This is a deliberately named complete-cause cohort, not a claim that complete-
+case analysis estimates the unobserved historical population. The readiness
+surface reports the retained and excluded populations so downstream users can
+judge the scope. The alternative—filling pre-treatment causes from terminal
+errors or current host state—would introduce post-treatment leakage and
+fabricated history.
+
+Primary research consulted after the physical missing-cause diagnosis:
+
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC7705610/
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC3414599/
+- https://pmc.ncbi.nlm.nih.gov/articles/PMC10089074/

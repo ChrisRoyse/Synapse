@@ -23,8 +23,8 @@ use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
 use crate::action_validation::{
-    ACTION_PANEL_VERSION, ACTION_VALIDATION_KEY, ACTION_VALIDATION_SCHEMA_VERSION,
-    MIN_HELD_OUT_RECORDS,
+    ACTION_CAUSAL_POPULATION_CONTRACT, ACTION_PANEL_VERSION, ACTION_VALIDATION_KEY,
+    ACTION_VALIDATION_SCHEMA_VERSION, MIN_HELD_OUT_RECORDS,
 };
 use crate::{
     SynapseCalyxActionValidationEvidence, SynapseCalyxCfWrite, SynapseCalyxError, SynapseCalyxVault,
@@ -33,12 +33,12 @@ use crate::{
 const ACTION_DOMAIN: &str = "synapse.action";
 const ACTION_CONTENT_SLOT: u16 = 50;
 const ACTION_ANCHOR_KIND: &str = "reward";
-/// Immutable readiness row generation. `v3` adds the exact domain and frozen
-/// panel version to the stored value. A `v2` row cannot identify the feature
-/// generation it measured, so it remains historical at its old key and is
-/// never inferred, upgraded, or served as current evidence.
-const READINESS_KEY: &[u8] = b"oracle-readiness/v3/synapse.action";
-const READINESS_SCHEMA_VERSION: u32 = 3;
+/// Immutable readiness row generation. `v4` adds the exact causal target
+/// population and its excluded historical identity set. Older rows cannot
+/// prove which missing-cause records they omitted, so they remain historical
+/// at their old keys and are never inferred, upgraded, or served as current.
+const READINESS_KEY: &[u8] = b"oracle-readiness/v4/synapse.action";
+const READINESS_SCHEMA_VERSION: u32 = 4;
 const EVIDENCE_CF: &str = "AnnealReport";
 const LEDGER_SOURCE: &str = "Ledger/anneal";
 const GUARD_SOURCE: &str = "Guard/profile\\0panel\\0<panel_version>";
@@ -90,8 +90,13 @@ pub struct SynapseCalyxReadinessEvidence {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub age_ms: Option<u64>,
     pub lease_ms: u64,
+    pub causal_population_contract: String,
+    pub source_reward_record_count: usize,
     pub action_record_count: usize,
     pub action_corpus_sha256: String,
+    pub excluded_incomplete_causal_records: usize,
+    pub excluded_incomplete_causal_sha256: String,
+    pub excluded_incomplete_causal_sample: Vec<String>,
     pub held_out_count: usize,
     pub held_out_sha256: String,
     pub guard_profile_sha256: String,
@@ -439,8 +444,13 @@ impl SynapseCalyxVault {
             ledger_ts_ms: None,
             age_ms: None,
             lease_ms: EVIDENCE_LEASE_MS,
+            causal_population_contract: evidence.causal_population_contract.clone(),
+            source_reward_record_count: evidence.source_reward_record_count,
             action_record_count: evidence.action_record_count,
             action_corpus_sha256: evidence.action_corpus_sha256.clone(),
+            excluded_incomplete_causal_records: evidence.excluded_incomplete_causal_records,
+            excluded_incomplete_causal_sha256: evidence.excluded_incomplete_causal_sha256.clone(),
+            excluded_incomplete_causal_sample: evidence.excluded_incomplete_causal_sample.clone(),
             held_out_count: evidence.held_out_count,
             held_out_sha256: evidence.held_out_sha256.clone(),
             guard_profile_sha256: evidence.guard_profile_sha256.clone(),
@@ -454,6 +464,7 @@ impl SynapseCalyxVault {
         if evidence.schema_version != ACTION_VALIDATION_SCHEMA_VERSION
             || evidence.domain != ACTION_DOMAIN
             || evidence.panel_version != ACTION_PANEL_VERSION
+            || evidence.causal_population_contract != ACTION_CAUSAL_POPULATION_CONTRACT
         {
             return Err(refuse(
                 log,
@@ -461,11 +472,14 @@ impl SynapseCalyxVault {
                 source,
                 "SYNAPSE_CALYX_READINESS_EVIDENCE_SCOPE_MISMATCH",
                 format!(
-                    "schema_version={} domain={} panel_version={}",
-                    evidence.schema_version, evidence.domain, evidence.panel_version
+                    "schema_version={} domain={} panel_version={} causal_population_contract={}",
+                    evidence.schema_version,
+                    evidence.domain,
+                    evidence.panel_version,
+                    evidence.causal_population_contract
                 ),
                 format!(
-                    "schema_version={ACTION_VALIDATION_SCHEMA_VERSION} domain={ACTION_DOMAIN} panel_version={ACTION_PANEL_VERSION}"
+                    "schema_version={ACTION_VALIDATION_SCHEMA_VERSION} domain={ACTION_DOMAIN} panel_version={ACTION_PANEL_VERSION} causal_population_contract={ACTION_CAUSAL_POPULATION_CONTRACT}"
                 ),
                 "discard the mismatched action validation row and rerun oracle_validate for syn-action-v1",
             ));
@@ -475,15 +489,54 @@ impl SynapseCalyxVault {
             "evidence_scope",
             &source,
             format!(
-                "schema_version={} domain={} panel_version={}",
-                evidence.schema_version, evidence.domain, evidence.panel_version
+                "schema_version={} domain={} panel_version={} causal_population_contract={}",
+                evidence.schema_version,
+                evidence.domain,
+                evidence.panel_version,
+                evidence.causal_population_contract
             ),
             format!(
-                "schema_version={ACTION_VALIDATION_SCHEMA_VERSION} domain={ACTION_DOMAIN} panel_version={ACTION_PANEL_VERSION}"
+                "schema_version={ACTION_VALIDATION_SCHEMA_VERSION} domain={ACTION_DOMAIN} panel_version={ACTION_PANEL_VERSION} causal_population_contract={ACTION_CAUSAL_POPULATION_CONTRACT}"
             ),
         );
 
-        // 4. The holdout is actually large enough on every side to mean
+        // 4. Every grounded reward record is accounted for exactly once as
+        //    causally eligible or explicitly excluded. This makes historical
+        //    missingness visible and prevents a writer from manufacturing a
+        //    cleaner validation population by silently dropping rows.
+        let accounted = evidence
+            .action_record_count
+            .checked_add(evidence.excluded_incomplete_causal_records);
+        if accounted != Some(evidence.source_reward_record_count) {
+            return Err(refuse(
+                log,
+                "evidence_population_accounted",
+                &source,
+                "SYNAPSE_CALYX_READINESS_CAUSAL_POPULATION_UNACCOUNTED",
+                format!(
+                    "source_reward_record_count={} eligible={} excluded={} accounted={accounted:?}",
+                    evidence.source_reward_record_count,
+                    evidence.action_record_count,
+                    evidence.excluded_incomplete_causal_records
+                ),
+                "source_reward_record_count == eligible + excluded",
+                "quarantine the incomplete evidence row and rerun oracle_validate; validation must bind every grounded reward identity",
+            ));
+        }
+        admit(
+            log,
+            "evidence_population_accounted",
+            &source,
+            format!(
+                "source_reward_record_count={} eligible={} excluded={}",
+                evidence.source_reward_record_count,
+                evidence.action_record_count,
+                evidence.excluded_incomplete_causal_records
+            ),
+            "source_reward_record_count == eligible + excluded",
+        );
+
+        // 5. The holdout is actually large enough on every side to mean
         //    anything. Re-asserted at read time so a row cannot claim a pass on
         //    an empty holdout regardless of which binary wrote it.
         let floors = [
@@ -524,7 +577,7 @@ impl SynapseCalyxVault {
             format!("every holdout population >= {MIN_HELD_OUT_RECORDS}"),
         );
 
-        // 5. The evidence is bound to a real, self-verifying Anneal ledger
+        // 6. The evidence is bound to a real, self-verifying Anneal ledger
         //    entry. This is what makes the row attributable rather than merely
         //    present: a hand-written row has no matching chain entry.
         let ledger_ts_ms = self.admit_evidence_ledger(log, &evidence)?;
@@ -532,31 +585,45 @@ impl SynapseCalyxVault {
             block.ledger_ts_ms = Some(ledger_ts_ms);
         }
 
-        // 6. The action corpus has not moved since the report was scored: an
-        //    exact version precondition, not a tolerance.
+        // 7. Both eligible causes and the excluded missing-cause population
+        //    are byte-identical to the target population that was scored.
         match self.current_action_corpus_binding() {
-            Ok((count, hash)) => {
-                if count != evidence.action_record_count || hash != evidence.action_corpus_sha256 {
+            Ok(binding) => {
+                let unchanged = binding.eligible_count == evidence.action_record_count
+                    && binding.eligible_sha256 == evidence.action_corpus_sha256
+                    && binding.source_reward_record_count == evidence.source_reward_record_count
+                    && binding.excluded_incomplete_causal_records
+                        == evidence.excluded_incomplete_causal_records
+                    && binding.excluded_incomplete_causal_sha256
+                        == evidence.excluded_incomplete_causal_sha256;
+                let live = format!(
+                    "source={} eligible={} eligible_sha256={} excluded={} excluded_sha256={}",
+                    binding.source_reward_record_count,
+                    binding.eligible_count,
+                    binding.eligible_sha256,
+                    binding.excluded_incomplete_causal_records,
+                    binding.excluded_incomplete_causal_sha256
+                );
+                let expected = format!(
+                    "source={} eligible={} eligible_sha256={} excluded={} excluded_sha256={}",
+                    evidence.source_reward_record_count,
+                    evidence.action_record_count,
+                    evidence.action_corpus_sha256,
+                    evidence.excluded_incomplete_causal_records,
+                    evidence.excluded_incomplete_causal_sha256
+                );
+                if !unchanged {
                     return Err(refuse(
                         log,
                         "evidence_corpus_fresh",
                         CORPUS_SOURCE,
                         "SYNAPSE_CALYX_READINESS_EVIDENCE_CORPUS_MOVED",
-                        format!("live corpus count={count} sha256={hash}"),
-                        format!(
-                            "count={} sha256={}",
-                            evidence.action_record_count, evidence.action_corpus_sha256
-                        ),
-                        "action outcomes changed after validation; rerun oracle_validate before measuring readiness",
+                        live,
+                        expected,
+                        "eligible causes or the explicitly excluded historical population changed after validation; rerun oracle_validate before measuring readiness",
                     ));
                 }
-                admit(
-                    log,
-                    "evidence_corpus_fresh",
-                    CORPUS_SOURCE,
-                    format!("count={count} sha256={hash}"),
-                    "byte-identical to the corpus the held-out report was scored on",
-                );
+                admit(log, "evidence_corpus_fresh", CORPUS_SOURCE, live, expected);
             }
             Err(error) => {
                 return Err(refuse(
@@ -571,12 +638,12 @@ impl SynapseCalyxVault {
             }
         }
 
-        // 7. The Goodhart boundary itself has not been recalibrated since the
+        // 8. The Goodhart boundary itself has not been recalibrated since the
         //    report was scored. An in-region fraction only means something
         //    relative to the exact Ward profile that produced it.
         self.admit_evidence_guard(log, &evidence)?;
 
-        // 8. The report is still inside its freshness lease.
+        // 9. The report is still inside its freshness lease.
         let age_ms = self.admit_evidence_lease(log, ledger_ts_ms)?;
         if let Some(block) = provenance.as_mut() {
             block.age_ms = Some(age_ms);
