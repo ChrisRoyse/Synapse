@@ -22154,7 +22154,8 @@ async function setContentInPage(request) {
 }
 
 function runClockInPage(request) {
-  const VERSION = "synapse-clock-2026-08-16-v2";
+  const VERSION = "synapse-clock-2026-08-20-v3";
+  const MAX_CLOCK_MS = 8640000000000000;
   const operation = String(request?.operation || "status");
   const timeMs = request?.timeMs;
   const deltaMs = request?.deltaMs;
@@ -22373,12 +22374,22 @@ function runClockInPage(request) {
       return Number.isFinite(n) ? Math.max(0, n) : fallback;
     }
 
+    function requireClockMs(value, field) {
+      const n = Number(value);
+      if (!Number.isSafeInteger(n) || n < 0 || n > MAX_CLOCK_MS) {
+        throw new Error(
+          `Synapse browser clock ${field} must be a safe integer from 0 through ${MAX_CLOCK_MS}`
+        );
+      }
+      return n;
+    }
+
     function timerDelay(value) {
       const n = Number(value);
       if (!Number.isFinite(n)) {
         return 0;
       }
-      return Math.max(0, n);
+      return Math.max(0, Math.floor(n));
     }
 
     function status() {
@@ -22446,7 +22457,13 @@ function runClockInPage(request) {
         const stillOwned = state.timers.get(next.id) === next;
         if (next.kind === "interval" && stillOwned && !next.cancelled) {
           const step = Math.max(1, next.delay);
-          next.due = state.nowMs + step;
+          const nextDue = state.nowMs + step;
+          if (!Number.isSafeInteger(nextDue) || nextDue > MAX_CLOCK_MS) {
+            throw new Error(
+              `Synapse browser clock interval ${next.id} cannot be rescheduled beyond ${MAX_CLOCK_MS}`
+            );
+          }
+          next.due = nextDue;
           state.timers.set(next.id, next);
         } else if (stillOwned) {
           state.timers.delete(next.id);
@@ -22458,13 +22475,17 @@ function runClockInPage(request) {
     function schedule(kind, handler, delay, args) {
       const id = state.nextTimerId++;
       const normalizedDelay = timerDelay(delay);
+      const due = state.nowMs + normalizedDelay;
+      if (!Number.isSafeInteger(due) || due > MAX_CLOCK_MS) {
+        throw new Error(`Synapse browser clock timer due time must not exceed ${MAX_CLOCK_MS}`);
+      }
       state.timers.set(id, {
         id,
         kind,
         handler,
         args,
         delay: normalizedDelay,
-        due: state.nowMs + normalizedDelay,
+        due,
         cancelled: false
       });
       return id;
@@ -22496,7 +22517,7 @@ function runClockInPage(request) {
 
     function install(args) {
       if (args && Object.prototype.hasOwnProperty.call(args, "nowMs") && args.nowMs !== null) {
-        state.nowMs = toFiniteMs(args.nowMs, state.nowMs);
+        state.nowMs = requireClockMs(args.nowMs, "install nowMs");
       }
       if (args && Object.prototype.hasOwnProperty.call(args, "loopLimit")) {
         state.loopLimit = Math.max(1, Math.floor(Number(args.loopLimit) || state.loopLimit));
@@ -22569,7 +22590,7 @@ function runClockInPage(request) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      state.nowMs = toFiniteMs(args && args.timeMs, state.nowMs);
+      state.nowMs = requireClockMs(args && args.timeMs, "setFixedTime timeMs");
       return status();
     }
 
@@ -22617,8 +22638,14 @@ function runClockInPage(request) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      const delta = toFiniteMs(args && args.deltaMs, 0);
-      drainUntil(state.nowMs + delta);
+      const delta = requireClockMs(args && args.deltaMs, "fastForward deltaMs");
+      const target = state.nowMs + delta;
+      if (!Number.isSafeInteger(target) || target > MAX_CLOCK_MS) {
+        throw new Error(
+          `Synapse browser clock fastForward target must not exceed ${MAX_CLOCK_MS}`
+        );
+      }
+      drainUntil(target);
       return status();
     }
 
@@ -22626,7 +22653,7 @@ function runClockInPage(request) {
       if (!state.installed) {
         throw new Error("Synapse browser clock is not installed");
       }
-      const target = toFiniteMs(args && args.timeMs, state.nowMs);
+      const target = requireClockMs(args && args.timeMs, "pauseAt timeMs");
       if (target < state.nowMs) {
         throw new Error("Synapse browser clock pauseAt cannot move backwards");
       }
