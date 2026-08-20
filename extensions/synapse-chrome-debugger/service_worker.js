@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v24";
-const BRIDGE_DECLARED_BUILD_SHA256 = "9e64f7dce8b2d310aed2e503fb4732d777118543f13446bb937da35d1c9df9ba";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-operator-panic-contract-v26";
+const BRIDGE_DECLARED_BUILD_SHA256 = "fb7ba5c83b01ec7c7e8be32a620f882fbefbc152da810e53b66abcf60902cf24";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -2729,26 +2729,32 @@ async function restoreDurableOwnerLedger() {
       );
     }
     if (!hasLocalLedger) {
-      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID =
-        storedBrowserSessionId || newDurableOwnerBrowserSessionId();
+      // A durable ledger is the sole authority for the terminal-sequence lineage.
+      // Reusing a surviving chrome.storage.session token after that ledger has
+      // disappeared would reset commandTerminalSequence to zero under an identity
+      // whose daemon-side high-water mark may already be greater than zero. The
+      // first new terminal would then be (correctly) rejected as a replay and its
+      // durable outbox could never be acknowledged. Loss of the ledger therefore
+      // ends the logical browser session even when Chrome's volatile token survives.
+      // Rotate the identity before publishing the new ledger; never weaken the
+      // daemon's monotonic replay check.
+      DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
       DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
         source: storedBrowserSessionId
-          ? "chrome.storage.session"
+          ? "durable_ledger_absent_with_surviving_session_token"
           : String(lifecycleEvent?.kind || "missing"),
         lifecycle_reason: lifecycleEvent?.reason || null,
         session_token_present: Boolean(storedBrowserSessionId),
-        decision: "new_ledger",
+        decision: "new_ledger_with_rotated_browser_session_identity",
         observed_at_unix_ms: Date.now()
       };
       DURABLE_OWNER_LEDGER = emptyDurableOwnerLedger();
       DURABLE_OWNER_LEDGER.browserSessionId = DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID;
       DURABLE_OWNER_BROWSER_SESSION_CONTINUITY_MATCHED = true;
-      if (!storedBrowserSessionId) {
-        await chrome.storage.session.set({
-          [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
-            DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
-        });
-      }
+      await chrome.storage.session.set({
+        [DURABLE_OWNER_BROWSER_SESSION_STORAGE_KEY]:
+          DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID
+      });
       await persistDurableOwnerLedger({ duringRestore: true });
     } else {
       const storedLedger = hasCurrentLocalLedger
@@ -2876,13 +2882,25 @@ async function restoreDurableOwnerLedger() {
           decision: "preserve_ledger_session_after_extension_update",
           observed_at_unix_ms: Date.now()
         };
-      } else if (!repairedEmptyMissingSession && lifecycleEvent?.kind === "runtime.onStartup") {
+      } else if (!repairedEmptyMissingSession && (
+        lifecycleEvent?.kind === "runtime.onStartup" ||
+        (lifecycleEvent?.kind === "runtime.onInstalled" &&
+          lifecycleEvent?.reason === "install")
+      )) {
+        // A first install has no pre-install worker whose Chrome API promises can
+        // still be alive. Persisted local bytes can nevertheless exist for an
+        // unpacked extension loaded into a reused profile (observed with Chrome
+        // for Testing). Treat that lifecycle as a new browser session exactly as
+        // runtime.onStartup, while an unpacked chrome.runtime.reload() remains the
+        // distinct onInstalled(reason=update) continuity path documented by Chrome.
         DURABLE_OWNER_CURRENT_BROWSER_SESSION_ID = newDurableOwnerBrowserSessionId();
         DURABLE_OWNER_BROWSER_SESSION_EVIDENCE = {
           source: lifecycleEvent.kind,
-          lifecycle_reason: null,
+          lifecycle_reason: lifecycleEvent.reason || null,
           session_token_present: false,
-          decision: "new_browser_session",
+          decision: lifecycleEvent.kind === "runtime.onStartup"
+            ? "new_browser_session"
+            : "new_browser_session_after_extension_install",
           observed_at_unix_ms: Date.now()
         };
       } else if (!repairedEmptyMissingSession) {
