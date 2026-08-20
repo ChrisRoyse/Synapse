@@ -2011,6 +2011,7 @@ fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<Str
                 return None;
             }
             let command_args = process_command_args(process);
+            let user_data_dir = process_switch_arg_value(&command_args, "--user-data-dir");
 
             let has_automation_controlled = command_line.contains("--disable-blink-features")
                 && command_line.contains("AutomationControlled");
@@ -2018,13 +2019,23 @@ fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<Str
             let has_remote_debugging_port = command_line.contains("--remote-debugging-port");
             let has_silent_debugger =
                 command_line.contains("--silent-debugger-extension-api");
+            let has_matching_silent_debugger_ancestor = !has_silent_debugger
+                && chrome_process_has_matching_silent_debugger_ancestor(
+                    system,
+                    process.parent(),
+                    user_data_dir.as_deref(),
+                );
+            let has_effective_silent_debugger =
+                has_silent_debugger || has_matching_silent_debugger_ancestor;
             let has_ms_playwright_mcp = command_line.contains("ms-playwright-mcp");
 
             let mut reasons = Vec::new();
             if has_automation_controlled {
                 reasons.push("unsupported_flag_disable_blink_features_automation_controlled");
             }
-            if (has_remote_debugging_pipe || has_remote_debugging_port) && !has_silent_debugger {
+            if (has_remote_debugging_pipe || has_remote_debugging_port)
+                && !has_effective_silent_debugger
+            {
                 reasons.push("remote_debugging_without_silent_debugger_extension_api");
             }
             if has_ms_playwright_mcp && has_automation_controlled {
@@ -2036,7 +2047,6 @@ fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<Str
 
             let parent_pid = process
                 .parent().map_or_else(|| "<unknown>".to_owned(), |parent| parent.as_u32().to_string());
-            let user_data_dir = process_switch_arg_value(&command_args, "--user-data-dir");
             let user_data_dir_state = chrome_user_data_dir_state_label(user_data_dir.as_deref());
             let user_data_dir_display = user_data_dir
                 .as_deref().map_or_else(|| "<missing>".to_owned(), quote_detail_value);
@@ -2050,7 +2060,7 @@ fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<Str
             let command_line_len = command_line.len();
             let command_line_sha256 = sha256_hex_lower(command_line.as_bytes());
             Some(format!(
-                "chrome_process pid={} parent_pid={} parent_chain={} name={} reasons={} user_data_dir={} user_data_dir_state={} owner_hint={} repair_hint={} has_remote_debugging_pipe={} has_remote_debugging_port={} has_silent_debugger_extension_api={} has_ms_playwright_mcp_dir={} command_metadata_policy=safe_display_v1 command_line_len={} command_line_sha256=sha256:{}",
+                "chrome_process pid={} parent_pid={} parent_chain={} name={} reasons={} user_data_dir={} user_data_dir_state={} owner_hint={} repair_hint={} has_remote_debugging_pipe={} has_remote_debugging_port={} has_silent_debugger_extension_api={} has_matching_silent_debugger_ancestor={} has_effective_silent_debugger_extension_api={} has_ms_playwright_mcp_dir={} command_metadata_policy=safe_display_v1 command_line_len={} command_line_sha256=sha256:{}",
                 pid.as_u32(),
                 parent_pid,
                 parent_chain,
@@ -2063,12 +2073,52 @@ fn external_chrome_layout_infobar_processes(system: &sysinfo::System) -> Vec<Str
                 has_remote_debugging_pipe,
                 has_remote_debugging_port,
                 has_silent_debugger,
+                has_matching_silent_debugger_ancestor,
+                has_effective_silent_debugger,
                 has_ms_playwright_mcp,
                 command_line_len,
                 command_line_sha256
             ))
         })
         .collect()
+}
+
+fn chrome_process_has_matching_silent_debugger_ancestor(
+    system: &sysinfo::System,
+    parent: Option<sysinfo::Pid>,
+    user_data_dir: Option<&str>,
+) -> bool {
+    let Some(user_data_dir) = user_data_dir else {
+        return false;
+    };
+    let user_data_dir = normalize_chrome_process_path(user_data_dir);
+    let mut current = parent;
+    let mut seen = BTreeSet::new();
+    for _ in 0..8 {
+        let Some(pid) = current else {
+            break;
+        };
+        if !seen.insert(pid.as_u32()) {
+            break;
+        }
+        let Some(process) = system.process(pid) else {
+            break;
+        };
+        if process.name().eq_ignore_ascii_case("chrome.exe") {
+            let args = process_command_args(process);
+            let ancestor_user_data_dir = process_switch_arg_value(&args, "--user-data-dir")
+                .map(|path| normalize_chrome_process_path(&path));
+            if ancestor_user_data_dir.as_deref() == Some(user_data_dir.as_str())
+                && args
+                    .iter()
+                    .any(|arg| is_process_switch_arg(arg, "--silent-debugger-extension-api"))
+            {
+                return true;
+            }
+        }
+        current = process.parent();
+    }
+    false
 }
 
 fn process_command_args(process: &sysinfo::Process) -> Vec<String> {

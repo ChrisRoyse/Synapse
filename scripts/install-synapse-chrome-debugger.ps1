@@ -4976,18 +4976,62 @@ if (Test-Path -LiteralPath $hostManifestPath -PathType Leaf) {
     throw "SYNAPSE_CHROME_NATIVE_HOST_MANIFEST_REMOVE_FAILED path=$hostManifestPath remediation=normal bridge must use direct localhost WebSocket command delivery only"
 }
 
-$chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue | ForEach-Object {
+$chromeProcessRows = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -ErrorAction SilentlyContinue)
+$chromeProcessByPid = @{}
+foreach ($chromeProcessRow in $chromeProcessRows) {
+    $chromeProcessByPid[[int]$chromeProcessRow.ProcessId] = $chromeProcessRow
+}
+$readChromeUserDataDir = {
+    param([string]$CommandLine)
+    if ($CommandLine -match '(?i)(?:^|\s)--user-data-dir(?:=|\s+)(?:"([^"]+)"|([^\s]+))') {
+        $value = if (-not [string]::IsNullOrWhiteSpace([string]$Matches[1])) { [string]$Matches[1] } else { [string]$Matches[2] }
+        try {
+            return [System.IO.Path]::GetFullPath($value).TrimEnd('\')
+        } catch {
+            return $value.TrimEnd('\')
+        }
+    }
+    return $null
+}
+$chromeProcesses = @($chromeProcessRows | ForEach-Object {
     $commandLine = [string]$_.CommandLine
     $hasRemoteDebuggingPipe = $commandLine -match '(^|\s)--remote-debugging-pipe(\s|=|$)'
     $hasRemoteDebuggingPort = $commandLine -match '(^|\s)--remote-debugging-port(\s|=|$)'
     $hasSilentDebuggerSwitch = $commandLine -match '(^|\s)--silent-debugger-extension-api(\s|=|$)'
+    $userDataDir = & $readChromeUserDataDir $commandLine
+    $hasMatchingSilentDebuggerAncestor = $false
+    $ancestorPid = [int]$_.ParentProcessId
+    $seenAncestorPids = @{}
+    for ($ancestorDepth = 0; $ancestorDepth -lt 8 -and $ancestorPid -gt 0; $ancestorDepth++) {
+        if ($seenAncestorPids.ContainsKey($ancestorPid)) {
+            break
+        }
+        $seenAncestorPids[$ancestorPid] = $true
+        $ancestor = $chromeProcessByPid[$ancestorPid]
+        if ($null -eq $ancestor) {
+            break
+        }
+        $ancestorCommandLine = [string]$ancestor.CommandLine
+        $ancestorUserDataDir = & $readChromeUserDataDir $ancestorCommandLine
+        if (
+            -not [string]::IsNullOrWhiteSpace($userDataDir) -and
+            -not [string]::IsNullOrWhiteSpace($ancestorUserDataDir) -and
+            [string]::Equals($userDataDir, $ancestorUserDataDir, [System.StringComparison]::OrdinalIgnoreCase) -and
+            $ancestorCommandLine -match '(^|\s)--silent-debugger-extension-api(\s|=|$)'
+        ) {
+            $hasMatchingSilentDebuggerAncestor = $true
+            break
+        }
+        $ancestorPid = [int]$ancestor.ParentProcessId
+    }
+    $hasEffectiveSilentDebuggerSwitch = $hasSilentDebuggerSwitch -or $hasMatchingSilentDebuggerAncestor
     $hasAutomationControlledFlag = $commandLine -match '(^|\s)--disable-blink-features=([^\s]*,)?AutomationControlled(,|\s|$)'
     $hasMsPlaywrightMcpDir = $commandLine -match 'ms-playwright-mcp'
     $layoutInfobarReasons = @()
     if ($hasAutomationControlledFlag) {
         $layoutInfobarReasons += 'unsupported_flag_disable_blink_features_automation_controlled'
     }
-    if (($hasRemoteDebuggingPipe -or $hasRemoteDebuggingPort) -and -not $hasSilentDebuggerSwitch) {
+    if (($hasRemoteDebuggingPipe -or $hasRemoteDebuggingPort) -and -not $hasEffectiveSilentDebuggerSwitch) {
         $layoutInfobarReasons += 'remote_debugging_without_silent_debugger_extension_api'
     }
     if ($hasMsPlaywrightMcpDir -and $hasAutomationControlledFlag) {
@@ -4999,6 +5043,8 @@ $chromeProcesses = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" -
         creation_date = [string]$_.CreationDate
         command_line_readable = -not [string]::IsNullOrWhiteSpace($commandLine)
         has_silent_debugger_switch = $hasSilentDebuggerSwitch
+        has_matching_silent_debugger_ancestor = $hasMatchingSilentDebuggerAncestor
+        has_effective_silent_debugger_switch = $hasEffectiveSilentDebuggerSwitch
         has_remote_debugging_pipe = $hasRemoteDebuggingPipe
         has_remote_debugging_port = $hasRemoteDebuggingPort
         has_automation_controlled_flag = $hasAutomationControlledFlag
