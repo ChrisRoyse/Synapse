@@ -96,7 +96,10 @@ fn validate_non_inert_required(
     Ok(())
 }
 
-fn validate_high_stakes_profile(
+/// Validates that every required slot carries current, finite calibration and
+/// a serving-score parity envelope. Profiles written before the envelope was
+/// introduced remain readable history but are never high-stakes authority.
+pub fn validate_high_stakes_profile(
     profile: &GuardProfile,
     required: &[SlotId],
 ) -> Result<(), WardError> {
@@ -104,10 +107,30 @@ fn validate_high_stakes_profile(
         guard_id: profile.guard_id,
     })?;
     for slot in required {
-        if profile.tau_for(slot).is_none() || !calibration.per_slot.contains_key(slot) {
+        let Some(slot_meta) = calibration.per_slot.get(slot) else {
             return Err(WardError::MissingSlotCalibration {
                 guard_id: profile.guard_id,
                 slot: *slot,
+            });
+        };
+        if profile.tau_for(slot).is_none() {
+            return Err(WardError::MissingSlotCalibration {
+                guard_id: profile.guard_id,
+                slot: *slot,
+            });
+        }
+        let score_tolerance = slot_meta.score_tolerance;
+        let scoring_engine = slot_meta.scoring_engine.as_deref();
+        if scoring_engine != Some(calyx_core::DENSE_COSINE_SCORING_ENGINE)
+            || score_tolerance
+                .is_none_or(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(WardError::CalibrationScoreContract {
+                guard_id: profile.guard_id,
+                slot: *slot,
+                estimator: slot_meta.estimator.clone(),
+                score_tolerance,
+                scoring_engine: slot_meta.scoring_engine.clone(),
             });
         }
     }

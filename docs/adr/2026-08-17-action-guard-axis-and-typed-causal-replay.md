@@ -130,7 +130,37 @@ or risk control calibrates a supplied score; it does not make an
 outcome-insensitive representation separable. Exact good/bad feature collisions
 must be corrected at measurement time or treated as missing evidence, while
 the real bad-case corpus and Clopper-Pearson requirements remain unchanged.
+
+Manual production verification found a second, independent numeric defect
+after a profile successfully calibrated. Calibration normalized the corpus and
+ranked it with Forge's CUDA dot-product reduction, while `guard_verify` rescored
+the selected vectors with `calyx_core::dense_cosine` on the CPU. The maximum
+known-bad CUDA score was `0.9866821765899658`, so conformal calibration selected
+the next representable threshold. The same physical bad record scored
+`0.9866834282875061` through the serving reduction and was accepted. The tool's
+return value had reported zero calibration bad accepts, but the separately read
+serving verdict falsified that claim.
+
+Ward now defines a versioned canonical scoring contract,
+`calyx_core::dense_cosine:f32-sequential-v1`. Synapse constructs both
+leave-one-out good scores and bad-to-good scores with that exact function and
+reduction order; calibration is deliberately CPU-bound because it is outside
+the serving hot path and a security threshold requires numeric identity more
+than batched throughput. The profile persists both the scoring-engine identity
+and its explicit deviation envelope (zero for the identical path). Legacy or
+malformed profiles remain readable history but fail high-stakes use with
+`CALYX_GUARD_CALIBRATION_SCORE_CONTRACT`. The MCP calibration result exposes
+the backend, engine, and tolerance so the physical artifact and tool surface
+state the same contract. A future scorer or reduction order must use a new
+engine id and fresh calibration; it cannot silently reuse these thresholds.
+
+NVIDIA documents that parallel reduction order and fused operations can produce
+different valid floating-point answers, and NIST recommends quantifying and
+documenting numerical reproducibility instead of assuming bitwise equivalence.
 Primary references:
 
 - https://proceedings.iclr.cc/paper_files/paper/2024/hash/f3549ef9b5ff520a7e41ff3cc306ab2b-Abstract-Conference.html
 - https://proceedings.mlr.press/v267/zhang25dn.html
+- https://docs.nvidia.com/cuda/archive/12.1.1/floating-point/index.html
+- https://www.nist.gov/programs-projects/numerical-reproducibility
+- https://www.nist.gov/srd/critical-evaluation-criteria

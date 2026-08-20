@@ -73,6 +73,18 @@ pub struct CalibrationMeta {
     pub frr: f32,
     pub confidence: f32,
     pub ts: i64,
+    /// Maximum absolute score deviation covered by calibration when the
+    /// calibration and serving reductions execute through different valid
+    /// floating-point orders/backends. `None` identifies a legacy profile
+    /// whose threshold has no serving-parity contract and is therefore not
+    /// admissible for high-stakes use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_tolerance: Option<f32>,
+    /// Versioned numeric score implementation used to construct the
+    /// calibration corpus. Ward serving rejects a profile unless this names
+    /// the exact scorer it executes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_engine: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub per_slot: BTreeMap<SlotId, SlotCalibrationMeta>,
 }
@@ -86,6 +98,12 @@ pub struct SlotCalibrationMeta {
     pub frr: f32,
     pub confidence: f32,
     pub ts: i64,
+    /// Per-slot serving-score deviation already folded conservatively into
+    /// the calibrated score distribution. Absent on legacy profiles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_tolerance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scoring_engine: Option<String>,
     /// The slot's aspect (Identity/Content/Stylistic), persisted at calibration
     /// time so the guard surface can label `perSlot.aspect` and report conformal
     /// FAR per aspect class (#1899). `None` for profiles calibrated before this
@@ -111,6 +129,8 @@ impl CalibrationMeta {
             frr,
             confidence,
             ts: clock_ts_i64(clock),
+            score_tolerance: None,
+            scoring_engine: None,
             per_slot: BTreeMap::new(),
         }
     }
@@ -125,6 +145,8 @@ impl SlotCalibrationMeta {
             frr: meta.frr,
             confidence: meta.confidence,
             ts: meta.ts,
+            score_tolerance: meta.score_tolerance,
+            scoring_engine: meta.scoring_engine.clone(),
             slot_kind: Some(slot_kind),
         }
     }

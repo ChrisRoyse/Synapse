@@ -248,6 +248,8 @@ fn civic_profile(corpus_hash: [u8; 32]) -> GuardProfile {
                 frr: 0.0,
                 confidence: 1.0,
                 ts: CALIBRATION_TS,
+                score_tolerance: Some(0.0),
+                scoring_engine: Some(calyx_core::DENSE_COSINE_SCORING_ENGINE.to_string()),
                 slot_kind: None,
             },
         );
@@ -267,6 +269,8 @@ fn civic_profile(corpus_hash: [u8; 32]) -> GuardProfile {
             frr: 0.0,
             confidence: 1.0,
             ts: CALIBRATION_TS,
+            score_tolerance: Some(0.0),
+            scoring_engine: Some(calyx_core::DENSE_COSINE_SCORING_ENGINE.to_string()),
             per_slot,
         }),
         novelty_action: NoveltyAction::Quarantine,

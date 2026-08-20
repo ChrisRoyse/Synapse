@@ -4,6 +4,12 @@ use std::collections::BTreeMap;
 
 use crate::SlotId;
 
+/// Stable identifier for the exact dense-cosine implementation and reduction
+/// order used by Ward at both calibration and serving time. A new numeric
+/// implementation is a new scoring engine, never a silent reuse of thresholds
+/// calibrated by this one.
+pub const DENSE_COSINE_SCORING_ENGINE: &str = "calyx_core::dense_cosine:f32-sequential-v1";
+
 /// Per-slot tau lookup used by guard-like policies without coupling crates.
 pub trait GuardTauProfile {
     fn tau_for(&self, slot: &SlotId) -> Option<f32>;

@@ -12,7 +12,7 @@ use crate::profile::{CalibrationMeta, GuardProfile, SlotCalibrationMeta};
 
 pub const TAU_COLD_START: f32 = DEFAULT_TAU;
 pub const MIN_BAD_SCORES: usize = 50;
-pub const ESTIMATOR: &str = "conformal_quantile_v1";
+pub const ESTIMATOR: &str = "conformal_quantile_score_contract_v2";
 
 /// Coarse slot role used to choose stricter or looser FAR targets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +49,16 @@ pub struct CalibrationInput {
     pub bad_scores: Vec<f32>,
     pub slot_kind: SlotKind,
     pub target_far: f32,
+    /// Maximum absolute difference between the score reduction used to build
+    /// this corpus and the score reduction used by the serving guard. Ward
+    /// expands bad scores upward and good scores downward by this amount before
+    /// choosing tau, so a legal backend/reduction-order difference cannot turn
+    /// a calibrated rejection into a serving acceptance.
+    pub score_tolerance: f32,
+    /// Exact numeric scorer used to build this corpus. Ward serves with
+    /// `calyx_core::dense_cosine`; a threshold from another scorer is a
+    /// different calibration domain and is refused rather than assumed equal.
+    pub scoring_engine: String,
 }
 
 /// Fail-closed gate that every calibration input names a slot the calibrated
@@ -116,43 +126,30 @@ pub fn calibrate_slot(
         });
     }
 
-    let mut bad_scores = sorted_scores(&input.bad_scores)?;
-    let good_scores = sorted_scores(&input.good_scores)?;
+    let mut bad_scores = conservative_bad_scores(&input.bad_scores, input.score_tolerance)?;
+    let good_scores = conservative_good_scores(&input.good_scores, input.score_tolerance)?;
     let tau = conformal_tau(input.slot, &bad_scores, input.target_far, alpha)?;
     let far = fraction(
-        input
-            .bad_scores
-            .iter()
-            .filter(|score| **score >= tau)
-            .count(),
-        input.bad_scores.len(),
+        bad_scores.iter().filter(|score| **score >= tau).count(),
+        bad_scores.len(),
     );
-    let frr = if input.good_scores.is_empty() {
+    let frr = if good_scores.is_empty() {
         0.0
     } else {
         fraction(
-            input
-                .good_scores
-                .iter()
-                .filter(|score| **score < tau)
-                .count(),
-            input.good_scores.len(),
+            good_scores.iter().filter(|score| **score < tau).count(),
+            good_scores.len(),
         )
     };
-    let corpus_hash = corpus_hash(
-        input.slot,
-        input.slot_kind,
-        input.target_far,
-        alpha,
-        &good_scores,
-        &bad_scores,
-    );
+    let corpus_hash = corpus_hash(input, alpha, &good_scores, &bad_scores);
     bad_scores.clear();
 
-    Ok((
-        tau,
-        CalibrationMeta::new(corpus_hash, ESTIMATOR, far, frr, 1.0 - alpha, clock),
-    ))
+    Ok((tau, {
+        let mut meta = CalibrationMeta::new(corpus_hash, ESTIMATOR, far, frr, 1.0 - alpha, clock);
+        meta.score_tolerance = Some(input.score_tolerance);
+        meta.scoring_engine = Some(input.scoring_engine.clone());
+        meta
+    }))
 }
 
 /// Calibrates a complete profile by updating tau for every supplied slot.
@@ -199,7 +196,35 @@ fn validate_input(input: &CalibrationInput, alpha: f32) -> Result<(), WardError>
             reason: "target_far exceeds slot_kind maximum",
         });
     }
+    if !input.score_tolerance.is_finite() || !(0.0..=1.0).contains(&input.score_tolerance) {
+        return Err(WardError::InvalidCalibrationInput {
+            reason: "score_tolerance must be finite and in [0,1]",
+        });
+    }
+    if input.scoring_engine != calyx_core::DENSE_COSINE_SCORING_ENGINE {
+        return Err(WardError::InvalidCalibrationInput {
+            reason: "scoring_engine must name the exact dense-cosine scorer Ward serves with",
+        });
+    }
     Ok(())
+}
+
+fn conservative_bad_scores(scores: &[f32], tolerance: f32) -> Result<Vec<f32>, WardError> {
+    sorted_scores(scores).map(|scores| {
+        scores
+            .into_iter()
+            .map(|score| (score + tolerance).min(1.0))
+            .collect()
+    })
+}
+
+fn conservative_good_scores(scores: &[f32], tolerance: f32) -> Result<Vec<f32>, WardError> {
+    sorted_scores(scores).map(|scores| {
+        scores
+            .into_iter()
+            .map(|score| (score - tolerance).max(-1.0))
+            .collect()
+    })
 }
 
 fn sorted_scores(scores: &[f32]) -> Result<Vec<f32>, WardError> {
@@ -360,23 +385,30 @@ fn merge_meta(
     let mut corpus_hash = [0_u8; 32];
     corpus_hash.copy_from_slice(&hash);
     let mut merged = CalibrationMeta::new(corpus_hash, ESTIMATOR, far, frr, 1.0 - alpha, clock);
+    merged.score_tolerance = metas
+        .iter()
+        .filter_map(|(_, _, meta)| meta.score_tolerance)
+        .reduce(f32::max);
+    merged.scoring_engine = metas
+        .first()
+        .and_then(|(_, _, meta)| meta.scoring_engine.clone());
     merged.per_slot = per_slot;
     Ok(merged)
 }
 
 fn corpus_hash(
-    slot: SlotId,
-    slot_kind: SlotKind,
-    target_far: f32,
+    input: &CalibrationInput,
     alpha: f32,
     good_scores: &[f32],
     bad_scores: &[f32],
 ) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(slot.get().to_be_bytes());
-    hasher.update([slot_kind as u8]);
-    hasher.update(target_far.to_le_bytes());
+    hasher.update(input.slot.get().to_be_bytes());
+    hasher.update([input.slot_kind as u8]);
+    hasher.update(input.target_far.to_le_bytes());
     hasher.update(alpha.to_le_bytes());
+    hasher.update(input.score_tolerance.to_le_bytes());
+    hasher.update(input.scoring_engine.as_bytes());
     for score in good_scores {
         hasher.update(score.to_le_bytes());
     }

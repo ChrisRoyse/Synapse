@@ -426,6 +426,17 @@ impl SynapseCalyxVault {
                 "calibrate a non-empty per-slot action guard with anchor_kind=action_guard_region before oracle_validate",
             ));
         }
+        calyx_ward::validate_high_stakes_profile(&profile, &profile.required_slots).map_err(
+            |error| {
+                validation_error(
+                    error.code(),
+                    format!(
+                        "action-panel Ward profile has no current high-stakes scoring contract: {error}"
+                    ),
+                    "recalibrate the action-panel guard so every required slot carries a serving-score parity envelope before oracle_validate",
+                )
+            },
+        )?;
         let training_good = training
             .iter()
             .filter(|row| row.outcome)

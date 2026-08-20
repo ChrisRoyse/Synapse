@@ -935,6 +935,9 @@ pub struct HygieneGuardCalibrateResponse {
     pub conflicting: u64,
     pub adjudicated_without_guarded_slots: u64,
     pub estimator: String,
+    pub scoring_backend: String,
+    pub scoring_engine: String,
+    pub scoring_tolerance: f32,
     pub slots: Vec<HygieneGuardSlotCalibration>,
     pub persisted: bool,
     pub guard_cf_profile_bytes: u64,
@@ -1303,6 +1306,9 @@ pub fn run_guard_calibrate_spec(
         conflicting: report.conflicting as u64,
         adjudicated_without_guarded_slots: report.adjudicated_without_guarded_slots as u64,
         estimator: report.estimator,
+        scoring_backend: report.scoring_backend,
+        scoring_engine: report.scoring_engine,
+        scoring_tolerance: report.scoring_tolerance,
         slots: report
             .slots
             .into_iter()

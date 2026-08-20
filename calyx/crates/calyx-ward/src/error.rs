@@ -21,6 +21,7 @@ pub const CALYX_GUARD_IDENTITY_SLOT_NOT_REQUIRED: &str = "CALYX_GUARD_IDENTITY_S
 pub const CALYX_GUARD_CALIBRATION_SLOT_SHAPE: &str = "CALYX_GUARD_CALIBRATION_SLOT_SHAPE";
 pub const CALYX_GUARD_CALIBRATION_SLOT_UNKNOWN: &str = "CALYX_GUARD_CALIBRATION_SLOT_UNKNOWN";
 pub const CALYX_GUARD_CALIBRATION_SLOT_STATE: &str = "CALYX_GUARD_CALIBRATION_SLOT_STATE";
+pub const CALYX_GUARD_CALIBRATION_SCORE_CONTRACT: &str = "CALYX_GUARD_CALIBRATION_SCORE_CONTRACT";
 pub const CALYX_WARD_MODEL_NOT_FOUND: &str = "CALYX_WARD_MODEL_NOT_FOUND";
 pub const CALYX_WARD_INVALID_INPUT: &str = "CALYX_WARD_INVALID_INPUT";
 pub const CALYX_WARD_MODEL_DIM_MISMATCH: &str = "CALYX_WARD_MODEL_DIM_MISMATCH";
@@ -42,6 +43,16 @@ pub enum WardError {
     MissingSlotCalibration {
         guard_id: GuardId,
         slot: SlotId,
+    },
+    /// A legacy or malformed profile has no finite serving-score envelope for
+    /// a required slot, so its calibrated tau can flip across otherwise valid
+    /// floating-point reduction orders.
+    CalibrationScoreContract {
+        guard_id: GuardId,
+        slot: SlotId,
+        estimator: String,
+        score_tolerance: Option<f32>,
+        scoring_engine: Option<String>,
     },
     InertProfile {
         guard_id: GuardId,
@@ -148,6 +159,7 @@ impl WardError {
             Self::Provisional { .. } | Self::MissingSlotCalibration { .. } => {
                 CALYX_GUARD_PROVISIONAL
             }
+            Self::CalibrationScoreContract { .. } => CALYX_GUARD_CALIBRATION_SCORE_CONTRACT,
             Self::InsufficientCalibrationData { .. }
             | Self::InvalidCalibrationInput { .. }
             | Self::TauUnreachable { .. }
@@ -190,6 +202,18 @@ impl fmt::Display for WardError {
             Self::MissingSlotCalibration { guard_id, slot } => write!(
                 f,
                 "{CALYX_GUARD_PROVISIONAL}: guard {guard_id} missing high-stakes calibration provenance for required slot {slot}; calibrate every required slot before high-stakes use"
+            ),
+            Self::CalibrationScoreContract {
+                guard_id,
+                slot,
+                estimator,
+                score_tolerance,
+                scoring_engine,
+            } => write!(
+                f,
+                "{CALYX_GUARD_CALIBRATION_SCORE_CONTRACT}: guard {guard_id} required slot {slot} has no supported serving-score contract (estimator={estimator:?}, scoring_engine={scoring_engine:?}, score_tolerance={score_tolerance:?}); recalibrate this profile with {} and {} before high-stakes use",
+                crate::calibrate::ESTIMATOR,
+                calyx_core::DENSE_COSINE_SCORING_ENGINE
             ),
             Self::InertProfile { guard_id, reason } => write!(
                 f,

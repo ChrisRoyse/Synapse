@@ -126,10 +126,9 @@ use calyx_aster::cf::ColumnFamily;
 use calyx_aster::mvcc::CfRead;
 use calyx_aster::vault::encode::decode_constellation_base;
 use calyx_core::{
-    AnchorKind, AnchorValue, COSINE_ROUNDING_TOLERANCE, CalyxError, Clock, CxId, Panel, SlotId,
-    SlotVector, Ts, clamp_cosine_quotient, dense_cosine,
+    AnchorKind, AnchorValue, CalyxError, Clock, CxId, DENSE_COSINE_SCORING_ENGINE, Panel, SlotId,
+    SlotVector, Ts, dense_cosine,
 };
-use calyx_forge::{Backend, KnnMetric};
 use calyx_ledger::{ActorId, EntryKind, SubjectId};
 use calyx_registry::load_vault_panel_state;
 use calyx_ward::{
@@ -308,13 +307,13 @@ pub struct SynapseCalyxGuardCalibrateReport {
     /// means the named slots are wrong for this panel, not that the corpus is.
     pub adjudicated_without_guarded_slots: usize,
     pub estimator: String,
-    /// Exact Forge backend selected by the process-local math runtime.
+    /// Backend executing the canonical calibration/serving scorer.
     pub scoring_backend: String,
     /// The score path used to turn dense corpus rows into cosine-equivalent
     /// nearest-neighbour scores.
     pub scoring_engine: String,
-    /// Maximum f32 deviation outside the mathematical cosine range that the
-    /// shared cosine contract recognizes as reduction-order rounding.
+    /// Maximum calibration-to-serving cosine deviation conservatively folded
+    /// into every bad/good score before tau selection.
     pub scoring_tolerance: f32,
     pub slots: Vec<SynapseCalyxGuardSlotCalibration>,
     pub persisted: bool,
@@ -710,6 +709,17 @@ impl SynapseCalyxVault {
                 "run hygiene operation=guard_calibrate for this panel",
             ));
         }
+        calyx_ward::validate_high_stakes_profile(&profile, &profile.required_slots).map_err(
+            |error| {
+                guard_error(
+                    error.code(),
+                    format!(
+                        "guard profile for panel {panel_version} has no current high-stakes scoring contract: {error}"
+                    ),
+                    "recalibrate this panel; legacy thresholds without a serving-score parity envelope remain readable history but cannot establish readiness",
+                )
+            },
+        )?;
         let calibration = profile.calibration.as_ref().ok_or_else(|| {
             guard_error(
                 calyx_ward::CALYX_GUARD_PROVISIONAL,
@@ -799,9 +809,11 @@ impl SynapseCalyxVault {
         }
 
         let clock = FixedGuardClock(self.clock_now_ms()?);
-        let backend_lease = self.math_runtime.backend()?;
-        let backend = &*backend_lease;
-        let scoring_backend = backend.device_info().kind.to_string();
+        // Calibration and serving deliberately use the same canonical CPU
+        // scorer. A Forge/GPU normalized-dot ranking is mathematically cosine,
+        // but its parallel reduction can differ by an f32 ulp at tau and turn a
+        // calibrated rejection into a serving acceptance.
+        let scoring_backend = "cpu".to_owned();
         let mut inputs = Vec::with_capacity(params.slots.len());
         let mut evidence = Vec::with_capacity(params.slots.len());
         let mut collision_diagnostics = Vec::new();
@@ -810,8 +822,7 @@ impl SynapseCalyxVault {
                 Some(target_far) => target_far,
                 None => self.configured_guard_target_far(spec.aspect)?,
             };
-            let score_report =
-                calibration_slot_scores(backend, &corpus.good, &corpus.bad, spec.slot)?;
+            let score_report = calibration_slot_scores(&corpus.good, &corpus.bad, spec.slot)?;
             if let Some(diagnostic) =
                 calibration_collision_diagnostic(spec.slot, &score_report.nearest_good)
             {
@@ -866,6 +877,8 @@ impl SynapseCalyxVault {
                 bad_scores,
                 slot_kind: spec.aspect.slot_kind(),
                 target_far,
+                score_tolerance: 0.0,
+                scoring_engine: DENSE_COSINE_SCORING_ENGINE.to_owned(),
             });
             evidence.push((*spec, target_far, certifiable_min));
         }
@@ -915,7 +928,7 @@ impl SynapseCalyxVault {
             let bad_accepts = input
                 .bad_scores
                 .iter()
-                .filter(|score| **score >= tau)
+                .filter(|score| conservative_bad_guard_score(**score, input.score_tolerance) >= tau)
                 .count();
             let tail = clopper_pearson_tail(bad_accepts, input.bad_scores.len(), target_far);
             // Independent readback of ward's own gate: if the returned tau is
@@ -938,7 +951,9 @@ impl SynapseCalyxVault {
                 input
                     .good_scores
                     .iter()
-                    .filter(|score| **score < tau)
+                    .filter(|score| {
+                        conservative_good_guard_score(**score, input.score_tolerance) < tau
+                    })
                     .count(),
                 input.good_scores.len(),
             );
@@ -1134,8 +1149,8 @@ impl SynapseCalyxVault {
             adjudicated_without_guarded_slots: corpus.adjudicated_without_guarded_slots,
             estimator: calyx_ward::ESTIMATOR.to_owned(),
             scoring_backend,
-            scoring_engine: "l2_normalize_once+exact_knn_dot".to_owned(),
-            scoring_tolerance: COSINE_ROUNDING_TOLERANCE,
+            scoring_engine: DENSE_COSINE_SCORING_ENGINE.to_owned(),
+            scoring_tolerance: 0.0,
             slots,
             persisted: params.persist,
             guard_cf_profile_bytes,
@@ -1761,10 +1776,10 @@ impl SynapseCalyxVault {
     }
 }
 
-/// One compact, validated, normalized matrix for a single guard slot.
+/// One compact, validated raw-vector matrix for a single guard slot.
 ///
 /// `row_ids` is not incidental bookkeeping: it is the physical-record
-/// provenance for every row handed to Forge, and therefore the diagnostic
+/// provenance for every row handed to the canonical scorer, and therefore the diagnostic
 /// bridge from a numerical failure back to the vault record that must be
 /// repaired.
 struct WardSlotMatrix {
@@ -1799,8 +1814,8 @@ fn calibration_collision_diagnostic(slot: u16, matches: &[NearestGoodMatch]) -> 
     const MAX_EXAMPLES: usize = 4;
     let exact = matches
         .iter()
-        // Backend scores have already passed the shared cosine validator,
-        // which clamps only reduction-order excess to the legal maximum.
+        // Scores come from the exact shared dense-cosine scorer, which clamps
+        // only reduction-order excess to the legal maximum.
         .filter(|nearest| nearest.score >= 1.0)
         .collect::<Vec<_>>();
     if exact.is_empty() {
@@ -1822,27 +1837,31 @@ impl WardSlotMatrix {
     const fn rows(&self) -> usize {
         self.row_ids.len()
     }
+
+    fn row(&self, index: usize) -> &[f32] {
+        let start = index * self.dim;
+        &self.flat[start..start + self.dim]
+    }
 }
 
-/// Builds the per-slot good and bad matrices, normalizes each exactly once,
-/// then performs exhaustive nearest-neighbour ranking through the backend
-/// selected by [`SynapseCalyxMathRuntime`](crate::math::SynapseCalyxMathRuntime).
+/// Builds validated per-slot matrices and scores them with the exact canonical
+/// function Ward invokes at serving time.
 ///
-/// Cosine over unit vectors is their inner product. Using `KnnMetric::Dot`
-/// after one normalization pass avoids recomputing both norms for every pair
-/// while retaining Forge's exact batched ranking. There is deliberately no
-/// alternate backend or scalar retry: a selected-backend failure is the result.
+/// This is intentionally not dispatched through Forge. A GPU normalized-dot
+/// reduction is mathematically equivalent, but its valid floating-point order
+/// is not byte-identical to `dense_cosine`; a one-ulp difference at tau is a
+/// different security decision. Calibration is off the hot path, so numeric
+/// identity with serving owns this boundary.
 fn calibration_slot_scores(
-    backend: &dyn Backend,
     good: &[AdjudicatedRecord],
     bad: &[AdjudicatedRecord],
     slot: u16,
 ) -> Result<CalibrationSlotScores, SynapseCalyxError> {
-    let mut good_matrix = collect_slot_matrix(good, slot, "good", None)?;
+    let good_matrix = collect_slot_matrix(good, slot, "good", None)?;
     let good_dim = good_matrix.as_ref().map(|matrix| matrix.dim);
-    let mut bad_matrix = collect_slot_matrix(bad, slot, "bad", good_dim)?;
+    let bad_matrix = collect_slot_matrix(bad, slot, "bad", good_dim)?;
 
-    let Some(good_matrix) = good_matrix.as_mut() else {
+    let Some(good_matrix) = good_matrix.as_ref() else {
         // Without one trusted vector there is no candidate space. The caller's
         // existing GOOD_CORPUS_INSUFFICIENT gate names that evidence deficit.
         return Ok(CalibrationSlotScores {
@@ -1851,14 +1870,9 @@ fn calibration_slot_scores(
             nearest_good: Vec::new(),
         });
     };
-    normalize_slot_matrix(backend, good_matrix, slot, "good")?;
-    if let Some(matrix) = bad_matrix.as_mut() {
-        normalize_slot_matrix(backend, matrix, slot, "bad")?;
-    }
-
-    let good_scores = leave_one_out_scores(backend, good_matrix, slot)?;
+    let good_scores = leave_one_out_scores(good_matrix, slot)?;
     let (bad_scores, nearest_good) = match bad_matrix.as_ref() {
-        Some(matrix) => nearest_good_scores(backend, matrix, good_matrix, slot)?,
+        Some(matrix) => nearest_good_scores(matrix, good_matrix, slot)?,
         None => (Vec::new(), Vec::new()),
     };
     Ok(CalibrationSlotScores {
@@ -1958,90 +1972,17 @@ fn collect_slot_matrix(
     Ok(Some(WardSlotMatrix { flat, row_ids, dim }))
 }
 
-fn normalize_slot_matrix(
-    backend: &dyn Backend,
-    matrix: &mut WardSlotMatrix,
-    slot: u16,
-    role: &str,
-) -> Result<(), SynapseCalyxError> {
-    backend
-        .normalize(&mut matrix.flat, matrix.dim)
-        .map_err(|error| {
-            ward_forge_error(
-                backend,
-                &format!(
-                    "normalize {role} guard matrix slot={slot} rows={} dim={} in Base-CF row order",
-                    matrix.rows(),
-                    matrix.dim
-                ),
-                &error,
-            )
-        })
-}
-
 /// Leave-one-out nearest-neighbour cosine per good exemplar: the in-region score
 /// the guard would compute for that record matched to its nearest OTHER trusted
 /// exemplar. Including itself would score a constant 1.0 and report FRR = 0.
-fn leave_one_out_scores(
-    backend: &dyn Backend,
-    good: &WardSlotMatrix,
-    slot: u16,
-) -> Result<Vec<f32>, SynapseCalyxError> {
+fn leave_one_out_scores(good: &WardSlotMatrix, slot: u16) -> Result<Vec<f32>, SynapseCalyxError> {
     if good.rows() < 2 {
         return Ok(Vec::new());
     }
-    let batch = backend
-        .knn(
-            &good.flat,
-            &good.flat,
-            good.rows(),
-            good.dim,
-            2,
-            KnnMetric::Dot,
-        )
-        .map_err(|error| {
-            ward_forge_error(
-                backend,
-                &format!(
-                    "rank leave-one-out good neighbors slot={slot} rows={} dim={} k=2",
-                    good.rows(),
-                    good.dim
-                ),
-                &error,
-            )
-        })?;
-    validate_knn_shape(&batch, good.rows(), good.rows(), 2, slot, "good×good")?;
-
     let mut scores = Vec::with_capacity(good.rows());
     for query_index in 0..good.rows() {
-        // Never assume self is rank zero. Duplicate categorical embeddings tie
-        // at 1.0, and a top-k implementation is free to order ties differently.
-        // Exclude by physical matrix identity; with k=2 and only one self row,
-        // at least one hit is non-self whenever good.rows() >= 2.
-        let score = batch
-            .row(query_index)
-            .and_then(|row| {
-                row.filter(|(candidate_index, _)| *candidate_index != query_index)
-                    .map(|(_, score)| score)
-                    .next()
-            })
-            .ok_or_else(|| {
-                guard_error(
-                    "SYNAPSE_CALYX_GUARD_KNN_SELF_EXCLUSION",
-                    format!(
-                        "good×good kNN for guard slot {slot} query row {query_index} ({}) returned no non-self hit from {} candidates",
-                        good.row_ids[query_index],
-                        good.rows()
-                    ),
-                    "inspect the exact Forge top-k indices; leave-one-out calibration requires one identity-distinct trusted neighbor per scored row",
-                )
-            })?;
-        scores.push(validate_backend_cosine(
-            score,
-            slot,
-            query_index,
-            "good×good",
-        )?);
+        let (_, score) = matrix_best_match(good.row(query_index), good, Some(query_index), slot)?;
+        scores.push(score);
     }
     Ok(scores)
 }
@@ -2049,7 +1990,6 @@ fn leave_one_out_scores(
 /// Nearest-good cosine per bad case: the score the guard would compute if that
 /// known-bad output were presented and matched to the trusted region.
 fn nearest_good_scores(
-    backend: &dyn Backend,
     bad: &WardSlotMatrix,
     good: &WardSlotMatrix,
     slot: u16,
@@ -2057,45 +1997,10 @@ fn nearest_good_scores(
     if bad.rows() == 0 || good.rows() == 0 {
         return Ok((Vec::new(), Vec::new()));
     }
-    let batch = backend
-        .knn(
-            &bad.flat,
-            &good.flat,
-            bad.rows(),
-            good.dim,
-            1,
-            KnnMetric::Dot,
-        )
-        .map_err(|error| {
-            ward_forge_error(
-                backend,
-                &format!(
-                    "rank bad-to-good guard neighbors slot={slot} bad_rows={} good_rows={} dim={} k=1",
-                    bad.rows(),
-                    good.rows(),
-                    good.dim
-                ),
-                &error,
-            )
-        })?;
-    validate_knn_shape(&batch, bad.rows(), good.rows(), 1, slot, "bad×good")?;
     let mut scores = Vec::with_capacity(bad.rows());
     let mut nearest_good = Vec::with_capacity(bad.rows());
     for query_index in 0..bad.rows() {
-        let (candidate_index, score) = batch
-            .row(query_index)
-            .and_then(|mut row| row.next())
-            .ok_or_else(|| {
-                guard_error(
-                    "SYNAPSE_CALYX_GUARD_KNN_RESULT_MISSING",
-                    format!(
-                        "bad×good kNN for guard slot {slot} query row {query_index} ({}) returned no nearest trusted hit",
-                        bad.row_ids[query_index]
-                    ),
-                    "inspect the exact Forge kNN result shape; every bad query requires one trusted candidate score",
-                )
-            })?;
-        let score = validate_backend_cosine(score, slot, query_index, "bad×good")?;
+        let (candidate_index, score) = matrix_best_match(bad.row(query_index), good, None, slot)?;
         scores.push(score);
         nearest_good.push(NearestGoodMatch {
             bad_cx_id: bad.row_ids[query_index].clone(),
@@ -2106,70 +2011,49 @@ fn nearest_good_scores(
     Ok((scores, nearest_good))
 }
 
-fn validate_knn_shape(
-    batch: &calyx_forge::KnnBatch,
-    query_count: usize,
-    candidate_count: usize,
-    k: usize,
+fn matrix_best_match(
+    query: &[f32],
+    candidates: &WardSlotMatrix,
+    excluded_index: Option<usize>,
     slot: u16,
-    lane: &str,
-) -> Result<(), SynapseCalyxError> {
-    if batch.query_count == query_count
-        && batch.candidate_count == candidate_count
-        && batch.k == k
-        && batch.metric == KnnMetric::Dot
-        && batch.indices.len() == query_count * k
-        && batch.scores.len() == query_count * k
-    {
-        return Ok(());
+) -> Result<(usize, f32), SynapseCalyxError> {
+    let mut best = None;
+    for candidate_index in 0..candidates.rows() {
+        if excluded_index == Some(candidate_index) {
+            continue;
+        }
+        let score = dense_cosine(query, candidates.row(candidate_index)).ok_or_else(|| {
+            guard_error(
+                "SYNAPSE_CALYX_GUARD_SCORE_INVALID",
+                format!(
+                    "canonical {DENSE_COSINE_SCORING_ENGINE} could not score guard slot {slot} candidate row {candidate_index} ({})",
+                    candidates.row_ids[candidate_index]
+                ),
+                "inspect the named physical row; calibration and serving both refuse an undefined dense cosine",
+            )
+        })?;
+        if best.is_none_or(|(_, current)| score > current) {
+            best = Some((candidate_index, score));
+        }
     }
-    Err(guard_error(
-        "SYNAPSE_CALYX_GUARD_KNN_SHAPE_MISMATCH",
-        format!(
-            "{lane} kNN for guard slot {slot} returned query_count={} candidate_count={} k={} metric={:?} indices={} scores={}; expected query_count={query_count} candidate_count={candidate_count} k={k} metric=dot and {} hits",
-            batch.query_count,
-            batch.candidate_count,
-            batch.k,
-            batch.metric,
-            batch.indices.len(),
-            batch.scores.len(),
-            query_count * k
-        ),
-        "repair the selected Forge backend result contract; Ward never accepts a partial or differently-scored neighbor matrix",
-    ))
-}
-
-fn validate_backend_cosine(
-    score: f32,
-    slot: u16,
-    query_index: usize,
-    lane: &str,
-) -> Result<f32, SynapseCalyxError> {
-    clamp_cosine_quotient(score).ok_or_else(|| {
+    best.ok_or_else(|| {
         guard_error(
-            "SYNAPSE_CALYX_GUARD_KNN_SCORE_INVALID",
+            "SYNAPSE_CALYX_GUARD_SCORE_CANDIDATE_MISSING",
             format!(
-                "{lane} normalized-dot kNN for guard slot {slot} query row {query_index} returned {score}, further outside [-1,1] than f32 rounding explains"
+                "guard slot {slot} has no identity-distinct candidate after applying excluded_index={excluded_index:?} to {} row(s)",
+                candidates.rows()
             ),
-            "inspect the named normalized matrix row and selected Forge reduction; Ward never clamps a score outside the shared cosine rounding tolerance",
+            "provide at least two adjudicated good records carrying the guarded slot; calibration never scores a record against itself",
         )
     })
 }
 
-fn ward_forge_error(
-    backend: &dyn Backend,
-    action: &str,
-    error: &calyx_forge::ForgeError,
-) -> SynapseCalyxError {
-    SynapseCalyxError {
-        code: "SYNAPSE_CALYX_GUARD_FORGE",
-        message: format!(
-            "{action}: selected {} Forge backend failed: {error}",
-            backend.device_info().kind
-        ),
-        remediation: "repair the selected Forge backend, device runtime, input contract, or explicit dispatch budget; Ward never retries on another backend",
-        source_code: Some(error.code()),
-    }
+fn conservative_bad_guard_score(score: f32, tolerance: f32) -> f32 {
+    (score + tolerance).min(1.0)
+}
+
+fn conservative_good_guard_score(score: f32, tolerance: f32) -> f32 {
+    (score - tolerance).max(-1.0)
 }
 
 /// Index of and cosine to the best-matching good exemplar on `slot`.
