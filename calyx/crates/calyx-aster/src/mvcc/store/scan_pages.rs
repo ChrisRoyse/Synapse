@@ -12,6 +12,8 @@ pub(crate) struct SnapshotCfRowStream<'a> {
     cf: ColumnFamily,
     clock: &'a dyn Clock,
     rows_until_lease_check: usize,
+    renew_lease_while_progressing: bool,
+    lease_renewal_count: u64,
     inner: SnapshotCfRowStreamInner<'a>,
 }
 
@@ -26,13 +28,45 @@ enum SnapshotCfRowStreamInner<'a> {
 }
 
 impl SnapshotCfRowStream<'_> {
+    /// Keeps this stream's exact pinned snapshot live while the consumer is
+    /// actively advancing it. Renewal preserves the reader id and sequence;
+    /// an expired/missing lease fails closed and is never replaced by a newer
+    /// snapshot.
+    pub(crate) fn renew_lease_while_progressing(mut self) -> Self {
+        self.renew_lease_while_progressing = true;
+        self
+    }
+
+    pub(crate) const fn lease_renewal_count(&self) -> u64 {
+        self.lease_renewal_count
+    }
+
+    fn refresh_or_validate_lease(&mut self) -> Result<()> {
+        if self.renew_lease_while_progressing {
+            self.snapshot = self.store.renew_snapshot(self.snapshot, self.clock)?;
+            self.lease_renewal_count = self.lease_renewal_count.checked_add(1).ok_or_else(|| {
+                CalyxError {
+                    code: "CALYX_ASTER_READER_LEASE_RENEWAL_OVERFLOW",
+                    message: format!(
+                        "reader lease {} renewal count exceeds the durable u64 limit",
+                        self.snapshot.lease().id()
+                    ),
+                    remediation: "stop the scan and inspect its progress accounting; do not continue with an uncounted lease renewal",
+                }
+            })?;
+            Ok(())
+        } else {
+            self.store.ensure_snapshot_live(self.snapshot, self.clock)
+        }
+    }
+
     /// Lends the next visible row to `visit`; returns `false` at EOF.
     pub(crate) fn next_with(
         &mut self,
         visit: impl FnOnce(&[u8], &[u8]) -> Result<()>,
     ) -> Result<bool> {
         if self.rows_until_lease_check == 0 {
-            self.store.ensure_snapshot_live(self.snapshot, self.clock)?;
+            self.refresh_or_validate_lease()?;
             self.rows_until_lease_check = SNAPSHOT_ROW_STREAM_LEASE_CHECK_ROWS;
         }
 
@@ -93,7 +127,7 @@ impl SnapshotCfRowStream<'_> {
         if present {
             self.rows_until_lease_check -= 1;
         } else {
-            self.store.ensure_snapshot_live(self.snapshot, self.clock)?;
+            self.refresh_or_validate_lease()?;
         }
         Ok(present)
     }
@@ -176,6 +210,8 @@ impl VersionedCfStore {
             cf,
             clock,
             rows_until_lease_check: 0,
+            renew_lease_while_progressing: false,
+            lease_renewal_count: 0,
             inner,
         })
     }

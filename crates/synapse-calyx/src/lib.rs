@@ -1748,6 +1748,11 @@ pub struct SynapseCalyxLedgerVerifyReport {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// Bounded stall window for the exact-snapshot integrity scan.
+    pub reader_lease_duration_ms: u64,
+    /// Successful same-snapshot renewals across physical Ledger and raw
+    /// commitment streams.
+    pub reader_lease_renewal_count: u64,
     /// True only when the verified range provably covers the vault directory's
     /// whole recorded history. False whenever the chain begins after a recorded
     /// vault replacement, or before the lineage journal existed — in which case
@@ -1961,6 +1966,8 @@ impl SynapseCalyxLedgerVerifyReport {
             tip_hash,
             verified_range,
             raw_commitments,
+            reader_lease_duration_ms,
+            reader_lease_renewal_count,
         } = verification;
         let raw_commitments_intact = raw_commitments.intact;
         let base = Self {
@@ -1984,6 +1991,8 @@ impl SynapseCalyxLedgerVerifyReport {
             raw_commitment_sealed_through_seq: raw_commitments.sealed_through_seq,
             raw_commitment_first_pending_seq: raw_commitments.first_pending_seq,
             raw_commitment_failure: raw_commitments.failure.clone(),
+            reader_lease_duration_ms,
+            reader_lease_renewal_count,
             covers_full_history: lineage.chain_covers_full_history(),
             chain_origin: lineage.chain_origin.clone(),
             history_coverage: lineage.history_coverage().to_owned(),

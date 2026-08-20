@@ -381,6 +381,10 @@ pub struct AuditVerifyChainResponse {
     pub raw_commitment_first_pending_seq: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_commitment_failure: Option<String>,
+    /// Bounded stall window used by the exact-snapshot integrity scan.
+    pub reader_lease_duration_ms: u64,
+    /// Successful renewals of that same pinned snapshot while rows advanced.
+    pub reader_lease_renewal_count: u64,
     /// True only when this chain provably covers the vault directory's whole
     /// recorded history. When false, `intact` attests only the surviving chain:
     /// the vault was replaced, or its lineage was not tracked from genesis

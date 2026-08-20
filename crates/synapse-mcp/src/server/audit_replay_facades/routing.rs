@@ -706,6 +706,8 @@ fn verify_chain_response(
         raw_commitment_sealed_through_seq: verify.raw_commitment_sealed_through_seq,
         raw_commitment_first_pending_seq: verify.raw_commitment_first_pending_seq,
         raw_commitment_failure: verify.raw_commitment_failure.clone(),
+        reader_lease_duration_ms: verify.reader_lease_duration_ms,
+        reader_lease_renewal_count: verify.reader_lease_renewal_count,
         covers_full_history: verify.covers_full_history,
         chain_origin: verify.chain_origin.clone(),
         history_coverage: verify.history_coverage.clone(),

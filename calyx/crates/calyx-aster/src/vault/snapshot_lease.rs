@@ -72,12 +72,17 @@ where
     }
 
     pub(crate) fn snapshot_handle(&self, seq: Seq) -> calyx_core::Result<ScopedSnapshot<'_>> {
-        let snapshot = self.rows.pin_snapshot_at(
-            seq,
-            Freshness::FreshDerived,
-            &self.clock,
-            DEFAULT_LEASE_MS,
-        )?;
+        self.snapshot_handle_with_max_age(seq, DEFAULT_LEASE_MS)
+    }
+
+    pub(crate) fn snapshot_handle_with_max_age(
+        &self,
+        seq: Seq,
+        max_age_ms: u64,
+    ) -> calyx_core::Result<ScopedSnapshot<'_>> {
+        let snapshot =
+            self.rows
+                .pin_snapshot_at(seq, Freshness::FreshDerived, &self.clock, max_age_ms)?;
         Ok(ScopedSnapshot {
             rows: &self.rows,
             snapshot,

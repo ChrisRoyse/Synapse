@@ -11,6 +11,10 @@ use calyx_ledger::{
 };
 use std::ops::Range;
 
+/// Maximum period for which a stalled integrity scan may retain its exact MVCC
+/// pin. Progressing row streams renew this same lease; they never re-pin.
+const LEDGER_VERIFY_READER_LEASE_MS: u64 = 30_000;
+
 /// Result of verifying the live physical Ledger hash chain against the exact
 /// stored bytes in [`ColumnFamily::Ledger`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -26,6 +30,12 @@ pub struct AsterLedgerChainVerification {
     /// Independent readback of the raw-write commitment CF and every
     /// checkpoint-cohort seal carried by this Ledger.
     pub raw_commitments: AsterRawCommitmentVerification,
+    /// Bounded stall window used by the progressing integrity scan.
+    pub reader_lease_duration_ms: u64,
+    /// Successful same-snapshot renewals across the Ledger and RawCommitment
+    /// row streams. A non-zero count proves a long scan did not fall back to a
+    /// newer snapshot after the initial pin.
+    pub reader_lease_renewal_count: u64,
 }
 
 /// Fail-closed verification of compact raw-write provenance commitments.
@@ -283,7 +293,8 @@ where
             &durable.root().join("locks").join("durable.commit.lock"),
         )?;
         let snapshot_seq = self.snapshot();
-        let snapshot_handle = self.snapshot_handle(snapshot_seq)?;
+        let snapshot_handle =
+            self.snapshot_handle_with_max_age(snapshot_seq, LEDGER_VERIFY_READER_LEASE_MS)?;
         let snapshot = snapshot_handle.snapshot();
         let head = crate::ledger_head::read_head_anchor(durable.root())?;
         drop(commit_guard);
@@ -337,20 +348,26 @@ where
             StreamingStart::Complete(result) => (None, Some(result)),
         };
 
-        let raw_stream = self.rows.open_cf_range_row_stream_at(
-            snapshot,
-            ColumnFamily::RawCommitment,
-            &KeyRange::all(),
-            &self.clock,
-        )?;
+        let raw_stream = self
+            .rows
+            .open_cf_range_row_stream_at(
+                snapshot,
+                ColumnFamily::RawCommitment,
+                &KeyRange::all(),
+                &self.clock,
+            )?
+            .renew_lease_while_progressing();
         let mut raw_cursor = RawCommitmentCursor::new(raw_stream);
         let mut raw_state = RawCommitmentVerificationState::default();
-        let mut ledger_stream = self.rows.open_cf_range_row_stream_at(
-            snapshot,
-            ColumnFamily::Ledger,
-            &KeyRange::all(),
-            &self.clock,
-        )?;
+        let mut ledger_stream = self
+            .rows
+            .open_cf_range_row_stream_at(
+                snapshot,
+                ColumnFamily::Ledger,
+                &KeyRange::all(),
+                &self.clock,
+            )?
+            .renew_lease_while_progressing();
         while ledger_stream.next_with(|key, bytes| {
             let seq = parse_aster_ledger_seq(key)?;
             raw_state.observe_ledger_row(seq, bytes, &mut raw_cursor)?;
@@ -383,12 +400,22 @@ where
             )
         })?;
         let raw_commitments = raw_state.finish(&mut raw_cursor);
+        let reader_lease_renewal_count = ledger_stream
+            .lease_renewal_count()
+            .checked_add(raw_cursor.stream.lease_renewal_count())
+            .ok_or_else(|| CalyxError {
+                code: "CALYX_ASTER_READER_LEASE_RENEWAL_OVERFLOW",
+                message: "combined Ledger and RawCommitment reader lease renewal count exceeds the durable u64 limit".to_owned(),
+                remediation: "stop the verification and inspect its progress accounting; do not publish an uncounted integrity verdict",
+            })?;
         Ok(AsterLedgerChainVerification {
             result,
             head_height,
             tip_hash: head.map(|anchor| anchor.tip_hash),
             verified_range,
             raw_commitments,
+            reader_lease_duration_ms: LEDGER_VERIFY_READER_LEASE_MS,
+            reader_lease_renewal_count,
         })
     }
 
