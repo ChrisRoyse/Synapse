@@ -395,14 +395,22 @@ async fn preflight_setup_repair_chrome_bridge() -> Result<String, ErrorData> {
                         !actual.is_empty()
                             && host.expected_service_worker_sha256.as_deref() == Some(actual)
                     })
-                && host.extension_debugger_api_available == Some(true)
+                // The authenticated normal-profile bridge is deliberately
+                // debugger-free (#1249). Deep CDP operations belong to the
+                // daemon-owned isolated browser lane. Requiring `true` here
+                // made setup reload an already exact popup-free host, which
+                // could leave an unpacked MV3 worker dormant after
+                // chrome.runtime.reload(). Require an explicit negative
+                // readback instead: `None` is unknown and `true` violates the
+                // normal-bridge security boundary, so both remain fail-closed.
+                && host.extension_debugger_api_available == Some(false)
                 && host
                     .extension_capabilities
                     .iter()
                     .any(|capability| capability == "maintenancePauseReconnect") =>
         {
             return Ok(format!(
-                "chrome_bridge_preflight=current_host_verified host_id={} service_worker_sha256={} service_worker_sha256_status={} maintenance_pause_capability=true",
+                "chrome_bridge_preflight=current_debugger_free_host_verified host_id={} service_worker_sha256={} service_worker_sha256_status={} debugger_api_available=false maintenance_pause_capability=true",
                 host.host_id,
                 host.extension_service_worker_sha256
                     .as_deref()
