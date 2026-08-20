@@ -1,6 +1,6 @@
 const PROTOCOL_VERSION = 2;
-const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-16-document-owner-v22";
-const BRIDGE_DECLARED_BUILD_SHA256 = "0d376d90e6d89f5e29845fac2f8ea2e6dd02cc19de33b34c097652e818d07f4c";
+const BRIDGE_BUILD_ID = "synapse-chrome-bridge-2026-08-20-reload-contract-v23";
+const BRIDGE_DECLARED_BUILD_SHA256 = "0a7bb3c99dc96d70bede872735bfb5d934f40de8a2a7fdcdb631e38676403ba2";
 const DEBUGGER_COMMAND_TIMEOUT_MS = 5000;
 // Bounded, caller-configurable budget for Runtime.evaluate (issue #1596). The
 // default preserves the historical fixed 5000 ms wall; agents may raise it up to
@@ -17175,16 +17175,16 @@ function handleReloadSelf(params = {}) {
   }, reloadDelayMs);
   return {
     ok: true,
-    control_surface: "chrome.runtime.reload",
-    required_foreground: false,
-    extension_id: chrome.runtime.id,
-    loaded_build_id: BRIDGE_BUILD_ID,
-    deployed_build_id: expectedDeployedBuildId,
-    scheduled_at_unix_ms: scheduledAtUnixMs,
-    reload_delay_ms: reloadDelayMs,
-    foreground_api_calls: 0,
-    tab_mutations: 0,
-    synthetic_input_events: 0
+    controlSurface: "chrome.runtime.reload",
+    requiredForeground: false,
+    extensionId: chrome.runtime.id,
+    loadedBuildId: BRIDGE_BUILD_ID,
+    deployedBuildId: expectedDeployedBuildId,
+    scheduledAtUnixMs,
+    reloadDelayMs,
+    foregroundApiCalls: 0,
+    tabMutations: 0,
+    syntheticInputEvents: 0
   };
 }
 
