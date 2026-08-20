@@ -198,6 +198,12 @@ judge the scope. The alternative—filling pre-treatment causes from terminal
 errors or current host state—would introduce post-treatment leakage and
 fabricated history.
 
+The persisted contract id is the compact, non-secret stable identifier
+`reward_dense_admission_v3_slot125`. Its full semantics are the v4 schema above.
+Keeping the identifier below the ledger's generic long-token boundary preserves
+the append-only payload secret scanner; complete population identity remains
+committed under the explicit SHA-256 fields rather than weakening that gate.
+
 Primary research consulted after the physical missing-cause diagnosis:
 
 - https://pmc.ncbi.nlm.nih.gov/articles/PMC7705610/

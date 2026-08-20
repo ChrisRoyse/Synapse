@@ -50,8 +50,7 @@ pub const ACTION_GUARD_ANCHOR_KIND: &str = "action_guard_region";
 /// Validation therefore measures the explicitly named complete-cause cohort,
 /// while binding and surfacing the entire excluded identity set. This is not
 /// imputation or a fallback to weaker slots.
-pub const ACTION_CAUSAL_POPULATION_CONTRACT: &str =
-    "reward_rows_with_finite_dense_admission_context_v3_slot_125";
+pub const ACTION_CAUSAL_POPULATION_CONTRACT: &str = "reward_dense_admission_v3_slot125";
 const ACTION_CAUSAL_PREDICTOR: &str = "typed_slot_rrf_knn.v1";
 const ACTION_CAUSAL_PREDICTOR_SLOTS: &[u16] = &[48, 117, 118, 119, 120, 121, 122, 125];
 const MIN_ACTION_RECORDS: usize = 50;
