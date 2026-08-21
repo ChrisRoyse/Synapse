@@ -1005,24 +1005,131 @@ function Get-SynapseCudaBuildCapability {
 }
 
 function Ensure-SynapseAtomicFileType {
-    if ('SynapseSetup.AtomicFile' -as [type]) { return }
+    if ('SynapseSetup.AtomicFileV2' -as [type]) { return }
     Add-Type -Language CSharp -TypeDefinition @"
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
 
 namespace SynapseSetup
 {
-    public static class AtomicFile
+    public sealed class PhysicalFileReadback
+    {
+        public long Length { get; set; }
+        public string Sha256 { get; set; }
+        public string Identity { get; set; }
+    }
+
+    public sealed class PhysicalTextReadback
+    {
+        public long Length { get; set; }
+        public string Sha256 { get; set; }
+        public string Identity { get; set; }
+        public string Content { get; set; }
+    }
+
+    public sealed class PhysicalEntryReadback
+    {
+        public string Identity { get; set; }
+        public bool IsDirectory { get; set; }
+    }
+
+    public static class AtomicFileV2
     {
         private const uint MOVEFILE_REPLACE_EXISTING = 0x00000001;
         private const uint MOVEFILE_WRITE_THROUGH = 0x00000008;
+        private const uint GENERIC_READ = 0x80000000;
+        private const uint GENERIC_WRITE = 0x40000000;
+        private const uint DELETE = 0x00010000;
+        private const uint FILE_READ_ATTRIBUTES = 0x00000080;
+        private const uint FILE_SHARE_READ = 0x00000001;
+        private const uint FILE_SHARE_WRITE = 0x00000002;
+        private const uint FILE_SHARE_DELETE = 0x00000004;
+        private const uint OPEN_EXISTING = 3;
+        private const uint CREATE_NEW = 1;
+        private const uint FILE_ATTRIBUTE_NORMAL = 0x00000080;
+        private const uint FILE_ATTRIBUTE_DIRECTORY = 0x00000010;
+        private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x00000400;
+        private const uint FILE_FLAG_BACKUP_SEMANTICS = 0x02000000;
+        private const uint FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000;
+        private const uint FILE_FLAG_WRITE_THROUGH = 0x80000000;
+        private const int FILE_ATTRIBUTE_TAG_INFO_CLASS = 9;
+        private const int FILE_DISPOSITION_INFO_CLASS = 4;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct FILE_ATTRIBUTE_TAG_INFO
+        {
+            public uint FileAttributes;
+            public uint ReparseTag;
+        }
+
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct FILE_DISPOSITION_INFO
+        {
+            public byte DeleteFile;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct BY_HANDLE_FILE_INFORMATION
+        {
+            public uint FileAttributes;
+            public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+            public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+            public uint VolumeSerialNumber;
+            public uint FileSizeHigh;
+            public uint FileSizeLow;
+            public uint NumberOfLinks;
+            public uint FileIndexHigh;
+            public uint FileIndexLow;
+        }
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool MoveFileEx(
             string existingFileName,
             string newFileName,
             uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern SafeFileHandle CreateFile(
+            string fileName,
+            uint desiredAccess,
+            uint shareMode,
+            IntPtr securityAttributes,
+            uint creationDisposition,
+            uint flagsAndAttributes,
+            IntPtr templateFile);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandleEx(
+            SafeFileHandle file,
+            int fileInformationClass,
+            out FILE_ATTRIBUTE_TAG_INFO fileInformation,
+            uint bufferSize);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(
+            SafeFileHandle file,
+            out BY_HANDLE_FILE_INFORMATION fileInformation);
+
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern uint GetFinalPathNameByHandle(
+            SafeFileHandle file,
+            StringBuilder filePath,
+            uint filePathSize,
+            uint flags);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(
+            SafeFileHandle file,
+            int fileInformationClass,
+            ref FILE_DISPOSITION_INFO fileInformation,
+            uint bufferSize);
 
         public static void ReplaceWriteThrough(string sourcePath, string destinationPath)
         {
@@ -1058,6 +1165,621 @@ namespace SynapseSetup
                     error,
                     "SYNAPSE_ATOMIC_FILE_INSTALL_NEW_FAILED win32=" + error +
                     " remediation=the content-addressed destination must be absent; no replace/fallback is permitted");
+            }
+        }
+
+        private static SafeFileHandle OpenPhysicalHandle(string path, uint access)
+        {
+            return OpenPhysicalHandleWithShare(
+                path,
+                access,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+
+        private static SafeFileHandle OpenPhysicalHandleWithShare(
+            string path,
+            uint access,
+            uint shareMode)
+        {
+            SafeFileHandle handle = CreateFile(
+                path,
+                access,
+                shareMode,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_PHYSICAL_HANDLE_OPEN_FAILED path=" + path + " win32=" + error);
+            }
+            return handle;
+        }
+
+        private static SafeFileHandle OpenPinnedPhysicalDirectory(string path)
+        {
+            SafeFileHandle handle = CreateFile(
+                path,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                IntPtr.Zero,
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                IntPtr.Zero);
+            if (handle.IsInvalid)
+            {
+                int error = Marshal.GetLastWin32Error();
+                handle.Dispose();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_PHYSICAL_DIRECTORY_PIN_FAILED path=" + path + " win32=" + error);
+            }
+            return handle;
+        }
+
+        private static string NormalizeDirectoryPath(string path)
+        {
+            string full = Path.GetFullPath(path);
+            string pathRoot = Path.GetPathRoot(full);
+            if (full.Equals(pathRoot, StringComparison.OrdinalIgnoreCase)) return pathRoot;
+            return full.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        }
+
+        private static List<SafeFileHandle> OpenPinnedPhysicalDirectoryChain(
+            string directoryPath,
+            string expectedDirectoryIdentity)
+        {
+            string directoryFull = NormalizeDirectoryPath(directoryPath);
+            List<string> paths = new List<string>();
+            DirectoryInfo cursor = new DirectoryInfo(directoryFull);
+            while (cursor != null)
+            {
+                paths.Add(NormalizeDirectoryPath(cursor.FullName));
+                cursor = cursor.Parent;
+            }
+            paths.Reverse();
+
+            List<SafeFileHandle> handles = new List<SafeFileHandle>();
+            try
+            {
+                foreach (string path in paths)
+                {
+                    SafeFileHandle handle = OpenPinnedPhysicalDirectory(path);
+                    handles.Add(handle);
+                    FILE_ATTRIBUTE_TAG_INFO information = ReadPhysicalAttributes(handle, path);
+                    if ((information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                        (information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_PHYSICAL_DIRECTORY_CHAIN_INVALID path=" + path +
+                            " attributes=" + information.FileAttributes);
+                    }
+                    string finalPath = NormalizeDirectoryPath(ReadFinalPath(handle, path));
+                    if (!finalPath.Equals(path, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_PHYSICAL_DIRECTORY_CHAIN_FINAL_PATH_MISMATCH path=" + path +
+                            " actual_final=" + finalPath);
+                    }
+                }
+                string actualIdentity = ReadPhysicalIdentity(handles[handles.Count - 1], directoryFull);
+                if (String.IsNullOrWhiteSpace(expectedDirectoryIdentity) ||
+                    !actualIdentity.Equals(expectedDirectoryIdentity, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_DIRECTORY_CHAIN_IDENTITY_MISMATCH path=" + directoryFull +
+                        " expected_identity=" + expectedDirectoryIdentity +
+                        " actual_identity=" + actualIdentity);
+                }
+                return handles;
+            }
+            catch
+            {
+                for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+                throw;
+            }
+        }
+
+        private static void DisposeHandles(List<SafeFileHandle> handles)
+        {
+            if (handles == null) return;
+            for (int index = handles.Count - 1; index >= 0; index--) handles[index].Dispose();
+        }
+
+        private static FILE_ATTRIBUTE_TAG_INFO ReadPhysicalAttributes(SafeFileHandle handle, string path)
+        {
+            FILE_ATTRIBUTE_TAG_INFO information;
+            if (!GetFileInformationByHandleEx(
+                handle,
+                FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                out information,
+                (uint)Marshal.SizeOf(typeof(FILE_ATTRIBUTE_TAG_INFO))))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_PHYSICAL_HANDLE_ATTRIBUTE_READ_FAILED path=" + path + " win32=" + error);
+            }
+            return information;
+        }
+
+        private static string ReadFinalPath(SafeFileHandle handle, string path)
+        {
+            StringBuilder value = new StringBuilder(32768);
+            uint length = GetFinalPathNameByHandle(handle, value, (uint)value.Capacity, 0);
+            if (length == 0 || length >= value.Capacity)
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_PHYSICAL_HANDLE_FINAL_PATH_READ_FAILED path=" + path + " win32=" + error);
+            }
+            string finalPath = value.ToString();
+            if (finalPath.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+            {
+                return @"\\" + finalPath.Substring(8);
+            }
+            if (finalPath.StartsWith(@"\\?\", StringComparison.OrdinalIgnoreCase))
+            {
+                return finalPath.Substring(4);
+            }
+            return finalPath;
+        }
+
+        private static string ReadPhysicalIdentity(SafeFileHandle handle, string path)
+        {
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(
+                    error,
+                    "SYNAPSE_PHYSICAL_HANDLE_IDENTITY_READ_FAILED path=" + path + " win32=" + error);
+            }
+            return information.VolumeSerialNumber.ToString("X8") + ":" +
+                information.FileIndexHigh.ToString("X8") + information.FileIndexLow.ToString("X8");
+        }
+
+        private static SafeFileHandle OpenVerifiedPhysicalEntry(
+            string rootPath,
+            string expectedRootIdentity,
+            string entryPath,
+            string expectedEntryIdentity,
+            bool expectDirectory,
+            uint access,
+            bool denyMutation,
+            out string actualEntryIdentity)
+        {
+            string rootFull = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar);
+            string entryFull = Path.GetFullPath(entryPath).TrimEnd(Path.DirectorySeparatorChar);
+            string rootPrefix = rootFull + Path.DirectorySeparatorChar;
+            if (!entryFull.Equals(rootFull, StringComparison.OrdinalIgnoreCase) &&
+                !entryFull.StartsWith(rootPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "SYNAPSE_PHYSICAL_HANDLE_SCOPE_ESCAPE root=" + rootFull + " path=" + entryFull);
+            }
+
+            SafeFileHandle entry = null;
+            List<SafeFileHandle> rootPins = null;
+            try
+            {
+                if (!String.IsNullOrWhiteSpace(expectedRootIdentity))
+                {
+                    rootPins = OpenPinnedPhysicalDirectoryChain(rootFull, expectedRootIdentity);
+                }
+                using (SafeFileHandle root = OpenPhysicalHandle(rootFull, FILE_READ_ATTRIBUTES))
+                {
+                FILE_ATTRIBUTE_TAG_INFO rootInformation = ReadPhysicalAttributes(root, rootFull);
+                if ((rootInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                    (rootInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_ROOT_INVALID root=" + rootFull +
+                        " attributes=" + rootInformation.FileAttributes);
+                }
+                string rootFinal = Path.GetFullPath(ReadFinalPath(root, rootFull)).TrimEnd(Path.DirectorySeparatorChar);
+                if (!rootFinal.Equals(rootFull, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_ROOT_FINAL_PATH_MISMATCH root=" + rootFull +
+                        " actual_final=" + rootFinal);
+                }
+                string rootIdentity = ReadPhysicalIdentity(root, rootFull);
+                if (!String.IsNullOrWhiteSpace(expectedRootIdentity) &&
+                    !rootIdentity.Equals(expectedRootIdentity, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_ROOT_IDENTITY_MISMATCH root=" + rootFull +
+                        " expected_identity=" + expectedRootIdentity +
+                        " actual_identity=" + rootIdentity);
+                }
+
+                entry = OpenPhysicalHandleWithShare(
+                    entryFull,
+                    access | FILE_READ_ATTRIBUTES,
+                    denyMutation ? FILE_SHARE_READ : FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+                FILE_ATTRIBUTE_TAG_INFO entryInformation = ReadPhysicalAttributes(entry, entryFull);
+                if ((entryInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_REPARSE_POINT root=" + rootFull +
+                        " path=" + entryFull + " attributes=" + entryInformation.FileAttributes);
+                }
+                bool isDirectory = (entryInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (isDirectory != expectDirectory)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_TYPE_MISMATCH root=" + rootFull +
+                        " path=" + entryFull + " expected_directory=" + expectDirectory +
+                        " actual_directory=" + isDirectory);
+                }
+                string relative = entryFull.Equals(rootFull, StringComparison.OrdinalIgnoreCase)
+                    ? String.Empty
+                    : entryFull.Substring(rootPrefix.Length);
+                string expectedFinal = String.IsNullOrEmpty(relative)
+                    ? rootFinal
+                    : Path.GetFullPath(Path.Combine(rootFinal, relative));
+                string entryFinal = Path.GetFullPath(ReadFinalPath(entry, entryFull)).TrimEnd(Path.DirectorySeparatorChar);
+                if (!entryFinal.Equals(expectedFinal, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_FINAL_PATH_MISMATCH root=" + rootFull +
+                        " path=" + entryFull + " expected_final=" + expectedFinal +
+                        " actual_final=" + entryFinal);
+                }
+                actualEntryIdentity = ReadPhysicalIdentity(entry, entryFull);
+                if (!String.IsNullOrWhiteSpace(expectedEntryIdentity) &&
+                    !actualEntryIdentity.Equals(expectedEntryIdentity, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_ENTRY_IDENTITY_MISMATCH root=" + rootFull +
+                        " path=" + entryFull + " expected_identity=" + expectedEntryIdentity +
+                        " actual_identity=" + actualEntryIdentity);
+                }
+                    return entry;
+                }
+            }
+            catch
+            {
+                if (entry != null) entry.Dispose();
+                throw;
+            }
+            finally
+            {
+                DisposeHandles(rootPins);
+            }
+        }
+
+        public static string GetPhysicalDirectoryIdentity(string directoryPath)
+        {
+            string ignored;
+            using (SafeFileHandle handle = OpenVerifiedPhysicalEntry(
+                directoryPath,
+                String.Empty,
+                directoryPath,
+                String.Empty,
+                true,
+                FILE_READ_ATTRIBUTES,
+                false,
+                out ignored))
+            {
+                return ignored;
+            }
+        }
+
+        public static PhysicalEntryReadback GetPhysicalEntryIdentityUnderRoot(
+            string rootPath,
+            string expectedRootIdentity,
+            string entryPath,
+            string expectedEntryIdentity,
+            bool directory)
+        {
+            string identity;
+            using (SafeFileHandle handle = OpenVerifiedPhysicalEntry(
+                rootPath,
+                expectedRootIdentity,
+                entryPath,
+                expectedEntryIdentity,
+                directory,
+                FILE_READ_ATTRIBUTES,
+                false,
+                out identity))
+            {
+                return new PhysicalEntryReadback { Identity = identity, IsDirectory = directory };
+            }
+        }
+
+        public static PhysicalFileReadback Sha256PhysicalFileUnderRoot(
+            string rootPath,
+            string expectedRootIdentity,
+            string filePath,
+            string expectedFileIdentity)
+        {
+            string identity;
+            using (SafeFileHandle handle = OpenVerifiedPhysicalEntry(
+                rootPath,
+                expectedRootIdentity,
+                filePath,
+                expectedFileIdentity,
+                false,
+                GENERIC_READ,
+                true,
+                out identity))
+            using (FileStream stream = new FileStream(handle, FileAccess.Read, 4096, false))
+            using (SHA256 sha = SHA256.Create())
+            {
+                long length = stream.Length;
+                byte[] digest = sha.ComputeHash(stream);
+                return new PhysicalFileReadback
+                {
+                    Length = length,
+                    Sha256 = BitConverter.ToString(digest).Replace("-", String.Empty),
+                    Identity = identity
+                };
+            }
+        }
+
+        public static PhysicalTextReadback ReadUtf8TextFileUnderPhysicalRoot(
+            string rootPath,
+            string expectedRootIdentity,
+            string filePath,
+            string expectedFileIdentity,
+            int maxBytes)
+        {
+            if (maxBytes < 1)
+            {
+                throw new ArgumentOutOfRangeException("maxBytes");
+            }
+            string identity;
+            using (SafeFileHandle handle = OpenVerifiedPhysicalEntry(
+                rootPath,
+                expectedRootIdentity,
+                filePath,
+                expectedFileIdentity,
+                false,
+                GENERIC_READ,
+                true,
+                out identity))
+            using (FileStream stream = new FileStream(handle, FileAccess.Read, 4096, false))
+            using (SHA256 sha = SHA256.Create())
+            {
+                if (stream.Length < 0 || stream.Length > maxBytes)
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_TEXT_LENGTH_INVALID path=" + filePath +
+                        " length=" + stream.Length + " max_bytes=" + maxBytes);
+                }
+                byte[] bytes = new byte[(int)stream.Length];
+                int offset = 0;
+                while (offset < bytes.Length)
+                {
+                    int read = stream.Read(bytes, offset, bytes.Length - offset);
+                    if (read == 0)
+                    {
+                        throw new EndOfStreamException(
+                            "SYNAPSE_PHYSICAL_TEXT_SHORT_READ path=" + filePath +
+                            " expected=" + bytes.Length + " actual=" + offset);
+                    }
+                    offset += read;
+                }
+                byte[] digest = sha.ComputeHash(bytes);
+                string content = new UTF8Encoding(false, true).GetString(bytes);
+                return new PhysicalTextReadback
+                {
+                    Length = bytes.Length,
+                    Sha256 = BitConverter.ToString(digest).Replace("-", String.Empty),
+                    Identity = identity,
+                    Content = content
+                };
+            }
+        }
+
+        public static PhysicalFileReadback InstallNewUtf8TextUnderPhysicalRoot(
+            string rootPath,
+            string expectedRootIdentity,
+            string leafName,
+            string content)
+        {
+            if (String.IsNullOrWhiteSpace(leafName) ||
+                !Path.GetFileName(leafName).Equals(leafName, StringComparison.Ordinal) ||
+                leafName.Equals(".", StringComparison.Ordinal) ||
+                leafName.Equals("..", StringComparison.Ordinal))
+            {
+                throw new ArgumentException(
+                    "SYNAPSE_PHYSICAL_TEXT_LEAF_INVALID leaf=" + leafName);
+            }
+            string rootFull = NormalizeDirectoryPath(rootPath);
+            string destinationPath = Path.Combine(rootFull, leafName);
+            string tempPath = Path.Combine(
+                rootFull,
+                "." + leafName + ".tmp-" + System.Diagnostics.Process.GetCurrentProcess().Id +
+                "-" + Guid.NewGuid().ToString("N"));
+            byte[] expectedBytes = new UTF8Encoding(false, true).GetBytes(content ?? String.Empty);
+            string expectedSha256;
+            using (SHA256 sha = SHA256.Create())
+            {
+                expectedSha256 = BitConverter.ToString(sha.ComputeHash(expectedBytes)).Replace("-", String.Empty);
+            }
+
+            List<SafeFileHandle> directoryPins = null;
+            string tempIdentity = null;
+            try
+            {
+                directoryPins = OpenPinnedPhysicalDirectoryChain(rootFull, expectedRootIdentity);
+                SafeFileHandle tempHandle = CreateFile(
+                    tempPath,
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ,
+                    IntPtr.Zero,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OPEN_REPARSE_POINT,
+                    IntPtr.Zero);
+                if (tempHandle.IsInvalid)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    tempHandle.Dispose();
+                    throw new Win32Exception(
+                        error,
+                        "SYNAPSE_PHYSICAL_TEXT_TEMP_CREATE_FAILED path=" + tempPath + " win32=" + error);
+                }
+                using (FileStream stream = new FileStream(tempHandle, FileAccess.ReadWrite, 4096, false))
+                {
+                    FILE_ATTRIBUTE_TAG_INFO tempInformation = ReadPhysicalAttributes(tempHandle, tempPath);
+                    if ((tempInformation.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                        (tempInformation.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_PHYSICAL_TEXT_TEMP_TYPE_INVALID path=" + tempPath +
+                            " attributes=" + tempInformation.FileAttributes);
+                    }
+                    tempIdentity = ReadPhysicalIdentity(tempHandle, tempPath);
+                    stream.Write(expectedBytes, 0, expectedBytes.Length);
+                    stream.Flush(true);
+                }
+                if (!MoveFileEx(tempPath, destinationPath, MOVEFILE_WRITE_THROUGH))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(
+                        error,
+                        "SYNAPSE_PHYSICAL_TEXT_INSTALL_NEW_FAILED source=" + tempPath +
+                        " destination=" + destinationPath + " win32=" + error);
+                }
+                PhysicalFileReadback readback = Sha256PhysicalFileUnderRoot(
+                    rootFull,
+                    expectedRootIdentity,
+                    destinationPath,
+                    tempIdentity);
+                if (readback.Length != expectedBytes.Length ||
+                    !readback.Sha256.Equals(expectedSha256, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_TEXT_READBACK_MISMATCH path=" + destinationPath +
+                        " expected_length=" + expectedBytes.Length +
+                        " actual_length=" + readback.Length +
+                        " expected_sha256=" + expectedSha256 +
+                        " actual_sha256=" + readback.Sha256);
+                }
+                return readback;
+            }
+            finally
+            {
+                if (!String.IsNullOrWhiteSpace(tempIdentity))
+                {
+                    try
+                    {
+                        DeletePhysicalEntryUnderRoot(
+                            rootFull,
+                            expectedRootIdentity,
+                            tempPath,
+                            tempIdentity,
+                            false);
+                    }
+                    catch { }
+                }
+                DisposeHandles(directoryPins);
+            }
+        }
+
+        public static void DeletePhysicalEntryUnderRoot(
+            string rootPath,
+            string expectedRootIdentity,
+            string entryPath,
+            string expectedEntryIdentity,
+            bool directory)
+        {
+            string rootFull = NormalizeDirectoryPath(rootPath);
+            string entryFull = Path.GetFullPath(entryPath).TrimEnd(
+                Path.DirectorySeparatorChar,
+                Path.AltDirectorySeparatorChar);
+            bool deletesRoot = entryFull.Equals(rootFull, StringComparison.OrdinalIgnoreCase);
+            string pinRoot;
+            string pinIdentity;
+            if (deletesRoot)
+            {
+                pinRoot = NormalizeDirectoryPath(Path.GetDirectoryName(rootFull));
+                pinIdentity = GetPhysicalDirectoryIdentity(pinRoot);
+            }
+            else
+            {
+                pinRoot = NormalizeDirectoryPath(Path.GetDirectoryName(entryFull));
+                pinIdentity = pinRoot.Equals(rootFull, StringComparison.OrdinalIgnoreCase)
+                    ? expectedRootIdentity
+                    : GetPhysicalDirectoryIdentity(pinRoot);
+            }
+            List<SafeFileHandle> rootPins = OpenPinnedPhysicalDirectoryChain(pinRoot, pinIdentity);
+            SafeFileHandle handle = null;
+            try
+            {
+                string openedIdentity;
+                if (deletesRoot)
+                {
+                    handle = OpenPhysicalHandleWithShare(
+                        entryFull,
+                        DELETE | FILE_READ_ATTRIBUTES,
+                        FILE_SHARE_READ);
+                    FILE_ATTRIBUTE_TAG_INFO information = ReadPhysicalAttributes(handle, entryFull);
+                    bool isDirectory = (information.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                    if ((information.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                        isDirectory != directory)
+                    {
+                        throw new InvalidOperationException(
+                            "SYNAPSE_PHYSICAL_HANDLE_DELETE_ROOT_TYPE_MISMATCH root=" + rootFull +
+                            " attributes=" + information.FileAttributes +
+                            " expected_directory=" + directory);
+                    }
+                    openedIdentity = ReadPhysicalIdentity(handle, entryFull);
+                }
+                else
+                {
+                    handle = OpenVerifiedPhysicalEntry(
+                        rootFull,
+                        expectedRootIdentity,
+                        entryFull,
+                        expectedEntryIdentity,
+                        directory,
+                        DELETE,
+                        true,
+                        out openedIdentity);
+                }
+                string finalPath = Path.GetFullPath(ReadFinalPath(handle, entryFull)).TrimEnd(
+                    Path.DirectorySeparatorChar,
+                    Path.AltDirectorySeparatorChar);
+                string finalIdentity = ReadPhysicalIdentity(handle, entryFull);
+                if (!finalPath.Equals(entryFull, StringComparison.OrdinalIgnoreCase) ||
+                    !finalIdentity.Equals(openedIdentity, StringComparison.OrdinalIgnoreCase) ||
+                    !finalIdentity.Equals(expectedEntryIdentity, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException(
+                        "SYNAPSE_PHYSICAL_HANDLE_DELETE_BOUNDARY_MOVED root=" + rootFull +
+                        " path=" + entryFull +
+                        " actual_final=" + finalPath +
+                        " expected_identity=" + expectedEntryIdentity +
+                        " opened_identity=" + openedIdentity +
+                        " actual_identity=" + finalIdentity);
+                }
+                FILE_DISPOSITION_INFO disposition = new FILE_DISPOSITION_INFO { DeleteFile = 1 };
+                if (!SetFileInformationByHandle(
+                    handle,
+                    FILE_DISPOSITION_INFO_CLASS,
+                    ref disposition,
+                    (uint)Marshal.SizeOf(typeof(FILE_DISPOSITION_INFO))))
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(
+                        error,
+                        "SYNAPSE_PHYSICAL_HANDLE_DELETE_FAILED root=" + rootFull +
+                        " path=" + entryFull + " directory=" + directory + " win32=" + error);
+                }
+            }
+            finally
+            {
+                if (handle != null) handle.Dispose();
+                DisposeHandles(rootPins);
             }
         }
     }
@@ -1104,9 +1826,9 @@ function Write-SynapseAtomicUtf8TextFile {
         $stream = $null
         Ensure-SynapseAtomicFileType
         if ($destinationExisted) {
-            [SynapseSetup.AtomicFile]::ReplaceWriteThrough($tempPath, $resolvedPath)
+            [SynapseSetup.AtomicFileV2]::ReplaceWriteThrough($tempPath, $resolvedPath)
         } else {
-            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $resolvedPath)
+            [SynapseSetup.AtomicFileV2]::InstallNewWriteThrough($tempPath, $resolvedPath)
         }
         if (Test-Path -LiteralPath $tempPath) {
             throw "SYNAPSE_ATOMIC_TEXT_TEMP_RETAINED purpose=$Purpose path=$tempPath remediation=repair atomic rename semantics before retrying"
@@ -1138,6 +1860,68 @@ function Write-SynapseAtomicUtf8TextFile {
         if ($null -ne $stream) { $stream.Dispose() }
         try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
         throw "SYNAPSE_ATOMIC_TEXT_WRITE_FAILED purpose=$Purpose path=$resolvedPath error=$($_.Exception.Message) remediation=repair setup-owned filesystem permissions/durability; no non-atomic or lossy fallback is permitted"
+    }
+}
+
+function Write-SynapseAtomicUtf8TextFileUnderPhysicalRoot {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedRootIdentity,
+        [Parameter(Mandatory=$true)][string]$LeafName,
+        [Parameter(Mandatory=$true)][AllowEmptyString()][string]$Content,
+        [Parameter(Mandatory=$true)][string]$Purpose
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $resolvedPath = [System.IO.Path]::GetFullPath((Join-Path $rootFull $LeafName))
+    try {
+        Ensure-SynapseAtomicFileType
+        $readback = [SynapseSetup.AtomicFileV2]::InstallNewUtf8TextUnderPhysicalRoot(
+            $rootFull,
+            $ExpectedRootIdentity,
+            $LeafName,
+            $Content)
+        return [pscustomobject][ordered]@{
+            path = $resolvedPath
+            sha256 = [string]$readback.Sha256
+            byte_length = [uint64]$readback.Length
+            file_identity = [string]$readback.Identity
+            root_identity = $ExpectedRootIdentity.ToUpperInvariant()
+            encoding = 'utf-8-no-bom'
+        }
+    } catch {
+        throw "SYNAPSE_PHYSICAL_ATOMIC_TEXT_WRITE_FAILED purpose=$Purpose root=$rootFull root_identity=$ExpectedRootIdentity path=$resolvedPath error=$($_.Exception.Message) remediation=preserve the exact physical directory and repair setup-owned filesystem permissions/durability; no path-following or non-atomic fallback is permitted"
+    }
+}
+
+function Read-SynapseUtf8TextFileUnderPhysicalRoot {
+    param(
+        [Parameter(Mandatory=$true)][string]$Root,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedRootIdentity,
+        [Parameter(Mandatory=$true)][string]$Path,
+        [AllowEmptyString()][string]$ExpectedFileIdentity = '',
+        [ValidateRange(1, 16777216)][int]$MaxBytes = 1048576,
+        [Parameter(Mandatory=$true)][string]$Purpose
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $pathFull = [System.IO.Path]::GetFullPath($Path)
+    try {
+        Ensure-SynapseAtomicFileType
+        $entry = [SynapseSetup.AtomicFileV2]::GetPhysicalEntryIdentityUnderRoot(
+            $rootFull,
+            $ExpectedRootIdentity,
+            $pathFull,
+            $ExpectedFileIdentity,
+            $false)
+        return [SynapseSetup.AtomicFileV2]::ReadUtf8TextFileUnderPhysicalRoot(
+            $rootFull,
+            $ExpectedRootIdentity,
+            $pathFull,
+            [string]$entry.Identity,
+            $MaxBytes)
+    } catch {
+        throw "SYNAPSE_PHYSICAL_TEXT_READ_FAILED purpose=$Purpose root=$rootFull root_identity=$ExpectedRootIdentity path=$pathFull expected_file_identity=$ExpectedFileIdentity max_bytes=$MaxBytes error=$($_.Exception.Message) remediation=preserve the physical evidence; setup never follows a reparse/replacement path or accepts unreadable/unbounded text"
     }
 }
 
@@ -1197,7 +1981,7 @@ function Write-SynapseManagedCpuOnlyCalyxConfig {
             # The filename is the content SHA. Never replace an existing object:
             # a prior generation may still pin it and MoveFileEx(REPLACE) would
             # recreate the same cross-generation TOCTOU under a different name.
-            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $resolvedPath)
+            [SynapseSetup.AtomicFileV2]::InstallNewWriteThrough($tempPath, $resolvedPath)
             if (Test-Path -LiteralPath $tempPath) {
                 throw "SYNAPSE_CALYX_CONFIG_TEMP_RETAINED path=$tempPath remediation=repair atomic rename semantics; setup refuses ambiguous source/destination ownership"
             }
@@ -1812,9 +2596,9 @@ function Invoke-SynapseDeploymentTransactionRollbackBestEffort {
                             if ($currentItem.PSIsContainer -or ($currentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
                                 throw "destination identity invalid attributes=$($currentItem.Attributes)"
                             }
-                            [SynapseSetup.AtomicFile]::ReplaceWriteThrough($tempPath, $path)
+                            [SynapseSetup.AtomicFileV2]::ReplaceWriteThrough($tempPath, $path)
                         } else {
-                            [SynapseSetup.AtomicFile]::InstallNewWriteThrough($tempPath, $path)
+                            [SynapseSetup.AtomicFileV2]::InstallNewWriteThrough($tempPath, $path)
                         }
                         if ((Get-SynapseFileSha256 -Path $path) -ine [string]$snapshot.Sha256) {
                             throw 'restored destination hash mismatch'
@@ -12319,22 +13103,176 @@ function Get-SynapseCandidateExitReadback {
     }
 }
 
+function Get-SynapseKernelProcessPresence {
+    param(
+        [Parameter(Mandatory=$true)][int]$ProcessId,
+        [Parameter(Mandatory=$true)][string]$Purpose
+    )
+
+    if ($ProcessId -le 0) {
+        return [pscustomobject]@{ Exists = $false; Process = $null }
+    }
+    try {
+        $process = [System.Diagnostics.Process]::GetProcessById($ProcessId)
+        return [pscustomobject]@{ Exists = $true; Process = $process }
+    } catch [System.ArgumentException] {
+        return [pscustomobject]@{ Exists = $false; Process = $null }
+    } catch {
+        throw "SYNAPSE_PROCESS_PRESENCE_SOT_UNREADABLE purpose=$Purpose pid=$ProcessId error=$($_.Exception.Message) remediation=preserve candidate state until the kernel process table can be read"
+    }
+}
+
+function Get-SynapsePhysicalDirectoryTreeSnapshotNoReparse {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedRootIdentity,
+        [ValidateRange(1, 200000)][int]$MaxEntries = 200000,
+        [ValidateRange(1, 128)][int]$MaxDepth = 64
+    )
+
+    $rootFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $rootPrefix = "$rootFull\"
+    Ensure-SynapseAtomicFileType
+    $rootIdentity = [SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentity($rootFull)
+    if ($rootIdentity -ine $ExpectedRootIdentity) {
+        throw "SYNAPSE_PHYSICAL_TREE_ROOT_IDENTITY_MISMATCH path=$rootFull expected_identity=$ExpectedRootIdentity actual_identity=$rootIdentity remediation=preserve the candidate evidence; the authorized directory was replaced before physical traversal"
+    }
+    $rootInfo = [System.IO.DirectoryInfo]::new($rootFull)
+    $rootInfo.Refresh()
+    if (-not $rootInfo.Exists) {
+        throw "SYNAPSE_PHYSICAL_TREE_ROOT_MISSING path=$rootFull remediation=preserve candidate evidence; the physical directory disappeared during bounded inspection"
+    }
+    if ($rootInfo.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        throw "SYNAPSE_PHYSICAL_TREE_REPARSE_POINT path=$rootFull depth=0 remediation=preserve candidate evidence; setup never follows junctions, symlinks, or other reparse points"
+    }
+    $files = [System.Collections.Generic.List[object]]::new()
+    $directories = [System.Collections.Generic.List[object]]::new()
+    $stack = [System.Collections.Generic.Stack[object]]::new()
+    $stack.Push([pscustomobject]@{ Directory = $rootInfo; Depth = 0; Identity = $rootIdentity })
+    $entryCount = 0
+    while ($stack.Count -gt 0) {
+        $frame = $stack.Pop()
+        $directory = $frame.Directory
+        $depth = [int]$frame.Depth
+        if ($depth -gt $MaxDepth) {
+            throw "SYNAPSE_PHYSICAL_TREE_DEPTH_EXCEEDED root=$rootFull path=$($directory.FullName) depth=$depth max_depth=$MaxDepth remediation=preserve and inspect the unexpectedly deep candidate tree"
+        }
+        $directory.Refresh()
+        if (-not $directory.Exists) { continue }
+        if ($directory.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            throw "SYNAPSE_PHYSICAL_TREE_REPARSE_POINT root=$rootFull path=$($directory.FullName) depth=$depth remediation=preserve candidate evidence; setup never traverses reparse directories"
+        }
+        $directoryFull = [System.IO.Path]::GetFullPath($directory.FullName).TrimEnd('\')
+        if (-not $directoryFull.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not $directoryFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "SYNAPSE_PHYSICAL_TREE_SCOPE_ESCAPE root=$rootFull path=$directoryFull depth=$depth remediation=preserve candidate evidence; physical traversal left the exact candidate root"
+        }
+        $directoryIdentity = [SynapseSetup.AtomicFileV2]::GetPhysicalEntryIdentityUnderRoot(
+            $rootFull,
+            $rootIdentity,
+            $directoryFull,
+            [string]$frame.Identity,
+            $true).Identity
+        $directories.Add([pscustomobject]@{ Path = $directoryFull; Depth = $depth; Identity = $directoryIdentity })
+        try {
+            $entries = @($directory.EnumerateFileSystemInfos())
+        } catch {
+            throw "SYNAPSE_PHYSICAL_TREE_ENUMERATION_FAILED root=$rootFull path=$directoryFull depth=$depth error=$($_.Exception.Message) remediation=preserve candidate evidence until every physical directory is readable"
+        }
+        foreach ($entry in $entries) {
+            $entry.Refresh()
+            if (-not $entry.Exists) { continue }
+            $entryCount++
+            if ($entryCount -gt $MaxEntries) {
+                throw "SYNAPSE_PHYSICAL_TREE_ENTRY_BOUND_EXCEEDED root=$rootFull count=$entryCount max_entries=$MaxEntries remediation=preserve and inspect the unexpectedly large candidate tree"
+            }
+            $entryFull = [System.IO.Path]::GetFullPath($entry.FullName)
+            if (-not $entryFull.StartsWith($rootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+                throw "SYNAPSE_PHYSICAL_TREE_SCOPE_ESCAPE root=$rootFull path=$entryFull depth=$depth remediation=preserve candidate evidence; physical entry left the exact candidate root"
+            }
+            $attributes = $entry.Attributes
+            if ($attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                throw "SYNAPSE_PHYSICAL_TREE_REPARSE_POINT root=$rootFull path=$entryFull depth=$($depth + 1) attributes=$attributes remediation=preserve candidate evidence; setup never reads or deletes through a reparse point"
+            }
+            $entryIsDirectory = [bool]($attributes -band [System.IO.FileAttributes]::Directory)
+            $entryIdentity = [SynapseSetup.AtomicFileV2]::GetPhysicalEntryIdentityUnderRoot(
+                $rootFull,
+                $rootIdentity,
+                $entryFull,
+                '',
+                $entryIsDirectory).Identity
+            if ($entryIsDirectory) {
+                $stack.Push([pscustomobject]@{ Directory = [System.IO.DirectoryInfo]::new($entryFull); Depth = $depth + 1; Identity = $entryIdentity })
+            } else {
+                $files.Add([pscustomobject]@{ Path = $entryFull; Identity = $entryIdentity })
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Root = $rootFull
+        RootIdentity = $rootIdentity
+        EntryCount = $entryCount
+        Files = @($files | Sort-Object Path)
+        Directories = @($directories | Sort-Object Depth -Descending)
+    }
+}
+
+function Remove-SynapsePhysicalDirectoryTreeNoReparse {
+    param(
+        [Parameter(Mandatory=$true)][string]$Path,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedRootIdentity
+    )
+
+    $snapshot = Get-SynapsePhysicalDirectoryTreeSnapshotNoReparse `
+        -Path $Path `
+        -ExpectedRootIdentity $ExpectedRootIdentity
+    Ensure-SynapseAtomicFileType
+    foreach ($file in $snapshot.Files) {
+        [SynapseSetup.AtomicFileV2]::DeletePhysicalEntryUnderRoot(
+            $snapshot.Root,
+            $snapshot.RootIdentity,
+            $file.Path,
+            $file.Identity,
+            $false)
+    }
+    foreach ($directoryRecord in $snapshot.Directories) {
+        [SynapseSetup.AtomicFileV2]::DeletePhysicalEntryUnderRoot(
+            $snapshot.Root,
+            $snapshot.RootIdentity,
+            [string]$directoryRecord.Path,
+            [string]$directoryRecord.Identity,
+            $true)
+    }
+    return $snapshot
+}
+
 function Write-SynapseCandidateFailureEvidence {
     param(
         [Parameter(Mandatory=$true)][string]$CandidateRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$CandidateRootIdentity,
         [AllowNull()][System.Diagnostics.Process]$Process,
+        [AllowNull()][System.Diagnostics.Process]$SupervisorProcess,
+        [AllowNull()][System.Diagnostics.Process]$BootstrapProcess,
         [Parameter(Mandatory=$true)][string]$FailureMessage,
+        [AllowEmptyString()][string]$PrimaryFailureMessage = '',
+        [AllowEmptyString()][string]$TerminalFailureMessage = '',
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$ExecutablePath,
-        [Parameter(Mandatory=$true)][string]$ExecutableSha256
+        [Parameter(Mandatory=$true)][string]$ExecutableSha256,
+        [Parameter(Mandatory=$true)][bool]$CleanupVerified,
+        [string[]]$CleanupErrors = @()
     )
 
     $exit = Get-SynapseCandidateExitReadback -Process $Process
     $evidence = @()
     $candidateRootFull = [System.IO.Path]::GetFullPath($CandidateRoot).TrimEnd('\')
     $candidateRootPrefix = "$candidateRootFull\"
-    foreach ($file in @(Get-ChildItem -LiteralPath $CandidateRoot -File -Recurse -Force -ErrorAction Stop | Sort-Object FullName)) {
-        $fileFull = [System.IO.Path]::GetFullPath($file.FullName)
+    $physicalTree = Get-SynapsePhysicalDirectoryTreeSnapshotNoReparse `
+        -Path $CandidateRoot `
+        -ExpectedRootIdentity $CandidateRootIdentity
+    Ensure-SynapseAtomicFileType
+    foreach ($file in $physicalTree.Files) {
+        $fileFull = [System.IO.Path]::GetFullPath($file.Path)
         if (-not $fileFull.StartsWith($candidateRootPrefix, [System.StringComparison]::OrdinalIgnoreCase)) {
             Die "SYNAPSE_CANDIDATE_EVIDENCE_SCOPE_ESCAPE root=$candidateRootFull path=$fileFull remediation=refuse to retain candidate evidence outside the exact isolated candidate directory"
         }
@@ -12342,18 +13280,28 @@ function Write-SynapseCandidateFailureEvidence {
         if ([string]::IsNullOrWhiteSpace($relative) -or $relative -match '(^|/)\.\.?(?:/|$)') {
             Die "SYNAPSE_CANDIDATE_EVIDENCE_RELATIVE_PATH_INVALID root=$candidateRootFull path=$fileFull relative_path=$relative remediation=retain only non-empty descendant paths without current-directory or parent-directory segments"
         }
+        $physicalFile = [SynapseSetup.AtomicFileV2]::Sha256PhysicalFileUnderRoot(
+            $candidateRootFull,
+            $physicalTree.RootIdentity,
+            $fileFull,
+            $file.Identity)
         $evidence += [ordered]@{
             relative_path = $relative
-            length = [int64]$file.Length
-            sha256 = Get-SynapseFileSha256 -Path $file.FullName
+            length = [int64]$physicalFile.Length
+            sha256 = [string]$physicalFile.Sha256
         }
     }
     $manifestPath = Join-Path $CandidateRoot 'candidate-diagnostic.json'
     $manifest = [ordered]@{
         schema = 'synapse_candidate_failure/v1'
         retained_at_utc = [DateTime]::UtcNow.ToString('o')
+        candidate_root_identity = $CandidateRootIdentity.ToUpperInvariant()
         failure = $FailureMessage
+        primary_failure = $PrimaryFailureMessage
+        terminal_failure = $TerminalFailureMessage
         candidate_pid = if ($null -eq $Process) { $null } else { [int]$Process.Id }
+        supervisor_pid = if ($null -eq $SupervisorProcess) { $null } else { [int]$SupervisorProcess.Id }
+        bootstrap_pid = if ($null -eq $BootstrapProcess) { $null } else { [int]$BootstrapProcess.Id }
         process_has_exited = $exit.HasExited
         exit_code_signed = $exit.ExitCodeSigned
         exit_code_hex = $exit.ExitCodeHex
@@ -12361,18 +13309,79 @@ function Write-SynapseCandidateFailureEvidence {
         bind = $Bind
         executable_path = $ExecutablePath
         executable_sha256 = $ExecutableSha256
+        cleanup_verified = $CleanupVerified
+        cleanup_errors = @($CleanupErrors)
         evidence = @($evidence)
-        retention_policy = 'newest 5 verified candidate failure bundles'
+        retention_policy = 'newest 5 failure bundles; older bundles expire only after journaled exact PID/path/bind quiescence proof'
     }
-    $encoding = [System.Text.UTF8Encoding]::new($false)
-    [System.IO.File]::WriteAllText($manifestPath, (($manifest | ConvertTo-Json -Depth 10) + "`n"), $encoding)
-    $manifestHash = Get-SynapseFileSha256 -Path $manifestPath
+    $manifestWrite = Write-SynapseAtomicUtf8TextFileUnderPhysicalRoot `
+        -Root $candidateRootFull `
+        -ExpectedRootIdentity $CandidateRootIdentity `
+        -LeafName 'candidate-diagnostic.json' `
+        -Content (($manifest | ConvertTo-Json -Depth 10) + "`n") `
+        -Purpose 'candidate_failure_evidence'
     return [pscustomobject]@{
         Path = $manifestPath
-        Sha256 = $manifestHash
+        Sha256 = $manifestWrite.sha256
         Exit = $exit
         EvidenceCount = $evidence.Count
     }
+}
+
+function Get-SynapseCandidateArtifactRootDescriptor {
+    param([Parameter(Mandatory=$true)][string]$ExpectedRoot)
+
+    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $rootFull)).TrimEnd('\')
+    $grandparentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $parentFull)).TrimEnd('\')
+    $parentLeaf = Split-Path -Leaf $parentFull
+    $rootLeaf = Split-Path -Leaf $rootFull
+    try {
+        $grandparentItem = Get-Item -LiteralPath $grandparentFull -Force -ErrorAction Stop
+        if (-not $grandparentItem.PSIsContainer -or
+            ($grandparentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            throw "candidate root grandparent is not a non-reparse directory attributes=$($grandparentItem.Attributes)"
+        }
+        $parentEntries = @(Get-ChildItem -LiteralPath $grandparentFull -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($parentLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    } catch {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_GRANDPARENT_INVALID root=$rootFull parent=$parentFull grandparent=$grandparentFull error=$($_.Exception.Message) remediation=preserve the candidate namespace; cleanup requires a physical non-reparse grandparent and exact parent enumeration"
+    }
+    if ($parentEntries.Count -gt 1) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_PARENT_AMBIGUOUS root=$rootFull parent=$parentFull matching_entry_count=$($parentEntries.Count) remediation=preserve the candidate namespace; cleanup requires zero or one exact log-directory entry"
+    }
+    if ($parentEntries.Count -eq 0) {
+        return [pscustomobject]@{ Path = $rootFull; Exists = $false; RootIdentity = $null }
+    }
+    $parentItem = $parentEntries[0]
+    if (-not $parentItem.FullName.Equals($parentFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $parentItem.PSIsContainer -or
+        ($parentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_PARENT_INVALID root=$rootFull parent=$parentFull actual_path=$($parentItem.FullName) is_container=$($parentItem.PSIsContainer) attributes=$($parentItem.Attributes) remediation=do not enumerate through a file, junction, symlink, or other reparse point"
+    }
+    try {
+        $rootEntries = @(Get-ChildItem -LiteralPath $parentItem.FullName -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($rootLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    } catch {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_PARENT_INVALID root=$rootFull parent=$parentFull error=$($_.Exception.Message) remediation=preserve the candidate namespace; cleanup requires a physical non-reparse parent and exact child enumeration"
+    }
+    if ($rootEntries.Count -gt 1) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_AMBIGUOUS root=$rootFull matching_entry_count=$($rootEntries.Count) remediation=preserve the candidate namespace; cleanup requires zero or one exact setup-candidates entry"
+    }
+    if ($rootEntries.Count -eq 0) {
+        return [pscustomobject]@{ Path = $rootFull; Exists = $false; RootIdentity = $null }
+    }
+    $rootItem = $rootEntries[0]
+    if (-not $rootItem.FullName.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $rootItem.PSIsContainer -or
+        ($rootItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_TYPE_INVALID root=$rootFull actual_path=$($rootItem.FullName) is_container=$($rootItem.PSIsContainer) attributes=$($rootItem.Attributes) remediation=do not enumerate or recursively delete through a file, junction, symlink, or other reparse point"
+    }
+    Ensure-SynapseAtomicFileType
+    $rootIdentity = [SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentity($rootFull)
+    return [pscustomobject]@{ Path = $rootFull; Exists = $true; RootIdentity = $rootIdentity }
 }
 
 function Get-SynapseCandidateArtifactDescriptor {
@@ -12381,7 +13390,8 @@ function Get-SynapseCandidateArtifactDescriptor {
         [Parameter(Mandatory=$true)][string]$ExpectedRoot
     )
 
-    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $rootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
+    $rootFull = $rootDescriptor.Path
     $pathFull = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
     $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $pathFull)).TrimEnd('\')
     $leaf = Split-Path -Leaf $pathFull
@@ -12390,17 +13400,35 @@ function Get-SynapseCandidateArtifactDescriptor {
         throw "SYNAPSE_CANDIDATE_ARTIFACT_SCOPE_INVALID path=$pathFull expected_parent=$rootFull actual_parent=$parentFull leaf=$leaf remediation=do not delete the path; only exact setup-created candidate directories are eligible"
     }
     $ownerPid = [int]$Matches[1]
-    if (-not (Test-Path -LiteralPath $pathFull)) {
-        return [pscustomobject]@{ Path = $pathFull; Exists = $false; OwnerPid = $ownerPid }
+    if (-not $rootDescriptor.Exists) {
+        return [pscustomobject]@{ Path = $pathFull; Exists = $false; OwnerPid = $ownerPid; RootIdentity = $null }
     }
-    $item = Get-Item -LiteralPath $pathFull -Force -ErrorAction Stop
-    if (-not $item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+    try {
+        $pathEntries = @(Get-ChildItem -LiteralPath $rootFull -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($leaf, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    } catch {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_ENUMERATION_FAILED path=$pathFull expected_parent=$rootFull error=$($_.Exception.Message) remediation=preserve the candidate namespace; cleanup requires exact direct-child enumeration"
+    }
+    if ($pathEntries.Count -gt 1) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_AMBIGUOUS path=$pathFull matching_entry_count=$($pathEntries.Count) remediation=preserve the candidate namespace; cleanup requires zero or one exact candidate child"
+    }
+    if ($pathEntries.Count -eq 0) {
+        return [pscustomobject]@{ Path = $pathFull; Exists = $false; OwnerPid = $ownerPid; RootIdentity = $null }
+    }
+    $item = $pathEntries[0]
+    if (-not $item.FullName.Equals($pathFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        -not $item.PSIsContainer -or
+        ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
         throw "SYNAPSE_CANDIDATE_ARTIFACT_TYPE_INVALID path=$pathFull is_container=$($item.PSIsContainer) attributes=$($item.Attributes) remediation=do not recurse into a file or reparse point; inspect the exact setup-candidates child"
     }
+    Ensure-SynapseAtomicFileType
+    $candidateRootIdentity = [SynapseSetup.AtomicFileV2]::GetPhysicalDirectoryIdentity($pathFull)
     return [pscustomobject]@{
         Path = $pathFull
         Exists = $true
         OwnerPid = $ownerPid
+        RootIdentity = $candidateRootIdentity
     }
 }
 
@@ -12408,20 +13436,32 @@ function Assert-SynapseCandidateArtifactCleanupSafe {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
         [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedCandidateRootIdentity,
         [int]$CandidateProcessId = 0,
         [AllowEmptyString()][string]$Bind = ''
     )
 
     $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
     if (-not $descriptor.Exists) { return $descriptor }
+    if ([string]$descriptor.RootIdentity -ine $ExpectedCandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$($descriptor.RootIdentity) remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
+    }
 
     if ($CandidateProcessId -gt 0) {
-        $candidateProcess = Get-CimInstance Win32_Process -Filter "ProcessId=$CandidateProcessId" -ErrorAction SilentlyContinue
-        if ($candidateProcess) {
-            throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_LIVE path=$($descriptor.Path) candidate_pid=$CandidateProcessId actual_name=$($candidateProcess.Name) actual_path=$($candidateProcess.ExecutablePath) remediation=do not delete candidate storage while the recorded process identity is live"
+        $candidatePresence = Get-SynapseKernelProcessPresence -ProcessId $CandidateProcessId -Purpose 'candidate_artifact_cleanup'
+        if ($candidatePresence.Exists) {
+            $candidateProcess = $candidatePresence.Process
+            $candidateProcessName = '<unreadable>'
+            try { $candidateProcessName = $candidateProcess.ProcessName } catch { }
+            throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_LIVE path=$($descriptor.Path) candidate_pid=$CandidateProcessId actual_name=$candidateProcessName remediation=do not delete candidate storage while the recorded process identity is live or reused"
         }
     }
-    $pathReferences = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    try {
+        $processTable = @(Get-CimInstance Win32_Process -ErrorAction Stop)
+    } catch {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_REFERENCE_SOT_UNREADABLE path=$($descriptor.Path) error=$($_.Exception.Message) remediation=preserve candidate storage until the process command-line table can be read"
+    }
+    $pathReferences = @($processTable | Where-Object {
         $_.ProcessId -ne $PID -and
         -not [string]::IsNullOrWhiteSpace([string]$_.CommandLine) -and
         ([string]$_.CommandLine).IndexOf($descriptor.Path, [System.StringComparison]::OrdinalIgnoreCase) -ge 0
@@ -12431,7 +13471,14 @@ function Assert-SynapseCandidateArtifactCleanupSafe {
         throw "SYNAPSE_CANDIDATE_ARTIFACT_PROCESS_REFERENCE_LIVE path=$($descriptor.Path) references=$referenceText remediation=inspect these exact processes; do not delete storage referenced by a live command line"
     }
     if (-not [string]::IsNullOrWhiteSpace($Bind)) {
-        $listeners = @(Get-SynapseTcpBindListenerSnapshot -Bind $Bind)
+        $endpoint = Get-SynapseBindEndpoint -Bind $Bind
+        try {
+            $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object {
+                $_.LocalAddress -eq $endpoint.Address -and $_.LocalPort -eq $endpoint.Port
+            })
+        } catch {
+            throw "SYNAPSE_CANDIDATE_ARTIFACT_BIND_SOT_UNREADABLE path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind error=$($_.Exception.Message) remediation=preserve candidate storage until the kernel TCP listener table can be read"
+        }
         if ($listeners.Count -gt 0) {
             throw "SYNAPSE_CANDIDATE_ARTIFACT_BIND_LIVE path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind listeners=$(Format-SynapseTcpBindListenerSnapshot -Snapshot $listeners) remediation=do not delete candidate storage until its exact listener is absent"
         }
@@ -12471,7 +13518,12 @@ function Read-SynapseCandidateCleanupIntent {
         [Parameter(Mandatory=$true)][string]$ExpectedRoot
     )
 
-    $rootFull = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+    $rootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
+    if (-not $rootDescriptor.Exists -or
+        [string]$rootDescriptor.RootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$') {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_ROOT_UNAVAILABLE root=$($rootDescriptor.Path) exists=$($rootDescriptor.Exists) root_identity=$($rootDescriptor.RootIdentity) remediation=preserve the cleanup journal; recovery requires the exact physical setup-candidates directory"
+    }
+    $rootFull = $rootDescriptor.Path
     $intentFull = [System.IO.Path]::GetFullPath($IntentPath)
     $parentFull = [System.IO.Path]::GetFullPath((Split-Path -Parent $intentFull)).TrimEnd('\')
     $leaf = Split-Path -Leaf $intentFull
@@ -12481,32 +13533,51 @@ function Read-SynapseCandidateCleanupIntent {
     }
     $candidatePath = Join-Path $rootFull "candidate-$($Matches[1])"
     $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $candidatePath -ExpectedRoot $rootFull
-    $item = Get-Item -LiteralPath $intentFull -Force -ErrorAction Stop
-    if ($item.PSIsContainer -or ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
-        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_TYPE_INVALID path=$intentFull attributes=$($item.Attributes) remediation=preserve and inspect the non-regular intent path; setup will not follow it"
-    }
     try {
-        $intent = Get-Content -LiteralPath $intentFull -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        Ensure-SynapseAtomicFileType
+        $intentEntry = [SynapseSetup.AtomicFileV2]::GetPhysicalEntryIdentityUnderRoot(
+            $rootFull,
+            [string]$rootDescriptor.RootIdentity,
+            $intentFull,
+            '',
+            $false)
+        $intentRead = [SynapseSetup.AtomicFileV2]::ReadUtf8TextFileUnderPhysicalRoot(
+            $rootFull,
+            [string]$rootDescriptor.RootIdentity,
+            $intentFull,
+            [string]$intentEntry.Identity,
+            131072)
+        $intent = [string]$intentRead.Content | ConvertFrom-Json -ErrorAction Stop
     } catch {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_UNREADABLE path=$intentFull error=$($_.Exception.Message) remediation=preserve the intent and candidate directory; repair the exact transaction journal before retrying setup"
     }
     $recordedRoot = [System.IO.Path]::GetFullPath([string]$intent.expected_root).TrimEnd('\')
+    $recordedRootIdentity = [string]$intent.expected_root_identity
     $recordedCandidate = [System.IO.Path]::GetFullPath([string]$intent.candidate_path).TrimEnd('\')
+    $recordedCandidateRootIdentity = [string]$intent.candidate_root_identity
     if ([string]$intent.schema -ne 'synapse_candidate_cleanup_intent/v1' -or
         [string]$intent.state -ne 'pending' -or
         -not $recordedRoot.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $recordedRootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$' -or
+        $recordedRootIdentity -ine [string]$rootDescriptor.RootIdentity -or
         -not $recordedCandidate.Equals($descriptor.Path, [System.StringComparison]::OrdinalIgnoreCase) -or
         [int]$intent.setup_owner_pid -ne $descriptor.OwnerPid -or
         [int]$intent.candidate_pid -le 0 -or
+        $recordedCandidateRootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$' -or
+        ($descriptor.Exists -and [string]$descriptor.RootIdentity -ine $recordedCandidateRootIdentity) -or
         [string]::IsNullOrWhiteSpace([string]$intent.bind) -or
         [string]::IsNullOrWhiteSpace([string]$intent.reason)) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_INVALID path=$intentFull candidate=$($descriptor.Path) schema=$($intent.schema) state=$($intent.state) setup_owner_pid=$($intent.setup_owner_pid) expected_setup_owner_pid=$($descriptor.OwnerPid) candidate_pid=$($intent.candidate_pid) bind=$($intent.bind) reason=$($intent.reason) remediation=preserve both paths and repair the exact cleanup transaction identity; setup refuses ambiguous recursive deletion"
     }
     return [pscustomobject]@{
         Path = $intentFull
+        ExpectedRoot = $rootFull
+        ExpectedRootIdentity = $recordedRootIdentity.ToUpperInvariant()
+        IntentFileIdentity = ([string]$intentRead.Identity).ToUpperInvariant()
         CandidatePath = $descriptor.Path
         SetupOwnerPid = [int]$intent.setup_owner_pid
         CandidatePid = [int]$intent.candidate_pid
+        CandidateRootIdentity = $recordedCandidateRootIdentity.ToUpperInvariant()
         Bind = [string]$intent.bind
         Reason = [string]$intent.reason
     }
@@ -12516,6 +13587,7 @@ function Ensure-SynapseCandidateCleanupIntent {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
         [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$CandidateRootIdentity,
         [Parameter(Mandatory=$true)][int]$CandidateProcessId,
         [Parameter(Mandatory=$true)][string]$Bind,
         [Parameter(Mandatory=$true)][string]$Reason
@@ -12525,30 +13597,54 @@ function Ensure-SynapseCandidateCleanupIntent {
         throw "SYNAPSE_CANDIDATE_CLEANUP_IDENTITY_MISSING path=$Path candidate_pid=$CandidateProcessId bind=$Bind reason=$Reason remediation=cleanup requires the exact validated candidate PID and bind"
     }
     $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    if (-not $descriptor.Exists -or [string]$descriptor.RootIdentity -ine $CandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_ROOT_IDENTITY_MISMATCH path=$($descriptor.Path) exists=$($descriptor.Exists) expected_identity=$CandidateRootIdentity actual_identity=$($descriptor.RootIdentity) remediation=preserve the path; a cleanup intent may authorize only the exact physical candidate directory"
+    }
+    $cleanupRootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
+    if (-not $cleanupRootDescriptor.Exists -or
+        [string]$cleanupRootDescriptor.RootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$') {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_ROOT_UNAVAILABLE root=$($cleanupRootDescriptor.Path) exists=$($cleanupRootDescriptor.Exists) root_identity=$($cleanupRootDescriptor.RootIdentity) remediation=preserve the candidate directory; cleanup requires the exact physical setup-candidates root"
+    }
     $intentPath = Get-SynapseCandidateCleanupIntentPath -Path $descriptor.Path -ExpectedRoot $ExpectedRoot
-    if (-not (Test-Path -LiteralPath $intentPath)) {
+    $intentLeaf = Split-Path -Leaf $intentPath
+    try {
+        $intentEntries = @(Get-ChildItem -LiteralPath $cleanupRootDescriptor.Path -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($intentLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    } catch {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_ENUMERATION_FAILED root=$($cleanupRootDescriptor.Path) path=$intentPath error=$($_.Exception.Message) remediation=preserve the candidate directory; setup must prove the exact journal leaf absent or present"
+    }
+    if ($intentEntries.Count -gt 1) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_AMBIGUOUS root=$($cleanupRootDescriptor.Path) path=$intentPath matching_entry_count=$($intentEntries.Count) remediation=preserve the candidate directory and ambiguous journal entries"
+    }
+    if ($intentEntries.Count -eq 0) {
         $record = [ordered]@{
             schema = 'synapse_candidate_cleanup_intent/v1'
             state = 'pending'
-            expected_root = [System.IO.Path]::GetFullPath($ExpectedRoot).TrimEnd('\')
+            expected_root = $cleanupRootDescriptor.Path
+            expected_root_identity = ([string]$cleanupRootDescriptor.RootIdentity).ToUpperInvariant()
             candidate_path = $descriptor.Path
+            candidate_root_identity = $CandidateRootIdentity.ToUpperInvariant()
             setup_owner_pid = $descriptor.OwnerPid
             candidate_pid = $CandidateProcessId
             bind = $Bind
             reason = $Reason
             created_at_utc = [DateTime]::UtcNow.ToString('o')
         }
-        $tempPath = "$intentPath.tmp-$PID-$([guid]::NewGuid().ToString('N'))"
         try {
-            [System.IO.File]::WriteAllText($tempPath, (($record | ConvertTo-Json -Depth 8) + "`n"), [System.Text.UTF8Encoding]::new($false))
-            Move-Item -LiteralPath $tempPath -Destination $intentPath -ErrorAction Stop
+            [void](Write-SynapseAtomicUtf8TextFileUnderPhysicalRoot `
+                -Root $cleanupRootDescriptor.Path `
+                -ExpectedRootIdentity ([string]$cleanupRootDescriptor.RootIdentity) `
+                -LeafName $intentLeaf `
+                -Content (($record | ConvertTo-Json -Depth 8) + "`n") `
+                -Purpose 'candidate_cleanup_intent')
         } catch {
-            try { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue } catch { }
             throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_WRITE_FAILED path=$intentPath candidate=$($descriptor.Path) error=$($_.Exception.Message) remediation=repair the setup-candidates directory; setup will not begin a recursive delete without a durable recovery intent"
         }
     }
     $intent = Read-SynapseCandidateCleanupIntent -IntentPath $intentPath -ExpectedRoot $ExpectedRoot
     if ($intent.CandidatePid -ne $CandidateProcessId -or
+        $intent.CandidateRootIdentity -ine $CandidateRootIdentity -or
         $intent.Bind -ne $Bind -or
         $intent.Reason -ne $Reason) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_CONFLICT path=$intentPath candidate=$($intent.CandidatePath) recorded_pid=$($intent.CandidatePid) expected_pid=$CandidateProcessId recorded_bind=$($intent.Bind) expected_bind=$Bind recorded_reason=$($intent.Reason) expected_reason=$Reason remediation=preserve both paths; a different cleanup transaction already owns this candidate"
@@ -12560,11 +13656,27 @@ function Ensure-SynapseCandidateCleanupIntent {
 function Complete-SynapseCandidateCleanupIntent {
     param([Parameter(Mandatory=$true)]$Intent)
 
-    if (Test-Path -LiteralPath $Intent.CandidatePath) {
+    $candidateDescriptor = Get-SynapseCandidateArtifactDescriptor `
+        -Path $Intent.CandidatePath `
+        -ExpectedRoot $Intent.ExpectedRoot
+    if ($candidateDescriptor.Exists) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_EARLY_COMPLETE path=$($Intent.Path) candidate=$($Intent.CandidatePath) remediation=do not clear recovery authority while the candidate directory remains"
     }
-    Remove-Item -LiteralPath $Intent.Path -Force -ErrorAction Stop
-    if ((Test-Path -LiteralPath $Intent.Path) -or (Test-Path -LiteralPath $Intent.CandidatePath)) {
+    Ensure-SynapseAtomicFileType
+    [SynapseSetup.AtomicFileV2]::DeletePhysicalEntryUnderRoot(
+        [string]$Intent.ExpectedRoot,
+        [string]$Intent.ExpectedRootIdentity,
+        [string]$Intent.Path,
+        [string]$Intent.IntentFileIdentity,
+        $false)
+    $intentLeaf = Split-Path -Leaf $Intent.Path
+    $intentEntries = @(Get-ChildItem -LiteralPath $Intent.ExpectedRoot -Force -ErrorAction Stop | Where-Object {
+        $_.Name.Equals($intentLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+    })
+    $candidateDescriptor = Get-SynapseCandidateArtifactDescriptor `
+        -Path $Intent.CandidatePath `
+        -ExpectedRoot $Intent.ExpectedRoot
+    if ($intentEntries.Count -ne 0 -or $candidateDescriptor.Exists) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_COMPLETION_UNVERIFIED path=$($Intent.Path) candidate=$($Intent.CandidatePath) remediation=inspect the exact intent and candidate paths; cleanup is incomplete"
     }
     Info "Candidate cleanup intent completion verified path=$($Intent.Path) candidate=$($Intent.CandidatePath) intent_exists=false candidate_exists=false"
@@ -12574,6 +13686,7 @@ function Remove-SynapseCandidateArtifact {
     param(
         [Parameter(Mandatory=$true)][string]$Path,
         [Parameter(Mandatory=$true)][string]$ExpectedRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$ExpectedCandidateRootIdentity,
         [int]$CandidateProcessId = 0,
         [AllowEmptyString()][string]$Bind = '',
         [ValidateRange(1, 60)][int]$TimeoutSeconds = 20,
@@ -12581,8 +13694,23 @@ function Remove-SynapseCandidateArtifact {
     )
 
     $initial = Get-SynapseCandidateArtifactDescriptor -Path $Path -ExpectedRoot $ExpectedRoot
+    if ($initial.Exists -and [string]$initial.RootIdentity -ine $ExpectedCandidateRootIdentity) {
+        throw "SYNAPSE_CANDIDATE_ARTIFACT_ROOT_IDENTITY_MISMATCH path=$($initial.Path) expected_identity=$ExpectedCandidateRootIdentity actual_identity=$($initial.RootIdentity) remediation=preserve the replacement directory; cleanup authority is bound to the original physical candidate root"
+    }
     $intentPath = Get-SynapseCandidateCleanupIntentPath -Path $initial.Path -ExpectedRoot $ExpectedRoot
-    if (-not $initial.Exists -and -not (Test-Path -LiteralPath $intentPath)) {
+    $cleanupRootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $ExpectedRoot
+    $intentLeaf = Split-Path -Leaf $intentPath
+    $intentEntries = if ($cleanupRootDescriptor.Exists) {
+        @(Get-ChildItem -LiteralPath $cleanupRootDescriptor.Path -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals($intentLeaf, [System.StringComparison]::OrdinalIgnoreCase)
+        })
+    } else {
+        @()
+    }
+    if ($intentEntries.Count -gt 1) {
+        throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_AMBIGUOUS root=$($cleanupRootDescriptor.Path) path=$intentPath matching_entry_count=$($intentEntries.Count) remediation=preserve the ambiguous recovery authority and candidate namespace"
+    }
+    if (-not $initial.Exists -and $intentEntries.Count -eq 0) {
         Info "Candidate artifact absence verified reason=$Reason path=$($initial.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=0 elapsed_ms=0 readback_exists=false intent_exists=false"
         return $initial
     }
@@ -12590,6 +13718,7 @@ function Remove-SynapseCandidateArtifact {
         Ensure-SynapseCandidateCleanupIntent `
             -Path $initial.Path `
             -ExpectedRoot $ExpectedRoot `
+            -CandidateRootIdentity $ExpectedCandidateRootIdentity `
             -CandidateProcessId $CandidateProcessId `
             -Bind $Bind `
             -Reason $Reason
@@ -12597,6 +13726,7 @@ function Remove-SynapseCandidateArtifact {
         Read-SynapseCandidateCleanupIntent -IntentPath $intentPath -ExpectedRoot $ExpectedRoot
     }
     if ($intent.CandidatePid -ne $CandidateProcessId -or
+        $intent.CandidateRootIdentity -ine $ExpectedCandidateRootIdentity -or
         $intent.Bind -ne $Bind -or
         $intent.Reason -ne $Reason) {
         throw "SYNAPSE_CANDIDATE_CLEANUP_INTENT_RESUME_CONFLICT path=$($intent.Path) candidate=$($intent.CandidatePath) recorded_pid=$($intent.CandidatePid) expected_pid=$CandidateProcessId recorded_bind=$($intent.Bind) expected_bind=$Bind recorded_reason=$($intent.Reason) expected_reason=$Reason remediation=resume the exact recorded cleanup transaction; do not replace its process/socket identity"
@@ -12610,6 +13740,7 @@ function Remove-SynapseCandidateArtifact {
         $descriptor = Assert-SynapseCandidateArtifactCleanupSafe `
             -Path $Path `
             -ExpectedRoot $ExpectedRoot `
+            -ExpectedCandidateRootIdentity $ExpectedCandidateRootIdentity `
             -CandidateProcessId $CandidateProcessId `
             -Bind $Bind
         if (-not $descriptor.Exists) {
@@ -12619,8 +13750,11 @@ function Remove-SynapseCandidateArtifact {
         }
 
         try {
-            Remove-Item -LiteralPath $descriptor.Path -Recurse -Force -ErrorAction Stop
-            if (-not (Test-Path -LiteralPath $descriptor.Path)) {
+            [void](Remove-SynapsePhysicalDirectoryTreeNoReparse `
+                -Path $descriptor.Path `
+                -ExpectedRootIdentity $ExpectedCandidateRootIdentity)
+            $postDeleteDescriptor = Get-SynapseCandidateArtifactDescriptor -Path $descriptor.Path -ExpectedRoot $ExpectedRoot
+            if (-not $postDeleteDescriptor.Exists) {
                 Complete-SynapseCandidateCleanupIntent -Intent $intent
                 Info "Candidate artifact cleanup verified reason=$Reason path=$($descriptor.Path) candidate_pid=$CandidateProcessId bind=$Bind attempts=$attempt elapsed_ms=$($clock.ElapsedMilliseconds) readback_exists=false intent_exists=false"
                 return $descriptor
@@ -12854,28 +13988,44 @@ function Remove-SynapseDeploymentTransactionArtifact {
 function Resume-SynapseCandidateCleanupIntents {
     param([Parameter(Mandatory=$true)][string]$Root)
 
-    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
-        Info "Candidate cleanup intent recovery root=$Root intent_count=0 resumed_count=0 retained_count=0"
+    $rootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $Root
+    if (-not $rootDescriptor.Exists) {
+        Info "Candidate cleanup intent recovery root=$($rootDescriptor.Path) intent_count=0 resumed_count=0 retained_count=0"
         return
     }
-    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $rootFull = $rootDescriptor.Path
     $resumed = 0
     $retained = 0
-    $intents = @(Get-ChildItem -LiteralPath $rootFull -File -Force -Filter 'candidate-cleanup-*.json' -ErrorAction Stop | Sort-Object Name)
+    $intents = @(Get-ChildItem -LiteralPath $rootFull -Force -ErrorAction Stop | Where-Object {
+        $_.Name -match '^candidate-cleanup-\d{8}T\d{9}Z-\d+\.json$'
+    } | Sort-Object Name)
     foreach ($file in $intents) {
-        $intent = Read-SynapseCandidateCleanupIntent -IntentPath $file.FullName -ExpectedRoot $rootFull
-        if (Get-Process -Id $intent.SetupOwnerPid -ErrorAction SilentlyContinue) {
+        $intent = $null
+        try {
+            $intent = Read-SynapseCandidateCleanupIntent -IntentPath $file.FullName -ExpectedRoot $rootFull
+            $intentOwnerPresence = Get-SynapseKernelProcessPresence -ProcessId $intent.SetupOwnerPid -Purpose 'candidate_cleanup_intent_owner'
+            if ($intentOwnerPresence.Exists) {
+                $retained++
+                Info "Candidate cleanup intent retained path=$($intent.Path) candidate=$($intent.CandidatePath) setup_owner_pid=$($intent.SetupOwnerPid) reason=setup_owner_pid_still_live"
+                continue
+            }
+            [void](Remove-SynapseCandidateArtifact `
+                -Path $intent.CandidatePath `
+                -ExpectedRoot $rootFull `
+                -ExpectedCandidateRootIdentity $intent.CandidateRootIdentity `
+                -CandidateProcessId $intent.CandidatePid `
+                -Bind $intent.Bind `
+                -Reason $intent.Reason)
+            $resumed++
+        } catch {
             $retained++
-            Info "Candidate cleanup intent retained path=$($intent.Path) candidate=$($intent.CandidatePath) setup_owner_pid=$($intent.SetupOwnerPid) reason=setup_owner_pid_still_live"
+            $intentPath = if ($null -eq $intent) { $file.FullName } else { $intent.Path }
+            $intentCandidate = if ($null -eq $intent) { '<unreadable>' } else { $intent.CandidatePath }
+            $intentCandidatePid = if ($null -eq $intent) { 0 } else { $intent.CandidatePid }
+            $intentBind = if ($null -eq $intent) { '<unreadable>' } else { $intent.Bind }
+            Info "WARN: candidate cleanup intent retained path=$intentPath candidate=$intentCandidate candidate_pid=$intentCandidatePid bind=$intentBind reason=journal_or_exact_quiescence_unverified error=$($_.Exception.Message) remediation=the durable journal and candidate evidence remain untouched; setup retries deletion only after typed authority and PID/path/socket Source of Truth are readable and unowned"
             continue
         }
-        [void](Remove-SynapseCandidateArtifact `
-            -Path $intent.CandidatePath `
-            -ExpectedRoot $rootFull `
-            -CandidateProcessId $intent.CandidatePid `
-            -Bind $intent.Bind `
-            -Reason $intent.Reason)
-        $resumed++
     }
     Info "Candidate cleanup intent recovery root=$rootFull intent_count=$($intents.Count) resumed_count=$resumed retained_count=$retained"
 }
@@ -12883,64 +14033,205 @@ function Resume-SynapseCandidateCleanupIntents {
 function Remove-SynapseStaleSuccessfulCandidateArtifacts {
     param([Parameter(Mandatory=$true)][string]$Root)
 
-    if (-not (Test-Path -LiteralPath $Root -PathType Container)) {
-        Info "Stale successful candidate sweep root=$Root eligible_count=0 removed_count=0 retained_count=0"
+    $rootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $Root
+    if (-not $rootDescriptor.Exists) {
+        Info "Stale successful candidate sweep root=$($rootDescriptor.Path) eligible_count=0 removed_count=0 retained_count=0"
         return
     }
-    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
+    $rootFull = $rootDescriptor.Path
     $removed = 0
     $retained = 0
     $eligible = 0
-    foreach ($child in @(Get-ChildItem -LiteralPath $rootFull -Directory -Force -ErrorAction Stop | Sort-Object Name)) {
+    foreach ($child in @(Get-ChildItem -LiteralPath $rootFull -Force -ErrorAction Stop | Where-Object {
+        $_.Name -match '^candidate-\d{8}T\d{9}Z-\d+$'
+    } | Sort-Object Name)) {
+        $descriptor = $null
+        try {
         $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $child.FullName -ExpectedRoot $rootFull
         $diagnosticPath = Join-Path $descriptor.Path 'candidate-diagnostic.json'
-        if (Test-Path -LiteralPath $diagnosticPath -PathType Leaf) {
+        $diagnosticEntries = @(Get-ChildItem -LiteralPath $descriptor.Path -Force -ErrorAction Stop | Where-Object {
+            $_.Name.Equals('candidate-diagnostic.json', [System.StringComparison]::OrdinalIgnoreCase)
+        })
+        if ($diagnosticEntries.Count -gt 0) {
             $retained++
+            Info "Candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath matching_entry_count=$($diagnosticEntries.Count) reason=diagnostic_entry_present"
             continue
         }
-        $healthPath = Join-Path $descriptor.Path 'candidate-health-after-bootstrap.json'
-        if (-not (Test-Path -LiteralPath $healthPath -PathType Leaf)) {
-            $retained++
-            Info "WARN: SYNAPSE_CANDIDATE_STALE_STATE_AMBIGUOUS path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) reason=validated_health_evidence_missing remediation=preserve and inspect this exact candidate directory; setup will not infer success"
-            continue
+        $successMarkerPath = Join-Path $descriptor.Path 'candidate-success.json'
+        try {
+            $successMarkerRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                -Root $descriptor.Path `
+                -ExpectedRootIdentity ([string]$descriptor.RootIdentity) `
+                -Path $successMarkerPath `
+                -MaxBytes 131072 `
+                -Purpose 'stale_candidate_success_marker'
+            $success = [string]$successMarkerRead.Content | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            throw "SYNAPSE_CANDIDATE_STALE_SUCCESS_MARKER_MISSING_OR_UNREADABLE path=$successMarkerPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory; setup will not infer success from partial health, shutdown, or Job evidence"
+        }
+        $successDrift = [System.Collections.Generic.List[string]]::new()
+        if ([string]$success.schema -cne 'synapse_candidate_success/v1') { $successDrift.Add("schema expected=synapse_candidate_success/v1 actual=$($success.schema)") }
+        if ([string]$success.state -cne 'verified') { $successDrift.Add("state expected=verified actual=$($success.state)") }
+        if ([int]$success.setup_owner_pid -ne $descriptor.OwnerPid) { $successDrift.Add("setup_owner_pid expected=$($descriptor.OwnerPid) actual=$($success.setup_owner_pid)") }
+        if (-not ([string]$success.candidate_root).Equals($descriptor.Path, [System.StringComparison]::OrdinalIgnoreCase)) { $successDrift.Add("candidate_root expected=$($descriptor.Path) actual=$($success.candidate_root)") }
+        if ([string]$success.candidate_root_identity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$') { $successDrift.Add("candidate_root_identity invalid=$($success.candidate_root_identity)") }
+        elseif ([string]$success.candidate_root_identity -ine [string]$descriptor.RootIdentity) { $successDrift.Add("candidate_root_identity expected=$($descriptor.RootIdentity) actual=$($success.candidate_root_identity)") }
+        if ([int]$success.candidate_pid -le 0) { $successDrift.Add("candidate_pid invalid=$($success.candidate_pid)") }
+        if ([int]$success.supervisor_pid -le 0) { $successDrift.Add("supervisor_pid invalid=$($success.supervisor_pid)") }
+        if ([int]$success.bootstrap_pid -le 0) { $successDrift.Add("bootstrap_pid invalid=$($success.bootstrap_pid)") }
+        if ([int]$success.authenticated_shutdown_exit_code -ne $SynapseAuthenticatedShutdownExitCode) { $successDrift.Add("authenticated_shutdown_exit_code expected=$SynapseAuthenticatedShutdownExitCode actual=$($success.authenticated_shutdown_exit_code)") }
+        if ([string]::IsNullOrWhiteSpace([string]$success.bind)) { $successDrift.Add('bind missing') }
+        if ([string]$success.job_limit_flags_hex -cne '0x00002300') { $successDrift.Add("job_limit_flags_hex expected=0x00002300 actual=$($success.job_limit_flags_hex)") }
+        if ([string]$success.daemon_process_memory_limit_bytes -cne [string]$SynapseDaemonProcessMemoryLimitBytes) { $successDrift.Add("daemon_process_memory_limit_bytes expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($success.daemon_process_memory_limit_bytes)") }
+        if ([string]$success.daemon_job_memory_limit_bytes -cne [string]$SynapseDaemonProcessMemoryLimitBytes) { $successDrift.Add("daemon_job_memory_limit_bytes expected=$SynapseDaemonProcessMemoryLimitBytes actual=$($success.daemon_job_memory_limit_bytes)") }
+        if ([string]$success.parent_process_memory_limit_bytes -cne [string]$SynapseOwnedMemoryLimitBytes) { $successDrift.Add("parent_process_memory_limit_bytes expected=$SynapseOwnedMemoryLimitBytes actual=$($success.parent_process_memory_limit_bytes)") }
+        if ([string]$success.parent_job_memory_limit_bytes -cne [string]$SynapseOwnedMemoryLimitBytes) { $successDrift.Add("parent_job_memory_limit_bytes expected=$SynapseOwnedMemoryLimitBytes actual=$($success.parent_job_memory_limit_bytes)") }
+        if ([string]$success.daemon_cpu_rate -cne [string]$SynapseDaemonCpuRate) { $successDrift.Add("daemon_cpu_rate expected=$SynapseDaemonCpuRate actual=$($success.daemon_cpu_rate)") }
+        if ([string]$success.parent_cpu_rate -cne [string]$SynapseSupervisorCpuRate) { $successDrift.Add("parent_cpu_rate expected=$SynapseSupervisorCpuRate actual=$($success.parent_cpu_rate)") }
+        if ([string]$success.working_set_policy -cne 'measured_only') { $successDrift.Add("working_set_policy expected=measured_only actual=$($success.working_set_policy)") }
+        foreach ($hashField in @('candidate_health_final_sha256', 'bootstrap_sha256', 'bootstrap_log_sha256', 'final_state_sha256', 'executable_sha256', 'tool_surface_sha256')) {
+            if ([string]$success.$hashField -notmatch '^[0-9A-Fa-f]{64}$') {
+                $successDrift.Add("$hashField invalid=$($success.$hashField)")
+            }
+        }
+        if ($successDrift.Count -gt 0) {
+            throw "SYNAPSE_CANDIDATE_STALE_SUCCESS_MARKER_MISMATCH path=$successMarkerPath drift=$($successDrift -join '; ') remediation=preserve the exact candidate directory; the durable post-validation marker is not the expected closed contract"
+        }
+
+        $healthPath = Join-Path $descriptor.Path 'candidate-health-final.json'
+        $terminalStatePath = Join-Path $descriptor.Path 'daemon-supervisor-current.json'
+        $bootstrapLogPath = Join-Path $descriptor.Path 'daemon-supervisor-bootstrap.log'
+        $successEvidenceContent = @{}
+        foreach ($evidenceContract in @(
+            [pscustomobject]@{ Name = 'candidate_health_final'; Path = $healthPath; Sha256 = [string]$success.candidate_health_final_sha256 },
+            [pscustomobject]@{ Name = 'supervisor_final_state'; Path = $terminalStatePath; Sha256 = [string]$success.final_state_sha256 },
+            [pscustomobject]@{ Name = 'bootstrap_log'; Path = $bootstrapLogPath; Sha256 = [string]$success.bootstrap_log_sha256 }
+        )) {
+            try {
+                $evidenceRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                    -Root $descriptor.Path `
+                    -ExpectedRootIdentity ([string]$descriptor.RootIdentity) `
+                    -Path $evidenceContract.Path `
+                    -MaxBytes 16777216 `
+                    -Purpose "stale_candidate_$($evidenceContract.Name)"
+                $evidenceSha256 = [string]$evidenceRead.Sha256
+                $successEvidenceContent[$evidenceContract.Name] = [string]$evidenceRead.Content
+            } catch {
+                throw "SYNAPSE_CANDIDATE_STALE_SUCCESS_EVIDENCE_UNREADABLE path=$($descriptor.Path) evidence=$($evidenceContract.Name) evidence_path=$($evidenceContract.Path) error=$($_.Exception.Message) remediation=preserve the exact candidate directory; cleanup requires every success-marker-bound evidence file"
+            }
+            if ($evidenceSha256 -ine $evidenceContract.Sha256) {
+                throw "SYNAPSE_CANDIDATE_STALE_SUCCESS_EVIDENCE_MISMATCH path=$($descriptor.Path) evidence=$($evidenceContract.Name) evidence_path=$($evidenceContract.Path) expected_sha256=$($evidenceContract.Sha256) actual_sha256=$evidenceSha256 remediation=preserve the exact candidate directory; marker-bound evidence changed after validation"
+            }
         }
         try {
-            $health = Get-Content -LiteralPath $healthPath -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $health = [string]$successEvidenceContent['candidate_health_final'] | ConvertFrom-Json -ErrorAction Stop
+            $terminalState = [string]$successEvidenceContent['supervisor_final_state'] | ConvertFrom-Json -ErrorAction Stop
+            $bootstrapLog = [string]$successEvidenceContent['bootstrap_log']
         } catch {
-            throw "SYNAPSE_CANDIDATE_STALE_HEALTH_UNREADABLE path=$healthPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory and inspect its post-bootstrap health evidence"
+            throw "SYNAPSE_CANDIDATE_STALE_SUCCESS_EVIDENCE_DECODE_FAILED path=$($descriptor.Path) health_path=$healthPath state_path=$terminalStatePath bootstrap_log=$bootstrapLogPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory; cleanup requires decodable marker-bound evidence"
         }
-        if ($health.ok -ne $true -or [int]$health.pid -le 0 -or [int]$health.tool_count -lt 1 -or [string]::IsNullOrWhiteSpace([string]$health.build)) {
-            $retained++
-            Info "WARN: SYNAPSE_CANDIDATE_STALE_STATE_AMBIGUOUS path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) health_ok=$($health.ok) health_pid=$($health.pid) tool_count=$($health.tool_count) build=$($health.build) remediation=preserve and inspect this exact candidate directory; setup will not infer successful validation"
-            continue
+        $recordedPid = [int]$success.candidate_pid
+        $terminalSupervisorPid = [int]$success.supervisor_pid
+        $terminalBootstrapPid = [int]$success.bootstrap_pid
+        $terminalDrift = [System.Collections.Generic.List[string]]::new()
+        if ($health.ok -ne $true) { $terminalDrift.Add("health_ok expected=True actual=$($health.ok)") }
+        if ([int]$health.pid -ne $recordedPid) { $terminalDrift.Add("health_pid expected=$recordedPid actual=$($health.pid)") }
+        if ([int]$health.tool_count -ne [int]$success.tool_count -or [int]$health.tool_count -lt 1) { $terminalDrift.Add("tool_count expected=$($success.tool_count) actual=$($health.tool_count)") }
+        if ([string]$health.tool_surface_sha256 -ine [string]$success.tool_surface_sha256) { $terminalDrift.Add("tool_surface_sha256 expected=$($success.tool_surface_sha256) actual=$($health.tool_surface_sha256)") }
+        if ([string]::IsNullOrWhiteSpace([string]$health.build)) { $terminalDrift.Add('health_build missing') }
+        if (-not ([string]$health.subsystems.http.bind_addr).Equals([string]$success.bind, [System.StringComparison]::Ordinal)) { $terminalDrift.Add("health_bind expected=$($success.bind) actual=$($health.subsystems.http.bind_addr)") }
+        if ([string]$terminalState.state -cne 'stopped') { $terminalDrift.Add("state expected=stopped actual=$($terminalState.state)") }
+        if ([int]$terminalState.supervisor_pid -ne $terminalSupervisorPid) { $terminalDrift.Add("supervisor_pid expected=$terminalSupervisorPid actual=$($terminalState.supervisor_pid)") }
+        if ([int]$terminalState.child_pid -ne $recordedPid) { $terminalDrift.Add("child_pid expected=$recordedPid actual=$($terminalState.child_pid)") }
+        if ([int]$terminalState.exit_code -ne $SynapseAuthenticatedShutdownExitCode) { $terminalDrift.Add("exit_code expected=$SynapseAuthenticatedShutdownExitCode actual=$($terminalState.exit_code)") }
+        if ([string]$terminalState.supervisor_job_name -cne [string]$success.parent_job_name) { $terminalDrift.Add("supervisor_job_name expected=$($success.parent_job_name) actual=$($terminalState.supervisor_job_name)") }
+        $expectedBootstrapExit = "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_EXIT bootstrap_pid=$terminalBootstrapPid supervisor_pid=$terminalSupervisorPid exit_code=$SynapseAuthenticatedShutdownExitCode"
+        if (-not $bootstrapLog.Contains($expectedBootstrapExit)) { $terminalDrift.Add("bootstrap_terminal_entry missing=[$expectedBootstrapExit]") }
+        foreach ($terminalPid in @($recordedPid, $terminalSupervisorPid, $terminalBootstrapPid) | Sort-Object -Unique) {
+            $terminalPresence = Get-SynapseKernelProcessPresence -ProcessId $terminalPid -Purpose 'stale_candidate_terminal_identity'
+            if ($terminalPresence.Exists) {
+                $terminalDrift.Add("terminal_pid_still_live pid=$terminalPid")
+            }
+        }
+        if ($terminalDrift.Count -gt 0) {
+            throw "SYNAPSE_CANDIDATE_STALE_TERMINAL_IDENTITY_MISMATCH path=$($descriptor.Path) marker=$successMarkerPath drift=$($terminalDrift -join '; ') remediation=preserve the exact candidate directory; cleanup requires the marker-bound stopped one-shot tree and final healthy identity"
         }
         $recordedPidPath = Join-Path $descriptor.Path 'db\daemon.pid'
-        $recordedPid = 0
+        $recordedPidSource = 'durable_success_marker'
+        $recordedPidParent = Split-Path -Parent $recordedPidPath
         try {
-            $recordedPidText = ([string](Get-Content -LiteralPath $recordedPidPath -Raw -Encoding UTF8 -ErrorAction Stop)).Trim()
+            $recordedPidParentItem = Get-Item -LiteralPath $recordedPidParent -Force -ErrorAction Stop
+            if (-not $recordedPidParentItem.PSIsContainer -or
+                ($recordedPidParentItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                throw "PID parent is not a non-reparse directory attributes=$($recordedPidParentItem.Attributes)"
+            }
+            $recordedPidEntries = @(Get-ChildItem -LiteralPath $recordedPidParent -Force -ErrorAction Stop | Where-Object {
+                $_.Name.Equals('daemon.pid', [System.StringComparison]::OrdinalIgnoreCase)
+            })
         } catch {
-            throw "SYNAPSE_CANDIDATE_STALE_PID_UNREADABLE path=$($descriptor.Path) pid_path=$recordedPidPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory; stale cleanup requires its physical PID record"
+            throw "SYNAPSE_CANDIDATE_STALE_PID_PARENT_UNREADABLE path=$($descriptor.Path) pid_parent=$recordedPidParent error=$($_.Exception.Message) remediation=preserve the exact candidate directory; cleanup must enumerate the physical PID parent before treating daemon.pid as absent"
         }
-        if (-not [int]::TryParse($recordedPidText, [ref]$recordedPid) -or $recordedPid -ne [int]$health.pid) {
-            throw "SYNAPSE_CANDIDATE_STALE_PID_MISMATCH path=$($descriptor.Path) health_pid=$($health.pid) recorded_pid=$recordedPid pid_path=$recordedPidPath remediation=preserve the directory; stale cleanup authority is inconsistent"
+        if ($recordedPidEntries.Count -gt 1) {
+            throw "SYNAPSE_CANDIDATE_STALE_PID_AMBIGUOUS path=$($descriptor.Path) pid_path=$recordedPidPath matching_entry_count=$($recordedPidEntries.Count) remediation=preserve the exact candidate directory; cleanup requires zero or one exact daemon.pid child entry"
         }
-        $recordedBind = [string]$health.subsystems.http.bind_addr
-        if ([string]::IsNullOrWhiteSpace($recordedBind)) {
-            throw "SYNAPSE_CANDIDATE_STALE_BIND_MISSING path=$($descriptor.Path) health_path=$healthPath candidate_pid=$recordedPid remediation=preserve the exact candidate directory; stale cleanup requires its validated HTTP bind"
+        if ($recordedPidEntries.Count -eq 1) {
+            $pidSidecarValue = 0
+            try {
+                $pidSidecarItem = $recordedPidEntries[0]
+                if ($pidSidecarItem.PSIsContainer -or
+                    ($pidSidecarItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -or
+                    -not $pidSidecarItem.FullName.Equals([System.IO.Path]::GetFullPath($recordedPidPath), [System.StringComparison]::OrdinalIgnoreCase)) {
+                    throw "PID sidecar is not a non-reparse regular file attributes=$($pidSidecarItem.Attributes)"
+                }
+                $pidSidecarRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                    -Root $descriptor.Path `
+                    -ExpectedRootIdentity ([string]$descriptor.RootIdentity) `
+                    -Path $pidSidecarItem.FullName `
+                    -MaxBytes 64 `
+                    -Purpose 'stale_candidate_daemon_pid'
+                $recordedPidText = ([string]$pidSidecarRead.Content).Trim()
+            } catch {
+                throw "SYNAPSE_CANDIDATE_STALE_PID_UNREADABLE path=$($descriptor.Path) pid_path=$recordedPidPath error=$($_.Exception.Message) remediation=preserve the exact candidate directory; the present physical PID record must be readable"
+            }
+            if (-not [int]::TryParse($recordedPidText, [ref]$pidSidecarValue) -or $pidSidecarValue -ne $recordedPid) {
+                throw "SYNAPSE_CANDIDATE_STALE_PID_MISMATCH path=$($descriptor.Path) health_pid=$($health.pid) recorded_pid=$pidSidecarValue pid_path=$recordedPidPath remediation=preserve the directory; stale cleanup authority is inconsistent"
+            }
+            $recordedPidSource = 'live_daemon_pid_sidecar'
+        } else {
+            Info "Stale successful candidate marker and terminal identity verified path=$($descriptor.Path) marker=$successMarkerPath candidate_pid=$recordedPid supervisor_pid=$terminalSupervisorPid bootstrap_pid=$terminalBootstrapPid exit_code=$SynapseAuthenticatedShutdownExitCode pid_sidecar=absent source=$recordedPidSource"
         }
-        if (Get-Process -Id $descriptor.OwnerPid -ErrorAction SilentlyContinue) {
+        $recordedBind = [string]$success.bind
+        $ownerPresence = Get-SynapseKernelProcessPresence -ProcessId $descriptor.OwnerPid -Purpose 'stale_candidate_setup_owner'
+        if ($ownerPresence.Exists) {
             $retained++
-            Info "Stale successful candidate retained path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) candidate_pid=$recordedPid reason=setup_owner_pid_still_live"
+            Info "Stale successful candidate retained path=$($descriptor.Path) owner_pid=$($descriptor.OwnerPid) candidate_pid=$recordedPid candidate_pid_source=$recordedPidSource reason=setup_owner_pid_still_live"
             continue
         }
         $eligible++
+        # Avoid creating a durable cleanup intent for routine PID, path-reference,
+        # or ephemeral-port reuse. The journal begins only after this independent
+        # read-only quiescence check succeeds; Remove rechecks it before deletion.
+        [void](Assert-SynapseCandidateArtifactCleanupSafe `
+            -Path $descriptor.Path `
+            -ExpectedRoot $rootFull `
+            -ExpectedCandidateRootIdentity ([string]$success.candidate_root_identity) `
+            -CandidateProcessId $recordedPid `
+            -Bind $recordedBind)
         [void](Remove-SynapseCandidateArtifact `
             -Path $descriptor.Path `
             -ExpectedRoot $rootFull `
+            -ExpectedCandidateRootIdentity ([string]$success.candidate_root_identity) `
             -CandidateProcessId $recordedPid `
             -Bind $recordedBind `
             -Reason 'startup_stale_validated_candidate')
+        Info "Stale successful candidate cleanup identity consumed path=$($descriptor.Path) candidate_pid=$recordedPid candidate_pid_source=$recordedPidSource bind=$recordedBind"
         $removed++
+        } catch {
+            $retained++
+            $retainedPath = if ($null -eq $descriptor) { $child.FullName } else { $descriptor.Path }
+            Info "WARN: SYNAPSE_CANDIDATE_STALE_STATE_RETAINED path=$retainedPath error=$($_.Exception.Message) remediation=the exact candidate artifact was preserved because success evidence, physical path type, or current PID/path/socket quiescence was not independently provable"
+            continue
+        }
     }
     Info "Stale successful candidate sweep root=$rootFull eligible_count=$eligible removed_count=$removed retained_count=$retained"
 }
@@ -12951,25 +14242,120 @@ function Remove-SynapseExpiredCandidateFailureEvidence {
         [ValidateRange(1, 20)][int]$Keep = 5
     )
 
-    if (-not (Test-Path -LiteralPath $Root -PathType Container)) { return }
-    $rootFull = [System.IO.Path]::GetFullPath($Root).TrimEnd('\')
-    $verified = @(Get-ChildItem -LiteralPath $rootFull -Directory -Force -ErrorAction Stop |
-        Where-Object {
-            $_.Name -match '^candidate-\d{8}T\d{9}Z-\d+$' -and
-            -not ($_.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
-            (Test-Path -LiteralPath (Join-Path $_.FullName 'candidate-diagnostic.json') -PathType Leaf)
-        } |
-        Sort-Object LastWriteTimeUtc -Descending)
-    foreach ($expired in @($verified | Select-Object -Skip $Keep)) {
-        $parent = [System.IO.Path]::GetFullPath((Split-Path -Parent $expired.FullName)).TrimEnd('\')
-        if (-not $parent.Equals($rootFull, [System.StringComparison]::OrdinalIgnoreCase)) {
-            Die "SYNAPSE_CANDIDATE_EVIDENCE_RETENTION_SCOPE_INVALID path=$($expired.FullName) expected_parent=$rootFull actual_parent=$parent remediation=do not delete anything; inspect candidate evidence paths"
+    $rootDescriptor = Get-SynapseCandidateArtifactRootDescriptor -ExpectedRoot $Root
+    if (-not $rootDescriptor.Exists) { return }
+    $rootFull = $rootDescriptor.Path
+    $failureBundles = [System.Collections.Generic.List[object]]::new()
+    foreach ($child in @(Get-ChildItem -LiteralPath $rootFull -Force -ErrorAction Stop | Where-Object {
+        $_.Name -match '^candidate-\d{8}T\d{9}Z-\d+$'
+    })) {
+        try {
+            $descriptor = Get-SynapseCandidateArtifactDescriptor -Path $child.FullName -ExpectedRoot $rootFull
+            $diagnosticEntries = @(Get-ChildItem -LiteralPath $descriptor.Path -Force -ErrorAction Stop | Where-Object {
+                $_.Name.Equals('candidate-diagnostic.json', [System.StringComparison]::OrdinalIgnoreCase)
+            })
+        } catch {
+            Info "WARN: candidate failure retention skipped ambiguous artifact path=$($child.FullName) error=$($_.Exception.Message) remediation=the exact entry is preserved; retention never follows or deletes an unreadable/non-physical candidate path"
+            continue
         }
-        Remove-Item -LiteralPath $expired.FullName -Recurse -Force -ErrorAction Stop
-        if (Test-Path -LiteralPath $expired.FullName) {
-            Die "SYNAPSE_CANDIDATE_EVIDENCE_RETENTION_CLEANUP_UNVERIFIED path=$($expired.FullName) remediation=inspect filesystem permissions; the expired verified failure bundle still exists"
+        if ($diagnosticEntries.Count -gt 0) {
+            $failureBundles.Add([pscustomobject]@{
+                Descriptor = $descriptor
+                DiagnosticEntries = @($diagnosticEntries)
+                LastWriteTimeUtc = $child.LastWriteTimeUtc
+            })
         }
-        Info "Expired candidate failure evidence removed path=$($expired.FullName) retention_keep=$Keep"
+    }
+    $orderedBundles = @($failureBundles | Sort-Object LastWriteTimeUtc -Descending)
+    foreach ($expired in @($orderedBundles | Select-Object -Skip $Keep)) {
+        $descriptor = $expired.Descriptor
+        $diagnosticPath = Join-Path $descriptor.Path 'candidate-diagnostic.json'
+        if ($expired.DiagnosticEntries.Count -ne 1) {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=diagnostic_entry_ambiguous matching_entry_count=$($expired.DiagnosticEntries.Count)"
+            continue
+        }
+        $diagnosticItem = $expired.DiagnosticEntries[0]
+        if (-not $diagnosticItem.FullName.Equals($diagnosticPath, [System.StringComparison]::OrdinalIgnoreCase) -or
+            $diagnosticItem.PSIsContainer -or
+            ($diagnosticItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=diagnostic_entry_not_regular attributes=$($diagnosticItem.Attributes)"
+            continue
+        }
+        try {
+            $diagnosticRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                -Root $descriptor.Path `
+                -ExpectedRootIdentity ([string]$descriptor.RootIdentity) `
+                -Path $diagnosticItem.FullName `
+                -MaxBytes 1048576 `
+                -Purpose 'expired_candidate_failure_diagnostic'
+            $failure = [string]$diagnosticRead.Content | ConvertFrom-Json -ErrorAction Stop
+            $candidatePid = [int]$failure.candidate_pid
+            $candidateRootIdentity = [string]$failure.candidate_root_identity
+            $supervisorPid = [int]$failure.supervisor_pid
+            $bootstrapPid = [int]$failure.bootstrap_pid
+            $recordedBind = [string]$failure.bind
+        } catch {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=diagnostic_decode_failed error=$($_.Exception.Message)"
+            continue
+        }
+        if ([string]$failure.schema -cne 'synapse_candidate_failure/v1' -or
+            $failure.cleanup_verified -isnot [bool] -or
+            $failure.cleanup_verified -ne $true -or
+            $failure.process_has_exited -isnot [bool] -or
+            $failure.process_has_exited -ne $true -or
+            $candidatePid -le 0 -or
+            $supervisorPid -le 0 -or
+            $bootstrapPid -le 0 -or
+            $candidateRootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$' -or
+            $candidateRootIdentity -ine [string]$descriptor.RootIdentity -or
+            @($failure.cleanup_errors).Count -ne 0 -or
+            [string]::IsNullOrWhiteSpace($recordedBind)) {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=cleanup_or_identity_not_verified schema=$($failure.schema) cleanup_verified=$($failure.cleanup_verified) cleanup_error_count=$(@($failure.cleanup_errors).Count) process_has_exited=$($failure.process_has_exited) candidate_pid=$candidatePid supervisor_pid=$supervisorPid bootstrap_pid=$bootstrapPid candidate_root_identity=$candidateRootIdentity actual_root_identity=$($descriptor.RootIdentity) bind=$recordedBind"
+            continue
+        }
+        $terminalIdentityLive = [System.Collections.Generic.List[string]]::new()
+        try {
+            foreach ($terminalIdentity in @(
+                [pscustomobject]@{ Role = 'setup_owner'; Pid = [int]$descriptor.OwnerPid },
+                [pscustomobject]@{ Role = 'candidate'; Pid = $candidatePid },
+                [pscustomobject]@{ Role = 'supervisor'; Pid = $supervisorPid },
+                [pscustomobject]@{ Role = 'bootstrap'; Pid = $bootstrapPid }
+            )) {
+                $presence = Get-SynapseKernelProcessPresence `
+                    -ProcessId ([int]$terminalIdentity.Pid) `
+                    -Purpose "expired_candidate_failure_$($terminalIdentity.Role)"
+                if ($presence.Exists) {
+                    $terminalIdentityLive.Add("role=$($terminalIdentity.Role),pid=$($terminalIdentity.Pid)")
+                }
+            }
+        } catch {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=terminal_identity_sot_unreadable error=$($_.Exception.Message)"
+            continue
+        }
+        if ($terminalIdentityLive.Count -gt 0) {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) diagnostic_path=$diagnosticPath reason=terminal_identity_live identities=$($terminalIdentityLive -join ';')"
+            continue
+        }
+        try {
+            # Check before journaling so routine PID/port reuse keeps evidence but
+            # does not create a cleanup intent that would block the next setup.
+            [void](Assert-SynapseCandidateArtifactCleanupSafe `
+                -Path $descriptor.Path `
+                -ExpectedRoot $rootFull `
+                -ExpectedCandidateRootIdentity $candidateRootIdentity `
+                -CandidateProcessId $candidatePid `
+                -Bind $recordedBind)
+            [void](Remove-SynapseCandidateArtifact `
+                -Path $descriptor.Path `
+                -ExpectedRoot $rootFull `
+                -ExpectedCandidateRootIdentity $candidateRootIdentity `
+                -CandidateProcessId $candidatePid `
+                -Bind $recordedBind `
+                -Reason 'expired_verified_candidate_failure')
+            Info "Expired verified candidate failure evidence removed path=$($descriptor.Path) candidate_pid=$candidatePid bind=$recordedBind retention_keep=$Keep"
+        } catch {
+            Info "WARN: expired candidate failure evidence retained path=$($descriptor.Path) candidate_pid=$candidatePid bind=$recordedBind reason=exact_quiescence_or_cleanup_unverified error=$($_.Exception.Message)"
+        }
     }
 }
 
@@ -13151,6 +14537,7 @@ function Get-SynapseCandidateReplacementReservationId {
 function Write-SynapseCandidateJsonEvidence {
     param(
         [Parameter(Mandatory=$true)][string]$CandidateRoot,
+        [Parameter(Mandatory=$true)][ValidatePattern('^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$')][string]$CandidateRootIdentity,
         [Parameter(Mandatory=$true)][ValidatePattern('^candidate-[a-z0-9-]+\.json$')][string]$LeafName,
         [Parameter(Mandatory=$true)]$Value
     )
@@ -13163,10 +14550,15 @@ function Write-SynapseCandidateJsonEvidence {
     }
     try {
         $json = $Value | ConvertTo-Json -Depth 30
-        [System.IO.File]::WriteAllText($path, $json, [System.Text.UTF8Encoding]::new($false))
-        $readback = Get-Content -Raw -LiteralPath $path -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-        $sha256 = Get-SynapseFileSha256 -Path $path
-        $length = (Get-Item -LiteralPath $path -ErrorAction Stop).Length
+        $readback = $json | ConvertFrom-Json -ErrorAction Stop
+        $physicalWrite = Write-SynapseAtomicUtf8TextFileUnderPhysicalRoot `
+            -Root $rootFull `
+            -ExpectedRootIdentity $CandidateRootIdentity `
+            -LeafName $LeafName `
+            -Content $json `
+            -Purpose 'candidate_json_evidence'
+        $sha256 = [string]$physicalWrite.sha256
+        $length = [uint64]$physicalWrite.byte_length
     } catch {
         Die "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$path error=$($_.Exception.Message) remediation=repair the exact candidate evidence directory before setup can accept or reject this binary"
     }
@@ -13174,6 +14566,7 @@ function Write-SynapseCandidateJsonEvidence {
         Path = $path
         Sha256 = $sha256
         Length = $length
+        FileIdentity = [string]$physicalWrite.file_identity
         Readback = $readback
     }
 }
@@ -13447,6 +14840,15 @@ function Test-SynapseCandidateDaemon {
     $candidateMaintenanceLockPath = Join-Path $candidateRoot 'candidate-maintenance.lock'
     New-Item -ItemType Directory -Force -Path $candidateDb | Out-Null
     New-Item -ItemType Directory -Force -Path $candidateShellJobRoot | Out-Null
+    $candidateArtifactRoot = Join-Path $LogDir 'setup-candidates'
+    $candidateRootDescriptor = Get-SynapseCandidateArtifactDescriptor `
+        -Path $candidateRoot `
+        -ExpectedRoot $candidateArtifactRoot
+    if (-not $candidateRootDescriptor.Exists -or
+        [string]$candidateRootDescriptor.RootIdentity -notmatch '^[0-9A-Fa-f]{8}:[0-9A-Fa-f]{16}$') {
+        Die "SYNAPSE_CANDIDATE_ROOT_IDENTITY_UNAVAILABLE path=$candidateRoot exists=$($candidateRootDescriptor.Exists) identity=$($candidateRootDescriptor.RootIdentity) remediation=preserve the isolated directory; candidate validation requires a stable physical volume/file identity before launch"
+    }
+    $candidateRootIdentity = [string]$candidateRootDescriptor.RootIdentity
     $candidateBind = New-SynapseCandidateBind
     $candidateHash = Get-SynapseFileSha256 -Path $CandidateExePath
     $candidateStdout = Join-Path $candidateRoot 'candidate-stdout.log'
@@ -13475,6 +14877,7 @@ function Test-SynapseCandidateDaemon {
     $health = $null
     $lastHealthError = $null
     $surface = $null
+    $candidateReadyForTerminalValidation = $false
     $candidateSucceeded = $false
     $candidateFailureMessage = $null
     $candidateResult = $null
@@ -13565,12 +14968,16 @@ function Test-SynapseCandidateDaemon {
         while ($null -eq $candidate) {
             $candidateSupervisorState = $null
             $candidateSupervisorStateError = $null
-            if (Test-Path -LiteralPath $candidateSupervisorStatePath -PathType Leaf) {
-                try {
-                    $candidateSupervisorState = Get-Content -Raw -LiteralPath $candidateSupervisorStatePath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
-                } catch {
-                    $candidateSupervisorStateError = (($_.Exception.Message -replace '\s+', ' ').Trim())
-                }
+            try {
+                $candidateSupervisorStateRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                    -Root $candidateRoot `
+                    -ExpectedRootIdentity $candidateRootIdentity `
+                    -Path $candidateSupervisorStatePath `
+                    -MaxBytes 1048576 `
+                    -Purpose 'candidate_live_supervisor_state'
+                $candidateSupervisorState = [string]$candidateSupervisorStateRead.Content | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                $candidateSupervisorStateError = (($_.Exception.Message -replace '\s+', ' ').Trim())
             }
             $candidateChildPid = if ($null -eq $candidateSupervisorState -or $null -eq $candidateSupervisorState.child_pid) { 0 } else { [int]$candidateSupervisorState.child_pid }
             if ($candidateChildPid -gt 0) {
@@ -13812,6 +15219,7 @@ function Test-SynapseCandidateDaemon {
         }
         $initialHealthEvidence = Write-SynapseCandidateJsonEvidence `
             -CandidateRoot $candidateRoot `
+            -CandidateRootIdentity $candidateRootIdentity `
             -LeafName 'candidate-health-before.json' `
             -Value $health
         Info "Candidate initial health evidence written path=$($initialHealthEvidence.Path) sha256=$($initialHealthEvidence.Sha256) length=$($initialHealthEvidence.Length) ok=$($health.ok)"
@@ -13917,6 +15325,7 @@ function Test-SynapseCandidateDaemon {
                     -TimeoutSec 120
                 $searchBootstrapEvidence = Write-SynapseCandidateJsonEvidence `
                     -CandidateRoot $candidateRoot `
+                    -CandidateRootIdentity $candidateRootIdentity `
                     -LeafName 'candidate-search-bootstrap.json' `
                     -Value $searchBootstrap.Json
                 $searchReadback = $searchBootstrap.Json.search_rebuild
@@ -13926,7 +15335,13 @@ function Test-SynapseCandidateDaemon {
                     $bootstrapReadback = if ($null -eq $searchReadback) { '<missing>' } else { $searchReadback | ConvertTo-Json -Depth 16 -Compress }
                     Die "SYNAPSE_CANDIDATE_SEARCH_BOOTSTRAP_READBACK_INVALID pid=$healthPid bind=$candidateBind panel_version=$searchPanelVersion evidence=$($searchBootstrapEvidence.Path) evidence_sha256=$($searchBootstrapEvidence.Sha256) readback=$bootstrapReadback remediation=the real storage search_rebuild call did not publish and report the exact active-panel manifest; inspect retained candidate evidence before retrying"
                 }
-                $manifestActualSha256 = Get-SynapseFileSha256 -Path $manifestPath
+                Ensure-SynapseAtomicFileType
+                $manifestPhysicalReadback = [SynapseSetup.AtomicFileV2]::Sha256PhysicalFileUnderRoot(
+                    $candidateRoot,
+                    $candidateRootIdentity,
+                    $manifestPath,
+                    '')
+                $manifestActualSha256 = [string]$manifestPhysicalReadback.Sha256
                 if ($manifestActualSha256 -ine $manifestExpectedSha256) {
                     Die "SYNAPSE_CANDIDATE_SEARCH_BOOTSTRAP_MANIFEST_MISMATCH pid=$healthPid bind=$candidateBind panel_version=$searchPanelVersion manifest=$manifestPath expected_sha256=$manifestExpectedSha256 actual_sha256=$manifestActualSha256 evidence=$($searchBootstrapEvidence.Path) remediation=the independently read physical manifest bytes do not match the storage facade's committed readback; inspect the isolated vault and candidate logs"
                 }
@@ -13940,6 +15355,7 @@ function Test-SynapseCandidateDaemon {
                 }
                 $postBootstrapHealthEvidence = Write-SynapseCandidateJsonEvidence `
                     -CandidateRoot $candidateRoot `
+                    -CandidateRootIdentity $candidateRootIdentity `
                     -LeafName 'candidate-health-after-bootstrap.json' `
                     -Value $health
                 Info "Candidate isolated search generation physically verified panel_version=$searchPanelVersion manifest=$manifestPath manifest_sha256=$manifestActualSha256 health_evidence=$($postBootstrapHealthEvidence.Path) health_evidence_sha256=$($postBootstrapHealthEvidence.Sha256) health_ok=$($health.ok)"
@@ -13968,6 +15384,7 @@ function Test-SynapseCandidateDaemon {
         $health = $finalCandidateHealthRead.Health
         $finalCandidateHealthEvidence = Write-SynapseCandidateJsonEvidence `
             -CandidateRoot $candidateRoot `
+            -CandidateRootIdentity $candidateRootIdentity `
             -LeafName 'candidate-health-final.json' `
             -Value $health
         [void](Assert-SynapseNoExplicitGpuRuntimeHealth -Health $health -ProcessId $healthPid -Bind $candidateBind -Phase 'candidate_after_search_and_tools_list')
@@ -14005,7 +15422,6 @@ function Test-SynapseCandidateDaemon {
             Die "SYNAPSE_CANDIDATE_CALYX_CONFIG_IDENTITY_MISMATCH phase=after_validation path=$CalyxConfigPath expected_sha256=$expectedCalyxConfigSha256 actual_sha256=$candidateConfigHashAfter pid=$healthPid bind=$candidateBind remediation=stop the concurrent config writer and rerun setup; no launcher may inherit config bytes different from the candidate-validated identity"
         }
         Info "Candidate daemon health preflight passed pid=$healthPid bind=$candidateBind tool_count=$($surface.tool_count) tool_surface_sha256=$($surface.tool_surface_sha256) final_health_evidence=$($finalCandidateHealthEvidence.Path) final_health_sha256=$($finalCandidateHealthEvidence.Sha256)"
-        $candidateSucceeded = $true
         $candidateResult = [pscustomobject]@{
             Ok = $true
             Pid = $healthPid
@@ -14031,6 +15447,7 @@ function Test-SynapseCandidateDaemon {
             terminal_parent_job_current_memory_used_bytes = [uint64]$candidateTerminalParentKernelJob.CurrentJobMemoryUsedBytes
             terminal_parent_job_peak_memory_used_bytes = [uint64]$candidateTerminalParentKernelJob.PeakJobMemoryUsedBytes
         }
+        $candidateReadyForTerminalValidation = $true
     } catch {
         $candidateFailureMessage = $_.Exception.Message
         throw
@@ -14071,7 +15488,7 @@ function Test-SynapseCandidateDaemon {
                 # candidate supervisor and native bootstrap must propagate that
                 # exact code without restarting; zero would describe a different
                 # signal/parent-exit path and is not the candidate stop contract.
-                if ($candidateSucceeded -and ($candidateBootstrapForcedStop -or [int]$candidateBootstrap.ExitCode -ne $SynapseAuthenticatedShutdownExitCode)) {
+                if ($candidateReadyForTerminalValidation -and ($candidateBootstrapForcedStop -or [int]$candidateBootstrap.ExitCode -ne $SynapseAuthenticatedShutdownExitCode)) {
                     throw "native bootstrap did not propagate the authenticated shutdown exit code forced_stop=$candidateBootstrapForcedStop expected_exit_code=$SynapseAuthenticatedShutdownExitCode actual_exit_code=$($candidateBootstrap.ExitCode)"
                 }
             } catch {
@@ -14104,16 +15521,23 @@ function Test-SynapseCandidateDaemon {
                 $candidateCleanupErrors.Add("bind_release bind=$candidateBind error=$($_.Exception.Message)")
             }
         }
+        $candidateTerminalFailureMessage = $null
         if ($candidateCleanupErrors.Count -gt 0) {
-            throw "SYNAPSE_CANDIDATE_TREE_CLEANUP_FAILED errors=$($candidateCleanupErrors -join '; ') bootstrap_log=$candidateBootstrapLogPath state_path=$candidateSupervisorStatePath remediation=inspect only the exact setup-owned candidate PIDs/Job and bind; setup attempted every cleanup stage and will not claim quiescence until all read back absent"
-        }
-        if ($candidateSucceeded) {
+            $candidateTerminalFailureMessage = "SYNAPSE_CANDIDATE_TREE_CLEANUP_FAILED errors=$($candidateCleanupErrors -join '; ') bootstrap_log=$candidateBootstrapLogPath state_path=$candidateSupervisorStatePath remediation=inspect only the exact setup-owned candidate PIDs/Job and bind; setup attempted every cleanup stage and will not claim quiescence until all read back absent"
+        } elseif ($candidateReadyForTerminalValidation) {
+            try {
             $candidateBootstrapHashAfter = Get-SynapseFileSha256 -Path $candidateBootstrapPath
             if ($candidateBootstrapHashAfter -ine $expectedCandidateBootstrapSha256) {
                 throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_IDENTITY_MISMATCH phase=after_validation path=$candidateBootstrapPath expected_sha256=$expectedCandidateBootstrapSha256 actual_sha256=$candidateBootstrapHashAfter remediation=refuse handoff because the native bootstrap bytes changed during candidate execution"
             }
             try {
-                $candidateBootstrapLog = Get-Content -Raw -LiteralPath $candidateBootstrapLogPath -ErrorAction Stop
+                $candidateBootstrapLogRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                    -Root $candidateRoot `
+                    -ExpectedRootIdentity $candidateRootIdentity `
+                    -Path $candidateBootstrapLogPath `
+                    -MaxBytes 16777216 `
+                    -Purpose 'candidate_terminal_bootstrap_log'
+                $candidateBootstrapLog = [string]$candidateBootstrapLogRead.Content
             } catch {
                 throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_LOG_UNREADABLE path=$candidateBootstrapLogPath error=$($_.Exception.Message) remediation=the exact production bootstrap must persist its bound/start/exit evidence before candidate acceptance"
             }
@@ -14127,9 +15551,15 @@ function Test-SynapseCandidateDaemon {
                     throw "SYNAPSE_CANDIDATE_SUPERVISOR_BOOTSTRAP_LOG_CONTRACT_MISSING path=$candidateBootstrapLogPath expected=[$expectedBootstrapLogEntry] remediation=the exact production bootstrap must prove parent-Job binding, child identity, and terminal exit"
                 }
             }
-            $candidateBootstrapLogSha256 = Get-SynapseFileSha256 -Path $candidateBootstrapLogPath
+            $candidateBootstrapLogSha256 = [string]$candidateBootstrapLogRead.Sha256
             try {
-                $candidateFinalState = Get-Content -Raw -LiteralPath $candidateSupervisorStatePath -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+                $candidateFinalStateRead = Read-SynapseUtf8TextFileUnderPhysicalRoot `
+                    -Root $candidateRoot `
+                    -ExpectedRootIdentity $candidateRootIdentity `
+                    -Path $candidateSupervisorStatePath `
+                    -MaxBytes 1048576 `
+                    -Purpose 'candidate_terminal_supervisor_state'
+                $candidateFinalState = [string]$candidateFinalStateRead.Content | ConvertFrom-Json -ErrorAction Stop
             } catch {
                 throw "SYNAPSE_CANDIDATE_FINAL_JOB_STATE_UNREADABLE path=$candidateSupervisorStatePath error=$($_.Exception.Message) remediation=preserve candidate evidence and repair the one-shot supervisor terminal-state write before accepting the candidate"
             }
@@ -14215,7 +15645,7 @@ function Test-SynapseCandidateDaemon {
             if ($candidateFinalDrift.Count -gt 0) {
                 throw "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_DRIFT path=$candidateSupervisorStatePath drift=$($candidateFinalDrift -join '; ') remediation=preserve the terminal Job evidence and repair the bounded supervisor before accepting or installing this candidate"
             }
-            $candidateFinalStateSha256 = Get-SynapseFileSha256 -Path $candidateSupervisorStatePath
+            $candidateFinalStateSha256 = [string]$candidateFinalStateRead.Sha256
             Info "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_VERIFIED bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath bootstrap_sha256=$candidateBootstrapHashAfter bootstrap_log=$candidateBootstrapLogPath bootstrap_log_sha256=$candidateBootstrapLogSha256 supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) state=stopped exit_code=$SynapseAuthenticatedShutdownExitCode stop_source=authenticated_http_shutdown state_path=$candidateSupervisorStatePath state_sha256=$candidateFinalStateSha256 parent_job_name=$($candidateFinalState.supervisor_job_name) parent_job_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$($candidateFinalState.supervisor_job_cpu_rate) parent_current_job_memory_used_bytes=$candidateParentCurrentBytes parent_job_memory_headroom_bytes=$candidateParentHeadroomBytes parent_peak_process_memory_used_bytes=$candidateParentPeakProcessBytes parent_peak_job_memory_used_bytes=$candidateParentPeakJobBytes daemon_job_limit_flags=$($candidateFinalState.job_limit_flags_hex) daemon_cpu_rate=$($candidateFinalState.job_cpu_rate) daemon_process_memory_limit_bytes=$($candidateFinalState.job_process_memory_limit_bytes) daemon_job_memory_limit_bytes=$($candidateFinalState.job_memory_limit_bytes) working_set_policy=measured_only daemon_peak_process_memory_used_bytes=$candidatePeakProcessBytes daemon_peak_job_memory_used_bytes=$candidatePeakJobBytes"
             $candidateResult | Add-Member -NotePropertyName JobLimitFlagsHex -NotePropertyValue ([string]$candidateFinalState.job_limit_flags_hex) -Force
             $candidateResult | Add-Member -NotePropertyName ProcessMemoryLimitBytes -NotePropertyValue ([uint64]$candidateFinalState.job_process_memory_limit_bytes) -Force
@@ -14233,28 +15663,125 @@ function Test-SynapseCandidateDaemon {
             $candidateResult | Add-Member -NotePropertyName SupervisorBootstrapSha256 -NotePropertyValue $candidateBootstrapHashAfter -Force
             $candidateResult | Add-Member -NotePropertyName SupervisorBootstrapLogSha256 -NotePropertyValue $candidateBootstrapLogSha256 -Force
             $candidateResult | Add-Member -NotePropertyName FinalJobStateSha256 -NotePropertyValue $candidateFinalStateSha256 -Force
+            $candidateSuccessMarkerPath = Join-Path $candidateRoot 'candidate-success.json'
+            if (Test-Path -LiteralPath $candidateSuccessMarkerPath) {
+                throw "SYNAPSE_CANDIDATE_SUCCESS_MARKER_PREEXISTING path=$candidateSuccessMarkerPath remediation=preserve and inspect the isolated candidate directory; a unique run may publish its post-validation marker exactly once"
+            }
+            $candidateSuccessMarker = [ordered]@{
+                schema = 'synapse_candidate_success/v1'
+                state = 'verified'
+                verified_at_utc = [DateTime]::UtcNow.ToString('o')
+                candidate_root = [System.IO.Path]::GetFullPath($candidateRoot).TrimEnd('\')
+                candidate_root_identity = $candidateRootIdentity.ToUpperInvariant()
+                setup_owner_pid = [int]$PID
+                candidate_pid = [int]$candidate.Id
+                supervisor_pid = [int]$candidateSupervisor.Id
+                bootstrap_pid = [int]$candidateBootstrap.Id
+                bind = $candidateBind
+                executable_path = [System.IO.Path]::GetFullPath($CandidateExePath)
+                executable_sha256 = $candidateHash
+                calyx_config_sha256 = $expectedCalyxConfigSha256
+                tool_count = [int]$surface.tool_count
+                tool_surface_sha256 = [string]$surface.tool_surface_sha256
+                authenticated_shutdown_exit_code = [int]$SynapseAuthenticatedShutdownExitCode
+                candidate_health_final_sha256 = [string]$finalCandidateHealthEvidence.Sha256
+                bootstrap_path = $candidateBootstrapPath
+                bootstrap_sha256 = $candidateBootstrapHashAfter
+                bootstrap_log_sha256 = $candidateBootstrapLogSha256
+                final_state_sha256 = $candidateFinalStateSha256
+                daemon_job_name = $candidateJobName
+                parent_job_name = $candidateExpectedParentJobName
+                job_limit_flags_hex = '0x00002300'
+                daemon_process_memory_limit_bytes = [uint64]$SynapseDaemonProcessMemoryLimitBytes
+                daemon_job_memory_limit_bytes = [uint64]$SynapseDaemonProcessMemoryLimitBytes
+                parent_process_memory_limit_bytes = [uint64]$SynapseOwnedMemoryLimitBytes
+                parent_job_memory_limit_bytes = [uint64]$SynapseOwnedMemoryLimitBytes
+                daemon_cpu_rate = [uint32]$SynapseDaemonCpuRate
+                parent_cpu_rate = [uint32]$SynapseSupervisorCpuRate
+                working_set_policy = 'measured_only'
+            }
+            $candidateSuccessMarkerJson = ($candidateSuccessMarker | ConvertTo-Json -Depth 10) + "`n"
+            try {
+                $candidateSuccessMarkerReadback = $candidateSuccessMarkerJson | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                throw "SYNAPSE_CANDIDATE_SUCCESS_MARKER_SERIALIZATION_INVALID path=$candidateSuccessMarkerPath error=$($_.Exception.Message) remediation=preserve candidate evidence and repair the exact marker schema before publication"
+            }
+            $candidateSuccessMarkerWrite = Write-SynapseAtomicUtf8TextFileUnderPhysicalRoot `
+                -Root $candidateRoot `
+                -ExpectedRootIdentity $candidateRootIdentity `
+                -LeafName 'candidate-success.json' `
+                -Content $candidateSuccessMarkerJson `
+                -Purpose 'candidate_post_validation_success_marker'
+            if ([string]$candidateSuccessMarkerReadback.schema -cne 'synapse_candidate_success/v1' -or
+                [string]$candidateSuccessMarkerReadback.state -cne 'verified' -or
+                [int]$candidateSuccessMarkerReadback.setup_owner_pid -ne [int]$PID -or
+                [string]$candidateSuccessMarkerReadback.candidate_root_identity -ine $candidateRootIdentity -or
+                [int]$candidateSuccessMarkerReadback.candidate_pid -ne [int]$candidate.Id -or
+                [int]$candidateSuccessMarkerReadback.supervisor_pid -ne [int]$candidateSupervisor.Id -or
+                [int]$candidateSuccessMarkerReadback.bootstrap_pid -ne [int]$candidateBootstrap.Id -or
+                [int]$candidateSuccessMarkerReadback.authenticated_shutdown_exit_code -ne $SynapseAuthenticatedShutdownExitCode -or
+                [string]$candidateSuccessMarkerReadback.candidate_health_final_sha256 -ine [string]$finalCandidateHealthEvidence.Sha256 -or
+                [string]$candidateSuccessMarkerReadback.bootstrap_log_sha256 -ine $candidateBootstrapLogSha256 -or
+                [string]$candidateSuccessMarkerReadback.final_state_sha256 -ine $candidateFinalStateSha256) {
+                throw "SYNAPSE_CANDIDATE_SUCCESS_MARKER_READBACK_MISMATCH path=$candidateSuccessMarkerPath remediation=preserve candidate evidence; the atomic marker did not decode to the exact terminal validation identities and hashes"
+            }
+            $candidateResult | Add-Member -NotePropertyName SuccessMarkerSha256 -NotePropertyValue ([string]$candidateSuccessMarkerWrite.sha256) -Force
+            Info "SYNAPSE_CANDIDATE_SUCCESS_MARKER_VERIFIED path=$candidateSuccessMarkerPath sha256=$($candidateSuccessMarkerWrite.sha256) candidate_pid=$($candidate.Id) supervisor_pid=$($candidateSupervisor.Id) bootstrap_pid=$($candidateBootstrap.Id) final_health_sha256=$($finalCandidateHealthEvidence.Sha256) bootstrap_log_sha256=$candidateBootstrapLogSha256 final_state_sha256=$candidateFinalStateSha256"
+            $candidateSucceeded = $true
+            } catch {
+                $candidateTerminalFailureMessage = $_.Exception.Message
+            }
         }
         if ((Test-Path -LiteralPath $candidateRoot) -and -not $candidateSucceeded) {
             try {
+                $candidateDiagnosticPrimaryFailure = if ([string]::IsNullOrWhiteSpace($candidateFailureMessage)) { '' } else { $candidateFailureMessage }
+                $candidateDiagnosticTerminalFailure = if ([string]::IsNullOrWhiteSpace($candidateTerminalFailureMessage)) {
+                    ''
+                } else {
+                    $candidateTerminalFailureMessage
+                }
+                $candidateDiagnosticFailure = if ([string]::IsNullOrWhiteSpace($candidateDiagnosticPrimaryFailure) -and [string]::IsNullOrWhiteSpace($candidateDiagnosticTerminalFailure)) {
+                    'candidate validation failed without a captured primary or terminal exception message'
+                } elseif ([string]::IsNullOrWhiteSpace($candidateDiagnosticTerminalFailure)) {
+                    $candidateDiagnosticPrimaryFailure
+                } elseif ([string]::IsNullOrWhiteSpace($candidateDiagnosticPrimaryFailure)) {
+                    $candidateDiagnosticTerminalFailure
+                } else {
+                    "primary_failure=[$candidateDiagnosticPrimaryFailure] terminal_failure=[$candidateDiagnosticTerminalFailure]"
+                }
                 $diagnostic = Write-SynapseCandidateFailureEvidence `
                     -CandidateRoot $candidateRoot `
+                    -CandidateRootIdentity $candidateRootIdentity `
                     -Process $candidate `
-                    -FailureMessage $(if ([string]::IsNullOrWhiteSpace($candidateFailureMessage)) { 'candidate validation failed without a captured exception message' } else { $candidateFailureMessage }) `
+                    -SupervisorProcess $candidateSupervisor `
+                    -BootstrapProcess $candidateBootstrap `
+                    -FailureMessage $candidateDiagnosticFailure `
+                    -PrimaryFailureMessage $candidateDiagnosticPrimaryFailure `
+                    -TerminalFailureMessage $candidateDiagnosticTerminalFailure `
                     -Bind $candidateBind `
                     -ExecutablePath $CandidateExePath `
-                    -ExecutableSha256 $candidateHash
+                    -ExecutableSha256 $candidateHash `
+                    -CleanupVerified ($candidateCleanupErrors.Count -eq 0) `
+                    -CleanupErrors @($candidateCleanupErrors)
                 Info "Candidate failure evidence retained path=$($diagnostic.Path) sha256=$($diagnostic.Sha256) evidence_count=$($diagnostic.EvidenceCount) exit_code_signed=$($diagnostic.Exit.ExitCodeSigned) exit_code_hex=$($diagnostic.Exit.ExitCodeHex)"
                 Remove-SynapseExpiredCandidateFailureEvidence -Root (Join-Path $LogDir 'setup-candidates') -Keep 5
             } catch {
-                throw "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$candidateRoot error=$($_.Exception.Message) original_failure=[$candidateFailureMessage] remediation=preserve the exact candidate directory and repair log-directory permissions before rerunning setup"
+                throw "SYNAPSE_CANDIDATE_EVIDENCE_WRITE_FAILED path=$candidateRoot error=$($_.Exception.Message) primary_failure=[$candidateFailureMessage] terminal_failure=[$candidateTerminalFailureMessage] remediation=preserve the exact candidate directory and repair log-directory permissions before rerunning setup"
             }
         } elseif (Test-Path -LiteralPath $candidateRoot) {
             [void](Remove-SynapseCandidateArtifact `
                 -Path $candidateRoot `
-                -ExpectedRoot (Join-Path $LogDir 'setup-candidates') `
+                -ExpectedRoot $candidateArtifactRoot `
+                -ExpectedCandidateRootIdentity $candidateRootIdentity `
                 -CandidateProcessId ([int]$candidate.Id) `
                 -Bind $candidateBind `
                 -Reason 'validated_candidate_success')
+        }
+        if (-not [string]::IsNullOrWhiteSpace($candidateTerminalFailureMessage)) {
+            if ([string]::IsNullOrWhiteSpace($candidateFailureMessage)) {
+                throw $candidateTerminalFailureMessage
+            }
+            throw "$candidateTerminalFailureMessage primary_failure=[$candidateFailureMessage]"
         }
     }
     return $candidateResult
@@ -18882,6 +20409,11 @@ if ($maintenanceReason -eq 'setup') {
 
 Wait-SynapsePostExitParent -ParentPid $PostExitParentPid -Reason $PostExitContinuationReason
 Acquire-SynapseSetupMaintenanceLock -Path $MaintenanceLockPath -Reason $maintenanceReason
+# Candidate recovery runs before the later build/install phases that historically
+# materialized LogDir. Create the caller-selected directory now so a legitimate
+# fresh nested -LogDir remains supported, then let the recovery descriptors prove
+# it and setup-candidates are physical non-reparse directories before enumeration.
+New-Item -ItemType Directory -Force -Path $LogDir -ErrorAction Stop | Out-Null
 if ($maintenanceReason -eq 'setup') {
     if ($script:SynapseManagedCalyxConfig) {
         $managedCalyxConfig = Write-SynapseManagedCpuOnlyCalyxConfig -Path $CalyxConfigPath
@@ -21063,7 +22595,7 @@ if (-not $ok) {
                     $launcherStream.Flush($true)
                     $launcherStream.Dispose()
                     $launcherStream = $null
-                    [SynapseSetup.AtomicFile]::ReplaceWriteThrough($launcherTempPath, $launcherPath)
+                    [SynapseSetup.AtomicFileV2]::ReplaceWriteThrough($launcherTempPath, $launcherPath)
                 } catch {
                     if ($null -ne $launcherStream) { $launcherStream.Dispose() }
                     try { Remove-Item -LiteralPath $launcherTempPath -Force -ErrorAction SilentlyContinue } catch { }
