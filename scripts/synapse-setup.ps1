@@ -322,6 +322,7 @@ $SynapseSupervisorCpuRate = [uint32]2500
 # child Job 100% of the supervisor-owned parent's 25% system allocation; using
 # 25% on both levels would multiply into an unintended 6.25% effective cap.
 $SynapseDaemonCpuRate = [uint32]10000
+$SynapseAuthenticatedShutdownExitCode = 1
 $SynapseCalyxConfigMaxBytesV1 = 65536
 $script:SynapseChromeBridgeMaintenancePauseUntilUnixMs = $null
 $script:SynapseChromeBridgeMaintenanceResumeProbeAfterUnixMs = $null
@@ -14065,8 +14066,13 @@ function Test-SynapseCandidateDaemon {
                 if (-not $candidateBootstrap.HasExited) {
                     throw 'exact native candidate bootstrap remained alive after its owned one-shot supervisor exited'
                 }
-                if ($candidateSucceeded -and ($candidateBootstrapForcedStop -or [int]$candidateBootstrap.ExitCode -ne 0)) {
-                    throw "native bootstrap did not exit naturally with code zero forced_stop=$candidateBootstrapForcedStop exit_code=$($candidateBootstrap.ExitCode)"
+                # Authenticated POST /shutdown deliberately returns exit code 1
+                # so a persistent supervisor restarts the daemon. The one-shot
+                # candidate supervisor and native bootstrap must propagate that
+                # exact code without restarting; zero would describe a different
+                # signal/parent-exit path and is not the candidate stop contract.
+                if ($candidateSucceeded -and ($candidateBootstrapForcedStop -or [int]$candidateBootstrap.ExitCode -ne $SynapseAuthenticatedShutdownExitCode)) {
+                    throw "native bootstrap did not propagate the authenticated shutdown exit code forced_stop=$candidateBootstrapForcedStop expected_exit_code=$SynapseAuthenticatedShutdownExitCode actual_exit_code=$($candidateBootstrap.ExitCode)"
                 }
             } catch {
                 $candidateCleanupErrors.Add("bootstrap_cleanup bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath error=$($_.Exception.Message)")
@@ -14114,7 +14120,7 @@ function Test-SynapseCandidateDaemon {
             $candidateBootstrapLogExpectations = @(
                 "SYNAPSE_SUPERVISOR_BOOTSTRAP_PARENT_JOB_BOUND bootstrap_pid=$($candidateBootstrap.Id) job_name=$candidateExpectedParentJobName",
                 "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_STARTED bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) job_name=$candidateExpectedParentJobName",
-                "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_EXIT bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) exit_code=0"
+                "SYNAPSE_SUPERVISOR_BOOTSTRAP_CHILD_EXIT bootstrap_pid=$($candidateBootstrap.Id) supervisor_pid=$($candidateSupervisor.Id) exit_code=$SynapseAuthenticatedShutdownExitCode"
             )
             foreach ($expectedBootstrapLogEntry in $candidateBootstrapLogExpectations) {
                 if (-not $candidateBootstrapLog.Contains($expectedBootstrapLogEntry)) {
@@ -14132,7 +14138,7 @@ function Test-SynapseCandidateDaemon {
                 state = 'stopped'
                 supervisor_pid = [string]$candidateSupervisor.Id
                 child_pid = [string]$candidate.Id
-                exit_code = '0'
+                exit_code = [string]$SynapseAuthenticatedShutdownExitCode
                 calyx_config_sha256 = $expectedCalyxConfigSha256
                 math_backend = 'cpu'
                 vram_budget_bytes = '0'
@@ -14210,7 +14216,7 @@ function Test-SynapseCandidateDaemon {
                 throw "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_DRIFT path=$candidateSupervisorStatePath drift=$($candidateFinalDrift -join '; ') remediation=preserve the terminal Job evidence and repair the bounded supervisor before accepting or installing this candidate"
             }
             $candidateFinalStateSha256 = Get-SynapseFileSha256 -Path $candidateSupervisorStatePath
-            Info "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_VERIFIED bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath bootstrap_sha256=$candidateBootstrapHashAfter bootstrap_log=$candidateBootstrapLogPath bootstrap_log_sha256=$candidateBootstrapLogSha256 supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) state=stopped exit_code=0 state_path=$candidateSupervisorStatePath state_sha256=$candidateFinalStateSha256 parent_job_name=$($candidateFinalState.supervisor_job_name) parent_job_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$($candidateFinalState.supervisor_job_cpu_rate) parent_current_job_memory_used_bytes=$candidateParentCurrentBytes parent_job_memory_headroom_bytes=$candidateParentHeadroomBytes parent_peak_process_memory_used_bytes=$candidateParentPeakProcessBytes parent_peak_job_memory_used_bytes=$candidateParentPeakJobBytes daemon_job_limit_flags=$($candidateFinalState.job_limit_flags_hex) daemon_cpu_rate=$($candidateFinalState.job_cpu_rate) daemon_process_memory_limit_bytes=$($candidateFinalState.job_process_memory_limit_bytes) daemon_job_memory_limit_bytes=$($candidateFinalState.job_memory_limit_bytes) working_set_policy=measured_only daemon_peak_process_memory_used_bytes=$candidatePeakProcessBytes daemon_peak_job_memory_used_bytes=$candidatePeakJobBytes"
+            Info "SYNAPSE_CANDIDATE_FINAL_JOB_CONTRACT_VERIFIED bootstrap_pid=$($candidateBootstrap.Id) bootstrap_path=$candidateBootstrapPath bootstrap_sha256=$candidateBootstrapHashAfter bootstrap_log=$candidateBootstrapLogPath bootstrap_log_sha256=$candidateBootstrapLogSha256 supervisor_pid=$($candidateSupervisor.Id) candidate_pid=$($candidate.Id) state=stopped exit_code=$SynapseAuthenticatedShutdownExitCode stop_source=authenticated_http_shutdown state_path=$candidateSupervisorStatePath state_sha256=$candidateFinalStateSha256 parent_job_name=$($candidateFinalState.supervisor_job_name) parent_job_limit_bytes=$SynapseOwnedMemoryLimitBytes parent_cpu_rate=$($candidateFinalState.supervisor_job_cpu_rate) parent_current_job_memory_used_bytes=$candidateParentCurrentBytes parent_job_memory_headroom_bytes=$candidateParentHeadroomBytes parent_peak_process_memory_used_bytes=$candidateParentPeakProcessBytes parent_peak_job_memory_used_bytes=$candidateParentPeakJobBytes daemon_job_limit_flags=$($candidateFinalState.job_limit_flags_hex) daemon_cpu_rate=$($candidateFinalState.job_cpu_rate) daemon_process_memory_limit_bytes=$($candidateFinalState.job_process_memory_limit_bytes) daemon_job_memory_limit_bytes=$($candidateFinalState.job_memory_limit_bytes) working_set_policy=measured_only daemon_peak_process_memory_used_bytes=$candidatePeakProcessBytes daemon_peak_job_memory_used_bytes=$candidatePeakJobBytes"
             $candidateResult | Add-Member -NotePropertyName JobLimitFlagsHex -NotePropertyValue ([string]$candidateFinalState.job_limit_flags_hex) -Force
             $candidateResult | Add-Member -NotePropertyName ProcessMemoryLimitBytes -NotePropertyValue ([uint64]$candidateFinalState.job_process_memory_limit_bytes) -Force
             $candidateResult | Add-Member -NotePropertyName JobMemoryLimitBytes -NotePropertyValue ([uint64]$candidateFinalState.job_memory_limit_bytes) -Force
